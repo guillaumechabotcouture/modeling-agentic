@@ -50,27 +50,45 @@ def _fixed(spec) -> dict:
     return {k: float(v) for k, v in ((spec["constraints"].get("fixed_costs_usd") or {}).items())}
 
 
-def frontier(A, ben0, cost0, out0, fractions=FRACTIONS) -> dict:
+def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
+    """The plan re-solved at fractions of the envelope (fixed costs held). A plan that model corrections bear on is
+    excluded with the reason (the analysis guard, applied to every frontier plan); an envelope the solver proves
+    infeasible is recorded separately; any other solver failure propagates. The marginal is on outcome averted (the
+    primary outcome, undiscounted); `objective` is the solver's (discounted) objective."""
     env = float(A.spec["constraints"]["envelope_usd"])
     fixed = sum(_fixed(A.spec).values())
-    rows, skipped = [], []
+    rows, skipped, infeasible, excluded = [], [], [], []
     for f in fractions:
         b = f * env - fixed
         if b <= 0:
             skipped.append({"fraction": f, "reason": "the fixed costs exceed this envelope"})
             continue
-        sol = A.solve(ben0, cost0, budget=b)
+        try:
+            sol = A.solve(ben0, cost0, budget=b)
+        except RuntimeError as e:
+            if str(e).strip() == "optimizer status infeasible":
+                infeasible.append({"fraction": f, "envelope_usd": f * env, "reason": "the solver proves no "
+                                   "allocation feasible at this envelope"})
+                continue
+            raise
+        hits = A.plan_corrections(list(events or []), sol["choice"])
+        if hits:
+            excluded.append({"fraction": f, "envelope_usd": f * env, "reason": f"{len(hits)} model corrections "
+                             "(extrapolation, clips, floors) bear on this plan", "examples": hits[:3]})
+            continue
         s = A.summary(sol["choice"], out0, cost0)
         rows.append({"fraction": f, "envelope_usd": f * env, "budget_allocatable": b, "objective": sol["objective"],
                      "cost": s["cost_allocated"], "averted": s["averted"], "packages": s["packages"], "mix": s["mix"]})
     by = {r["fraction"]: r for r in rows}
     marg = None
     if 0.9 in by and 1.1 in by:
-        d_obj = by[1.1]["objective"] - by[0.9]["objective"]
+        d_out = by[1.1]["averted"][A.primary] - by[0.9]["averted"][A.primary]
         d_usd = by[1.1]["cost"] - by[0.9]["cost"]
-        marg = {"from_fraction": 0.9, "to_fraction": 1.1, "outcome_per_usd": d_obj / d_usd if d_usd > 0 else None,
-                "usd_per_outcome": d_usd / d_obj if d_obj > 0 else None}
-    return {"envelope_usd": env, "fixed_costs_usd": fixed, "points": rows, "skipped": skipped, "marginal": marg}
+        marg = {"from_fraction": 0.9, "to_fraction": 1.1, "outcome": A.primary,
+                "outcome_per_usd": d_out / d_usd if d_usd > 0 else None,
+                "usd_per_outcome": d_usd / d_out if d_out > 0 else None}
+    return {"envelope_usd": env, "fixed_costs_usd": fixed, "points": rows, "skipped": skipped,
+            "infeasible": infeasible, "excluded": excluded, "marginal": marg, "discount_factor": A.dfac}
 
 
 def dollars(A, plan, out0) -> dict:
@@ -128,24 +146,46 @@ def replay(A, plan, uq: dict) -> dict:
 
 
 def by_package(A, plan, out0, cost0, rep: dict | None) -> dict:
+    """Per package in the plan: units, cost, outcome averted and cost per outcome averted (None when nothing is
+    averted: the figure shows such packages as harmful or undefined), with its interval over the replayed draws.
+    The interval is withheld, with the reason and the share of draws, when the replay did not reproduce or some
+    draws avert nothing."""
     from toolkit.analysis.core import q
     pt = _package_sums(A, plan, out0, cost0)
     out = {}
     for k, e in pt.items():
         row = dict(e, components=sorted(A.pk[k]),
                    usd_per_outcome=e["cost"] / e["averted"] if e["averted"] > 0 else None)
-        if rep and rep["reproduced"]:
-            ratios = [d[k]["cost"] / d[k]["averted"] for d in rep["per_draw"] if k in d and d[k]["averted"] > 0]
-            row["usd_per_outcome_interval"] = q(ratios, rep["level"]) if len(ratios) == rep["draws"] else None
+        if rep and rep.get("reproduced"):
+            ds = [d[k] for d in rep["per_draw"] if k in d]
+            bad = [d for d in ds if not d["averted"] > 0]
+            if len(ds) != rep["draws"]:
+                row["usd_per_outcome_interval"] = None
+                row["interval_withheld"] = {"reason": "the package is missing from some draws",
+                                            "share_draws_nonpositive": None}
+            elif bad:
+                row["usd_per_outcome_interval"] = None
+                row["interval_withheld"] = {"reason": "the package averts nothing (or harms) in some draws, where cost "
+                                            "per outcome averted is undefined",
+                                            "share_draws_nonpositive": len(bad) / len(ds)}
+            else:
+                row["usd_per_outcome_interval"] = q([d["cost"] / d["averted"] for d in ds], rep["level"])
+        elif rep is not None:
+            row["usd_per_outcome_interval"] = None
+            row["interval_withheld"] = {"reason": "the draw replay did not reproduce the stored interval",
+                                        "share_draws_nonpositive": None}
         out[k] = row
     return out
 
 
-def component_increment(A, plan, ben0, cost0) -> dict:
+def component_increment(A, plan, ben0, cost0, events=None) -> dict:
+    """Per component, the outcome averted and cost added in the units that get it, against the same package without
+    it. A unit whose counterfactual package model corrections bear on is left out and counted."""
     by_set = {cs: k for k, cs in A.pk.items()}
+    ev = list(events or [])
     res = {}
     for c in A.spec["options"]["components"]:
-        r = {"units": 0, "units_without_counterpart": 0, "averted": 0.0, "cost": 0.0}
+        r = {"units": 0, "units_without_counterpart": 0, "units_with_corrections": 0, "averted": 0.0, "cost": 0.0}
         for i in A.ids:
             cs = A.pk[plan[i]]
             if c not in cs:
@@ -153,6 +193,9 @@ def component_increment(A, plan, ben0, cost0) -> dict:
             alt = by_set.get(frozenset(set(cs) - {c}))
             if alt is None:
                 r["units_without_counterpart"] += 1
+                continue
+            if A.plan_corrections(ev, {i: alt}):
+                r["units_with_corrections"] += 1
                 continue
             r["units"] += 1
             r["averted"] += (ben0[i][plan[i]] - ben0[i][alt]) / max(A.dfac, 1e-12)
@@ -188,7 +231,7 @@ def schedule(A, plan, z0) -> dict:
     from toolkit.engines.contract import Package, UnitSpec
     eng = A.eng
     if not hooks.supports(eng, "schedule"):
-        return {"status": "not_offered", "reason": str(hooks.HookUnsupported("schedule", eng))}
+        return {"status": "not_offered", "reason": str(hooks._unsupported("schedule", eng))}
     h = A.spec.horizon({})
     cal_attr = A.spec["calibration"].get("attribute")
     regions = {}
@@ -218,7 +261,10 @@ def schedule(A, plan, z0) -> dict:
             "start": float(h.start), "regions": out}
 
 
-def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None, log=print) -> dict:
+def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None, log=print, events=None) -> dict:
+    """`events`: the model corrections of the point evaluation (out0); every plan the figures show is guarded with
+    them. With events=None the rebuild's own (A.point_events) are used."""
+    ev = list(events if events is not None else (getattr(A, "point_events", None) or []))
     rep = None
     if uq and uq.get("draws"):
         rep = replay(A, plan, uq)
@@ -229,13 +275,19 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
         sch = schedule(A, plan, z0 or {})
     except Exception as e:  # noqa: BLE001 - a malformed schedule is recorded, not fatal for the other figures
         sch = {"status": "invalid", "reason": f"{type(e).__name__}: {e}"}
-    return {"primary": A.primary, "comparator": A.comp, "region": A.region,
-            "frontier": frontier(A, ben0, cost0, out0), "dollars": dollars(A, plan, out0),
-            "by_package": by_package(A, plan, out0, cost0, rep),
-            "replay": {k: rep[k] for k in ("draws", "seed", "level", "reproduced", "replayed", "stored")} if rep
-            else {"reproduced": False, "reason": "no uncertainty draws"},
-            "component_increment": component_increment(A, plan, ben0, cost0), "burden": burden(A, out0),
-            "calibration": calibration_modelled(A, z0 or {}), "schedule": sch}
+    out = {"primary": A.primary, "comparator": A.comp, "region": A.region,
+           "frontier": frontier(A, ben0, cost0, out0, events=ev), "dollars": dollars(A, plan, out0),
+           "by_package": by_package(A, plan, out0, cost0, rep),
+           "replay": {k: rep[k] for k in ("draws", "seed", "level", "reproduced", "replayed", "stored")} if rep
+           else {"reproduced": False, "reason": "no uncertainty draws"},
+           "component_increment": component_increment(A, plan, ben0, cost0, events=ev), "burden": burden(A, out0),
+           "calibration": calibration_modelled(A, z0 or {}), "schedule": sch}
+    if getattr(A, "rebuild_info", None):
+        out["rebuild"] = A.rebuild_info
+    return out
+
+
+ULP_BOUND = 4          # a stored row's job may differ from the rebuilt one by at most this many ulps in one input
 
 
 # --------------------------------------------------------------------------- offline rebuild
@@ -243,10 +295,47 @@ def _canon(x):
     return json.loads(json.dumps(x, sort_keys=True, default=str))
 
 
+def _float_leaves(x, path=()):
+    if isinstance(x, dict):
+        for k, v in x.items():
+            yield from _float_leaves(v, path + (k,))
+    elif isinstance(x, list):
+        for k, v in enumerate(x):
+            yield from _float_leaves(v, path + (k,))
+    elif isinstance(x, float):
+        yield path, x
+
+
+def ulp_match(job: dict, stored_sha: str, job_sha, bound: int = ULP_BOUND):
+    """The single float input of `job` (in its unit attributes or parameters) that, moved by at most `bound` ulps,
+    reproduces `stored_sha`: (dotted path, ulps), or None. Exactly one candidate must match."""
+    hits = []
+    for path, v in _float_leaves({k: job[k] for k in ("unit", "params") if k in job}):
+        for k in [x for n in range(1, bound + 1) for x in (n, -n)]:
+            w = v
+            for _ in range(abs(k)):
+                w = float(np.nextafter(w, np.inf if k > 0 else -np.inf))
+            jj = json.loads(json.dumps(job))
+            tgt = jj
+            for p in path[:-1]:
+                tgt = tgt[p]
+            tgt[path[-1]] = w
+            if job_sha(jj) == stored_sha:
+                hits.append((".".join(str(p) for p in path), k))
+    return hits[0] if len(hits) == 1 else None
+
+
 def rebuild(run_dir: str, log=print):
-    """(A, plan, out0, ben0, cost0, z0) of a finished emulator-path run, from its stored batch (no engine runs)."""
+    """(A, plan, out0, ben0, cost0, z0) of a finished emulator-path run, from its stored batch (no engine runs).
+
+    Fail closed: the stored design and every stored batch file must have the hashes batch.yaml recorded; every row
+    must carry this code's engine identity; a row whose job hash differs from the rebuilt job is taken only when one
+    float input moved by at most ULP_BOUND ulps reproduces its stored hash (a platform's libm, e.g. exp of the
+    calibrated attribute), recorded in A.rebuild_info; the rebuilt plan must equal the stored plan. A.point_events
+    holds the point evaluation's model corrections."""
     import yaml
     from toolkit.analysis import batch as Bt
+    from toolkit.analysis.artifacts import sha256
     from toolkit.analysis.core import Analysis
     from toolkit.analysis.model import EmulatorModel
     from toolkit.engines.contract import engine_identity
@@ -259,56 +348,61 @@ def rebuild(run_dir: str, log=print):
     rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
     if not os.path.exists(rows):
         raise RebuildRefused("no stored batch rows (analysis/batch/results.jsonl)")
-    with open(rows) as f:
-        first = json.loads(f.readline())
-    stored_ident = ((first.get("result") or {}).get("provenance") or {}).get("engine")
-    if stored_ident != engine_identity(eng):
-        raise RebuildRefused(f"the batch was computed by engine {stored_ident and stored_ident.get('name')} "
-                             f"v{stored_ident and stored_ident.get('version')} (code "
-                             f"{(stored_ident or {}).get('code_sha256', '')[:12]}); this code's engine is "
-                             f"v{engine_identity(eng)['version']} (code {engine_identity(eng)['code_sha256'][:12]}): "
-                             "re-render with the run's own code")
+    bdoc = yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml")))
+    for rel, h in (bdoc.get("inputs") or {}).items():
+        if rel.startswith("analysis/batch/") and sha256(os.path.join(run_dir, rel)) != h:
+            raise RebuildRefused(f"{rel} is not the file batch.yaml recorded (hash differs): the stored batch changed "
+                                 "after the analysis")
+    ident = engine_identity(eng)
     design, jobs = Bt.design(spec)
     stored = json.load(open(os.path.join(run_dir, "analysis", "batch", "design.json")))
     if _canon(stored) != _canon(design):
         raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
-    res, probs = Bt.load_results(rows, jobs, eng)
-    accepted_by_index = []
-    if probs and all(p.endswith("inputs differ from the current job") for p in probs):
-        # The run's own analysis verified every row on the computing platform (batch.yaml rejected_rows 0, manifest
-        # complete); a job rebuilt here can differ from it in the last bit of a derived float (libm differs across
-        # platforms, as batch.adopt notes), which changes its hash. Such rows are taken by their index, and the
-        # rebuilt plan must still equal the stored plan below.
-        man = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))
-        bsum = (yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml")))["data"].get("summary") or {})
-        if man.get("status") != "complete" or bsum.get("rejected_rows") != 0:
-            raise RebuildRefused(f"{len(probs)} batch rows lack matching provenance and the run's analysis did not "
-                                 "verify them")
-        with open(rows) as f:
-            for line in f:
-                r = json.loads(line)
-                jid = jobs[r["i"]]["id"]
-                if jid not in res and r.get("ok"):
-                    res[jid] = r["result"]["result"]
-                    accepted_by_index.append(jid)
-        probs = []
-    if probs or len(res) != len(jobs):
-        raise RebuildRefused(f"{len(probs)} batch rows lack matching provenance, {len(jobs) - len(res)} jobs missing")
-    if accepted_by_index:
-        log(f"rebuild: {len(accepted_by_index)} rows taken by index (job hash differs on this platform), e.g. "
-            f"{accepted_by_index[:2]}")
+    res, by_ulp, other = {}, [], []
+    with open(rows) as f:
+        for line in f:
+            r = json.loads(line)
+            if not r.get("ok") or not isinstance(r.get("i"), int) or r["i"] >= len(jobs):
+                continue
+            body = r.get("result") or {}
+            pv = body.get("provenance") or {}
+            job = jobs[r["i"]]
+            if pv.get("engine") != ident:
+                pe = pv.get("engine") or {}
+                raise RebuildRefused(f"row {r['i']} ({job['id']}) was computed by engine {pe.get('name')} "
+                                     f"v{pe.get('version')} (code {str(pe.get('code_sha256', ''))[:12]}); this code's "
+                                     f"engine is v{ident['version']} (code {ident['code_sha256'][:12]}): re-render with "
+                                     "the run's own code")
+            if pv.get("job_sha") != Bt.job_sha(job):
+                m = ulp_match(job, pv.get("job_sha"), Bt.job_sha)
+                if m is None:
+                    other.append(job["id"])
+                    continue
+                by_ulp.append({"job": job["id"], "field": m[0], "ulps": m[1]})
+            res[job["id"]] = body["result"]
+    if other:
+        raise RebuildRefused(f"{len(other)} rows' inputs differ from the rebuilt jobs by more than one input within "
+                             f"{ULP_BOUND} ulps (e.g. {other[:3]})")
+    if len(res) != len(jobs):
+        raise RebuildRefused(f"{len(jobs) - len(res)} jobs have no stored row")
+    if by_ulp:
+        log(f"rebuild: {len(by_ulp)} rows match their rebuilt job within {ULP_BOUND} ulps in one input "
+            f"(e.g. {by_ulp[0]})")
     model = EmulatorModel(spec, design, res, log=log).fit()
     A = Analysis(spec, model, log=log)
     A.fit_calibration()
     cal0 = A.calibrate(A.theta0)
     z0 = {i: v[0] for i, v in cal0.items()}
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    A.point_events = list(A.last_events)
     sol = A.solve(ben0, cost0)
     point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
     plan = {str(k): v for k, v in point["plan"].items()}
     diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
     if diff:
         raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units")
+    A.rebuild_info = {"rows": len(res), "by_ulp": by_ulp, "ulp_bound": ULP_BOUND,
+                      "fields": sorted({x["field"] for x in by_ulp}), "plan_reproduced": True}
     return A, plan, out0, ben0, cost0, z0
 
 
@@ -362,10 +456,115 @@ def _self_test() -> int:
         fd2 = compute(A, plan, out0, ben0, cost0, R["uncertainty"], z0, log=q)
         ok(abs(fd2["frontier"]["points"][-1]["objective"] - fr[-1]["objective"]) <= 1e-6 * abs(fr[-1]["objective"]),
            "FD11 the rebuilt frontier equals the harness's")
+        # ---- Codex r1 P1-2: rows are taken only when their own inputs are proven to match
+        import hashlib
+        import numpy as np
+        from toolkit.analysis import batch as Bt
+        rows = os.path.join(d, "analysis", "batch", "results.jsonl")
+        bpath = os.path.join(d, "analysis", "batch.yaml")
+        keep_rows, keep_b = open(rows).read(), open(bpath).read()
+
+        def rewrite(fn):
+            out = []
+            for n, line in enumerate(keep_rows.splitlines()):
+                r = json.loads(line)
+                fn(n, r)
+                out.append(json.dumps(r))
+            open(rows, "w").write("\n".join(out) + "\n")
+            b = yaml.safe_load(keep_b)            # as if the batch had been written so on its own platform
+            b["inputs"]["analysis/batch/results.jsonl"] = hashlib.sha256(open(rows, "rb").read()).hexdigest()
+            yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
+        _d, jobs = Bt.design(A.spec)
+        j5 = json.loads(json.dumps(jobs[5]))
+        leaf = sorted(k for k, v in j5["params"].items() if isinstance(v, float))[0]
+        j5["params"][leaf] = float(np.nextafter(j5["params"][leaf], np.inf))
+        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha=Bt.job_sha(j5)) if n == 5 else None)
+        A2, plan2, *_ = rebuild(d, log=q)
+        info = getattr(A2, "rebuild_info", {}) or {}
+        ok(plan2 == plan and [(x["job"], x["field"], x["ulps"]) for x in info.get("by_ulp", [])]
+           == [(jobs[5]["id"], f"params.{leaf}", 1)],
+           f"FD14 a row whose job differs from the rebuilt job by 1 ulp in one input is taken, and recorded: {info}")
+        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14b a row whose inputs cannot be matched within the bound is refused")
+        except RebuildRefused as e:
+            ok("within" in str(e), f"FD14b a row whose inputs cannot be matched within the bound is refused: {e}")
+        rewrite(lambda n, r: r["result"]["provenance"]["engine"].update(version="0") if n == 7 else None)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14c a later row from another engine identity is refused")
+        except RebuildRefused as e:
+            ok("engine" in str(e), f"FD14c a later row from another engine identity is refused: {e}")
+        open(rows, "w").write(keep_rows)
+        b = yaml.safe_load(keep_b)
+        b["inputs"]["analysis/batch/results.jsonl"] = "f" * 64
+        yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
+        try:
+            rebuild(d, log=q)
+            ok(False, "FD14d batch rows that are not the ones the analysis recorded are refused")
+        except RebuildRefused as e:
+            ok("batch.yaml" in str(e), f"FD14d batch rows that are not the ones the analysis recorded are refused: {e}")
+        open(bpath, "w").write(keep_b)
+        # ---- Codex r1 P1-3: frontier and component plans are guarded against model corrections
+        star = [{"unit": A.ids[0], "package": "*", "kind": "clip"}]
+        fr_g = frontier(A, ben0, cost0, out0, events=star)
+        ok(fr_g["points"] == [] and len(fr_g["excluded"]) == len(FRACTIONS)
+           and all("correction" in x["reason"] for x in fr_g["excluded"]),
+           "FD15 frontier plans that model corrections bear on are excluded with the reason")
+        cpk = {i: plan[i] for i in A.ids}
+        by_set = {cs: k for k, cs in A.pk.items()}
+        unit_c = next(i for i in A.ids if len(A.pk[plan[i]]) >= 1)
+        c0 = sorted(A.pk[plan[unit_c]])[0]
+        alt = by_set[frozenset(set(A.pk[plan[unit_c]]) - {c0})]
+        ci = component_increment(A, cpk, ben0, cost0, events=[{"unit": unit_c, "package": alt, "kind": "clip"}])
+        ok(ci[c0].get("units_with_corrections") == 1,
+           f"FD15b a component increment whose counterfactual package has corrections is excluded: {ci[c0]}")
+        # ---- Codex r1 P1-4: an infeasible exploratory envelope is recorded; a genuine solver failure propagates
+        orig = A.solve
+
+        def infeasible_low(ben, cost, budget=None, feas=None):
+            if budget is not None and budget < 0.6 * A.budget:
+                raise RuntimeError("optimizer status infeasible")
+            return orig(ben, cost, budget, feas)
+        A.solve = infeasible_low
+        fr_i = frontier(A, ben0, cost0, out0)
+        ok([x["fraction"] for x in fr_i.get("infeasible", [])] == [0.25, 0.5]
+           and all(p["fraction"] >= 0.75 for p in fr_i["points"]),
+           f"FD16 infeasible exploratory envelopes are recorded separately: {fr_i.get('infeasible')}")
+
+        def broken(ben, cost, budget=None, feas=None):
+            raise RuntimeError("optimizer status time_limit")
+        A.solve = broken
+        try:
+            frontier(A, ben0, cost0, out0)
+            ok(False, "FD16b a solver failure other than infeasibility propagates")
+        except RuntimeError:
+            ok(True, "FD16b a solver failure other than infeasibility propagates")
+        A.solve = orig
+        # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
+        half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
+        fr_h = frontier(A, half, cost0, out0)
+        pts = {p["fraction"]: p for p in fr_h["points"]}
+        want = ((pts[1.1]["averted"][A.primary] - pts[0.9]["averted"][A.primary])
+                / (pts[1.1]["cost"] - pts[0.9]["cost"]))
+        ok(abs(fr_h["marginal"]["outcome_per_usd"] - want) <= 1e-9 * abs(want),
+           "FD18 the marginal is computed on outcome averted, not on the discounted objective")
+        # ---- Codex r1 P2-12: package intervals withheld with a reason and the share of draws
+        k0 = next(k for k in set(plan.values()) if k != A.comp)
+        rep = {"reproduced": True, "draws": 4, "level": 0.95, "per_draw": [
+            {k0: {"units": 1, "cost": 10.0, "averted": a}} for a in (5.0, 4.0, -1.0, 6.0)]}
+        bp = by_package(A, plan, out0, cost0, rep)
+        w = bp[k0].get("interval_withheld") or {}
+        ok(bp[k0].get("usd_per_outcome_interval") is None and w.get("share_draws_nonpositive") == 0.25
+           and w.get("reason"), f"FD17 a withheld package interval says why and in what share of draws: {w}")
         # a stale engine identity is refused
         rows = os.path.join(d, "analysis", "batch", "results.jsonl")
         txt = open(rows).read().replace('"version": "1"', '"version": "0"', 1)
         open(rows, "w").write(txt)
+        b = yaml.safe_load(keep_b)            # the batch as its analysis recorded it, so the identity check is reached
+        b["inputs"]["analysis/batch/results.jsonl"] = hashlib.sha256(open(rows, "rb").read()).hexdigest()
+        yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
         try:
             rebuild(d, log=q)
             ok(False, "FD12 a batch from another engine identity is refused")

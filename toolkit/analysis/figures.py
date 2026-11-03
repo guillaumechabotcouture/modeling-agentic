@@ -31,8 +31,32 @@ if ROOT not in sys.path:
 from toolkit.analysis import figure_style as FS  # noqa: E402
 
 PRODUCER = "toolkit/analysis/figures.py"
-ORDER = ("headline", "allocation_map", "stability_map", "burden_map", "calibration_fit", "frontier", "dollars",
-         "cost_per_outcome", "sensitivity", "timeline", "trajectories")
+# The figure set in three tiers (owner, 2026-11-02). Tiers 1 and 2 are drawn for every run; tier 3 depends on the
+# question: DECISION_SETS maps the spec's deliverable.kind to its decision figures (one declared table; an unknown
+# kind gets a not-produced entry, fail closed).
+TIERS = {
+    "data_model": ("data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage",
+                   "sensitivity"),
+    "simulation": ("timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"),
+}
+DECISION_SETS = {
+    "package_per_unit": ("headline", "allocation_map", "stability_map", "burden_map", "dollars", "frontier",
+                         "cost_per_outcome", "decision_tests", "comparison"),
+}
+TIER_OF = {n: k for k, v in TIERS.items() for n in v}
+TIER_OF.update({n: "decision" for v in DECISION_SETS.values() for n in v})
+
+
+def deliverable_kind(spec: dict) -> str:
+    return str(((spec or {}).get("deliverable") or {}).get("kind", "package_per_unit"))
+
+
+def tiers_for(spec: dict) -> dict:
+    return dict(TIERS, decision=DECISION_SETS.get(deliverable_kind(spec), ()))
+
+
+ORDER = TIERS["data_model"] + TIERS["simulation"] + tuple(n for v in DECISION_SETS.values() for n in v
+                                                         if n not in TIERS["data_model"] + TIERS["simulation"])
 TITLE_MAX = 95
 CAPTION_MAX = 230          # two lines of the report's caption width
 
@@ -76,7 +100,10 @@ class RunData:
         self.spec = yaml.safe_load(open(sp, encoding="utf-8"))
         self.override = {"figure_data": figure_data, "trajectories": trajectories}
         eng = self.opt("engine") or {}
-        self.labels = FS.Labels(self.spec, card=eng.get("card"), params=eng.get("parameters"), overlay=labels_overlay)
+        self.pres = load_presentation(self.dir, labels_overlay, self.spec, eng)
+        self.labels = FS.Labels(self.spec, card=eng.get("card"), params=eng.get("parameters"),
+                                overlay=self.pres["labels"])
+        self._geo = None
         du = self.spec["decision_units"]
         self.uid, self.region_col = du["id"], du.get("region")
         with open(os.path.join(self.dir, du["csv"]), newline="", encoding="utf-8") as f:
@@ -105,6 +132,24 @@ class RunData:
         if rel not in self.used:
             self.used.append(rel)
         return doc["data"]
+
+    @property
+    def geo(self):
+        """Unit polygons from the presentation file's boundaries (None without one); loaded once, fail closed."""
+        if self.pres.get("boundaries") is None:
+            return None
+        if self._geo is None:
+            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region)
+        return self._geo
+
+    def use(self, rel: str):
+        """Record a source file this figure read (besides the analysis artifacts)."""
+        if rel not in self.used:
+            self.used.append(rel)
+
+    def doc(self, kind):
+        """The whole artifact document (envelope included), or None."""
+        return self._load(os.path.join("analysis", f"{kind}.yaml"))
 
     def opt(self, kind):
         try:
@@ -174,8 +219,34 @@ def _legend_handles(t, items):
 
 
 def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=None, edge=None, labels=True):
-    """Draw one dot per unit: at its coordinates (layout 'map') or in a by-region strip (rows = regions)."""
+    """Draw every unit: as its polygon (layout 'boundaries', context features in grey, region outlines heavier), as a
+    dot at its coordinates ('map'), or in a by-region strip (rows = regions)."""
     ax.set_facecolor(t["surface"])
+    if layout == "boundaries":
+        import numpy as np
+        from matplotlib.collections import LineCollection, PolyCollection
+        B = R.geo
+        if B["context"]:
+            ax.add_collection(PolyCollection(B["context"], facecolors=t["band"], edgecolors=t["surface"],
+                                             linewidths=0.3, zorder=1))
+        polys, cols = [], []
+        for i in order:
+            for ring in B["units"].get(i, []):
+                polys.append(ring)
+                cols.append(colors[i])
+        ax.add_collection(PolyCollection(polys, facecolors=cols, edgecolors=t["surface"], linewidths=0.25, zorder=2))
+        if B["outline"]:
+            ax.add_collection(LineCollection(B["outline"], colors=t["ink2"], linewidths=0.7, zorder=3))
+        allp = np.vstack(polys + B["context"]) if (polys or B["context"]) else np.zeros((1, 2))
+        ax.set_xlim(allp[:, 0].min(), allp[:, 0].max())
+        ax.set_ylim(allp[:, 1].min(), allp[:, 1].max())
+        lat = float(np.mean(allp[:, 1]))
+        ax.set_aspect(1 / max(math.cos(math.radians(lat)), 0.2) if -90 <= lat <= 90 else 1.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_visible(False)
+        return
     if layout == "map":
         xy = R.coords()
         ids = order
@@ -206,6 +277,8 @@ def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=Non
 
 
 def _layout(R):
+    if R.geo:
+        return "boundaries", "units on their boundaries"
     return ("map", "units at their coordinates") if R.coords() else \
         ("strip", f"one row per {R.labels.region_title().lower()}, one dot per unit")
 
@@ -231,16 +304,16 @@ def _top(fig, inches=0.62):
 
 def _comp_colors(R, t) -> dict:
     """One categorical slot per component the plan uses, in the spec's component order, contiguous from slot 1 (so
-    a stack of them shows only validated adjacent pairs); the same mapping in every figure of the run."""
+    a stack of them shows only validated adjacent pairs); the same mapping in every figure of the run. Components past
+    the eighth share one neutral "other" colour (never a ninth hue)."""
     mix = (R.opt("point") or {}).get("mix") or {}
     used = [c for c in R.components if mix.get(c, 0) > 0] or list(R.components)
-    used = used[:FS.MAX_CATEGORIES]
-    return {c: t["cat"][n] for n, c in enumerate(used)}
+    return {c: (t["cat"][n] if n < FS.MAX_CATEGORIES else t["ink2"]) for n, c in enumerate(used)}
 
 
 def spec_differences(Rs) -> list[str]:
     """What differs between the runs' specs where it bears on the headline (window, delivery, envelope, comparator,
-    uncertainty sources, engine choice), in words."""
+    uncertainty sources and level, engine mappings and choice, package definitions), in words."""
     def get(R, path):
         x = R.spec
         for k in path:
@@ -249,6 +322,8 @@ def spec_differences(Rs) -> list[str]:
     checks = [(("objective", "horizon"), "outcome window"), (("objective", "delivery"), "delivery period"),
               (("constraints", "envelope_usd"), "envelope"), (("constraints", "fixed_costs_usd"), "fixed costs"),
               (("comparator", "package"), "comparator"), (("uncertainty", "sources"), "uncertainty sources"),
+              (("uncertainty", "level"), "interval level"),
+              (("options", "engine_map"), "component engine mappings"),
               (("decision_units", "engine_attributes"), "engine unit attributes"),
               (("analysis", "decision_tests"), "decision tests")]
     out = []
@@ -256,10 +331,785 @@ def spec_differences(Rs) -> list[str]:
         vals = [json.dumps(get(R, path), sort_keys=True, default=str) for R in Rs]
         if len(set(vals)) > 1:
             out.append(name)
+    defs = {}
+    for R in Rs:
+        for k, cs in R.pk.items():
+            defs.setdefault(k, set()).add(tuple(sorted(cs)))
+    if any(len(v) > 1 for v in defs.values()):
+        out.append("package definitions")
     engs = {json.dumps((R.opt("engine") or {}).get("card", {}).get("version")) for R in Rs}
     if len(engs) > 1:
         out.append("engine version")
     return out
+
+
+def _spec_threshold(R) -> tuple[float, str]:
+    """The share of units whose package must change for a test to count as changing the plan: the spec's
+    analysis.share_threshold, else thresholds.yaml."""
+    v = (R.spec.get("analysis") or {}).get("share_threshold")
+    if v is not None:
+        return float(v), "spec analysis.share_threshold"
+    import yaml
+    return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
+                 ["decision_tests"]["share_threshold"]), "thresholds.yaml"
+
+
+def _bound_attributes(R) -> list[dict]:
+    """The spec's engine attributes as bound: {attribute, kind: column|columns|value, columns, value, source}."""
+    out = []
+    for a, m in ((R.spec.get("decision_units") or {}).get("engine_attributes") or {}).items():
+        m = m or {}
+        if "value" in m:
+            out.append({"attribute": a, "kind": "value", "columns": [], "value": m["value"], "source": m.get("source")})
+        elif "column" in m:
+            out.append({"attribute": a, "kind": "column", "columns": [m["column"]], "split": m.get("split")})
+        elif "columns" in m:
+            cols = m["columns"]
+            out.append({"attribute": a, "kind": "columns", "columns": list(cols.values()) if isinstance(cols, dict)
+                        else list(cols), "keys": list(cols) if isinstance(cols, dict) else None})
+    cal = R.spec.get("calibration") or {}
+    if cal.get("attribute"):
+        out.append({"attribute": cal["attribute"], "kind": "calibrated", "columns": [], "source": "calibration"})
+    return out
+
+
+def _num_or_none(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _x_format(ax, values) -> None:
+    """Compact numbers on x, except calendar years, which keep their digits."""
+    vals = [v for v in values if v is not None]
+    if vals and 1800 <= min(vals) and max(vals) <= 2200:
+        from matplotlib.ticker import FuncFormatter, MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:g}"))
+    else:
+        FS.set_axis_format(ax, "x")
+        ax.locator_params(axis="x", nbins=4)
+
+
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def fig_data_coverage(R, t):
+    import yaml
+    regs = R.regions()
+    pops = (R.spec.get("decision_units") or {}).get("populations") or {}
+    popcols = [pm["column"] for pm in pops.values() if isinstance(pm, dict) and pm.get("column")]
+    pop = {i: sum(_num_or_none(R.by_id[i].get(c)) or 0.0 for c in popcols) for i in R.ids}
+    attrs = _bound_attributes(R)
+    der_p = os.path.join(R.dir, "data", "derivations.yaml")
+    ders = (yaml.safe_load(open(der_p)) or {}).get("derivations") or [] if os.path.exists(der_p) else []
+    if ders:
+        R.use("data/derivations.yaml")
+    inputs = []
+    for dv in ders:
+        cols = dv.get("columns") or {}
+        for inp in dv.get("inputs") or []:
+            inputs.append({"input": inp, "derivation": dv.get("id"), "used": len((cols.get("uses") or {}).get(inp) or []),
+                           "ignored": len((cols.get("ignores") or {}).get(inp) or {})})
+    rows = []
+    for r in regs:
+        ids = [i for i in R.ids if R.region(i) == r]
+        rows.append({"region": r, "units": len(ids), "population": sum(pop[i] for i in ids)})
+    miss_total = 0
+    for a in attrs:
+        cells = [R.by_id[i].get(c) for i in R.ids for c in a["columns"]]
+        miss = sum(1 for v in cells if v is None or str(v).strip() == "" or str(v).lower() == "nan")
+        miss_total += miss
+        binding = ("from " + ", ".join(a["columns"][:3]) + (f" … ({len(a['columns'])} columns)"
+                                                             if len(a["columns"]) > 3 else "")
+                   if a["columns"] else (f"set to {a.get('value')}" if a["kind"] == "value"
+                                         else "calibrated by the run"))
+        rows.append({"attribute": a["attribute"], "binding": ",".join(a["columns"]) if a["columns"] else binding,
+                     "shown": binding, "source": a.get("source") or "", "missing_cells": miss,
+                     "cells": len(cells)})
+    rows += inputs
+    U = R.labels.unit_title()
+    RT = R.labels.region_title()
+    na = len(attrs)
+    H = 0.6 + 0.24 * len(regs) + 0.5 + 0.2 * na + 0.5 + (0.22 * len(inputs) + 0.3 if inputs else 0) + 0.4
+    fig = _fig(t, 7.8, H)
+    y = H - 0.65
+    h1 = 0.24 * len(regs)
+    a1 = fig.add_axes([0.24, (y - h1) / H, 0.62, h1 / H])
+    FS.style(a1, t, grid="x")
+    pv = [x["population"] for x in rows[:len(regs)]]
+    a1.barh(range(len(regs))[::-1], pv, height=0.6, color=t["cat"][0])
+    for k, x in enumerate(rows[:len(regs)][::-1]):
+        a1.text(x["population"], k, f"  {x['units']} {U}", va="center", fontsize=7, color=t["ink2"])
+    a1.set_yticks(range(len(regs)))
+    a1.set_yticklabels(regs[::-1], fontsize=7.5)
+    a1.set_xlim(0, max(pv + [1]) * 1.2)
+    FS.set_axis_format(a1, "x", "count")
+    a1.set_title(f"population and {U} by {RT.lower()}", fontsize=8.5, loc="left", color=t["ink"])
+    y -= h1 + 0.75
+    h2 = 0.2 * na
+    a2 = fig.add_axes([0.02, (y - h2) / H, 0.96, max(h2, 0.2) / H])
+    a2.axis("off")
+    a2.set_title("engine attributes as bound by the spec (units-table column, or a value with its source)", fontsize=8.5,
+                 loc="left", color=t["ink"])
+    for k, x in enumerate([r for r in rows if "attribute" in r]):
+        yy = 1 - (k + 0.5) / max(na, 1)
+        a2.text(0.0, yy, x["attribute"], fontsize=7.5, color=t["ink"], va="center", transform=a2.transAxes)
+        a2.text(0.22, yy, _clip(str(x["shown"]), 62), fontsize=7.5,
+                color=t["ink2"], va="center", transform=a2.transAxes)
+        miss = (f"{x['missing_cells']} of {x['cells']} cells missing" if x["cells"]
+                else ("source: " + _clip(os.path.basename(str(x["source"]).split(" ")[0]), 34) if x["source"]
+                      and x["source"] != "calibration" else "from the calibration targets"))
+        a2.text(0.72, yy, miss, fontsize=7.5, color=t["ink"] if x["missing_cells"] else t["ink2"], va="center",
+                transform=a2.transAxes)
+    if inputs:
+        y -= h2 + 0.75
+        h3 = 0.22 * len(inputs)
+        a3 = fig.add_axes([0.42, (y - h3) / H, 0.5, h3 / H])
+        FS.style(a3, t, grid="x")
+        ys = range(len(inputs))[::-1]
+        a3.barh([v + 0.18 for v in ys], [x["used"] for x in inputs], height=0.34, color=t["cat"][0], label="used")
+        a3.barh([v - 0.18 for v in ys], [x["ignored"] for x in inputs], height=0.34, color=t["cat"][1],
+                label="ignored (with a reason)")
+        a3.set_yticks(list(ys))
+        a3.set_yticklabels([textwrap.shorten(os.path.basename(x["input"]), 42, placeholder="…") for x in inputs],
+                           fontsize=7)
+        FS.set_axis_format(a3, "x", "count")
+        a3.legend(loc="lower right", fontsize=7)
+        a3.set_title("staged inputs, through the derivation, to the units table: columns per input", fontsize=8.5, loc="left",
+                     color=t["ink"])
+    cs = R.spec.get("calibration") or {}
+    meas = []
+    if cs.get("target_frame"):
+        meas.append("calibration target frame declared")
+    if cs.get("target_uncertainty"):
+        meas.append("target error model declared")
+    title = (f"{len(R.ids)} {U} in {len(regs)} {RT.lower()}s; {na} engine attributes bound, "
+             f"{miss_total} missing cells" + (f"; {len(inputs)} staged inputs" if inputs else ""))
+    cap = ("Units and population by region, how each engine attribute is bound, and the columns each staged input "
+           "contributes to the units table (data/derivations.yaml)"
+           + (f"; {', '.join(meas)}." if meas else "; no measurement model declared.")
+           + ("" if inputs else " No derivation record in the run dir."))
+    return fig, title, cap, rows, "data coverage and provenance"
+
+
+def fig_unit_attributes(R, t):
+    import numpy as np
+    attrs = [a for a in _bound_attributes(R) if a["kind"] in ("column", "columns")]
+    if not attrs:
+        raise Missing("the spec binds no engine attribute to units-table columns")
+    card = (R.opt("engine") or {}).get("card") or {}
+    vr = card.get("valid_ranges") or {}
+    regs = R.regions()
+    panels = []
+    for a in attrs:
+        if a["kind"] == "columns" and len(a["columns"]) == 12 and not a.get("keys"):
+            panels.append(("profile", a["attribute"], a["columns"], None))
+        elif a["kind"] == "columns":
+            for k, c in zip(a.get("keys") or a["columns"], a["columns"]):
+                panels.append(("scalar", f"{a['attribute']}: {k}", [c], None))
+        else:
+            panels.append(("scalar", a["attribute"], a["columns"], a.get("split")))
+    ncol = 3
+    nrow = math.ceil(len(panels) / ncol)
+    ph = 0.17 * len(regs) + 0.7
+    fig = _fig(t, 8.2, ph * nrow + 0.8)
+    gs = fig.add_gridspec(nrow, ncol, left=0.1, right=0.99, top=_top(fig, 0.7), bottom=0.04, hspace=0.6, wspace=0.12)
+    rows, outside = [], 0
+    for n, (kind, name, cols, split) in enumerate(panels):
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="x")
+        if kind == "profile":
+            M = np.array([[_num_or_none(R.by_id[i].get(c)) or np.nan for c in cols] for i in R.ids])
+            for row in M:
+                ax.plot(range(1, 13), row, color=t["neutral"], lw=0.6)
+            ax.plot(range(1, 13), np.nanmedian(M, axis=0), color=t["cat"][0], lw=2)
+            ax.set_xticks([1, 4, 7, 10])
+            ax.set_xlabel("month (median in colour)", fontsize=7)
+            FS.set_axis_format(ax, "y")
+            rows += [{"attribute": name, "unit": i, **{c: v for c, v in zip(cols, M[k])}} for k, i in enumerate(R.ids)]
+        else:
+            lo_hi = vr.get(name.split(":")[0])
+            for yv, r in enumerate(regs[::-1]):
+                vals = []
+                for i in R.ids:
+                    if R.region(i) != r:
+                        continue
+                    raw = R.by_id[i].get(cols[0])
+                    vs = [_num_or_none(x) for x in str(raw).split(split)] if split else [_num_or_none(raw)]
+                    vals += [v for v in vs if v is not None]
+                    rows += [{"attribute": name, "unit": i, "region": r, "value": v} for v in vs]
+                bad = [v for v in vals if lo_hi and not (lo_hi[0] <= v <= lo_hi[1])]
+                outside += len(bad)
+                ax.scatter(vals, [yv] * len(vals), s=7, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.3,
+                           zorder=3)
+                if bad:
+                    ax.scatter(bad, [yv] * len(bad), s=30, facecolors="none", edgecolors=t["ink"], linewidths=1,
+                               zorder=4)
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1] if n % ncol == 0 else [], fontsize=6.5)
+            _x_format(ax, [r["value"] for r in rows if r.get("attribute") == name and r.get("value") is not None])
+        ax.tick_params(labelsize=6.5)
+        ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
+    vals_bound = [a for a in _bound_attributes(R) if a["kind"] == "value"]
+    title = (f"{len(attrs)} unit attributes across {len(R.ids)} {R.labels.unit_title()}; {outside} outside the "
+             f"engine's valid ranges")
+    cap = ("Each bound attribute by region (dots: units; ringed: outside the engine card's valid range); monthly "
+           "profiles as thin lines with the median." + (f" Set by value: {', '.join(a['attribute'] for a in vals_bound)}."
+                                                       if vals_bound else ""))
+    return fig, title, cap, rows, "unit attribute distributions"
+
+
+def fig_parameters(R, t):
+    eng = R.opt("engine") or {}
+    params = eng.get("parameters") or []
+    if not params:
+        raise Missing("needs the engine parameters (analysis/engine.yaml)")
+    rep = {}
+    try:
+        rep = R.report()
+    except Missing:
+        pass
+    drawn = {x["name"]: x for x in rep.get("parameters_drawn") or [] if isinstance(x, dict) and x.get("name")}
+    cal_theta = (R.opt("calibration") or {}).get("theta") or {}
+    rows = []
+    for p in params:
+        name = p["name"]
+        d = drawn.get(name) or {}
+        if d.get("source_kind") in ("priors", "prior"):          # toolkit/spec/priors.py plan(): "priors"
+            kind = "prior"
+        elif name in cal_theta or d.get("source_kind") == "calibration":
+            kind = "calibrated"
+        else:
+            kind = p.get("kind") or "fixed"
+        rng = d.get("range") if d.get("range") else [p.get("lo"), p.get("hi")]
+        lo, hi = (_num_or_none(rng[0]), _num_or_none(rng[1])) if rng else (None, None)
+        val = _num_or_none(cal_theta.get(name, p.get("value")))
+        rows.append({"name": name, "label": R.labels.parameter(name), "kind": kind, "value": val, "lo": lo, "hi": hi,
+                     "units": p.get("units") or "", "dist": d.get("dist") or "", "drawn": bool(d),
+                     "source": textwrap.shorten(str(d.get("source") or p.get("source") or ""), 90, placeholder="…")})
+    ranged = [r for r in rows if r["lo"] is not None and r["hi"] is not None and r["hi"] > r["lo"] and
+              r["value"] is not None]
+    if not ranged:
+        raise Missing("no engine parameter declares a range")
+    kinds = ["fitted", "prior", "calibrated", "fixed", "scenario"]
+    present = [k for k in kinds if any(r["kind"] == k for r in ranged)] + \
+        sorted({r["kind"] for r in ranged} - set(kinds))
+    col = {k: (t["cat"][n] if n < FS.MAX_SCATTER_CATEGORIES else t["ink2"]) for n, k in enumerate(present)}
+    ranged.sort(key=lambda r: (present.index(r["kind"]), r["name"]))
+    fig = _fig(t, 7.8, 0.32 * len(ranged) + 1.5)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.42, 0.75 / h, 0.5, _top(fig, 0.6) - 0.75 / h])
+    FS.style(ax, t, grid="x")
+    edge = 0
+    markers = {"fitted": "o", "prior": "D", "calibrated": "s"}
+    for y, r in enumerate(ranged[::-1]):
+        pos = (r["value"] - r["lo"]) / (r["hi"] - r["lo"])
+        edge += pos <= 0.02 or pos >= 0.98
+        ax.plot([0, 1], [y, y], color=t["neutral"], lw=3, solid_capstyle="round", zorder=1)
+        ax.scatter([pos], [y], s=36, marker=markers.get(r["kind"], "o"), color=col[r["kind"]],
+                   edgecolors=t["surface"], linewidths=1, zorder=3)
+    ax.set_yticks(range(len(ranged)))
+    ax.set_yticklabels([f"{r['label']}  {FS.fmt(r['value'])} {r['units']}".rstrip() + f"  ({FS.fmt(r['lo'])}–"
+                        f"{FS.fmt(r['hi'])})" for r in ranged[::-1]], fontsize=7)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_xticks([0, 0.5, 1])
+    ax.set_xticklabels(["low end", "middle", "high end"], fontsize=7)
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], marker=markers.get(k, "o"), ls="", color=col[k], label=k) for k in present],
+               loc="lower left", bbox_to_anchor=(0.42, 0.0), ncol=len(present), fontsize=7.5)
+    cnt = {k: sum(r["kind"] == k for r in ranged) for k in present}
+    title = (f"{len(ranged)} of {len(rows)} parameters have ranges (" + ", ".join(f"{v} {k}" for k, v in cnt.items())
+             + f"); {edge} at a range edge")
+    cap = (f"Each parameter's value within its range (fitted: engine fit; prior: drawn from the spec's prior; "
+           f"calibrated: the run's calibration). {len(rows) - len(ranged)} parameters without a range are fixed "
+           f"values (table view lists all with their sources).")
+    return fig, title, cap, rows, "parameters: priors, fitted and calibrated values with their ranges"
+
+
+def fig_design_coverage(R, t):
+    import numpy as np
+    dp = os.path.join(R.dir, "analysis", "batch", "design.json")
+    if not os.path.exists(dp):
+        raise Missing("needs analysis/batch/design.json (the emulator path's design)")
+    R.use("analysis/batch/design.json")
+    design = json.load(open(dp))
+    pts = design.get("points") or []
+    if not pts:
+        raise Missing("the design has no points")
+    cal = R.opt("calibration") or {}
+    uz = {i: (v or {}).get("z") for i, v in (cal.get("units") or {}).items()}
+    feats = list(((R.spec.get("analysis") or {}).get("emulator") or {}).get("features") or [])
+    names = sorted({k for p in pts for k in (p.get("theta") or {})})
+    panels = [("z", "calibrated attribute (design scale)")] + [("f", f) for f in feats] + [("p", n) for n in names]
+    ncol = 3
+    nrow = math.ceil(len(panels) / ncol)
+    fig = _fig(t, 8.0, 1.05 * nrow + 1.2)
+    gs = fig.add_gridspec(nrow, ncol, left=0.08, right=0.99, top=_top(fig, 0.7), bottom=0.13, hspace=0.9, wspace=0.12)
+    rows = []
+    dunits = [str(p.get("unit_id")) for p in pts]
+    hold = [bool(p.get("holdout")) for p in pts]
+    for n, (kind, name) in enumerate(panels):
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="x")
+        if kind == "z":
+            dv = [p.get("z") for p in pts]
+            uv = [v for v in uz.values() if v is not None]
+            label_u = "units (fitted)"
+        elif kind == "f":
+            dv = [_num_or_none(R.by_id.get(u, {}).get(name)) for u in dunits]
+            uv = [_num_or_none(R.by_id[i].get(name)) for i in R.ids]
+            label_u = "units"
+        else:
+            dv = [(p.get("theta") or {}).get(name) for p in pts]
+            uv = []
+            label_u = ""
+        if uv:
+            ax.scatter([v for v in uv if v is not None], [1] * len([v for v in uv if v is not None]), s=8,
+                       color=t["neutral"], zorder=2)
+        ax.scatter([v for v, h in zip(dv, hold) if v is not None and not h], [0] * sum(1 for v, h in zip(dv, hold)
+                                                                                     if v is not None and not h),
+                   s=6, color=t["cat"][0], alpha=0.7, linewidths=0, zorder=3)
+        ax.scatter([v for v, h in zip(dv, hold) if v is not None and h], [0] * sum(1 for v, h in zip(dv, hold)
+                                                                                 if v is not None and h),
+                   s=16, facecolors="none", edgecolors=t["cat"][1], linewidths=1, zorder=3)
+        ax.set_yticks([0, 1] if uv else [0])
+        ax.set_yticklabels((["design", label_u] if uv else ["design"]) if n % ncol == 0 else ([""] * (2 if uv else 1)),
+                           fontsize=7)
+        ax.set_ylim(-0.6, 1.6)
+        _x_format(ax, [v for v in dv + uv if v is not None])
+        ax.tick_params(labelsize=6.5)
+        ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
+        dv_ok = [v for v in dv if v is not None]
+        uv_ok = [v for v in uv if v is not None]
+        out = [v for v in uv_ok if dv_ok and not (min(dv_ok) <= v <= max(dv_ok))]
+        rows.append({"dimension": name, "design_min": min(dv_ok) if dv_ok else None,
+                     "design_max": max(dv_ok) if dv_ok else None, "units_outside_design_range": len(out),
+                     "units": len(uv_ok)})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], marker="o", ls="", color=t["cat"][0], label="design point"),
+                        Line2D([0], [0], marker="o", ls="", markerfacecolor="none", markeredgecolor=t["cat"][1],
+                               label="held out"),
+                        Line2D([0], [0], marker="o", ls="", color=t["neutral"], label="units")],
+               loc="lower left", bbox_to_anchor=(0.08, 0.0), ncol=3, fontsize=7.5)
+    n_out = sum(r["units_outside_design_range"] for r in rows)
+    title = f"Design covers the units: {n_out} unit values fall outside the design range across {len(rows)} dimensions"
+    cap = (f"{len(pts)} design points ({sum(hold)} held out) against the units, per emulator input: the calibrated "
+           f"attribute, the unit features and the drawn parameters.")
+    return fig, title, cap, rows, "design and emulator coverage"
+
+
+def fig_burn_in(R, t):
+    tr = R.opt("trajectories") or {}
+    if tr.get("burn_in"):
+        raise Missing("burn-in series present but no renderer yet")
+    raise Missing("needs a series over the burn-in: run_series (engine hooks contract figures-hooks/1) starts at "
+                  "horizon.start, after the burn-in, and the run dir holds no equilibration evidence")
+
+
+def _monthly_profile_attribute(R):
+    for a in _bound_attributes(R):
+        if a["kind"] == "columns" and len(a["columns"]) == 12 and not a.get("keys"):
+            return a
+    return None
+
+
+def _trajectories_current(R):
+    tr = R.opt("trajectories")
+    if not tr or tr.get("status") != "ok":
+        raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
+                      + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
+    doc = R.doc("trajectories") or {}
+    from toolkit.analysis.artifacts import sha256
+    stale = [rel for rel, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(R.dir, rel)) != h]
+    if stale:
+        raise Missing(f"the trajectories are stale: {', '.join(stale)} changed after they were computed; rerun "
+                      "python -m toolkit.analysis.trajectories run <run_dir>")
+    run_eng = (R.doc("point") or {}).get("engine") or {}
+    te = tr.get("engine") or {}
+    if run_eng and (te.get("name"), str(te.get("version"))) != (run_eng.get("name"), str(run_eng.get("version"))):
+        raise Missing(f"the trajectories are stale: computed by engine {te.get('name')} v{te.get('version')}, the "
+                      f"analysis by {run_eng.get('name')} v{run_eng.get('version')}")
+    return tr
+
+
+def trajectory_checks(R, tr) -> list[dict]:
+    """The harness checks paired with the trajectory figure (a later dynamics-review gate reads them)."""
+    import numpy as np
+    out = []
+    d0, d1 = tr["delivery"]
+    ser = tr["series"]
+    panels = {"total": ser["total"], **(ser.get("regions") or {})}
+    worst = 0.0
+    for p, s in panels.items():
+        for m in tr["metrics"]:
+            c, pl = np.asarray(s["arms"]["comparator"][m]), np.asarray(s["arms"]["plan"][m])
+            pre = np.asarray(s["t"]) < d0 - 1e-9
+            if pre.any():
+                scale = max(float(np.max(np.abs(c[pre]))), 1e-12)
+                worst = max(worst, float(np.max(np.abs(c[pre] - pl[pre]))) / scale)
+    out.append({"check": "plan_equals_comparator_before_delivery", "value": worst,
+                "status": "pass" if worst <= 1e-9 else "flag", "detail": "largest relative difference before delivery"})
+    cm = tr.get("calibration_metric")
+    win = (R.spec.get("calibration") or {}).get("window")
+    if cm in tr["metrics"] and win:
+        flags, n = [], 0
+        for p, s in panels.items():
+            tg = s.get("target") or {}
+            if tg.get("value") is None:
+                continue
+            tt = np.asarray(s["t"])
+            sel = (tt >= float(win[0]) - 1 / 24) & (tt < float(win[1]) + 1 / 24)
+            if not sel.any():
+                continue
+            v = float(np.mean(np.asarray(s["arms"]["comparator"][cm])[sel]))
+            n += 1
+            if not tg["lo"] <= v <= tg["hi"]:
+                flags.append(p)
+        out.append({"check": "pre_intervention_vs_target", "value": len(flags), "panels": n,
+                    "status": "pass" if not flags else "flag",
+                    "detail": f"modelled comparator over the calibration window outside the target interval in "
+                              f"{len(flags)} of {n} panels" + (f": {', '.join(flags[:5])}" if flags else "")})
+    w1 = tr["window"][1]
+    if d1 < w1 - 1e-9:
+        s = ser["total"]
+        tt = np.asarray(s["t"])
+        i0, i1 = int(np.searchsorted(tt, d1) - 1), int(np.searchsorted(tt, d1))
+        if 0 <= i0 < i1 < len(tt):
+            jumps = {m: float((s["arms"]["plan"][m][i1] - s["arms"]["plan"][m][i0])
+                              / max(abs(s["arms"]["plan"][m][i0]), 1e-12)) for m in tr["metrics"]}
+            out.append({"check": "end_of_delivery_step", "value": jumps, "status": "info",
+                        "detail": "relative step in the plan's series across the end of delivery (month before vs "
+                                  "after)"})
+    return out
+
+
+def fig_seasonality(R, t):
+    import numpy as np
+    tr = _trajectories_current(R)
+    a = _monthly_profile_attribute(R)
+    if a is None:
+        raise Missing("no engine attribute is a monthly profile (12 units-table columns) to check the modelled "
+                      "season against")
+    m = next((k for k in tr["metrics"] if (tr["metric_info"].get(k) or {}).get("aggregate") == "rate"),
+             tr["metrics"][0])
+    ser = tr["series"]
+    panels = ["total"] + sorted(ser.get("regions") or {})
+    ncol = 4
+    nrow = math.ceil(len(panels) / ncol)
+    fig = _fig(t, 8.0, 1.5 * nrow + 1.0)
+    gs = fig.add_gridspec(nrow, ncol, left=0.06, right=0.99, top=_top(fig, 0.75), bottom=0.1, hspace=0.8, wspace=0.25)
+    rows, shifts = [], []
+    d0 = tr["delivery"][0]
+    for n, p in enumerate(panels):
+        s = ser["total"] if p == "total" else ser["regions"][p]
+        ids = s.get("units") or []
+        prof = np.nanmean([[_num_or_none(R.by_id[i].get(c)) or np.nan for c in a["columns"]] for i in ids], axis=0)
+        tt = np.asarray(s["t"])
+        v = np.asarray(s["arms"]["comparator"][m])
+        sel = tt < d0 - 1e-9 if (tt < d0 - 1e-9).sum() >= 12 else np.ones_like(tt, bool)
+        mon = np.array([int(round((x % 1) * 12)) % 12 for x in tt[sel]])
+        mod = np.array([np.mean(v[sel][mon == k]) if (mon == k).any() else np.nan for k in range(12)])
+        prof_n, mod_n = prof / np.nanmean(prof), mod / np.nanmean(mod)
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        FS.style(ax, t, grid="y")
+        ax.plot(range(1, 13), prof_n, color=t["muted"], lw=1.4)
+        ax.plot(range(1, 13), mod_n, color=t["cat"][0], lw=1.6)
+        ax.set_xticks([1, 4, 7, 10])
+        ax.tick_params(labelsize=6.5)
+        FS.set_axis_format(ax, "y")
+        pk_in, pk_mod = int(np.nanargmax(prof_n)) + 1, int(np.nanargmax(mod_n)) + 1
+        lag = (pk_mod - pk_in) % 12
+        shifts.append(lag)
+        ax.set_title(f"{'Sample' if p == 'total' else p}: lag {lag} mo", fontsize=7.5, loc="left", color=t["ink"])
+        rows.append({"panel": p, "input_peak_month": pk_in, "model_peak_month": pk_mod, "lag_months": lag,
+                     **{f"input_m{k + 1:02d}": prof_n[k] for k in range(12)},
+                     **{f"model_m{k + 1:02d}": mod_n[k] for k in range(12)}})
+    from matplotlib.lines import Line2D
+    fig.legend(handles=[Line2D([0], [0], color=t["muted"], lw=1.4, label=f"input profile ({a['attribute']})"),
+                        Line2D([0], [0], color=t["cat"][0], lw=1.6,
+                               label=f"modelled {tr['metric_info'].get(m, {}).get('label', m)}, comparator")],
+               loc="lower left", bbox_to_anchor=(0.06, 0.0), ncol=2, fontsize=7.5)
+    med = sorted(shifts)[len(shifts) // 2]
+    title = f"Modelled seasonal peak lags the input profile by a median of {med} months"
+    cap = ("Input monthly profile and the modelled comparator series by calendar month, each scaled to its mean, in "
+           "the purposive trajectory sample (before delivery where a full year is available).")
+    return fig, title, cap, rows, "seasonality check (diagnostic)"
+
+
+def fig_stochastic_noise(R, t):
+    import numpy as np
+    tr = _trajectories_current(R)
+    se = tr.get("seed_effects") or {}
+    if not se:
+        raise Missing("the trajectory step recorded no per-seed effects (rerun the trajectory step)")
+    m = next((k for k in tr["metrics"] if (tr["metric_info"].get(k) or {}).get("aggregate") == "rate"),
+             tr["metrics"][0])
+    units = sorted(se, key=lambda i: np.mean(se[i][m]))
+    fig = _fig(t, 7.6, 0.22 * len(units) + 1.4)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.2, 0.6 / h, 0.75, _top(fig, 0.55) - 0.6 / h])
+    FS.style(ax, t, grid="x")
+    rows, rel = [], []
+    for y, i in enumerate(units):
+        v = np.asarray(se[i][m], float)
+        ax.scatter(v, [y] * len(v), s=12, color=t["cat"][0], alpha=0.8, zorder=3)
+        ax.plot([v.mean()] * 2, [y - 0.3, y + 0.3], color=t["ink"], lw=1.4, zorder=4)
+        if len(v) > 1 and abs(v.mean()) > 0:
+            rel.append(float(np.std(v, ddof=1) / abs(v.mean())))
+        rows.append({"unit": i, "region": R.region(i) if i in R.by_id else "", "mean": float(v.mean()),
+                     "sd": float(np.std(v, ddof=1)) if len(v) > 1 else None, **{f"seed_{k}": x for k, x in enumerate(v)}})
+    ax.set_yticks(range(len(units)))
+    ax.set_yticklabels([f"{R.region(i) if i in R.by_id else ''} {i}" for i in units], fontsize=6.5)
+    FS.set_axis_format(ax, "x")
+    lab = tr["metric_info"].get(m, {}).get("label", m)
+    ax.set_xlabel(f"{lab} averted per person over the outcome window, by seed (bar: mean)", fontsize=8)
+    med = sorted(rel)[len(rel) // 2] if rel else None
+    title = (f"Seed-to-seed spread is {FS.fmt(med, 'percent')} of the mean effect (median over {len(rel)} sampled units)"
+             if med is not None else "Seed-to-seed spread of the effect in the sampled units")
+    cap = (f"Comparator minus plan, {lab}, over the outcome window for each seed of the trajectory step "
+           f"({tr.get('seeds')} seeds) in the purposive sample: what one simulation's Monte Carlo noise looks like.")
+    return fig, title, cap, rows, "stochastic noise (diagnostic)"
+
+
+def fig_decision_tests(R, t):
+    dt = R.art("decision_tests")
+    tests = dt.get("tests") or []
+    if not tests:
+        raise Missing("the run declares no decision tests")
+    fig = _fig(t, 7.8, 0.36 * len(tests) + 1.4)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.36, 0.7 / h, 0.42, _top(fig, 0.6) - 0.7 / h])
+    FS.style(ax, t, grid="x")
+    rows, k = [], 0
+    mx = max([float(x.get("share_pct") or 0) for x in tests] + [float(x.get("threshold_pct") or 0) for x in tests] + [1])
+    for y, x in enumerate(tests[::-1]):
+        sh, th, v = x.get("share_pct"), x.get("threshold_pct"), x.get("verdict")
+        if v == "NOT_RUN" or sh is None:
+            ax.text(0, y, " not run", va="center", fontsize=7.5, color=t["ink2"])
+        else:
+            ax.barh(y, float(sh) / 100, height=0.5, color=t["cat"][0] if v == "CHANGES_PLAN" else t["neutral"])
+            if float(sh) == 0:
+                ax.text(0, y, " no unit changes", va="center", fontsize=7.5, color=t["ink2"])
+        if th is not None:
+            ax.plot([float(th) / 100] * 2, [y - 0.35, y + 0.35], color=t["ink"], lw=1.2)
+        if v == "CHANGES_PLAN":
+            k += 1
+            ax.text(1.02, y, "changes the plan", transform=ax.get_yaxis_transform(), va="center", fontsize=7.5,
+                    color=t["ink"])
+        rows.append({"test": x.get("test_id"), "verdict": v, "share_pct": sh, "threshold_pct": th,
+                     "statement": x.get("statement")})
+    ax.set_yticks(range(len(tests)))
+    texts = {str(d.get("id")): str(d.get("text") or "") for d in
+             ((R.spec.get("analysis") or {}).get("decision_tests") or []) if isinstance(d, dict)}
+
+    def name(x):
+        tid = str(x.get("test_id"))
+        if tid.startswith("prior_range_"):
+            return f"prior range: {R.labels.parameter(tid[len('prior_range_'):])}"
+        return f"{tid}: {_clip(texts[tid], 44)}" if texts.get(tid) else tid
+    ax.set_yticklabels([name(x) for x in tests[::-1]], fontsize=7.5)
+    ax.set_xlim(0, mx / 100 * 1.15)
+    FS.set_axis_format(ax, "x", "percent")
+    ax.set_xlabel(f"share of {R.labels.unit_title()} whose package changes (tick: the test's threshold)", fontsize=8)
+    n_run = sum(1 for x in tests if x.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE"))
+    title = f"{k} of {n_run} decision tests change the plan" + (
+        f"; {len(tests) - n_run} not run" if len(tests) > n_run else "")
+    cap = ("Each decision test re-solves the plan under its alternative and counts the units that change package; "
+           "filled bars cross the test's threshold.")
+    return fig, title, cap, rows, "decision tests: does the plan change?"
+
+
+def fig_comparison(R, t):
+    raise Missing("drawn across runs: python -m toolkit.analysis.figures compare <run_dir> <run_dir> ... --out <dir>")
+
+
+def contact_sheets(res: dict, dest: str, run_dir: str, harness: bool) -> dict:
+    """One overview PNG per tier: a grid of the tier's figures with their titles."""
+    from PIL import Image, ImageDraw
+    out = {}
+    for tier in ("data_model", "simulation", "decision"):
+        ents = [f for f in res["figures"] if f.get("tier") == tier]
+        if not ents:
+            continue
+        thumbs = []
+        for f in ents:
+            p = f["path"] if os.path.isabs(f["path"]) else os.path.join(run_dir, f["path"])
+            im = Image.open(p).convert("RGB")
+            im.thumbnail((620, 520))
+            thumbs.append(im)
+        ncol = 3 if len(thumbs) > 2 else len(thumbs)
+        cw, ch = 640, max(im.height for im in thumbs) + 20
+        nrow = math.ceil(len(thumbs) / ncol)
+        sheet = Image.new("RGB", (cw * ncol, ch * nrow + 40), FS.THEMES["light"]["surface"])
+        dr = ImageDraw.Draw(sheet)
+        dr.text((10, 10), f"{tier.replace('_', ' and ').replace('data and model', 'data and model')}: "
+                          f"{len(thumbs)} figures", fill=FS.THEMES["light"]["ink"])
+        for n, im in enumerate(thumbs):
+            sheet.paste(im, ((n % ncol) * cw + 10, (n // ncol) * ch + 40))
+        path = os.path.join(dest, f"overview_{tier}.png")
+        sheet.save(path, dpi=(FS.DPI, FS.DPI))
+        out[tier] = os.path.relpath(path, run_dir) if harness else path
+    return out
+
+
+def load_presentation(run_dir: str, extra=None, spec: dict | None = None, engine_art: dict | None = None) -> dict:
+    """The unsigned presentation files (owner, 2026-11-02): presentation.yaml (or labels.yaml) in the run dir, then
+    `extra` (a path given with --labels, or a labels mapping), each overriding the one before id by id. A file holds
+    `labels:` (display names) and/or `boundaries:` ({path, feature_id, crosswalk: {path, unit_id, feature_id},
+    credit}). Malformed files and ids the spec does not have fail closed (ValueError naming the file). Returns
+    {labels, boundaries, files: [{path, sha256}]}; labels never change a number, so the files are not in the spec."""
+    import yaml
+    from toolkit.analysis.artifacts import sha256
+    from toolkit.spec import schema
+    keys = set(schema.PRESENTATION_LABELS + schema.PRESENTATION_TITLES)
+    eng = engine_art or {}
+    pnames = [p.get("name") for p in eng.get("parameters") or [] if isinstance(p, dict)]
+    found = [n for n in ("presentation.yaml", "labels.yaml") if os.path.exists(os.path.join(run_dir, n))]
+    if len(found) > 1:
+        raise ValueError(f"{run_dir}: both presentation.yaml and labels.yaml; keep one presentation file")
+    srcs = [(os.path.join(run_dir, n), n) for n in found]
+    if isinstance(extra, str):
+        srcs.append((os.path.abspath(os.path.expanduser(extra)), os.path.abspath(os.path.expanduser(extra))))
+    labels, bnd, files = {}, None, []
+    for path, shown in srcs:
+        try:
+            doc = yaml.safe_load(open(path, encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as e:
+            raise ValueError(f"{shown}: unreadable presentation file: {e}") from e
+        doc = {} if doc is None else doc
+        if not isinstance(doc, dict):
+            raise ValueError(f"{shown}: a mapping with labels and/or boundaries")
+        if doc and set(doc) <= keys:                      # a bare labels mapping
+            doc = {"labels": doc}
+        unknown = sorted(set(doc) - {"labels", "boundaries"})
+        if unknown:
+            raise ValueError(f"{shown}: unknown keys {unknown} (known: labels, boundaries)")
+        lab = doc.get("labels") if doc.get("labels") is not None else {}
+        probs = schema.labels_problems(spec or {}, lab, pnames, eng.get("card"))
+        if probs:
+            raise ValueError(f"{shown}: {'; '.join(probs)}")
+        for k, v in lab.items():
+            if isinstance(v, dict):
+                labels.setdefault(k, {}).update(v)
+            else:
+                labels[k] = v
+        if doc.get("boundaries") is not None:
+            bnd = _boundaries_config(doc["boundaries"], os.path.dirname(path), shown)
+        files.append({"path": shown, "sha256": sha256(path)})
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if isinstance(v, dict):
+                labels.setdefault(k, {}).update(v)
+            else:
+                labels[k] = v
+    return {"labels": labels, "boundaries": bnd, "files": files}
+
+
+def _boundaries_config(b, base: str, shown: str) -> dict:
+    def where(p):
+        p = os.path.expanduser(str(p))
+        return p if os.path.isabs(p) else os.path.join(base, p)
+    if not isinstance(b, dict) or not isinstance(b.get("path"), str) or not isinstance(b.get("feature_id"), str):
+        raise ValueError(f"{shown}: boundaries needs path and feature_id (strings)")
+    unknown = sorted(set(b) - {"path", "feature_id", "crosswalk", "credit"})
+    if unknown:
+        raise ValueError(f"{shown}: boundaries: unknown keys {unknown}")
+    out = {"path": where(b["path"]), "shown": b["path"], "feature_id": b["feature_id"], "credit": b.get("credit")}
+    xw = b.get("crosswalk")
+    if xw is not None:
+        if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
+            raise ValueError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
+        out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
+                            "feature_id": xw["feature_id"]}
+    if out.get("credit") is not None and not isinstance(out["credit"], str):
+        raise ValueError(f"{shown}: boundaries.credit must be a string")
+    return out
+
+
+def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
+    """Polygons per unit from a GeoJSON FeatureCollection (Polygon and MultiPolygon exterior rings; json and numpy
+    only), matched to the units through the crosswalk or directly by the feature property. Fail closed on a malformed
+    file. Returns {units: {id: [ring]}, context: [ring], unmatched: [ids], outline: [segment], features}."""
+    import numpy as np
+    shown = cfg["shown"]
+    try:
+        doc = json.load(open(cfg["path"], encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{shown}: unreadable boundary file: {e}") from e
+    feats = doc.get("features") if isinstance(doc, dict) else None
+    if not isinstance(feats, list) or not feats:
+        raise ValueError(f"{shown}: not a GeoJSON FeatureCollection with features")
+    by_fid = {}
+    for k, f in enumerate(feats):
+        g = f.get("geometry") if isinstance(f, dict) else None
+        props = f.get("properties") if isinstance(f, dict) else None
+        if not isinstance(g, dict) or not isinstance(props, dict):
+            raise ValueError(f"{shown}: feature {k} lacks geometry or properties")
+        if props.get(cfg["feature_id"]) is None:
+            raise ValueError(f"{shown}: feature {k} has no property {cfg['feature_id']}")
+        typ, co = g.get("type"), g.get("coordinates")
+        polys = [co] if typ == "Polygon" else co if typ == "MultiPolygon" else None
+        if not isinstance(polys, list):
+            raise ValueError(f"{shown}: feature {k} geometry {typ!r} is not a Polygon or MultiPolygon")
+        rings = []
+        for poly in polys:
+            try:
+                ring = np.asarray(poly[0], float)[:, :2]
+            except (TypeError, ValueError, IndexError) as e:
+                raise ValueError(f"{shown}: feature {k} has malformed coordinates") from e
+            if ring.ndim != 2 or len(ring) < 3 or not np.isfinite(ring).all():
+                raise ValueError(f"{shown}: feature {k} has malformed coordinates")
+            rings.append(ring)
+        by_fid.setdefault(str(props[cfg["feature_id"]]), []).extend(rings)
+    xw = None
+    if cfg.get("crosswalk"):
+        c = cfg["crosswalk"]
+        try:
+            with open(c["path"], newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+        except OSError as e:
+            raise ValueError(f"{c['shown']}: unreadable crosswalk: {e}") from e
+        if not rows or c["unit_id"] not in rows[0] or c["feature_id"] not in rows[0]:
+            raise ValueError(f"{c['shown']}: the crosswalk needs columns {c['unit_id']} and {c['feature_id']}")
+        xw = {str(r[c["unit_id"]]): str(r[c["feature_id"]]) for r in rows if r.get(c["feature_id"])}
+    units, unmatched, used = {}, [], set()
+    for i in unit_ids:
+        fid = xw.get(i) if xw is not None else i
+        if fid is not None and fid in by_fid:
+            units[i] = by_fid[fid]
+            used.add(fid)
+        else:
+            unmatched.append(i)
+    context = [r for fid, rs in by_fid.items() if fid not in used for r in rs]
+    # region outlines: polygon edges not shared with another unit of the same region
+    seg_n = {}
+    for i, rings in units.items():
+        r = region_of(i)
+        for ring in rings:
+            q = np.round(ring, 5)
+            for a, b in zip(q[:-1], q[1:]):
+                key = (r, tuple(sorted([tuple(a), tuple(b)])))
+                seg_n[key] = seg_n.get(key, 0) + 1
+    outline = [list(k[1]) for k, n in seg_n.items() if n == 1]
+    return {"units": units, "context": context, "unmatched": unmatched, "outline": outline,
+            "features": len(feats), "context_features": sum(1 for fid in by_fid if fid not in used)}
+
+
+def _map_extra(R, layout: str) -> dict:
+    """What a unit-layout figure records: its layout and, on boundaries, the unmatched units, the credit and the
+    context features (a note the renderer appends to the caption untruncated)."""
+    if layout != "boundaries":
+        return {"layout": layout}
+    B, cfg = R.geo, R.pres["boundaries"]
+    um = B["unmatched"]
+    note = (f" Not on the map (no boundary): {', '.join(um[:12])}" + (f" and {len(um) - 12} more" if len(um) > 12
+                                                                      else "") + "." if um else "")
+    return {"layout": "boundaries", "unmatched": list(um), "credit": cfg.get("credit"),
+            "context_features": B["context_features"], "caption_note": note}
 
 
 def fig_headline(R, t):
@@ -342,7 +1192,7 @@ def fig_allocation(R, t):
         nrow = math.ceil(len(comps) / ncol)
         ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
         fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 0.75)
-        gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.02,
+        gs = fig.add_gridspec(nrow, ncol, left=0.02 if layout == "boundaries" else 0.12, right=0.995, top=_top(fig, 0.75), bottom=0.02,
                               hspace=0.22, wspace=0.04)
         cnt = {}
         for n, c in enumerate(comps):
@@ -360,7 +1210,7 @@ def fig_allocation(R, t):
     cap = (f"Recommended package per unit ({how}; within a row, ordered by {ordered_by})"
            + (". Filled dot: the unit gets the component" if mode.startswith("small") else "")
            + (f". Ids: {'; '.join(defs)}" if defs else "") + ".")
-    return fig, title, cap, rows, f"where each package goes ({mode})"
+    return fig, title, cap, rows, f"where each package goes ({mode})", _map_extra(R, layout)
 
 
 def _binned(t, vals, edges, fmtk):
@@ -400,7 +1250,8 @@ def fig_stability(R, t):
     ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
     fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 1.25)
     h = fig.get_figheight()
-    gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.55 / h, hspace=0.22,
+    gs = fig.add_gridspec(nrow, ncol, left=0.02 if layout == "boundaries" else 0.12, right=0.995, top=_top(fig, 0.75),
+                          bottom=0.55 / h, hspace=0.22,
                           wspace=0.06)
     for n, (key, name, vals) in enumerate(panels):
         ax = fig.add_subplot(gs[n // ncol, n % ncol])
@@ -421,7 +1272,7 @@ def fig_stability(R, t):
            f"panel) and each component's yes/no; {how}, ordered by {ordered_by}.")
     rows = [{"unit": i, "region": R.region(i), "package": plan[i], "share_keeping_package": share[i],
              **{f"share_keeping_{c}": comp_keep[c][i] for c in comps}} for i in order]
-    return fig, title, cap, rows, "assignment stability over the uncertainty draws (package and components)"
+    return fig, title, cap, rows, "assignment stability over the uncertainty draws (package and components)", _map_extra(R, layout)
 
 
 def fig_burden(R, t):
@@ -454,7 +1305,7 @@ def fig_burden(R, t):
            f"{how}, ordered by {ordered_by}.")
     rows = [{"unit": i, "region": R.region(i), f"{R.primary}_{per.replace(' ', '_').replace(',', '')}": v[i]}
             for i in order]
-    return fig, title, cap, rows, "comparator burden per person"
+    return fig, title, cap, rows, "comparator burden per person", _map_extra(R, layout)
 
 
 def fig_calibration(R, t):
@@ -464,76 +1315,111 @@ def fig_calibration(R, t):
     method = cal.get("method", cs.get("method"))
     if method == "none":
         raise Missing("the spec has no calibration (method none)")
-    fig = _fig(t, 7.8, 4.6)
-    h = fig.get_figheight()
-    a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
-    a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
-    FS.style(a1, t, grid="both")
-    FS.style(a2, t, grid="x")
     rows = []
     lg = lambda p: np.log(p / (1 - p))  # noqa: E731
     il = lambda x: 1 / (1 + np.exp(-x))  # noqa: E731
     regs = R.regions()
     RT = R.labels.region_title()
+    diag = cal.get("diagnostics") or {}
+    n_cl = int(diag.get("clamped_units") or 0)
     if method == "emulator_inversion":
         tc = cs["target_column"]
         tgt = {i: float(R.by_id[i][tc]) for i in R.ids}
         fd = R.opt("figure_data") or {}
         mod_src = ((fd.get("calibration") or {}).get("units")) or {}
-        resid_max = float((cal.get("diagnostics") or {}).get("target_logit_residual_max") or 0.0)
-        modelled = {i: float(mod_src[i]["modelled"]) if i in mod_src else None for i in R.ids}
-        have_mod = all(v is not None for v in modelled.values())
+        have_mod = all(i in mod_src and mod_src[i].get("modelled") is not None for i in R.ids)
         sd = float((cs.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
-        acc = (R.opt("emulator") or {}).get("accuracy") or {}
-        e_rmse = acc.get("cal_logit_rmse")
-        x = np.array([tgt[i] for i in R.ids])
-        y = np.array([modelled[i] if have_mod else tgt[i] for i in R.ids])
-        m = float(max(x.max(), y.max())) * 1.06
-        gx = np.linspace(max(m / 400, 1e-4), m, 200)
-        if e_rmse:
-            a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
-                            zorder=0, label="emulator held-out error (95%)")
-        a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8, zorder=2)
-        a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
-        a1.set_xlim(0, m)
-        a1.set_ylim(0, m)
-        FS.set_axis_format(a1, "x", "percent")
-        FS.set_axis_format(a1, "y", "percent")
+        e_rmse = ((R.opt("emulator") or {}).get("accuracy") or {}).get("cal_logit_rmse")
         metric = R.labels.metric(cs.get("metric", "metric"))
-        a1.set_xlabel(f"target {metric}", fontsize=8)
-        a1.set_ylabel("model at the fitted attribute", fontsize=8)
-        if e_rmse:
-            a1.legend(loc="upper left", fontsize=7)
-        # right: targets by region with the region-level target interval (common-mode error on the logit scale)
-        for yv, r in enumerate(regs[::-1]):
-            v = np.array([tgt[i] for i in R.ids if R.region(i) == r])
-            if sd > 0 and len(v):
-                c = float(np.mean(lg(np.clip(v, 1e-6, 1 - 1e-6))))
-                a2.plot([il(c - 1.96 * sd), il(c + 1.96 * sd)], [yv, yv], color=t["cat"][1], lw=5, alpha=0.35,
-                        solid_capstyle="round", zorder=1)
-            a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4, zorder=3)
-        a2.set_yticks(range(len(regs)))
-        a2.set_yticklabels(regs[::-1], fontsize=7.5)
-        a2.set_xlim(0, m)
-        FS.set_axis_format(a2, "x", "percent")
-        a2.set_xlabel(f"target {metric} per unit; bar: {RT.lower()} interval (95%)" if sd > 0 else
-                      f"target {metric} per unit", fontsize=8)
-        res = {i: (float(lg(np.clip(modelled[i], 1e-9, 1 - 1e-9)) - lg(np.clip(tgt[i], 1e-9, 1 - 1e-9)))
-                   if have_mod else None) for i in R.ids}
-        worst = max(abs(v) for v in res.values()) if have_mod else resid_max
-        for i in R.ids:
-            rows.append({"unit": i, "region": R.region(i), "target": tgt[i], "modelled": modelled[i],
-                         "residual_logit": res[i]})
-        title = f"Inversion reproduces all {len(R.ids)} targets exactly; the uncertainty is in the targets"
-        cap = (f"Left: target against model, 1:1 line"
-               + (f"; band: emulator held-out error ({FS.fmt(e_rmse)} logit RMSE)" if e_rmse else "")
-               + f". Right: targets by {RT.lower()}" + (f", bar: {RT.lower()} target interval (sd {FS.fmt(sd)} "
-                                                       f"logit)" if sd > 0 else "")
-               + f". All residuals within {worst:.1g} logit.")
+        m = max(tgt.values()) * 1.06
+
+        def targets_panel(ax):
+            for yv, r in enumerate(regs[::-1]):
+                v = np.array([tgt[i] for i in R.ids if R.region(i) == r])
+                if sd > 0 and len(v):
+                    lo = float(np.mean(il(lg(np.clip(v, 1e-6, 1 - 1e-6)) - 1.96 * sd)))
+                    hi = float(np.mean(il(lg(np.clip(v, 1e-6, 1 - 1e-6)) + 1.96 * sd)))
+                    ax.plot([lo, hi], [yv, yv], color=t["cat"][1], lw=5, alpha=0.35, solid_capstyle="round", zorder=1)
+                ax.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4,
+                           zorder=3)
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1], fontsize=7.5)
+            ax.set_xlim(0, m)
+            FS.set_axis_format(ax, "x", "percent")
+            ax.set_xlabel(f"target {metric} per unit" + (f"; bar: shift of the {RT.lower()}'s targets by its 95% "
+                                                         "common-mode error" if sd > 0 else ""), fontsize=8)
+        if have_mod:
+            mod = {i: float(mod_src[i]["modelled"]) for i in R.ids}
+            res = {i: float(lg(np.clip(mod[i], 1e-9, 1 - 1e-9)) - lg(np.clip(tgt[i], 1e-9, 1 - 1e-9))) for i in R.ids}
+            fig = _fig(t, 7.8, 4.6)
+            h = fig.get_figheight()
+            a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
+            a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
+            FS.style(a1, t, grid="both")
+            FS.style(a2, t, grid="x")
+            x = np.array([tgt[i] for i in R.ids])
+            y = np.array([mod[i] for i in R.ids])
+            m = float(max(x.max(), y.max())) * 1.06
+            gx = np.linspace(max(m / 400, 1e-4), m, 200)
+            if e_rmse:
+                a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
+                                zorder=0, label="emulator held-out error (95%)")
+                a1.legend(loc="upper left", fontsize=7)
+            a1.plot([0, m], [0, m], color=t["ink2"], lw=0.8, zorder=2)
+            a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
+            a1.set_xlim(0, m)
+            a1.set_ylim(0, m)
+            FS.set_axis_format(a1, "x", "percent")
+            FS.set_axis_format(a1, "y", "percent")
+            a1.set_xlabel(f"target {metric}", fontsize=8)
+            a1.set_ylabel("model at the fitted attribute", fontsize=8)
+            if sd > 0:
+                a2.axvspan(-1.96 * sd, 1.96 * sd, color=t["band"], lw=0, zorder=0)
+            for yv, r in enumerate(regs[::-1]):
+                v = [res[i] for i in R.ids if R.region(i) == r]
+                a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.4,
+                           zorder=3)
+            a2.axvline(0, color=t["ink2"], lw=0.8)
+            a2.set_yticks(range(len(regs)))
+            a2.set_yticklabels(regs[::-1], fontsize=7.5)
+            lim = max(1.96 * sd * 1.2, max(abs(v) for v in res.values()) * 1.2, 0.05)
+            a2.set_xlim(-lim, lim)
+            FS.set_axis_format(a2, "x", "signed")
+            a2.set_xlabel("model minus target, logit scale" + (" (band: 95% target error)" if sd > 0 else ""),
+                          fontsize=8)
+            worst = max(abs(v) for v in res.values())
+            title = (f"Calibration: largest residual {worst:.2g} logit over {len(R.ids)} targets"
+                     + (f"; {n_cl} clamped at the attribute range" if n_cl else "; none clamped"))
+            cap = (f"Left: target {metric} against the model at each unit's fitted attribute, 1:1 line"
+                   + (f"; band: emulator held-out error ({FS.fmt(e_rmse)} logit RMSE)" if e_rmse else "")
+                   + f". Right: residuals by {RT.lower()}" + (f"; band: target error (sd {FS.fmt(sd)} logit)." if sd > 0
+                                                              else "."))
+            panels = ["fit", "residuals"]
+            rows = [{"unit": i, "region": R.region(i), "target": tgt[i], "modelled": mod[i], "residual_logit": res[i]}
+                    for i in R.ids]
+        else:
+            fig = _fig(t, 7.8, 0.28 * len(regs) + 1.4)
+            h = fig.get_figheight()
+            ax = fig.add_axes([0.2, 0.6 / h, 0.76, _top(fig, 0.6) - 0.6 / h])
+            FS.style(ax, t, grid="x")
+            targets_panel(ax)
+            rmax = diag.get("target_logit_residual_max")
+            title = f"Calibration targets by {RT.lower()} with their error; per-unit model values not stored"
+            cap = (f"Target {metric} per unit by {RT.lower()}. The fit panel is withheld: this run did not store the "
+                   f"model's value per unit" + (f"; its recorded largest residual is {rmax:.1g} logit" if rmax is not None
+                                                else "") + (f"; {n_cl} units clamped." if n_cl else "."))
+            panels = ["targets"]
+            rows = [{"unit": i, "region": R.region(i), "target": tgt[i]} for i in R.ids]
     else:
-        fit = (cal.get("diagnostics") or {}).get("fit") or []
+        fit = diag.get("fit") or []
         if not fit:
             raise Missing(f"calibration method {method} recorded no fit rows")
+        fig = _fig(t, 7.8, 4.6)
+        h = fig.get_figheight()
+        a1 = fig.add_axes([0.085, 0.6 / h, 0.37, _top(fig, 0.95) - 0.6 / h])
+        a2 = fig.add_axes([0.62, 0.6 / h, 0.36, _top(fig, 0.95) - 0.6 / h])
+        FS.style(a1, t, grid="both")
+        FS.style(a2, t, grid="x")
         x = np.array([float(r["observed"]) for r in fit])
         y = np.array([float(r["expected"]) for r in fit])
         a1.scatter(x, y, s=12, color=t["cat"][0], edgecolors=t["surface"], linewidths=0.5, zorder=3)
@@ -560,15 +1446,16 @@ def fig_calibration(R, t):
         title = f"{len(fit)} calibration targets; {out2} Pearson residuals beyond ±2"
         cap = (f"Calibration ({method}): observed against model expected, 1:1 line; right, Pearson residuals by "
                f"{RT.lower()}.")
-    return fig, title, cap, rows, "calibration fit"
+        panels = ["fit", "residuals"]
+    return fig, title, cap, rows, "calibration fit", {"panels": panels}
 
 
 def fig_frontier(R, t):
     fd = R.art("figure_data")
     fr = fd["frontier"]
-    pts = fr["points"]
-    if len(pts) < 2:
-        raise Missing("the frontier has fewer than two envelopes")
+    xs, ys = _frontier_xy(fr, R.primary)
+    if len(xs) < 2:
+        raise Missing("the frontier has fewer than two solved envelopes")
     pt = R.art("point")
     olab = R.labels.outcome(R.primary)
     fig = _fig(t, 7.2, 4.2)
@@ -576,10 +1463,8 @@ def fig_frontier(R, t):
     ax = fig.add_axes([0.1, 0.55 / h, 0.86, _top(fig, 0.6) - 0.55 / h])
     FS.style(ax, t, grid="both")
     fixed = float(fr.get("fixed_costs_usd") or 0.0)
-    xs = [fixed] + [p["envelope_usd"] for p in pts]
-    ys = [0.0] + [p["objective"] for p in pts]
     ax.plot(xs, ys, color=t["cat"][0], lw=2, zorder=2)
-    ax.scatter(xs[1:], ys[1:], s=22, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+    ax.scatter(xs, ys, s=22, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
     env = fr["envelope_usd"]
     ax.axvline(env, color=t["muted"], lw=0.9, zorder=1)
     ax.text(env, 1.0, " declared envelope", transform=ax.get_xaxis_transform(), va="top", fontsize=7.5,
@@ -588,28 +1473,39 @@ def fig_frontier(R, t):
         ax.axvspan(0, fixed, color=t["band"], lw=0, zorder=0)
         ax.text(fixed / 2, 0.03, f"fixed\n{FS.fmt(fixed, 'money')}", transform=ax.get_xaxis_transform(),
                 ha="center", fontsize=7, color=t["ink2"])
-    obj = float(pt["solver"]["objective"])
-    ax.scatter([env], [obj], s=70, color=t["cat"][1], edgecolors=t["surface"], linewidths=1.8, zorder=4)
-    ax.annotate(f"plan: {FS.fmt(obj)} {olab}", (env, obj), xytext=(8, -16), textcoords="offset points",
+    got = float(pt["averted"][R.primary])
+    ax.scatter([env], [got], s=70, color=t["cat"][1], edgecolors=t["surface"], linewidths=1.8, zorder=4)
+    ax.annotate(f"plan: {FS.fmt(got)} {olab}", (env, got), xytext=(8, -16), textcoords="offset points",
                 fontsize=8, color=t["ink"])
-    ax.set_xlim(0, max(xs) * 1.04)
-    ax.set_ylim(0, max(ys) * 1.1)
+    ax.set_xlim(0, max(xs + [env]) * 1.04)
+    ax.set_ylim(0, max(ys + [got]) * 1.1)
     FS.set_axis_format(ax, "x", "money")
     FS.set_axis_format(ax, "y")
     ax.set_xlabel("envelope (fixed costs included)", fontsize=8)
-    ax.set_ylabel(f"{olab} averted", fontsize=8)
+    dfac = float(fr.get("discount_factor") or 1.0)
+    ax.set_ylabel(f"{olab} averted" + (" (undiscounted)" if abs(dfac - 1) > 1e-12 else ""), fontsize=8)
     mg = fr.get("marginal") or {}
-    avg = pt["cost_allocated"] / max(float(pt["averted"][R.primary]), 1e-12)
+    avg = pt["cost_allocated"] / max(got, 1e-12)
     if mg.get("usd_per_outcome"):
         title = (f"At the envelope, the next {_sing(olab)} averted costs {FS.fmt(mg['usd_per_outcome'], 'money')} "
                  f"(average {FS.fmt(avg, 'money')}, fixed costs excluded)")
     else:
-        title = f"{olab} averted rises from {FS.fmt(ys[1])} to {FS.fmt(ys[-1])} across the envelopes tested"
-    cap = (f"The plan re-solved by the run's own solver and emulator at {min(p['fraction'] for p in pts):.0%}–"
-           f"{max(p['fraction'] for p in pts):.0%} of the declared envelope, fixed costs held. Marginal cost: "
-           f"central difference over 90–110% of the envelope.")
-    rows = [{"fraction": p["fraction"], "envelope_usd": p["envelope_usd"], "objective": p["objective"],
-             "cost": p["cost"], **{f"units_{k}": v for k, v in (p.get("packages") or {}).items()}} for p in pts]
+        title = f"{olab} averted rises from {FS.fmt(ys[0])} to {FS.fmt(ys[-1])} across the envelopes solved"
+    notes = []
+    if fr.get("infeasible"):
+        notes.append("infeasible at " + ", ".join(f"{x['fraction']:.0%}" for x in fr["infeasible"]))
+    if fr.get("excluded"):
+        notes.append("left out (model corrections bear on the plan) at "
+                     + ", ".join(f"{x['fraction']:.0%}" for x in fr["excluded"]))
+    if fr.get("skipped"):
+        notes.append("below the fixed costs at " + ", ".join(f"{x['fraction']:.0%}" for x in fr["skipped"]))
+    cap = (f"The plan re-solved by the run's own solver and emulator at fractions of the declared envelope, fixed costs "
+           f"held; marginal over 90–110%." + (f" Not drawn: {'; '.join(notes)}." if notes else ""))
+    rows = [{"fraction": p["fraction"], "envelope_usd": p["envelope_usd"], "averted": p["averted"][R.primary],
+             "objective": p["objective"], "cost": p["cost"],
+             **{f"units_{k}": v for k, v in (p.get("packages") or {}).items()}} for p in fr["points"]]
+    rows += [{"fraction": x["fraction"], "status": k} for k in ("infeasible", "excluded", "skipped")
+             for x in fr.get(k) or []]
     if mg:
         rows.append({"marginal_usd_per_outcome": mg.get("usd_per_outcome"), "average_usd_per_outcome": avg})
     return fig, title, cap, rows, "efficiency frontier: outcome averted against budget"
@@ -618,14 +1514,16 @@ def fig_frontier(R, t):
 def fig_dollars(R, t):
     dl = R.art("figure_data")["dollars"]
     col = _comp_colors(R, t)
-    comps = [c for c in col if dl["by_component"].get(c, 0) > 0]
-    fixed = sum(dl["fixed_costs_usd"].values())
-    env = dl["envelope_usd"]
-    tot = dl["allocated_usd"]
-    regs = sorted(dl["by_region"], key=lambda r: -sum(dl["by_region"][r].values()))
+    bc = dl.get("by_component") or {}
+    comps = [c for c in list(R.components) + [c for c in bc if c not in R.components] if bc.get(c, 0) > 0]
+    fixed = sum((dl.get("fixed_costs_usd") or {}).values())
+    env = float(dl["envelope_usd"])
+    tot = float(dl.get("allocated_usd") or sum(bc.values()))
+    unspent = max(env - fixed - tot, 0.0)
+    regs = sorted(dl.get("by_region") or {}, key=lambda r: -sum(dl["by_region"][r].values()))
     RT = R.labels.region_title()
     ncol = len(comps) + 1
-    fig = _fig(t, 7.9, 0.26 * len(regs) + 3.1)
+    fig = _fig(t, 7.9, (0.26 * len(regs) + 3.1) if comps else 2.2)
     h = fig.get_figheight()
     top = _top(fig, 0.45)
     a1 = fig.add_axes([0.17, top - 0.42 / h, 0.8, 0.38 / h])
@@ -637,9 +1535,14 @@ def fig_dollars(R, t):
                 color=t["ink"])
         left = fixed
     for c in comps:
-        v = dl["by_component"][c]
-        a1.barh(0, v, left=left, height=0.8, color=col[c], edgecolor=t["surface"], linewidth=2)
+        v = bc[c]
+        a1.barh(0, v, left=left, height=0.8, color=col.get(c, t["ink2"]), edgecolor=t["surface"], linewidth=2)
         left += v
+    if unspent > 0:
+        a1.barh(0, unspent, left=left, height=0.8, color=t["surface"], edgecolor=t["axis"], linewidth=1)
+        if unspent > 0.06 * env:                     # label only a segment wide enough for it (else: the table)
+            a1.text(left + unspent / 2, 0, f"unspent {FS.fmt(unspent, 'money')}", ha="center", va="center",
+                    fontsize=7, color=t["ink2"])
     a1.axvline(env, color=t["ink"], lw=1.2)
     a1.text(env, 0.75, f"envelope {FS.fmt(env, 'money')} ", ha="right", va="bottom", fontsize=7.5, color=t["ink"],
             transform=a1.get_xaxis_transform())
@@ -649,81 +1552,108 @@ def fig_dollars(R, t):
     a1.set_xlim(0, max(env, left) * 1.01)
     FS.set_axis_format(a1, "x", "money")
     import matplotlib.patches as mp
-    fig.legend(handles=[mp.Patch(color=col[c], label=f"{R.labels.component(c)} {FS.fmt(dl['by_component'][c], 'money')}")
-                        for c in comps], loc="upper left", bbox_to_anchor=(0.17, top - 0.72 / h),
-               ncol=min(3, len(comps)), fontsize=7.5)
-    # region x component: a table of bars, one column per component, the same x scale in every column
-    gs = fig.add_gridspec(1, ncol, left=0.17, right=0.97, top=top - 1.75 / h, bottom=0.35 / h, wspace=0.12)
-    vmax = max(max(dl["by_region"][r].get(c, 0.0) for r in regs) for c in comps)
-    rows = []
-    for k, c in enumerate(comps + ["__total"]):
-        ax = fig.add_subplot(gs[0, k])
-        FS.style(ax, t, grid="x")
-        if c == "__total":
-            vals = [sum(dl["by_region"][r].values()) for r in regs]
-            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=t["ink2"])
-            ax.set_xlim(0, max(vals) * 1.15)
-            ax.set_title("all components", fontsize=8, loc="left", color=t["ink"])
-        else:
-            vals = [dl["by_region"][r].get(c, 0.0) for r in regs]
-            ax.barh(range(len(regs))[::-1], vals, height=0.62, color=col[c])
-            ax.set_xlim(0, vmax * 1.1)
-            ax.set_title(textwrap.fill(R.labels.component(c), 16), fontsize=8, loc="left", color=t["ink"])
-        ax.set_yticks(range(len(regs)))
-        ax.set_yticklabels(regs[::-1] if k == 0 else [], fontsize=7.5)
-        ax.set_ylim(-0.6, len(regs) - 0.4)
-        FS.set_axis_format(ax, "x", "money")
-        ax.locator_params(axis="x", nbins=2)
-        ax.tick_params(labelsize=6.5)
-    title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
-             f"{R.labels.component(max(comps, key=lambda c: dl['by_component'][c]))} take "
-             f"{FS.fmt(max(dl['by_component'][c] for c in comps) / tot, 'percent')} of allocated dollars")
-    cap = (f"Top: the envelope split into fixed costs and the plan's dollars by component. Bottom: allocated dollars by "
-           f"{RT.lower()} and component (same scale per component column; fixed costs not split by {RT.lower()}).")
-    rows = [{"region": r, **{c: dl["by_region"][r].get(c, 0.0) for c in R.components}} for r in regs] + \
-        [{"region": "ALL", **dl["by_component"], "fixed": fixed, "envelope": env}]
+    if comps:
+        fig.legend(handles=[mp.Patch(color=col.get(c, t["ink2"]),
+                                     label=f"{R.labels.component(c)} {FS.fmt(bc[c], 'money')}") for c in comps],
+                   loc="upper left", bbox_to_anchor=(0.17, top - 0.72 / h), ncol=min(3, len(comps)), fontsize=7.5)
+        gs = fig.add_gridspec(1, ncol, left=0.17, right=0.97, top=top - 1.75 / h, bottom=0.35 / h, wspace=0.12)
+        vmax = max(max(dl["by_region"][r].get(c, 0.0) for r in regs) for c in comps) if regs else 1.0
+        for k, c in enumerate(comps + ["__total"]):
+            ax = fig.add_subplot(gs[0, k])
+            FS.style(ax, t, grid="x")
+            if c == "__total":
+                vals = [sum(dl["by_region"][r].values()) for r in regs]
+                ax.barh(range(len(regs))[::-1], vals, height=0.62, color=t["ink2"])
+                ax.set_xlim(0, max(vals + [1e-9]) * 1.15)
+                ax.set_title("all components", fontsize=8, loc="left", color=t["ink"])
+            else:
+                vals = [dl["by_region"][r].get(c, 0.0) for r in regs]
+                ax.barh(range(len(regs))[::-1], vals, height=0.62, color=col.get(c, t["ink2"]))
+                ax.set_xlim(0, max(vmax, 1e-9) * 1.1)
+                ax.set_title(textwrap.fill(R.labels.component(c), 16), fontsize=8, loc="left", color=t["ink"])
+            ax.set_yticks(range(len(regs)))
+            ax.set_yticklabels(regs[::-1] if k == 0 else [], fontsize=7.5)
+            ax.set_ylim(-0.6, len(regs) - 0.4)
+            FS.set_axis_format(ax, "x", "money")
+            ax.locator_params(axis="x", nbins=2)
+            ax.tick_params(labelsize=6.5)
+        topc = max(comps, key=lambda c: bc[c])
+        title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
+                 f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+        if unspent > 0.005 * env:
+            title = (f"{FS.fmt(unspent, 'money')} of the {FS.fmt(env, 'money')} envelope is unspent; "
+                     f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+    else:
+        title = (f"The plan spends nothing beyond fixed costs: {FS.fmt(fixed, 'money')} fixed, "
+                 f"{FS.fmt(unspent, 'money')} unspent of {FS.fmt(env, 'money')}")
+    cap = (f"Top: the envelope split into fixed costs, the plan's dollars by component and any unspent funds. Bottom: "
+           f"allocated dollars by {RT.lower()} and component (same scale per component column; fixed costs not split)."
+           if comps else "The envelope split into fixed costs and unspent funds; the plan allocates nothing.")
+    rows = [{"region": r, **{c: dl["by_region"][r].get(c, 0.0) for c in comps or R.components}} for r in regs] + \
+        [{"region": "ALL", **{c: bc.get(c, 0.0) for c in comps or R.components}, "fixed": fixed, "unspent": unspent,
+          "envelope": env}]
     return fig, title, cap, rows, "dollars by component and region against the envelope"
 
 
 def fig_cost_per_outcome(R, t):
     fd = R.art("figure_data")
-    bp = {k: v for k, v in fd["by_package"].items() if k != R.comparator and v.get("usd_per_outcome")}
-    if not bp:
-        raise Missing("no package in the plan averts any outcome")
     olab = R.labels.outcome(R.primary)
     U = R.labels.unit_title()
-    order = sorted(bp, key=lambda k: bp[k]["usd_per_outcome"])
+    allp = {k: v for k, v in fd["by_package"].items() if k != R.comparator}
+
+    def status(v):
+        if v.get("averted", 0) < 0:
+            return "harmful"
+        if not v.get("averted"):
+            return "undefined"
+        return "free" if float(v.get("cost") or 0) <= 0 else "cost"
+    st = {k: status(v) for k, v in allp.items()}
+    shown = sorted([k for k in allp if st[k] in ("cost", "free")], key=lambda k: allp[k]["cost"] / allp[k]["averted"])
+    other = [k for k in allp if st[k] not in ("cost", "free")]
+    if not shown and not other:
+        raise Missing("the plan gives no unit a package")
+    rep = fd.get("replay") or {}
+    lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
     inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
-    npk, nin = len(order), len(inc)
-    fig = _fig(t, 7.6, 0.3 * (npk + nin) + 2.2)
+    nrow = len(shown) + len(other)
+    fig = _fig(t, 7.6, 0.3 * (nrow + len(inc)) + 2.2)
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h
-    h1 = avail * (npk + 0.6) / (npk + nin + 1.2)
+    h1 = avail * (nrow + 0.6) / (nrow + len(inc) + 1.2)
     a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
     FS.style(a1, t, grid="x")
-    vals = []
-    have_ci = False
+    vals, have_ci, withheld = [1e-9], False, []
+    order = shown + other
     for y, k in enumerate(order[::-1]):
-        v = bp[k]
-        ci = v.get("usd_per_outcome_interval")
-        if ci:
-            have_ci = True
-            a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round", zorder=2)
-            vals += [ci["ci_low"], ci["ci_high"]]
-        a1.scatter([v["usd_per_outcome"]], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2,
-                   zorder=3)
-        vals.append(v["usd_per_outcome"])
+        v = allp[k]
+        if st[k] in ("cost", "free"):
+            x = v["cost"] / v["averted"]
+            ci = v.get("usd_per_outcome_interval")
+            if ci:
+                have_ci = True
+                a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round",
+                        zorder=2)
+                vals += [ci["ci_low"], ci["ci_high"]]
+            elif v.get("interval_withheld"):
+                withheld.append((k, v["interval_withheld"]))
+            a1.scatter([x], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
+            if st[k] == "free":
+                a1.text(x, y, "  free", va="center", fontsize=7, color=t["ink2"])
+            vals.append(x)
+        else:
+            msg = (f"harms: {FS.fmt(-v['averted'])} more {olab}" if st[k] == "harmful" else f"no {olab} averted")
+            a1.text(0, y, " " + msg, va="center", fontsize=7.5, color=t["ink2"])
         a1.text(1.02, y, f"{v['units']}", transform=a1.get_yaxis_transform(), va="center", fontsize=7.5,
                 color=t["ink2"])
-    a1.text(1.02, npk - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
-    a1.set_yticks(range(npk))
+    a1.text(1.02, nrow - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
+    a1.set_yticks(range(nrow))
     a1.set_yticklabels([R.labels.package(R.pk[k]) for k in order[::-1]], fontsize=7.5)
     a1.set_xlim(0, max(vals) * 1.08)
-    a1.set_ylim(-0.6, npk - 0.4)
+    a1.set_ylim(-0.6, nrow - 0.4)
     FS.set_axis_format(a1, "x", "money")
-    a1.set_title(f"$ per {_sing(olab)} averted, by package" + (" (line: 95% UI)" if have_ci else ""), fontsize=8.5,
-                 loc="left", color=t["ink"])
+    a1.set_title(f"$ per {_sing(olab)} averted, by package" + (f" (line: {lvl:.0%} UI)" if have_ci else ""),
+                 fontsize=8.5, loc="left", color=t["ink"])
     if inc:
         h2 = avail - h1 - 0.5 / h
         a2 = fig.add_axes([0.38, 0.55 / h, 0.5, h2])
@@ -742,29 +1672,31 @@ def fig_cost_per_outcome(R, t):
         FS.set_axis_format(a2, "x", "money")
         a2.set_title(f"$ per {_sing(olab)} averted by adding each component (point estimate)", fontsize=8.5,
                      loc="left", color=t["ink"])
-    lo, hi = order[0], order[-1]
-    title = (f"Cost per {_sing(olab)} averted: {FS.fmt(bp[lo]['usd_per_outcome'], 'money')} to "
-             f"{FS.fmt(bp[hi]['usd_per_outcome'], 'money')} across the plan's {npk} packages")
-    rep = fd.get("replay") or {}
-    cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the interval over the "
-           f"uncertainty draws{'' if rep.get('reproduced') else ' (withheld: the replay did not reproduce)'}. "
-           f"Bottom: each component against the same package without it, in the {U} that get it.")
-    rows = [{"package": k, "label": R.labels.package(R.pk[k]), **{x: bp[k].get(x) for x in
-            ("units", "cost", "averted", "usd_per_outcome")},
-             "ci_low": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_low"),
-             "ci_high": (bp[k].get("usd_per_outcome_interval") or {}).get("ci_high")} for k in order] + \
+    if shown:
+        lo, hi = shown[0], shown[-1]
+        title = (f"Cost per {_sing(olab)} averted: {FS.fmt(allp[lo]['cost'] / allp[lo]['averted'], 'money')} to "
+                 f"{FS.fmt(allp[hi]['cost'] / allp[hi]['averted'], 'money')} across {len(shown)} packages"
+                 + (f"; {len(other)} avert none" if other else ""))
+    else:
+        title = f"No package in the plan averts {olab}"
+    wh = ""
+    if withheld:
+        sh = [w.get("share_draws_nonpositive") for _k, w in withheld if w.get("share_draws_nonpositive") is not None]
+        wh = (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
+              + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
+    cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the {lvl:.0%} interval over "
+           f"the uncertainty draws.{wh} Bottom: each component against the same package without it.")
+    rows = [{"package": k, "label": R.labels.package(R.pk[k]), "status": st[k],
+             **{x: allp[k].get(x) for x in ("units", "cost", "averted", "usd_per_outcome")},
+             "ci_low": (allp[k].get("usd_per_outcome_interval") or {}).get("ci_low"),
+             "ci_high": (allp[k].get("usd_per_outcome_interval") or {}).get("ci_high"),
+             "interval_withheld": (allp[k].get("interval_withheld") or {}).get("reason"),
+             "share_draws_nonpositive": (allp[k].get("interval_withheld") or {}).get("share_draws_nonpositive")}
+            for k in order] + \
         [{"component": c, "label": R.labels.component(c), "usd_per_outcome_added": 1.0 / v["outcome_per_usd"],
-          "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart")} for c, v in inc.items()]
+          "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart"),
+          "units_with_corrections": v.get("units_with_corrections")} for c, v in inc.items()]
     return fig, title, cap, rows, "cost per outcome averted by package and by component"
-
-
-def _threshold(dts) -> float:
-    for x in dts or []:
-        if x.get("threshold_pct") is not None:
-            return float(x["threshold_pct"]) / 100.0
-    import yaml
-    return float(yaml.safe_load(open(os.path.join(ROOT, "toolkit", "analysis", "thresholds.yaml")))
-                 ["decision_tests"]["share_threshold"])
 
 
 def fig_sensitivity(R, t):
@@ -775,32 +1707,39 @@ def fig_sensitivity(R, t):
     base = float(se["objective_point"])
     dts = (R.opt("decision_tests") or {}).get("tests") or []
     by_test = {x["test_id"]: x for x in dts}
-    thr = _threshold(dts)
+    spec_thr, spec_src = _spec_threshold(R)
     out = []
     for r in rows_in:
         lo, hi = r["low"]["point_plan_objective"] - base, r["high"]["point_plan_objective"] - base
         tst = by_test.get(f"prior_range_{r['name']}")
-        share = max(float(r["low"].get("share_units_changed") or 0), float(r["high"].get("share_units_changed") or 0))
-        changes = (tst["verdict"] == "CHANGES_PLAN") if tst and tst.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE") \
-            else share > thr
+        if tst and tst.get("verdict") in ("CHANGES_PLAN", "NO_CHANGE") and tst.get("share_pct") is not None:
+            # one calculation: the prior-range decision test's verdict, share and threshold
+            share = float(tst["share_pct"]) / 100.0
+            thr = float(tst["threshold_pct"]) / 100.0 if tst.get("threshold_pct") is not None else spec_thr
+            changes, by = tst["verdict"] == "CHANGES_PLAN", f"decision test {tst['test_id']}"
+        else:
+            share = max(float(r["low"].get("share_units_changed") or 0), float(r["high"].get("share_units_changed")
+                                                                             or 0))
+            thr, changes, by = spec_thr, None, f"sensitivity re-optimisation ({spec_src})"
+            changes = share > thr
         out.append({"name": r["name"], "label": R.labels.parameter(r["name"]), "units": R.labels.parameter_units(r["name"]),
                     "point": r.get("point"), "low": r["low"]["value"], "high": r["high"]["value"], "d_low": lo,
-                    "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share,
-                    "basis": r.get("basis"), "by": "decision test " + tst["test_id"] if tst else "share of units"})
+                    "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share, "threshold": thr,
+                    "basis": r.get("basis"), "by": by})
     out.sort(key=lambda x: -max(abs(x["d_low"]), abs(x["d_high"])))
     out = out[:14]
     fig = _fig(t, 7.8, 0.46 * len(out) + 1.45)
     h = fig.get_figheight()
     ax = fig.add_axes([0.33, 0.85 / h, 0.45, _top(fig, 0.55) - 0.85 / h])
     FS.style(ax, t, grid="x")
+    U = R.labels.unit_title()
     for y, r in enumerate(out[::-1]):
         ax.barh(y + 0.17, r["d_low"], height=0.3, color=t["cat"][0], zorder=2)
         ax.barh(y - 0.17, r["d_high"], height=0.3, color=t["cat"][1], zorder=2)
         if r["changes_plan"]:
             ax.scatter([1.04], [y], marker="D", s=24, color=t["ink"], transform=ax.get_yaxis_transform(),
                        clip_on=False, zorder=4)
-            ax.text(1.075, y, f"changes the plan\n({FS.fmt(r['share_units_changed'], 'percent')} of "
-                              f"{R.labels.unit_title()})",
+            ax.text(1.075, y, f"changes the plan\n({FS.fmt(r['share_units_changed'], 'percent')} of {U})",
                     transform=ax.get_yaxis_transform(), va="center", fontsize=7, color=t["ink"], linespacing=1.1)
     ax.axvline(0, color=t["ink2"], lw=0.9, zorder=3)
     labels = []
@@ -813,7 +1752,9 @@ def fig_sensitivity(R, t):
     ax.set_xlim(-m, m)
     FS.set_axis_format(ax, "x", "signed")
     olab = R.labels.outcome(se.get("outcome") or R.primary)
-    ax.set_xlabel(f"change in the plan's {olab} averted", fontsize=8)
+    dfac = float((R.opt("point") or {}).get("discount_factor") or 1.0)
+    ax.set_xlabel(f"change in the plan's objective ({'discounted ' if abs(dfac - 1) > 1e-12 else ''}{olab} averted)",
+                  fontsize=8)
     import matplotlib.patches as mp
     fig.legend(handles=[mp.Patch(color=t["cat"][0], label="low end of the range"),
                         mp.Patch(color=t["cat"][1], label="high end of the range")],
@@ -822,9 +1763,11 @@ def fig_sensitivity(R, t):
     title = f"{k} of {len(out)} tested ranges change the plan; {out[0]['label']} moves {olab} averted most"
     if len(title) > TITLE_MAX:
         title = f"{k} of {len(out)} tested ranges change the plan"
+    thrs = sorted({r["threshold"] for r in out})
     cap = (f"One at a time, each parameter at the ends of its tested range; change in the point plan's objective "
-           f"(base {FS.fmt(base)}). Diamond: the re-optimised plan moves more than {FS.fmt(thr, 'percent')} of units "
-           f"(per its prior-range decision test where one exists).")
+           f"(base {FS.fmt(base)}). Diamond: more than "
+           + (f"{FS.fmt(thrs[0], 'percent')}" if len(thrs) == 1 else "the threshold")
+           + f" of {U} change package, per the prior-range decision test where one exists (table: share, threshold, source).")
     return fig, title, cap, out, "one-at-a-time sensitivity with plan changes marked"
 
 
@@ -890,12 +1833,11 @@ def fig_timeline(R, t):
 
 
 def fig_trajectories(R, t):
-    tr = R.opt("trajectories")
-    if not tr or tr.get("status") != "ok":
-        raise Missing("needs trajectory runs (python -m toolkit.analysis.trajectories run <run_dir>)"
-                      + (f": {tr.get('reason')}" if tr and tr.get("reason") else ""))
+    tr = _trajectories_current(R)
     ser = tr["series"]
     metrics = tr["metrics"]
+    sample = tr.get("sample") or {}
+    n_units = sum(len(v) for v in sample.values())
     panels = ["total"] + sorted(ser.get("regions") or {})
     ncol = 4
     nrow = math.ceil(len(panels) / ncol)
@@ -917,8 +1859,10 @@ def fig_trajectories(R, t):
             if tg.get("value") is not None:
                 ax.errorbar([tg["t"]], [tg["value"]], yerr=[[tg["value"] - tg["lo"]], [tg["hi"] - tg["value"]]],
                             fmt="o", color=t["ink"], ms=3.5, lw=1, capsize=0, zorder=4)
-            ax.set_title(("All sampled units" if p == "total" else p) + (f": {meta.get('label', m)}" if n == 0 else ""),
-                         fontsize=7.5, loc="left", color=t["ink"])
+            k_units = len(s.get("units") or [])
+            name = f"Purposive sample, {k_units} units" if p == "total" else f"{p}: {k_units} sampled units"
+            ax.set_title(name + (f" ({meta.get('label', m)})" if n == 0 else ""), fontsize=7.5, loc="left",
+                         color=t["ink"])
             FS.set_axis_format(ax, "y", "percent" if meta.get("units") == "share" else "number")
             ax.set_ylim(0, None)
             ax.tick_params(labelsize=6.5)
@@ -926,18 +1870,30 @@ def fig_trajectories(R, t):
                 rows.append({"metric": m, "panel": p, "t": s["t"][k], "comparator": s["arms"]["comparator"][m][k],
                              "plan": s["arms"]["plan"][m][k]})
     from matplotlib.lines import Line2D
+    lvl = next((s.get("target", {}).get("level") for s in [ser["total"]] if s.get("target")), None) or 0.95
     fig.legend(handles=[Line2D([0], [0], color=t["muted"], lw=1.4, label="comparator"),
                         Line2D([0], [0], color=t["cat"][0], lw=1.6, label="plan"),
-                        Line2D([0], [0], marker="o", ls="", color=t["ink"], label="target (interval)")],
+                        Line2D([0], [0], marker="o", ls="", color=t["ink"], label=f"target ({lvl:.0%} interval)")],
                loc="upper right", bbox_to_anchor=(0.99, 1 - 0.2 / fig.get_figheight()), ncol=3, fontsize=7.5)
-    title = (f"Modelled {' and '.join(tr['metric_info'].get(m, {}).get('label', m) for m in metrics)} over time: "
-             f"comparator and plan")
-    cap = (f"Population-weighted means over {len(tr['sample'])} sampled units ({tr.get('per_region')} per region, "
-           f"{tr.get('seeds')} seeds); shaded: delivery period {d0:g}–{d1:g}.")
-    return fig, title, cap, rows, "modelled trajectories by region"
+    title = (f"Modelled {' and '.join(tr['metric_info'].get(m, {}).get('label', m) for m in metrics)} in a purposive "
+             f"sample: comparator and plan")
+    cap = (f"A purposive sample of {n_units} units ({tr.get('per_region')} per region at the lowest, median and highest "
+           f"comparator burden; {tr.get('seeds')} seeds), population-weighted within the sample: not a regional "
+           f"estimate. Shaded: delivery period {d0:g}–{d1:g}.")
+    return fig, title, cap, rows, "modelled trajectories in a purposive sample (diagnostic)", \
+        {"checks": trajectory_checks(R, tr)}
 
 
-FUNCS = {"headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
+def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
+    """The frontier's plotted points: solved envelopes only, on outcome averted."""
+    pts = fr.get("points") or []
+    return [float(p["envelope_usd"]) for p in pts], [float(p["averted"][primary]) for p in pts]
+
+
+FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attributes, "parameters": fig_parameters,
+         "design_coverage": fig_design_coverage, "burn_in": fig_burn_in, "seasonality": fig_seasonality,
+         "stochastic_noise": fig_stochastic_noise, "decision_tests": fig_decision_tests, "comparison": fig_comparison,
+         "headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
          "burden_map": fig_burden, "calibration_fit": fig_calibration, "frontier": fig_frontier,
          "dollars": fig_dollars, "cost_per_outcome": fig_cost_per_outcome, "sensitivity": fig_sensitivity,
          "timeline": fig_timeline, "trajectories": fig_trajectories}
@@ -950,7 +1906,7 @@ def _offset_free(fig) -> bool:
                for a in fig.axes)
 
 
-def _save(fig, out_dir, name, run_dir, sources, harness: bool, t) -> dict:
+def _save(fig, out_dir, name, run_dir, sources, harness: bool, t, presentation=None) -> dict:
     import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
     png = os.path.join(out_dir, f"{name}.png")
@@ -968,6 +1924,7 @@ def _save(fig, out_dir, name, run_dir, sources, harness: bool, t) -> dict:
               source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
     if not harness:
         sc["run_dir"] = run_dir
+    sc["presentation"] = list(presentation or [])        # the unsigned labels/boundaries files used, with their sha
     with open(sp, "w") as f:
         json.dump(sc, f, indent=2, sort_keys=True)
     return {"png": png, "svg": svg}
@@ -991,30 +1948,50 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         R = RunData(run_dir, labels_overlay, figure_data, trajectories)
     except Missing as e:
         return {"figures": [], "not_produced": [{"figure": n, "reason": str(e)} for n in ORDER]}
-    for name in only or ORDER:
+    tiers = tiers_for(R.spec)
+    names = [n for k in ("data_model", "simulation", "decision") for n in tiers[k]]
+    if not tiers["decision"] and (not only or any(TIER_OF.get(n) == "decision" for n in only)):
+        notp.append({"figure": "decision_figures", "tier": "decision",
+                     "reason": f"no decision figure set declared for kind {deliverable_kind(R.spec)} "
+                               f"(toolkit/analysis/figures.py DECISION_SETS)"})
+    for name in [n for n in names if not only or n in only]:
         R.used = []
         try:
-            fig, title, cap, rows, shows = FUNCS[name](R, t)
+            got = FUNCS[name](R, t)
         except Missing as e:
-            notp.append({"figure": name, "reason": str(e)})
+            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
             continue
+        fig, title, cap, rows, shows = got[:5]
+        extra = got[5] if len(got) > 5 else {}
         if len(title) > TITLE_MAX:
             title = title[:TITLE_MAX - 1].rsplit(" ", 1)[0] + "…"
         FS.title(fig, title, t)
+        if extra.get("credit"):
+            fig.text(0.995, 0.004, extra["credit"], ha="right", va="bottom", fontsize=6.5, color=t["ink2"])
         clean = _offset_free(fig)
         sources = list(R.used) + (["decision_spec.yaml", os.path.relpath(os.path.join(run_dir, R.spec["decision_units"]["csv"]), run_dir)])
         sources = [s for s in sources if os.path.exists(os.path.join(run_dir, s))]
-        files = _save(fig, dest, name, run_dir, sources, harness, t)
+        files = _save(fig, dest, name, run_dir, sources, harness, t, R.pres["files"])
         table = os.path.join(dest, f"{name}.csv")
         _write_csv(table, rows)
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
+        cap += extra.pop("caption_note", "")
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
-        figs.append({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
-                     "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
-                     "theme": theme})
-    res = {"figures": figs, "not_produced": notp}
+        figs.append(dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
+                          "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
+                          "theme": theme, "tier": TIER_OF[name],
+                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
+                          "presentation": R.pres["files"]}, **extra))
+    res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
+           "groups": {"decision": list(tiers_for(R.spec)["decision"]),
+                      "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
+    try:
+        res["overviews"] = contact_sheets(res, dest, run_dir, harness) if figs else {}
+    except Exception as e:  # noqa: BLE001 - an overview is a convenience; its failure is recorded, not fatal
+        res["overviews"] = {"error": f"{type(e).__name__}: {e}"}
     if not harness or write_index:
         import yaml
+        os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, "figures.yaml"), "w") as f:
             yaml.safe_dump({"run_dir": run_dir, "producer": PRODUCER, **res}, f, sort_keys=False, width=120)
     return res
@@ -1029,8 +2006,8 @@ def _run_name(d):
 def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, labels_overlay: dict | None = None,
             theme: str = "light") -> dict:
     """The headline with its interval, and the component and package counts, side by side across runs of one project
-    (same units, components and objective outcome; anything else is refused). Spec differences that bear on the
-    headline are named in the caption."""
+    (same units, components and objective outcome; anything else is refused). Packages are matched by their
+    component sets, not their names; spec differences that bear on the headline are named in the caption."""
     if len(run_dirs) < 2:
         raise ValueError("compare needs at least two run dirs")
     if len(run_dirs) > FS.MAX_CATEGORIES:
@@ -1051,11 +2028,20 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     olab = L.outcome(r0.primary)
     U = L.unit_title()
     comps = [c for c in r0.components if any(p["mix"].get(c, 0) for p in pts)]
-    pkgs = sorted([k for k in r0.pk if any(p["packages"].get(k) for p in pts)],
-                  key=lambda k: -sum(p["packages"].get(k, 0) for p in pts))
+    # packages reconciled by component set across runs (names may mean different sets in different specs)
+    keyed = []
+    for R, p in zip(Rs, pts):
+        cnt = {}
+        for name, n in (p.get("packages") or {}).items():
+            cs = tuple(sorted(R.pk.get(name, ())))
+            cnt[cs] = cnt.get(cs, 0) + n
+        keyed.append(cnt)
+    sets = sorted({cs for c in keyed for cs in c}, key=lambda cs: -sum(c.get(cs, 0) for c in keyed))
+    levels = [float(u["fixed_plan"][r0.primary].get("level", 0.95)) for u in uqs]
+    lvl_txt = f"{levels[0]:.0%}" if len(set(levels)) == 1 else "/".join(f"{x:.0%}" for x in levels)
     nr = len(Rs)
     row_h = 0.16 * nr + 0.12
-    h1, h2, h3 = 0.36 * nr + 0.25, row_h * len(comps), row_h * len(pkgs)
+    h1, h2, h3 = 0.36 * nr + 0.25, row_h * len(comps), row_h * len(sets)
     H = h1 + h2 + h3 + 0.6 + 3 * 0.5 + 0.35
     fig = _fig(t, 7.8, H)
     y = H - 0.6 - 0.3
@@ -1076,27 +2062,28 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
         a1.text(1.02, yy, f"{FS.fmt(p['averted'][r0.primary])} ({FS.fmt(q['ci_low'])}–{FS.fmt(q['ci_high'])})",
                 transform=a1.get_yaxis_transform(), va="center", fontsize=7.5)
         rows.append({"run": n, "point": p["averted"][r0.primary], "ci_low": q["ci_low"], "ci_high": q["ci_high"],
-                     "cost": p["cost_allocated"], "window": json.dumps(Rs[j].spec["objective"]["horizon"]),
+                     "level": q.get("level", 0.95), "cost": p["cost_allocated"],
+                     "window": json.dumps(Rs[j].spec["objective"]["horizon"]),
                      **{f"units_{c_}": p["mix"].get(c_, 0) for c_ in comps},
-                     **{f"package_{k}": p["packages"].get(k, 0) for k in pkgs}})
+                     **{f"package_{'+'.join(cs) or 'none'}": keyed[j].get(cs, 0) for cs in sets}})
     a1.set_yticks(range(nr))
     a1.set_yticklabels(names[::-1], fontsize=8)
     a1.set_ylim(-0.6, nr - 0.4)
     FS.set_axis_format(a1, "x")
-    a1.set_title(f"{olab} averted, point and 95% UI", fontsize=8.5, loc="left", color=t["ink"])
+    a1.set_title(f"{olab} averted, point and {lvl_txt} UI", fontsize=8.5, loc="left", color=t["ink"])
     bh = 0.8 / nr
-    for ax, keys, get, lab in ((a2, comps, lambda p, k: p["mix"].get(k, 0), L.component),
-                               (a3, pkgs, lambda p, k: p["packages"].get(k, 0),
-                                lambda k: textwrap.shorten(L.package(r0.pk[k]), 44, placeholder="…"))):
-        for j, p in enumerate(pts):
+    for ax, keys, get, lab in ((a2, comps, lambda j, k: pts[j]["mix"].get(k, 0), L.component),
+                               (a3, sets, lambda j, k: keyed[j].get(k, 0),
+                                lambda k: textwrap.shorten(L.package(k), 44, placeholder="…"))):
+        for j in range(nr):
             ys = [len(keys) - 1 - yk + ((nr - 1) / 2 - j) * bh for yk in range(len(keys))]
-            ax.barh(ys, [get(p, k) for k in keys], height=bh * 0.9, color=t["cat"][j], label=names[j])
+            ax.barh(ys, [get(j, k) for k in keys], height=bh * 0.9, color=t["cat"][j], label=names[j])
         ax.set_yticks(range(len(keys)))
         ax.set_yticklabels([lab(k) for k in keys][::-1], fontsize=7.5)
         ax.set_ylim(-0.6, len(keys) - 0.4)
         FS.set_axis_format(ax, "x", "count")
     a2.set_title(f"{U} per component", fontsize=8.5, loc="left", color=t["ink"])
-    a3.set_title(f"{U} per package", fontsize=8.5, loc="left", color=t["ink"])
+    a3.set_title(f"{U} per package (matched by components)", fontsize=8.5, loc="left", color=t["ink"])
     a2.legend(loc="lower right", fontsize=7.5)
     d = [p["averted"][r0.primary] for p in pts]
     title = (f"{olab} averted: " + " vs ".join(f"{FS.fmt(x)} ({n})" for x, n in zip(d, names)))
@@ -1113,12 +2100,15 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     import matplotlib.pyplot as plt
     plt.close(fig)
     _write_csv(os.path.join(out_dir, "comparison.csv"), rows)
-    cap = ("Each run's point plan: headline with its 95% UI over that run's declared sources, and its units per "
-           "component and per package." + (f" The specs differ in: {', '.join(diffs)}." if diffs else
-                                            " The specs agree on window, envelope, comparator and sources."))
+    cap = (f"Each run's point plan: headline with its {lvl_txt} UI over that run's declared sources, and its units per "
+           f"component and per package (packages matched by their components)."
+           + (" The package definitions differ between the runs; packages are matched by their components."
+              if "package definitions" in diffs else "")
+           + (f" The specs differ in: {', '.join(diffs)}." if diffs else
+              " The specs agree on window, envelope, comparator, sources and package definitions."))
     entry = {"figure": "comparison", "path": png, "svg": svg, "table": os.path.join(out_dir, "comparison.csv"),
              "title": title, "caption": cap, "runs": [os.path.abspath(d) for d in run_dirs], "names": names,
-             "spec_differences": diffs, "offset_free": clean}
+             "spec_differences": diffs, "offset_free": clean, "group": "decision"}
     import yaml
     with open(os.path.join(out_dir, "figures.yaml"), "w") as f:
         yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, f, sort_keys=False, width=120)
@@ -1133,7 +2123,9 @@ def main(argv=None) -> int:
     r.add_argument("run_dir")
     r.add_argument("--out", required=True)
     r.add_argument("--recompute", action="store_true", help="rebuild figure_data from the stored batch (no engine runs)")
-    r.add_argument("--labels", help="YAML with presentation labels (components, parameters, outcomes, ...)")
+    r.add_argument("--labels", help="an unsigned presentation file: labels and/or boundaries (overrides the run "
+                                    "dir's presentation.yaml id by id)")
+    r.add_argument("--only", help="comma-separated figure names")
     r.add_argument("--figure-data", help="a figure_data YAML written by an earlier --recompute (its data block)")
     r.add_argument("--trajectories", help="a trajectories YAML (analysis/trajectories.yaml format)")
     r.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
@@ -1145,9 +2137,7 @@ def main(argv=None) -> int:
     c.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
     a = ap.parse_args(argv)
     import yaml
-    ov = yaml.safe_load(open(a.labels)) if a.labels else None
-    if ov and "labels" in ov:
-        ov = ov["labels"]
+    ov = a.labels or None                       # a presentation file path; RunData loads and checks it
     if a.cmd == "compare":
         e = compare(a.run_dirs, a.out, a.names.split(",") if a.names else None, ov, a.theme)
         print(json.dumps({"comparison": e["path"]}))
@@ -1168,7 +2158,7 @@ def main(argv=None) -> int:
         except FD.RebuildRefused as e:
             print(f"recompute refused: {e}", file=sys.stderr)
             fd = None
-    res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme)
+    res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme, only=a.only.split(",") if a.only else None)
     print(json.dumps({"produced": [f["figure"] for f in res["figures"]], "not_produced": res["not_produced"]}, indent=1))
     return 0
 
@@ -1205,11 +2195,12 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
             "calibration": {"method": "emulator_inversion", "attribute": "x", "target_column": "tgt", "metric": "prev",
                             "target_uncertainty": {"region_sd_logit": 0.15}},
             "deliverable": {"headline": {"name": "total", "outcome": "dalys"}}}
-    if labels:
-        spec["presentation"] = {"labels": {"components": {"ca": "Alpha service", "cb": "Beta service"},
-                                           "parameters": {"p_eff": "Effect size"}, "outcomes": {"dalys": "DALYs",
-                                                                                                 "cases": "Cases"}}}
     yaml.safe_dump(spec, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+    if labels:      # display names live in the unsigned presentation file beside the spec (owner, 2026-11-02)
+        yaml.safe_dump({"labels": {"components": {"ca": "Alpha service", "cb": "Beta service"},
+                                   "parameters": {"p_eff": "Effect size"},
+                                   "outcomes": {"dalys": "DALYs", "cases": "Cases"}}},
+                       open(os.path.join(d, "presentation.yaml"), "w"), sort_keys=False)
     from toolkit.alloc import costs as acosts
     pk = acosts.packages(spec["options"])
     names = [k for k in pk if k != "none"]
@@ -1243,8 +2234,10 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
     art("sensitivity", {"rows": rows, "objective_point": 1.234e7, "outcome": "dalys"})
     art("engine", {"card": {"name": "toy"}, "parameters": [{"name": "p_eff", "units": "share"},
                                                            {"name": "p_dur", "units": "days"}]})
-    art("decision_tests", {"tests": [{"test_id": "prior_range_p_eff", "verdict": "CHANGES_PLAN", "threshold_pct": 10.0},
-                                     {"test_id": "prior_range_p_dur", "verdict": "NO_CHANGE", "threshold_pct": 10.0}]})
+    art("decision_tests", {"tests": [{"test_id": "prior_range_p_eff", "verdict": "CHANGES_PLAN", "threshold_pct": 10.0,
+                                      "share_pct": 30.0, "status": "run", "statement": "toy"},
+                                     {"test_id": "prior_range_p_dur", "verdict": "NO_CHANGE", "threshold_pct": 10.0,
+                                      "share_pct": 5.0, "status": "run", "statement": "toy"}]})
     art("calibration", {"method": "emulator_inversion", "units": {u: {"z": 0.0} for u in ids},
                         "diagnostics": {"target_logit_residual_max": 7e-5}})
     art("emulator", {"accuracy": {"cal_logit_rmse": 0.13}})
@@ -1281,6 +2274,59 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
                          if schedule else
                          {"status": "not_offered",
                           "reason": "engine toy v1 does not offer schedule() (toolkit/engines/hooks.py)"})})
+        fdp = os.path.join(d, "analysis", "figure_data.yaml")
+        doc = yaml.safe_load(open(fdp))
+        for pt in doc["data"]["frontier"]["points"]:
+            pt["averted"] = {"dalys": pt["objective"]}
+        yaml.safe_dump(doc, open(fdp, "w"), sort_keys=False)
+    # tier-1 inputs: bound engine attributes (one column, one monthly profile), the emulator design, parameter
+    # ranges and kinds, the drawn priors, and a derivation record
+    import math as _m
+    up = os.path.join(d, "units.csv")
+    lines = open(up).read().splitlines()
+    out = [lines[0] + ",cov," + ",".join(f"m{k:02d}" for k in range(1, 13))]
+    for i, line in enumerate(lines[1:]):
+        prof = [1 + 0.8 * _m.sin(2 * _m.pi * (k + i % 3) / 12) for k in range(12)]
+        out.append(line + f",{0.2 + 0.6 * ((i * 5) % n) / n:.3f}," + ",".join(f"{v:.3f}" for v in prof))
+    open(up, "w").write("\n".join(out) + "\n")
+    sp = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+    sp["decision_units"]["engine_attributes"] = {"access": {"column": "cov"},
+                                                 "profile": {"columns": [f"m{k:02d}" for k in range(1, 13)]},
+                                                 "level": {"value": 0.5, "source": "toy assumption"}}
+    sp["analysis"] = dict(sp.get("analysis") or {}, emulator={"features": ["cov"]})
+    sp["deliverable"]["kind"] = "package_per_unit"
+    yaml.safe_dump(sp, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+    os.makedirs(os.path.join(d, "analysis", "batch"), exist_ok=True)
+    pts = [{"point": k, "unit_id": f"u{(k * 7) % n}", "z": -1.5 + 3.0 * k / 39, "seed": 1000 + k,
+            "theta": {"p_eff": 0.3 + 0.4 * ((k * 3) % 40) / 39, "p_dur": 480 + 380 * ((k * 11) % 40) / 39},
+            "holdout": k % 10 == 0} for k in range(40)]
+    json.dump({"points": pts, "fitted_names": ["p_eff"], "prior_names": ["p_dur"], "packages": list(pk)},
+              open(os.path.join(d, "analysis", "batch", "design.json"), "w"))
+    eng = yaml.safe_load(open(os.path.join(d, "analysis", "engine.yaml")))
+    eng["data"]["parameters"] = [
+        {"name": "p_eff", "value": 0.5, "kind": "fitted", "units": "share", "lo": 0.3, "hi": 0.7, "source": "fitted"},
+        {"name": "p_dur", "value": 600.0, "kind": "fixed", "units": "days", "lo": 480.0, "hi": 860.0,
+         "source": "a published review"},
+        {"name": "p_cost", "value": 1.0, "kind": "scenario", "units": "", "lo": None, "hi": None, "source": "toy"}]
+    yaml.safe_dump(eng, open(os.path.join(d, "analysis", "engine.yaml"), "w"), sort_keys=False)
+    calp = os.path.join(d, "analysis", "calibration.yaml")
+    cal = yaml.safe_load(open(calp))
+    cal["data"]["units"] = {f"u{i}": {"z": -1.0 + 2.0 * i / n, "clamped": i == 5} for i in range(n)}
+    yaml.safe_dump(cal, open(calp, "w"), sort_keys=False)
+    rp = os.path.join(d, "uncertainty_report.yaml")
+    rep = yaml.safe_load(open(rp)) if os.path.exists(rp) else {}
+    rep["parameters_drawn"] = [{"name": "p_dur", "source_kind": "priors", "dist": "uniform", "range": [480.0, 860.0],
+                                "source": "a published review"},
+                               {"name": "p_eff", "source_kind": "engine_parameters", "dist": "uniform",
+                                "range": [0.3, 0.7], "source": "fitted"}]
+    yaml.safe_dump(rep, open(rp, "w"))
+    os.makedirs(os.path.join(d, "data"), exist_ok=True)
+    yaml.safe_dump({"derivations": [{"id": "units", "script": "data/derive/units.py",
+                                     "inputs": ["data/inputs/a.csv", "data/inputs/b.csv"], "outputs": ["units.csv"],
+                                     "columns": {"uses": {"data/inputs/a.csv": ["uid", "pop"],
+                                                          "data/inputs/b.csv": ["cov", "m*"]},
+                                                 "ignores": {"data/inputs/a.csv": {"area": "not used"}}}}]},
+                   open(os.path.join(d, "data", "derivations.yaml"), "w"), sort_keys=False)
     return d
 
 
@@ -1406,6 +2452,241 @@ def _self_test() -> int:
            "F15 with the engine's schedule, the timeline shows history, decision and routine deliveries per region")
         resd = render(d, os.path.join(base, "dark"), theme="dark")
         ok(len(resd["figures"]) == len(res["figures"]), "F14 the dark theme renders the same set")
+
+        # ---------------- Codex r1
+        def edit(dd, kind, fn, rel=None):
+            pth = os.path.join(dd, rel or os.path.join("analysis", f"{kind}.yaml"))
+            doc = yaml.safe_load(open(pth))
+            fn(doc["data"] if "data" in doc else doc)
+            yaml.safe_dump(doc, open(pth, "w"), sort_keys=False)
+
+        def one(dd, name, out):
+            r = render(dd, os.path.join(base, out), only=[name])
+            e = {f["figure"]: f for f in r["figures"]}.get(name)
+            return e, {x["figure"]: x["reason"] for x in r["not_produced"]}.get(name)
+        # P1-1: no fabricated fit; the title follows the actual residuals and clamping
+        e, _ = one(d, "calibration_fit", "c1")
+        ok(e and e.get("panels") == ["targets"] and "exactly" not in e["title"] and "reproduces" not in e["title"],
+           f"F16 without modelled values the fit panel is withheld and nothing claims a fit: {e and e['title']}")
+        dc = toy_run(os.path.join(base, "runc"))
+        ids = [f"u{i}" for i in range(24)]
+        edit(dc, "figure_data", lambda x: x.update(calibration={"metric": "prev", "units": {
+            u: {"target": 0.1 + 0.3 * (i % 7) / 7, "modelled": 0.1 + 0.3 * (i % 7) / 7 + (0.05 if i == 3 else 0.0)}
+            for i, u in enumerate(ids)}}))
+        edit(dc, "calibration", lambda x: x["diagnostics"].update(clamped_units=2))
+        e, _ = one(dc, "calibration_fit", "c2")
+        ok(e and e.get("panels") == ["fit", "residuals"] and "2 clamped" in e["title"] and "exactly" not in e["title"],
+           f"F16b with modelled values the title states the largest residual and the clamped units: {e and e['title']}")
+        # P1-4 and P2-8: the frontier plots solved points only, on outcome averted
+        df = toy_run(os.path.join(base, "runf"))
+        edit(df, "figure_data", lambda x: (x["frontier"].update(infeasible=[{"fraction": 0.25, "reason": "infeasible"}]),
+                                           [pt.update(averted={"dalys": pt["objective"]}, objective=2 * pt["objective"])
+                                            for pt in x["frontier"]["points"]]))
+        fdd = yaml.safe_load(open(os.path.join(df, "analysis", "figure_data.yaml")))["data"]
+        xs, ys = _frontier_xy(fdd["frontier"], "dalys")
+        ok(len(xs) == len(fdd["frontier"]["points"]) and 0.0 not in ys
+           and ys == [pt["averted"]["dalys"] for pt in fdd["frontier"]["points"]],
+           "F17 the frontier draws only solved points (no unsolved origin), on outcome averted (F20)")
+        e, _ = one(df, "frontier", "f1")
+        ok(e and "infeasible" in e["caption"], f"F17b infeasible envelopes are named in the caption: {e and e['caption']}")
+        # P1-5: a plan that spends nothing
+        dz = toy_run(os.path.join(base, "runz"))
+        edit(dz, "figure_data", lambda x: x["dollars"].update(allocated_usd=0.0, by_component={"ca": 0.0, "cb": 0.0},
+                                                               by_region={r: {"ca": 0.0, "cb": 0.0} for r in
+                                                                          ("Z0", "Z1", "Z2")}))
+        e, why = one(dz, "dollars", "z1")
+        ok(e and "unspent" in e["title"], f"F18 a zero-spend plan draws fixed costs and unspent funds: {e or why}")
+        # P1-7: stale trajectories are not plotted
+        dt = toy_run(os.path.join(base, "runt"))
+        tj = {"schema": "analysis.trajectories/1", "inputs": {"analysis/point.yaml": "0" * 64}, "data": {
+            "status": "ok", "engine": {"name": "toy"}, "sample": {"Z0": ["u0"]}, "per_region": 1, "seeds": 1,
+            "metrics": ["prev"], "metric_info": {"prev": {"label": "prevalence", "units": "share"}},
+            "delivery": [1.0, 2.0], "window": [1.0, 3.0], "calibration_metric": "prev",
+            "series": {"total": {"t": [0.0, 1.0], "arms": {"comparator": {"prev": [0.5, 0.5]},
+                                                            "plan": {"prev": [0.5, 0.4]}}, "target": {}},
+                       "regions": {}}}}
+        yaml.safe_dump(tj, open(os.path.join(dt, "analysis", "trajectories.yaml"), "w"))
+        e, why = one(dt, "trajectories", "t1")
+        ok(e is None and why and "stale" in why, f"F19 trajectories computed from other inputs are not plotted: {why}")
+        # P2-11: every component counts in the dollars summary
+        d9 = toy_run(os.path.join(base, "run9"), labels=False)     # its components are replaced below
+        comps9 = [f"k{j}" for j in range(9)]
+        edit(d9, "figure_data", lambda x: x["dollars"].update(
+            allocated_usd=900.0, by_component={c: 100.0 for c in comps9},
+            by_region={r: {c: 100.0 / 3 for c in comps9} for r in ("Z0", "Z1", "Z2")}))
+        sp9 = yaml.safe_load(open(os.path.join(d9, "decision_spec.yaml")))
+        sp9["options"]["components"] = {c: {} for c in comps9}
+        yaml.safe_dump(sp9, open(os.path.join(d9, "decision_spec.yaml"), "w"), sort_keys=False)
+        edit(d9, "point", lambda x: x.update(mix={c: 3 for c in comps9}))
+        e, why = one(d9, "dollars", "d9")
+        rows9 = list(csv.DictReader(open(e["table"]))) if e else []
+        allrow = [r for r in rows9 if r.get("region") == "ALL"]
+        ok(e and allrow and all(float(allrow[0][c]) == 100.0 for c in comps9) and "11%" in e["title"],
+           f"F21 the dollars summary covers all nine components: {e and e['title']} {why}")
+        # P2-12: free, harmful and undefined packages are shown, not dropped
+        dp = toy_run(os.path.join(base, "runp"))
+
+        def pk_edit(x):
+            ks = sorted(x["by_package"])
+            x["by_package"][ks[0]].update(cost=0.0, usd_per_outcome=0.0)
+            x["by_package"][ks[1]].update(averted=-5.0, usd_per_outcome=None, usd_per_outcome_interval=None)
+            x["by_package"][ks[2]].update(averted=0.0, usd_per_outcome=None, usd_per_outcome_interval=None)
+        edit(dp, "figure_data", pk_edit)
+        e, why = one(dp, "cost_per_outcome", "p1")
+        st = {r.get("status") for r in csv.DictReader(open(e["table"]))} if e else set()
+        ok(e and {"free", "harmful", "undefined"} <= st, f"F22 free, harmful and undefined packages are shown: {st} {why}")
+        # P2-13: verdict, share and threshold from one calculation
+        ds = toy_run(os.path.join(base, "runs"))
+        edit(ds, "decision_tests", lambda x: x["tests"][0].update(share_pct=30.0, threshold_pct=25.0))
+        sps = yaml.safe_load(open(os.path.join(ds, "decision_spec.yaml")))
+        sps["analysis"] = {"share_threshold": 0.04}
+        yaml.safe_dump(sps, open(os.path.join(ds, "decision_spec.yaml"), "w"), sort_keys=False)
+        e, _ = one(ds, "sensitivity", "s1")
+        sr = {r["name"]: r for r in csv.DictReader(open(e["table"]))}
+        ok(float(sr["p_eff"]["share_units_changed"]) == 0.30 and float(sr["p_eff"]["threshold"]) == 0.25
+           and float(sr["p_cost"]["threshold"]) == 0.04 and sr["p_cost"]["changes_plan"] == "True",
+           f"F23 each marker's verdict, share and threshold come from one source: "
+           f"{[(k, v['share_units_changed'], v['threshold'], v['changes_plan']) for k, v in sr.items()]}")
+        # P2-14: package definitions that differ across runs are reconciled and disclosed
+        dk = toy_run(os.path.join(base, "runk"))
+        spk = yaml.safe_load(open(os.path.join(dk, "decision_spec.yaml")))
+        spk["options"]["packages"] = {"none": [], "ca": ["cb"], "cb": ["ca"], "ca+cb": ["ca", "cb"]}
+        yaml.safe_dump(spk, open(os.path.join(dk, "decision_spec.yaml"), "w"), sort_keys=False)
+        ek = compare([d, dk], os.path.join(base, "cmpk"), names=["A", "K"])
+        ok("package definitions differ" in ek["caption"], f"F24 differing package definitions are disclosed: {ek['caption']}")
+        # P2-15: the stored interval level, not a hardcoded 95%
+        dl = toy_run(os.path.join(base, "runl"))
+        edit(dl, "uncertainty", lambda x: [v.update(level=0.9) for v in x["fixed_plan"].values()])
+        edit(dl, "figure_data", lambda x: x["replay"].update(level=0.9))
+        rl = render(dl, os.path.join(base, "l1"), only=["headline", "cost_per_outcome"])
+        el = {f["figure"]: f for f in rl["figures"]}
+        el2 = compare([dl, dl], os.path.join(base, "cmpl"), names=["X", "Y"])
+        ok("90% UI" in el["headline"]["title"] and "90%" in el["cost_per_outcome"]["caption"]
+           and "95%" not in el["cost_per_outcome"]["caption"] and "90%" in el2["caption"] and "95%" not in el2["caption"],
+           "F25 interval levels come from the stored artifacts")
+        # ---------------- owner: three tiers (data and model, simulation, decision)
+        rt = render(d, os.path.join(base, "tiers"))
+        idx_t = yaml.safe_load(open(os.path.join(base, "tiers", "figures.yaml")))
+        ent_t = {f["figure"]: f for f in rt["figures"]}
+        np_t = {x["figure"]: x for x in rt["not_produced"]}
+        ok(all(f.get("tier") in ("data_model", "simulation", "decision") for f in rt["figures"])
+           and all(x.get("tier") in ("data_model", "simulation", "decision") for x in rt["not_produced"])
+           and set(idx_t.get("tiers") or {}) == {"data_model", "simulation", "decision"},
+           "TT1 every figure and not-produced entry records its tier; figures.yaml lists the three tiers")
+        want1 = {"data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage"}
+        ok(want1 <= {n for n, f in ent_t.items() if f["tier"] == "data_model"},
+           f"TT2 tier 1 (data and model) is drawn from the run's own inputs: "
+           f"{sorted(n for n, f in ent_t.items() if f['tier'] == 'data_model')} / "
+           f"{ {k: v['reason'][:60] for k, v in np_t.items() if v['tier'] == 'data_model'} }")
+        cov = list(csv.DictReader(open(ent_t["data_coverage"]["table"]))) if "data_coverage" in ent_t else []
+        ok(any(r.get("attribute") == "profile" and "m01" in (r.get("binding") or "") for r in cov)
+           and any(r.get("input") == "data/inputs/b.csv" for r in cov),
+           "TT2b data coverage lists each bound attribute's binding and each staged input's columns")
+        pr = list(csv.DictReader(open(ent_t["parameters"]["table"]))) if "parameters" in ent_t else []
+        ok({r["name"]: r["kind"] for r in pr if r.get("name")}.items() >= {"p_eff": "fitted", "p_dur": "prior"}.items(),
+           f"TT2c parameters show fitted against prior-drawn values with their ranges: {pr[:3]}")
+        dsg = ent_t.get("design_coverage") or {}
+        ok(dsg and "40 design points" in dsg.get("caption", ""), f"TT2d design coverage counts the design points: {dsg}")
+        sim = {"timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"}
+        ok(sim <= {n for n, x in np_t.items() if x["tier"] == "simulation"}
+           and "run_series" in np_t["burn_in"]["reason"] and "trajectory" in np_t["stochastic_noise"]["reason"],
+           f"TT3 tier 2 figures without their inputs are not produced, each with its reason: "
+           f"{ {k: np_t[k]['reason'][:50] for k in sim if k in np_t} }")
+        ok("decision_tests" in ent_t and ent_t["decision_tests"]["tier"] == "decision"
+           and "1 of 2" in ent_t["decision_tests"]["title"],
+           f"TT4 the decision tests are a decision figure: {ent_t.get('decision_tests', {}).get('title')}")
+        ov = idx_t.get("overviews") or {}
+        ok(all(os.path.exists(ov.get(k, "")) for k in ("data_model", "decision")),
+           f"TT5 one overview contact sheet per tier with figures: {ov}")
+        du = toy_run(os.path.join(base, "runu"))
+        spu = yaml.safe_load(open(os.path.join(du, "decision_spec.yaml")))
+        spu["deliverable"]["kind"] = "threshold_rule"
+        yaml.safe_dump(spu, open(os.path.join(du, "decision_spec.yaml"), "w"), sort_keys=False)
+        ru = render(du, os.path.join(base, "unk"))
+        npu = [x for x in ru["not_produced"] if x["tier"] == "decision"]
+        ok(not [f for f in ru["figures"] if f["tier"] == "decision"] and npu
+           and "no decision figure set declared for kind threshold_rule" in npu[0]["reason"],
+           f"TT6 an undeclared deliverable kind gets no decision figures and says why: {npu}")
+        # ---------------- owner: unsigned presentation file (labels, boundaries)
+        sc = json.load(open(os.path.join(d, ents["sensitivity"]["path"]) + ".provenance.json"))
+        ok((sc.get("presentation") or [{}])[0].get("path") == "presentation.yaml"
+           and len((sc.get("presentation") or [{}])[0].get("sha256") or "") == 64,
+           f"PL1 each figure's provenance records the presentation file and its sha: {sc.get('presentation')}")
+        dm = toy_run(os.path.join(base, "runm"))
+        open(os.path.join(dm, "presentation.yaml"), "w").write("labels: [not, a, mapping]\n")
+        try:
+            render(dm, os.path.join(base, "m1"))
+            ok(False, "PL2 a malformed presentation file fails closed")
+        except ValueError as e:
+            ok("presentation.yaml" in str(e), f"PL2 a malformed presentation file fails closed: {e}")
+        open(os.path.join(dm, "presentation.yaml"), "w").write("labels:\n  components: {zz: Zed}\n")
+        try:
+            render(dm, os.path.join(base, "m2"))
+            ok(False, "PL2b labels for ids the spec does not have fail closed")
+        except ValueError as e:
+            ok("zz" in str(e), f"PL2b labels for ids the spec does not have fail closed: {e}")
+        ovp = os.path.join(base, "over.yaml")
+        yaml.safe_dump({"labels": {"components": {"ca": "Overlay A"}}}, open(ovp, "w"))
+        r = subprocess.run([sys.executable, "-m", "toolkit.analysis.figures", "render", d, "--out",
+                            os.path.join(base, "ov"), "--labels", ovp, "--only", "cost_per_outcome"],
+                           cwd=ROOT, capture_output=True, text=True)
+        cpo2 = open(os.path.join(base, "ov", "cost_per_outcome.csv")).read() if r.returncode == 0 else ""
+        ok("Overlay A" in cpo2 and "Beta service" in cpo2,
+           f"PL3 a --labels file overrides the run dir's presentation file, id by id: {r.stderr[-200:]}")
+
+        # boundaries: GeoJSON polygons matched to units directly or through a crosswalk
+        def geo(dd, ids, extra=2, key="code"):
+            feats = []
+            for k, u in enumerate(ids + [f"ctx{j}" for j in range(extra)]):
+                x0, y0 = (k % 6) * 1.0, (k // 6) * 1.0
+                ring = [[x0, y0], [x0 + 1, y0], [x0 + 1, y0 + 1], [x0, y0 + 1], [x0, y0]]
+                gtype, coords = (("MultiPolygon", [[ring]]) if k % 2 else ("Polygon", [ring]))
+                feats.append({"type": "Feature", "properties": {key: f"S-{u}"},
+                              "geometry": {"type": gtype, "coordinates": coords}})
+            json.dump({"type": "FeatureCollection", "features": feats}, open(os.path.join(dd, "b.geojson"), "w"))
+        db = toy_run(os.path.join(base, "runb"))
+        uids = [f"u{i}" for i in range(24)]
+        geo(db, uids)
+        with open(os.path.join(db, "xw.csv"), "w") as fh:
+            fh.write("uid,code\n" + "".join(f"{u},S-{u}\n" for u in uids[1:]))      # u0 has no polygon
+        pres = yaml.safe_load(open(os.path.join(db, "presentation.yaml")))
+        pres["boundaries"] = {"path": "b.geojson", "feature_id": "code", "credit": "Boundaries: toy (CC0)",
+                              "crosswalk": {"path": "xw.csv", "unit_id": "uid", "feature_id": "code"}}
+        yaml.safe_dump(pres, open(os.path.join(db, "presentation.yaml"), "w"))
+        rb = render(db, os.path.join(base, "bmap"), only=["allocation_map", "stability_map", "burden_map"])
+        eb = {f["figure"]: f for f in rb["figures"]}
+        ok(set(eb) == {"allocation_map", "stability_map", "burden_map"}
+           and all(f.get("layout") == "boundaries" and f.get("unmatched") == ["u0"]
+                   and "u0" in f["caption"] and f.get("credit") == "Boundaries: toy (CC0)" for f in eb.values())
+           and all(f.get("context_features") == 3 for f in eb.values()),     # 2 context + the one u0 is not mapped to
+           f"BD1 with a boundary file and crosswalk the maps draw polygons, list unmatched units, credit the source and "
+           f"draw context features: {[(k, v.get('layout'), v.get('unmatched'), v.get('context_features')) for k, v in eb.items()]}")
+        db2 = toy_run(os.path.join(base, "runb2"))
+        geo(db2, uids, key="uid_prop")
+        sp2 = yaml.safe_load(open(os.path.join(db2, "presentation.yaml")))
+        lines = open(os.path.join(db2, "units.csv")).read().splitlines()
+        open(os.path.join(db2, "units.csv"), "w").write("\n".join([lines[0]] + [ln.replace(f"{ln.split(',')[0]},",
+                                                                                         f"S-{ln.split(',')[0]},", 1)
+                                                                             for ln in lines[1:]]) + "\n")
+        edit(db2, "point", lambda x: x.update(plan={f"S-{k}": v for k, v in x["plan"].items()}))
+        sp2["boundaries"] = {"path": "b.geojson", "feature_id": "uid_prop"}
+        yaml.safe_dump(sp2, open(os.path.join(db2, "presentation.yaml"), "w"))
+        e2b, why = one(db2, "allocation_map", "bmap2")
+        ok(e2b and e2b.get("layout") == "boundaries" and e2b.get("unmatched") == [],
+           f"BD2 without a crosswalk the unit id matches the feature property directly: {e2b and e2b.get('unmatched')} {why}")
+        open(os.path.join(db, "b.geojson"), "w").write("{\"type\": \"FeatureCollection\", \"features\": [{}]}")
+        try:
+            render(db, os.path.join(base, "bmap3"), only=["allocation_map"])
+            ok(False, "BD3 a malformed boundary file fails closed")
+        except ValueError as e:
+            ok("b.geojson" in str(e), f"BD3 a malformed boundary file fails closed: {e}")
+        # design: decision figures and modeller diagnostics are grouped in figures.yaml
+        idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
+        grp = idx.get("groups") or {}
+        ok(set(grp.get("decision", [])) >= {"allocation_map", "dollars", "stability_map", "frontier"}
+           and set(grp.get("diagnostics", [])) >= {"calibration_fit", "sensitivity", "trajectories"}
+           and all(f.get("group") in ("decision", "diagnostics") for f in idx["figures"]),
+           f"F27 figures.yaml separates decision figures from modeller diagnostics: {grp}")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

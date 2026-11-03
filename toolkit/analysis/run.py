@@ -270,11 +270,13 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                         A.by_id[i].get(reg, "") if reg else ""])
     S.deliverable(dp, PRODUCER, "allocation")
     # ---- figures: the decision numbers they need (no engine runs), then every figure from the saved artifacts
-    fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log)
+    fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log, events=events0)
     arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]])
     rend = FG.render(run_dir)
     figs = rend["figures"]
-    arts["figures"] = S.write("figures", {"figures": figs, "not_produced": rend["not_produced"]}, FG.PRODUCER,
+    arts["figures"] = S.write("figures", {"figures": figs, "not_produced": rend["not_produced"],
+                                          "tiers": rend["tiers"], "groups": rend["groups"],
+                                          "overviews": rend.get("overviews") or {}}, FG.PRODUCER,
                               sorted({s for f in figs for s in f["sources"]}))
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")

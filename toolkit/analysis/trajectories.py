@@ -67,7 +67,7 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     eng = spec.engine()
     if not hooks.supports(eng, "series"):
-        raise hooks.HookUnsupported("run_series", eng)
+        raise hooks._unsupported("run_series", eng)
     known = hooks.series_metrics(eng)
     metrics = list(metrics or known)
     point, cal, fd = _data(run_dir, "point"), _data(run_dir, "calibration"), _data(run_dir, "figure_data")
@@ -76,7 +76,12 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
     theta = dict(A.theta0, **(cal.get("theta") or {}))
     reg = spec["decision_units"].get("region")
     units = {i: str(A.by_id[i].get(reg, "")) if reg else "" for i in A.ids}
-    burden = {i: (v or {}).get("per_person") or 0.0 for i, v in (fd.get("burden") or {}).items()}
+    bd = fd.get("burden") or {}
+    miss = [i for i in A.ids if (bd.get(i) or {}).get("per_person") is None]
+    if miss:
+        raise ValueError(f"trajectories: figure_data has no comparator burden for {len(miss)} units (e.g. {miss[:3]}); "
+                         "the purposive sample needs every unit's burden")
+    burden = {i: float(bd[i]["per_person"]) for i in A.ids}
     smp = sample_units(units, burden, per_region)
     h = spec.horizon({})
     hz = {"start": float(h.start), "stop": float(h.stop), "window": [float(x) for x in h.window]}
@@ -84,20 +89,27 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
         hz["delivery"] = [float(x) for x in h.delivery]
     cal_attr = spec["calibration"].get("attribute")
     seed0 = int((spec.get("uncertainty") or {}).get("seed", 42))
+    if cal_attr:
+        nz = [i for ids in smp.values() for i in ids if ((cal.get("units") or {}).get(i) or {}).get("z") is None]
+        if nz:
+            raise ValueError(f"trajectories: {len(nz)} sampled units have no calibrated attribute {cal_attr} in "
+                             f"analysis/calibration.yaml (e.g. {nz[:3]})")
     out = []
     for r, ids in smp.items():
         for i in ids:
             a = dict(spec.unit_attributes(A.by_id[i]))
-            z = ((cal.get("units") or {}).get(i) or {}).get("z")
-            if cal_attr and z is not None:
-                a[cal_attr] = calibrated_value(spec, z)
+            if cal_attr:
+                a[cal_attr] = calibrated_value(spec, cal["units"][i]["z"])
             arms = [[A.comp, spec.engine_package(A.pk[A.comp])], [plan[i], spec.engine_package(A.pk[plan[i]])]]
             for s in range(seeds):
                 out.append({"unit": i, "region": r, "attributes": a, "arms": arms, "params": theta,
                             "engine": spec["engine"],     # engine: auto is resolved to the chosen engine on load
                             "horizon": hz, "seed": seed0 + 1000 * s + 7, "metrics": metrics})
+    from toolkit.engines.contract import engine_identity
     step = {"sample": smp, "per_region": per_region, "seeds": seeds, "metrics": metrics,
-            "metric_info": {m: known[m] for m in metrics}, "plan": plan, "units": units}
+            "metric_info": {m: known[m] for m in metrics}, "plan": plan, "units": units,
+            "engine": engine_identity(eng), "hooks_contract": hooks.HOOKS_CONTRACT,
+            "selection": "purposive: per region, the units at the lowest, median and highest comparator burden"}
     return out, step
 
 
@@ -116,6 +128,25 @@ def run_task(task: dict) -> dict:
     return {"unit": task["unit"], "seed": task["seed"], "series": res}
 
 
+def target_interval(targets, weights, regions, sd: float, level: float = 0.95, draws: int = 4000) -> dict:
+    """Weighted mean target and its interval: one common-mode logit error per region (sd), independent across
+    regions, applied to each unit before weighting."""
+    v = np.clip(np.asarray(targets, float), 1e-9, 1 - 1e-9)
+    w = np.asarray(weights, float)
+    w = w / w.sum()
+    value = float(np.sum(v * w))
+    if not sd > 0:
+        return {"value": value, "lo": value, "hi": value}
+    regs = sorted(set(regions))
+    idx = np.array([regs.index(r) for r in regions])
+    rng = np.random.default_rng(20261103)
+    sh = rng.normal(0.0, sd, size=(draws, len(regs)))[:, idx]          # common mode within a region
+    lg = np.log(v / (1 - v))
+    m = (1 / (1 + np.exp(-(lg[None, :] + sh)))) @ w
+    a = 100 * (1 - level) / 2
+    return {"value": value, "lo": float(np.percentile(m, a)), "hi": float(np.percentile(m, 100 - a))}
+
+
 def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
     """Seed means per unit and arm, then population-weighted means per region and in total."""
     from toolkit.spec import schema
@@ -124,15 +155,25 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
     by_id = {str(u[spec.uid]): u for u in spec.units()}
     w = {i: sum(float(by_id[i][pm["column"]]) for pm in pops.values()) for i in by_id}
     metrics = step["metrics"]
+    from toolkit.engines.hooks import GRID_TOL, HookInvalid
     acc = {}
     t = None
     for r in results:
         for k, arm in enumerate(("comparator", "plan")):
             s = r["series"][k]
             t = t or s["t"]
+            if len(s["t"]) != len(t) or any(abs(a - b) > GRID_TOL for a, b in zip(s["t"], t)):
+                raise HookInvalid(f"trajectories: unit {r['unit']} seed {r.get('seed')} {arm} is on another time grid "
+                                  "than the first series; series are averaged step by step only on one grid")
             e = acc.setdefault(r["unit"], {}).setdefault(arm, {m: [] for m in metrics})
             for m in metrics:
                 e[m].append(s["values"][m])
+    # per unit and seed: comparator minus plan, averaged over the outcome window (the stochastic-noise figure)
+    w0, w1 = (float(x) for x in spec["objective"]["horizon"])
+    inwin = np.array([(w0 - 1e-9) <= x < w1 for x in (t or [])])
+    seed_effects = {i: {m: [float(np.mean(np.asarray(c)[inwin] - np.asarray(p)[inwin]))
+                            for c, p in zip(a["comparator"][m], a["plan"][m])] for m in metrics}
+                    for i, a in acc.items()} if inwin.any() else {}
     per_unit = {i: {arm: {m: list(np.mean(np.asarray(v[m], float), axis=0)) for m in metrics} for arm, v in a.items()}
                 for i, a in acc.items()}
 
@@ -144,22 +185,21 @@ def aggregate(run_dir: str, step: dict, results: list[dict]) -> dict:
     tgt_col, cal_metric = cal.get("target_column"), cal.get("metric")
     sd = float((cal.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
 
+    reg_col = spec["decision_units"].get("region")
+    level = float((spec.get("uncertainty") or {}).get("level", 0.95))
+
     def target(ids):
         if not tgt_col or cal_metric not in metrics:
             return {}
-        v = np.array([float(by_id[i][tgt_col]) for i in ids])
-        ws = np.array([w[i] for i in ids])
-        c = float(np.sum(v * ws) / np.sum(ws))
-        lg = np.log(c / (1 - c))
-        il = lambda x: float(1 / (1 + np.exp(-x)))  # noqa: E731
+        ti = target_interval([float(by_id[i][tgt_col]) for i in ids], [w[i] for i in ids],
+                             [str(by_id[i].get(reg_col, "")) if reg_col else "" for i in ids], sd, level)
         win = cal.get("window") or [None, None]
-        return {"value": c, "lo": il(lg - 1.96 * sd), "hi": il(lg + 1.96 * sd),
-                "t": (float(win[0]) + float(win[1])) / 2 if win[0] is not None else None}
+        return dict(ti, level=level, t=(float(win[0]) + float(win[1])) / 2 if win[0] is not None else None)
     regions = {r: {"t": t, "arms": wmean(ids), "target": target(ids), "units": ids}
                for r, ids in step["sample"].items() if ids}
     allids = [i for ids in step["sample"].values() for i in ids]
     return {"total": {"t": t, "arms": wmean(allids), "target": target(allids), "units": allids}, "regions": regions,
-            "per_unit": per_unit}
+            "per_unit": per_unit, "seed_effects": seed_effects}
 
 
 def write(run_dir: str, data: dict, inputs: list[str]) -> str:
@@ -195,14 +235,16 @@ def run(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None, log=pri
     if bad:
         raise RuntimeError(f"trajectories: {len(bad)} of {len(rows)} tasks failed (e.g. {str(bad[0])[:300]})")
     series = aggregate(run_dir, step, [r["result"] for r in rows])
+    seed_effects = series.pop("seed_effects", {})
     from toolkit.spec import schema
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     h = spec.horizon({})
     d = getattr(h, "delivery", None) or h.window
     data = {"status": "ok", "sample": step["sample"], "per_region": per_region, "seeds": seeds,
+            "engine": step["engine"], "hooks_contract": step["hooks_contract"], "selection": step["selection"],
             "metrics": step["metrics"], "metric_info": step["metric_info"],
             "calibration_metric": (spec.get("calibration") or {}).get("metric"),
-            "delivery": [float(x) for x in d], "window": [float(x) for x in h.window], "series": series,
+            "delivery": [float(x) for x in d], "window": [float(x) for x in h.window], "series": series, "seed_effects": seed_effects,
             "compute": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s")}}
     write(run_dir, data, inputs)
     return data
@@ -261,6 +303,73 @@ def _self_test() -> int:
         ok(res["series"]["total"]["target"].get("value") is not None, "TJ7 the calibration target is carried per panel")
         r2 = FG.render(d, os.path.join(figs, "b"))
         ok(any(f["figure"] == "trajectories" for f in r2["figures"]), "TJ8 the trajectories figure is produced")
+        # ---- owner: tier-2 figures and their paired checks
+        e2 = {f["figure"]: f for f in r2["figures"]}
+        n2 = {x["figure"]: x["reason"] for x in r2["not_produced"]}
+        chk = {c["check"]: c for c in (e2.get("trajectories") or {}).get("checks") or []}
+        ok(chk.get("plan_equals_comparator_before_delivery", {}).get("status") == "pass"
+           and "pre_intervention_vs_target" in chk,
+           f"TJ14 the trajectory figure carries its checks (plan equals comparator before delivery; pre-intervention "
+           f"level against target): {list(chk)}")
+        ok("stochastic_noise" in e2 and e2["stochastic_noise"]["tier"] == "simulation",
+           f"TJ15 seed-to-seed spread is drawn from the trajectory seeds: {n2.get('stochastic_noise')}")
+        ok("seasonality" not in e2 and "monthly profile" in n2.get("seasonality", ""),
+           f"TJ16 without a monthly profile attribute the seasonality check says why: {n2.get('seasonality')}")
+        # ---- Codex r1
+        doc = yaml.safe_load(open(os.path.join(d, OUT)))
+        ok(set(doc["inputs"]) >= {"decision_spec.yaml", "analysis/point.yaml", "analysis/calibration.yaml",
+                                  "analysis/figure_data.yaml"} and (doc["data"].get("engine") or {}).get("code_sha256"),
+           "TJ12 trajectories.yaml records its input hashes and the engine identity (staleness check, P1-7)")
+        ent = [f for f in r2["figures"] if f["figure"] == "trajectories"][0]
+        ok(f"{n_units} " in ent["caption"] and "purposive" in ent["caption"],
+           f"TJ13 the caption counts sampled units, not regions, and says the sample is purposive: {ent['caption']}")
+        fdp = os.path.join(d, "analysis", "figure_data.yaml")
+        keep_fd = open(fdp).read()
+        fd = yaml.safe_load(keep_fd)
+        first = sorted(fd["data"]["burden"])[0]
+        del fd["data"]["burden"][first]
+        yaml.safe_dump(fd, open(fdp, "w"), sort_keys=False)
+        try:
+            tasks(d, 2, 1)
+            ok(False, "TJ9 a unit without burden is refused before any task is submitted (P2-9)")
+        except ValueError as e:
+            ok("burden" in str(e), f"TJ9 a unit without burden is refused before any task is submitted: {e}")
+        open(fdp, "w").write(keep_fd)
+        cp = os.path.join(d, "analysis", "calibration.yaml")
+        keep_cal = open(cp).read()
+        cal = yaml.safe_load(keep_cal)
+        for v in cal["data"]["units"].values():
+            v.pop("z", None)
+        yaml.safe_dump(cal, open(cp, "w"), sort_keys=False)
+        try:
+            tasks(d, 2, 1)
+            ok(False, "TJ9b a sampled unit without its calibrated attribute is refused (P2-9)")
+        except ValueError as e:
+            ok("calibrated" in str(e), f"TJ9b a sampled unit without its calibrated attribute is refused: {e}")
+        open(cp, "w").write(keep_cal)
+        # the grids of all units, arms and seeds must be identical (P1-6)
+        step = {"metrics": ["prev"], "sample": {"r0": ["0", "3"]}}
+        g = [0.0 + k / 12 for k in range(36)]
+        mk = lambda u, t: {"unit": u, "seed": 1, "series": [  # noqa: E731
+            {"package": "none", "t": t, "values": {"prev": [0.5] * len(t)}},
+            {"package": "a", "t": t, "values": {"prev": [0.4] * len(t)}}]}
+        try:
+            aggregate(d, step, [mk("0", g), mk("3", [x + 1 / 24 for x in g])])
+            ok(False, "TJ11 units on different grids are refused")
+        except Exception as e:  # noqa: BLE001
+            ok(type(e).__name__ == "HookInvalid" and "grid" in str(e), f"TJ11 units on different grids are refused: {e}")
+    # target interval: the region's common-mode shift applied per unit, then weighted (P2-10)
+    import math as _m
+    lg = lambda x: _m.log(x / (1 - x))  # noqa: E731
+    il = lambda x: 1 / (1 + _m.exp(-x))  # noqa: E731
+    ti = target_interval([0.1, 0.9], [1.0, 1.0], ["r", "r"], 0.5, 0.95)
+    want = (0.5 * (il(lg(0.1) - 0.98) + il(lg(0.9) - 0.98)), 0.5 * (il(lg(0.1) + 0.98) + il(lg(0.9) + 0.98)))
+    ok(abs(ti["lo"] - want[0]) < 0.01 and abs(ti["hi"] - want[1]) < 0.01 and abs(ti["value"] - 0.5) < 1e-12,
+       f"TJ10 the target interval shifts each unit on the logit scale, then averages: {ti} vs {want}")
+    t2 = target_interval([0.3, 0.3], [1.0, 1.0], ["r1", "r2"], 0.5, 0.95)
+    t1 = target_interval([0.3, 0.3], [1.0, 1.0], ["r1", "r1"], 0.5, 0.95)
+    ok(t2["hi"] - t2["lo"] < t1["hi"] - t1["lo"],
+       "TJ10b independent region errors give a narrower total interval than one common error")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run console</title>
+<!-- scripts/run_console.py serves this page on 127.0.0.1 only. No external scripts, fonts or styles:
+     run outputs derive from licensed data and nothing here may leave the machine. -->
+<style>
+:root {
+  --bg: #f7f7f8; --panel: #ffffff; --ink: #1d1f23; --muted: #6b7079; --faint: #a3a7ae; --line: #e6e7ea; --soft: #f0f1f3;
+  --accent: #3a63b8; --accent-soft: #e9effa; --ok: #2f7d4f; --warn: #a86a10; --bad: #b3363a;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #141518; --panel: #1b1d21; --ink: #e7e8ea; --muted: #9a9fa8; --faint: #636871; --line: #2b2e34; --soft: #23262b;
+  --accent: #86a8e8; --accent-soft: #232d40; --ok: #6fbf8c; --warn: #d9a650; --bad: #e57f80; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #141518; --panel: #1b1d21; --ink: #e7e8ea; --muted: #9a9fa8; --faint: #636871; --line: #2b2e34; --soft: #23262b;
+  --accent: #86a8e8; --accent-soft: #232d40; --ok: #6fbf8c; --warn: #d9a650; --bad: #e57f80; color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14.5px/1.55 var(--sans); }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
+button:hover { border-color: var(--faint); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+button.link { border: none; color: var(--muted); padding: 2px 4px; }
+button.link:hover { color: var(--accent); }
+select, input, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 13px; }
+.app { display: grid; grid-template-columns: 300px minmax(0, 1fr) auto; height: 100vh; }
+
+/* sidebar */
+aside { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 16px 12px; }
+.brand { display: flex; align-items: center; gap: 6px; margin: 0 6px 14px; font-weight: 600; font-size: 14px; }
+.brand span { flex: 1; }
+.tabs { display: flex; gap: 2px; margin: 0 2px 12px; background: var(--soft); border-radius: 7px; padding: 2px; }
+.tabs button { flex: 1; border: none; border-radius: 5px; color: var(--muted); }
+.tabs button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.group { font-size: 12px; color: var(--muted); margin: 16px 8px 4px; }
+.runitem { padding: 8px 10px; border-radius: 7px; cursor: pointer; margin-bottom: 1px; }
+.runitem:hover { background: var(--soft); }
+.runitem.on { background: var(--accent-soft); }
+.runitem .l { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runitem .s { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; white-space: nowrap; overflow: hidden; }
+.runitem .q { font-size: 13px; }
+.runitem .top { display: flex; gap: 8px; align-items: baseline; }
+.runitem .top .l { flex: none; }
+.runitem .top .h { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.runitem .sc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.runitem.on .sc { white-space: normal; }
+.runitem.cmp { box-shadow: inset 0 0 0 1px var(--accent); }
+.runitem .det { font-size: 12px; color: var(--muted); margin-top: 6px; display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; }
+.runitem .det b { font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+.runitem .det b.tail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.project { font-size: 12.5px; font-weight: 600; margin: 4px 8px 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+details.drafts { margin: 10px 8px 0; font-size: 12px; color: var(--muted); }
+details.drafts summary { cursor: pointer; }
+.hint { font-size: 11.5px; color: var(--faint); margin: 14px 8px 0; }
+.state { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+.state.bad { color: var(--bad); } .state.bad::before { background: var(--bad); }
+.state.ok { color: var(--ok); } .state.ok::before { background: var(--ok); }
+.state.warn { color: var(--warn); } .state.warn::before { background: var(--warn); }
+.state.live::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* main column: header, stepper, stream, composer */
+main { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100vh; }
+.wrap { max-width: 900px; margin: 0 auto; padding: 0 28px; width: 100%; }
+header { padding: 20px 0 6px; flex: none; }
+.crumb { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+#navbtn { display: none; }
+h1 { font-size: 18px; font-weight: 600; margin: 2px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: center; font-size: 13px; color: var(--muted); }
+.meta b { color: var(--ink); font-weight: 500; }
+.crumb .acts { margin-left: auto; display: flex; gap: 2px; }
+details.question { margin-top: 8px; font-size: 13px; color: var(--muted); }
+details.question summary { cursor: pointer; width: max-content; }
+details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240px; overflow: auto; margin-top: 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.stepper { flex: none; padding: 14px 0 12px; border-bottom: 1px solid var(--line); }
+.steps { display: flex; overflow-x: auto; scrollbar-width: none; }
+.st { flex: 1 0 58px; position: relative; text-align: center; cursor: pointer; padding-top: 14px; font-size: 11.5px; color: var(--faint); }
+.st::before { content: ""; position: absolute; top: 4px; left: 0; right: 0; height: 2px; background: var(--line); }
+.st:first-child::before { left: 50%; } .st:last-child::before { right: 50%; }
+.st.done::before, .st.current::before, .st.waiting::before, .st.failed::before { background: var(--faint); }
+.st:first-child.done::before { background: var(--faint); }
+.st i { position: absolute; top: 0; left: 50%; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: var(--panel); border: 2px solid var(--line); }
+.st.done { color: var(--muted); } .st.done i { background: var(--muted); border-color: var(--muted); }
+.st.current, .st.waiting { color: var(--ink); font-weight: 600; }
+.st.current i { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.st.waiting i { border-color: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
+.st.failed { color: var(--bad); } .st.failed i { background: var(--bad); border-color: var(--bad); width: 8px; height: 8px; margin-left: -4px; top: 1px; }
+.st.sel span { text-decoration: underline; text-underline-offset: 3px; }
+.stepnote { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 12px; align-items: center; }
+.views { display: flex; gap: 2px; background: var(--soft); border-radius: 7px; padding: 2px; }
+.views button { border: none; border-radius: 5px; color: var(--muted); padding: 1px 10px; font-size: 12.5px; }
+.views button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.figs { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; margin: 12px 0; }
+.fig { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; cursor: zoom-in; }
+.fig img { width: 100%; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; border-radius: 6px; display: block; }
+.fig .c { font-size: 13px; margin-top: 8px; }
+.fig .p { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
+.empty { color: var(--muted); font-size: 13.5px; padding: 18px 2px; }
+table.cmp { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; margin: 6px 0 4px; }
+table.cmp th:first-child { width: 40%; }
+table.cmp td { overflow-wrap: anywhere; }
+table.cmp th, table.cmp td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.cmp th { font-weight: 500; color: var(--muted); }
+table.cmp tr.ch td { color: var(--ink); font-weight: 500; }
+table.cmp .n { text-align: right; font-variant-numeric: tabular-nums; }
+table.cmp tr.ch td { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); }
+.term { border-bottom: 1px dotted var(--faint); cursor: help; }
+.ctx { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
+.ctx b { font-weight: 500; color: var(--ink); }
+table.t { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+table.t th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
+table.t td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.t tr:last-child td { border-bottom: none; }
+table.t td:first-child { max-width: 150px; min-width: 64px; }
+table.t.fixed { table-layout: fixed; } table.t.fixed td { overflow-wrap: anywhere; max-width: none; }
+table.t .n, .md td.n, .md th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.t td.clip { max-width: 0; width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table.t tr.row { cursor: pointer; } table.t tr.row:hover td { background: var(--soft); }
+table.t tr.more td { background: var(--bg); padding: 10px 12px; white-space: normal; }
+table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
+.ok-i { color: var(--ok); } .bad-i { color: var(--bad); }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 14px 0 6px; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font-size: 18px; font-weight: 600; line-height: 1.3; }
+.stat .v.hero { font-size: 22px; }
+.stat .d { font-size: 12px; color: var(--muted); }
+.stat .s { font-size: 11px; color: var(--faint); background: none; border: none; padding: 0; cursor: pointer; }
+.stat .s:hover { color: var(--accent); }
+.stat.wide { grid-column: span 2; }
+.md .doc-h1 { font-size: 12.5px; color: var(--muted); font-weight: 400; margin: 0 0 10px; }
+.cmp-h { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
+.stream { flex: 1; overflow-y: auto; min-height: 0; }
+.stream .wrap { padding-top: 14px; padding-bottom: 28px; }
+
+/* one card style; transitions are single lines */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 12px 0; }
+.card .head { display: flex; gap: 10px; align-items: baseline; }
+.card .head .t { flex: 1; font-weight: 600; min-width: 0; }
+.tm { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.card .body { margin-top: 6px; }
+.card .sub { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+.card .acts { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+.card .acts button { color: var(--muted); padding: 2px 9px; font-size: 12.5px; }
+.card .acts button:hover { color: var(--ink); }
+.card.need { border-left: 3px solid var(--warn); }
+.card.error .t { color: var(--bad); }
+.line { display: flex; gap: 8px; align-items: baseline; font-size: 13px; color: var(--muted); padding: 3px 2px; margin: 2px 0; }
+.line .x { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.line b { color: var(--ink); font-weight: 500; }
+.line.bad b { color: var(--bad); }
+.chat.user { background: var(--accent-soft); border-color: transparent; margin-left: 12%; }
+.chat.feedback { border-style: dashed; }
+.sev { font-size: 11px; font-weight: 600; letter-spacing: .02em; margin-right: 6px; }
+.sev.HIGH { color: var(--bad); } .sev.MEDIUM { color: var(--warn); } .sev.LOW { color: var(--muted); }
+.thumb { max-width: 100%; width: 360px; border-radius: 6px; cursor: zoom-in; display: block; margin-top: 10px; background: #fff; border: 1px solid var(--line); }
+.cite { font-size: 12px; background: var(--accent-soft); color: var(--accent); border: none; border-radius: 4px; padding: 0 5px; }
+.uncited { margin-top: 6px; font-size: 12px; color: var(--warn); }
+.stream code { font-family: inherit; background: var(--soft); border-radius: 4px; padding: 0 4px; font-size: .95em; }
+.stream pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; font: inherit; font-size: 13px; }
+
+/* composer: sticky, always visible */
+.composer { flex: none; border-top: 1px solid var(--line); background: var(--panel); padding: 10px 0 12px; }
+.composer .row { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea { flex: 1; min-height: 40px; max-height: 30vh; resize: vertical; padding: 9px 12px; border-radius: 8px; font-size: 14px; background: var(--bg); }
+.composer .opts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.composer .opts input { flex: 1; min-width: 160px; }
+.chip { font-size: 12px; background: var(--accent-soft); color: var(--accent); border-radius: 12px; padding: 1px 8px; }
+
+/* side panel: the only place with mono ids and paths */
+.side { width: 0; overflow: hidden; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; height: 100vh; }
+.side.open { width: min(46vw, 640px); }
+.side .bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.side .bar .t { flex: 1; font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.side .content { overflow: auto; padding: 16px 20px; flex: 1; }
+.side img { max-width: 100%; background: #fff; }
+.side pre, .side code { font-family: var(--mono); font-size: 12.5px; }
+.side td code { word-break: break-all; }
+.side pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; }
+.lines div { white-space: pre-wrap; font: 12px/1.5 var(--mono); padding: 0 6px; }
+.lines div.hit { background: var(--accent-soft); }
+.md h1 { font-size: 18px; white-space: normal; } .md h2 { font-size: 16px; margin-top: 18px; } .md h3 { font-size: 14.5px; }
+.md table { border-collapse: collapse; font-size: 13px; margin: 8px 0; }
+.md table.t { margin: 10px 0 14px; }
+.md .hit { background: var(--accent-soft); }
+.md p:first-child { margin-top: 0; } .md p:last-child { margin-bottom: 0; }
+.muted { color: var(--muted); } .small { font-size: 12.5px; }
+.kv td { padding: 2px 12px 2px 0; vertical-align: top; font-size: 13px; }
+.banner { position: fixed; top: 0; left: 0; right: 0; z-index: 30; background: var(--bad); color: #fff; font-size: 13px; padding: 6px 16px; display: flex; gap: 12px; align-items: center; }
+.banner span { flex: 1; } .banner button { color: #fff; border-color: rgba(255,255,255,.5); padding: 1px 8px; }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 420px; }
+.toast.on { opacity: .95; }
+.answer { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+.answer textarea { width: 100%; min-height: 50px; }
+label.inline { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; font-size: 13px; }
+
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  aside { display: none; position: fixed; inset: 0 auto 0 0; width: 84vw; z-index: 10; box-shadow: 0 0 24px rgba(0,0,0,.25); }
+  .app.nav aside { display: block; }
+  #navbtn { display: inline-block; }
+  .wrap { padding: 0 16px; }
+  header { padding-top: 12px; }
+  .st { flex-basis: 30px; } .st span { display: none; }
+  .st.current span, .st.waiting span, .st.failed span { display: inline; position: relative; white-space: nowrap; }
+  .chat.user { margin-left: 0; }
+  .side { position: fixed; top: 0; right: 0; z-index: 20; }
+  .side.open { width: 100vw; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside>
+    <div class="brand"><span>Run console</span><button class="link" id="theme" title="Light or dark">◐</button></div>
+    <div class="tabs"><button id="tab-runs" class="on">Runs</button><button id="tab-learn">Learning</button></div>
+    <div id="sidebar"></div>
+  </aside>
+  <main>
+    <header><div class="wrap">
+      <div class="crumb"><button class="link" id="navbtn">☰ Runs</button><span id="crumb"></span><span class="acts" id="acts"></span></div>
+      <h1 id="title">Select a run</h1>
+      <div class="meta" id="meta"></div>
+      <div class="ctx" id="stopline" hidden></div>
+      <details class="question" id="qbox" hidden><summary>Question</summary><div id="qtext"></div></details>
+    </div></header>
+    <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote"><span class="views"><button id="v-stream" class="on">Stream</button><button id="v-figs">Figures</button></span><span id="stepnote"></span></div></div></div>
+    <div class="stream" id="streambox"><div class="wrap" id="stream"></div></div>
+    <div class="composer"><div class="wrap">
+      <div class="row">
+        <textarea id="text" rows="1" placeholder="Ask, or give guidance or a correction…"></textarea>
+        <button id="send" class="primary">Send</button>
+      </div>
+      <div class="opts">
+        <select id="kind" title="What this message is"></select>
+        <select id="layer" title="Which layer the feedback is about"></select>
+        <input id="proposed" placeholder="proposed change (optional)">
+        <button id="record" title="Record as feedback without asking Claude">Record only</button>
+        <span id="anchor"></span>
+        <span style="flex:1"></span>
+        <span id="chatspend"></span>
+      </div>
+    </div></div>
+  </main>
+  <div class="side" id="side">
+    <div class="bar"><span class="t" id="side-title"></span><button id="side-close">Close</button></div>
+    <div class="content" id="side-content"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<div class="banner" id="banner" hidden><span id="banner-text"></span><button id="banner-retry">Retry</button><button id="banner-close">Dismiss</button></div>
+<script>
+"use strict";
+const TOKEN = "__CONSOLE_TOKEN__";
+const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
+// Errors are never swallowed: a failed fetch or render shows one line at the top of the page.
+function fail(where, e) { $("banner-text").textContent = `${where} failed: ${e && e.message ? e.message : e}`; $("banner").hidden = false; console.error(where, e); }
+window.addEventListener("error", (e) => fail("Page script", e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => fail("Page script", e.reason));
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": TOKEN }, body: JSON.stringify(body) };
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), body === undefined ? 60000 : 600000);
+  let r;
+  try { r = await fetch(path, { ...opt, signal: ctl.signal }); }
+  catch (e) { throw new Error(e.name === "AbortError" ? `${path.split("?")[0]}: no answer from the console server within ${body === undefined ? 60 : 600} s` : `${path.split("?")[0]}: ${e.message} (is the console server running?)`); }
+  finally { clearTimeout(timer); }
+  const j = await r.json().catch(() => ({ error: "not JSON (" + r.status + ")" }));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+const q = (o) => Object.entries(o).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+
+// ---- words: stage labels, run state, short title, times
+const STAGE = { SPEC: "Spec", SIGN: "Sign", EVIDENCE: "Evidence", ENGINE_CHOICE: "Engine", CONFIGURE: "Configure", ANALYZE: "Analyze",
+  CRITIQUE: "Critique", GATE: "Gate", FIX_LOOP: "Fix loop", OWNER_DECISION: "Owner", WRITE: "Write", PRESENTATION: "Present", FINAL: "Final" };
+const stage = (s) => STAGE[s] || String(s || "").toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+const FAIL = ["run_failed", "completed_gate_error", "completed_gate_not_accepted", "completed_scope_declined"];
+function runState(r) {   // r: a run summary or a run's state; returns [class, words]
+  const status = r.status, fail = r.fail_statuses || FAIL;
+  if (r.error) return ["bad", "Unreadable"];
+  if (status && fail.includes(status)) return ["bad", "Failed"];
+  if (status) return [status === "completed" || status === "completed_with_report_restored" ? "ok" : "warn", "Completed"];
+  if (r.paused) return ["warn", "Waiting for you"];
+  if (r.finished || r.state === "FINAL") return ["", "Ended"];
+  return ["", "At " + stage(r.state)];
+}
+function shortTitle(s) {   // the first sentence, at most ~90 characters, cut at a word
+  const t = String(s || "").trim().split(/\n/)[0], m = t.match(/^.*?[.?!](?=\s|$)/), f = m ? m[0] : t;
+  return f.length <= 90 ? f : f.slice(0, 90).replace(/\s+\S*$/, "") + "…";
+}
+const day = (at) => { const d = new Date(at); return isNaN(d) ? "" : d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" }); };
+const hhmm = (at) => (at && /T\d\d:\d\d/.test(at)) ? at.slice(11, 16) : "";
+const when = (at) => at ? `<span class="tm" title="${esc(at)}">${esc(day(at))} ${esc(hhmm(at))}</span>` : "";
+const usd = (x) => "$" + Number(x || 0).toFixed(2);
+function num(v, unit) {   // 12.34M, 86.6M, 147.1K, $260.7M; small values as is with separators
+  if (v == null || v === "" || isNaN(v)) return v == null ? "—" : String(v);
+  const a = Math.abs(v), pre = unit === "usd" ? "$" : "";
+  const c = a >= 1e9 ? (v / 1e9).toFixed(2) + "B" : a >= 1e6 ? (v / 1e6).toFixed(2) + "M" : a >= 1e4 ? (v / 1e3).toFixed(1) + "K"
+    : Number.isInteger(v) ? v.toLocaleString("en-US") : Number(v.toPrecision(6)).toLocaleString("en-US", { maximumFractionDigits: 6 });
+  return pre + c;
+}
+const UNIT = { dalys: "DALYs", usd: "", units: "units" };
+const unitWord = (u) => (u in UNIT ? UNIT[u] : u);
+const pct = (x, d = 1) => x == null ? "—" : `${Number(x).toFixed(d)}%`;
+function uiText(lo, hi, level) {   // "95% UI 11.29–13.65M"
+  const sfx = (v) => { const a = Math.abs(v); return a >= 1e9 ? "B" : a >= 1e6 ? "M" : a >= 1e4 ? "K" : ""; };
+  const s = sfx(hi), f = (v) => num(v).replace(/[BMK]$/, "");
+  return `${Math.round((level || 0.95) * 100)}% ${T("UI")} ${f(lo)}–${f(hi)}${s && sfx(lo) === s ? s : ""}`;
+}
+function T(key, label) {   // a glossary term: dotted underline, the definition and its source on hover
+  const g = S.meta && S.meta.glossary && S.meta.glossary[key];
+  return g ? `<span class="term" tabindex="0" title="${esc(g.text + " (" + g.source + ")")}">${esc(label || key)}</span>` : esc(label || key);
+}
+function bench(text) {     // benchmark ids in run text, defined by the run's engine card
+  const B = (S.run && S.run.benchmarks) || {};
+  return esc(text).replace(/\bB\d+[a-z]?\b/g, (id) => B[id] ? `<span class="term" tabindex="0" title="${esc(`${id}: ${B[id].metric || ""}. Role ${String(B[id].role || "?").replace("_", " ")}; target ${B[id].target} (band ${(B[id].band || []).join("–")}); engine ${B[id].computed}; ${String(B[id].status || "").replace(/_/g, " ")}.`)}">${id}</span>` : id);
+}
+const clip = (t, n) => (t.length <= n ? t : t.slice(0, n).replace(/\s+\S*$/, "") + "…");
+const ctx = (what, needs) => `<div class="ctx">${what} <b>Needs you: ${needs}</b></div>`;
+const fmtS = (s) => s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : s + " s";
+
+// ---- markdown (small, local) with [[file#anchor]] citations
+function inline(s) {
+  s = esc(s);
+  s = s.replace(/\[\[([^\]#]+)(?:#([^\]]*))?\]\]/g, (m, f, a) => `<button class="cite" data-file="${f.trim()}" data-anchor="${(a || "").trim()}">${f.trim()}${a ? "#" + a.trim() : ""}</button>`);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
+  return s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");   // links render as text: nothing leaves the page
+}
+const NUMCELL = /^[-+]?[$]?\d[\d,]*(\.\d+)?%?$/;
+function cellNum(c) { const t = c.trim(); if (!NUMCELL.test(t)) return null; const v = Number(t.replace(/[$,%]/g, "")); return /\./.test(t) || t.includes("%") || Math.abs(v) < 10000 ? t : t.replace(/[\d.]+/, (x) => Number(x).toLocaleString("en-US")); }
+function md(src, doc) {
+  const L = String(src || "").split("\n"), out = []; let i = 0;
+  while (i < L.length) {
+    let l = L[i];
+    if (/^```/.test(l)) { const b = []; i++; while (i < L.length && !/^```/.test(L[i])) b.push(L[i++]); i++; out.push("<pre>" + esc(b.join("\n")) + "</pre>"); continue; }
+    let m = l.match(/^(#{1,4})\s+(.*)/);
+    if (m && doc && m[1].length === 1) { out.push(`<div class="doc-h1" data-h="${esc(m[2].trim())}">${inline(m[2])}</div>`); i++; continue; }
+    if (m) { out.push(`<h${m[1].length} data-h="${esc(m[2].trim())}">${inline(m[2])}</h${m[1].length}>`); i++; continue; }
+    if (/^\s*\|/.test(l)) { const rows = []; while (i < L.length && /^\s*\|/.test(L[i])) rows.push(L[i++]);
+      const cells = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const body = rows.slice(1).filter((r) => !/^\s*\|?\s*:?-{2,}/.test(r)).map(cells), ncol = cells(rows[0]).length;
+      const isNum = [...Array(ncol).keys()].map((j) => body.length && body.every((r) => r[j] == null || r[j] === "" || cellNum(r[j]) != null));
+      let h = '<table class="t">'; rows.forEach((r, k) => { if (/^\s*\|?\s*:?-{2,}/.test(r)) return; const tag = k === 0 ? "th" : "td"; h += "<tr>" + cells(r).map((c, j) => `<${tag}${isNum[j] ? ' class="n"' : ""}>${isNum[j] && k ? esc(cellNum(c) || c) : inline(c)}</${tag}>`).join("") + "</tr>"; });
+      out.push(h + "</table>"); continue; }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) { const ord = /^\s*\d+\./.test(l), it = [];
+      while (i < L.length && /^\s*([-*]|\d+\.)\s+/.test(L[i])) { let t = L[i++].replace(/^\s*([-*]|\d+\.)\s+/, ""); while (i < L.length && /^\s{2,}\S/.test(L[i]) && !/^\s*([-*]|\d+\.)\s+/.test(L[i])) t += " " + L[i++].trim(); it.push("<li>" + inline(t) + "</li>"); }
+      out.push((ord ? "<ol>" : "<ul>") + it.join("") + (ord ? "</ol>" : "</ul>")); continue; }
+    if (/^>\s?/.test(l)) { const b = []; while (i < L.length && /^>\s?/.test(L[i])) b.push(L[i++].replace(/^>\s?/, "")); out.push("<blockquote>" + inline(b.join(" ")) + "</blockquote>"); continue; }
+    if (!l.trim()) { i++; continue; }
+    const p = []; while (i < L.length && L[i].trim() && !/^(#{1,4}\s|```|\s*\||\s*([-*]|\d+\.)\s+|>)/.test(L[i])) p.push(L[i++]);
+    if (!p.length) p.push(L[i++]);
+    out.push("<p>" + inline(p.join(" ")) + "</p>");
+  }
+  return '<div class="md">' + out.join("\n") + "</div>";
+}
+
+// ---- sidebar: runs and the learning view
+const PAGE_NEEDS = ["runs", "projects", "kinds", "layers", "chat", "glossary"];   // RC17: /api/runs must carry these
+async function loadRuns() {
+  if (!S.meta) $("sidebar").innerHTML = '<div class="muted small" style="margin:0 8px">Loading runs…</div>';
+  try {
+    const j = await api("/api/runs"), missing = PAGE_NEEDS.filter((k) => !(k in j));
+    if (missing.length) throw new Error(`/api/runs lacks ${missing.join(", ")}: restart the console server from this checkout`);
+    S.runs = j.runs; S.meta = j;
+  } catch (e) { $("sidebar").innerHTML = `<div class="card error small">${esc(e.message)}</div>`; fail("Loading runs", e); return; }
+  $("banner").hidden = true;
+  try { renderLoaded(); } catch (e) { fail("Showing runs", e); }
+}
+function renderLoaded() {
+  if (!$("kind").options.length) {
+    $("kind").innerHTML = S.meta.kinds.map((k) => `<option>${k}</option>`).join("");
+    $("layer").innerHTML = S.meta.layers.map((k) => `<option>${k}</option>`).join("");
+    syncComposer();
+  }
+  renderChatSpend();
+  if (S.tab === "runs") renderRuns();
+  const first = ((S.meta.projects || [])[0] || {}).lineage || [];
+  if (!S.runId && S.runs.length) selectRun(first.length ? first[first.length - 1] : S.runs[0].id);
+}
+function renderChatSpend() {
+  const c = S.meta && S.meta.chat; if (!c) return;
+  $("chatspend").textContent = c.key ? `chat ${usd(c.spent)} of ${usd(c.cap)}` : "Chat is off (no API key). Record only still works.";
+  $("send").disabled = !c.key; $("send").title = c.key ? "Send (Ctrl or Cmd + Enter)" : "Chat is off: ANTHROPIC_API_KEY is unset or a placeholder.";
+}
+const runLabel = (r) => r.label || r.name;
+const CHIP = { completed: "ok", failed: "bad", stopped: "", running: "live", waiting: "warn", ended: "" };
+function runRow(r, sub) {
+  const cls = CHIP[r.chip] != null ? CHIP[r.chip] : runState(r)[0], words = r.chip || runState(r)[1];
+  const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : (r.engine || "");
+  const on = r.id === S.runId, cmp = S.cmp === r.id;
+  const det = on ? `<div class="det">
+      ${eng ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
+      ${r.ended ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
+      ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui_vals ? " (" + uiText(...r.ui_vals) + ")" : r.ui ? " (95% UI " + esc(r.ui.replace(/([0-9.]+)M-/, "$1–")) + ")" : ""}</b>` : ""}
+      ${r.shift ? `<span>largest shifts</span><b>${(r.shifts || []).length ? r.shifts.map((x) => `${esc(x.name)}: ${x.before} → ${x.after} units`).join("<br>") : esc(r.shift)}<br><span class="muted">vs ${esc(r.shift_vs)}</span></b>` : ""}
+      ${r.spent_usd != null ? `<span>model spend</span><b>${usd(r.spent_usd)}</b>` : ""}
+      ${r.spec_sha ? `<span>spec</span><b>${esc(r.spec_sha.slice(0, 10))}</b>` : ""}
+      ${r.signed_at ? `<span>signed</span><b>${esc(day(r.signed_at))} ${esc(hhmm(r.signed_at))} by ${esc(r.signed_by || "?")}</b>` : ""}
+      ${r.launch_commit ? `<span>commit</span><b>${esc(r.launch_commit)}</b>` : ""}
+      ${r.signoff_note ? `<span>sign-off note</span><b>${esc(r.signoff_note.length > 80 ? r.signoff_note.slice(0, 80).replace(/\s+\S*$/, "") + "…" : r.signoff_note)} <button class="link" data-note="${esc(r.id)}">full note</button></b>` : ""}
+      <span>folder</span><b>${esc(r.full_label || r.label || r.name)}</b><span>path</span><b class="tail" title="${esc(r.id)}">${esc(r.id)}</b></div>` : "";
+  return `<div class="runitem ${on ? "on" : ""} ${cmp ? "cmp" : ""}" data-run="${esc(r.id)}">
+    <div class="top"><span class="l">${esc(runLabel(r))}</span><span class="state ${cls}">${esc(words)}</span>${r.headline_number ? `<span class="h">${esc(r.headline_number)}</span>` : ""}</div>
+    <div class="sc" title="${esc(r.signoff_note || "")}">${r.mirror ? '<span class="chip">live mirror</span> ' : ""}${esc(sub)}</div>${det}</div>`;
+}
+function renderRuns() {
+  const by = {}; S.runs.forEach((r) => (by[r.id] = r));
+  const pjs = (S.meta && S.meta.projects) || [{ question: "", lineage: S.runs.map((r) => r.id), drafts: [] }];
+  let h = "";
+  for (const pj of pjs) {
+    h += `<div class="project" title="${esc(pj.question)}">${esc(pj.title || shortTitle(pj.question) || "Runs")}</div>`;
+    for (const id of [...pj.lineage].reverse()) {   // newest on top
+      const r = by[id]; if (!r) continue;
+      const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : "";
+      const sub = r.relation ? `${r.relation}${r.prev && by[r.prev] ? " " + runLabel(by[r.prev]) : ""} · ${r.scenario}` : [eng, r.ended, r.started ? day(r.started) : ""].filter(Boolean).join(" · ");
+      h += runRow(r, sub);
+    }
+    if (pj.drafts.length) h += `<details class="drafts"><summary>Drafts and staging copies (${pj.drafts.length})</summary>${pj.drafts.map((id) => by[id] ? runRow(by[id], by[id].draft || "") : "").join("")}</details>`;
+  }
+  h += S.runs.length > 1 ? '<div class="hint">Shift-click a second run to compare.</div>' : "";
+  $("sidebar").innerHTML = S.runs.length ? h : '<div class="muted small">No runs under the roots.</div>';
+  document.querySelectorAll(".runitem[data-run]").forEach((el) => (el.onclick = (e) => {
+    if (e.shiftKey && S.runId && el.dataset.run !== S.runId) { S.cmp = el.dataset.run; renderRuns(); renderCompare(); return; }
+    $("app").classList.remove("nav"); S.cmp = null; selectRun(el.dataset.run);
+  }));
+  document.querySelectorAll("[data-note]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const r = S.runs.find((x) => x.id === b.dataset.note); side("sign-off note · " + runLabel(r), `<p>${esc(r.signoff_note)}</p><p class="small muted">${esc(r.signed_by || "")} · ${esc(r.signed_at || "")} · decision_spec.signoff.json</p>`); }));
+  const d = document.querySelector("details.drafts"); if (d && d.querySelector(".runitem.on")) d.open = true;
+}
+async function renderLearning() {
+  let j; try { j = await api("/api/learning"); } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  let h = `<div class="small muted" style="margin:0 8px">${j.n} feedback item(s) across ${S.runs.length} run(s), by layer.</div><div style="margin:8px"><button id="export">Export digest</button></div>`;
+  for (const [layer, items] of Object.entries(j.by_layer)) {
+    if (!items.length) continue;
+    h += `<div class="group">${esc(layer)} (${items.length})</div>`;
+    for (const r of items) h += `<div class="runitem" title="${esc(r.run)}"><div class="q"><b>${esc(r.kind)}</b>${r.verdict ? " · " + esc(r.verdict) : ""}: ${esc(r.text)}</div>
+      ${r.proposed_change ? `<div class="s">→ ${esc(r.proposed_change)}</div>` : ""}</div>`;
+  }
+  if (j.errors.length) h += `<div class="card error small">${j.errors.map(esc).join("<br>")}</div>`;
+  $("sidebar").innerHTML = h;
+  $("export").onclick = async () => { try { const r = await api("/api/export", {}); toast("Digest written: " + r.path); } catch (e) { toast(e.message); } };
+}
+
+// ---- one run: header, stepper, stream
+async function selectRun(id) { S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns(); }
+async function refresh() {
+  if (!S.runId) return;
+  try { S.run = await api("/api/run?" + q({ run: S.runId })); } catch (e) { $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; fail("Loading the run", e); return; }
+  try { renderHeader(); renderStepper(); renderStream(); } catch (e) { fail("Showing the run", e); }
+}
+function renderHeader() {
+  const r = S.run, st = r.state || {}, c = r.compute || {}, sp = r.stepper || { stages: [] };
+  const summary = S.runs.find((x) => x.id === S.runId) || {};
+  const question = st.question || "";
+  $("crumb").textContent = runLabel(summary.label ? summary : r);
+  $("title").textContent = shortTitle(question) || r.name;
+  $("title").title = question;
+  $("qbox").hidden = !question; $("qtext").textContent = question;
+  // at most four items: state and round, engine batch, spend, compute used
+  const [cls0, words] = runState({ ...st, status: r.status || st.status, finished: r.finished, error: r.error, fail_statuses: r.fail_statuses });
+  const failed = sp.stages.find((s) => s.status === "failed"), cls = summary.chip === "stopped" ? "" : cls0;
+  const calls = c.calls || [], k = calls.find((x) => x.live) || calls[0];
+  const items = [];
+  items.push(`<span class="state ${cls} ${c.live ? "live" : ""}" title="${esc(r.error || (failed && failed.why) || r.status || "")}">${esc(failed ? "Failed in " + stage(failed.state) : c.live ? "Running · " + stage(st.state) : (summary.chip === "stopped" || !summary.chip) && r.stop ? "Stopped in " + stage(st.state).toLowerCase() : words)}${st.round != null ? ` <span class="muted">· round ${esc(st.round)} of ${esc(st.max_rounds)}</span>` : ""}</span>`);
+  if (k && k.done != null) items.push(k.live ? `<span>Engine batch <b>${k.done}/${esc(k.n)}</b>${k.eta_s != null ? " · ETA " + fmtS(k.eta_s) : ""}</span>`
+                                           : `<span title="the run is not live; this progress record was left behind">Engine batch interrupted at <b>${k.done}/${esc(k.n)}</b></span>`);
+  items.push(`<span><b>${usd(st.spent_usd)}</b>${st.budget_usd != null ? " of " + usd(st.budget_usd) : ""} spent</span>`);
+  const reused = (summary.batches || r.batches || []).filter((b) => b.reused);
+  items.push(`<span title="${esc(c.cap_source || "")}${c.error ? " · " + esc(c.error) : ""}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
+  const task = (r.stop || "").split(": ")[1];
+  const where = (r.stop || "").split(":")[0].replace(/ \(round (\d+) of \d+\)/, ", round $1");
+  $("stopline").innerHTML = r.stop ? `<span title="${esc(task || "")}">Stopped ${esc(where)}; no reason recorded.</span>${r.operator_note ? ` <button class="link" id="b-note">note</button>` : ""}` : "";
+  if ($("b-note")) $("b-note").onclick = () => side("operator note · progress.md", `<p>${esc(r.operator_note)}</p><p class="small muted">The latest note in progress.md, written after this run's last transition.</p>`);
+  $("stopline").hidden = !r.stop;
+  $("meta").innerHTML = items.join("");
+  $("acts").innerHTML = `<button class="link" id="b-results">Results</button><button class="link" id="b-compute">Compute</button><button class="link" id="b-build">Build on this run</button>`;
+  $("b-results").onclick = () => openDoc();
+  $("b-compute").onclick = () => openCompute();
+  $("b-build").onclick = buildOn;
+}
+function renderStepper() {
+  const sp = S.run.stepper;
+  if (!sp) { $("stepper").innerHTML = ""; $("stepnote").textContent = "No stage history."; return; }
+  const tip = { done: "done", current: "current", waiting: "waiting for you", failed: "failed", skipped: "not reached", todo: "not reached" };
+  const ended = sp.stages.some((s) => s.status === "failed");   // a failed run's FINAL is not a step reached
+  $("stepper").innerHTML = sp.stages.map((s) => `<div class="st ${ended && s.state === "FINAL" ? "todo" : s.status} ${S.filter === s.state ? "sel" : ""}" data-s="${s.state}" title="${esc(stage(s.state) + ": " + (s.why || tip[s.status] || s.status))}"><i></i><span>${esc(stage(s.state))}</span></div>`).join("");
+  const note = [];
+  if (sp.fix_rounds) note.push(`${sp.fix_rounds} fix-loop round${sp.fix_rounds > 1 ? "s" : ""}`);
+  if (S.filter) note.push(`showing ${esc(stage(S.filter))} <button class="link" id="nofilter">show all</button>`);
+  $("stepnote").innerHTML = note.join(" · "); $("stepnote").hidden = !note.length;
+  document.querySelectorAll(".st").forEach((el) => (el.onclick = () => { S.filter = S.filter === el.dataset.s ? null : el.dataset.s; renderStepper(); renderStream(); }));
+  if ($("nofilter")) $("nofilter").onclick = () => { S.filter = null; renderStepper(); renderStream(); };
+}
+$("v-stream").onclick = () => setView("stream");
+$("v-figs").onclick = () => setView("figs");
+function setView(v) { S.view = v; S.cmp = null; $("v-stream").classList.toggle("on", v === "stream"); $("v-figs").classList.toggle("on", v === "figs"); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+function renderFigures() {
+  const figs = S.run.cards.filter((c) => c.kind === "figure"), sp = S.run.stepper || { stages: [] };
+  $("v-figs").textContent = figs.length ? `Figures (${figs.length})` : "Figures";
+  if (!figs.length) {
+    const an = sp.stages.find((s) => s.state === "ANALYZE") || {};
+    const why = an.status === "failed" ? "the run ended in ANALYZE before it wrote any"
+      : an.status === "current" || an.status === "waiting" ? "ANALYZE is still running"
+      : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
+    return `<div class="empty">No figures yet: ${why}.</div>`;
+  }
+  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" alt="">
+    <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
+}
+async function renderCompare() {
+  const order = ((S.meta.projects || []).find((p) => p.lineage.includes(S.runId)) || { lineage: [] }).lineage;
+  const [a, b] = order.indexOf(S.cmp) >= 0 && order.indexOf(S.cmp) < order.indexOf(S.runId) ? [S.cmp, S.runId] : [S.runId, S.cmp];   // older on the left
+  let j; try { j = await api("/api/compare?" + q({ a, b })); } catch (e) { toast(e.message); return; }
+  const val = (v) => { if (v == null) return "—"; try { const x = JSON.parse(v); if (Array.isArray(x)) return x.length === 2 && x.every((n) => typeof n === "number") ? `${x[0]}–${x[1]}` : x.join(", "); return String(x); } catch (e) { return String(v); } };
+  const [A, B] = j.labels, row = (k, a, b, ch) => `<tr class="${ch ? "ch" : ""}"><td>${k}</td><td>${a}</td><td>${b}</td></tr>`;
+  const eng = (e) => e && e.name ? esc(`${e.name} ${e.version || ""}`) : "—";
+  const head = `<table class="cmp"><tr><th></th><th>${esc(A)}</th><th>${esc(B)}</th></tr>`;
+  let h = `<div class="cmp-h" style="margin-top:4px">Compare ${esc(A)} and ${esc(B)} <button class="link" id="cmp-close">close</button></div>` + head +
+    row("status", esc(j.chips[0].join(" · ")), esc(j.chips[1].join(" · ")), false) +
+    row("engine", eng(j.engines[0]), eng(j.engines[1]), eng(j.engines[0]) !== eng(j.engines[1])) +
+    row("outcome", ...[0, 1].map((k) => esc(j.headline[k][0] || "—") + ((j.ui_vals || [])[k] ? " (" + uiText(...j.ui_vals[k]) + ")" : j.headline[k][1] ? " (95% UI " + esc(j.headline[k][1].replace(/([0-9.]+)M-/, "$1–")) + ")" : "")), j.headline[0][0] !== j.headline[1][0]) +
+    row("model spend", usd(j.spent[0]), usd(j.spent[1]), false) + "</table>";
+  h += `<div class="cmp-h">Signed spec</div>` + (j.spec_diff.length ? head + j.spec_diff.map((d) => row(esc(d.field.replace("decision_units.", "")), esc(val(d.before)), esc(val(d.after)), true)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">Same lineage fields in both specs.</div>');
+  const pk = Object.entries(j.packages);
+  h += `<div class="cmp-h">Units per package component</div>` + (pk.length ? `<table class="cmp"><tr><th></th><th class="n">${esc(A)}</th><th class="n">${esc(B)}</th><th class="n">change</th></tr>` + pk.map(([k, [a, b]]) => `<tr class="${a !== b ? "ch" : ""}"><td>${esc(k)}</td><td class="n">${a}</td><td class="n">${b}</td><td class="n">${b - a > 0 ? "+" : ""}${b - a || ""}</td></tr>`).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No allocation.csv in either run.</div>');
+  const ts = Object.entries(j.tests), v = (x) => x === "CHANGES_PLAN" ? "changes plan" : x === "NO_CHANGE" ? "no change" : x || "—";
+  h += `<div class="cmp-h">Decision tests: does the plan change?</div>` + (ts.length ? head + ts.map(([k, [a, b]]) => row(esc(k), esc(v(a)), esc(v(b)), a !== b)).join("") + "</table>" : '<div class="empty" style="padding:4px 0">No decision tests in either run.</div>');
+  $("stream").innerHTML = h; $("streambox").scrollTop = 0;
+  $("cmp-close").onclick = () => { S.cmp = null; renderRuns(); renderStream(); };
+}
+function renderStream() {
+  if (S.cmp) return renderCompare();
+  if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
+  renderFigures();
+  const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter), items = [], seen = {};
+  for (const c of cards) {   // blockers of one round and all decision tests read as one table each
+    const g = c.kind === "blocker" ? "b" + (c.round == null ? "" : c.round) : c.kind === "decision_test" ? "dt" : null;
+    if (!g) { items.push(c); continue; }
+    if (!seen[g]) { seen[g] = { kind: g === "dt" ? "dt_table" : "blocker_table", round: c.round, at: c.at, rows: [] }; items.push(seen[g]); }
+    seen[g].rows.push(c);
+  }
+  const top = !S.filter ? summaryBlock() : "";
+  $("stream").innerHTML = top + (items.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>');
+  wire($("stream"));
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+function summaryBlock(forDoc) {
+  const sm = (S.run && S.run.summary) || [];
+  if (!sm.length) return "";
+  const cite = (it) => `<button class="s" data-act="open" data-file="${esc(it.source)}" data-anchor-id="${esc(it.key.split(".").pop())}" title="${esc(it.source + " · " + it.key)}">${esc(it.source.split("/").pop())}</button>`;
+  const tiles = sm.map((it, i) => {
+    const label = it.unit === "dalys" ? T("DALYs") + " averted" : it.label === "allocatable" ? T("allocatable", "Allocatable") : esc(it.label.replace(/^./, (x) => x.toUpperCase()));
+    const v = it.unit === "units" ? `${num(it.value)}${it.of ? ` <span class="d">of ${num(it.of)} units</span>` : ""}` : num(it.value, it.unit);
+    const ui = it.ui ? `<div class="d">${uiText(it.ui[0], it.ui[1], it.level)} · median ${num(it.median)}</div>` : "";
+    return `<div class="stat ${i === 0 && it.ui ? "wide" : ""}"><div class="k">${label}</div><div class="v ${i === 0 && it.ui ? "hero" : ""}">${v}</div>${ui}<div>${cite(it)}${it.ui_source ? " " + cite({ source: it.ui_source, key: "fixed_plan" }) : ""}</div></div>`;
+  }).join("");
+  const covers = (sm[0] && sm[0].covers) || [];
+  return `<div class="stats">${tiles}</div>${covers.length ? `<div class="ctx">Point plan, ${T("comparator")}-based. The ${T("UI")} covers ${covers.map((c) => c === "calibration_partly_clamped" ? T("calibration partly clamped") : esc(c.replace(/_/g, " "))).join(", ")}. <b>Needs you: no.</b></div>` : ""}`;
+}
+function statusCell(p) { return p === true ? '<span class="ok-i">✓ pass</span>' : p === false ? '<span class="bad-i">✗ fail</span>' : '<span class="muted">? unknown</span>'; }
+function gateCard(c, head, open, comment) {
+  const dw = c.done_when || [];
+  const rows = dw.map((r) => {
+    const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"], n = checks.length;
+    return `<tr class="grp"><td colspan="5"><b>${esc(r.blocker)}</b> ${r.severity ? T(r.severity) : ""} · ${esc(r.reviewer || "")} — ${bench(clip((r.claim || "").split("\n")[0], 150))}</td></tr>` +
+      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</td>${k === 0 ? `<td rowspan="${n}">${statusCell(r.passes)}</td><td rowspan="${n}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${n}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
+  }).join("");
+  const act = c.action || "", rule = c.rule != null ? `rule ${c.rule}` : "";
+  const needs = act === "AWAIT_OWNER" ? "yes, answer the decision card below." : "no.";
+  return `<div class="card">${head(`${T("gate", "Gate")} round ${esc((c.title.match(/round (\d+)/) || [])[1] || "?")}: ${T(act)} <span class="muted small">(${T(rule)})</span>`)}
+    ${ctx(`${T("gate", "The gate")} decides whether the run may write its report. ${T("ACCEPT")} needs no unresolved ${T("HIGH")} ${T("blocker")} and no missing required artifact.`, needs)}
+    <div class="body">${esc(c.body)}</div>
+    ${rows ? `<div class="cmp-h">${T("done-when", "Done-when")} tests, by blocker</div><table class="t fixed"><colgroup><col style="width:11%"><col style="width:45%"><col style="width:9%"><col style="width:24%"><col style="width:11%"></colgroup><tr><th>criterion</th><th>what it checks</th><th>status</th><th>detail</th><th>test</th></tr>${rows}</table>` : ""}
+    <div class="acts">${open}${comment}</div></div>`;
+}
+function blockerTable(g) {
+  const rows = g.rows.map((c, i) => {
+    const a = esc(JSON.stringify(c.anchor || {}));
+    return `<tr class="row" data-tog="bt${g.round}_${i}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
+      <tr class="more" id="bt${g.round}_${i}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
+      <div class="acts"><button data-act="agree" data-anchor="${a}">Agree</button><button data-act="disagree" data-anchor="${a}">Disagree</button><button data-act="comment" data-anchor="${a}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+  }).join("");
+  const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
+  return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
+    ${ctx(`Findings from the critics. An open ${T("HIGH")} blocks ${T("ACCEPT")}; each has a ${T("done-when")} test. Click a row for the full claim.`, "no. Agree or disagree to record feedback.")}
+    <table class="t"><tr><th>id</th><th>severity</th><th>reviewer</th><th>${T("target stage")}</th><th>claim</th><th>status</th></tr>${rows}</table></div>`;
+}
+function dtTable(g) {
+  g.rows.forEach((c) => { if (c.changes == null) c.changes = c.verdict === "CHANGES_PLAN"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before ζ
+  const thrs = [...new Set(g.rows.map((c) => c.threshold_pct))], thr = thrs.length === 1 ? thrs[0] : undefined;
+  const first = (t) => { const m = String(t).match(/^.*?[.?!](?=\s|$)/); return m ? m[0] : String(t); };
+  const rows = g.rows.map((c, i) => { const body = c.body || "", lead = first(body), rest = body.slice(lead.length).trim();
+    return `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id).replace(/_/g, "_<wbr>")}</button></td>
+    <td>${bench(lead)}${rest ? ` <button class="link" data-more="dtm${i}">more</button><div id="dtm${i}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
+    <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}${c.unit && (c.values || []).some((v) => typeof v === "number") ? ` <span class="muted">${esc(c.unit)}</span>` : ""}</td>
+    <td>${c.changes ? '<span class="bad-i">yes</span>' : "no"}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
+    <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`; }).join("");
+  const ch = g.rows.filter((c) => c.changes).length;
+  return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${ch} of ${g.rows.length} change the plan</span>${when(g.at)}</div>
+    ${ctx(`Each test re-solves the plan with one input at other values. It changes the plan when more than ${thr != null ? pct(thr, 0) : "the threshold share"} of units change package.`, "no.")}
+    <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
+}
+function card(c) {
+  const a = c.anchor ? esc(JSON.stringify(c.anchor)) : "";
+  const comment = c.anchor ? `<button data-act="comment" data-anchor="${a}">Comment</button>` : "";
+  const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">Open</button>` : "";
+  const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
+  const line = (cls, txt) => `<div class="line ${cls || ""}"><span class="x">${txt}</span>${when(c.at)}</div>`;
+  switch (c.kind) {
+    case "blocker_table": return blockerTable(c);
+    case "dt_table": return dtTable(c);
+    case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
+    case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
+    case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
+    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}">
+      <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
+    case "gate": return gateCard(c, head, open, comment);
+    case "decision_needed": return decisionCard(c, head);
+    case "chat": {
+      const body = c.role === "assistant" ? md(c.text) : esc(c.text).replace(/\n/g, "<br>");
+      const unc = (c.uncited || []).length ? `<div class="uncited">Uncited: ${c.uncited.map(esc).join(" · ")}</div>` : "";
+      const cost = c.usd != null ? `<span class="tm" title="${c.model && c.model !== "claude-opus-5-5" ? "served by " + esc(c.model) + ", priced at Opus 5.5 rates" : ""}">$${Number(c.usd).toFixed(3)}</span>` : "";
+      return `<div class="card chat ${esc(c.role)}"><div class="head"><span class="t">${c.role === "assistant" ? "Claude" : "You"}</span>${cost}${when(c.at)}</div><div class="body">${body}</div>${unc}</div>`;
+    }
+    case "feedback": return `<div class="card chat feedback">${head("Feedback: " + esc(c.fb_kind) + (c.verdict ? " · " + esc(c.verdict) : ""), `<span class="tm">${esc(c.layer)}</span>`)}<div class="body">${esc(c.text)}</div>${c.anchor && c.anchor.file ? `<div class="sub">on ${esc(c.anchor.file)}${c.anchor.id ? "#" + esc(c.anchor.id) : ""}</div>` : ""}${c.proposed_change ? `<div class="sub">Proposed: ${esc(c.proposed_change)}</div>` : ""}</div>`;
+    case "error": return `<div class="card error">${head(esc(c.title))}<div class="body small">${esc(c.body)}</div><div class="acts">${open}</div></div>`;
+    default: return `<div class="card">${head(esc(c.title || c.kind))}<div class="body">${esc(c.body || "")}</div></div>`;
+  }
+}
+function decisionCard(c, head) {
+  const id = esc(c.id);
+  if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
+    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec">Sign</button><div class="small result"></div></div></div>`;
+  const items = (c.items || []).map((it, k) => `<div style="margin:12px 0"><b>${esc(it.finding)}</b>
+      <div class="sub">Why it bears on the decision: ${esc(it.reason)}</div><div class="sub">Gate finding: ${esc(it.claim)}</div>
+      ${(it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
+      <div style="margin-top:6px"><label class="inline"><input type="radio" name="a${k}${id}" value="accept" data-f="${esc(it.finding)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
+      <label class="inline"><input type="radio" name="a${k}${id}" value="decline" data-f="${esc(it.finding)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
+  return `<div class="card need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
+    <div class="answer" data-for="${id}"><textarea class="note" placeholder="Your note (required)"></textarea>
+    <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope">Submit answers</button><div class="small result"></div></div></div>`;
+}
+function wire(root) {
+  root.querySelectorAll("[data-more]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const m = document.getElementById(b.dataset.more); if (m) { m.hidden = !m.hidden; b.textContent = m.hidden ? "more" : "less"; } }));
+  root.querySelectorAll("tr[data-tog]").forEach((tr) => (tr.onclick = () => { const m = document.getElementById(tr.dataset.tog); if (m) m.hidden = !m.hidden; }));
+  root.querySelectorAll(".cite").forEach((b) => (b.onclick = () => openFile(b.dataset.file, b.dataset.anchor)));
+  root.querySelectorAll("[data-act]").forEach((b) => (b.onclick = () => act(b)));
+}
+async function act(b) {
+  const anchor = b.dataset.anchor ? JSON.parse(b.dataset.anchor) : null;
+  switch (b.dataset.act) {
+    case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
+    case "comment": return setAnchor(anchor, null);
+    case "agree":
+      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
+      return;
+    case "disagree": setAnchor(anchor, "disagree"); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
+    case "sign-spec": case "scope": {
+      const box = b.closest(".answer"), note = box.querySelector(".note").value, confirmed = box.querySelector(".confirm").checked;
+      const res = box.querySelector(".result");
+      let body = { run: S.runId, note, confirm: confirmed };
+      if (b.dataset.act === "scope") { body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
+      if (!confirmed) { res.textContent = "Tick the confirmation first."; return; }
+      if (!window.confirm(b.dataset.act === "scope" ? "Submit these answers through scripts/scope_signoff.py sign?" : "Sign the decision spec through agents/stage_machine.py sign?")) return;
+      try { const r = await api(b.dataset.act === "scope" ? "/api/scope" : "/api/sign_spec", body);
+        res.innerHTML = r.refused ? `<span style="color:var(--bad)">Not sent: ${esc(r.refused)}</span>` : `<span style="color:${r.ok ? "var(--ok)" : "var(--bad)"}">exit ${esc(r.rc)}</span><pre>${esc(r.out)}</pre><div class="muted">${esc((r.cmd || []).slice(1).join(" "))}</div>`;
+        if (r.ok) refresh(); } catch (e) { res.textContent = e.message; }
+      return;
+    }
+  }
+}
+
+// ---- composer
+function setAnchor(a, verdict) { S.anchor = a; S.verdict = verdict; renderAnchor(); $("text").focus(); }
+function renderAnchor() {
+  $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
+  if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
+}
+function syncComposer() { const steer = $("kind").value !== "question"; $("layer").style.display = steer ? "" : "none"; $("proposed").style.display = steer ? "" : "none"; $("record").style.display = steer ? "" : "none"; }
+$("kind").onchange = syncComposer;
+function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
+$("record").onclick = async () => {
+  const text = $("text").value.trim(); if (!text || !S.runId) return;
+  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
+    $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
+};
+$("send").onclick = async () => {
+  const text = $("text").value.trim(); if (!text || !S.runId) return;
+  const kind = $("kind").value, btn = $("send");
+  btn.disabled = true; btn.textContent = "Thinking…";
+  try {
+    const body = { run: S.runId, text, anchor: S.anchor, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
+    const r = await api("/api/chat", body);
+    if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
+    else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; }
+    refresh();
+  } catch (e) { toast(e.message); } finally { btn.textContent = "Send"; renderChatSpend(); }
+};
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("send").click(); });
+
+// ---- side panel: artifacts, results, compute, build-on
+function side(title, html) { $("side-title").textContent = title; $("side-content").innerHTML = html; $("side").classList.add("open"); wire($("side-content")); }
+$("side-close").onclick = () => { $("side").classList.remove("open"); stopLive(); };
+async function openFile(file, anchor) {
+  if (!S.runId) return;
+  const url = "/api/file?" + q({ run: S.runId, path: file });
+  if (/\.(png|jpe?g|svg)$/i.test(file)) {
+    const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
+    side(file, `<img src="${url}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-anchor="${esc(JSON.stringify({ kind: "figure", id: file, file }))}">Comment</button></div>`);
+    return;
+  }
+  let text;
+  try { const r = await fetch(url); text = await r.text(); if (!r.ok) throw new Error(JSON.parse(text).error); } catch (e) { side(file, `<div class="card error"><div class="body">${esc(e.message)}</div></div>`); return; }
+  if (/\.md$/i.test(file)) {
+    side(file + (anchor ? "#" + anchor : ""), md(text));
+    if (anchor) { const h = [...$("side-content").querySelectorAll("[data-h]")].find((e) => e.dataset.h.toLowerCase().includes(anchor.toLowerCase())); if (h) { h.classList.add("hit"); h.scrollIntoView({ block: "start" }); } }
+  } else {
+    const lines = text.split("\n"), key = (anchor || "").toLowerCase();
+    let hit = -1;
+    if (key) hit = lines.findIndex((l) => new RegExp(`(^|[\\s"'{:\\-])${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[\\s"',:}])`, "i").test(l));
+    side(file + (anchor ? "#" + anchor : ""), `<div class="lines">${lines.map((l, k) => `<div class="${k >= hit && hit >= 0 && k < hit + 12 ? "hit" : ""}" ${k === hit ? 'id="hit"' : ""}>${esc(l) || " "}</div>`).join("")}</div>`);
+    if ($("hit")) $("hit").scrollIntoView({ block: "center" });
+  }
+}
+function openDoc() {
+  const d = S.run.docs || {}, names = Object.keys(d);
+  if (!names.length) { side("results", '<div class="muted">No results.md, manuscript.md or report.md yet.</div>'); return; }
+  side(names.join(" · "), summaryBlock() + names.map((n) => (d[n].error ? `<div class="card error">${esc(d[n].error)}</div>` : md(d[n].text, true))).join("<hr>"));
+}
+async function openCompute() {
+  const c = S.run.compute || {};
+  const calls = (c.calls || []).map((k) => `<tr><td><code>${esc(k.fn)}</code></td><td>${esc(k.purpose || "")}</td><td>${k.done == null ? "?" : k.done}/${esc(k.n)}</td><td>${k.core_s == null ? "" : Math.round(k.core_s)}</td><td>${k.live ? "live" : "interrupted"}</td><td>${k.eta_s == null ? "" : fmtS(k.eta_s)}</td><td>${esc(k.error || "")}</td></tr>`).join("");
+  let h = `<h3>This run</h3><table class="kv"><tr><td>core-hours used</td><td>${esc(c.used_core_h)} of ${esc(c.cap_core_h)} <span class="muted small">(settled in the ledger${c.live ? ", plus live calls" : ""}; cap from ${esc(c.cap_source)})</span></td></tr><tr><td>finished calls</td><td>${esc(c.done_calls)}</td></tr></table>${c.error ? `<div class="card error">${esc(c.error)}</div>` : ""}
+    ${calls ? `<table class="kv"><tr class="muted"><td>fn</td><td>purpose</td><td>done/n</td><td>core-s</td><td>state</td><td>ETA</td><td></td></tr>${calls}</table>` : '<p class="muted small">No compute call in flight.</p>'}
+    <h3>Coiled</h3><label class="inline"><input type="checkbox" id="live" ${S.live ? "checked" : ""}> live (refreshes at most once a minute; each refresh attaches to the cluster read-only)</label><div id="cloud"></div>`;
+  side("compute", h);
+  $("live").onchange = () => { S.live = $("live").checked; if (S.live) { cloud(); S.liveTimer = setInterval(cloud, 60000); } else stopLive(); };
+  cloud(false);
+}
+function stopLive() { S.live = false; clearInterval(S.liveTimer); S.liveTimer = null; }
+async function cloud(force) {
+  let j; try { j = await api("/api/cloud?" + q({ live: (force === false ? false : S.live) ? 1 : 0 })); } catch (e) { if ($("cloud")) $("cloud").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
+  if (!$("cloud")) return;
+  if (!j.available) { $("cloud").innerHTML = `<p class="muted">${esc(j.why)}</p>`; return; }
+  const s = j.snapshot;
+  if (!s) { $("cloud").innerHTML = '<p class="muted small">No snapshot yet: turn on live.</p>'; return; }
+  const cl = s.clusters ? Object.entries(s.clusters).map(([k, v]) => `<tr><td>${k}</td><td><code>${esc(v.name || "")}</code></td><td><b>${esc(v.state)}</b></td></tr>`).join("") : "";
+  $("cloud").innerHTML = `<p class="small muted">snapshot ${when(s.at)}${j.next_refresh_s ? " · next refresh in " + j.next_refresh_s + " s" : ""}</p>${cl ? `<table class="kv">${cl}</table>` : ""}` +
+    ["status", "health", "report-cost"].map((k) => `<h4>${k} <span class="muted small">exit ${esc(s[k].rc)}</span></h4><pre>${esc(s[k].out)}</pre>`).join("");
+}
+async function buildOn() {
+  if (!window.confirm("Write a draft directory that reuses this run's assets? Nothing is launched.")) return;
+  try {
+    const r = await api("/api/build_on", { run: S.runId });
+    const b = (r.batches || []).map((x) => `<tr><td><code>${esc(x.out)}</code></td><td><b>${x.reused ? "reused" : "not reused"}</b></td><td>${esc(x.why)}</td></tr>`).join("");
+    side("build on this run", `<p>Draft written: <code>${esc(r.draft_dir)}</code></p><h3>Commands (run them yourself; they spend money)</h3>
+      <p class="small">Continue this run:</p><pre>${esc(r.commands.continue_this_run)}</pre><p class="small">New run on the same question:</p><pre>${esc(r.commands.new_run)}</pre>
+      <h3>Reused assets</h3><p class="small">spec ${esc(r.spec.copied_from || "none")} · sign-off ${esc(r.spec.signoff_status)} · engine <code>${esc(r.engine || "")}</code></p><p class="small">${(r.copied || []).map((x) => `<code>${esc(x)}</code>`).join(" ")}</p>
+      <h3>Stored engine batches</h3>${b ? `<table class="kv">${b}</table>` : '<p class="muted small">No stored batch.</p>'}
+      <h3>What needs harness support</h3><ul>${(r.harness_support || []).map((x) => `<li class="small">${esc(x)}</li>`).join("")}</ul>`);
+  } catch (e) { toast(e.message); }
+}
+
+// ---- tabs, theme, phone nav, refresh
+$("tab-runs").onclick = () => { S.tab = "runs"; $("tab-runs").classList.add("on"); $("tab-learn").classList.remove("on"); renderRuns(); };
+$("tab-learn").onclick = () => { S.tab = "learn"; $("tab-learn").classList.add("on"); $("tab-runs").classList.remove("on"); renderLearning(); };
+$("theme").onclick = () => { const d = document.documentElement, dark = d.dataset.theme ? d.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; d.dataset.theme = dark ? "light" : "dark"; };
+$("banner-close").onclick = () => ($("banner").hidden = true);
+$("banner-retry").onclick = () => { $("banner").hidden = true; loadRuns(); refresh(); };
+$("navbtn").onclick = (e) => { e.stopPropagation(); $("app").classList.toggle("nav"); };
+document.querySelector("main").addEventListener("click", () => $("app").classList.remove("nav"));
+{ const t = new URLSearchParams(location.search).get("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; }
+loadRuns();
+setInterval(() => { if (!document.hidden) { refresh(); loadRuns(); } }, 20000);
+</script>
+</body>
+</html>
