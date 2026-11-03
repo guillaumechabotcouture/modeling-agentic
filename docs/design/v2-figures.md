@@ -164,8 +164,48 @@ counts side by side across runs of one project.
 - **trajectories.yaml** is written by its own step after the analysis. It uses the analysis envelope, and the
   manifest is not changed.
 
-## 8. Open questions for the owner
+## 8. Review round 1, the three tiers, labels and boundaries (2026-11-02)
+
+**Codex round 1 (17 findings; each reproduced by a failing test first, r1 α/β).** The fit panel is withheld when
+per-unit model values are not stored, and calibration titles come from the actual residuals and clamping. An offline
+rebuild takes a stored row only when one float input, moved by at most 4 ulps, reproduces its job hash. In both
+re-rendered runs this was the design point's `unit.m0` (`exp(z)`), off by 1 ulp between the computing platform's
+libm and this one. The rebuild also checks every row's engine identity and the batch files' recorded hashes.
+Frontier and component-increment plans are guarded against model corrections. Infeasible envelopes are recorded,
+and other solver failures propagate. The frontier is on outcome averted. The dollars figure handles zero spend and
+counts every component. Free, harmful and undefined packages are shown. Sensitivity markers take verdict, share and
+threshold from one source. Runs are compared by package component sets. Interval levels are read from the artifacts.
+Trajectories require complete identical monthly grids, a current input hash and engine identity, burden and the
+calibrated attributes; the target interval is shifted per unit, and samples are labelled purposive. The hooks carry
+a contract version (`figures-hooks/1`).
+
+**Three tiers (owner).** Every figure records `tier: data_model | simulation | decision` in figures.yaml, and each
+tier gets one overview contact sheet.
+
+| Tier | Figures | Inputs |
+|---|---|---|
+| 1 data and model | data coverage and provenance, unit attributes, parameters, calibration, design coverage, sensitivity | units table, `data/derivations.yaml`, engine card and parameters, priors drawn, calibration, `analysis/batch/design.json` |
+| 2 simulation | timeline, trajectories (with checks), burn-in, seasonality, stochastic noise | the engine hooks; burn-in is not produced until a series covers it |
+| 3 decision | `DECISION_SETS[deliverable.kind]`: for `package_per_unit`, headline, allocation, stability, burden, dollars, frontier, cost per outcome, decision tests, comparison | figure_data and the analysis artifacts |
+
+An undeclared deliverable kind gets "not produced: no decision figure set declared for kind X". The trajectory
+figure carries the checks a later dynamics review can gate on: plan equals comparator before delivery,
+pre-intervention level against target, and the step at the end of delivery.
+
+**Labels and boundaries (owner): an unsigned presentation file.** Display names live in `presentation.yaml` (or
+`labels.yaml`) beside the spec and/or in a file given with `--labels`, merged id by id. They never live in the signed
+spec, which now refuses a `presentation` block with a pointer to the file. Labels are checked against the spec, and
+malformed files fail closed. Each figure's provenance records the presentation files and their sha.
+
+The same file can declare `boundaries: {path, feature_id, crosswalk: {path, unit_id, feature_id}, credit}`:
+- GeoJSON Polygon and MultiPolygon exterior rings, read with json and numpy only; no new dependency.
+- Units are matched through the crosswalk, or directly by the feature property.
+- Unmatched units are listed in the caption and figures.yaml.
+- Features outside the analysis are drawn grey for context.
+- Region outlines are drawn from polygon edges not shared within a region.
+- The credit line is printed on every map.
+
+## 9. Open questions for the owner
 
 1. The malaria engine v0.8 (`schedule`, `run_series`) and its proof: separate PR, run off the laptop.
-2. Whether `presentation.labels` belongs in the signed spec (it changes the spec hash, not the analysis) or in a
-   separate unsigned file. This note puts it in the spec, read only by the figures.
+2. Decided: labels and boundaries live in the unsigned presentation file (§8).

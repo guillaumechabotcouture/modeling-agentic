@@ -36,6 +36,17 @@ Hook 2, monthly series (a separate method, so `run` / `run_batch` are untouched)
     step mean of a state (a prevalence); "rate" is events per person-year over the step (an incidence). Metrics must
     be listed in the card's outputs["series"]. Packages share their history as in run_batch (common random numbers).
 
+Contract version `figures-hooks/1` (HOOKS_CONTRACT): an engine opts in with `hooks_contract = HOOKS_CONTRACT`; without
+it neither hook is offered, and another version is refused. Under version 1:
+  grid        run_series returns exactly the monthly grid t[k] = horizon.start + k/12 (within GRID_TOL) through the
+              outcome window's end, identical for every arm (HookInvalid otherwise)
+  metrics     each card entry gives label, units, aggregate (mean | rate) and denominator (e.g. person, person-year):
+              values are per member of the unit's simulated population, and the harness weights them by the units
+              table's populations
+  schedule    every event lies in [horizon.start, window end]; decision events lie in the delivery period and only
+              for components the package sets; history events end before the delivery period; routine events lie
+              outside it; charged is true exactly for decision events
+
 Nothing here names a disease, component or metric.
 """
 from __future__ import annotations

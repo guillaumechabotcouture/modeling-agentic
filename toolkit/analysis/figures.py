@@ -381,6 +381,22 @@ def _num_or_none(v):
         return None
 
 
+def _x_format(ax, values) -> None:
+    """Compact numbers on x, except calendar years, which keep their digits."""
+    vals = [v for v in values if v is not None]
+    if vals and 1800 <= min(vals) and max(vals) <= 2200:
+        from matplotlib.ticker import FuncFormatter, MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:g}"))
+    else:
+        FS.set_axis_format(ax, "x")
+        ax.locator_params(axis="x", nbins=4)
+
+
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
 def fig_data_coverage(R, t):
     import yaml
     regs = R.regions()
@@ -407,8 +423,10 @@ def fig_data_coverage(R, t):
         cells = [R.by_id[i].get(c) for i in R.ids for c in a["columns"]]
         miss = sum(1 for v in cells if v is None or str(v).strip() == "" or str(v).lower() == "nan")
         miss_total += miss
-        binding = (", ".join(a["columns"][:3]) + (f" … ({len(a['columns'])} columns)" if len(a["columns"]) > 3 else "")
-                   if a["columns"] else (f"value {a.get('value')}" if a["kind"] == "value" else a["kind"]))
+        binding = ("from " + ", ".join(a["columns"][:3]) + (f" … ({len(a['columns'])} columns)"
+                                                             if len(a["columns"]) > 3 else "")
+                   if a["columns"] else (f"set to {a.get('value')}" if a["kind"] == "value"
+                                         else "calibrated by the run"))
         rows.append({"attribute": a["attribute"], "binding": ",".join(a["columns"]) if a["columns"] else binding,
                      "shown": binding, "source": a.get("source") or "", "missing_cells": miss,
                      "cells": len(cells)})
@@ -440,10 +458,11 @@ def fig_data_coverage(R, t):
     for k, x in enumerate([r for r in rows if "attribute" in r]):
         yy = 1 - (k + 0.5) / max(na, 1)
         a2.text(0.0, yy, x["attribute"], fontsize=7.5, color=t["ink"], va="center", transform=a2.transAxes)
-        a2.text(0.22, yy, "from " + textwrap.shorten(str(x["shown"]), 60, placeholder="…"), fontsize=7.5,
+        a2.text(0.22, yy, _clip(str(x["shown"]), 62), fontsize=7.5,
                 color=t["ink2"], va="center", transform=a2.transAxes)
-        miss = f"{x['missing_cells']} of {x['cells']} cells missing" if x["cells"] else textwrap.shorten(
-            str(x["source"]), 40, placeholder="…")
+        miss = (f"{x['missing_cells']} of {x['cells']} cells missing" if x["cells"]
+                else ("source: " + _clip(os.path.basename(str(x["source"]).split(" ")[0]), 34) if x["source"]
+                      and x["source"] != "calibration" else "from the calibration targets"))
         a2.text(0.72, yy, miss, fontsize=7.5, color=t["ink"] if x["missing_cells"] else t["ink2"], va="center",
                 transform=a2.transAxes)
     if inputs:
@@ -532,13 +551,12 @@ def fig_unit_attributes(R, t):
                                zorder=4)
             ax.set_yticks(range(len(regs)))
             ax.set_yticklabels(regs[::-1] if n % ncol == 0 else [], fontsize=6.5)
-            FS.set_axis_format(ax, "x")
-            ax.locator_params(axis="x", nbins=4)
+            _x_format(ax, [r["value"] for r in rows if r.get("attribute") == name and r.get("value") is not None])
         ax.tick_params(labelsize=6.5)
         ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
     vals_bound = [a for a in _bound_attributes(R) if a["kind"] == "value"]
-    title = (f"{len(attrs)} engine attributes from the units table across {len(R.ids)} units; "
-             f"{outside} values outside the engine's valid ranges")
+    title = (f"{len(attrs)} unit attributes across {len(R.ids)} {R.labels.unit_title()}; {outside} outside the "
+             f"engine's valid ranges")
     cap = ("Each bound attribute by region (dots: units; ringed: outside the engine card's valid range); monthly "
            "profiles as thin lines with the median." + (f" Set by value: {', '.join(a['attribute'] for a in vals_bound)}."
                                                        if vals_bound else ""))
@@ -561,9 +579,9 @@ def fig_parameters(R, t):
     for p in params:
         name = p["name"]
         d = drawn.get(name) or {}
-        if d.get("source_kind") == "prior":
+        if d.get("source_kind") in ("priors", "prior"):          # toolkit/spec/priors.py plan(): "priors"
             kind = "prior"
-        elif name in cal_theta:
+        elif name in cal_theta or d.get("source_kind") == "calibration":
             kind = "calibrated"
         else:
             kind = p.get("kind") or "fixed"
@@ -654,7 +672,7 @@ def fig_design_coverage(R, t):
                        color=t["neutral"], zorder=2)
         ax.scatter([v for v, h in zip(dv, hold) if v is not None and not h], [0] * sum(1 for v, h in zip(dv, hold)
                                                                                      if v is not None and not h),
-                   s=10, color=t["cat"][0], zorder=3)
+                   s=6, color=t["cat"][0], alpha=0.7, linewidths=0, zorder=3)
         ax.scatter([v for v, h in zip(dv, hold) if v is not None and h], [0] * sum(1 for v, h in zip(dv, hold)
                                                                                  if v is not None and h),
                    s=16, facecolors="none", edgecolors=t["cat"][1], linewidths=1, zorder=3)
@@ -662,8 +680,7 @@ def fig_design_coverage(R, t):
         ax.set_yticklabels((["design", label_u] if uv else ["design"]) if n % ncol == 0 else ([""] * (2 if uv else 1)),
                            fontsize=7)
         ax.set_ylim(-0.6, 1.6)
-        FS.set_axis_format(ax, "x")
-        ax.locator_params(axis="x", nbins=4)
+        _x_format(ax, [v for v in dv + uv if v is not None])
         ax.tick_params(labelsize=6.5)
         ax.set_title(textwrap.shorten(name, 34, placeholder="…"), fontsize=8, loc="left", color=t["ink"])
         dv_ok = [v for v in dv if v is not None]
@@ -875,6 +892,8 @@ def fig_decision_tests(R, t):
             ax.text(0, y, " not run", va="center", fontsize=7.5, color=t["ink2"])
         else:
             ax.barh(y, float(sh) / 100, height=0.5, color=t["cat"][0] if v == "CHANGES_PLAN" else t["neutral"])
+            if float(sh) == 0:
+                ax.text(0, y, " no unit changes", va="center", fontsize=7.5, color=t["ink2"])
         if th is not None:
             ax.plot([float(th) / 100] * 2, [y - 0.35, y + 0.35], color=t["ink"], lw=1.2)
         if v == "CHANGES_PLAN":
@@ -884,8 +903,15 @@ def fig_decision_tests(R, t):
         rows.append({"test": x.get("test_id"), "verdict": v, "share_pct": sh, "threshold_pct": th,
                      "statement": x.get("statement")})
     ax.set_yticks(range(len(tests)))
-    ax.set_yticklabels([textwrap.shorten(str(x.get("test_id")).replace("prior_range_", "prior range: ")
-                                         .replace("_", " "), 40, placeholder="…") for x in tests[::-1]], fontsize=7.5)
+    texts = {str(d.get("id")): str(d.get("text") or "") for d in
+             ((R.spec.get("analysis") or {}).get("decision_tests") or []) if isinstance(d, dict)}
+
+    def name(x):
+        tid = str(x.get("test_id"))
+        if tid.startswith("prior_range_"):
+            return f"prior range: {R.labels.parameter(tid[len('prior_range_'):])}"
+        return f"{tid}: {_clip(texts[tid], 44)}" if texts.get(tid) else tid
+    ax.set_yticklabels([name(x) for x in tests[::-1]], fontsize=7.5)
     ax.set_xlim(0, mx / 100 * 1.15)
     FS.set_axis_format(ax, "x", "percent")
     ax.set_xlabel(f"share of {R.labels.unit_title()} whose package changes (tick: the test's threshold)", fontsize=8)
@@ -1166,7 +1192,7 @@ def fig_allocation(R, t):
         nrow = math.ceil(len(comps) / ncol)
         ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
         fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 0.75)
-        gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.02,
+        gs = fig.add_gridspec(nrow, ncol, left=0.02 if layout == "boundaries" else 0.12, right=0.995, top=_top(fig, 0.75), bottom=0.02,
                               hspace=0.22, wspace=0.04)
         cnt = {}
         for n, c in enumerate(comps):
@@ -1224,7 +1250,8 @@ def fig_stability(R, t):
     ph = 0.19 * len(R.regions()) + 0.45 if layout == "strip" else 2.8
     fig = _fig(t, 3.1 * ncol + 1.1, ph * nrow + 1.25)
     h = fig.get_figheight()
-    gs = fig.add_gridspec(nrow, ncol, left=0.12, right=0.995, top=_top(fig, 0.75), bottom=0.55 / h, hspace=0.22,
+    gs = fig.add_gridspec(nrow, ncol, left=0.02 if layout == "boundaries" else 0.12, right=0.995, top=_top(fig, 0.75),
+                          bottom=0.55 / h, hspace=0.22,
                           wspace=0.06)
     for n, (key, name, vals) in enumerate(panels):
         ax = fig.add_subplot(gs[n // ncol, n % ncol])
@@ -1513,8 +1540,9 @@ def fig_dollars(R, t):
         left += v
     if unspent > 0:
         a1.barh(0, unspent, left=left, height=0.8, color=t["surface"], edgecolor=t["axis"], linewidth=1)
-        a1.text(left + unspent / 2, 0, f"unspent {FS.fmt(unspent, 'money')}", ha="center", va="center", fontsize=7,
-                color=t["ink2"])
+        if unspent > 0.06 * env:                     # label only a segment wide enough for it (else: the table)
+            a1.text(left + unspent / 2, 0, f"unspent {FS.fmt(unspent, 'money')}", ha="center", va="center",
+                    fontsize=7, color=t["ink2"])
     a1.axvline(env, color=t["ink"], lw=1.2)
     a1.text(env, 0.75, f"envelope {FS.fmt(env, 'money')} ", ha="right", va="bottom", fontsize=7.5, color=t["ink"],
             transform=a1.get_xaxis_transform())
@@ -2287,7 +2315,7 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
     yaml.safe_dump(cal, open(calp, "w"), sort_keys=False)
     rp = os.path.join(d, "uncertainty_report.yaml")
     rep = yaml.safe_load(open(rp)) if os.path.exists(rp) else {}
-    rep["parameters_drawn"] = [{"name": "p_dur", "source_kind": "prior", "dist": "uniform", "range": [480.0, 860.0],
+    rep["parameters_drawn"] = [{"name": "p_dur", "source_kind": "priors", "dist": "uniform", "range": [480.0, 860.0],
                                 "source": "a published review"},
                                {"name": "p_eff", "source_kind": "engine_parameters", "dist": "uniform",
                                 "range": [0.3, 0.7], "source": "fitted"}]
