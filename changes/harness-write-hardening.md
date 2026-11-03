@@ -1,6 +1,6 @@
 ---
 phase: "v2"
-commit: "HW α-β3"
+commit: "HW α-β4"
 ---
 
 ## Changelog
@@ -23,3 +23,14 @@ Following Codex's review of this PR (WA13-WA20, each reproduced first):
 - `rename_nofollow` opens the source with no link followed, as a plain file, and publishes its bytes from that fd. It then removes the source only if it is still the same inode.
 - The audit also finds `getattr(x, "open")`, `functools.partial(open, <write mode>)`, assigned writer aliases, and shell commands (`shell=True`, `sh -c`, `os.system`). Each shell command is reviewed.
 - A helper in another module that returns `open` is a documented limit of the per-module scan.
+
+The focused check at c22b0e6 led to the following changes (WA21-WA23, each reproduced first):
+- A root is opened once by identity. Its absolute path is made lexical, so `run/analysis/..` is `run`. Each component is opened from `/` with O_NOFOLLOW, and `st_dev`/`st_ino` must match the named path.
+- Every write below the root is relative to that fd; the root is never re-resolved by name, and the primitives accept a directory fd as their base.
+- The root always comes from the caller. The parent fallback and the marker-chosen root are removed. An omitted or None root is refused, and so is a path outside the root.
+- Run markers are used only to refuse, never to choose a root. A root inside a run dir is refused. So is a root above one, when the root has no marker of its own.
+- `validate_figure` now requires `run_dir`, and the modeler prompt's example passes it.
+- `batch.ship` and `merge_shipped` take a required `root=` (in β3 this was `run_dir`). `optimize.benchmark(out=...)` outside a run dir needs `root=`. Neither takes the root from the output path.
+- A remote chunk's `--no-ledger` outputs are anchored at the call dir its worker made (`--out-root`).
+- The audit treats every `partial(open, ...)` as a writer. It flags any argv whose `argv[0]` is a shell and that includes `-c`, `-lc`, `-ec` and similar flags.
+

@@ -241,10 +241,40 @@ def _parts(rel: str) -> list:
     return parts
 
 
-def dir_fd_nofollow(base: str, parts, create: bool = False) -> int:
+def _open_base(base) -> int:
+    """A directory fd on `base`: an fd is duplicated; a path is made absolute lexically (so `a/link/..` is `a`, never
+    the link's parent), then every component of its resolved form is opened from `/` with O_NOFOLLOW, and the result
+    must be the same directory (st_dev, st_ino) as the absolute path names. All traversal below is relative to this
+    fd; the base is never re-resolved by name. The caller closes it."""
+    if isinstance(base, int):
+        return os.dup(base)
+    if not isinstance(base, str) or not base:
+        raise LinkRefused(f"{base!r}: not a directory path")
+    ap = os.path.abspath(base)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [x for x in os.path.realpath(ap).split(os.sep) if x]:
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as e:
+                raise LinkRefused(f"{ap}: not a plain directory path ({part}: {e.strerror})") from None
+            os.close(fd)
+            fd = nfd
+        a, b = os.fstat(fd), os.stat(ap)
+        if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+            raise LinkRefused(f"{ap}: changed while it was opened")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def dir_fd_nofollow(base, parts, create: bool = False) -> int:
     """An fd on base/parts..., every component opened with O_NOFOLLOW relative to its parent (created when
-    `create`). The caller closes it."""
-    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    `create`). `base` is a directory fd (duplicated) or a trusted path (opened by _open_base). The caller closes it."""
+    fd = _open_base(base)
     try:
         for part in parts:
             if create:
@@ -307,59 +337,78 @@ def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[by
 RUN_MARKERS = ("metadata.json",)     # written at a run dir's creation by main.py (v1) and stage_machine (v2)
 
 
-def run_root_of(path: str) -> str | None:
-    """The run dir `path` lies in, compared lexically: the outermost ancestor of abspath(path) that holds a run
-    marker. Outermost, so a marker an agent plants in a subdirectory (or behind a link) cannot move the root inward."""
-    ap = os.path.abspath(path)
-    parts = ap.split(os.sep)
-    for i in range(2, len(parts)):
-        a = os.sep.join(parts[:i]) or os.sep
+def _marker_in(dirs) -> str | None:
+    for a in dirs:
         if any(os.path.lexists(os.path.join(a, m)) for m in RUN_MARKERS):
             return a
     return None
 
 
-def _same_dir(a: str, b: str) -> bool:
-    return os.path.abspath(a) == os.path.abspath(b) or os.path.realpath(a) == os.path.realpath(b)
+def anchored(path: str, root: str) -> tuple[int, str]:
+    """(root fd, rel) for a no-follow write of `path` under the trusted `root` the caller passes (the harness always
+    knows its run dir). The root is required: omitted or None is refused, and so is a path not lexically under it;
+    there is no parent fallback and the root is never chosen from files in the tree. The root is opened once by
+    identity (_open_base) and every write below is relative to that fd, so a root spelled through a link
+    (`run/analysis/..`) anchors at the run dir it names lexically, never at the link's parent.
+
+    Run markers (metadata.json) only refuse, never choose: a root inside a run dir (a marker above it) is refused, and
+    so is a root with no marker of its own above a run dir the path lies in. A marker planted below a run root
+    changes nothing; deleting one only removes a refusal (the root still comes from the caller). The caller closes
+    the fd."""
+    if not isinstance(root, str) or not root:
+        raise LinkRefused(f"{path}: a trusted root is required (got {root!r})")
+    ar, ap = os.path.abspath(root), os.path.abspath(path)
+    rel = os.path.relpath(ap, ar)
+    if rel in (".", "..") or rel.startswith(".." + os.sep):
+        # the same root spelled otherwise (/var vs /private/var): the outermost ancestor of the path that resolves to
+        # the root's directory is where the root sits in the path; the rest stays lexical (no link below it resolved)
+        rr, up = os.path.realpath(ar), ap.split(os.sep)
+        for i in range(2, len(up)):
+            if os.path.realpath(os.sep.join(up[:i])) == rr:
+                rel = os.sep.join(up[i:])
+                break
+        else:
+            raise LinkRefused(f"{path}: not under the root {root}")
+    up = ar.split(os.sep)
+    above = _marker_in(os.sep.join(up[:i]) or os.sep for i in range(1, len(up)))
+    if above:
+        raise LinkRefused(f"{root}: inside the run dir {above}; pass that run dir as the root")
+    if not _marker_in([ar]):
+        parts = rel.split(os.sep)[:-1]
+        below = _marker_in(os.path.join(ar, *parts[:i]) for i in range(1, len(parts) + 1))
+        if below:
+            raise LinkRefused(f"{path}: in the run dir {below}, below the root {root}; pass that run dir as the root")
+    return _open_base(ar), rel.replace(os.sep, "/")
 
 
-def anchored(path: str, root: str | None) -> tuple[str, str]:
-    """(base, rel) for a no-follow write of `path`. The run root is mandatory for a path under a run dir: `root` must
-    be that run dir and the path is anchored there, compared lexically (no link resolved below the root, so a planted
-    link inside the run dir is caught by the no-follow traversal, not resolved away); an omitted, None or inner root
-    is refused (LinkRefused). A path under no run dir is anchored at `root` when it lies under it, else at its own
-    parent, resolved once."""
-    ap = os.path.abspath(path)
-    rd = run_root_of(ap)
-    if rd is not None and not (root and _same_dir(root, rd)):
-        raise LinkRefused(f"{path}: under the run dir {rd}; pass that run dir as the root (got {root!r})")
-    if root:
-        for r in (os.path.abspath(root), os.path.realpath(root)):
-            rel = os.path.relpath(ap, r)
-            if rel != "." and not rel.startswith(".." + os.sep) and rel != "..":
-                return os.path.realpath(root), rel.replace(os.sep, "/")
-        if rd is not None:
-            raise LinkRefused(f"{path}: not under the run root {root}")
-    return os.path.realpath(os.path.dirname(ap)), os.path.basename(ap)
+def publish(path: str, data, root: str) -> str:
+    """write_nofollow(atomic) of `path` (str data is UTF-8) under the trusted root (anchored)."""
+    fd, rel = anchored(path, root)
+    try:
+        write_nofollow(fd, rel, data.encode("utf-8") if isinstance(data, str) else data, atomic=True)
+    finally:
+        os.close(fd)
+    return os.path.join(os.path.abspath(root), rel)
 
 
-def publish(path: str, data, root: str | None) -> str:
-    """write_nofollow(atomic) of `path` (str data is UTF-8), anchored by anchored(path, root) (root mandatory)."""
-    base, rel = anchored(path, root)
-    return write_nofollow(base, rel, data.encode("utf-8") if isinstance(data, str) else data, atomic=True)
-
-
-def append_text(path: str, text: str, root: str | None) -> None:
-    """Append text to `path` with no link followed (open_append_nofollow), anchored by anchored(path, root)."""
-    base, rel = anchored(path, root)
-    with open_append_nofollow(base, rel) as f:
+def append_text(path: str, text: str, root: str) -> None:
+    """Append text to `path` with no link followed (open_append_nofollow) under the trusted root (anchored)."""
+    fd, rel = anchored(path, root)
+    try:
+        f = open_append_nofollow(fd, rel)
+    finally:
+        os.close(fd)
+    with f:
         f.write(text)
 
 
-def remove_path(path: str, root: str | None) -> bool:
-    """remove_nofollow of `path`, anchored by anchored(path, root)."""
-    base, rel = anchored(path, root)
-    return remove_nofollow(base, rel)
+def remove_path(path: str, root: str) -> bool:
+    """remove_nofollow of `path` under the trusted root (anchored)."""
+    fd, rel = anchored(path, root)
+    try:
+        return remove_nofollow(fd, rel)
+    finally:
+        os.close(fd)
 
 
 def rename_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
@@ -367,9 +416,16 @@ def rename_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
     followed as a plain file (a link or a directory is refused, never moved), its bytes are published from that fd at
     the destination (atomic, no link followed; a link at the destination name is replaced, never followed), then the
     source entry is removed only if it is still the file that was read."""
-    base = os.path.realpath(base)
     sp = _parts(src_rel)
     _parts(dst_rel)
+    bfd = _open_base(base)                    # one identity for the read, the publish and the removal
+    try:
+        _rename_at(bfd, src_rel, dst_rel, sp)
+    finally:
+        os.close(bfd)
+
+
+def _rename_at(base: int, src_rel: str, dst_rel: str, sp: list) -> None:
     fd = open_nofollow(base, src_rel)
     try:
         st = os.fstat(fd)
@@ -397,13 +453,16 @@ def rename_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
 
 def copy_nofollow(base: str, src_rel: str, dst_rel: str) -> None:
     """Copy base/src_rel to base/dst_rel: read with no link followed, published atomically with no link followed."""
-    write_nofollow(base, dst_rel, read_nofollow(base, src_rel)[0], atomic=True)
+    bfd = _open_base(base)
+    try:
+        write_nofollow(bfd, dst_rel, read_nofollow(bfd, src_rel)[0], atomic=True)
+    finally:
+        os.close(bfd)
 
 
 def open_append_nofollow(base: str, rel: str):
     """A text file object appending to base/rel (created if absent, never truncated), opened with no link followed
     at any component and refused when the file has other hard links. Also usable as an flock target."""
-    base = os.path.realpath(base)
     parts = _parts(rel)
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
     try:
@@ -425,7 +484,7 @@ def remove_nofollow(base: str, rel: str, missing_ok: bool = True) -> bool:
     target never touched); a directory is refused. `rel` must be a plain relative path (no "..")."""
     parts = _parts(rel)
     try:
-        dfd = dir_fd_nofollow(os.path.realpath(base), parts[:-1])
+        dfd = dir_fd_nofollow(base, parts[:-1])
     except FileNotFoundError:
         if missing_ok:
             return False
@@ -452,7 +511,6 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
     the new file). Otherwise O_NOFOLLOW (and O_EXCL when `exclusive`), and a file with other hard links is refused
     before it is truncated or appended to. Directories are created as needed. Returns base/rel."""
     import secrets as _secrets
-    base = os.path.realpath(base)
     parts = _parts(rel)
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
     try:
@@ -467,7 +525,7 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
             finally:
                 os.close(fd)
             os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
-            return os.path.join(base, rel)
+            return rel if isinstance(base, int) else os.path.join(base, rel)
         flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive
                                                                                             else 0)
         try:
@@ -487,7 +545,7 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
             os.close(fd)
     finally:
         os.close(dfd)
-    return os.path.join(base, rel)
+    return rel if isinstance(base, int) else os.path.join(base, rel)
 
 
 # --------------------------------------------------------------------------- #

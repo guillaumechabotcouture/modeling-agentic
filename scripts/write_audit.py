@@ -23,18 +23,20 @@ file by path:
   tempfile.mkstemp / mkdtemp / NamedTemporaryFile / TemporaryFile / SpooledTemporaryFile with dir= (a chosen
                                                            destination; without dir= it is the system's temp dir)
   getattr(<x>, "open" / a writer name)                    a writer fetched by name (getattr(builtins, "open"))
-  functools.partial(open, <write or unknown mode>) / partial(os.remove, ...) and the other writers
+  functools.partial(open, ...) whatever its mode (it can be given at call time) / partial(os.remove, ...) and the
+                                                           other writers
   <name> = open / os.remove / ...                          an assigned alias: later calls of <name> are that writer
-  subprocess.* with shell=True (or a non-constant shell=), [sh|bash ..., "-c", ...], os.system / os.popen /
+  subprocess.* with shell=True (or a non-constant shell=), an argv whose argv[0] (or env's argv[1]) is a shell
+  (sh, bash, zsh, dash, ksh, fish by basename) with -c / -lc / -ec ..., os.system / os.popen /
   os.spawn*, asyncio.create_subprocess_shell               a shell can redirect into any path: each is reviewed
-  lib.safe_io publish / append_text / remove_path / anchored without a run root (omitted or None): the root is
-                                                           mandatory for a run-dir path (safe_io also refuses it at
-                                                           run time when the path lies under a run marker)
+  lib.safe_io publish / append_text / remove_path / anchored without a run root (omitted or None): the trusted
+                                                           root is mandatory (safe_io also refuses an omitted or
+                                                           None root at run time, with no parent fallback)
 
 Known limit (not solved statically): a helper in another module that returns `open` (or a writer) and is used
 there, e.g. `yaml.safe_dump(doc, stream=helpers.opener(p))`, is a call this per-module scan cannot resolve; the
 dump-to-handle rule flags the dump only when the stream is not a plain name. Such helpers are found by review, and
-lib.safe_io's runtime refusal (a run-dir path needs its run root) covers the safe_io entry points.
+lib.safe_io's runtime refusal (every write needs the caller's trusted root) covers the safe_io entry points.
 
 Self-test and fixture code is skipped (functions named `_self_test*`, `_toy*`, `toy_*`, `derived_toy_*`,
 `*fixture*`, `example_*`, and the `if __name__ == "__main__"` guard's own self-test branch is not special-cased: a
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import sys
 
@@ -69,7 +72,8 @@ _SIO_ROOT_ARG = {"publish": 2, "append_text": 2, "remove_path": 1, "anchored": 1
 _GETATTR_WRITERS = {"open", "fdopen"} | _OS_WRITE | _SHUTIL | _METHOD_WRITES | _NP_SAVE
 _SUBPROCESS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
                "subprocess.Popen", "asyncio.create_subprocess_exec"}
-_SHELLS = {"sh", "bash", "zsh", "dash", "/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/env"}
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}          # compared by basename (/bin/bash, /usr/bin/zsh, ...)
+_SHELL_CMD_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")          # -c, -lc, -ec, -xc: a command string follows
 
 
 def _is_fixture(name: str) -> bool:
@@ -148,7 +152,9 @@ class _Scan(ast.NodeVisitor):
             cmd = ast.List(elts=list(node.args))
         if isinstance(cmd, (ast.List, ast.Tuple)) and cmd.elts:
             c = [e.value for e in cmd.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-            if c and c[0] in _SHELLS and "-c" in c:
+            names = [os.path.basename(x) for x in c[:2]]
+            if c and (names[0] in _SHELLS or (names[0] == "env" and names[1:2] and names[1] in _SHELLS)) and any(
+                    _SHELL_CMD_FLAG.match(x) for x in c[1:]):
                 return True
         return False
 
@@ -185,14 +191,7 @@ class _Scan(ast.NodeVisitor):
                 node.args[1].value in _GETATTR_WRITERS:
             self.add("getattr-writer", node)
         elif name == "functools.partial" and node.args and self._writer(self._dotted(node.args[0]) or ""):
-            t = self._dotted(node.args[0])
-            if t in _OPENS:
-                mode = node.args[2] if len(node.args) > 2 else kw.get("mode")
-                w = _mode_writes(mode)
-                if w or (w is None and mode is not None):
-                    self.add("partial-writer", node)
-            else:
-                self.add("partial-writer", node)
+            self.add("partial-writer", node)    # whatever its mode: the mode can be given when the partial is called
         elif self._shell(node, name, kw):
             self.add("shell-command", node)
         elif name in _OPENS:
@@ -632,7 +631,7 @@ def _self_test_round6(ok) -> None:
         os.symlink(out, os.path.join(d, "analysis"))
         spec = types.SimpleNamespace(sha256="s", settings_sha256=None)
         call(Bt.ship, os.path.join(d, "analysis", "shipped"), spec, {"points": 1}, [{"id": "a"}],
-             [{"id": "a", "ok": True, "result": {}}], platform={"system": "x"}, run_dir=d)
+             [{"id": "a", "ok": True, "result": {}}], platform={"system": "x"}, root=d)
         ok(os.listdir(out) == [], f"WA15 a shipped bundle is not published through a planted parent link "
                                   f"({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:

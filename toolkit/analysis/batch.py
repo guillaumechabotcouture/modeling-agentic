@@ -417,38 +417,36 @@ def _file_sha(path: str) -> str | None:
     return sha256(path)
 
 
-def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict],
-                  run_dir: str | None = None) -> dict:
-    """Publish the bundle with no link followed, anchored at the run dir when `out_dir` lies in one (the run root is
-    mandatory there: lib.safe_io refuses a run-dir path without it); the manifest hashes the bytes published."""
+def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict], root: str) -> dict:
+    """Publish the bundle with no link followed under the trusted `root` the caller names (the run dir when `out_dir`
+    lies in one, else the dir the caller made for its bundles); no root is refused, never taken from `out_dir`. The
+    manifest hashes the bytes published."""
     import hashlib
     from toolkit.analysis.artifacts import _safe_io
     sio = _safe_io()
-    if sio.run_root_of(os.path.join(out_dir, SHIP_MANIFEST)) is None:
-        os.makedirs(out_dir, exist_ok=True)        # a bundle dir outside any run dir, which the caller names
     body = {"jobs": "".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs),
             "design": json.dumps(design_, indent=1, sort_keys=True),
             "results": "".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
                                for r in rows)}
     for k, name in SHIP_FILES.items():
-        sio.publish(os.path.join(out_dir, name), body[k], run_dir)
+        sio.publish(os.path.join(out_dir, name), body[k], root)
     man = dict(man, producer=PRODUCER, n_jobs=len(jobs), n_rows=len(rows),
                **{f"{k}_sha256": hashlib.sha256(body[k].encode("utf-8")).hexdigest() for k in SHIP_FILES})
-    sio.publish(os.path.join(out_dir, SHIP_MANIFEST), json.dumps(man, indent=1, sort_keys=True), run_dir)
+    sio.publish(os.path.join(out_dir, SHIP_MANIFEST), json.dumps(man, indent=1, sort_keys=True), root)
     return man
 
 
 def ship(out_dir: str, spec, design_: dict, jobs: list[dict], rows: list[dict], platform: dict | None = None,
-         run_dir: str | None = None) -> dict:
+         root: str | None = None) -> dict:
     """Write a shipped batch (or one shard of it) where it was computed: the exact jobs, the design, the ok rows
     ({"id", "ok", "result": run_job output}) and a manifest with each file's sha256, the decision spec's sha256 and
-    the computing platform. `run_dir`: the run dir `out_dir` lies in, if any (mandatory there). Returns the
-    manifest."""
+    the computing platform. `root` (required): the trusted dir the bundle is written under, the run dir when
+    `out_dir` lies in one; without it the write is refused. Returns the manifest."""
     ids = {j["id"] for j in jobs}
     ok_rows = [r for r in rows if r.get("ok") and r.get("id") in ids]
     return _write_bundle(out_dir, {"platform": platform or platform_info(), "spec_sha256": spec.sha256,
                                    "settings_sha256": getattr(spec, "settings_sha256", None)}, design_, jobs, ok_rows,
-                         run_dir)
+                         root)
 
 
 def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
@@ -473,7 +471,7 @@ def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
     return man, des, jobs, rows
 
 
-def merge_shipped(out_dir: str, parts: list[str], run_dir: str | None = None) -> dict:
+def merge_shipped(out_dir: str, parts: list[str], root: str | None = None) -> dict:
     """Merge shipped shards into one shipped batch. They must come from one platform, one decision spec and one
     design, with no job in two shards; each shard's hashes are checked. The merged jobs are the shards' own."""
     if not parts:
@@ -501,7 +499,7 @@ def merge_shipped(out_dir: str, parts: list[str], run_dir: str | None = None) ->
                                    "settings_sha256": mans[0].get("settings_sha256"),
                                    "merged_from": [{"path": os.path.basename(os.path.normpath(p)),
                                                     "results_sha256": m.get("results_sha256")}
-                                                   for p, m in zip(parts, mans)]}, des, jobs, rows, run_dir)
+                                                   for p, m in zip(parts, mans)]}, des, jobs, rows, root)
 
 
 def _input_diff(a, b, worst) -> bool:
@@ -646,13 +644,13 @@ def _self_test() -> int:
                 mine = [j for j in jobs if j["point"] % 2 == k]
                 ids = {j["id"] for j in mine}
                 g["ship"](sd, spec, vm_design, mine, [r for r in rws if r["id"] in ids],
-                          platform=plat_a if k == 0 or plat_b is None else plat_b)
+                          platform=plat_a if k == 0 or plat_b is None else plat_b, root=d)
                 out.append(sd)
             return out
 
         def merged(sds):
             m = os.path.join(d, f"merged{made[0]}")
-            g["merge_shipped"](m, sds)
+            g["merge_shipped"](m, sds, root=d)
             return m
 
         def b1():

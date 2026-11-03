@@ -474,7 +474,7 @@ def _self_test() -> int:
         try:
             sh = os.path.join(d, "shipped")
             Bt.ship(sh, spec, design, jobs, [{"id": j["id"], "ok": True, "result": Bt.run_job(j)} for j in jobs],
-                    platform=dict(Bt.platform_info(), system="OtherOS"))
+                    platform=dict(Bt.platform_info(), system="OtherOS"), root=d)
             run(d, log=q, adopt={"shipped": sh}, compute_kw={"max_workers": 2}, draws=2)
             bdoc = yaml.safe_load(open(os.path.join(d, "analysis", "batch.yaml")))
             sm = bdoc["data"]["summary"]

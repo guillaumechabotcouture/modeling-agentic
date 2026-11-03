@@ -428,7 +428,8 @@ def _self_test() -> int:
         fig = (f"import sys, os\nsys.path.insert(0, {here!r})\nimport figure_validator as fv\n"
                "d = os.getcwd()\n"
                "open(os.path.join(d, 'figures', 'a.png'), 'w').write(open(os.path.join(d, 'models', 'out.csv')).read())\n"
-               "fv.validate_figure(os.path.join(d, 'figures', 'a.png'), [os.path.join(d, 'models', 'out.csv')])\n")
+               "fv.validate_figure(os.path.join(d, 'figures', 'a.png'), [os.path.join(d, 'models', 'out.csv')], "
+               "run_dir=d)\n")
         open(os.path.join(d, "models", "figs.py"), "w").write(fig)
         bad = "raise SystemExit('boom')\n"
         open(os.path.join(d, "models", "bad.py"), "w").write(bad)
@@ -521,7 +522,7 @@ def _self_test() -> int:
                  "d = os.getcwd()\n"
                  "open(os.path.join(d, 'figures', 'b.png'), 'w').write(open(os.path.join(d, 'models', 'out.csv')).read())\n"
                  "fv.validate_figure(os.path.join(d, 'figures', 'b.png'), [os.path.join(d, 'models', 'out.csv')],"
-                 " expected_annotations=['Cases by unit'])\n# title: Cases by unit\n")
+                 " expected_annotations=['Cases by unit'], run_dir=d)\n# title: Cases by unit\n")
         open(os.path.join(d, "models", "eda.py"), "w").write(first)
         r = subprocess.run([sys.executable, os.path.join(d, "models", "eda.py")], cwd=d, capture_output=True, text=True)
         ok(r.returncode == 0 and os.path.exists(sp), f"DR13 fixture: the first draw writes a sidecar: {r.stderr[-300:]}")
@@ -591,7 +592,7 @@ def _self_test() -> int:
         open(s, "w").write(
             f"import sys, os\nsys.path.insert(0, {here!r})\nimport figure_validator as fv\nd = os.getcwd()\n"
             f"open(os.path.join(d, 'figures', '{name}.png'), 'w').write(open({src!r}).read())\n"
-            f"fv.validate_figure(os.path.join(d, 'figures', '{name}.png'), [{src!r}])\n")
+            f"fv.validate_figure(os.path.join(d, 'figures', '{name}.png'), [{src!r}], run_dir=d)\n")
         r = subprocess.run([sys.executable, s], cwd=d, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         if ann is not None:

@@ -19,6 +19,7 @@ calls:
         png_path,
         source_data_paths=["data/district_prevalence.csv", ...],
         expected_annotations=["RMSE = 0.66pp", "n=53 districts", ...],
+        run_dir=run_dir,     # required: the sidecar is written under it with no link followed
     )
 
 This writes a sidecar `<png_path>.provenance.json` with:
@@ -57,7 +58,7 @@ Usage:
     # In modeler scripts:
     from figure_validator import validate_figure
     plt.savefig(path)
-    validate_figure(path, source_data_paths=[...], expected_annotations=[...])
+    validate_figure(path, source_data_paths=[...], expected_annotations=[...], run_dir=run_dir)
 """
 
 from __future__ import annotations
@@ -203,9 +204,10 @@ def validate_figure(png_path: str,
         Optional sanity check, recorded in the sidecar for
         downstream consumers. Not asserted here.
     run_dir
-        The run directory the sidecar is written in (default: the run
-        dir the PNG lies in, found by its run marker). The sidecar is
-        written with no link followed below it.
+        The run directory the PNG lies in (required). The sidecar is
+        written with no link followed below it; without run_dir it is
+        refused (lib.safe_io.LinkRefused), since the root is never
+        guessed.
     """
     if not os.path.exists(png_path):
         raise FileNotFoundError(
@@ -257,10 +259,10 @@ def validate_figure(png_path: str,
     import sys as _sys
     if os.path.dirname(os.path.abspath(__file__)) not in _sys.path:
         _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from lib.safe_io import publish, run_root_of    # no link followed at the sidecar (follow-up to review round 5)
-    # anchored at the run dir the PNG lies in (its outermost run marker), so a planted figures/ link is refused
-    publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True),
-            run_dir or run_root_of(png_path))
+    from lib.safe_io import publish    # no link followed at the sidecar (follow-up to review round 5)
+    # anchored at the run dir the caller names (required: never guessed from the PNG's parent or a marker), so a
+    # planted figures/ link is refused
+    publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True), run_dir)
 
 
 def check_staleness(png_path: str) -> dict:
@@ -347,7 +349,7 @@ def _run_self_test() -> int:
                 "# plt.title('RMSE = 0.66pp')\n"
                 "# plt.text(0.5, 0.5, 'n = 53 LGAs')\n"
                 f"validate_figure({png!r}, source_data_paths=[{src!r}], "
-                "expected_annotations=['RMSE = 0.66pp', 'n = 53 LGAs'])\n"
+                f"expected_annotations=['RMSE = 0.66pp', 'n = 53 LGAs'], run_dir={d!r})\n"
             )
         # T1: fresh PNG with annotations matching caller-script literals
         # → success, sidecar written.
@@ -380,7 +382,7 @@ def _run_self_test() -> int:
                 "raised = False\n"
                 "try:\n"
                 f"    validate_figure({png3!r}, source_data_paths=[], "
-                "expected_annotations=['THIS STRING IS NOT IN THE SCRIPT'])\n"
+                f"expected_annotations=['THIS STRING IS NOT IN THE SCRIPT'], run_dir={d!r})\n"
                 "except FigureAnnotationMismatchError:\n"
                 "    raised = True\n"
                 "import sys\n"
@@ -403,7 +405,7 @@ def _run_self_test() -> int:
                 "import sys\n"
                 f"sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})\n"
                 "from figure_validator import validate_figure\n"
-                f"validate_figure({png4!r})\n"
+                f"validate_figure({png4!r}, run_dir={d!r})\n"
             )
         result4 = subprocess.run([sys.executable, caller4], capture_output=True,
                                  text=True, env=env)
@@ -416,7 +418,7 @@ def _run_self_test() -> int:
         # T5: PNG missing — validate_figure must raise FileNotFoundError.
         raised = False
         try:
-            validate_figure(os.path.join(d, "nope.png"))
+            validate_figure(os.path.join(d, "nope.png"), run_dir=d)
         except FileNotFoundError:
             raised = True
         ok(raised, "T5: missing PNG should raise FileNotFoundError")

@@ -156,7 +156,7 @@ def cross_check(spec: dict, refs: list[str], work_dir: str, n_units: int = 8) ->
         if isinstance(s.get("options", {}).get("units"), dict):
             s["options"]["units"]["csv"] = sub
         s.setdefault("uncertainty", {})["draws"] = min(int(s["uncertainty"].get("draws", 4)), 4)
-        _configure(s, d)
+        _configure(s, d, d)
         A = _analyze(s, d)
         plans[ref] = {u: p for u, p in _plan_of(d).items()}
         plans[ref + "#headline"] = A["point"]["averted"]
@@ -322,7 +322,7 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     ]
 
 
-def _configure(spec: dict, out: str, root: str | None = None) -> dict:
+def _configure(spec: dict, out: str, root: str) -> dict:
     from spike.analysis import batch as B
     from toolkit.analysis.artifacts import _safe_io
     for f in ("results.jsonl", "results_prev.jsonl"):

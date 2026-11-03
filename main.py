@@ -1078,7 +1078,7 @@ def _run_self_test() -> int:
         open(os.path.join(td, "models", "dr_fig.py"), "w").write(
             f"import sys, os\nsys.path.insert(0, {os.path.join(REPO_ROOT, 'scripts')!r})\nimport figure_validator as fv\n"
             "p = os.path.join(os.getcwd(), 'figures', 'dr.png'); s = os.path.join(os.getcwd(), 'models', 'dr_out.csv')\n"
-            "open(p, 'w').write(open(s).read()); fv.validate_figure(p, [s])\n")
+            "open(p, 'w').write(open(s).read()); fv.validate_figure(p, [s], run_dir=os.getcwd())\n")
         subprocess.run([sys.executable, os.path.join(td, "models", "dr_fig.py")], cwd=td, check=True)
         open(_src, "w").write("a\n2\n")
         ok(_fv.check_staleness(os.path.join(td, "figures", "dr.png"))["status"] == "stale", "DR-H0 fixture is stale")

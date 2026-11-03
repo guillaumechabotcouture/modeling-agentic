@@ -798,7 +798,7 @@ def _remote_task(bundle: bytes, sha: str, run_dir: str, fn_spec: str, chunk: lis
                 env["MA_COMPUTE_BREAKER_MIN"] = "0"     # a rerun tail: only the batch-wide breaker applies
             cancel_mark = os.path.join(calls, "cancel")
             cmd = [sys.executable, script, "map", run_dir, "--fn", fn_spec, "--inputs", inp,
-                   "--out", out, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
+                   "--out", out, "--out-root", td, "--backend", "local", "--max-workers", str(procs), "--no-ledger",
                    "--max-tasks", str(max(1, len(chunk)))]   # the caller already enforced its limit
             if chunk_allowance_s is not None:
                 cmd += ["--max-core-hours", f"{chunk_allowance_s / 3600:.6f}"]
@@ -2451,10 +2451,10 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
         lock.close()
 
 
-def _out_base(out: str, run_dir: str | None = None) -> tuple[str, str]:
-    """(base, rel) for no-follow writes of `out` and its sidecars: anchored at the trusted run dir when `out` is under
-    it, so every component below the run dir is traversed with no link followed (a planted analysis/batch link is
-    refused, not resolved); else the parent resolved once (lib.safe_io.anchored; follow-up to review round 5)."""
+def _out_base(out: str, run_dir: str) -> tuple[int, str]:
+    """(root fd, rel) for no-follow writes of `out` and its sidecars, anchored at the trusted run dir (`out` must lie
+    in it): every component below the run dir is traversed with no link followed, so a planted analysis/batch link
+    is refused, not resolved (lib.safe_io.anchored; no parent fallback). The caller closes the fd."""
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
     from lib.safe_io import anchored
@@ -2469,7 +2469,10 @@ def _out_lock(out: str, block: bool = False, suffix: str = ".lock", run_dir: str
         sys.path.insert(0, HERE)
     from lib.safe_io import open_append_nofollow
     base, name = _out_base(out, run_dir)
-    f = open_append_nofollow(base, name + suffix)
+    try:
+        f = open_append_nofollow(base, name + suffix)
+    finally:
+        os.close(base)
     try:
         fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
     except OSError:
@@ -2495,8 +2498,11 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         base, name = _out_base(out, run_dir)
         journal = json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
             json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
-        write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
-        part = open_append_nofollow(base, name + PARTIAL_EXT)
+        try:
+            write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
+            part = open_append_nofollow(base, name + PARTIAL_EXT)
+        finally:
+            os.close(base)
 
         def sink(got):
             for r in got:
@@ -2527,12 +2533,15 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
-    write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
-    write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
     try:
-        remove_nofollow(base, name + PARTIAL_EXT)
-    except OSError:
-        pass
+        write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+        write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
+        try:
+            remove_nofollow(base, name + PARTIAL_EXT)
+        except OSError:
+            pass
+    finally:
+        os.close(base)
     return rows, summary
 
 
@@ -4858,7 +4867,11 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     publish(log, b"", run_dir)                                   # a fresh log file, no link followed
     # the child's stdout is the checked append primitive's own descriptor: opened with no link followed and refused
     # when the file has other hard links (a swap after the fresh file was published is not appended to)
-    with open_append_nofollow(base, rel) as lf:
+    try:
+        lf = open_append_nofollow(base, rel)
+    finally:
+        os.close(base)
+    with lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
@@ -4891,6 +4904,7 @@ def main() -> int:
     ap.add_argument("--fresh", action="store_true",
                     help="recompute every row (default: keep rows of an earlier run of the same command and code)")
     ap.add_argument("--no-ledger", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--out-root", help=argparse.SUPPRESS)   # a remote chunk: the call dir its worker made for --out
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -4938,9 +4952,10 @@ def main() -> int:
     if a.no_ledger:   # a remote chunk: plain map, no reuse (the caller already chose the rows)
         rows, summary = map_fn(a.run_dir, a.fn, _read_inputs(a.inputs), a.backend, a.max_workers,
                                a.max_tasks, a.timeout_s, ledger=False, max_core_hours=a.max_core_hours)
-        from lib.safe_io import publish   # anchored at the run dir when --out lies in it; a worker's temp dir otherwise
-        publish(a.out, "".join(json.dumps(r) + "\n" for r in rows), a.run_dir)
-        publish(a.out + ".summary.json", json.dumps(summary, indent=1), a.run_dir)
+        from lib.safe_io import publish   # anchored at the trusted root: --out-root (the worker's call dir) or the run dir
+        root = a.out_root or a.run_dir
+        publish(a.out, "".join(json.dumps(r) + "\n" for r in rows), root)
+        publish(a.out + ".summary.json", json.dumps(summary, indent=1), root)
     else:
         rows, summary = run_map(a.run_dir, a.fn, _read_inputs(a.inputs), a.out, fresh=a.fresh,
                                 backend=a.backend, max_workers=a.max_workers, max_tasks=a.max_tasks,

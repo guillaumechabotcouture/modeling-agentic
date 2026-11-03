@@ -379,6 +379,7 @@ validate_figure(
         f"RMSE = {rmse:.2f}pp",
         "Calibration scatter",
     ],
+    run_dir=run_dir,   # required: the sidecar is written under the run dir with no link followed
 )
 ```
 

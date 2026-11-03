@@ -30,7 +30,7 @@ def _save(fig, run_dir, name, sources):
     import matplotlib.pyplot as plt
     plt.close(fig)
     fv = _fv()
-    fv.validate_figure(path, source_data_paths=[os.path.join(run_dir, s) for s in sources])
+    fv.validate_figure(path, source_data_paths=[os.path.join(run_dir, s) for s in sources], run_dir=run_dir)
     sp = path + ".provenance.json"
     with open(sp) as f:
         sc = json.load(f)
