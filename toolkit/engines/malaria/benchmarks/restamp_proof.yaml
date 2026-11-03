@@ -1,6 +1,6 @@
 producer: toolkit/engines/malaria/benchmarks/restamp_proof.py
 old:
-  ref: origin/v2
+  ref: bf24d1b4c6920aa977b79cae3e217a601cd5e3c3
   commit: bf24d1b4c6920aa977b79cae3e217a601cd5e3c3
   identity:
     code_sha256: d4e8a852eff1b69ef324393f1efa899289e6fbfdea10d8493be6bd9684f1ed86
@@ -10,10 +10,10 @@ old:
     version: '0.7'
   engine_version: '0.7'
 new:
-  commit_of_tree_base: e402254c96862774fe18a8e121e8ccb598fb09c3
+  commit_of_tree_base: 0d660012aa3da3554a947cc09c731c096f2dd97c
   identity:
-    code_sha256: 5fd8e883c593618e14599bfc574ec6eaa830cb6fd89d95009d3c4f3e2efe8b9d
-    config_sha256: e8b4d7b6969c74102a80760950d126cffbb2f62dc910ac2a4d884d2944ded184
+    code_sha256: edd92865a8d372c8299756a35edced7f60cf614dde782e2b120034dbc0eb5284
+    config_sha256: 4b86811a290ba8b0d9cff872a840ee2d2e4543eee525495e640008bcf214032c
     name: malaria-starsim
     params_sha256: 04b1cab140eb45c36aa89d24656fddfdf500d28596f50523dcdd606ae2de6992
     version: '0.8'
@@ -67,6 +67,10 @@ scope:
       - x0.25
       - 2
       - 50
+  scenarios:
+    gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+    boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+    heterogeneous: 5 members, seed 23, delivery None
   not_repeated: calibration-grid runs (same code path at other attribute values)
   compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
     dicts exactly
@@ -147,5 +151,17 @@ cases:
     equal: true
     old_sha256: b2ccd6481784cffdb4a1d6a32fd170ce4c1f96aca3810a4618991082b7b18938
     new_sha256: b2ccd6481784cffdb4a1d6a32fd170ce4c1f96aca3810a4618991082b7b18938
-n_cases: 19
+  scenario:boundaries:seed22:
+    equal: true
+    old_sha256: 8b6479a5e7e9eb59f5e86f49399099363d91b36d8a1297a1709f6f11e009c802
+    new_sha256: 8b6479a5e7e9eb59f5e86f49399099363d91b36d8a1297a1709f6f11e009c802
+  scenario:gc7_delivery_routine:seed21:
+    equal: true
+    old_sha256: b65f7b9d519b5ca21833accd1b82861424938e945d85151224593d994c66b8a9
+    new_sha256: b65f7b9d519b5ca21833accd1b82861424938e945d85151224593d994c66b8a9
+  scenario:heterogeneous:seed23:
+    equal: true
+    old_sha256: cb07334c7963914d8a47d063c797a7ee171bfa3afe567a383839f313a0c7219c
+    new_sha256: cb07334c7963914d8a47d063c797a7ee171bfa3afe567a383839f313a0c7219c
+n_cases: 22
 identical: true
