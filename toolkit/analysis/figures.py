@@ -225,26 +225,41 @@ def _legend_handles(t, items):
             for lab, c in items]
 
 
+def _part_path(part):
+    """A polygon part (closed rings: the outer one, then its holes, oppositely wound) as one compound path, so the
+    fill leaves the holes empty."""
+    import numpy as np
+    from matplotlib.path import Path
+    verts, codes = [], []
+    for ring in part:
+        verts.append(np.asarray(ring, float))
+        codes += [Path.MOVETO] + [Path.LINETO] * (len(ring) - 2) + [Path.CLOSEPOLY]
+    return Path(np.vstack(verts), codes)
+
+
 def _unit_layout(R, ax, t, colors: dict, layout: str, order: list[str], size=None, edge=None, labels=True):
     """Draw every unit: as its polygon (layout 'boundaries', context features in grey, region outlines heavier), as a
     dot at its coordinates ('map'), or in a by-region strip (rows = regions)."""
     ax.set_facecolor(t["surface"])
     if layout == "boundaries":
         import numpy as np
-        from matplotlib.collections import LineCollection, PolyCollection
+        from matplotlib.collections import LineCollection, PatchCollection
+        from matplotlib.patches import PathPatch
         B = R.geo
         if B["context"]:
-            ax.add_collection(PolyCollection(B["context"], facecolors=t["band"], edgecolors=t["surface"],
-                                             linewidths=0.3, zorder=1))
-        polys, cols = [], []
+            ax.add_collection(PatchCollection([PathPatch(_part_path(p)) for p in B["context"]], facecolors=t["band"],
+                                              edgecolors=t["surface"], linewidths=0.3, zorder=1))
+        parts, cols = [], []
         for i in order:
-            for ring in B["units"].get(i, []):
-                polys.append(ring)
+            for part in B["units"].get(i, []):
+                parts.append(part)
                 cols.append(colors[i])
-        ax.add_collection(PolyCollection(polys, facecolors=cols, edgecolors=t["surface"], linewidths=0.25, zorder=2))
+        ax.add_collection(PatchCollection([PathPatch(_part_path(p)) for p in parts], facecolors=cols,
+                                          edgecolors=t["surface"], linewidths=0.25, zorder=2))
         if B["outline"]:
             ax.add_collection(LineCollection(B["outline"], colors=t["ink2"], linewidths=0.7, zorder=3))
-        allp = np.vstack(polys + B["context"]) if (polys or B["context"]) else np.zeros((1, 2))
+        rings = [r for p in parts + B["context"] for r in p]
+        allp = np.vstack(rings) if rings else np.zeros((1, 2))
         ax.set_xlim(allp[:, 0].min(), allp[:, 0].max())
         ax.set_ylim(allp[:, 1].min(), allp[:, 1].max())
         lat = float(np.mean(allp[:, 1]))
@@ -1053,33 +1068,11 @@ def load_presentation(run_dir: str, extra=None, spec: dict | None = None, engine
 
 
 def _boundaries_config(b, base: str, shown: str) -> dict:
-    def where(p):
-        p = os.path.expanduser(str(p))
-        return p if os.path.isabs(p) else os.path.join(base, p)
-    if not isinstance(b, dict) or not isinstance(b.get("path"), str) or not isinstance(b.get("feature_id"), str):
-        raise ValueError(f"{shown}: boundaries needs path and feature_id (strings)")
-    unknown = sorted(set(b) - {"path", "feature_id", "crosswalk", "credit"})
-    if unknown:
-        raise ValueError(f"{shown}: boundaries: unknown keys {unknown}")
-    out = {"path": where(b["path"]), "shown": b["path"], "feature_id": b["feature_id"], "credit": b.get("credit")}
-    xw = b.get("crosswalk")
-    if xw is not None:
-        if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
-            raise ValueError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
-        unknown = sorted(set(xw) - {"path", "unit_id", "feature_id", "union"})
-        if unknown:
-            raise ValueError(f"{shown}: boundaries.crosswalk: unknown keys {unknown}")
-        if "union" in xw and not isinstance(xw["union"], bool):
-            raise ValueError(f"{shown}: boundaries.crosswalk.union must be true or false")
-        out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
-                            "feature_id": xw["feature_id"], "union": bool(xw.get("union", False))}
-    if out.get("credit") is not None and not isinstance(out["credit"], str):
-        raise ValueError(f"{shown}: boundaries.credit must be a string")
-    return out
-
-
-GEOGRAPHIC_CRS = {"EPSG:4326", "urn:ogc:def:crs:EPSG::4326", "urn:ogc:def:crs:OGC:1.3:CRS84", "OGC:CRS84", "CRS84",
-                  "urn:ogc:def:crs:OGC::CRS84"}
+    """The presentation file's boundaries block: toolkit/spec/geometry.py's parser, the one for figures and the
+    input geometry check (keys path, feature_id, crosswalk {path, unit_id, feature_id}, credit; `crosswalk.union` is
+    refused: unions are not supported)."""
+    from toolkit.spec import geometry as GEO
+    return GEO.boundaries_config(b, base, shown)
 
 
 def _record_path(p: str, run_dir: str | None) -> str:
@@ -1092,116 +1085,64 @@ def _record_path(p: str, run_dir: str | None) -> str:
     return os.path.abspath(p)
 
 
-def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | None = None) -> dict:
-    """Polygons per unit from a GeoJSON FeatureCollection in geographic coordinates (EPSG:4326 / CRS84; Polygon and
-    MultiPolygon exterior rings; json and numpy only), matched to the units through the crosswalk or directly by the
-    feature property. Fail closed: a malformed file, a projected CRS, coordinates outside the geographic range, a
-    feature id used by two features, and an ambiguous crosswalk (a unit mapped to two features without
-    `union: true`, or a feature mapped to two units) raise ValueError naming every affected id. A feature with no
-    polygon leaves its unit unmatched. Returns {units: {id: [ring]}, context, unmatched, outline, features,
-    context_features, files: [{path, sha256, kind}]}."""
+def _part_rings(part) -> list:
+    """One polygon part ([outer ring, hole, ...], open rings of (lon, lat)) as closed numpy rings, the outer ring
+    counter-clockwise and each hole clockwise, so a filled path leaves the holes empty under either fill rule."""
     import numpy as np
+    out = []
+    for k, ring in enumerate(part):
+        r = np.asarray(ring + [ring[0]], float)
+        signed = float(np.sum(r[:-1, 0] * r[1:, 1] - r[1:, 0] * r[:-1, 1]))
+        if (signed > 0) != (k == 0):
+            r = r[::-1]
+        out.append(r)
+    return out
+
+
+def load_boundaries(cfg: dict, unit_ids: list[str], region_of, run_dir: str | None = None) -> dict:
+    """Polygons per unit, read with toolkit/spec/geometry.py (the one loader: EPSG:4326 / CRS84 only, Polygon and
+    MultiPolygon with holes, unique feature ids, degenerate rings refused) and matched to the units through the
+    crosswalk or directly by the feature property (geometry.resolve_targets: a unit mapped to more than one feature,
+    and a feature mapped to two units, are refused; unions are not supported). Every refusal raises ValueError naming the affected
+    ids. A feature with no polygon leaves its unit unmatched. Returns {units: {id: [part]}, context: [part],
+    unmatched, outline, features, context_features, files: [{path, sha256, kind}]}, where a part is a list of
+    closed rings (outer first, then holes) for a compound path."""
     from toolkit.analysis.artifacts import sha256
-    shown = cfg["shown"]
-    try:
-        doc = json.load(open(cfg["path"], encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise ValueError(f"{shown}: unreadable boundary file: {e}") from e
-    feats = doc.get("features") if isinstance(doc, dict) else None
-    if not isinstance(feats, list) or not feats:
-        raise ValueError(f"{shown}: not a GeoJSON FeatureCollection with features")
-    crs = ((doc.get("crs") or {}).get("properties") or {}).get("name") if isinstance(doc.get("crs"), dict) else None
-    if doc.get("crs") is not None and crs not in GEOGRAPHIC_CRS:
-        raise ValueError(f"{shown}: CRS {crs or doc.get('crs')!r} is not geographic (EPSG:4326 / CRS84 only); "
-                         "reproject the file")
-    by_fid, dup, empty = {}, set(), set()
-    for k, f in enumerate(feats):
-        g = f.get("geometry") if isinstance(f, dict) else None
-        props = f.get("properties") if isinstance(f, dict) else None
-        if not isinstance(g, dict) or not isinstance(props, dict):
-            raise ValueError(f"{shown}: feature {k} lacks geometry or properties")
-        if props.get(cfg["feature_id"]) is None:
-            raise ValueError(f"{shown}: feature {k} has no property {cfg['feature_id']}")
-        typ, co = g.get("type"), g.get("coordinates")
-        polys = [co] if typ == "Polygon" else co if typ == "MultiPolygon" else None
-        if not isinstance(polys, list):
-            raise ValueError(f"{shown}: feature {k} geometry {typ!r} is not a Polygon or MultiPolygon")
-        rings = []
-        for poly in polys:
-            try:
-                ring = np.asarray(poly[0], float)[:, :2]
-            except (TypeError, ValueError, IndexError) as e:
-                raise ValueError(f"{shown}: feature {k} has malformed coordinates") from e
-            if ring.ndim != 2 or len(ring) < 3 or not np.isfinite(ring).all():
-                raise ValueError(f"{shown}: feature {k} has malformed coordinates")
-            if (np.abs(ring[:, 0]) > 180).any() or (np.abs(ring[:, 1]) > 90).any():
-                raise ValueError(f"{shown}: feature {k} has coordinates outside the geographic range (longitude "
-                                 "within ±180, latitude within ±90): a projected file? Reproject to EPSG:4326")
-            rings.append(ring)
-        fid = str(props[cfg["feature_id"]])
-        if fid in by_fid or fid in empty:
-            dup.add(fid)
-        if rings:
-            by_fid[fid] = rings
-        else:
-            empty.add(fid)
-    if dup:
-        raise ValueError(f"{shown}: feature id {cfg['feature_id']} is not unique: {sorted(dup)[:20]}")
+    from toolkit.spec import geometry as GEO
+    import numpy as np
+    feats = GEO.read_features(cfg)
     files = [{"path": _record_path(cfg["path"], run_dir), "sha256": sha256(cfg["path"]), "kind": "boundaries"}]
-    targets = {}
+    xw = None
     if cfg.get("crosswalk"):
         c = cfg["crosswalk"]
-        try:
-            with open(c["path"], newline="", encoding="utf-8") as fh:
-                rows = list(csv.DictReader(fh))
-        except OSError as e:
-            raise ValueError(f"{c['shown']}: unreadable crosswalk: {e}") from e
-        if not rows or c["unit_id"] not in rows[0] or c["feature_id"] not in rows[0]:
-            raise ValueError(f"{c['shown']}: the crosswalk needs columns {c['unit_id']} and {c['feature_id']}")
-        for r in rows:
-            if r.get(c["feature_id"]):
-                tl = targets.setdefault(str(r[c["unit_id"]]), [])
-                if str(r[c["feature_id"]]) not in tl:
-                    tl.append(str(r[c["feature_id"]]))
+        xw = GEO.read_crosswalk(c)
         files.append({"path": _record_path(c["path"], run_dir), "sha256": sha256(c["path"]), "kind": "crosswalk"})
-        multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
-        if multi and not c.get("union"):
-            raise ValueError(f"{c['shown']}: {len(multi)} units map to more than one feature: {multi[:20]}; declare "
-                             "crosswalk.union: true to draw each such unit as the union of its features")
-    else:
-        targets = {i: [i] for i in unit_ids}
-    users = {}
-    for u, fl in targets.items():
-        if u in set(unit_ids):
-            for fid in fl:
-                users.setdefault(fid, []).append(u)
-    shared = {fid: us for fid, us in users.items() if len(us) > 1}
-    if shared:
-        aff = sorted({u for us in shared.values() for u in us})
-        raise ValueError(f"{(cfg.get('crosswalk') or {}).get('shown', shown)}: {len(shared)} features map to more than "
-                         f"one unit (units {aff[:20]}); each feature may belong to one unit")
+    targets = GEO.resolve_targets(xw, [str(i) for i in unit_ids],
+                                  (cfg.get("crosswalk") or {}).get("shown") or cfg["shown"])
     units, unmatched, used = {}, [], set()
     for i in unit_ids:
-        fl = [fid for fid in targets.get(i, []) if fid in by_fid]
-        if fl and len(fl) == len(targets.get(i, [])):
-            units[i] = [r for fid in fl for r in by_fid[fid]]
+        fl = targets.get(str(i), [])
+        if fl and all(feats.get(f) for f in fl):
+            units[i] = [_part_rings(p) for f in fl for p in feats[f]]
             used.update(fl)
         else:
             unmatched.append(i)
-            used.update(fid for fid in targets.get(i, []) if fid in by_fid)
-    context = [r for fid, rs in by_fid.items() if fid not in used for r in rs]
-    # region outlines: polygon edges not shared with another unit of the same region
+            used.update(f for f in fl if feats.get(f))
+    context = [_part_rings(p) for fid, ps in feats.items() if fid not in used for p in ps]
+    # region outlines: polygon edges (outer rings and holes) not shared with another unit of the same region
     seg_n = {}
-    for i, rings in units.items():
+    for i, parts in units.items():
         r = region_of(i)
-        for ring in rings:
-            q = np.round(ring, 5)
-            for a, b in zip(q[:-1], q[1:]):
-                key = (r, tuple(sorted([tuple(a), tuple(b)])))
-                seg_n[key] = seg_n.get(key, 0) + 1
+        for part in parts:
+            for ring in part:
+                q = np.round(ring, 5)
+                for a, b in zip(q[:-1], q[1:]):
+                    key = (r, tuple(sorted([tuple(a), tuple(b)])))
+                    seg_n[key] = seg_n.get(key, 0) + 1
     outline = [list(k[1]) for k, n in seg_n.items() if n == 1]
     return {"units": units, "context": context, "unmatched": unmatched, "outline": outline,
-            "features": len(feats), "context_features": sum(1 for fid in by_fid if fid not in used), "files": files}
+            "features": len(feats), "context_features": sum(1 for fid, ps in feats.items() if ps and fid not in used),
+            "files": files}
 
 
 def _map_extra(R, layout: str) -> dict:
@@ -2898,9 +2839,12 @@ def _self_test() -> int:
             except ValueError as e:
                 ok(needle in str(e) and "u1" in str(e), f"{label}: {e}")
         dd = bnd_run("bxu", [r for r in base_rows if r[0] != "u2"] + [("u1", "S-u2")], union=True)
-        eu, why = one(dd, "burden_map", "bxu_o")
-        ok(eu and "u2" in eu.get("unmatched", []) and "u1" not in eu.get("unmatched", []),
-           f"BD4c a declared union draws both features for the unit: {eu and eu.get('unmatched')} {why}")
+        try:
+            render(dd, os.path.join(base, "bxu_o"), only=["burden_map"])
+            ok(False, "BD4c a declared crosswalk.union is refused: unions are not supported (focused check of #131)")
+        except ValueError as e:
+            ok("not supported" in str(e), f"BD4c a declared crosswalk.union is refused: unions are not supported "
+                                         f"(focused check of #131): {e}")
         dd = bnd_run("bxe", base_rows, feats=lambda fs: fs[3].update(geometry={"type": "MultiPolygon",
                                                                               "coordinates": []}))
         ee, why = one(dd, "burden_map", "bxe_o")
@@ -2921,6 +2865,30 @@ def _self_test() -> int:
         dd = bnd_run("bxg", base_rows, crs="urn:ogc:def:crs:OGC:1.3:CRS84")
         eg, why = one(dd, "burden_map", "bxg_o")
         ok(eg is not None, f"BD6c CRS84 is accepted: {why}")
+        # BD7 (one loader, #131): figures read boundaries with toolkit/spec/geometry.py; a hole is cut out of the fill
+        dd = bnd_run("bxh", base_rows, feats=lambda fs: fs[4]["geometry"].update(
+            type="Polygon", coordinates=[[[4, 0], [5, 0], [5, 1], [4, 1], [4, 0]],
+                                         [[4.25, 0.25], [4.75, 0.25], [4.75, 0.75], [4.25, 0.75], [4.25, 0.25]]]))
+        from toolkit.spec import geometry as _GEO
+        cfg = _GEO.presentation_boundaries(dd)[0]
+        B7 = load_boundaries(cfg, uids, lambda i: "r", dd)
+        part = B7["units"]["u4"][0]
+        import matplotlib.pyplot as _plt
+        from matplotlib.collections import PatchCollection as _PC
+        from matplotlib.patches import PathPatch as _PP
+        f7, a7 = _plt.subplots(figsize=(1, 1), dpi=100)
+        a7.add_collection(_PC([_PP(_part_path(part))], facecolors=["black"], edgecolors="none"))
+        a7.set_xlim(4, 5)
+        a7.set_ylim(0, 1)
+        a7.axis("off")
+        f7.subplots_adjust(0, 0, 1, 1)
+        f7.canvas.draw()
+        px = __import__("numpy").asarray(f7.canvas.buffer_rgba())
+        _plt.close(f7)
+        eh, why = one(dd, "burden_map", "bxh_o")
+        ok(len(part) == 2 and min(px[50, 50][:3]) > 200 and max(px[90, 10][:3]) < 30   # hole: background; fill: black
+           and eh is not None,
+           f"BD7 a polygon's hole is kept and cut out of its fill; the map renders ({len(part)} rings) {why}")
         # P1-5: every tested range is kept; a plan-changing range is never dropped
         dr = toy_run(os.path.join(base, "runr"))
 

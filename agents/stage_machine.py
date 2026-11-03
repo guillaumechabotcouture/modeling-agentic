@@ -751,11 +751,26 @@ def _signoff(run_dir: str) -> dict | None:
 
 
 def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None) -> dict:
-    rec = {"by": by, "note": note, "at": _now(), "spec_sha256": signed_hash(run_dir)}
-    if rec["spec_sha256"] is None:
-        raise ValueError(f"no {AB.SPEC_FILE} to sign")
+    """The spike adapter's sign-off. The spec is read once, never through a link (lib.safe_io); that same content is
+    hashed into the record and frozen with its geometry inputs (Codex on 08f96a9)."""
+    import yaml
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:
+        data = read_nofollow(run_dir, AB.SPEC_FILE)[0]
+    except FileNotFoundError:
+        raise ValueError(f"no {AB.SPEC_FILE} to sign") from None
+    except (LinkRefused, OSError) as e:
+        raise ValueError(f"{AB.SPEC_FILE}: {e}") from None
+    rec = {"by": by, "note": note, "at": _now(), "spec_sha256": hashlib.sha256(data).hexdigest()}
     if expect_sha256 is not None and rec["spec_sha256"] != expect_sha256:
         raise ValueError(f"{AB.SPEC_FILE} changed since it was shown; read it again before signing")
+    try:
+        spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
+    from toolkit.spec import geometry as GEO
+    # the geometry declaration and input hashes of this content; the owner's approvals
+    GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
     _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
 
@@ -899,7 +914,29 @@ class Machine:
             except Exception:  # noqa: BLE001 -- the spec's own findings say why; the data refs need it
                 spec = None
             out += P.derivation_findings(self.run_dir, spec, required=self.st.derived_inputs)
+        out += self._geometry_findings()
         return out
+
+    def _geometry_findings(self) -> list[dict]:
+        """The standing input geometry check (toolkit/spec/geometry.py, docs/design/v2-input-geometry.md): the units'
+        coordinates and areas against the declared boundaries, re-run on the current files at every gate."""
+        if not os.path.exists(os.path.join(self.run_dir, AB.SPEC_FILE)):
+            return []
+        from toolkit.spec import geometry as GEO
+        return GEO.findings(GEO.run(self.run_dir))
+
+    def _geometry_problems(self) -> list[str]:
+        """Before SIGN: a HIGH geometry finding not accepted by name in the spec, or a check that failed on its
+        declared inputs. Writes data/input_checks.json, which the sign-off sheet reads."""
+        from toolkit.spec import geometry as GEO
+        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(self.run_dir))]
+
+    def _geometry_owner_pending(self) -> list[str]:
+        """HIGH geometry findings the spec proposes as exceptions and the owner has not approved."""
+        if not os.path.exists(os.path.join(self.run_dir, AB.SPEC_FILE)):
+            return []
+        from toolkit.spec import geometry as GEO
+        return GEO.owner_pending(GEO.run(self.run_dir))
 
     def _signed_ref(self, run_dir: str):
         """The signed spec's sha256: from the backend's own sign-off (B) or the machine's."""
@@ -997,10 +1034,12 @@ class Machine:
                         errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
                             self.run_dir, self._spec(), required=True)]
                     errs = errs or self.backend.pre_sign_problems(self.run_dir, derived=True)
+                    errs = errs or self._geometry_problems()
                     if not errs:
                         self._write_sheet()
                 else:
                     errs = errs or self.backend.pre_sign_problems(self.run_dir)
+                    errs = errs or self._geometry_problems()
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -1028,9 +1067,16 @@ class Machine:
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
         by = self._signed_by()
-        if by and (mode == "lead" or by == "owner"):
+        # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
+        # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
+        pend = self._geometry_owner_pending()
+        if by and (mode == "lead" or by == "owner") and not pend:
             return self._go("EVIDENCE", f"spec signed by {by}")
-        if mode == "lead":
+        if pend:
+            how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
+            self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
+                     f"{how} {self.run_dir} --by owner")
+        elif mode == "lead":
             res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
             note = (_signoff(self.run_dir) or {}).get("note", "")
             if res is not None and res.ok:
@@ -2078,6 +2124,12 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"DI machine tests: {type(e).__name__}: {e}")
+        try:
+            _self_test_geometry(ok, td)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            ok(False, f"IG machine tests: {type(e).__name__}: {e}")
         # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
         from toolkit.spec import schema as _S, signoff as _SO
         d70 = os.path.join(td, "t61")
@@ -2345,6 +2397,108 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        f"failed row, an older summary, no summary, or no run dir is not ({got})")
 
 
+def _self_test_geometry(ok, td: str) -> None:
+    """IG-M1-3 (docs/design/v2-input-geometry.md §4): the input geometry check through the machine. A units table
+    whose two rows carry each other's points is refused before SIGN; accepted by name, it reaches SIGN; the gate
+    carries the open finding."""
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import schema as S
+    from toolkit.spec import geometry as GEO
+    toolkit = AB.backend("toolkit")
+
+    def setup(d, accept=None):
+        os.makedirs(d)
+        raw = yaml.safe_load(open(S.toy_spec(d)))
+        os.remove(os.path.join(d, AB.SPEC_FILE))
+        rows = open(os.path.join(d, "units.csv")).read().strip().split("\n")
+        feats, out = [], [rows[0] + ",lon,lat"]
+        for k, line in enumerate(rows[1:]):
+            x = k * 0.6
+            feats.append({"type": "Feature", "properties": {"fid": str(k)}, "geometry": {
+                "type": "Polygon", "coordinates": [[[x, 10], [x + 0.5, 10], [x + 0.5, 10.5], [x, 10.5], [x, 10]]]}})
+            j = {0: 1, 1: 0}.get(k, k)                      # units 0 and 1 carry each other's points
+            out.append(f"{line},{j * 0.6 + 0.25:.3f},10.25")
+        open(os.path.join(d, "units.csv"), "w").write("\n".join(out) + "\n")
+        json.dump({"type": "FeatureCollection", "features": feats}, open(os.path.join(d, "b.geojson"), "w"))
+        yaml.safe_dump({"boundaries": {"path": "b.geojson", "feature_id": "fid"}},
+                       open(os.path.join(d, "presentation.yaml"), "w"))
+        if accept:
+            raw["decision_units"][GEO.ACCEPT_KEY] = accept
+        st = init_run(d, "toy question", 3, "owner", "v2", None, derived_inputs=False)
+        return Machine(d, StubTasks({"spec": raw}), st, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    d1 = os.path.join(td, "ig1")
+    m1 = setup(d1)
+    status = m1.run(max_steps=12)
+    fb = load_state(d1).tries.get("spec_feedback") or []
+    ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
+       and "SIGN" not in [h.get("to") for h in load_state(d1).history],
+       f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
+    hf = {f["kind"]: f for f in m1.harness_findings()}
+    ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
+       f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")
+    d2 = os.path.join(td, "ig2")
+    why = "the owner checked both rows against the source"
+    m2 = setup(d2, {"reciprocal_swap:0+1": why})
+    m2.run(max_steps=12)
+    rep = json.load(open(os.path.join(d2, GEO.ARTIFACT)))
+    still = "reciprocal_swap" in {f["kind"] for f in m2.harness_findings()}
+    ok(m2.st.state == "SIGN" and m2.st.paused == "awaiting_signoff"
+       and [f.get("proposed") for f in rep["findings"]] == [why] and still,
+       f"IG-M2a proposed by name with a reason, the spec reaches SIGN, where the owner decides; until then the gate "
+       f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
+    toolkit.sign(d2, "owner")
+    m2.step()
+    ok(m2.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
+       f"IG-M2b the owner's sign-off approves the proposed exception: the run goes on and the gate no longer carries "
+       f"it ({m2.st.state})")
+    # IG-M4 (review P1): under --signoff lead a proposed HIGH exception pauses for the owner, as a spec sign-off does
+    d4 = os.path.join(td, "ig4")
+    os.makedirs(d4)
+    m4 = setup(os.path.join(d4, "run"), {"reciprocal_swap:0+1": why})
+    m4.st.signoff = "lead"
+    m4.run(max_steps=12)
+    from toolkit.spec import signoff as SO
+    ok(m4.st.state == "SIGN" and m4.st.paused == "awaiting_signoff" and SO.status(m4.run_dir) == "awaiting",
+       f"IG-M4a --signoff lead: a HIGH geometry exception is not lead-signed; the run pauses for the owner "
+       f"({m4.st.state}, {m4.st.paused}, {SO.status(m4.run_dir)})")
+    toolkit.sign(m4.run_dir, "owner")
+    m4.step()
+    ok(m4.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
+       f"IG-M4b once the owner signs, the run goes on with the exception approved ({m4.st.state})")
+    import v2_sdk_tasks as SDK
+    ok({GEO.ARTIFACT, GEO.SIGNOFF_FILE} <= set(SDK.HARNESS_FILES),
+       "IG-M5 the check's record and the owner's geometry sign-off are harness files no task can write")
+    # IG-M6 (Codex on 08f96a9, P2): the spike signer reads the spec once (no link followed), then hashes and freezes
+    # that same content
+    import builtins
+    d6 = os.path.join(td, "ig6")
+    os.makedirs(d6)
+    try:
+        GEO.toy_spec_with_boundaries(d6)
+        opens, real_open, real_osopen = [], builtins.open, os.open
+
+        def bopen(f, *a, **k):
+            if str(f).endswith(AB.SPEC_FILE):
+                opens.append(str(f))
+            return real_open(f, *a, **k)
+
+        def oopen(f, *a, **k):
+            if str(f).endswith(AB.SPEC_FILE):
+                opens.append(str(f))
+            return real_osopen(f, *a, **k)
+        builtins.open, os.open = bopen, oopen
+        try:
+            rec6 = sign(d6, "owner", "n")
+        finally:
+            builtins.open, os.open = real_open, real_osopen
+        g6 = json.load(open(os.path.join(d6, GEO.SIGNOFF_FILE)))
+        ok(len(opens) == 1 and rec6["spec_sha256"] == signed_hash(d6) and (g6.get("declaration") or {}).get("enabled"),
+           f"IG-M6 the spike signer reads the spec once, then hashes and freezes that content ({len(opens)} opens)")
+    except Exception as e:  # noqa: BLE001 -- before the shared fixture exists (step α)
+        ok(False, f"IG-M6 the spike signer reads the spec once: {type(e).__name__}: {e}")
+
+
 def _self_test_derived(ok, td: str) -> None:
     """DI1, DI8 and the development flag at the gate, through the machine (docs/design/v2-derived-inputs.md §4)."""
     import shutil
@@ -2443,11 +2597,12 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s1 = sub.add_parser("status")
+    s1 = sub.add_parser("status", allow_abbrev=False)
     s1.add_argument("run_dir")
-    s2 = sub.add_parser("sign")
+    s2 = sub.add_parser("sign", allow_abbrev=False)
     s2.add_argument("run_dir")
     s2.add_argument("--by", choices=["owner"], required=True)
     s2.add_argument("--note", default="")

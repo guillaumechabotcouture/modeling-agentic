@@ -353,9 +353,10 @@ def signoff_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{ru
     if mode == "owner":
         return ("The decision brief is ready and waits for the owner's sign-off. Do not start other work. End your "
                 "turn now with the line AWAITING_SIGNOFF; the harness resumes you with the owner's answers.")
-    return ("Review the decision brief against the question, then sign it: python3 scripts/decision_brief.py sign "
-            f"{run_dir_rel} --by lead --accept-proposed --note \"<why it is an adequate target>\" (or answer the "
-            "open questions with --answers <file>).")
+    # Focused check of #131: the harness signs (main.py harness_sign_brief_lead) and registers what signing writes.
+    return (f"Review the decision brief against the question, then write {run_dir_rel}/{decision_brief.LEAD_ANSWERS} with the Write tool "
+            "(`accept_proposed: true` or `answers: {Q1: <answer>, ...}`, and `note: <why it is an adequate target>`) "
+            "and end your turn now with the line AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
 
 
 def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_dir}") -> str | None:
@@ -371,6 +372,32 @@ def scope_hold_reason(run_path: str, mode: str | None, run_dir_rel: str = "{run_
             f"finding, its declaration and decision test), write {run_dir_rel}/{scope_signoff.LEAD_ANSWERS} (one line "
             "per finding: `\"<finding>\": {decision: accept|decline, note: <why>}`), then end your turn with the line "
             "AWAITING_SIGNOFF; the harness signs your answers and resumes you.")
+
+
+LEAD_ANSWERS_EVENT = "lead_answers_written"
+
+
+def record_lead_answers(run_path: str, input_data: dict, trace_file) -> None:
+    """Focused check of #131: after the lead's own Write/Edit of decision_brief.LEAD_ANSWERS, record the file's
+    sha256 in the trace. The harness signs only answers whose content matches a lead write in the current turn
+    (main.py harness_sign_brief_lead). A specialist's write is denied at PreToolUse (enforcement.OWNED_BY) and never
+    recorded; a shell write is never recorded."""
+    if "agent_id" in input_data or input_data.get("tool_name") not in ("Write", "Edit", "MultiEdit"):
+        return
+    p = str((input_data.get("tool_input") or {}).get("file_path") or "")
+    target = os.path.realpath(os.path.join(run_path, decision_brief.LEAD_ANSWERS))
+    # resolved as enforcement resolves a tool's path: the call's cwd (else the repo root) plus the path, then realpath
+    if not p or os.path.realpath(enforcement._abspath(p, input_data.get("cwd"))) != target:
+        return
+    import hashlib
+    from datetime import timezone
+    from lib.safe_io import LinkRefused, read_nofollow
+    try:                                 # never through a link (lib.safe_io): a planted link records nothing
+        sha = hashlib.sha256(read_nofollow(run_path, decision_brief.LEAD_ANSWERS)[0]).hexdigest()
+    except (LinkRefused, OSError):
+        return
+    _safe_write(trace_file, {"ts": datetime.now(timezone.utc).isoformat(), "type": LEAD_ANSWERS_EVENT,
+                             "agent": "lead", "sha256": sha})
 
 
 def create_hooks(run_path: str, trace_file, start_time: datetime,
@@ -448,9 +475,13 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
             from agents.integrity import pipeline_builds
             if pipeline_builds(str(tool_input.get("command") or ""), input_data.get("cwd")):
                 deny_reason = PIPELINE_BUILD_DENY
-        if (not deny_reason and signoff == "owner" and tool_name == "Bash"
-                and re.search(r"decision_brief\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
-            deny_reason = "The owner signs the decision brief in this run; agents cannot sign it."
+        if (not deny_reason and tool_name == "Bash"
+                and re.search(r"decision_brief\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
+            # Focused check of #131: no agent signs the brief in any mode. In lead mode the lead writes
+            # decision_brief.LEAD_ANSWERS and the harness signs (main.py harness_sign_brief_lead).
+            deny_reason = ("The owner signs the decision brief in this run; agents cannot sign it." if signoff != "lead"
+                           else f"agents cannot sign the brief: write {decision_brief.LEAD_ANSWERS} and end your "
+                                "turn with AWAITING_SIGNOFF; the harness signs it")
         if (not deny_reason and signoff in ("owner", "lead") and tool_name == "Bash"
                 and re.search(r"scope_signoff\.py\b.*\bsign\b", str(tool_input.get("command") or ""), re.S)):
             deny_reason = "Agents cannot sign scope declarations (the harness records the answers)."   # Phase 49 β
@@ -566,6 +597,7 @@ def create_hooks(run_path: str, trace_file, start_time: datetime,
                     if fname.endswith(".png"):
                         _check_figure_size(os.path.join(fig_dir, fname), agent_id)
         snapshot_report(run_path, snapshot_state)
+        record_lead_answers(run_path, input_data, trace_file)
         if tool_use_id in review_before:
             # Phase 49 δ (Codex): record which draft this presentation review read and
             # whether it produced a usable critique; the gate requires one for the

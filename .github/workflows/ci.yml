@@ -17,7 +17,9 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # A guard against a hung job, not a duration budget: a normal run takes 25-40 min on a
+    # loaded runner; 40 cancelled healthy runs (2026-11-03), so the ceiling sits well above it.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +45,10 @@ jobs:
       # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
       # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
       - name: Self-tests (every module with --self-test, found by scripts/self_tests.py)
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2
+        env:
+          OPENBLAS_NUM_THREADS: "2"
+          OMP_NUM_THREADS: "2"
 
       # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
       # a PR into a long-lived branch (v2) that merges main brings main's checked rows.

@@ -59,6 +59,14 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    derived file needs a new sign-off. A failed script comes back to you with its error.
    Codes: `units_not_derived`, `data_ref_not_derived`, `derivation_stale`, `derivation_failed`,
    `derivation_nondeterministic`, `input_column_unaccounted`, `ignored_column_used`.
+   When the units table has coordinates (`decision_units.coordinates: {lat, lon, area_km2}`)
+   and the run's presentation file declares boundaries, the harness checks each unit's point
+   and area against its polygon (`toolkit/spec/geometry.py`, `data/input_checks.json`). A
+   `reciprocal_swap`, a point far outside its own polygon, or an area that matches another
+   polygon blocks sign-off: fix the derivation, the crosswalk or the boundary file. If you
+   believe the data are right, propose an exception by name with a reason in
+   `decision_units.geometry_accepted`; only the owner's sign-off approves a HIGH one, and the
+   run waits for the owner. Signing freezes the boundary declaration and files.
 4. **Options.** Components, packages (`generate: true` for every combination with at most
    one per group, or the exact list the question offers, with its names), the engine map
    (component to engine component value), prices and cost items in toolkit/alloc form
