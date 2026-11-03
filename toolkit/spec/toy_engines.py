@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Self-test toy engines for toolkit/spec/engine_parameters.py (and the sign-off sheet's self-test).
 
-Never allowed in a production run: toolkit/import_guard.py refuses these references unless a self-test enables them
-with `import_guard.allow_test_refs("engine", REFS)` (that process and the worker processes it starts). ToySpecEngine
-appends to the log path its configuration names; nothing outside a self-test can construct it through the guard.
+Never allowed in a production run: toolkit/import_guard.py refuses these references unless code in a self-test
+enables them (`enable_for_test`, which calls `import_guard.allow_test_refs`); its worker processes get that registration
+only as their pool initializer's argument (`import_guard.pool_kwargs`). No environment variable enables them.
+ToySpecEngine appends to a call log under the root the self-test registered; nothing outside a self-test can construct
+it through the guard.
 Exercised by the self-test of toolkit/spec/engine_parameters.py.
 """
 from __future__ import annotations
@@ -20,15 +22,24 @@ from toolkit.engines.empirical.engine import PackageRateEngine  # noqa: E402
 from toolkit.engines.hooks import ToyScheduleEngine  # noqa: E402
 
 REFS = ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")
-LOG_ENV = "MA_TOY_SPEC_LOG_DIR"      # set by the self-test only: the directory of the call log (its trusted root)
+LOG_STATE = "toy_spec_log_root"      # the call log's root, registered by the self-test (never read from the environment)
 LOG_FILE = "calls.{pid}.jsonl"
+
+
+def enable_for_test(log_root: str | None = None) -> None:
+    """Self-tests only: enable REFS in this process (import_guard.allow_test_refs) and, when given, root the call log
+    in `log_root`, a temporary directory the self-test created. Both travel to worker processes only through
+    import_guard.pool_kwargs()."""
+    from toolkit import import_guard as G
+    G.allow_test_refs("engine", REFS, state={LOG_STATE: os.path.realpath(log_root) if log_root else None})
 
 
 class ToySpecEngine(ToyScheduleEngine):
     """The toy engine with both hooks, a card range on `base` ([0.4, 0.6]) and a calibrated parameter `c_rate` (unused
     by the model). `log`: every run, schedule and run_series call appends the resolved base, k and synergy as a JSON
-    line to calls.<pid>.jsonl under the directory the self-test names in LOG_ENV (worker processes inherit it), through
-    lib.safe_io with that directory as the trusted root. No path comes from the configuration."""
+    line to calls.<pid>.jsonl under the root the self-test registered (enable_for_test; its workers get it from their
+    pool initializer), through lib.safe_io with that directory as the trusted root. No path comes from the
+    configuration or the environment."""
 
     def __init__(self, results_path: str | None = None, log: bool = False):
         super().__init__(results_path)
@@ -40,7 +51,8 @@ class ToySpecEngine(ToyScheduleEngine):
         return out + [ParamSpec("c_rate", 1.0, "calibrated", source="toy")]
 
     def _log(self, call, params):
-        root = os.environ.get(LOG_ENV)
+        from toolkit import import_guard as G
+        root = G.test_state(LOG_STATE)
         if self.log and root:
             if os.path.join(ROOT, "scripts") not in sys.path:
                 sys.path.insert(0, os.path.join(ROOT, "scripts"))

@@ -148,6 +148,13 @@ def _side_refs(x, kind: str) -> list:
     return out
 
 
+def _pool_kw() -> dict:
+    """Worker-pool arguments carrying a self-test's import-guard registration (test-only toy engines) to its
+    workers; {} in production (toolkit/import_guard.py pool_kwargs)."""
+    from toolkit import import_guard as G
+    return G.pool_kwargs()
+
+
 def _oracles(pack: dict):
     """The pack's oracle module, through toolkit/import_guard.py (policy "oracle")."""
     from toolkit import import_guard as G
@@ -557,7 +564,7 @@ class Runner:
             res = []
             for i in range(0, len(tasks), chunk):
                 part = tasks[i:i + chunk]
-                with ProcessPoolExecutor(min(self.workers, len(part))) as ex:
+                with ProcessPoolExecutor(min(self.workers, len(part)), **_pool_kw()) as ex:
                     res += list(ex.map(fn, part, chunksize=1))
                 if len(tasks) > chunk:
                     print(f"  ran {min(i + chunk, len(tasks))}/{len(tasks)} engine tasks", flush=True)
@@ -854,7 +861,7 @@ class Runner:
             # (a fresh pool per chunk; max_tasks_per_child hung on macOS / Python 3.14 in the self-test)
             per, k = [], self.workers * COVERAGE_TASKS_PER_CHILD
             for i in range(0, reps, k):
-                with ProcessPoolExecutor(min(self.workers, len(jobs[i:i + k]))) as ex:
+                with ProcessPoolExecutor(min(self.workers, len(jobs[i:i + k])), **_pool_kw()) as ex:
                     per += list(ex.map(_coverage_job, jobs[i:i + k], chunksize=1))
         else:
             per = [_coverage_job(j) for j in jobs]

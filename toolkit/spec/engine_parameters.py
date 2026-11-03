@@ -620,7 +620,7 @@ def _self_test() -> int:
     from toolkit.spec import engine_parameters as EPm     # the module the engine loader imports, not __main__
     from toolkit.spec import toy_engines as TOYS
     from toolkit import import_guard as G
-    G.allow_test_refs("engine", TOYS.REFS)     # this process and the workers it starts (never a production run)
+    TOYS.enable_for_test()    # this process; its workers through import_guard.pool_kwargs() (never a production run)
     fails = []
 
     def ok(cond, msg):
@@ -642,8 +642,7 @@ def _self_test() -> int:
     def toy_raw(d, **entries):
         raw = yaml.safe_load(open(schema.toy_spec(d, n=24)))
         raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine",
-                         "config": {"log": True}}
-        os.environ[TOYS.LOG_ENV] = d          # the call log's root, inherited by worker processes
+                         "config": {"log": True}}     # logs only where the self-test registered a root (EP10-EP19)
         if entries:
             raw[FIELD] = entries
         return raw
@@ -989,7 +988,9 @@ def _self_test() -> int:
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
         from toolkit.analysis import run as RUN, trajectories as TR
-        with tempfile.TemporaryDirectory() as d:
+        # the call log's root: a temporary directory this self-test owns (outside the run dir), registered explicitly
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix="ma_toy_log_") as logs:
+            TOYS.enable_for_test(logs)
             r = toy_raw(d,
                         base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY},
                         k={"value": 0.9, "source": SRC, "reason": WHY},
@@ -1021,7 +1022,7 @@ def _self_test() -> int:
                f"EP11 the batch: k held at its spec value in every job; base (a decision test varies it) an emulator "
                f"input over the box from its spec value to the tested value; synergy drawn over its range: "
                f"{design.get('spec_value_names')}, {design.get('prior_names')}")
-            calls = [json.loads(x) for f in sorted(glob.glob(os.path.join(d, "calls.*.jsonl"))) for x in open(f)]
+            calls = [json.loads(x) for f in sorted(glob.glob(os.path.join(logs, "calls.*.jsonl"))) for x in open(f)]
             runs = [c for c in calls if c["call"] == "run"]
             sch = [c for c in calls if c["call"] == "schedule"]
             ok(runs and all(c["k"] == 0.9 for c in calls) and sch and all(c["base"] == 0.3 for c in sch),

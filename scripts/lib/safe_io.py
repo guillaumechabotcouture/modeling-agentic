@@ -39,6 +39,7 @@ import math
 import os
 import stat
 import sys
+import time
 import traceback
 from typing import Any, Callable, Iterable, Optional
 
@@ -296,6 +297,26 @@ def dir_fd_nofollow(base, parts, create: bool = False) -> int:
         raise
 
 
+# Follow-up to #133: two processes creating the same new file through a directory fd at once can get ENOENT from
+# openat(O_CREAT) (seen on macOS: 4 processes x 400 appends, about 1 in 30 creations). The open is retried as the same
+# single openat (no check-then-open, links still refused by O_NOFOLLOW); only ENOENT in a directory that still exists is
+# retried, a bounded number of times.
+CREATE_ATTEMPTS = 100
+
+
+def _openat_create(dfd: int, name: str, flags: int) -> int:
+    """os.open(name, flags | O_CREAT | O_NOFOLLOW, dir_fd=dfd), retried on the concurrent-creation ENOENT window.
+    Other errors (a link: ELOOP; a directory: EISDIR) are raised at once."""
+    for attempt in range(CREATE_ATTEMPTS):
+        try:
+            return os.open(name, flags | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except FileNotFoundError:
+            if os.fstat(dfd).st_nlink == 0 or attempt == CREATE_ATTEMPTS - 1:
+                raise                     # the directory was removed, or the window never closed
+            time.sleep(0.0005 * min(attempt + 1, 20))
+    raise AssertionError("unreachable")
+
+
 def open_nofollow(base: str, rel: str) -> int:
     """A read-only fd on the plain file base/rel, opened with no link followed at any component. The caller closes
     it."""
@@ -467,7 +488,7 @@ def open_append_nofollow(base: str, rel: str):
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
     try:
         try:
-            fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+            fd = _openat_create(dfd, parts[-1], os.O_WRONLY | os.O_APPEND)
         except OSError as e:
             raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
     finally:
@@ -526,10 +547,9 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
                 os.close(fd)
             os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
             return rel if isinstance(base, int) else os.path.join(base, rel)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive
-                                                                                            else 0)
+        flags = os.O_WRONLY | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive else 0)
         try:
-            fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+            fd = _openat_create(dfd, parts[-1], flags)
         except OSError as e:
             raise LinkRefused(f"{rel}: cannot be written without following a link ({e.strerror})") from None
         try:

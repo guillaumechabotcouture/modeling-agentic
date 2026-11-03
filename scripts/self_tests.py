@@ -13,12 +13,14 @@ unless it is listed in EXEMPT with the reason it has none. So a new module under
     python3 scripts/self_tests.py              # run them all (exit 1 on any failure)
     python3 scripts/self_tests.py --list       # print what would run, and the exemptions
     python3 scripts/self_tests.py --jobs 2     # run two at a time
+    python3 scripts/self_tests.py --per-test-timeout 900   # kill (and fail) a self-test after 15 min (default)
     python3 scripts/self_tests.py --self-test  # test the discovery rule itself
 """
 from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -123,36 +125,69 @@ def discover(repo: str = REPO):
     return classify(tracked_files(repo), file_has_marker(repo))
 
 
-def _run_one(python: str, repo: str, path: str):
+PER_TEST_TIMEOUT_S = 15 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
+
+
+def _run_one(python: str, repo: str, path: str, timeout_s: float | None = None):
+    """(path, exit code or None when timed out, output, seconds). Each self-test runs in its own session; one that
+    outlives `timeout_s` is killed with its whole process group (its children too)."""
     t0 = time.time()
-    p = subprocess.run([python, path, MARKER], cwd=repo, capture_output=True, text=True)
-    return path, p.returncode, p.stdout + p.stderr, time.time() - t0
-
-
-def run_all(python: str, jobs: int, repo: str = REPO) -> int:
+    p = subprocess.Popen([python, path, MARKER], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, text=True, start_new_session=True)
     try:
-        run, skipped, notes, problems = discover(repo)
-    except RuntimeError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
+        out, _ = p.communicate(timeout=timeout_s if timeout_s and timeout_s > 0 else None)
+        return path, p.returncode, out or "", time.time() - t0
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            out, _ = p.communicate(timeout=30)    # the pipe closes once the group is gone
+        except subprocess.TimeoutExpired:         # a grandchild that left the group still holds it
+            p.kill()
+            out = ""
+        return path, None, (out or "") + f"\n(killed after {timeout_s:.0f}s)", time.time() - t0
+
+
+def run_all(python: str, jobs: int, repo: str = REPO, per_test_timeout: float | None = PER_TEST_TIMEOUT_S,
+            files: list | None = None) -> int:
+    """Run every discovered self-test (or `files`, which skips discovery: the watchdog's own test). A self-test that
+    runs longer than `per_test_timeout` seconds (0 or None: no limit) is killed, named and counted as failed; the
+    others still run."""
+    if files is None:
+        try:
+            run, skipped, notes, problems = discover(repo)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+    else:
+        run, skipped, notes, problems = list(files), [], [], []
     gha = os.environ.get("GITHUB_ACTIONS") == "true"
-    failed = []
+    failed, timed_out = [], []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
-        for path, rc, out, dt in ex.map(lambda f: _run_one(python, repo, f), run):
-            print(f"::group::{path}" if gha else f"== {path} ({dt:.0f}s)", flush=True)
+        for path, rc, out, dt in ex.map(lambda f: _run_one(python, repo, f, per_test_timeout), run):
+            print(f"::group::{path} ({dt:.0f}s)" if gha else f"== {path} ({dt:.0f}s)", flush=True)
             print(out.rstrip())
             if gha:
                 print("::endgroup::")
-            if rc != 0:
+            if rc is None:
+                failed.append(path)
+                timed_out.append(path)
+                msg = f"self-test timed out after {per_test_timeout:.0f}s; its process group was killed"
+                print(f"::error file={path}::{msg}" if gha else f"FAILED: {path} ({msg})", flush=True)
+            elif rc != 0:
                 failed.append(path)
                 print(f"::error file={path}::self-test failed" if gha else f"FAILED: {path} (exit {rc})",
                       flush=True)
+    for p in timed_out:
+        print(f"TIMED OUT: {p}")
     for n in notes:
         print(f"NOTE: {n}")
     for p in problems:
         print(f"::error file={p.split()[0]}::{p}" if gha else f"DISCOVERY PROBLEM: {p}")
-    print(f"\n{len(run) - len(failed)}/{len(run)} self-tests passed; {len(skipped)} exempt; "
-          f"{len(problems)} discovery problem(s).")
+    print(f"\n{len(run) - len(failed)}/{len(run)} self-tests passed ({len(timed_out)} timed out); "
+          f"{len(skipped)} exempt; {len(problems)} discovery problem(s).")
     return 1 if failed or problems else 0
 
 
@@ -253,6 +288,9 @@ def main(argv=None) -> int:
     ap.add_argument("--list", action="store_true", help="print the files that would run and the exemptions")
     ap.add_argument("--jobs", type=int, default=1, help="self-tests to run at a time (default 1)")
     ap.add_argument("--python", default=sys.executable, help="interpreter to run each self-test with")
+    ap.add_argument("--per-test-timeout", type=float, default=PER_TEST_TIMEOUT_S, metavar="S",
+                    help="kill a self-test (and its process group) that runs longer than S seconds and count it as "
+                         f"failed; 0 for no limit (default {PER_TEST_TIMEOUT_S:.0f})")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -271,7 +309,7 @@ def main(argv=None) -> int:
         for p in problems:
             print(f"# DISCOVERY PROBLEM: {p}")
         return 1 if problems else 0
-    return run_all(a.python, a.jobs)
+    return run_all(a.python, a.jobs, per_test_timeout=a.per_test_timeout)
 
 
 if __name__ == "__main__":
