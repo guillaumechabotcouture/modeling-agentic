@@ -238,10 +238,9 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
                 for j, row in zip(g["jobs"], r["result"]["rows"]):
                     byid[j["id"]] = row
         rows = [{"ok": True, "result": byid[j["id"]]} if j["id"] in byid else {"ok": False} for j in jobs]
-        with open(out, "w") as f:
-            for n, (j, r) in enumerate(zip(jobs, rows)):
-                if r["ok"]:
-                    f.write(json.dumps({"i": n, "ok": True, "result": r["result"]}) + "\n")
+        from toolkit.analysis.artifacts import _safe_io
+        _safe_io().publish(out, "".join(json.dumps({"i": n, "ok": True, "result": r["result"]}) + "\n"
+                                        for n, (j, r) in enumerate(zip(jobs, rows)) if r["ok"]), run_dir)
         summ = dict(summ, tasks=len(groups), n=len(jobs), n_failed=sum(not r["ok"] for r in rows))
     res, problems = verify_rows([dict(r, id=j["id"]) for j, r in zip(jobs, rows) if r.get("ok")], jobs, engine)
     return {"results": res, "problems": problems,
@@ -361,12 +360,12 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
         raise ValueError("stored batch not adopted: the current engine does not reproduce it: " + "; ".join(mism))
     ident = engine_identity(engine)
     out = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
     src = {"path": os.path.abspath(src_results), "sha256": sha256(src_results), "jobs_sha256": sha256(src_jobs)}
-    with open(out, "w") as f:
-        for n, j in enumerate(jobs):
-            f.write(json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
-                "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n")
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().write_nofollow(run_dir, "analysis/batch/results.jsonl", "".join(
+        json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
+            "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n"
+        for n, j in enumerate(jobs)).encode(), atomic=True)
     return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
             "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
             "ignored": sorted(TIMING_KEYS)}
@@ -419,19 +418,17 @@ def _file_sha(path: str) -> str | None:
 
 
 def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict]) -> dict:
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)            # a bundle dir the caller names (outside or inside a run dir)
     p = {k: os.path.join(out_dir, v) for k, v in SHIP_FILES.items()}
-    with open(p["jobs"], "w") as f:
-        f.write("".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs))
-    with open(p["design"], "w") as f:
-        json.dump(design_, f, indent=1, sort_keys=True)
-    with open(p["results"], "w") as f:
-        f.write("".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
-                        for r in rows))
+    from toolkit.analysis.artifacts import _safe_io
+    sio = _safe_io()
+    sio.publish(p["jobs"], "".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs))
+    sio.publish(p["design"], json.dumps(design_, indent=1, sort_keys=True))
+    sio.publish(p["results"], "".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True)
+                                      + "\n" for r in rows))
     man = dict(man, producer=PRODUCER, n_jobs=len(jobs), n_rows=len(rows),
                **{f"{k}_sha256": _file_sha(v) for k, v in p.items()})
-    with open(os.path.join(out_dir, SHIP_MANIFEST), "w") as f:
-        json.dump(man, f, indent=1, sort_keys=True)
+    sio.publish(os.path.join(out_dir, SHIP_MANIFEST), json.dumps(man, indent=1, sort_keys=True))
     return man
 
 

@@ -127,9 +127,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":
         design, jobs = Bt.design(spec)
-        os.makedirs(os.path.join(run_dir, "analysis", "batch"), exist_ok=True)
-        with open(os.path.join(run_dir, "analysis", "batch", "design.json"), "w") as f:
-            json.dump(design, f, indent=1)
+        from toolkit.analysis.artifacts import _safe_io
+        _safe_io().write_nofollow(run_dir, "analysis/batch/design.json", json.dumps(design, indent=1).encode(),
+                                  atomic=True)
         kw = dict(compute_kw or {})
         if spec["analysis"].get("workers"):
             kw.setdefault("max_workers", int(spec["analysis"]["workers"]))
@@ -140,13 +140,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
             # jobs, and the analysis uses the shipped design (batch.load_shipped)
             from toolkit.engines.contract import engine_identity
             design, jobs, res, info = Bt.load_shipped(shipped, spec, design, jobs, eng)
-            with open(os.path.join(run_dir, "analysis", "batch", "design.json"), "w") as f:
-                json.dump(design, f, indent=1)
-            with open(os.path.join(run_dir, "analysis", "batch", "results.jsonl"), "w") as f:
-                for n, j in enumerate(jobs):
-                    f.write(json.dumps({"i": n, "ok": True, "result": {"result": res[j["id"]], "provenance": {
-                        "job_sha": Bt.job_sha(j), "engine": engine_identity(eng), "producer": Bt.PRODUCER,
-                        "shipped_from": info}}}) + "\n")
+            _safe_io().write_nofollow(run_dir, "analysis/batch/design.json", json.dumps(design, indent=1).encode(),
+                                      atomic=True)
+            _safe_io().write_nofollow(run_dir, "analysis/batch/results.jsonl", "".join(
+                json.dumps({"i": n, "ok": True, "result": {"result": res[j["id"]], "provenance": {
+                    "job_sha": Bt.job_sha(j), "engine": engine_identity(eng), "producer": Bt.PRODUCER,
+                    "shipped_from": info}}}) + "\n" for n, j in enumerate(jobs)).encode(), atomic=True)
             res, probs = Bt.load_results(os.path.join(run_dir, "analysis", "batch", "results.jsonl"), jobs, eng)
             bsum = {"source": "shipped batch", "shipped": info, "n": len(res), "rejected_rows": len(probs)}
             adopt_in = [os.path.join(os.path.abspath(shipped), n) for n in
@@ -235,9 +234,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if stab.get("folds"):
         import yaml
         rp = os.path.join(run_dir, "models", "allocation_robustness.yaml")
-        os.makedirs(os.path.dirname(rp), exist_ok=True)
-        with open(rp, "w") as f:
-            yaml.safe_dump(plain(ST.robustness_yaml(stab)), f, sort_keys=False)
+        from toolkit.analysis.artifacts import _safe_io
+        _safe_io().write_nofollow(run_dir, "models/allocation_robustness.yaml",
+                                  yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
     # ---- sensitivity
     sens = SE.run(A, z0, ben0, cost0, plan, sol["objective"])
@@ -260,13 +259,16 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     cols = d["columns"]
     reg = spec["decision_units"].get("region")
     dp = os.path.join(run_dir, d["allocation_file"])
-    with open(dp, "w", newline="") as f:
-        w = csv.writer(f)
-        hl_o = d["headline"]["outcome"]
-        w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"])
-        for i in A.ids:
-            w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
-                        A.by_id[i].get(reg, "") if reg else ""])
+    import io as _io
+    buf = _io.StringIO(newline="")
+    w = csv.writer(buf)
+    hl_o = d["headline"]["outcome"]
+    w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"])
+    for i in A.ids:
+        w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
+                    A.by_id[i].get(reg, "") if reg else ""])
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().publish(dp, buf.getvalue(), run_dir)
     S.deliverable(dp, PRODUCER, "allocation")
     # ---- figures
     figs = FG.draw(run_dir, point, u["data"], sens, cal, A.primary, arts)

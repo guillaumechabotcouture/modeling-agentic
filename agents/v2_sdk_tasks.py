@@ -219,6 +219,15 @@ def _settings_text() -> str:
     return ", ".join(getattr(AB.backend(), "settings_paths", AB.SETTINGS_PATHS))
 
 
+def _sio():
+    """scripts/lib/safe_io.py: run-dir writes with no link followed (follow-up to review round 5)."""
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io
+    return safe_io
+
+
 class SdkTasks:
     """Each call's dollar cap is the allowance the machine sets just before it (set_allowance: the
     run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
@@ -262,8 +271,7 @@ class SdkTasks:
         if allowance is None or allowance <= 0:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
-        if os.path.exists(out):
-            os.remove(out)
+        _sio().remove_path(out, self.run_dir)
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
@@ -337,14 +345,12 @@ class SdkTasks:
         except (OSError, ValueError):
             return TaskResult(False, None, usd, f"no valid {OUT}", seen["sid"])
         finally:
-            if os.path.exists(out):
-                os.remove(out)
+            _sio().remove_path(out, self.run_dir)
         return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300], seen["sid"])
 
     def _input(self, obj) -> str:
         name = "_task_input.json"
-        with open(os.path.join(self.run_dir, name), "w") as f:
-            json.dump(obj, f, indent=1, default=str)
+        _sio().write_nofollow(self.run_dir, name, json.dumps(obj, indent=1, default=str).encode(), atomic=True)
         return name
 
     def draft_spec(self, question, run_dir, feedback):
@@ -356,8 +362,8 @@ class SdkTasks:
             repo=R, out=OUT), p, OWNS["draft_spec"])
 
     def sign_spec(self, run_dir):
-        with open(os.path.join(run_dir, "decision_spec.signoff.json"), "w") as f:
-            json.dump({"by": "lead", "note": "lead mode: the harness accepts the drafted spec"}, f)
+        _sio().write_nofollow(run_dir, "decision_spec.signoff.json", json.dumps(
+            {"by": "lead", "note": "lead mode: the harness accepts the drafted spec"}).encode(), atomic=True)
         return TaskResult(True, None, 0.0, "lead mode")
 
     def pick_engine(self, spec, eligible):

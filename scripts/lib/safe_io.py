@@ -304,6 +304,38 @@ def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[by
         os.close(fd)
 
 
+def anchored(path: str, root: str | None = None) -> tuple[str, str]:
+    """(base, rel) for a no-follow write of `path`: anchored at the trusted `root` (a run dir) when `path` lies under
+    it, compared lexically (no link resolved below the root, so a planted link inside the run dir is caught by the
+    no-follow traversal, not resolved away); else at the path's own parent, resolved once."""
+    ap = os.path.abspath(path)
+    if root:
+        for r in (os.path.abspath(root), os.path.realpath(root)):
+            rel = os.path.relpath(ap, r)
+            if rel != "." and not rel.startswith(".." + os.sep) and rel != "..":
+                return os.path.realpath(root), rel.replace(os.sep, "/")
+    return os.path.realpath(os.path.dirname(ap)), os.path.basename(ap)
+
+
+def publish(path: str, data, root: str | None = None) -> str:
+    """write_nofollow(atomic) of `path` (str data is UTF-8), anchored by anchored(path, root)."""
+    base, rel = anchored(path, root)
+    return write_nofollow(base, rel, data.encode("utf-8") if isinstance(data, str) else data, atomic=True)
+
+
+def append_text(path: str, text: str, root: str | None = None) -> None:
+    """Append text to `path` with no link followed (open_append_nofollow), anchored by anchored(path, root)."""
+    base, rel = anchored(path, root)
+    with open_append_nofollow(base, rel) as f:
+        f.write(text)
+
+
+def remove_path(path: str, root: str | None = None) -> bool:
+    """remove_nofollow of `path`, anchored by anchored(path, root)."""
+    base, rel = anchored(path, root)
+    return remove_nofollow(base, rel)
+
+
 def open_append_nofollow(base: str, rel: str):
     """A text file object appending to base/rel (created if absent, never truncated), opened with no link followed
     at any component and refused when the file has other hard links. Also usable as an flock target."""

@@ -21,9 +21,12 @@ def _fv():
 
 
 def _save(fig, run_dir, name, sources):
+    import io
+    from toolkit.analysis.artifacts import _safe_io
     path = os.path.join(run_dir, "figures", name)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, bbox_inches="tight", format=os.path.splitext(name)[1].lstrip(".") or "png")
+    _safe_io().write_nofollow(run_dir, f"figures/{name}", buf.getvalue(), atomic=True)   # no link followed
     import matplotlib.pyplot as plt
     plt.close(fig)
     fv = _fv()
@@ -35,8 +38,8 @@ def _save(fig, run_dir, name, sources):
     sc.update(produced_by="harness", producer=PRODUCER, paths_relative_to="run_dir",
               png_path=os.path.relpath(path, run_dir),
               source_hashes={os.path.relpath(p, run_dir): h for p, h in (sc.get("source_hashes") or {}).items()})
-    with open(sp, "w") as f:
-        json.dump(sc, f, indent=2, sort_keys=True)
+    _safe_io().write_nofollow(run_dir, f"figures/{name}.provenance.json",
+                              json.dumps(sc, indent=2, sort_keys=True).encode(), atomic=True)
     return os.path.relpath(path, run_dir)
 
 

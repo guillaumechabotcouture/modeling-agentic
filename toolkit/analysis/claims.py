@@ -75,9 +75,9 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc) -> dict:
     B, R = _scripts()
     spec = {"producer": PRODUCER, "produced_by": "harness",
             "claims": claim_spec(A, arts, point, uq, stab, dts, cal)}
-    os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
-    with open(os.path.join(run_dir, SPEC_REL), "w") as f:
-        yaml.safe_dump(spec, f, sort_keys=False, width=120)
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().write_nofollow(run_dir, SPEC_REL.replace(os.sep, "/"),
+                              yaml.safe_dump(spec, sort_keys=False, width=120).encode(), atomic=True)
     doc, errs = B.write(run_dir)
     if errs or doc is None:
         raise RuntimeError(f"claims ledger: {errs}")
@@ -88,8 +88,7 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc) -> dict:
     rendered, unresolved = R.render_text(text, claims)
     if unresolved:
         raise RuntimeError(f"results.md: unresolved claims {unresolved}")
-    with open(os.path.join(run_dir, "results.md"), "w") as f:
-        f.write(rendered)
+    _safe_io().write_nofollow(run_dir, "results.md", rendered.encode("utf-8"), atomic=True)
     return {"n_claims": len(claims), "unresolved": doc.get("unresolved") or [], "ledger": "models/claims_ledger.yaml",
             "spec": SPEC_REL, "results": "results.md"}
 

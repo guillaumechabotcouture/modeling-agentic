@@ -67,13 +67,14 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
         if dt.get("automatic"):
             rec["automatic"] = True
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")
+        rel = f"{DIR}/{dt['id']}.yaml".replace(os.sep, "/")
+        from toolkit.analysis.artifacts import _safe_io
         if rec.get("status") == "not_run":
-            if os.path.exists(p):
-                os.remove(p)            # no stale result file from an earlier run
+            _safe_io().remove_nofollow(run_dir, rel)      # no stale result file from an earlier run
             rec["path"] = None
         else:
-            with open(p, "w") as f:
-                yaml.safe_dump(plain(rec), f, sort_keys=False, width=120)
+            _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(plain(rec), sort_keys=False, width=120).encode(),
+                                      atomic=True)
             rec["path"] = os.path.relpath(p, run_dir)
         out.append(rec)
     return out

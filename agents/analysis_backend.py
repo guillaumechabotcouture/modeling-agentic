@@ -324,9 +324,9 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
 
 def _configure(spec: dict, out: str) -> dict:
     from spike.analysis import batch as B
+    from toolkit.analysis.artifacts import _safe_io
     for f in ("results.jsonl", "results_prev.jsonl"):
-        if os.path.exists(os.path.join(out, f)):
-            os.remove(os.path.join(out, f))      # a changed spec invalidates every engine run
+        _safe_io().remove_path(os.path.join(out, f))      # a changed spec invalidates every engine run
     d = B.design(spec, out)
     s = B.run(out, max(1, min(2, os.cpu_count() or 1)))   # at most 2 local workers
     return {"design": d, "batch": s}

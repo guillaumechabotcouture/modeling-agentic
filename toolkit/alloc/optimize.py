@@ -650,9 +650,14 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
         report["sweep"] = sweep
     path = out or (os.path.join(run_dir, "models", "optimization_quality.yaml") if run_dir else None)
     if path:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w") as f:
-            yaml.safe_dump(report, f, sort_keys=False)
+        import sys as _sys
+        _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts")
+        if _scripts not in _sys.path:
+            _sys.path.insert(0, _scripts)
+        from lib.safe_io import publish                # no link followed (follow-up to review round 5)
+        if not run_dir:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        publish(path, yaml.safe_dump(report, sort_keys=False), run_dir)
     report["results"] = res
     report["path"] = path
     return report

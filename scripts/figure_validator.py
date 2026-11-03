@@ -249,8 +249,11 @@ def validate_figure(png_path: str,
         "written_at_utc": datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
     }
-    with open(_provenance_path(png_path), "w") as f:
-        json.dump(sidecar, f, indent=2, sort_keys=True)
+    import sys as _sys
+    if os.path.dirname(os.path.abspath(__file__)) not in _sys.path:
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from lib.safe_io import publish                 # no link followed at the sidecar (follow-up to review round 5)
+    publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True))
 
 
 def check_staleness(png_path: str) -> dict:

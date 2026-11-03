@@ -536,17 +536,11 @@ def _safe_dest(run_dir: str, rel: str) -> str:
     return cur
 
 
-def _copy_nofollow(src: str, dest: str, run_dir: str | None = None) -> None:
-    """Copy a repo file into the run dir. With `run_dir`, published through lib.safe_io (no link at any component,
-    atomic); without, the final component is opened with O_NOFOLLOW."""
+def _copy_nofollow(src: str, dest: str, run_dir: str) -> None:
+    """Copy a repo file into the run dir, published through lib.safe_io (no link at any component, atomic)."""
     data = open(src, "rb").read()
-    if run_dir is not None:
-        from lib.safe_io import write_nofollow
-        write_nofollow(run_dir, os.path.relpath(dest, run_dir).replace(os.sep, "/"), data, atomic=True)
-        return
-    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, os.path.relpath(dest, run_dir).replace(os.sep, "/"), data, atomic=True)
 
 
 def stage_inputs(run_dir: str, question: str) -> list[str]:

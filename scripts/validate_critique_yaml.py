@@ -2723,9 +2723,8 @@ def _append_validator_history(run_dir: str, round_n: int, decision: dict,
                      for v in (decision.get("rigor_violations") or [])],
     }
     try:
-        with open(os.path.join(run_dir, _VALIDATOR_HISTORY_FILE), "a",
-                  encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
+        from lib.safe_io import append_text           # no link followed (follow-up to review round 5)
+        append_text(os.path.join(run_dir, _VALIDATOR_HISTORY_FILE), json.dumps(rec) + "\n", run_dir)
     except OSError as e:
         print(f"WARNING: could not append validator history: {e}",
               file=sys.stderr)
