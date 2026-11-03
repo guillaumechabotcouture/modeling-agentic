@@ -878,6 +878,43 @@ def _self_test_merge_v2(ok) -> None:
                                      f"not ({s})")
 
 
+def _self_test_render_out(ok) -> None:
+    """WA28: `figures render RUN --out RUN[/sub] --recompute` on a run without analysis/figure_data.yaml is refused
+    before anything is created or published (the outside-the-run check comes first)."""
+    import tempfile
+    for p in (REPO, os.path.join(REPO, "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    from toolkit.analysis import figures as FG, figure_data as FD
+
+    def tree(d):
+        return sorted((os.path.relpath(os.path.join(r, n), d), os.lstat(os.path.join(r, n)).st_mtime_ns)
+                      for r, ds, fs in os.walk(d) for n in ds + fs)
+    res = []
+    for sub in ("", "out"):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "metadata.json"), "w").write("{}")
+            os.makedirs(os.path.join(d, "analysis"))
+            open(os.path.join(d, "analysis", "uncertainty.yaml"), "w").write("data: {}\n")
+            before = tree(d)
+            real = FD.rebuild, FD.compute
+            FD.rebuild = lambda run_dir: ({}, {}, {}, {}, {}, 0)       # a rebuild that succeeds (an older run)
+            FD.compute = lambda *a, **k: {"x": 1}
+            refused = False
+            try:
+                FG.main(["render", d, "--out", os.path.join(d, sub) if sub else d, "--recompute"])
+            except ValueError:
+                refused = True
+            except Exception:  # noqa: BLE001 -- any other failure is not the refusal
+                pass
+            finally:
+                FD.rebuild, FD.compute = real
+            res.append((refused, tree(d) == before))
+    ok(all(r == (True, True) for r in res),
+       f"WA28 render --out inside the run with --recompute is refused before it creates or publishes anything "
+       f"(--out RUN, --out RUN/out: {res})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -909,6 +946,7 @@ def _self_test() -> int:
     _self_test_round7(ok)
     _self_test_round8(ok)
     _self_test_merge_v2(ok)
+    _self_test_render_out(ok)
     live = problems(sites(), REVIEWED, OPEN_ITEMS)
     n_open = sum(n for pats in OPEN_ITEMS.values() for n, _ in pats.values())
     print(f"NOTE {n_open} attacker-reachable write site(s) remain as counted open items (OPEN_ITEMS)")
