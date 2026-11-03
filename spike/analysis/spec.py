@@ -38,8 +38,8 @@ DT_TYPES = ("interaction_rescale",)
 
 def load_engine(ref: str):
     """The engine a spec names, through toolkit/import_guard.py (policy "engine"; refused before any import)."""
-    from toolkit import import_guard as G
-    return G.resolve("engine", ref)()
+    from toolkit.spec import schema
+    return schema.engine_class(ref)()        # the class is checked against the Engine contract before construction
 
 
 def read_units(spec: dict, base: str = ROOT) -> list[dict]:

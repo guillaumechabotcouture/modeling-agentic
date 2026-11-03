@@ -2442,10 +2442,21 @@ def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict
         lock.close()
 
 
+def _out_base(out: str) -> tuple[str, str]:
+    """(directory, name) for no-follow writes of `out` and its sidecars: the parent resolved once, the name never
+    followed (lib.safe_io; review round 4, P1-2)."""
+    return os.path.realpath(os.path.dirname(os.path.abspath(out))), os.path.basename(out)
+
+
 def _out_lock(out: str, block: bool = False, suffix: str = ".lock"):
-    """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it."""
+    """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it. The lock
+    file is opened for append with no link followed (never truncated)."""
     import fcntl
-    f = open(out + suffix, "w")
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib.safe_io import open_append_nofollow
+    base, name = _out_base(out)
+    f = open_append_nofollow(base, name + suffix)
     try:
         fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
     except OSError:
@@ -2467,14 +2478,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         # an interrupted or killed batch keeps them (rerunning reuses them).
         # The rows kept so far are copied to a new journal that replaces the old
         # one only once complete (a kill during the copy loses nothing).
-        with open(out + PARTIAL_EXT + ".tmp", "w") as f:
-            f.write(json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n")
-            for key, r in old.items():
-                f.write(json.dumps({**r, "key": key}) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(out + PARTIAL_EXT + ".tmp", out + PARTIAL_EXT)
-        part = open(out + PARTIAL_EXT, "a")
+        from lib.safe_io import open_append_nofollow, write_nofollow
+        base, name = _out_base(out)
+        journal = json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
+            json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
+        write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
+        part = open_append_nofollow(base, name + PARTIAL_EXT)
 
         def sink(got):
             for r in got:
@@ -2503,15 +2512,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
-    tmp = out + ".tmp"
-    with open(tmp, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-    os.replace(tmp, out)
-    json.dump(summary, open(out + ".summary.json.tmp", "w"), indent=1)
-    os.replace(out + ".summary.json.tmp", out + ".summary.json")
+    from lib.safe_io import remove_nofollow, write_nofollow
+    base, name = _out_base(out)
+    write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+    write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
     try:
-        os.remove(out + PARTIAL_EXT)
+        remove_nofollow(base, name + PARTIAL_EXT)
     except OSError:
         pass
     return rows, summary

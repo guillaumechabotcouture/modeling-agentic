@@ -538,8 +538,8 @@ def _self_test() -> int:
         os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "point.yaml"))
         st_ = Store(d, None, False, {})
         os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "manifest.json.tmp"))
-        for fn in (lambda: st_.write("point", {k: 0 for k in __import__("toolkit.analysis.artifacts", fromlist=["KINDS"]
-                                                                         ).KINDS["point"]}, "t"),
+        from toolkit.analysis.artifacts import KINDS as _KINDS
+        for fn in (lambda: st_.write("point", {k: 0 for k in _KINDS["point"]}, "t"),
                    lambda: st_.finalize("blocked", "t")):
             try:
                 fn()

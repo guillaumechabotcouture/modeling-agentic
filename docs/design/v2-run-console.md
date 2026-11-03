@@ -401,3 +401,25 @@ refuses it. The brief sign-off validates the captured `success_criteria.yaml` by
 canonical run id and are checked against the run they are submitted to; the page clears the composer's anchor when
 the run changes; gate cards and the figure side panel carry their render-time snapshot; a blocker's own `evidence`
 field is kept and the snapshot is stored under `snapshot`.
+
+## 14. Review round 4 (Codex, on #129)
+
+- **Retired derivation outputs** (`pipeline._retire_outputs`): names from the previous derivation record must be
+  plain relative paths under `data/derived/` (checked by parts, so `data/derived/../../x` is refused) and are
+  unlinked relative to a no-follow directory fd (`lib.safe_io.remove_nofollow`).
+- **More writers on `lib.safe_io`**: run_state.json (`save_state`), the machine's JSON and YAML records, the report
+  and deliverable, the evidence and pipeline stubs, the lead's sign-off record, staged inputs, the findings ledger,
+  analysis artifacts and the manifest, compute batch results, summaries, the partial journal (append through
+  `open_append_nofollow`) and the batch lock, and the scope sign-off ledger, trace and request.
+  `scripts/write_audit.py --self-test` scans the v2 harness modules for write-mode `open(`, write-flag `os.open(`,
+  `shutil.copy*/move/rmtree`, `os.replace/rename` and `os.remove/unlink` outside self-test code; each remaining site
+  is in its reviewed table with a reason and an exact count. The table names the run-dir writes still on plain opens
+  as open items (fix loop records, analysis batch files, the compute ledger, a few task outputs, pipeline aside
+  copies); the counts keep new ones out.
+- **The engine policy resolves only engine classes** (a class with describe/parameters/run); the spike loader builds
+  through `schema.engine_class`.
+- **The sign-off sheet is rendered from the captured bytes it hashes** (the spec and the derivation record, read once).
+- **Feedback controls and the composer are bound to the run they were taken in**: a control left from another run is
+  refused on the page, and the server refuses a snapshot that does not check for the run and anchor instead of
+  replacing it with fresh evidence.
+- **Figures are served by their snapshot hash** (`/api/file?...&sha=`); a file whose bytes changed is refused.

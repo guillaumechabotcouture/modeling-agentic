@@ -341,9 +341,9 @@ def harness_record(run_dir: str) -> str:
     for fp, a in answers.items():
         if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)):
             led[fp] = {"sha256": _answer_sha(a), "nonce": nonce, "by": a.get("by"), "recorded_at": now}
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump({"entries": led, "producer": "main.py"}, f, indent=1)
-    with open(os.path.join(run_dir, TRACE), "a", encoding="utf-8") as f:
+    from lib.safe_io import open_append_nofollow, write_nofollow    # no link followed (review round 4, P1-2)
+    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
+    with open_append_nofollow(run_dir, TRACE) as f:
         f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
     return nonce
 
@@ -466,10 +466,8 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optio
         if not old or not old.get("pending"):
             return None
         doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=1)
-    os.replace(tmp, p)
+    from lib.safe_io import write_nofollow    # atomic, no link followed (review round 4, P1-2)
+    write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
     return p
 
 

@@ -136,12 +136,16 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _put(run_dir: str, rel: str, text: str) -> None:
+    """A harness file in the run dir, published atomically with no link followed (lib.safe_io; review round 4)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
+
+
 def save_state(run_dir: str, st: RunState) -> None:
-    p = os.path.join(run_dir, STATE_FILE)
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(st.to_dict(), f, indent=1, default=str)
-    os.replace(tmp, p)
+    """run_state.json, published atomically with no link followed (lib.safe_io; review round 4, P1-2)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, STATE_FILE, json.dumps(st.to_dict(), indent=1, default=str).encode(), atomic=True)
 
 
 # ------------------------------------------------------------------ gate routing (pure)
@@ -479,10 +483,10 @@ DECLARED_FILE = "declared_findings.yaml"
 
 def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
-    with open(os.path.join(run_dir, DECLARED_FILE), "w") as f:
-        yaml.safe_dump({"rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
-                        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
-                                      "claim": o["claim"]} for o in opened]}, f, sort_keys=False)
+    _put(run_dir, DECLARED_FILE, yaml.safe_dump({
+        "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
+        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"], "claim": o["claim"]}
+                     for o in opened]}, sort_keys=False))
 
 
 # ---- provenance of inputs
@@ -532,8 +536,14 @@ def _safe_dest(run_dir: str, rel: str) -> str:
     return cur
 
 
-def _copy_nofollow(src: str, dest: str) -> None:
+def _copy_nofollow(src: str, dest: str, run_dir: str | None = None) -> None:
+    """Copy a repo file into the run dir. With `run_dir`, published through lib.safe_io (no link at any component,
+    atomic); without, the final component is opened with O_NOFOLLOW."""
     data = open(src, "rb").read()
+    if run_dir is not None:
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, os.path.relpath(dest, run_dir).replace(os.sep, "/"), data, atomic=True)
+        return
     fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
@@ -557,7 +567,7 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
         parent = os.path.dirname(dest)
         os.makedirs(parent, exist_ok=True)
         _safe_dest(run_dir, dest_rel)                      # nothing linked was created on the way
-        _copy_nofollow(src, dest)
+        _copy_nofollow(src, os.path.join(os.path.realpath(run_dir), dest_rel), os.path.realpath(run_dir))
         prov["inputs"][dest_rel] = {"source": rel, "sha256": _sha256(src), "bytes": os.path.getsize(src)}
         staged.append(dest_rel)
     _safe_dest(run_dir, PROVENANCE)
@@ -752,8 +762,7 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         raise ValueError(f"no {AB.SPEC_FILE} to sign")
     if expect_sha256 is not None and rec["spec_sha256"] != expect_sha256:
         raise ValueError(f"{AB.SPEC_FILE} changed since it was shown; read it again before signing")
-    with open(os.path.join(run_dir, SIGNOFF_FILE), "w") as f:
-        json.dump(rec, f, indent=1)
+    _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
 
 
@@ -1032,7 +1041,8 @@ class Machine:
             note = (_signoff(self.run_dir) or {}).get("note", "")
             if res is not None and res.ok:
                 if os.path.exists(os.path.join(self.run_dir, SIGNOFF_FILE)) and getattr(self.backend, "sign", None):
-                    os.remove(os.path.join(self.run_dir, SIGNOFF_FILE))   # the lead's note; B writes its own record
+                    from lib.safe_io import remove_nofollow
+                    remove_nofollow(self.run_dir, SIGNOFF_FILE)   # the lead's note; B writes its own record
                 try:
                     self._sign("lead", note)              # the harness records the hash
                     return self._go("EVIDENCE", "spec signed by the lead")
@@ -1046,10 +1056,8 @@ class Machine:
 
     def h_EVIDENCE(self):
         # Stub (workstream V5): every parameter is an assumption until the evidence service checks it.
-        os.makedirs(os.path.join(self.run_dir, "evidence"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "evidence", "registry.yaml"), "w") as f:
-            f.write("# evidence service stub (v2 C): no parameter has been fetched or matched yet\n"
-                    "status: stub\nentries: []\n")
+        _put(self.run_dir, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
+             "matched yet\nstatus: stub\nentries: []\n")
         return self._go("ENGINE_CHOICE", "evidence stub")
 
     def h_ENGINE_CHOICE(self):
@@ -1092,9 +1100,7 @@ class Machine:
             steps = self.backend.pipeline_steps(os.path.join(self.run_dir, AB.SPEC_FILE), self.run_dir)
         except Exception as e:  # noqa: BLE001
             return f"the pipeline could not be written: {type(e).__name__}: {e}"
-        os.makedirs(os.path.join(self.run_dir, "models"), exist_ok=True)
-        with open(os.path.join(self.run_dir, "models", "pipeline.yaml"), "w") as f:
-            yaml.safe_dump({"version": 1, "steps": steps}, f, sort_keys=False)
+        _put(self.run_dir, "models/pipeline.yaml", yaml.safe_dump({"version": 1, "steps": steps}, sort_keys=False))
         return None
 
     def reopen_interrupted_analysis(self) -> str | None:
@@ -1310,11 +1316,9 @@ class _Journaled:
 
 
 def _write_json(run_dir: str, rel: str, obj) -> None:
-    p = os.path.join(run_dir, rel)
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=1, default=str)
-    os.replace(tmp, p)
+    """A harness record in the run dir, published atomically with no link followed (lib.safe_io)."""
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, rel.replace(os.sep, "/"), json.dumps(obj, indent=1, default=str).encode(), atomic=True)
 
 
 def _rep_error(rep: dict) -> str:
@@ -1452,8 +1456,7 @@ def render_report(run_dir: str, backend=AB) -> str:
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']}" for e in dec2["declared"]]
-    with open(os.path.join(run_dir, "report.md"), "w") as f:
-        f.write(draft.rstrip() + "\n" + "\n".join(lines) + "\n")
+    _put(run_dir, "report.md", draft.rstrip() + "\n" + "\n".join(lines) + "\n")
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
 
@@ -1470,12 +1473,14 @@ def _write_deliverable(run_dir: str) -> None:
         return                      # an invalid destination is a HIGH finding, never written
     rows = list(csv.DictReader(open(src)))
     names = df.get("package_names") or {}
-    with open(os.path.join(run_dir, df["path"]), "w", newline="") as f:
-        w = csv.writer(f)
-        cols = df["columns"]
-        w.writerow(list(cols))
-        for r in rows:
-            w.writerow([names.get(r[c], r[c]) if c == "package" else r[c] for c in cols.values()])
+    import io
+    buf = io.StringIO(newline="")
+    w = csv.writer(buf)
+    cols = df["columns"]
+    w.writerow(list(cols))
+    for r in rows:
+        w.writerow([names.get(r[c], r[c]) if c == "package" else r[c] for c in cols.values()])
+    _put(run_dir, str(df["path"]), buf.getvalue())
 
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",

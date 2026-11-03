@@ -1082,8 +1082,15 @@ def evidence(run_dir: str, anchor: dict | None, captured: str = "submit") -> dic
 
 
 def _evidence_for(run_dir: str, anchor: dict | None, shown) -> dict | None:
-    """The snapshot the page showed when its seal checks, else one captured now."""
-    return dict(shown) if evidence_ok(shown, anchor, run_dir) else evidence(run_dir, anchor)
+    """The snapshot the page showed when its seal checks for this run and anchor. A snapshot that does not check is
+    refused (ValueError), never replaced with fresh evidence (review round 4, P2-5); with none sent, the evidence is
+    captured now and marked `captured: submit`."""
+    if shown is None:
+        return evidence(run_dir, anchor)
+    if evidence_ok(shown, anchor, run_dir):
+        return dict(shown)
+    raise ValueError("the evidence snapshot does not match this run or anchor (a control left from another run, or "
+                     "a stale page): not recorded; reload and try again")
 
 
 def append_feedback(run_dir: str, rec: dict) -> dict:
@@ -1493,13 +1500,17 @@ class ChatSession:
                                                "verdict": verdict, "evidence": shown_evidence})
             except ValueError as e:
                 return {"ok": False, "error": str(e)}
+        try:
+            shown_ok = _evidence_for(run_dir, anchor, shown_evidence) if (anchor or {}).get("file") else None
+        except ValueError as e:
+            return {"ok": False, "feedback": fb, "error": str(e)}
         ctx = chat_context(run_dir)
         hist, _ = read_jsonl_rel(run_dir, CHAT)
         msgs = [{"role": r["role"], "content": r["text"]} for r in hist[-HISTORY_TURNS:]
                 if r.get("role") in ("user", "assistant") and r.get("text")]
         a = anchor or {}
         prefix = (f"[Anchored to {a.get('kind')} {a.get('id')} in {a.get('file')}]\n" if a.get("kind") else "")
-        ev = (fb or {}).get("evidence") or (_evidence_for(run_dir, a, shown_evidence) if a.get("file") else None)
+        ev = (fb or {}).get("evidence") or shown_ok
         if ev and ev.get("excerpt") is not None:
             prefix += (f"[Evidence from {ev['file']} (sha256 {str(ev.get('sha256'))[:12]}, round {ev.get('round')}): "
                        f"{ev['excerpt']}]\n")
@@ -2239,6 +2250,10 @@ class Console:
         if method == "GET" and path == "/api/file":
             rel = q.get("path") or ""
             data = read_file_bytes(rd, rel)
+            want = q.get("sha") or ""
+            if want and hashlib.sha256(data).hexdigest() != want:
+                # the page asks for the bytes its snapshot recorded (review round 4, P2-6)
+                raise ValueError(f"{rel} changed since the page was rendered: reload the run")
             ext = os.path.splitext(rel)[1].lower()
             ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml"}.get(
                 ext, "text/plain; charset=utf-8")

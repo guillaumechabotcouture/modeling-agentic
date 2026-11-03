@@ -190,22 +190,29 @@ def sheet_sources(text) -> dict | None:
 
 def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     """Generate the sign-off sheet and publish it (no link followed, atomic), with the hashes of the spec and the
-    derivation record it was generated from recorded in its last line. The hashes are taken before and after the
-    sheet is generated; a change in between is retried, so the record is the sources the text was made from. The
-    console disables approval and the signer refuses when they no longer match (review round 3, P1-4)."""
-    for _ in range(3):
-        before = (_sha_nofollow(run_dir, SPEC), _sha_nofollow(run_dir, DERIVATIONS_RECORD) or "none")
-        text = sheet(run_dir, candidates)
-        after = (_sha_nofollow(run_dir, SPEC), _sha_nofollow(run_dir, DERIVATIONS_RECORD) or "none")
-        if before == after:
-            src = json.dumps({"spec_sha256": before[0], "derivations_sha256": before[1]}, sort_keys=True)
-            write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(),
-                           atomic=True)
-            return os.path.join(run_dir, SHEET)
-    raise ValueError(f"{SPEC} or {DERIVATIONS_RECORD} kept changing while the sheet was written")
+    derivation record it was generated from recorded in its last line. The spec and the record are each read once;
+    the sheet is rendered from those bytes and records their hashes (review round 4, P1-4). The console disables
+    approval and the signer refuses when they no longer match."""
+    try:
+        spec_bytes = read_nofollow(run_dir, SPEC)[0]
+    except (FileNotFoundError, LinkRefused) as e:
+        raise ValueError(f"{SPEC}: {e}") from None
+    try:
+        rec_bytes = read_nofollow(run_dir, DERIVATIONS_RECORD)[0]
+    except FileNotFoundError:
+        rec_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{DERIVATIONS_RECORD}: {e}") from None
+    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes)
+    src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none"},
+                     sort_keys=True)
+    write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
+    return os.path.join(run_dir, SHEET)
 
 
-def sheet(run_dir: str, candidates: list | None = None) -> str:
+def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
+          record_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; and, when given, the candidate engines and why any is
@@ -213,12 +220,19 @@ def sheet(run_dir: str, candidates: list | None = None) -> str:
     import yaml
     path = os.path.join(run_dir, SPEC)
     try:
-        raw = yaml.safe_load(open(path, encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as e:
+        if spec_bytes is None:
+            with open(path, "rb") as f:
+                spec_bytes = f.read()
+            record_bytes = record_bytes if record_bytes is not None else (
+                open(os.path.join(run_dir, DERIVATIONS_RECORD), "rb").read()
+                if os.path.exists(os.path.join(run_dir, DERIVATIONS_RECORD)) else None)
+        raw = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         return f"# Decision spec sign-off sheet\n\n{SPEC} unreadable: {e}\n"
+    rsha = hashlib.sha256(record_bytes).hexdigest() if record_bytes is not None else "none"
     out = ["# Decision spec sign-off sheet", "",
-           f"Signing accepts `{SPEC}` (sha256 `{(DB._sha(path) or '')[:16]}`) and the derived data recorded in "
-           f"`{DERIVATIONS_RECORD}` (sha256 `{(DB._sha(os.path.join(run_dir, DERIVATIONS_RECORD)) or 'none')[:16]}`). "
+           f"Signing accepts `{SPEC}` (sha256 `{hashlib.sha256(spec_bytes).hexdigest()[:16]}`) and the derived data "
+           f"recorded in `{DERIVATIONS_RECORD}` (sha256 `{rsha[:16]}`). "
            "It also accepts what follows.", ""]
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \

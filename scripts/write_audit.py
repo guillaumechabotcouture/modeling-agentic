@@ -39,13 +39,53 @@ PATTERNS = {
 # self-tests and the toy fixtures they build (synthetic run dirs in a temporary directory)
 _SELF_TEST = re.compile(r"^(\s*)def (?:_self_test\w*|_toy\w*|toy_\w*|derived_toy_\w*|_\w*fixture\w*|example_\w*)\(")
 _DEF = re.compile(r"^(\s*)(?:async\s+)?def \w+\(|^(\s*)class \w+")
-_OUTSIDE = "writes outside any run dir (a temporary directory or a file named by the operator)"
-_TMPDIR = "inside a temporary work directory the harness created (tempfile), not a run dir"
-# {file: {pattern: (count, reason)}}: write sites that do not write inside a run dir, or are safe there.
+# Remaining run-dir writes on plain opens: an open item, counted exactly so none is added (migrate, then lower the
+# count). Migrated in round 4: run_state.json, the machine's records, report and deliverable, the findings ledger,
+# analysis artifacts and manifest, compute batch outputs/summaries/journal/lock, the scope sign-off ledger, trace and
+# request, derivation outputs and record, retired outputs, the sign-off sheet and records.
+_OPEN = "a run-dir write on a plain open, not yet on lib.safe_io (open item; the count keeps new ones out)"
+_TEST = "self-test fixture code (a temporary directory), inside a helper the skip rule does not name"
+# {file: {pattern: (count, reason)}}: write sites that do not write inside a run dir, or are counted open items.
 REVIEWED = {
+    "agents/analysis_backend.py": {
+        "open-write": (2, "a units subset in the cross-check's temporary work dir; write_toy_units (fixtures)"),
+        "remove": (1, _OPEN + ": engine-run results invalidated by a changed spec")},
+    "agents/fix_loop.py": {"open-write": (4, _OPEN + ": fix-loop impact log, plan and progress"),
+                           "remove": (2, _OPEN + ": a superseded fix record")},
+    "agents/stage_machine.py": {
+        "os.open-write": (1, "_copy_nofollow without run_dir (O_NOFOLLOW on the final component); stage_inputs "
+                             "passes run_dir and goes through lib.safe_io"),
+        "open-write": (2, "toy tasks of the self-test (MA_TOY_CALLS, toy rows)")},
+    "agents/v2_sdk_tasks.py": {"remove": (2, _OPEN + ": a task's own stale output before it reruns"),
+                               "open-write": (2, _OPEN + ": the lead's sign-off note and a task output")},
+    "agents/v2_tasks.py": {"open-write": (3, "stub tasks for dry runs and self-tests: " + _OPEN),
+                           "rename": (1, "stub tasks for dry runs and self-tests: " + _OPEN)},
     "scripts/compute.py": {
-        "open-write": (0, ""),
-    },
+        "open-write": (16, "worker init markers and chunk files in temporary dirs; the cloud chunk sync "
+                           "current/members files; detached-job records and logs; the ledger and its lock "
+                           "(models/compute_ledger.json: " + _OPEN + "); the CLI's operator-named --out"),
+        "remove": (8, "temporary chunk and pid files; stale job and ledger files (" + _OPEN + ")"),
+        "shutil": (1, "the worker's own __pycache__ under a temporary dir"),
+        "rename": (4, "pid file, ledger and job record publication (" + _OPEN + ")"),
+        "os.open-write": (1, "an O_EXCL file in a private temporary dir (the result-store download)")},
+    "scripts/decision_brief.py": {
+        "shutil": (1, _OPEN + ": restore() copies a signed version back"),
+        "open-write": (11, "the brief lock (" + _OPEN + "); the rest is self-test fixture code"),
+        "remove": (1, _TEST)},
+    "scripts/pipeline.py": {
+        "shutil": (11, "sandbox copies, caches and work dirs the harness made in temporary dirs; "
+                       "the aside copy of a failed step's outputs (" + _OPEN + ")"),
+        "rename": (3, "moving a failed step's outputs aside and back (" + _OPEN + ")"),
+        "remove": (7, "a failed step's leftovers and sandbox mount points (" + _OPEN + "); temporary copies"),
+        "open-write": (8, "a CSV filter and mount points in the sandbox work dir; the rest is the self-test's "
+                          "toy derivation (" + _TEST + ")")},
+    "toolkit/analysis/batch.py": {"open-write": (6, _OPEN + ": the analysis batch design, jobs and results")},
+    "toolkit/analysis/run.py": {
+        "open-write": (10, "analysis batch design/results and calibration records (" + _OPEN + "); "
+                           "the rest is self-test fixture code"),
+        "remove": (1, _TEST), "shutil": (1, _TEST)},
+    "toolkit/spec/schema.py": {"open-write": (1, "a string: the toy derivation script's source text")},
+    "tools/run_console/run_console.py": {"remove": (2, "the console's own temporary answers file (tempfile.mkstemp)")},
 }
 
 

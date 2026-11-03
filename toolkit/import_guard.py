@@ -34,6 +34,7 @@ POLICIES = {
                    "suffix": None},
 }
 _TEST_MODULES: dict = {k: set() for k in POLICIES}
+ENGINE_METHODS = ("describe", "parameters", "run")      # the Engine contract (toolkit/engines/contract.py)
 _MOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 _ATTR = re.compile(r"[A-Za-z]\w*")
 
@@ -92,7 +93,10 @@ def resolve(kind: str, ref: str):
     m = importlib.import_module(mod)
     if not hasattr(m, attr):
         raise ImportRefused(f"{kind} {ref}: {mod} has no {attr}")
-    return getattr(m, attr)
+    obj = getattr(m, attr)
+    if kind == "engine" and not (isinstance(obj, type) and all(callable(getattr(obj, x, None)) for x in ENGINE_METHODS)):
+        raise ImportRefused(f"engine {ref}: not a class implementing the Engine contract ({', '.join(ENGINE_METHODS)})")
+    return obj
 
 
 def attr(kind: str, mod: str, name: str):

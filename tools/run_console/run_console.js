@@ -289,7 +289,7 @@ function renderFigures() {
       : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
     return `<div class="empty">No figures yet: ${why}.</div>`;
   }
-  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" alt="">
+  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}"><img loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file, sha: (c.snapshot || {}).sha256 || "" })}" alt="">
     <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
 }
 async function renderCompare() {
@@ -367,7 +367,7 @@ function blockerTable(g) {
     const tog = "bt" + (++TOG_N);
     return `<tr class="row" data-tog="${esc(tog)}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
       <tr class="more" id="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
-      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
+      <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
   }).join("");
   const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
   return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
@@ -394,7 +394,7 @@ function dtTable(g) {
     <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
 }
 function card(c) {
-  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.snapshot })}">Comment</button>` : "";
+  const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button>` : "";
   const open = c.anchor && c.anchor.file ? `<button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.anchor.id || "")}">Open</button>` : "";
   const head = (t, extra) => `<div class="head"><span class="t">${t}</span>${extra || ""}${when(c.at)}</div>`;
   const line = (cls, txt) => `<div class="line ${esc(cls || "")}"><span class="x">${txt}</span>${when(c.at)}</div>`;
@@ -404,7 +404,7 @@ function card(c) {
     case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
     case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
     case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
-    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file })}" data-act="open" data-file="${esc(c.file)}">
+    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}<img class="thumb" loading="lazy" src="/api/file?${q({ run: S.runId, path: c.file, sha: (c.snapshot || {}).sha256 || "" })}" data-act="open" data-file="${esc(c.file)}">
       <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
     case "gate": return gateCard(c, head, open, comment);
     case "decision_needed": return decisionCard(c, head);
@@ -477,14 +477,16 @@ function wire(root) {
 }
 async function act(b) {
   // The anchor and the evidence snapshot the card was rendered with (sealed by the server) travel together.
-  const anchor = b.dataset.ref ? getRef(b.dataset.ref).anchor || null : null, shown = b.dataset.ref ? getRef(b.dataset.ref).evidence || null : null;
+  const R = b.dataset.ref ? getRef(b.dataset.ref) : {}, anchor = R.anchor || null, shown = R.evidence || null;
+  // A control acts on the run it was rendered for; a control left from another run is refused, never redirected.
+  if (anchor && R.run && R.run !== S.runId && b.dataset.act !== "open") { toast("This control belongs to another run: reload it."); return; }
   switch (b.dataset.act) {
     case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
-    case "comment": return setAnchor(anchor, null, shown);
+    case "comment": return setAnchor(anchor, null, shown, R.run);
     case "agree":
-      try { await api("/api/feedback", { run: S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, evidence: shown, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
+      try { await api("/api/feedback", { run: R.run || S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, evidence: shown, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
       return;
-    case "disagree": setAnchor(anchor, "disagree", shown); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
+    case "disagree": setAnchor(anchor, "disagree", shown, R.run); $("kind").value = "correction"; $("layer").value = "critique"; syncComposer(); $("text").placeholder = `Why do you disagree with ${anchor.id}?`; return;
     case "sign-spec": case "scope": {
       const box = b.closest(".answer"), note = box.querySelector(".note").value, confirmed = box.querySelector(".confirm").checked;
       const res = box.querySelector(".result"), R = getRef(box.dataset.ref);
@@ -504,7 +506,13 @@ async function act(b) {
 }
 
 // ---- composer
-function setAnchor(a, verdict, shown) { S.anchor = a; S.verdict = verdict; S.shown = shown || null; renderAnchor(); $("text").focus(); }
+function setAnchor(a, verdict, shown, run) {   // the composer's anchor, its snapshot and the run they were taken in
+  S.anchor = a; S.verdict = verdict; S.shown = shown || null; S.anchorRun = a ? (run || S.runId) : null; renderAnchor(); $("text").focus();
+}
+function composerRun() {   // the run the composer posts to, or null when its anchor was taken in another run
+  if (S.anchor && S.anchorRun && S.anchorRun !== S.runId) { toast("The anchor was taken in another run: clear it first."); return null; }
+  return S.anchorRun || S.runId;
+}
 function renderAnchor() {
   $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
   if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
@@ -514,15 +522,17 @@ $("kind").onchange = syncComposer;
 function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
 $("record").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
-  try { await api("/api/feedback", { run: S.runId, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, evidence: S.shown, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
+  const run = composerRun(); if (!run) return;   // S.anchorRun
+  try { await api("/api/feedback", { run, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, evidence: S.shown, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
     $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
 };
 $("send").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
+  const run = composerRun(); if (!run) return;   // S.anchorRun
   const kind = $("kind").value, btn = $("send");
   btn.disabled = true; btn.textContent = "Thinking…";
   try {
-    const body = { run: S.runId, text, anchor: S.anchor, evidence: S.shown, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
+    const body = { run, text, anchor: S.anchor, evidence: S.shown, kind, layer: $("layer").value, proposed_change: $("proposed").value, stage: curStage(), verdict: S.verdict };
     const r = await api("/api/chat", body);
     if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
     else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; }
@@ -536,10 +546,11 @@ function side(title, html) { $("side-title").textContent = title; $("side-conten
 $("side-close").onclick = () => { $("side").classList.remove("open"); stopLive(); };
 async function openFile(file, anchor) {
   if (!S.runId) return;
-  const url = "/api/file?" + q({ run: S.runId, path: file });
+  const figc = (S.run && S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
+  const url = "/api/file?" + q({ run: S.runId, path: file, sha: (figc && figc.snapshot || {}).sha256 || "" });
   if (/\.(png|jpe?g|svg)$/i.test(file)) {
     const fig = (S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
-    side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file }, evidence: fig && fig.snapshot })}">Comment</button></div>`);
+    side(file, `<img src="${esc(url)}">${fig ? `<p>${esc(fig.body)}</p><p class="small muted">${esc(fig.producer || "")} ${fig.sources ? "from <code>" + fig.sources.map(esc).join("</code>, <code>") + "</code>" : ""}</p>` : ""}<div class="acts"><button data-act="comment" data-ref="${ref({ anchor: { kind: "figure", id: file, file }, evidence: fig && fig.snapshot, run: S.run && S.run.run_dir })}">Comment</button></div>`);
     return;
   }
   let text;

@@ -304,6 +304,51 @@ def read_nofollow(base: str, rel: str, max_bytes: int | None = None) -> tuple[by
         os.close(fd)
 
 
+def open_append_nofollow(base: str, rel: str):
+    """A text file object appending to base/rel (created if absent, never truncated), opened with no link followed
+    at any component and refused when the file has other hard links. Also usable as an flock target."""
+    base = os.path.realpath(base)
+    parts = _parts(rel)
+    dfd = dir_fd_nofollow(base, parts[:-1], create=True)
+    try:
+        try:
+            fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except OSError as e:
+            raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
+    finally:
+        os.close(dfd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        os.close(fd)
+        raise LinkRefused(f"{rel}: not a plain file with one link")
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def remove_nofollow(base: str, rel: str, missing_ok: bool = True) -> bool:
+    """Unlink base/rel relative to its directory's no-follow fd: the entry itself (a planted link is removed, its
+    target never touched); a directory is refused. `rel` must be a plain relative path (no "..")."""
+    parts = _parts(rel)
+    try:
+        dfd = dir_fd_nofollow(os.path.realpath(base), parts[:-1])
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        raise
+    try:
+        try:
+            st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return False
+            raise
+        if stat.S_ISDIR(st.st_mode):
+            raise LinkRefused(f"{rel}: a directory, not removed")
+        os.unlink(parts[-1], dir_fd=dfd)
+        return True
+    finally:
+        os.close(dfd)
+
+
 def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclusive: bool = False,
                    atomic: bool = False) -> str:
     """Write base/rel with no link followed at any component. `atomic`: a temporary file in the same directory,

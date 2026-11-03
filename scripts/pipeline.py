@@ -635,6 +635,28 @@ def _write_json(run_dir: str, rel: str, obj) -> str:
     return rel
 
 
+def _retire_outputs(run_dir: str, old: dict, entries: dict) -> list:
+    """Remove the outputs of derivations no longer declared. The names come from the previous derivation record, an
+    artifact: each must be a plain relative path under data/derived/ (no "..", checked by its parts, not by prefix)
+    and is unlinked relative to a no-follow directory fd, never outside the run dir (review round 4, P1-1)."""
+    from lib.safe_io import remove_nofollow, LinkRefused
+    removed = []
+    for sid, e in (old or {}).items():
+        if sid in entries or not isinstance(e, dict):
+            continue
+        for o in e.get("outputs") or {}:
+            o = str(o)
+            parts = o.replace("\\", "/").split("/")
+            if not o.startswith(DERIVED_PREFIX) or any(x in ("", ".", "..") for x in parts) or os.path.isabs(o):
+                continue
+            try:
+                if remove_nofollow(run_dir, o):
+                    removed.append(o)
+            except (LinkRefused, OSError):
+                continue
+    return removed
+
+
 def _publish_outputs(work: str, run_dir: str, outputs) -> dict:
     """Copy a derivation's outputs from its work dir into the run dir: each read with no link followed in the work
     dir (an output that is a link is refused) and published atomically with no link followed in the run dir.
@@ -1624,12 +1646,7 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
             rep["ok"] = False
             rep["problems"].append({"code": entry["code"], "id": sid, "claim": f"derivation {sid}: {entry['reason']}"
                                     + (f" | stderr: {entry['stderr_tail'][-400:]}" if entry["stderr_tail"] else "")})
-    for sid, e in old.items():                 # a derivation no longer declared: its outputs go
-        if sid not in entries:
-            for o in (e or {}).get("outputs") or {}:
-                p = os.path.join(run_dir, o)
-                if o.startswith(DERIVED_PREFIX) and os.path.isfile(p):
-                    os.remove(p)
+    _retire_outputs(run_dir, old, entries)
     _write_json(run_dir, DERIVATIONS_RECORD, {"version": 1, "producer": "scripts/pipeline.py derive",
                                               "declaration_sha256": _sha(os.path.join(run_dir, DERIVATIONS)),
                                               "derivations": entries})
