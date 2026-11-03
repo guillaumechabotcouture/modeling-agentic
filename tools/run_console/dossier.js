@@ -74,7 +74,12 @@ const stateCell = (s, why) => {
   const w = { match: '<span class="ok-i">✓ same</span>', changed: '<span class="bad-i">changed</span>', missing: '<span class="bad-i">missing</span>', refused: '<span class="bad-i">refused</span>' }[s] || esc(s || "—");
   return why ? `<span title="${esc(why)}">${w}</span>` : w;
 };
-const sig = (x, p = 3) => (typeof x === "number" && isFinite(x) && x !== 0 ? num(Number(x.toPrecision(p))) : num(x));   // 3 significant digits
+function sig(x, p = 3) {   // p significant digits; scientific notation below 1e-3, so a small value never reads as 0
+  if (typeof x !== "number" || !isFinite(x)) return num(x);
+  if (x === 0) return "0";
+  if (Math.abs(x) < 1e-3) return x.toExponential(p - 1).replace(/\.?0+e/, "e").replace("e+", "e");
+  return num(Number(x.toPrecision(p)));
+}
 const tail = (p) => { const s = String(p || ""), i = s.lastIndexOf("/"); return i < 0 ? `<span class="lt">${esc(s)}</span>` : `<span class="lt"><span class="muted">${esc(s.slice(0, i + 1))}</span>${esc(s.slice(i + 1))}</span>`; };
 const outcomeWord = (o) => (o === "dalys" ? T("DALYs") : esc(o || "—"));
 
@@ -130,7 +135,7 @@ function specHTML(d) {
     tbl(["source", "items"], (un.sources || []).map((s) => [esc(String(s.kind || "—").replace(/_/g, " ")), (s.items || []).map((i) => `${esc(i.id)} ×${Array.isArray(i.range) ? i.range.map(num).join("–") : val(i.range)}`).join(" · ") || '<span class="muted">all</span>'])));
   h += section(T("decision test", "Decision tests"), "Each re-solves the plan with one input at other values. The results are in the Stream.", "no.", d.file,
     tbl(["id", "type", "what is varied", ["values tested"], "question"], (d.decision_tests || []).map((t) => [esc(t.id), esc(String(t.type || "").replace(/_/g, " ")), more(t.varied, 140),
-      (t.values || []).length ? (t.unit === "×" ? (t.values || []).map((x) => "×" + num(x)).join(", ") : (t.values || []).map((x) => num(x)).join(", ") + (t.unit ? ` <span class="muted">${esc(t.unit)}</span>` : "")) : "—", more(t.question, 160)])));
+      (t.values || []).length ? (t.unit === "USD" ? (t.values || []).map(money).join(", ") : t.unit === "×" ? (t.values || []).map((x) => "×" + num(x)).join(", ") : (t.values || []).map((x) => num(x)).join(", ") + (t.unit ? ` <span class="muted">${esc(t.unit)}</span>` : "")) : "—", more(t.question, 160)])));
   h += signoffHTML(d);
   return h;
 }
@@ -223,16 +228,23 @@ function engineHTML(d) {
   let rline;
   if (!has(rs)) rline = `Re-stamp status not shown: ${esc(rs.why)}.`;
   else if (rs.state === "recomputed") rline = `The benchmark numbers were computed by this engine code (${esc(rs.new_version || "?")}); no re-stamp.`;
-  else rline = `${T("re-stamped by proof", rs.state === "proof" ? "Re-stamped by proof" : "Re-stamped")}${rs.state === "proof" ? ", not recomputed" : ""}: numbers from version ${esc(rs.old_version || "?")}, identity ${esc(rs.new_version || "?")}; proof identical: ${rs.proof_identical ? "yes" : "no"}. ${T("validate_once")} confirmation: <b class="${rs.validate_once === "pending" || rs.validate_once === "not recorded" ? "bad-i" : "ok-i"}">${esc(rs.validate_once)}</b>${rs.evidence ? ` (${esc(rs.evidence)})` : ""}.`;
+  else rline = `The benchmark numbers were computed by ${rs.computed_by ? "v" + esc(rs.computed_by) : "an earlier version (not recorded)"}; ${T("re-stamped by proof", rs.state === "proof" ? "re-stamped by proof" : "re-stamped")}${rs.state === "proof" ? " (not recomputed)" : ""} to ${(rs.restamped_to || []).map((v) => "v" + esc(v)).join(", ") || "?"}. Proof identical: ${rs.proof_identical ? "yes" : "no"}. ${T("validate_once")} confirmation: <b class="${rs.validate_once === "pending" || rs.validate_once === "not recorded" ? "bad-i" : "ok-i"}">${esc(rs.validate_once)}</b>${rs.evidence ? ` (${esc(rs.evidence)})` : ""}.`;
   h += section(T("benchmark", "Benchmarks"), `Published results the engine is run against. ${T("held out")}: not used to fit. Rows outside their band are flagged.`, has(bm) && bm.out_of_band ? `no, but ${num(bm.out_of_band)} benchmark${bm.out_of_band === 1 ? " is" : "s are"} out of band.` : "no.", bm.file,
     !has(bm) ? naBox(bm) : `<div class="sub">${num(bm.total)} benchmarks: ${num(bm.in_band)} in band, <b class="${bm.out_of_band ? "bad-i" : ""}">${num(bm.out_of_band)} out of band</b>; held out: ${num(bm.held_out_in_band)} of ${num(bm.held_out)} in band.</div><div class="sub">${rline}</div>` +
-      tbl(["id", "what it tests", "role", ["model"], ["target"], ["band"], "status", "source"], (bm.rows || []).map((b) => ({ cls: b.flag ? "flag" : "", cells: [esc(b.id), more(b.metric, 110), b.role === "held_out" ? T("held out") : esc(b.role || "—"), num(b.computed), num(b.target), span(b.band),
+      tbl(["id", "what it tests", "role", ["model"], "criterion", "status", "source"], (bm.rows || []).map((b) => ({ cls: b.flag ? "flag" : "", cells: [esc(b.id), more(b.metric, 110), b.role === "held_out" ? T("held out") : esc(b.role || "—"), b.kind === "compare" ? sig(b.computed, 6) : num(b.computed), criterion(b),
         b.status === "in_band" ? '<span class="ok-i">✓ in band</span>' : `<span class="bad-i">${esc(String(b.status || "unknown").replace(/_/g, " "))}</span>`, more(b.source, 60)] }))));
   return h;
 }
 
+const CMP = { eq: "equal to the reference within the tolerance", le: "at most the reference", differ: "differs from the reference" };
+function criterion(b) {   // a band benchmark: target and band; an equation or identity one: reference, compare, tolerance, errors
+  if (b.kind !== "compare") return `target ${num(b.target)}<div class="sub">band ${span(b.band)}</div>`;
+  return `reference ${sig(b.reference, 6)} <span class="muted">(${esc(CMP[b.compare] || b.compare)})</span><div class="sub">tolerance ${val(b.tolerance)}; error ${sig(b.error_abs)} abs${b.error_rel != null ? `, ${sig(b.error_rel)} rel` : ""}</div>`;
+}
+
 // ---- Calibration
 function calibrationHTML(d) {
+  if (d.available !== false && d.method !== "emulator_inversion") return fitHTML(d);
   const s = d.settings || {};
   const set = kv([["method", s.method === "emulator_inversion" ? T("emulator inversion") : val(s.method)], ["calibrated attribute", `${val(s.attribute)}${s.scale ? ` <span class="muted">(${esc(s.scale)} scale)</span>` : ""}`],
     ["range", span(s.range)], ["metric", val(s.metric)], ["target column", val(s.target_column)], ["target window", span(s.window)],
@@ -240,7 +252,8 @@ function calibrationHTML(d) {
   if (d.available === false) return section("Calibration", "How each unit was fitted to its target.", "no.", "analysis/calibration.yaml", set + naBox(d));
   const g = d.diagnostics || {}, idf = d.identifiability || {}, em = d.emulator || {};
   const clamped = g.clamped_units != null ? g.clamped_units : (d.units || []).filter((u) => u.clamped).length;
-  let h = section("Calibration", `Each unit's attribute is set so that the ${T("emulator")} reproduces its target.`, clamped ? `no, but ${num(clamped)} unit${clamped === 1 ? " is" : "s are"} ${T("clamped")}.` : "no.", d.file,
+  const needs = d.needs_owner ? `yes: ${[clamped ? `${num(clamped)} unit${clamped === 1 ? " is" : "s are"} ${T("clamped")}` : "", idf.status && idf.status !== "well_identified" ? `${T("identifiability")} is ${esc(String(idf.status).replace(/_/g, " "))}` : ""].filter(Boolean).join("; ")}.` : "no.";
+  let h = section("Calibration", `By ${T("emulator inversion")}: each unit's attribute is set so that the ${T("emulator")} reproduces its target.`, needs, d.file,
     set + kv([["units fitted", num(g.units != null ? g.units : (d.units || []).length)], [T("clamped", "clamped units"), `<b class="${clamped ? "bad-i" : ""}">${num(clamped)}</b>`], ["grid points", num(g.grid_points)],
       ["largest target residual (logit)", sig(g.target_logit_residual_max, 2)], [T("slope", "slope, median / smallest"), `${sig(g.slope_median)} / ${sig(g.slope_min)}`],
       [T("identifiability"), `${esc(String(idf.status || "—").replace(/_/g, " "))}${idf.design ? ` <span class="muted">(${esc(idf.design)})</span>` : ""}${(idf.units_unidentified || []).length ? `; unidentified: ${val(idf.units_unidentified)}` : ""}`]]) +
@@ -256,5 +269,29 @@ function calibrationHTML(d) {
       ["R², median / 10th percentile", `${sig(em.reduction_r2_median)} / ${sig(em.reduction_r2_p10)}`], ["MAE, median", sig(em.reduction_mae_median)], ["base outcome RMSE (log)", sig(em.base_log_rmse)],
       ...Object.entries(em.error_model || {}).map(([a, b]) => [`error model: ${esc(a.replace(/_/g, " "))}`, typeof b === "number" ? sig(b) : more(b, 160)]),
       ["features", val(em.features)], ["fit time", em.fit_seconds != null ? `${num(Math.round(em.fit_seconds))} s` : "—"]]));
+  return h;
+}
+function fitHTML(d) {   // likelihood or posterior calibration: a fit to a panel of observed counts
+  const s = d.settings || {}, g = d.diagnostics || {}, idf = d.identifiability || {};
+  if (d.method === "none") return section("Calibration", "The spec calibrates nothing.", "no.", d.file, kv([["method", "none"]]));
+  const bound = g.at_bound || [];
+  const why = [g.converged !== true ? "the fit did not converge" : "", bound.length ? `${num(bound.length)} parameter${bound.length === 1 ? " is" : "s are"} at a bound` : "",
+    g.unsupported_targets ? `${num(g.unsupported_targets)} observed target${g.unsupported_targets === 1 ? " has" : "s have"} no expected count` : "",
+    idf.status && idf.status !== "well_identified" ? `${T("identifiability")} is ${esc(String(idf.status).replace(/_/g, " "))}` : ""].filter(Boolean);
+  const label = d.method === "posterior" ? "posterior (a joint sample of the parameters and unit attributes)" : "likelihood (Poisson quasi-likelihood, the dispersion from the Pearson statistic)";
+  let h = section("Calibration", `Fitted by ${esc(label)} to a panel of observed counts. Convergence, bound hits, Pearson residuals and identifiability decide whether the fit can be used.`, d.needs_owner ? `yes: ${why.join("; ")}.` : "no.", d.file,
+    kv([["method", esc(d.method)], ["calibrated attribute", `${val(s.attribute)}${s.scale ? ` <span class="muted">(${esc(s.scale)} scale)</span>` : ""}`], ["range", span(s.range)],
+      ["converged", g.converged === true ? '<span class="ok-i">yes</span>' : `<span class="bad-i">no</span>${g.message ? ` <span class="muted">(${esc(g.message)})</span>` : ""}`],
+      ["iterations", num(g.iterations)], ["parameters at a bound", bound.length ? `<span class="bad-t">${bound.map(esc).join(", ")}</span>` : "none"],
+      ["targets / parameters", `${num(g.n_targets)} / ${num(g.n_parameters)}`], ["Pearson χ² / df", g.pearson_chi2 != null ? `${sig(g.pearson_chi2)} / ${num(g.df)}` : "—"],
+      ["dispersion", sig(g.dispersion)], ["largest Pearson residual", sig(g.pearson_residual_max)], ["targets with no expected count", num(g.unsupported_targets)],
+      ...["sampler", "ess", "rhat_max", "chains", "draws_per_chain"].filter((k) => g[k] != null).map((k) => [esc(k.replace(/_/g, " ")), typeof g[k] === "number" ? sig(g[k]) : esc(g[k])]),
+      [T("identifiability"), esc(String(idf.status || "—").replace(/_/g, " ")) + (idf.method ? ` <span class="muted">(${esc(idf.method)})</span>` : "")],
+      ...((d.prior_dominated || []).length ? [["prior-dominated", val(d.prior_dominated)]] : [])]));
+  h += section("Observed vs expected", "Each target of the panel against the fitted model's expected count. Pearson residual: (observed − expected) / √expected.", "no.", d.file,
+    tbl(["unit", "period", "package", ["observed"], ["expected"], ["Pearson residual"]], (d.fit || []).map((r) => ({ cls: r.pearson != null && Math.abs(r.pearson) > 3 ? "flag" : "", cells: [esc(r.unit), val(r.t0), esc(r.package || "—"), sig(r.observed), sig(r.expected), sig(r.pearson)] }))));
+  h += section(`${T("identifiability", "Identifiability")} by parameter`, "Whether the panel pins each fitted quantity down.", "no.", d.file,
+    tbl(["parameter", "status", ["estimate"], ["se"], "profile interval", "why"], (d.parameters || []).map((p) => ({ cls: p.status && !/^(well_identified|identified)$/.test(p.status) ? "flag" : "", cells: [esc(p.name), esc(String(p.status || "—").replace(/_/g, " ")), sig(p.estimate), sig(p.se), p.profile_ci ? p.profile_ci.map((x) => sig(x)).join(" – ") : "—", more(p.explanation, 120)] }))) +
+    `<div class="cmp-h">Fitted values</div>` + kv(Object.entries(d.theta || {}).map(([k, v]) => [esc(k), sig(v)])));
   return h;
 }

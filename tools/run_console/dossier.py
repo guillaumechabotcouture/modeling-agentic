@@ -57,6 +57,38 @@ def _doc(run_dir: str, rel: str):
     return (e["parsed"], None) if e["err"] is None else (None, f"{rel}: {e['err']}")
 
 
+def _entry(run_dir: str, rel: str):
+    """run_console._load_rel's entry (parsed value and sha256 from one read), or None for a refused or missing path."""
+    try:
+        RC.check_rel(rel)
+    except ValueError:
+        return None
+    return RC._load_rel(run_dir, rel) if RC._rexists(run_dir, rel) else None
+
+
+_TYPES = {dict: "a mapping", list: "a list", str: "text", (int, float): "a number", bool: "true or false"}
+
+
+def _invalid(doc, rel: str, need) -> str | None:
+    """Why `doc` lacks a required field, or None. `need`: [(dotted path, type)]. A payload without its fields is not
+    shown as zeros."""
+    for path, typ in need:
+        v = doc
+        for k in path.split("."):
+            v = v.get(k) if isinstance(v, dict) else None
+        if v is None:
+            return f"{rel}: missing {path}"
+        if not isinstance(v, typ) or (typ is not bool and isinstance(v, bool)):
+            return f"{rel}: invalid {path} (not {_TYPES.get(typ, typ)})"
+    return None
+
+
+def _need(run_dir: str, rel: str, need):
+    """(doc, None) or (None, why): a mapping with every required field."""
+    doc, why = _mapping(run_dir, rel)
+    return (None, why) if why else (None, _invalid(doc, rel, need)) if _invalid(doc, rel, need) else (doc, None)
+
+
 def _mapping(run_dir: str, rel: str):
     doc, why = _doc(run_dir, rel)
     if why is None and not isinstance(doc, dict):
@@ -222,10 +254,10 @@ def _cost_items(opts: dict) -> list:
             if basis == "per_commodity":
                 ppc = _num(it.get("people_per_commodity"))
                 per = per / ppc if ppc else None
-            elif basis == "per_reached":
-                rs = _num(_m(comps.get(it.get("component"))).get("reach_share"))
-                per = per * rs if rs is not None else None
         extra = []
+        if basis == "per_reached":
+            rs = _num(_m(comps.get(it.get("component"))).get("reach_share"))
+            extra.append(f"reach share {rs} of the eligible" if rs is not None else "no reach share in the spec")
         if it.get("people_per_commodity") is not None:
             extra.append(f"{it['people_per_commodity']} people per commodity")
         for k, w in (("share", "share charged"), ("times", "times per year"), ("years", "years")):
@@ -259,10 +291,18 @@ def _decision_tests(spec: dict, units: dict) -> list:
         elif typ == "interaction_rescale":
             varied, unit = (f"interaction of {_short(t.get('components'))} with any of {_short(t.get('with_any'))}"
                             + (f" (benchmark {t['benchmark']})" if t.get("benchmark") else "")), "×"
+        elif typ == "group_rule" and isinstance(t.get("add"), dict):
+            a = t["add"]
+            varied = (f"group rule added: {a.get('rule') or 'a rule'} on {_short(a.get('components'))} by "
+                      f"{a.get('by') or '(no grouping column)'}" + (f" ({a['reason']})" if a.get("reason") else ""))
         elif typ == "group_rule":
-            a = _m(t.get("add"))
-            varied = (f"rule {a.get('rule')}: {_short(a.get('components'))} by {a.get('by')}"
-                      + (f" ({a['reason']})" if a.get("reason") else ""))
+            rid = t.get("rule")
+            r = _m(_m(_m(spec.get("constraints")).get("group_rules")).get(rid))
+            varied = (f"group rule {rid} removed" + (f" ({r.get('rule')} on {_short(r.get('components'))} by "
+                                                     f"{r.get('by')})" if r else " (the spec's constraints do not "
+                                                                                 "define it)"))
+        elif typ == "envelope":
+            varied, unit = "the envelope (the plan re-solved at each value; fixed costs unchanged)", "USD"
         else:
             varied = _short({k: v for k, v in t.items() if k not in ("id", "type", "text", "values", "finding")})
         out.append({"id": t.get("id"), "type": typ, "varied": varied, "values": values, "unit": unit,
@@ -296,9 +336,11 @@ def _archived_spec(run_dir: str, folder: str, want) -> tuple:
         return None, "the archived record has no spec sha256"
     for rel in _walk(run_dir, folder, 3):
         name = rel.rsplit("/", 1)[-1]
-        if name.startswith("decision_spec") and name.endswith((".yaml", ".yml")) and _sha(run_dir, rel)[0] == want:
-            doc, why = _doc(run_dir, rel)
-            return (rel, doc) if why is None else (None, why)
+        if not (name.startswith("decision_spec") and name.endswith((".yaml", ".yml"))):
+            continue
+        e = _entry(run_dir, rel)            # one read: the hash and the parsed spec come from the same bytes
+        if e and e["sha256"] == want:
+            return (rel, e["parsed"]) if e["err"] is None else (None, f"{rel}: {e['err']}")
     return None, f"no spec in {folder} has the archived sha256 {str(want)[:12]}"
 
 
@@ -351,7 +393,7 @@ def _signoffs(run_dir: str, spec: dict, spec_sha) -> list:
 
 
 def spec_tab(run_dir: str) -> dict:
-    spec, why = _mapping(run_dir, RC.SPEC)
+    spec, why = _need(run_dir, RC.SPEC, [("question", str), ("decision_units", dict)])
     if why:
         return na(why)
     sha, _ = _sha(run_dir, RC.SPEC)
@@ -443,7 +485,7 @@ def _cited_ids(text) -> list:
 
 
 def _registry(run_dir: str, by_id: dict) -> dict:
-    doc, why = _mapping(run_dir, REGISTRY)
+    doc, why = _need(run_dir, REGISTRY, [("entries", list)])
     if why:
         return na(why)
     out = []
@@ -492,7 +534,7 @@ def _param_registries(run_dir: str, flat: dict, by_id: dict) -> list:
 
 
 def _inputs(run_dir: str, ders: list, ignored: dict) -> dict:
-    doc, why = _mapping(run_dir, PROVENANCE)
+    doc, why = _need(run_dir, PROVENANCE, [("inputs", dict)])
     if why:
         return na(why)
     rows = []
@@ -546,7 +588,7 @@ def _derivations(run_dir: str, ders: list, ignored: dict, why_d) -> dict:
 
 
 def _input_checks(run_dir: str) -> dict:
-    doc, why = _mapping(run_dir, INPUT_CHECKS)
+    doc, why = _need(run_dir, INPUT_CHECKS, [("status", str), ("counts", dict), ("findings", list)])
     if why:
         return na(why)
     return {"available": True, "file": INPUT_CHECKS, "status": doc.get("status"), "reason": doc.get("reason"),
@@ -569,7 +611,7 @@ def evidence_tab(run_dir: str) -> dict:
         c["cited_by"] = sorted({e["name"] for r in params for e in r.get("entries") or []
                                 if c["id"] in _cited_ids(e.get("source"))} |
                                {str(e["id"]) for e in reg.get("entries") or [] if str(e.get("citation")) == c["id"]})
-    dd, dwhy = _mapping(run_dir, DERIVATIONS)
+    dd, dwhy = _need(run_dir, DERIVATIONS, [("derivations", list)])
     ders = [d for d in _l(_m(dd).get("derivations")) if isinstance(d, dict)]
     ignored = {str(k): _short(v) for k, v in _m(_m(dd).get("ignored_inputs")).items()}
     return {"registry": reg, "param_registries": params, "citations": cit,
@@ -579,7 +621,7 @@ def evidence_tab(run_dir: str) -> dict:
 
 # ------------------------------------------------------------------ Engine
 def _choice(run_dir: str) -> dict:
-    doc, why = _mapping(run_dir, CHOICE)
+    doc, why = _need(run_dir, CHOICE, [("engine.ref", str), ("candidates", list)])
     if why:
         return na(why)
     return {"available": True, "file": CHOICE, "at": doc.get("at"), "chosen": _m(doc.get("engine")).get("ref"),
@@ -630,8 +672,14 @@ def _restamp(eng: dict, repo: str) -> dict:
     if not isinstance(rs, dict):
         return {**base, "state": "recomputed", "by": doc.get("producer"), "validate_once": "not needed"}
     conf = _m(rs.get("confirmation"))
-    return {**base, "state": "proof" if "not recomputed" in str(rs.get("by") or "") else "restamped",
+    # restamp_proof.py keeps the earlier records under `previous`, newest first: the oldest record's old version
+    # computed the numbers; every later version only re-stamped them.
+    chain = [rs] + [r for r in _l(rs.get("previous")) if isinstance(r, dict)]
+    olds = [r.get("old_engine_version") for r in chain]
+    after = [str(v) for v in list(reversed(olds[:-1])) + [base["new_version"]]]
+    return {**base, "state": "proof" if all("not recomputed" in str(r.get("by") or "") for r in chain) else "restamped",
             "by": rs.get("by"), "old_version": rs.get("old_engine_version"), "proof_identical": rs.get("proof_identical"),
+            "computed_by": None if olds[-1] is None else str(olds[-1]), "restamped_to": after,
             "validate_once": conf.get("validate_once") or "not recorded", "evidence": conf.get("evidence"),
             "note": rs.get("note")}
 
@@ -639,7 +687,8 @@ def _restamp(eng: dict, repo: str) -> dict:
 def engine_tab(run_dir: str, repo: str = REPO) -> dict:
     spec, _ = _mapping(run_dir, RC.SPEC)
     spec = spec if isinstance(spec, dict) else {}
-    eng, why = _mapping(run_dir, ENGINE_YAML)
+    eng, why = _need(run_dir, ENGINE_YAML, [("data.card", dict), ("data.card.name", str),
+                                            ("data.card.benchmarks", list), ("data.parameters", list)])
     data = _m(_m(eng).get("data"))
     card = data.get("card")
     if why is None and not isinstance(card, dict):
@@ -666,6 +715,9 @@ def engine_tab(run_dir: str, repo: str = REPO) -> dict:
         rows = [{"id": b.get("id"), "metric": b.get("metric"), "role": b.get("role"), "target": b.get("target"),
                  "band": b.get("band"), "computed": b.get("computed"), "status": b.get("status"),
                  "in_band": b.get("in_band"), "source": b.get("source"),
+                 "compare": b.get("compare"), "reference": b.get("reference"), "tolerance": b.get("tolerance"),
+                 "error_abs": b.get("error_abs"), "error_rel": b.get("error_rel"),
+                 "kind": "compare" if b.get("compare") is not None else "band",
                  "flag": b.get("status") != "in_band"} for b in _l(card.get("benchmarks")) if isinstance(b, dict)]
         out["benchmarks"] = {"available": True, "file": ENGINE_YAML, "rows": rows, "total": len(rows),
                              "in_band": sum(r["status"] == "in_band" for r in rows),
@@ -689,26 +741,68 @@ def engine_tab(run_dir: str, repo: str = REPO) -> dict:
 
 
 # ------------------------------------------------------------------ Calibration
+CAL_METHODS = ("emulator_inversion", "likelihood", "posterior", "none")
+
+
+def _cal_inputs(run_dir: str, doc: dict, spec_sha, units_rel) -> str | None:
+    """Why the calibration may not be joined to the current spec and units table, or None. Each hash is compared with
+    the bytes read now; the units table is parsed from the same read (_cal_units)."""
+    if not doc.get("spec_sha256"):
+        return f"{CALIBRATION} records no spec sha256, so its inputs cannot be checked"
+    changed = [] if doc.get("spec_sha256") == spec_sha else [RC.SPEC]
+    inputs = doc.get("inputs")
+    if not isinstance(inputs, dict):
+        return f"{CALIBRATION} records no input hashes, so its inputs cannot be checked"
+    if units_rel and units_rel not in inputs:
+        return f"{CALIBRATION} does not record the units table {units_rel} among its inputs"
+    for rel, want in inputs.items():
+        e = _entry(run_dir, str(rel))
+        if e is None or e["sha256"] != want:
+            changed.append(str(rel))
+    if changed:
+        return (f"inputs changed since the analysis ({', '.join(changed)}): {CALIBRATION} was computed from other "
+                "inputs, so its fit is not joined to the current ones")
+    return None
+
+
+def _cal_units(run_dir: str, units_rel, idc, regc, tcol) -> tuple:
+    """{unit id: row} of the units table, from one read, and why not."""
+    e = _entry(run_dir, units_rel) if isinstance(units_rel, str) else None
+    if e is None or e["err"] is not None or not isinstance(e["parsed"], str):
+        return {}, f"{units_rel}: not read" if units_rel else "the spec names no units table"
+    rows = list(csv.DictReader(io.StringIO(e["parsed"])))
+    return {str(r.get(idc)): r for r in rows}, None
+
+
 def calibration_tab(run_dir: str) -> dict:
-    spec, _ = _mapping(run_dir, RC.SPEC)
-    spec = spec if isinstance(spec, dict) else {}
+    se = _entry(run_dir, RC.SPEC)
+    spec = se["parsed"] if se and se["err"] is None and isinstance(se["parsed"], dict) else {}
     scal = _m(spec.get("calibration"))
     settings = {k: scal.get(k) for k in ("method", "attribute", "scale", "range", "target_column", "window", "metric")}
-    doc, why = _mapping(run_dir, CALIBRATION)
-    data = _m(_m(doc).get("data"))
+    doc, why = _need(run_dir, CALIBRATION, [("data", dict), ("data.method", str)])
     if why:
         return {**na(why), "settings": settings}
+    data, method = doc["data"], doc["data"]["method"]
+    if method not in CAL_METHODS:
+        return {**na(f"{CALIBRATION}: calibration method {method!r} is not supported by the dossier"),
+                "settings": settings}
+    if method == "none":
+        return {"available": True, "file": CALIBRATION, "method": "none", "settings": settings, "needs_owner": False,
+                "units": [], "regions": []}
+    why = _invalid(data, CALIBRATION, [("units", dict), ("diagnostics", dict)] +
+                   ([("diagnostics.converged", bool)] if method != "emulator_inversion" else []))
     du = _m(spec.get("decision_units"))
+    why = why or _cal_inputs(run_dir, doc, se["sha256"] if se else None, du.get("csv"))
+    if why:
+        return {**na(why), "settings": settings}
     idc, regc, tcol = du.get("id"), du.get("region"), scal.get("target_column")
-    table, twhy = {}, None
-    if isinstance(du.get("csv"), str):
-        header, rows, twhy = _rows(run_dir, du["csv"])
-        table = {str(r.get(idc)): r for r in rows or []}
+    table, twhy = _cal_units(run_dir, du.get("csv"), idc, regc, tcol)
     units = []
-    for uid, u in _m(data.get("units")).items():
+    for uid, u in data["units"].items():
         u, r = _m(u), table.get(str(uid)) or {}
         try:
-            target = float(r.get(tcol)) if tcol and r.get(tcol) not in (None, "") else None
+            target = float(r.get(tcol)) if method == "emulator_inversion" and tcol and r.get(tcol) not in (None, "") \
+                else None
         except ValueError:
             target = None
         units.append({"id": str(uid), "region": r.get(regc), "target": target, "z": u.get("z"),
@@ -729,26 +823,49 @@ def calibration_tab(run_dir: str) -> dict:
                  "target_mean": sum(g["targets"]) / len(g["targets"]) if g["targets"] else None,
                  "z_min": min(g["z"]) if g["z"] else None, "z_max": max(g["z"]) if g["z"] else None}
                 for g in sorted(regions.values(), key=lambda g: g["region"])]
-    diag = _m(data.get("diagnostics"))
-    res = diag.get("target_logit_residual_max")
-    em, ewhy = _mapping(run_dir, EMULATOR)
+    diag = data["diagnostics"]
+    ident = _m(data.get("identifiability"))
+    em, ewhy = _need(run_dir, EMULATOR, [("data.accuracy", dict), ("data.accuracy.holdout_points", (int, float))])
     acc = _m(_m(_m(em).get("data")).get("accuracy"))
-    return {"available": True, "file": CALIBRATION, "settings": settings, "method": data.get("method"),
-            "target_uncertainty": {k: _short(v) for k, v in _m(scal.get("target_uncertainty")).items()},
-            "units": units, "regions": reg_rows, "join_why": twhy,
-            "model_per_unit": ("not stored: analysis/calibration.yaml keeps each unit's calibrated value (z), slope and "
-                               "clamp, not the model's value at the fitted point"
-                               + (f"; the inversion's largest residual is {res:.2g} on the logit scale"
-                                  if _num(res) is not None else "")),
-            "diagnostics": {str(k): v for k, v in diag.items()},
-            "identifiability": {str(k): v for k, v in _m(data.get("identifiability")).items()},
-            "emulator": na(ewhy) if ewhy else {
-                "available": True, "file": EMULATOR, **{k: acc.get(k) for k in (
-                    "holdout_points", "training_points", "cal_logit_rmse", "reduction_r2_median", "reduction_r2_p10",
-                    "reduction_mae_median", "base_log_rmse")},
-                "error_model": {str(k): v for k, v in _m(acc.get("error_model")).items()},
-                "features": _l(_m(_m(em).get("data")).get("features")),
-                "fit_seconds": _m(_m(em).get("data")).get("fit_seconds")}}
+    out = {"available": True, "file": CALIBRATION, "settings": settings, "method": method,
+           "target_uncertainty": {k: _short(v) for k, v in _m(scal.get("target_uncertainty")).items()},
+           "units": units, "regions": reg_rows, "join_why": twhy,
+           "diagnostics": {str(k): v for k, v in diag.items() if k != "fit"},
+           "identifiability": {str(k): v for k, v in ident.items() if k not in ("parameters", "classes")},
+           "emulator": na(ewhy) if ewhy else {
+               "available": True, "file": EMULATOR, **{k: acc.get(k) for k in (
+                   "holdout_points", "training_points", "cal_logit_rmse", "reduction_r2_median", "reduction_r2_p10",
+                   "reduction_mae_median", "base_log_rmse")},
+               "error_model": {str(k): v for k, v in _m(acc.get("error_model")).items()},
+               "features": _l(_m(_m(em).get("data")).get("features")),
+               "fit_seconds": _m(_m(em).get("data")).get("fit_seconds")}}
+    well = ident.get("status") == "well_identified"
+    if method == "emulator_inversion":
+        res = diag.get("target_logit_residual_max")
+        clamped = diag.get("clamped_units") if _num(diag.get("clamped_units")) is not None else \
+            sum(u["clamped"] for u in units)
+        out["model_per_unit"] = ("not stored: analysis/calibration.yaml keeps each unit's calibrated value (z), slope "
+                                 "and clamp, not the model's value at the fitted point"
+                                 + (f"; the inversion's largest residual is {res:.2g} on the logit scale"
+                                    if _num(res) is not None else ""))
+        out["needs_owner"] = bool(clamped) or not well
+        return out
+    fit = []
+    for r in _l(diag.get("fit")):
+        if not isinstance(r, dict):
+            continue
+        o, e = _num(r.get("observed")), _num(r.get("expected"))
+        fit.append({"unit": r.get("unit"), "t0": r.get("t0"), "package": r.get("package"), "observed": o,
+                    "expected": e, "pearson": (o - e) / e ** 0.5 if o is not None and e and e > 0 else None})
+    params = ([{"name": str(k), "status": _m(v).get("status"), "estimate": _m(v).get("estimate"),
+                "se": _m(v).get("se"), "profile_ci": _m(v).get("profile_ci"), "explanation": _m(v).get("explanation")}
+               for k, v in _m(ident.get("parameters")).items()] +
+              [{"name": str(k), "status": v} for k, v in _m(ident.get("classes")).items()])
+    out.update(fit=fit, parameters=params, theta={str(k): v for k, v in _m(data.get("theta")).items()},
+               prior_dominated=_l(data.get("prior_dominated")),
+               needs_owner=(diag.get("converged") is not True or bool(_l(diag.get("at_bound")))
+                            or bool(diag.get("unsupported_targets")) or not well))
+    return out
 
 
 def dossier(run_dir: str, repo: str = REPO) -> dict:
@@ -996,7 +1113,7 @@ def _self_test_review1(ok, td: str) -> None:
     def html_of(dd, tab):
         if not node:
             return None
-        p = _node(node, f"process.stdout.write(dossierHTML({json.dumps(tab)}, {json.dumps(dd, default=str)})); "
+        p = _node(node, f"process.stdout.write(dossierHTML({json.dumps(tab)}, {json.dumps(dd[tab], default=str)})); "
                         "process.exit(0);\n")
         return p.stdout or ("NODE FAILED " + p.stderr[-300:])
 

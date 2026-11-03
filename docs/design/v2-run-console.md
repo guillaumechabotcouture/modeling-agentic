@@ -507,3 +507,31 @@ the source file in the side panel through the existing `/api/file` route (text l
 | DS5 | `/api/dossier` returns the four sections for a known run, refuses an unknown run, and the page loads `/dossier.js` under the CSP; every glossary term the dossier marks has a definition and a source |
 
 Then a check in Chrome on port 8793 against the toy run, and read-only against the owner's real runs.
+
+### 15.3 Review round 1 (Codex, on #132)
+
+Each finding was reproduced by a failing self-test first (DR1-DR9).
+
+- **The calibration is joined only to the inputs it was computed from (DR1).** The tab compares the calibration
+  envelope's `spec_sha256` and its recorded `inputs` hashes with the bytes read now. The units table must be among
+  those inputs, and it is parsed from the same read that was hashed. On any mismatch the section reads "not
+  available: inputs changed since the analysis (<files>)". An envelope without these hashes is not joined either.
+- **The tab renders by the artifact's method (DR2).** `emulator_inversion` shows what it showed before. `likelihood`
+  and `posterior` show convergence, bound hits, the Pearson statistic and residuals, observed vs expected per target,
+  identifiability per parameter, and the fitted values. `none` says the spec calibrates nothing. Any other method
+  reads "not supported". A failure sets "Needs you: yes": clamped units, an identifiability status other than
+  well identified, no convergence, a parameter at a bound, or a target with no expected count.
+- **Required fields per section (DR3).** A payload without its required fields, or with the wrong type, is "not
+  available: <file>: missing <field>", never zeros. The fields: the spec's question and decision units, the
+  registry's entries, the provenance's inputs, the derivations list, the input check's status, counts and findings,
+  the engine choice's engine and candidates, the card's name and benchmarks and the parameters, the calibration's
+  method, units and diagnostics, and the emulator's held-out points.
+- **`per_reached` is priced per person reached (DR4)**, with the reach share in the basis column.
+- **An archived spec is hashed and parsed from one read (DR5).**
+- **The re-stamp chain (DR6).** `restamped.previous` is newest first, so the oldest record's old version computed the
+  numbers, and every later version only re-stamped them: "computed by v0.5; re-stamped by proof to v0.6, v0.7".
+- **Equation and identity benchmarks keep their criterion (DR7):** reference, comparison, tolerance and the absolute
+  and relative errors, in one criterion column beside target-and-band rows.
+- **Small values keep their significant digits (DR8):** below 1e-3 in scientific notation (`1.2e-8`).
+- **Decision tests (DR9):** a removed group rule names the rule and what it was, from `constraints.group_rules`; an
+  added rule names what it adds; an envelope test states it varies the envelope, with values in USD.
