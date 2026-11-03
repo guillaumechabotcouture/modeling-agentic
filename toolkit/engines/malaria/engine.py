@@ -1523,11 +1523,12 @@ def _self_test_v08(ok, e, unit) -> None:
         hp = DeliveryHorizon(2015.0, 2018.1, (2016.0, w1), {}, delivery=(2016.0, 2017.0))
         for h in (hd, hp):
             r = HK.run_series(e, base, u, [none, full], h, 4, ["pfpr_u5"])
-            n = int(round((float(h.window[1]) - float(h.start)) * 12))
+            n = int(np.ceil((float(h.window[1]) - float(h.start)) * 12 - 1e-9))
             ok(all(len(x["t"]) == n and all(abs(x["t"][k] - (float(h.start) + k / 12)) < 1e-6 for k in range(n))
-                   and abs(x["t_end"][-1] - float(h.window[1])) < 1e-12 for x in r) and r[0]["t"] == r[1]["t"],
-               f"S12c the grid is horizon.start + k/12 for k < round((window end - start) x 12) = {n}, ends at the "
-               "window end, and is the same for every arm")
+                   and x["t"] == HK.monthly_grid(h) and abs(x["t_end"][-1] - float(h.window[1])) < 1e-12
+                   for x in r) and r[0]["t"] == r[1]["t"],
+               f"S12c the grid is hooks.monthly_grid: every step start horizon.start + k/12 before the window end "
+               f"({n}; a partial last step ending at the window end), the same for every arm")
         d0, d1 = delivery_period(hd)
         for pkg in (none, full, smc_only):
             ev = HK.schedule(e, base, u, pkg, hd)
@@ -1557,6 +1558,47 @@ def _self_test_v08(ok, e, unit) -> None:
            and abs(e.series_window(ent, "pfpr_u5", 2015.0, 2019.0) - 0.1) < 1e-12,
            "S13b windows covered by whole steps inside the coverage are aggregated")
     case("S13", s13)
+
+    def s14():
+        # #127 r2 (P2-11): half-open delivery semantics at each boundary, against what the sim does
+        from toolkit.engines.malaria import model as MM
+        d0, d1 = delivery_period(hd)
+        net = Package("pyr", {"net": "pyr"})
+        ev = e.schedule(base, UnitSpec("t", dict(attrs, campaign_year=d0)), net, hd)
+        dec = [x for x in ev if x["kind"] == "decision"]
+        o = e.run(base, UnitSpec("t", dict(attrs, campaign_year=d0)), net, hd, 3)
+        ok(len(dec) == 1 and dec[0]["t0"] == d0 and dec[0]["charged"] and o.cost_drivers["nets_given"] > 0,
+           f"S14 a decision campaign at the delivery start d0 is inside, charged in the schedule and by the sim "
+           f"(nets_given {o.cost_drivers['nets_given']:.3f})")
+        for at, pkg, label, needle in (
+                ({"campaign_year": d1}, net, "S14b a decision campaign at the delivery end d1 is refused",
+                 "delivery period"),
+                ({"itn_hist_years": [d0]}, net, "S14c a past campaign at d0 is refused", "history"),
+                ({"campaign_year": d0 - 0.5, "itn_routine_interval": 0.5}, none,   # routine nets run in every arm
+                 "S14d a routine campaign at d0 is refused", "routine")):
+            why = refused(lambda: e.schedule(base, UnitSpec("t", dict(attrs, **at)), pkg, hd))
+            ok(why is not None and needle in why, f"{label} ({why})")
+        ur = UnitSpec("t", dict(attrs, campaign_year=d0, itn_routine_interval=1.0, smc_months=[1, 2, 3, 4]))
+        ev = e.schedule(base, ur, Package("ps", {"net": "pyr", "smc": 1}), hd)
+        rn = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "net")
+        rs = sorted(x["t0"] for x in ev if x["kind"] == "routine" and x["component"] == "smc")
+        sim, _ = e.build_sim(base, ur, Package("ps", {"net": "pyr", "smc": 1}), hd, 3)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        ran = sorted(float(yv[i]) for i in MM._event_tis(sim, sim.interventions["smc_routine"].targets()))
+        ok(rn and rn[0] == d1 and rs and rs[0] == d1 and rs == [t for t in ran if t < float(hd.window[1])]
+           and all(x["t0"] < float(hd.window[1]) for x in ev),
+           f"S14e a routine campaign and the first routine SMC round at d1 are accepted, as the sim runs them "
+           f"(nets {rn}, first SMC {rs[:1]})")
+        g = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        ug = UnitSpec("t", dict(attrs, itn_hist_years=[2021.25], campaign_year=2024.25, itn_routine_interval=3.0))
+        evg = HK.schedule(e, {"n_agents": 200}, ug, Package("ps", {"net": "pyr", "smc": 1}), g)
+        rg = sorted(round(x["t0"], 3) for x in evg if x["kind"] == "routine" and x["component"] == "net")
+        sg = [x["t0"] for x in evg if x["kind"] == "routine" and x["component"] == "smc"]
+        ok(rg in ([2027.249], [2027.25]) and bool(sg) and min(sg) >= 2027.0,
+           f"S14f GC7 dates: the routine campaign at campaign + 3 ({rg}) and routine SMC from d1 (first "
+           f"{round(min(sg), 3) if sg else None}) lie outside the delivery period; #127's checker accepts them")
+    case("S14", s14)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
