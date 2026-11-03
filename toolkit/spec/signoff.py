@@ -256,6 +256,18 @@ def _self_test() -> int:
                f"DI7f the sign-off sheet lists each accepted default with its card meaning and the spec's reason")
             ok("elig" in md and "not used by the toy" in md and "units_raw.csv" in md,
                "DI10c the sign-off sheet lists the ignored columns per input")
+            ok("## Input geometry check" in md and "has not run" in md,
+               "IG-S1a with no geometry record the sheet says the check has not run (never a silent pass)")
+            from toolkit.spec import geometry
+            geometry.toy_inputs(d)                   # its own spec and units in the same dir: the sheet reads the record
+            sp = _y.safe_load(open(os.path.join(d, SPEC)))
+            sp["decision_units"][geometry.ACCEPT_KEY] = {"reciprocal_swap:swap_a+swap_b": "rows checked by the owner"}
+            geometry.write(d, geometry.check(d, sp, {"edge_tolerance_km": 5.0, "area_ratio_max": 1.5}))
+            md = sheet(d)
+            ok("reciprocal_swap:swap_a+swap_b" in md and "rows checked by the owner" in md
+               and "1 reciprocal swap(s)" in md and "point_outside_own_polygon:stray" in md,
+               "IG-S1b the sheet lists the counts, each geometry finding accepted by name with its reason, and the "
+               "open ones")
     except Exception as e:  # noqa: BLE001 -- before the record and the sheet exist (step α) this is the failure
         ok(False, f"DI6/DI7/DI10 sign-off: {type(e).__name__}: {e}")
     if fails:

@@ -2076,6 +2076,12 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"DI machine tests: {type(e).__name__}: {e}")
+        try:
+            _self_test_geometry(ok, td)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            ok(False, f"IG machine tests: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2274,6 +2280,57 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     ok(got == ["infra", None, None, None, None, None, None],
        f"T61c infra only, in a summary written during this pipeline run, is resumable; a model or stopped row, no "
        f"failed row, an older summary, no summary, or no run dir is not ({got})")
+
+
+def _self_test_geometry(ok, td: str) -> None:
+    """IG-M1-3 (docs/design/v2-input-geometry.md §4): the input geometry check through the machine. A units table
+    whose two rows carry each other's points is refused before SIGN; accepted by name, it reaches SIGN; the gate
+    carries the open finding."""
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import schema as S
+    from toolkit.spec import geometry as GEO
+    toolkit = AB.backend("toolkit")
+
+    def setup(d, accept=None):
+        os.makedirs(d)
+        raw = yaml.safe_load(open(S.toy_spec(d)))
+        os.remove(os.path.join(d, AB.SPEC_FILE))
+        rows = open(os.path.join(d, "units.csv")).read().strip().split("\n")
+        feats, out = [], [rows[0] + ",lon,lat"]
+        for k, line in enumerate(rows[1:]):
+            x = k * 0.6
+            feats.append({"type": "Feature", "properties": {"fid": str(k)}, "geometry": {
+                "type": "Polygon", "coordinates": [[[x, 10], [x + 0.5, 10], [x + 0.5, 10.5], [x, 10.5], [x, 10]]]}})
+            j = {0: 1, 1: 0}.get(k, k)                      # units 0 and 1 carry each other's points
+            out.append(f"{line},{j * 0.6 + 0.25:.3f},10.25")
+        open(os.path.join(d, "units.csv"), "w").write("\n".join(out) + "\n")
+        json.dump({"type": "FeatureCollection", "features": feats}, open(os.path.join(d, "b.geojson"), "w"))
+        yaml.safe_dump({"boundaries": {"path": "b.geojson", "feature_id": "fid"}},
+                       open(os.path.join(d, "presentation.yaml"), "w"))
+        if accept:
+            raw["decision_units"][GEO.ACCEPT_KEY] = accept
+        st = init_run(d, "toy question", 3, "owner", "v2", None, derived_inputs=False)
+        return Machine(d, StubTasks({"spec": raw}), st, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    d1 = os.path.join(td, "ig1")
+    m1 = setup(d1)
+    status = m1.run(max_steps=12)
+    fb = load_state(d1).tries.get("spec_feedback") or []
+    ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
+       and "SIGN" not in [h.get("to") for h in load_state(d1).history],
+       f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
+    hf = {f["kind"]: f for f in m1.harness_findings()}
+    ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
+       f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")
+    d2 = os.path.join(td, "ig2")
+    m2 = setup(d2, {"reciprocal_swap:0+1": "the owner checked both rows against the source"})
+    m2.run(max_steps=12)
+    rep = json.load(open(os.path.join(d2, GEO.ARTIFACT)))
+    ok(m2.st.state == "SIGN" and m2.st.paused == "awaiting_signoff"
+       and [f.get("accepted") for f in rep["findings"]] == ["the owner checked both rows against the source"]
+       and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
+       f"IG-M2 accepted by name with a reason, the spec reaches SIGN and the gate no longer carries it "
+       f"({m2.st.state}, {m2.st.paused}, {load_state(d2).tries.get('spec_feedback')})")
 
 
 def _self_test_derived(ok, td: str) -> None:
