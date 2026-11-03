@@ -2968,6 +2968,8 @@ def _self_test() -> int:
         _self_test_review3(ok, tr3)
     with tempfile.TemporaryDirectory() as tr4:
         _self_test_review4(ok, tr4)
+    with tempfile.TemporaryDirectory() as tr5:
+        _self_test_review5(ok, tr5)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -3061,6 +3063,35 @@ def _self_test_review4(ok, td: str) -> None:
         ok(r != "served" and "sha:" in src[src.index("function renderFigures"):][:1200],
            f"RY6 /api/file refuses a figure whose bytes differ from the snapshot's hash; the page asks by hash ({r[:80]})")
     case("RY6", ry6)
+
+
+def _self_test_review5(ok, td: str) -> None:
+    """RZ5: Codex review round 5 of PR #129 (P2-5): a figure with no digest is never requested unbound."""
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    def rz5():
+        d = _toy_run(os.path.join(td, "rz5", "a"))
+        con = Console([os.path.join(td, "rz5")], log=lambda *a: None)
+        res = []
+        for sha in ("", "nothex"):
+            try:
+                con.handle("GET", "/api/file", {"run": [d], "path": ["figures/plan.png"], "bound": ["1"], "sha": [sha]}, {})
+                res.append("served")
+            except ValueError:
+                res.append("refused")
+        good = hashlib.sha256(open(os.path.join(d, "figures", "plan.png"), "rb").read()).hexdigest()
+        st, _, body = con.handle("GET", "/api/file", {"run": [d], "path": ["figures/plan.png"], "bound": ["1"],
+                                                     "sha": [good]}, {})
+        ok(res == ["refused", "refused"] and st == 200,
+           f"RZ5a a snapshot-bound figure request with an empty or invalid sha is refused ({res})")
+        src = _page_sources()
+        ok("function figSrc" in src and "bound: 1" in src and 'sha256 || ""' not in src,
+           "RZ5b the page builds figure URLs only from a captured digest (figSrc), never with sha=\"\"")
+    case("RZ5", rz5)
 
 
 def _self_test_review3(ok, td: str) -> None:
