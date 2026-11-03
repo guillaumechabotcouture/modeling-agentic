@@ -949,7 +949,8 @@ def _toy_dossier(d: str, repo: str, hostile: str = "") -> str:
     # calibration and emulator
     units_cal = {f"u{i}": {"z": 0.1 * i, "clamped": i == 6, "slope": 1.0 / i} for i in range(1, 7)}
     _toy_w(d, "analysis/calibration.yaml", {"schema": "analysis.calibration/1", "producer": "toolkit/analysis/calibration.py",
-                                        "engine": eng, "data": {
+                                        "engine": eng, "spec_sha256": _sha_file(cur),
+                                        "inputs": {"data/derived/units.csv": _sha_file(units)}, "data": {
         "method": "emulator_inversion", "units": units_cal,
         "diagnostics": {"units": 6, "clamped_units": 1, "grid_points": 10, "range": [-1.0, 2.0],
                         "target_logit_residual_max": 0.0001, "slope_median": 0.3, "slope_min": 1.0 / 6},
@@ -962,6 +963,226 @@ def _toy_dossier(d: str, repo: str, hostile: str = "") -> str:
                      "error_model": {"model": "toy common plus per-unit", "rmse_median": 0.03}},
         "features": ["s1", "pop"], "fit_seconds": 1.5}})
     return d
+
+
+def _node(node: str, tail: str):
+    """Run the page's two scripts in node with a stub DOM, then `tail` (the self-test renders the tabs this way)."""
+    import subprocess
+    stub = (
+        "const _h = { get: (t, k) => k === Symbol.iterator ? function* () {} : k === Symbol.toPrimitive ? "
+        "() => '' : k === 'forEach' ? () => {} : k === 'search' ? '' : k === 'content' ? 'tok' : P, "
+        "set: () => true, apply: () => P };\nconst P = new Proxy(function () {}, _h);\n"
+        "globalThis.document = P; globalThis.window = P; globalThis.location = { search: '' };\n"
+        "globalThis.matchMedia = () => ({ matches: false }); globalThis.setInterval = () => 0; "
+        "globalThis.setTimeout = () => 0;\nglobalThis.fetch = () => new Promise(() => {});\n")
+    js = open(os.path.join(HERE, "run_console.js"), encoding="utf-8").read() + "\n" + open(JS, encoding="utf-8").read()
+    glossary = json.dumps({k: {"text": v[0], "source": v[1]} for k, v in RC.GLOSSARY.items()})
+    return subprocess.run([node, "-e", stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n" + tail],
+                          capture_output=True, text=True, timeout=60)
+
+
+def _self_test_review1(ok, td: str) -> None:
+    """DR1-DR9: Codex review round 1 of PR #132, each finding reproduced first."""
+    import shutil
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"{name}: {type(e).__name__}: {str(e)[:300]}")
+
+    node = shutil.which("node")
+
+    def html_of(dd, tab):
+        if not node:
+            return None
+        p = _node(node, f"process.stdout.write(dossierHTML({json.dumps(tab)}, {json.dumps(dd, default=str)})); "
+                        "process.exit(0);\n")
+        return p.stdout or ("NODE FAILED " + p.stderr[-300:])
+
+    def fresh(name):
+        return _toy_dossier(os.path.join(td, "r1", name), os.path.join(td, "r1", "repo_" + name))
+
+    # DR1 (P1) the calibration join is refused when the units table or the spec changed after the analysis
+    def dr1():
+        d = fresh("dr1a")
+        _toy_w(d, "data/derived/units.csv", UNITS_CSV.replace("u1,R1,100,1,20,0.10", "u1,R1,100,1,20,0.90"))
+        c1 = calibration_tab(d)
+        d2 = fresh("dr1b")
+        sp = yaml.safe_load(open(os.path.join(d2, "decision_spec.yaml")))
+        sp["calibration"]["target_column"] = "pop"
+        _toy_w(d2, "decision_spec.yaml", sp)
+        c2 = calibration_tab(d2)
+        c3 = calibration_tab(fresh("dr1c"))
+        ok(c1.get("available") is False and "changed since the analysis" in c1.get("why", "")
+           and c2.get("available") is False and "changed since the analysis" in c2.get("why", "")
+           and c3.get("available") is True,
+           f"DR1 a units table or spec edited after the analysis is not joined to the old fit ({c1.get('why')}; "
+           f"{c2.get('why')})")
+    case("DR1", dr1)
+
+    # DR2 (P1) the calibration tab renders by the artifact's method; failures need the owner
+    def dr2():
+        d = fresh("dr2")
+        doc = yaml.safe_load(open(os.path.join(d, "analysis/calibration.yaml")))
+        doc["data"] = {"method": "likelihood", "theta": {"k": 0.5}, "names": ["k", "z:u1"],
+                       "units": {f"u{i}": {"z": 0.1 * i} for i in range(1, 7)},
+                       "diagnostics": {"converged": False, "message": "ABNORMAL", "iterations": 9, "n_targets": 2,
+                                       "n_parameters": 2, "dispersion": 1.4, "pearson_chi2": 2.8, "df": 1,
+                                       "at_bound": ["k"], "pearson_residual_max": 1.9, "unsupported_targets": 0,
+                                       "fit": [{"unit": "u1", "t0": 2020, "package": "none", "observed": 12.0,
+                                                "expected": 9.0},
+                                               {"unit": "u2", "t0": 2020, "package": "none", "observed": 4.0,
+                                                "expected": 4.0}]},
+                       "identifiability": {"method": "scripts/identifiability.py", "status": "weakly_or_unidentified",
+                                           "parameters": {"k": {"status": "weakly_identified", "explanation": "flat",
+                                                                "estimate": 0.5, "se": 0.4,
+                                                                "profile_ci": [0.1, 0.9]}}}}
+        _toy_w(d, "analysis/calibration.yaml", doc)
+        c = calibration_tab(d)
+        fit = (c.get("fit") or [{}])[0]
+        ok(c.get("method") == "likelihood" and (c.get("diagnostics") or {}).get("converged") is False
+           and c.get("needs_owner") is True and abs((fit.get("pearson") or 0) - 1.0) < 1e-9,
+           f"DR2a a likelihood fit: convergence, bound hits, observed vs expected with the Pearson residual, and it "
+           f"needs the owner ({ {k: c.get(k) for k in ('method', 'needs_owner')} }; {fit})")
+        doc["data"]["method"] = "magic"
+        _toy_w(d, "analysis/calibration.yaml", doc)
+        cu = calibration_tab(d)
+        ok(cu.get("available") is False and "not supported" in cu.get("why", ""),
+           f"DR2b an unknown calibration method is not supported ({cu.get('why')})")
+        if node:
+            doc["data"]["method"] = "likelihood"
+            _toy_w(d, "analysis/calibration.yaml", doc)
+            h = html_of(dossier(d), "calibration") or ""
+            hi = html_of(dossier(fresh("dr2b")), "calibration") or ""
+            ok("reproduces its target" not in h and "Needs you: yes" in h and "Pearson" in h
+               and "Needs you: yes" in hi,
+               f"DR2c the likelihood tab has no inversion wording and says Needs you: yes; a clamped inversion does too "
+               f"({h[:160]!r})")
+    case("DR2", dr2)
+
+    # DR3 (P2) an empty or mistyped payload is not available, never zeros
+    def dr3():
+        d = fresh("dr3")
+        for rel in (REGISTRY, PROVENANCE, DERIVATIONS, INPUT_CHECKS, CHOICE, ENGINE_YAML, CALIBRATION, EMULATOR):
+            _toy_w(d, rel, {} if rel.endswith(".json") else "{}\n")
+        dd = dossier(d)
+        ev, en, ca = dd["evidence"], dd["engine"], dd["calibration"]
+        parts = {"registry": ev["registry"], "inputs": ev["inputs"], "derivations": ev["derivations"],
+                 "input_checks": ev["input_checks"], "choice": en["choice"], "card": en["card"],
+                 "benchmarks": en["benchmarks"], "calibration": ca, "emulator": ca.get("emulator") or ca}
+        bad = {k: v.get("why") for k, v in parts.items() if v.get("available") is not False}
+        ok(not bad and all("missing" in (v.get("why") or "") or "invalid" in (v.get("why") or "")
+                           for v in parts.values()),
+           f"DR3 a {{}} payload is not available with the missing field named, never shown as zeros "
+           f"(shown as available: {sorted(bad)}; {[v.get('why') for v in parts.values()][:3]})")
+    case("DR3", dr3)
+
+    # DR4 (P2) per_reached: the cost per person reached, with the reach share
+    def dr4():
+        opts = {"components": {"r": {"eligible": "elig", "reach_share": 0.5}},
+                "prices": {"base_year": "2024"},
+                "cost_items": [{"id": "r_item", "component": "r", "value": 2.0, "price_year": "2024",
+                                "price_rule": "as_published", "basis": "per_reached", "includes": ["x"]}]}
+        it = _cost_items(opts)[0]
+        ok(abs((it["per_person"] or 0) - 2.0) < 1e-9 and it["per_label"] == "per person reached"
+           and any("reach share 0.5" in x for x in it["extra"]),
+           f"DR4 a per_reached item is priced per person reached and shows its reach share ({it})")
+    case("DR4", dr4)
+
+    # DR5 (P2) an archived spec is hashed and parsed from the same read
+    def dr5():
+        d = fresh("dr5")
+        rel = "evidence_planner/superseded_signoff_2026-01-01/decision_spec.signed_aa.yaml"
+        calls, real = [], RC._load_rel
+
+        def counting(run_dir, r):
+            if r == rel:
+                calls.append(r)
+            return real(run_dir, r)
+        RC._load_rel = counting
+        try:
+            so = spec_tab(d)["signoffs"]
+        finally:
+            RC._load_rel = real
+        ok(len(calls) == 1 and so[0]["diff"]["available"],
+           f"DR5 the archived spec is read once, its hash and its parsed content from that read ({len(calls)} reads)")
+    case("DR5", dr5)
+
+    # DR6 (P2) the re-stamp chain: who computed the numbers and every re-stamp since
+    def dr6():
+        d = fresh("dr6")
+        repo = os.path.join(td, "r1", "repo_dr6")
+        res = os.path.join(repo, "toolkit/engines/toy/benchmarks/results.yaml")
+        doc = yaml.safe_load(open(res))
+        doc["engine_identity"]["version"] = "0.8"
+        doc["restamped"] = {"by": "restamp_proof.py (byte-identity proof, not recomputed)", "proof_identical": True,
+                            "old_engine_version": "0.7", "confirmation": {"validate_once": "pending"},
+                            "previous": [{"by": "restamp_proof.py (byte-identity proof, not recomputed)",
+                                          "old_engine_version": "0.6"},
+                                         {"by": "restamp_proof.py (byte-identity proof, not recomputed)",
+                                          "old_engine_version": "0.5"}]}
+        _toy_w(repo, "toolkit/engines/toy/benchmarks/results.yaml", doc)
+        eng = yaml.safe_load(open(os.path.join(d, ENGINE_YAML)))
+        k = next(x for x in eng["inputs"] if "results.yaml" in x)
+        eng["inputs"][k] = _sha_file(res)
+        _toy_w(d, ENGINE_YAML, eng)
+        rs = engine_tab(d, repo)["restamp"]
+        ok(rs.get("computed_by") == "0.5" and rs.get("restamped_to") == ["0.6", "0.7", "0.8"],
+           f"DR6a the chain: computed by v0.5, re-stamped by proof to v0.6, v0.7, v0.8 "
+           f"({ {k: rs.get(k) for k in ('computed_by', 'restamped_to', 'old_version')} })")
+        if node:
+            h = html_of(dossier(d, repo), "engine") or ""
+            ok("computed by v0.5" in h and "v0.6, v0.7, v0.8" in h and "numbers from version" not in h,
+               "DR6b the page says which version computed the numbers and which only re-stamped them")
+    case("DR6", dr6)
+
+    # DR7 (P2) an equation or identity benchmark keeps its criterion
+    def dr7():
+        d = fresh("dr7")
+        eng = yaml.safe_load(open(os.path.join(d, ENGINE_YAML)))
+        eng["data"]["card"]["benchmarks"].append({
+            "id": "FS1a", "metric": "toy final size", "role": "held_out", "target": None, "band": None,
+            "source": "closed form", "computed": 0.5828116449805854, "reference": 0.58281164498064,
+            "error_abs": 5.46e-14, "error_rel": 9.37e-14, "tolerance": {"abs": 1e-6}, "compare": "eq",
+            "in_band": True, "status": "in_band"})
+        _toy_w(d, ENGINE_YAML, eng)
+        row = next(r for r in engine_tab(d)["benchmarks"]["rows"] if r["id"] == "FS1a")
+        ok(row.get("compare") == "eq" and row.get("reference") == 0.58281164498064
+           and row.get("tolerance") == {"abs": 1e-6} and row.get("error_abs") == 5.46e-14,
+           f"DR7a the row keeps reference, compare, tolerance and errors ({row})")
+        if node:
+            h = html_of(dossier(d), "engine") or ""
+            ok("reference" in h and "tolerance" in h and "5.46e-14" in h,
+               "DR7b the page shows the criterion of an equation benchmark, not blank target and band")
+    case("DR7", dr7)
+
+    # DR8 (P2) small values keep their significant digits
+    def dr8():
+        if not node:
+            ok(True, "DR8 skipped: node is not installed")
+            return
+        p = _node(node, "process.stdout.write(JSON.stringify([sig(1.2e-8), sig(0.000072), sig(0.4512), sig(0)])); "
+                        "process.exit(0);\n")
+        v = json.loads(p.stdout or "[]")
+        ok(len(v) == 4 and v[0] == "1.2e-8" and v[1] == "7.2e-5" and v[2] == "0.451" and v[3] == "0",
+           f"DR8 sig() writes small magnitudes in scientific notation with their significant digits ({v})")
+    case("DR8", dr8)
+
+    # DR9 (P2) decision tests: a group rule removed; an envelope test in USD
+    def dr9():
+        spec = _toy_spec()
+        spec["constraints"]["group_rules"] = {"same_region": {"by": "region", "components": ["a", "b"],
+                                                              "rule": "same_choice"}}
+        spec["analysis"]["decision_tests"] = [
+            {"id": "DT4", "type": "group_rule", "rule": "same_region", "text": "without the region rule?"},
+            {"id": "DT5", "type": "envelope", "values": [800000, 1200000], "text": "at other envelopes?"}]
+        t = {x["id"]: x for x in _decision_tests(spec, {})}
+        ok("None" not in t["DT4"]["varied"] and "same_region" in t["DT4"]["varied"] and "removed" in t["DT4"]["varied"]
+           and t["DT5"]["unit"] == "USD" and "envelope" in t["DT5"]["varied"],
+           f"DR9 a removed group rule and an envelope test (USD) say what is varied ({t['DT4']['varied']!r}; "
+           f"{t['DT5']})")
+    case("DR9", dr9)
 
 
 def _self_test() -> int:
@@ -1215,19 +1436,9 @@ def _self_test() -> int:
             hostile = '<img src=x onerror=alert(1)>" onmouseover="alert(2)'
             hr = _toy_dossier(os.path.join(td, "runs", "xss"), os.path.join(td, "repo_x"), hostile)
             dd = dossier(hr, os.path.join(td, "repo_x"))
-            stub = (
-                "const _h = { get: (t, k) => k === Symbol.iterator ? function* () {} : k === Symbol.toPrimitive ? "
-                "() => '' : k === 'forEach' ? () => {} : k === 'search' ? '' : k === 'content' ? 'tok' : P, "
-                "set: () => true, apply: () => P };\nconst P = new Proxy(function () {}, _h);\n"
-                "globalThis.document = P; globalThis.window = P; globalThis.location = { search: '' };\n"
-                "globalThis.matchMedia = () => ({ matches: false }); globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;\n"
-                "globalThis.fetch = () => new Promise(() => {});\n")
-            js = open(os.path.join(HERE, "run_console.js"), encoding="utf-8").read() + "\n" + src
-            test = (f"\nS.meta = {{ glossary: {json.dumps({k: {'text': v[0], 'source': v[1]} for k, v in RC.GLOSSARY.items()})} }};\n"
-                    f"const D = {json.dumps(dd, default=str)};\n"
-                    "const out = {}; for (const t of ['spec', 'evidence', 'engine', 'calibration']) out[t] = dossierHTML(t, D[t]);\n"
-                    "process.stdout.write(JSON.stringify(out)); process.exit(0);\n")
-            p = subprocess.run([node, "-e", stub + js + test], capture_output=True, text=True, timeout=60)
+            p = _node(node, f"const D = {json.dumps(dd, default=str)};\n"
+                            "const out = {}; for (const t of ['spec', 'evidence', 'engine', 'calibration']) "
+                            "out[t] = dossierHTML(t, D[t]);\nprocess.stdout.write(JSON.stringify(out)); process.exit(0);\n")
             try:
                 html = json.loads(p.stdout)
             except ValueError:
@@ -1262,6 +1473,7 @@ def _self_test() -> int:
             ok(used and not missing, f"DS5d every glossary term the dossier marks has a definition and a source "
                                      f"({len(used)} used; missing {missing})")
         case("DS5", ds5)
+        _self_test_review1(ok, td)
     finally:
         shutil.rmtree(td, ignore_errors=True)
     if fails:
