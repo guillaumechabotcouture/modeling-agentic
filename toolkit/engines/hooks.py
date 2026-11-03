@@ -38,14 +38,17 @@ Hook 2, monthly series (a separate method, so `run` / `run_batch` are untouched)
 
 Contract version `figures-hooks/1` (HOOKS_CONTRACT): an engine opts in with `hooks_contract = HOOKS_CONTRACT`; without
 it neither hook is offered, and another version is refused. Under version 1:
-  grid        run_series returns exactly the monthly grid t[k] = horizon.start + k/12 (within GRID_TOL) through the
-              outcome window's end, identical for every arm (HookInvalid otherwise)
+  grid        run_series returns exactly monthly_grid(horizon): t[k] = horizon.start + k/12 (within GRID_TOL) for
+              every t[k] < the outcome window's end, identical for every arm (HookInvalid otherwise); a window end
+              inside a month gives a partial final step whose value covers [t[k], window end)
   metrics     each card entry gives label, units, aggregate (mean | rate) and denominator (e.g. person, person-year):
               values are per member of the unit's simulated population, and the harness weights them by the units
               table's populations
-  schedule    every event lies in [horizon.start, window end]; decision events lie in the delivery period and only
-              for components the package sets; history events end before the delivery period; routine events lie
-              outside it; charged is true exactly for decision events
+  schedule    half-open periods: a point event t0 is in [a, b) iff a <= t0 < b, an interval [t0, t1) overlaps it
+              iff t0 < b and t1 > a. Every event lies in [horizon.start, window end); decision events lie in the
+              delivery period [d0, d1) and only for components the package sets (a decision at d1 is refused);
+              history events lie wholly before d0; routine events do not overlap [d0, d1); charged is true exactly
+              for decision events
 
 Nothing here names a disease, component or metric.
 """
@@ -121,10 +124,26 @@ def _unsupported(hook, engine):
     return HookUnsupported(hook, engine)
 
 
+def window_mean(t, v, w0: float, w1: float, end: float | None = None, step: float = 1 / 12) -> float:
+    """Mean of a step series (values on the contract's monthly grid) over the half-open window [w0, w1): each step
+    [t_k, t_k + step) (the last one cut at `end`, the window end of the grid) weighted by its overlap. NaN when no
+    step overlaps."""
+    num = den = 0.0
+    for k, (tk, vk) in enumerate(zip(t, v)):
+        a = float(tk)
+        b = a + step if k + 1 < len(t) or end is None else min(a + step, float(end))
+        w = max(0.0, min(b, w1) - max(a, w0))
+        num += w * float(vk)
+        den += w
+    return num / den if den > 0 else float("nan")
+
+
 def monthly_grid(horizon) -> list[float]:
-    """The contract's grid: monthly step starts from horizon.start through the outcome window's end."""
-    n = int(round((float(horizon.window[1]) - float(horizon.start)) * 12))
-    return [float(horizon.start) + k / 12 for k in range(n)]
+    """The contract's grid: every monthly step start t_k = horizon.start + k/12 with t_k < the outcome window's end.
+    When the window ends inside a month, the final step is partial: its value covers [t_k, window end) (the step
+    mean for `mean`, events per person-year over that span for `rate`)."""
+    n = int(math.ceil((float(horizon.window[1]) - float(horizon.start)) * 12 - 1e-9))
+    return [float(horizon.start) + k / 12 for k in range(max(n, 0))]
 
 
 def schedule(engine, params, unit, package, horizon) -> list[dict]:
@@ -156,17 +175,24 @@ def schedule(engine, params, unit, package, horizon) -> list[dict]:
         if not str(e.get("label") or "").strip():
             bad.append(f"event {n}: no label")
         if _num(e.get("t0")) and (e.get("t1") is None or _num(e.get("t1"))):
-            t0, t1 = float(e["t0"]), float(e["t0"] if e.get("t1") is None else e["t1"])
-            if t0 < h0 - GRID_TOL or t1 > w1 + GRID_TOL:
-                bad.append(f"event {n}: [{t0:g}, {t1:g}] is outside the horizon [{h0:g}, {w1:g}]")
+            # half-open periods throughout: a point event t0 is in [a, b) iff a <= t0 < b; an interval [t0, t1)
+            # overlaps [a, b) iff t0 < b and t1 > a
+            t0 = float(e["t0"])
+            t1 = None if e.get("t1") is None else float(e["t1"])
+            T = GRID_TOL
+            in_h = (h0 - T <= t0 < w1 - T) if t1 is None else (t0 >= h0 - T and t1 <= w1 + T)
+            if not in_h:
+                bad.append(f"event {n}: at {t0:g} is outside the horizon [{h0:g}, {w1:g})")
+            inside = (d0 - T <= t0 < d1 - T) if t1 is None else (t0 < d1 - T and t1 > d0 + T)
+            within = (d0 - T <= t0 < d1 - T) if t1 is None else (t0 >= d0 - T and t1 <= d1 + T)
             k = e.get("kind")
-            if k == "decision" and not (d0 - GRID_TOL <= t0 and t1 <= d1 + GRID_TOL):
+            if k == "decision" and not within:
                 bad.append(f"event {n}: decision event at {t0:g} is outside the delivery period [{d0:g}, {d1:g})")
             if k == "decision" and e.get("component") not in has:
                 bad.append(f"event {n}: decision event for {e.get('component')!r}, which is not in the package")
-            if k == "history" and t1 > d0 + GRID_TOL:
-                bad.append(f"event {n}: history event at {t0:g} does not end before the delivery period ({d0:g})")
-            if k == "routine" and t1 > d0 + GRID_TOL and t0 < d1 - GRID_TOL:
+            if k == "history" and (inside or t0 >= d0 - T):
+                bad.append(f"event {n}: history event at {t0:g} does not lie before the delivery period ({d0:g})")
+            if k == "routine" and inside:
                 bad.append(f"event {n}: routine event at {t0:g} falls inside the delivery period [{d0:g}, {d1:g})")
         out.append({k: e.get(k) for k in ("component", "label", "kind", "t0", "t1", "charged")})
     if bad:
@@ -244,10 +270,13 @@ class ToyScheduleEngine(_toy_base()):
         return EngineCard(**dict(c.to_dict(), outputs=out))
 
     def schedule(self, params, unit, package, horizon):
+        from toolkit.engines.horizon import delivery_period
         ev = []
+        d0 = delivery_period(horizon)[0]
         for comp in sorted(self.describe().components):
-            ev.append({"component": comp, "label": "past round", "kind": "history", "t0": float(horizon.start),
-                       "t1": None, "charged": False})
+            if float(horizon.start) < d0:       # a past round only when there is time before the delivery period
+                ev.append({"component": comp, "label": "past round", "kind": "history", "t0": float(horizon.start),
+                           "t1": None, "charged": False})
             if package.components.get(comp):
                 ev.append({"component": comp, "label": "round", "kind": "decision", "t0": float(horizon.window[0]),
                            "t1": None, "charged": True})
@@ -257,8 +286,8 @@ class ToyScheduleEngine(_toy_base()):
         from toolkit.engines.contract import resolve_params
         p = resolve_params(self, params)
         x = float(unit.attributes.get("x", 0.0))
-        n = int(round((float(horizon.window[1]) - float(horizon.start)) * 12))
-        t = [float(horizon.start) + k / 12 for k in range(n)]
+        t = monthly_grid(horizon)           # the contract's grid (one definition)
+        n = len(t)
         res = []
         for pk in packages:
             a, b = int(pk.components.get("a", 0)), int(pk.components.get("b", 0))
@@ -394,6 +423,30 @@ def _self_test() -> int:
             return EngineCard(**dict(c.to_dict(), outputs=dict(c.outputs, series={"prev": {"aggregate": "mean"}})))
     refused("H12 a series metric without label, units and denominator is refused",
             lambda: run_series(BadMeta(), {}, u, [pa], h, 1, ["prev"]), "denominator")
+    # ---- Codex r2 P2-10: a window end inside a month keeps its final partial step
+    hu = Horizon(0.0, 4.0, (1.0, 3.0 + 1 / 24), {})
+    ok(len(monthly_grid(hu)) == 37 and monthly_grid(hu)[-1] < 3.0 + 1 / 24,
+       f"H13 the grid keeps every step that starts before the window end (partial last step): {len(monthly_grid(hu))}")
+    ok(len(run_series(E, {}, u, [p0, pa], hu, 1, ["prev"])[0]["t"]) == 37, "H13b a 37-step answer is accepted")
+
+    class Rounded(Hooked):                   # the old rounding: drops the partial step
+        def run_series(self, params, unit, packages, horizon, seed, metrics, step="month"):
+            r = super().run_series(params, unit, packages, horizon, seed, metrics, step)
+            for x in r:
+                x["t"] = x["t"][:-1]
+                x["values"] = {m: v[:-1] for m, v in x["values"].items()}
+            return r
+    refused("H13c an answer that omits the partial final step is refused",
+            lambda: run_series(Rounded(), {}, u, [p0, pa], hu, 1, ["prev"]), "monthly")
+    # ---- Codex r2 P2-11: point events follow [d0, d1) exactly
+    refused("H14 a charged decision event at the delivery end d1 is refused",
+            lambda: schedule(sched([ev(t0=2.0)]), {}, u, pa, hd), "delivery period")
+    refused("H14b a history event at the delivery start d0 is refused",
+            lambda: schedule(sched([ev(kind="history", charged=False, t0=1.0)]), {}, u, pa, hd), "history")
+    refused("H14c a routine event at the delivery start d0 is refused",
+            lambda: schedule(sched([ev(kind="routine", charged=False, t0=1.0)]), {}, u, pa, hd), "routine")
+    ok(len(schedule(sched([ev(t0=1.0), ev(kind="routine", charged=False, t0=2.0)]), {}, u, pa, hd)) == 2,
+       "H14d a decision at d0 and a routine event at d1 are accepted")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

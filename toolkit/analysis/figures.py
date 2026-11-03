@@ -47,8 +47,10 @@ TIER_OF = {n: k for k, v in TIERS.items() for n in v}
 TIER_OF.update({n: "decision" for v in DECISION_SETS.values() for n in v})
 
 
-def deliverable_kind(spec: dict) -> str:
-    return str(((spec or {}).get("deliverable") or {}).get("kind", "package_per_unit"))
+def deliverable_kind(spec: dict):
+    """The spec's deliverable.kind, or None when it declares none (no default: the decision set must be explicit)."""
+    k = ((spec or {}).get("deliverable") or {}).get("kind")
+    return str(k) if k else None
 
 
 def tiers_for(spec: dict) -> dict:
@@ -132,6 +134,11 @@ class RunData:
         if rel not in self.used:
             self.used.append(rel)
         return doc["data"]
+
+    def presentation_record(self) -> list[dict]:
+        """The presentation files this run's figures read, with their sha: the labels file(s) and, once maps are
+        drawn, the boundary and crosswalk files."""
+        return list(self.pres["files"]) + (list(self._geo.get("files") or []) if self._geo else [])
 
     @property
     def geo(self):
@@ -728,11 +735,28 @@ def _trajectories_current(R):
     if stale:
         raise Missing(f"the trajectories are stale: {', '.join(stale)} changed after they were computed; rerun "
                       "python -m toolkit.analysis.trajectories run <run_dir>")
-    run_eng = (R.doc("point") or {}).get("engine") or {}
+    run_eng = (R.doc("point") or {}).get("engine")
+    if run_eng and tr.get("analysis_engine") != run_eng:
+        raise Missing(f"the trajectories are stale: they were computed against the analysis of engine "
+                      f"{(tr.get('analysis_engine') or {}).get('name')} (card "
+                      f"{str((tr.get('analysis_engine') or {}).get('card_sha256', ''))[:12]}), this run's is "
+                      f"{run_eng.get('name')} (card {str(run_eng.get('card_sha256', ''))[:12]})")
     te = tr.get("engine") or {}
-    if run_eng and (te.get("name"), str(te.get("version"))) != (run_eng.get("name"), str(run_eng.get("version"))):
-        raise Missing(f"the trajectories are stale: computed by engine {te.get('name')} v{te.get('version')}, the "
-                      f"analysis by {run_eng.get('name')} v{run_eng.get('version')}")
+    rows_p = os.path.join(R.dir, "analysis", "batch", "results.jsonl")
+    be = None
+    if os.path.exists(rows_p):
+        with open(rows_p) as fh:
+            first = json.loads(fh.readline() or "{}")
+        be = ((first.get("result") or {}).get("provenance") or {}).get("engine")
+    if be is not None:
+        diff = [k for k in ("name", "version", "code_sha256", "params_sha256", "config_sha256") if te.get(k) != be.get(k)]
+        if diff:
+            raise Missing(f"the trajectories are stale: their engine identity differs from the analysis batch's in "
+                          f"{', '.join(d.replace('_sha256', '') for d in diff)} (code {str(te.get('code_sha256', ''))[:12]} "
+                          f"vs {str(be.get('code_sha256', ''))[:12]})")
+    elif not run_eng:
+        raise Missing("the trajectories cannot be checked against this run's engine (no batch rows and no analysis "
+                      "engine record)")
     return tr
 
 
@@ -761,11 +785,10 @@ def trajectory_checks(R, tr) -> list[dict]:
             tg = s.get("target") or {}
             if tg.get("value") is None:
                 continue
-            tt = np.asarray(s["t"])
-            sel = (tt >= float(win[0]) - 1 / 24) & (tt < float(win[1]) + 1 / 24)
-            if not sel.any():
+            v = _window_mean(s["t"], s["arms"]["comparator"][cm], float(win[0]), float(win[1]),
+                             end=float(tr["window"][1]))
+            if v != v:              # NaN: no step overlaps the calibration window
                 continue
-            v = float(np.mean(np.asarray(s["arms"]["comparator"][cm])[sel]))
             n += 1
             if not tg["lo"] <= v <= tg["hi"]:
                 flags.append(p)
@@ -866,11 +889,16 @@ def fig_stochastic_noise(R, t):
     ax.set_yticklabels([f"{R.region(i) if i in R.by_id else ''} {i}" for i in units], fontsize=6.5)
     FS.set_axis_format(ax, "x")
     lab = tr["metric_info"].get(m, {}).get("label", m)
-    ax.set_xlabel(f"{lab} averted per person over the outcome window, by seed (bar: mean)", fontsize=8)
+    agg = (tr["metric_info"].get(m) or {}).get("aggregate")
+    unit_txt = ("averted per person-year (mean rate over the outcome window)" if agg == "rate" else
+                "comparator minus plan (mean over the outcome window)")
+    ax.set_xlabel(f"{lab} {unit_txt}, by seed (bar: mean)", fontsize=8)
     med = sorted(rel)[len(rel) // 2] if rel else None
     title = (f"Seed-to-seed spread is {FS.fmt(med, 'percent')} of the mean effect (median over {len(rel)} sampled units)"
              if med is not None else "Seed-to-seed spread of the effect in the sampled units")
-    cap = (f"Comparator minus plan, {lab}, over the outcome window for each seed of the trajectory step "
+    cap = (f"Comparator minus plan, {lab}" + (" as a mean rate per person-year" if agg == "rate" else
+                                                " as a mean level") + ", over the outcome window for each seed of "
+           f"the trajectory step "
            f"({tr.get('seeds')} seeds) in the purposive sample: what one simulation's Monte Carlo noise looks like.")
     return fig, title, cap, rows, "stochastic noise (diagnostic)"
 
@@ -999,7 +1027,7 @@ def load_presentation(run_dir: str, extra=None, spec: dict | None = None, engine
                 labels[k] = v
         if doc.get("boundaries") is not None:
             bnd = _boundaries_config(doc["boundaries"], os.path.dirname(path), shown)
-        files.append({"path": shown, "sha256": sha256(path)})
+        files.append({"path": shown, "sha256": sha256(path), "kind": "presentation"})
     if isinstance(extra, dict):
         for k, v in extra.items():
             if isinstance(v, dict):
@@ -1023,18 +1051,32 @@ def _boundaries_config(b, base: str, shown: str) -> dict:
     if xw is not None:
         if not isinstance(xw, dict) or not all(isinstance(xw.get(k), str) for k in ("path", "unit_id", "feature_id")):
             raise ValueError(f"{shown}: boundaries.crosswalk needs path, unit_id and feature_id (strings)")
+        unknown = sorted(set(xw) - {"path", "unit_id", "feature_id", "union"})
+        if unknown:
+            raise ValueError(f"{shown}: boundaries.crosswalk: unknown keys {unknown}")
+        if "union" in xw and not isinstance(xw["union"], bool):
+            raise ValueError(f"{shown}: boundaries.crosswalk.union must be true or false")
         out["crosswalk"] = {"path": where(xw["path"]), "shown": xw["path"], "unit_id": xw["unit_id"],
-                            "feature_id": xw["feature_id"]}
+                            "feature_id": xw["feature_id"], "union": bool(xw.get("union", False))}
     if out.get("credit") is not None and not isinstance(out["credit"], str):
         raise ValueError(f"{shown}: boundaries.credit must be a string")
     return out
 
 
+GEOGRAPHIC_CRS = {"EPSG:4326", "urn:ogc:def:crs:EPSG::4326", "urn:ogc:def:crs:OGC:1.3:CRS84", "OGC:CRS84", "CRS84",
+                  "urn:ogc:def:crs:OGC::CRS84"}
+
+
 def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
-    """Polygons per unit from a GeoJSON FeatureCollection (Polygon and MultiPolygon exterior rings; json and numpy
-    only), matched to the units through the crosswalk or directly by the feature property. Fail closed on a malformed
-    file. Returns {units: {id: [ring]}, context: [ring], unmatched: [ids], outline: [segment], features}."""
+    """Polygons per unit from a GeoJSON FeatureCollection in geographic coordinates (EPSG:4326 / CRS84; Polygon and
+    MultiPolygon exterior rings; json and numpy only), matched to the units through the crosswalk or directly by the
+    feature property. Fail closed: a malformed file, a projected CRS, coordinates outside the geographic range, a
+    feature id used by two features, and an ambiguous crosswalk (a unit mapped to two features without
+    `union: true`, or a feature mapped to two units) raise ValueError naming every affected id. A feature with no
+    polygon leaves its unit unmatched. Returns {units: {id: [ring]}, context, unmatched, outline, features,
+    context_features, files: [{path, sha256, kind}]}."""
     import numpy as np
+    from toolkit.analysis.artifacts import sha256
     shown = cfg["shown"]
     try:
         doc = json.load(open(cfg["path"], encoding="utf-8"))
@@ -1043,7 +1085,11 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
     feats = doc.get("features") if isinstance(doc, dict) else None
     if not isinstance(feats, list) or not feats:
         raise ValueError(f"{shown}: not a GeoJSON FeatureCollection with features")
-    by_fid = {}
+    crs = ((doc.get("crs") or {}).get("properties") or {}).get("name") if isinstance(doc.get("crs"), dict) else None
+    if doc.get("crs") is not None and crs not in GEOGRAPHIC_CRS:
+        raise ValueError(f"{shown}: CRS {crs or doc.get('crs')!r} is not geographic (EPSG:4326 / CRS84 only); "
+                         "reproject the file")
+    by_fid, dup, empty = {}, set(), set()
     for k, f in enumerate(feats):
         g = f.get("geometry") if isinstance(f, dict) else None
         props = f.get("properties") if isinstance(f, dict) else None
@@ -1063,9 +1109,21 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
                 raise ValueError(f"{shown}: feature {k} has malformed coordinates") from e
             if ring.ndim != 2 or len(ring) < 3 or not np.isfinite(ring).all():
                 raise ValueError(f"{shown}: feature {k} has malformed coordinates")
+            if (np.abs(ring[:, 0]) > 180).any() or (np.abs(ring[:, 1]) > 90).any():
+                raise ValueError(f"{shown}: feature {k} has coordinates outside the geographic range (longitude "
+                                 "within ±180, latitude within ±90): a projected file? Reproject to EPSG:4326")
             rings.append(ring)
-        by_fid.setdefault(str(props[cfg["feature_id"]]), []).extend(rings)
-    xw = None
+        fid = str(props[cfg["feature_id"]])
+        if fid in by_fid or fid in empty:
+            dup.add(fid)
+        if rings:
+            by_fid[fid] = rings
+        else:
+            empty.add(fid)
+    if dup:
+        raise ValueError(f"{shown}: feature id {cfg['feature_id']} is not unique: {sorted(dup)[:20]}")
+    files = [{"path": cfg["path"], "sha256": sha256(cfg["path"]), "kind": "boundaries"}]
+    targets = {}
     if cfg.get("crosswalk"):
         c = cfg["crosswalk"]
         try:
@@ -1075,15 +1133,37 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
             raise ValueError(f"{c['shown']}: unreadable crosswalk: {e}") from e
         if not rows or c["unit_id"] not in rows[0] or c["feature_id"] not in rows[0]:
             raise ValueError(f"{c['shown']}: the crosswalk needs columns {c['unit_id']} and {c['feature_id']}")
-        xw = {str(r[c["unit_id"]]): str(r[c["feature_id"]]) for r in rows if r.get(c["feature_id"])}
+        for r in rows:
+            if r.get(c["feature_id"]):
+                tl = targets.setdefault(str(r[c["unit_id"]]), [])
+                if str(r[c["feature_id"]]) not in tl:
+                    tl.append(str(r[c["feature_id"]]))
+        files.append({"path": c["path"], "sha256": sha256(c["path"]), "kind": "crosswalk"})
+        multi = sorted(u for u, fl in targets.items() if len(fl) > 1)
+        if multi and not c.get("union"):
+            raise ValueError(f"{c['shown']}: {len(multi)} units map to more than one feature: {multi[:20]}; declare "
+                             "crosswalk.union: true to draw each such unit as the union of its features")
+    else:
+        targets = {i: [i] for i in unit_ids}
+    users = {}
+    for u, fl in targets.items():
+        if u in set(unit_ids):
+            for fid in fl:
+                users.setdefault(fid, []).append(u)
+    shared = {fid: us for fid, us in users.items() if len(us) > 1}
+    if shared:
+        aff = sorted({u for us in shared.values() for u in us})
+        raise ValueError(f"{(cfg.get('crosswalk') or {}).get('shown', shown)}: {len(shared)} features map to more than "
+                         f"one unit (units {aff[:20]}); each feature may belong to one unit")
     units, unmatched, used = {}, [], set()
     for i in unit_ids:
-        fid = xw.get(i) if xw is not None else i
-        if fid is not None and fid in by_fid:
-            units[i] = by_fid[fid]
-            used.add(fid)
+        fl = [fid for fid in targets.get(i, []) if fid in by_fid]
+        if fl and len(fl) == len(targets.get(i, [])):
+            units[i] = [r for fid in fl for r in by_fid[fid]]
+            used.update(fl)
         else:
             unmatched.append(i)
+            used.update(fid for fid in targets.get(i, []) if fid in by_fid)
     context = [r for fid, rs in by_fid.items() if fid not in used for r in rs]
     # region outlines: polygon edges not shared with another unit of the same region
     seg_n = {}
@@ -1096,7 +1176,7 @@ def load_boundaries(cfg: dict, unit_ids: list[str], region_of) -> dict:
                 seg_n[key] = seg_n.get(key, 0) + 1
     outline = [list(k[1]) for k, n in seg_n.items() if n == 1]
     return {"units": units, "context": context, "unmatched": unmatched, "outline": outline,
-            "features": len(feats), "context_features": sum(1 for fid in by_fid if fid not in used)}
+            "features": len(feats), "context_features": sum(1 for fid in by_fid if fid not in used), "files": files}
 
 
 def _map_extra(R, layout: str) -> dict:
@@ -1110,6 +1190,31 @@ def _map_extra(R, layout: str) -> dict:
                                                                       else "") + "." if um else "")
     return {"layout": "boundaries", "unmatched": list(um), "credit": cfg.get("credit"),
             "context_features": B["context_features"], "caption_note": note}
+
+
+def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, labels_overlay: dict | None = None,
+            theme: str = "light") -> dict:
+    """The headline with its interval, and the component and package counts, side by side across runs of one project
+    (same units, components and objective outcome; each run's deliverable kind must declare the comparison; anything
+    else is refused). Packages are matched by their component sets; spec differences that bear on the headline are
+    named in the caption. The output dir must lie outside every source run; the figure's provenance lists every
+    run's sources, the presentation files and the tier."""
+    if len(run_dirs) < 2:
+        raise ValueError("compare needs at least two run dirs")
+    if len(run_dirs) > FS.MAX_CATEGORIES:
+        raise ValueError(f"compare takes at most {FS.MAX_CATEGORIES} runs")
+    od = os.path.realpath(out_dir)
+    for d in run_dirs:
+        rd = os.path.realpath(d)
+        if os.path.commonpath([od, rd]) == rd:
+            raise ValueError(f"--out {out_dir} is inside the source run {d}; write the comparison elsewhere")
+    t = FS.setup(theme)
+    Rs = [RunData(d, labels_overlay) for d in run_dirs]
+    for R in Rs:
+        kind = deliverable_kind(R.spec)
+        if not kind or "comparison" not in DECISION_SETS.get(kind, ()):
+            raise ValueError(f"{R.dir}: deliverable kind {kind} declares no comparison figure (DECISION_SETS)")
+    return _compare_draw(Rs, run_dirs, out_dir, names, t)
 
 
 def fig_headline(R, t):
@@ -1727,7 +1832,6 @@ def fig_sensitivity(R, t):
                     "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share, "threshold": thr,
                     "basis": r.get("basis"), "by": by})
     out.sort(key=lambda x: -max(abs(x["d_low"]), abs(x["d_high"])))
-    out = out[:14]
     fig = _fig(t, 7.8, 0.46 * len(out) + 1.45)
     h = fig.get_figheight()
     ax = fig.add_axes([0.33, 0.85 / h, 0.45, _top(fig, 0.55) - 0.85 / h])
@@ -1890,6 +1994,32 @@ def _frontier_xy(fr: dict, primary: str) -> tuple[list, list]:
     return [float(p["envelope_usd"]) for p in pts], [float(p["averted"][primary]) for p in pts]
 
 
+def _window_mean(t, v, w0: float, w1: float, step: float = 1 / 12, end: float | None = None) -> float:
+    """Mean of a step series over the half-open window [w0, w1), each step weighted by its overlap."""
+    from toolkit.engines.hooks import window_mean
+    return window_mean(t, v, w0, w1, end=end, step=step)
+
+
+def presentation_findings(run_dir: str, sidecar: dict) -> list[str]:
+    """Files of a figure's presentation record (labels, boundaries, crosswalk) that changed since it was drawn: a
+    path relative to the run dir or absolute; a missing or changed file is a finding (the contract check reads these
+    beside the source hashes)."""
+    from toolkit.analysis.artifacts import sha256
+    out = []
+    for e in (sidecar or {}).get("presentation") or []:
+        if not isinstance(e, dict) or not e.get("path"):
+            out.append(f"malformed presentation record {e!r}")
+            continue
+        pth = os.path.expanduser(str(e["path"]))
+        pth = pth if os.path.isabs(pth) else os.path.join(run_dir, pth)
+        got = sha256(pth)
+        if got is None:
+            out.append(f"{e['path']} ({e.get('kind', 'presentation')}) is missing")
+        elif got != e.get("sha256"):
+            out.append(f"{e['path']} ({e.get('kind', 'presentation')}) changed after the figure was drawn")
+    return out
+
+
 FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attributes, "parameters": fig_parameters,
          "design_coverage": fig_design_coverage, "burn_in": fig_burn_in, "seasonality": fig_seasonality,
          "stochastic_noise": fig_stochastic_noise, "decision_tests": fig_decision_tests, "comparison": fig_comparison,
@@ -1951,9 +2081,11 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
     tiers = tiers_for(R.spec)
     names = [n for k in ("data_model", "simulation", "decision") for n in tiers[k]]
     if not tiers["decision"] and (not only or any(TIER_OF.get(n) == "decision" for n in only)):
+        kind = deliverable_kind(R.spec)
         notp.append({"figure": "decision_figures", "tier": "decision",
-                     "reason": f"no decision figure set declared for kind {deliverable_kind(R.spec)} "
-                               f"(toolkit/analysis/figures.py DECISION_SETS)"})
+                     "reason": (f"no decision figure set declared for kind {kind} (toolkit/analysis/figures.py "
+                                f"DECISION_SETS)" if kind else "the spec declares no deliverable.kind; decision "
+                                "figures are chosen by it (DECISION_SETS), with no default")})
     for name in [n for n in names if not only or n in only]:
         R.used = []
         try:
@@ -1971,7 +2103,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         clean = _offset_free(fig)
         sources = list(R.used) + (["decision_spec.yaml", os.path.relpath(os.path.join(run_dir, R.spec["decision_units"]["csv"]), run_dir)])
         sources = [s for s in sources if os.path.exists(os.path.join(run_dir, s))]
-        files = _save(fig, dest, name, run_dir, sources, harness, t, R.pres["files"])
+        files = _save(fig, dest, name, run_dir, sources, harness, t, R.presentation_record())
         table = os.path.join(dest, f"{name}.csv")
         _write_csv(table, rows)
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
@@ -1981,7 +2113,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
                           "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
                           "theme": theme, "tier": TIER_OF[name],
                           "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
-                          "presentation": R.pres["files"]}, **extra))
+                          "presentation": R.presentation_record()}, **extra))
     res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
            "groups": {"decision": list(tiers_for(R.spec)["decision"]),
                       "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
@@ -2003,17 +2135,8 @@ def _run_name(d):
     return os.path.basename(os.path.dirname(os.path.normpath(d))) if b[:4].isdigit() else b
 
 
-def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, labels_overlay: dict | None = None,
-            theme: str = "light") -> dict:
-    """The headline with its interval, and the component and package counts, side by side across runs of one project
-    (same units, components and objective outcome; anything else is refused). Packages are matched by their
-    component sets, not their names; spec differences that bear on the headline are named in the caption."""
-    if len(run_dirs) < 2:
-        raise ValueError("compare needs at least two run dirs")
-    if len(run_dirs) > FS.MAX_CATEGORIES:
-        raise ValueError(f"compare takes at most {FS.MAX_CATEGORIES} runs")
-    t = FS.setup(theme)
-    Rs = [RunData(d, labels_overlay) for d in run_dirs]
+def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
+    """compare()'s figure, table, index and provenance (the checks are in compare)."""
     names = names or [_run_name(d) for d in run_dirs]
     if len(names) != len(Rs):
         raise ValueError("give one name per run")
@@ -2100,6 +2223,19 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
     import matplotlib.pyplot as plt
     plt.close(fig)
     _write_csv(os.path.join(out_dir, "comparison.csv"), rows)
+    # provenance: every run's sources (absolute: the runs differ), the presentation files, the tier
+    fv = _fv()
+    srcs = [os.path.join(R.dir, rel) for R in Rs for rel in ("decision_spec.yaml", os.path.join("analysis", "point.yaml"),
+                                                             os.path.join("analysis", "uncertainty.yaml"))
+            if os.path.exists(os.path.join(R.dir, rel))]
+    fv.validate_figure(png, source_data_paths=srcs)
+    sp = png + ".provenance.json"
+    sc = json.load(open(sp))
+    pres = [dict(e, run=R.dir) for R in Rs for e in R.presentation_record()]
+    sc.update(produced_by="harness_compare", producer=PRODUCER, tier="decision", runs=[R.dir for R in Rs],
+              presentation=pres, paths_relative_to="absolute")
+    with open(sp, "w") as f:
+        json.dump(sc, f, indent=2, sort_keys=True)
     cap = (f"Each run's point plan: headline with its {lvl_txt} UI over that run's declared sources, and its units per "
            f"component and per package (packages matched by their components)."
            + (" The package definitions differ between the runs; packages are matched by their components."
@@ -2108,7 +2244,8 @@ def compare(run_dirs: list[str], out_dir: str, names: list[str] | None = None, l
               " The specs agree on window, envelope, comparator, sources and package definitions."))
     entry = {"figure": "comparison", "path": png, "svg": svg, "table": os.path.join(out_dir, "comparison.csv"),
              "title": title, "caption": cap, "runs": [os.path.abspath(d) for d in run_dirs], "names": names,
-             "spec_differences": diffs, "offset_free": clean, "group": "decision"}
+             "spec_differences": diffs, "offset_free": clean, "group": "decision", "tier": "decision",
+             "provenance": sp, "presentation": pres}
     import yaml
     with open(os.path.join(out_dir, "figures.yaml"), "w") as f:
         yaml.safe_dump({"producer": PRODUCER, "figures": [entry], "not_produced": []}, f, sort_keys=False, width=120)
@@ -2680,6 +2817,118 @@ def _self_test() -> int:
             ok(False, "BD3 a malformed boundary file fails closed")
         except ValueError as e:
             ok("b.geojson" in str(e), f"BD3 a malformed boundary file fails closed: {e}")
+        # ---------------- Codex r2
+        def bnd_run(name, xw_rows=None, feats=None, crs=None, union=False):
+            dd = toy_run(os.path.join(base, name))
+            geo(dd, uids)
+            if feats is not None or crs is not None:
+                g = json.load(open(os.path.join(dd, "b.geojson")))
+                if feats is not None:
+                    feats(g["features"])
+                if crs is not None:
+                    g["crs"] = {"type": "name", "properties": {"name": crs}}
+                json.dump(g, open(os.path.join(dd, "b.geojson"), "w"))
+            bd = {"path": "b.geojson", "feature_id": "code"}
+            if xw_rows is not None:
+                with open(os.path.join(dd, "xw.csv"), "w") as fh:
+                    fh.write("uid,code\n" + "".join(f"{u},{c}\n" for u, c in xw_rows))
+                bd["crosswalk"] = dict({"path": "xw.csv", "unit_id": "uid", "feature_id": "code"},
+                                       **({"union": True} if union else {}))
+            pr = yaml.safe_load(open(os.path.join(dd, "presentation.yaml")))
+            pr["boundaries"] = bd
+            yaml.safe_dump(pr, open(os.path.join(dd, "presentation.yaml"), "w"))
+            return dd
+        base_rows = [(u, f"S-{u}") for u in uids]
+        for label, rows, needle in (
+                ("BD4 a unit mapped to two features is refused, naming the unit (P1-1)",
+                 base_rows + [("u1", "S-u2")], "u1"),
+                ("BD4b two units mapped to one feature are refused, naming both (P1-1)",
+                 [r for r in base_rows if r[0] != "u2"] + [("u2", "S-u1")], "u2")):
+            dd = bnd_run("bx" + label[2:4].strip(), rows)
+            try:
+                render(dd, os.path.join(base, "bx" + label[:4].strip()), only=["burden_map"])
+                ok(False, label)
+            except ValueError as e:
+                ok(needle in str(e) and "u1" in str(e), f"{label}: {e}")
+        dd = bnd_run("bxu", [r for r in base_rows if r[0] != "u2"] + [("u1", "S-u2")], union=True)
+        eu, why = one(dd, "burden_map", "bxu_o")
+        ok(eu and "u2" in eu.get("unmatched", []) and "u1" not in eu.get("unmatched", []),
+           f"BD4c a declared union draws both features for the unit: {eu and eu.get('unmatched')} {why}")
+        dd = bnd_run("bxe", base_rows, feats=lambda fs: fs[3].update(geometry={"type": "MultiPolygon",
+                                                                              "coordinates": []}))
+        ee, why = one(dd, "burden_map", "bxe_o")
+        ok(ee and "u3" in ee.get("unmatched", []), f"BD5 a unit whose feature is an empty MultiPolygon is unmatched: "
+                                                 f"{ee and ee.get('unmatched')} {why}")
+        for label, kw, needle in (("BD6 a projected CRS is refused (P2-9)", {"crs": "EPSG:3857"}, "CRS"),
+                                  ("BD6b coordinates outside the geographic range are refused",
+                                   {"feats": lambda fs: fs[0]["geometry"].update(coordinates=[[[5e5, 4e6], [5e5 + 1, 4e6],
+                                                                                              [5e5 + 1, 4e6 + 1],
+                                                                                              [5e5, 4e6]]],
+                                                                                 type="Polygon")}, "geographic")):
+            dd = bnd_run("bxc" + label[3:5].strip(), base_rows, **kw)
+            try:
+                render(dd, os.path.join(base, "bxc_o" + label[3:5].strip()), only=["burden_map"])
+                ok(False, label)
+            except ValueError as e:
+                ok(needle in str(e), f"{label}: {e}")
+        dd = bnd_run("bxg", base_rows, crs="urn:ogc:def:crs:OGC:1.3:CRS84")
+        eg, why = one(dd, "burden_map", "bxg_o")
+        ok(eg is not None, f"BD6c CRS84 is accepted: {why}")
+        # P1-5: every tested range is kept; a plan-changing range is never dropped
+        dr = toy_run(os.path.join(base, "runr"))
+
+        def many(x):
+            x["rows"] = [{"name": f"q{k:02d}", "kind": "parameter", "basis": "declared prior range", "point": 1.0,
+                          "low": {"value": 0.9, "point_plan_objective": 1.234e7 - (16 - k) * 1e5,
+                                  "share_units_changed": 0.5 if k == 15 else 0.0},
+                          "high": {"value": 1.1, "point_plan_objective": 1.234e7 + (16 - k) * 1e5,
+                                   "share_units_changed": 0.0}} for k in range(16)]
+        edit(dr, "sensitivity", many)
+        er, _ = one(dr, "sensitivity", "r1")
+        srows = list(csv.DictReader(open(er["table"]))) if er else []
+        ok(len(srows) == 16 and {r["name"]: r["changes_plan"] for r in srows}.get("q15") == "True",
+           f"F28 all 16 ranges are kept, including the only plan-changing one with the smallest effect: {len(srows)}")
+        # P2-6: an explicit deliverable kind is required, and compare() applies the gate
+        dk2 = toy_run(os.path.join(base, "runk2"))
+        spk2 = yaml.safe_load(open(os.path.join(dk2, "decision_spec.yaml")))
+        spk2["deliverable"].pop("kind", None)
+        yaml.safe_dump(spk2, open(os.path.join(dk2, "decision_spec.yaml"), "w"), sort_keys=False)
+        rk2 = render(dk2, os.path.join(base, "k2o"))
+        nk2 = [x for x in rk2["not_produced"] if x["tier"] == "decision"]
+        ok(not [f for f in rk2["figures"] if f["tier"] == "decision"] and nk2
+           and "deliverable.kind" in nk2[0]["reason"],
+           f"F29 a spec without deliverable.kind gets no decision figures and says why: {nk2[:1]}")
+        try:
+            compare([du, du], os.path.join(base, "cmpu"))
+            ok(False, "F30 compare refuses a kind with no declared comparison")
+        except ValueError as e:
+            ok("threshold_rule" in str(e), f"F30 compare refuses a kind with no declared comparison: {e}")
+        try:
+            compare([d, d4], os.path.join(d4, "analysis", "cmp"))
+            ok(False, "F33 compare refuses an output dir inside a source run (P2-14)")
+        except ValueError as e:
+            ok("inside" in str(e), f"F33 compare refuses an output dir inside a source run: {e}")
+        # P2-15: the comparison carries provenance from every run, the presentation record and the tier
+        scc = json.load(open(os.path.join(outc, "comparison.png.provenance.json"))) \
+            if os.path.exists(os.path.join(outc, "comparison.png.provenance.json")) else {}
+        srcs = list((scc.get("source_hashes") or {}))
+        ok(any(os.path.join("run1", "analysis", "point.yaml") in x for x in srcs)
+           and any(os.path.join("run4", "analysis", "point.yaml") in x for x in srcs)
+           and scc.get("tier") == "decision" and scc.get("presentation") is not None,
+           f"F34 the comparison's provenance lists every run's sources, the presentation files and the tier: {srcs[:4]}")
+        # P2-7: the presentation, boundary and crosswalk files are in each figure's checked provenance
+        scb = json.load(open(os.path.join(base, "bmap", "burden_map.png.provenance.json")))
+        kinds_b = {x.get("kind") for x in scb.get("presentation") or []}
+        ok(kinds_b >= {"presentation", "boundaries", "crosswalk"},
+           f"F31 map provenance records the presentation, boundary and crosswalk files: {kinds_b}")
+        open(os.path.join(db, "xw.csv"), "a").write("\n")
+        ok(presentation_findings(db, scb) and any("xw.csv" in f for f in presentation_findings(db, scb)),
+           "F31b a changed crosswalk is found when the figure's provenance is checked")
+        # P2-12: a window mean over monthly steps uses the half-open window and weights partial steps
+        tg = [k / 12 for k in range(24)]
+        vg = [float(k) for k in range(24)]
+        wm = _window_mean(tg, vg, 0.125, 0.375)        # 1.5 to 4.5 months: half of step 1, steps 2-3, half of step 4
+        ok(abs(wm - (0.5 * 1 + 2 + 3 + 0.5 * 4) / 3.0) < 1e-9, f"F32 the window mean weights partial steps: {wm}")
         # design: decision figures and modeller diagnostics are grouped in figures.yaml
         idx = yaml.safe_load(open(os.path.join(out, "figures.yaml")))
         grp = idx.get("groups") or {}

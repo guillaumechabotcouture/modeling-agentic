@@ -429,12 +429,13 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
     if derived is not None:
         spec.derived = derived
     try:
+        pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
-                        "cannot be checked)"]
-            return _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
-        return _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
+                        "cannot be checked)"] + pres
+            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
+        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
 
@@ -775,10 +776,16 @@ def _validate(s: Spec) -> list[str]:
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
-    if "presentation" in r:
-        bad.append("presentation: display labels are not part of the signed spec; put them in presentation.yaml "
-                   "beside the spec (unsigned, read only by the figures) or pass --labels to the figure renderer")
     return bad
+
+
+def presentation_refusal(raw: dict) -> list[str]:
+    """Display labels are never part of the signed spec (owner, 2026-11-02): a presentation block is refused on
+    every validation path."""
+    if isinstance(raw, dict) and "presentation" in raw:
+        return ["presentation: display labels are not part of the signed spec; put them in presentation.yaml beside "
+                "the spec (unsigned, read only by the figures) or pass --labels to the figure renderer"]
+    return []
 
 
 PRESENTATION_LABELS = ("components", "parameters", "outcomes", "metrics")
@@ -1170,6 +1177,14 @@ def _self_test() -> int:
         # owner 2026-11-02: display labels are not part of the signed spec (an unsigned presentation.yaml instead)
         bad(lambda r: r.update(presentation={"labels": {"components": {"a": "Service A"}}}), "presentation.yaml",
             "SP-P1 a presentation block in the signed spec is refused, with a pointer to the presentation file")
+        # Codex r2 P1-3: the refusal also holds for engine: auto before the choice (the sign-off path)
+        r_pend = copy.deepcopy(s.raw)
+        r_pend["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        r_pend["presentation"] = {"labels": {"components": {"a": "Service A"}}}
+        sp_pend = Spec(r_pend, d)
+        errs_pend = validate(sp_pend, pending_ok=True)
+        ok(sp_pend.engine_pending and any("presentation.yaml" in e for e in errs_pend),
+           f"SP-P5 a presentation block is refused at sign-off too (engine pending): {errs_pend[:3]}")
         eng = s.engine()
         pn, card = {p.name for p in eng.parameters()}, eng.describe()
         lab_ok = {"components": {"a": "Service A"}, "parameters": {"eff_a": "Effect of A"}, "outcomes": {"dalys": "DALYs"},
