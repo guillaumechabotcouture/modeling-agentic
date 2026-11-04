@@ -39,7 +39,10 @@ class ToySpecEngine(ToyScheduleEngine):
     by the model). `log`: every run, schedule and run_series call appends the resolved base, k and synergy as a JSON
     line to calls.<pid>.jsonl under the root the self-test registered (enable_for_test; its workers get it from their
     pool initializer), through lib.safe_io with that directory as the trusted root. No path comes from the
-    configuration or the environment."""
+    configuration or the environment. Its benchmark ids (fit targets TF1, TF2; held out TH1, TH2) are in
+    toy_engines_pack.yaml beside this file (engine_parameters.benchmark_pack)."""
+
+    BENCHMARK_PACK = "toy_engines_pack.yaml"
 
     def __init__(self, results_path: str | None = None, log: bool = False):
         super().__init__(results_path)

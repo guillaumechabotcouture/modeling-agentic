@@ -14,6 +14,9 @@ choice the owner signs, not an engine change and not a fit:
         units: days                      # optional; must equal the engine card's units
         source: "<where the value comes from>"
         reason: "<why this run uses it>"
+        basis: literature | setting_data | owner_judgement | fitted    # required: how the value was chosen
+        fitted_to: [<benchmark id>, ...]  # required with basis: fitted, refused otherwise: the fit targets of the
+                                         # engine's own benchmark pack that the value was chosen with
         outside_card_range: true         # required when the value (or its range) lies outside the
                                          # engine card's range; refused when it does not
         range: [lo, hi]                  # optional: the uncertainty draws vary it over this range
@@ -23,6 +26,13 @@ Rules (every check names the entry it failed):
   - the parameter is on the engine card, of kind `fixed` or `scenario`; fitted and calibrated
     values come from fitting and are refused; a unit attribute is bound in decision_units;
   - source and reason are required;
+  - basis is required (missing or unknown: refused). `fitted` needs `fitted_to`, a list of benchmark ids of the
+    engine's own benchmark pack (benchmark_pack(): the pack beside the engine's code, never named by the spec).
+    An id that is not in the pack is refused; an id the pack holds out (every benchmark not in its fit targets,
+    toolkit/engines/benchmark.py fit_targets) is refused, and no flag, owner or lead sign-off accepts it: a value
+    chosen with a held-out benchmark leaves that benchmark nothing to test;
+  - backstop (not the main check): a source or reason that names a held-out benchmark id of the engine's pack
+    (word-boundary match against the pack's own ids) is refused the same way, whatever the basis says;
   - the card's range is the parameter's own `lo`/`hi`, else its engine-card prior's range. A
     value outside it needs `outside_card_range: true`; the sign-off sheet, results.md and the
     report then show it as a HIGH note;
@@ -64,7 +74,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 FIELD = "engine_parameters"
-KEYS = ("value", "units", "source", "reason", "outside_card_range", "range", "dist", "verified")
+KEYS = ("value", "units", "source", "reason", "basis", "fitted_to", "outside_card_range", "range", "dist", "verified")
+BASES = ("literature", "setting_data", "owner_judgement", "fitted")   # how the value was chosen (required)
+HELD_OUT_REFUSED = "held-out benchmark"      # every refusal of a value chosen with a held-out benchmark names this
 KINDS = ("fixed", "scenario")
 DISTS = ("uniform", "loguniform", "triangular")      # toolkit/spec/priors.py DISTS: bounded, so the design box spans them
 HELD = "held fixed at the spec value"
@@ -105,6 +117,7 @@ def _entry_shape(n, e) -> list[str]:
     for k, what in (("source", "where the value comes from"), ("reason", "why this run uses it")):
         if not str(e.get(k) or "").strip():
             bad.append(f"{w}: {k} ({what}) is empty")
+    bad += _basis_shape(w, e)
     if "outside_card_range" in e and not isinstance(e["outside_card_range"], bool):
         bad.append(f"{w}: outside_card_range is true or false")
     if "units" in e and not isinstance(e["units"], str):
@@ -119,6 +132,32 @@ def _entry_shape(n, e) -> list[str]:
             bad.append(f"{w}: a loguniform range must be positive")
     elif "dist" in e:
         bad.append(f"{w}: dist without range (give range [lo, hi], or drop dist: the value is then held fixed)")
+    return bad
+
+
+def _basis_shape(w: str, e: dict) -> list[str]:
+    """basis is one of BASES; fitted_to is a non-empty list of distinct ids with basis: fitted, absent otherwise."""
+    b, ft = e.get("basis"), e.get("fitted_to")
+    if not isinstance(b, str) or b not in BASES:
+        return [f"{w}: basis {'is missing' if b is None else repr(b) + ' is not known'} (one of {', '.join(BASES)}: "
+                "how the value was chosen)"]
+    if b != "fitted":
+        return [f"{w}: fitted_to is only for basis: fitted"] if "fitted_to" in e else []
+    if not (isinstance(ft, list) and ft and all(isinstance(x, str) and x.strip() for x in ft)
+            and len(set(ft)) == len(ft)):
+        return [f"{w}: basis: fitted needs fitted_to, a list of the benchmark ids the value was fitted to (fit "
+                "targets of the engine's benchmark pack)"]
+    return []
+
+
+def basis_problems(spec) -> list[str]:
+    """The basis checks alone (every entry; no engine needed)."""
+    bad = []
+    for n, e in declared(spec).items():
+        if isinstance(e, dict):
+            bad += _basis_shape(f"{FIELD}.{n}", e)
+        else:
+            bad.append(f"{FIELD}.{n}: a mapping {{value, source, reason, basis, ...}}")
     return bad
 
 
@@ -203,7 +242,256 @@ def problems(spec, engine) -> list[str]:
         elif flag and side is None:
             bad.append(f"{w}: outside_card_range is true but the value{' and its range lie' if rg else ' lies'} inside "
                        f"the card's range [{cr[0]:g}, {cr[1]:g}]")
+    return bad + held_out_problems(spec, engine)
+
+
+# ---- values chosen with a held-out benchmark (refused at sign-off; no flag or signer accepts them)
+PACK_DEFAULT = os.path.join("benchmarks", "pack.yaml")
+
+
+def _class_ref(cls) -> str:
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+class PackError(ValueError):
+    """The engine has a benchmark pack, but it cannot be read or does not have the shape the checks need: a spec with
+    engine parameter values is refused (fail closed), whatever their basis."""
+
+
+def benchmark_pack(engine_or_cls):
+    """(pack, path) of the engine's own benchmark pack, or (None, why) when the engine has none. The pack is the file
+    beside the engine's code: the class attribute BENCHMARK_PACK (a path relative to the class's module directory), else
+    benchmarks/pack.yaml there. Never from the spec or the engine's configuration, which an agent writes. A pack that
+    is unreadable, malformed (pack_ids) or names another class raises PackError."""
+    import inspect
+    import yaml
+    cls = engine_or_cls if isinstance(engine_or_cls, type) else type(engine_or_cls)
+    try:
+        here = os.path.dirname(os.path.abspath(inspect.getfile(cls)))
+    except (TypeError, OSError) as e:
+        return None, f"the code of {_class_ref(cls)} has no file ({e})"
+    path = os.path.join(here, getattr(cls, "BENCHMARK_PACK", None) or PACK_DEFAULT)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None, f"{_class_ref(cls)} has no benchmark pack"
+    except OSError as e:          # not absence: a pack that may exist cannot be reached (fail closed)
+        raise PackError(f"the benchmark pack of {_class_ref(cls)} cannot be reached: {e}") from None
+    try:
+        pack = yaml.safe_load(open(path, encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise PackError(f"the benchmark pack of {_class_ref(cls)} is unreadable: {e}") from None
+    if not isinstance(pack, dict) or pack.get("engine") != _class_ref(cls):
+        raise PackError(f"the benchmark pack beside {_class_ref(cls)} is for "
+                        f"{pack.get('engine') if isinstance(pack, dict) else 'no engine'}")
+    pack_ids(pack, _class_ref(cls))          # its shape, checked here so every caller fails closed
+    return pack, path
+
+
+def pack_ids(pack: dict, ref: str = "the engine") -> tuple[set, set]:
+    """(every benchmark id, the held-out ids): held out is every benchmark not in the pack's fit targets (`fit` steps'
+    and `fit_joint` targets, as toolkit/engines/benchmark.py fit_targets reads them). The pack's shape is checked, not
+    coerced: benchmarks a list of mappings with distinct non-empty text ids; fit targets lists of those ids. Else
+    PackError."""
+    why = f"the benchmark pack of {ref}"
+    bms = pack.get("benchmarks") if isinstance(pack, dict) else None
+    if not isinstance(bms, list) or not bms:
+        raise PackError(f"{why} lists no benchmarks")
+    ids = []
+    for b in bms:
+        if not (isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"].strip()):
+            raise PackError(f"{why}: every benchmark is a mapping with a text id ({str(b)[:60]})")
+        ids.append(b["id"])
+    if len(set(ids)) != len(ids):
+        raise PackError(f"{why}: benchmark ids repeat")
+
+    def targets(x, where):
+        if not (isinstance(x, list) and all(isinstance(t, str) for t in x)):
+            raise PackError(f"{why}: {where} targets must be a list of benchmark ids")
+        if set(x) - set(ids):
+            raise PackError(f"{why}: {where} targets name unknown benchmarks {sorted(set(x) - set(ids))}")
+        return set(x)
+    fit = set()
+    steps = pack.get("fit")
+    if steps is not None:
+        if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+            raise PackError(f"{why}: fit must be a list of steps")
+        for s in steps:
+            fit |= targets(s.get("targets"), "fit")
+    fj = pack.get("fit_joint")
+    if fj is not None:
+        if not isinstance(fj, dict):
+            raise PackError(f"{why}: fit_joint must be a mapping")
+        fit |= targets(fj.get("targets"), "fit_joint")
+    return set(ids), set(ids) - fit
+
+
+def _names(text: str, ident: str) -> bool:
+    """Whether `text` names the id `ident` as a word (case-insensitive; B7 is not named by B7b or AB7)."""
+    import re
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+
+
+def _pack_of(cls_or_engine, ref: str) -> tuple:
+    """(pack, why, error): error is a refusal (the pack exists but cannot be used), whatever the basis."""
+    try:
+        pack, why = benchmark_pack(cls_or_engine)
+        return pack, why, None
+    except PackError as e:
+        return None, str(e), (f"{FIELD}: {e}; the spec's engine parameter values cannot be checked against the held-out "
+                              f"benchmarks of {ref}")
+
+
+def _held_out_entry(w: str, e: dict, ref: str, pack, why) -> list[str]:
+    """The refusals of one entry against one engine's pack (pack None: the engine has none; `why` says so)."""
+    bad = []
+    if pack is None:
+        if e.get("basis") == "fitted":
+            bad.append(f"{w}: fitted_to cannot be resolved: {why}; a value fitted to benchmarks needs the engine's own "
+                       "pack to show they are fit targets, not held out")
+        return bad
+    ids, held = pack_ids(pack, ref)
+    if e.get("basis") == "fitted" and isinstance(e.get("fitted_to"), list):
+        for t in e["fitted_to"]:
+            if not isinstance(t, str):
+                continue
+            if t not in ids:
+                bad.append(f"{w}: fitted_to names {t}, not a benchmark of {ref}'s pack")
+            elif t in held:
+                bad.append(f"{w}: REFUSED: fitted_to names {t}, a {HELD_OUT_REFUSED} of {ref} (not one of the "
+                           "pack's fit targets). A value chosen with a held-out benchmark cannot be signed by the "
+                           "owner or the lead: the benchmark would no longer test the engine")
+    named = sorted(i for i in held if any(_names(str(e.get(k) or ""), i) for k in ("source", "reason")))
+    if named:
+        bad.append(f"{w}: REFUSED: its source or reason names {', '.join(named)}, {HELD_OUT_REFUSED}"
+                   f"{'s' if len(named) > 1 else ''} of {ref}. A value justified by a held-out benchmark cannot be "
+                   "signed by the owner or the lead (if the value does not come from it, say where it does come from)")
     return bad
+
+
+def held_out_problems(spec, engine) -> list[str]:
+    """The held-out refusals of every entry on this engine, an instance or its class (its own benchmark pack)."""
+    ents = {n: e for n, e in declared(spec).items() if isinstance(e, dict)}
+    if not ents:
+        return []
+    ref = _class_ref(engine if isinstance(engine, type) else type(engine))
+    pack, why, err = _pack_of(engine, ref)
+    if err:
+        return [err]
+    bad = []
+    for n, e in ents.items():
+        bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
+    return bad
+
+
+def _all_packs() -> tuple[list, list]:
+    """([(engine ref, pack)], [refusal]) for every pack under toolkit/engines/*/benchmarks/ (the fallback when no
+    engine is known). A pack that cannot be read or has the wrong shape is a refusal, never skipped."""
+    import yaml
+    out, errs = [], []
+    base = os.path.join(ROOT, "toolkit", "engines")
+    what = ("with no engine known, the spec's values cannot be checked against every engine's held-out benchmarks")
+    try:                          # explicit listing: a directory that cannot be read is a refusal, never skipped
+        subs = sorted(x.path for x in os.scandir(base) if x.is_dir(follow_symlinks=False))
+    except OSError as e:
+        return [], [f"{FIELD}: {os.path.relpath(base, ROOT)} cannot be listed ({e}); {what}"]
+    paths = []
+    for sub in subs:
+        p = os.path.join(sub, "benchmarks", "pack.yaml")
+        try:
+            os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            errs.append(f"{FIELD}: {os.path.relpath(p, ROOT)} cannot be reached ({e}); {what}")
+            continue
+        paths.append(p)
+    for p in paths:
+        rel = os.path.relpath(p, ROOT)
+        try:
+            pk = yaml.safe_load(open(p, encoding="utf-8"))
+            ref = str(pk.get("engine")) if isinstance(pk, dict) else rel
+            pack_ids(pk, ref)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, PackError) as e:
+            errs.append(f"{FIELD}: {rel} cannot be read as a benchmark pack ({e}); {what}")
+            continue
+        out.append((ref, pk))
+    return out, errs
+
+
+def _auto(eng) -> bool:
+    """Whether a backend may choose the engine after sign-off: no engine, "auto", or a mapping whose `auto` is truthy
+    (the broadest reading among toolkit/spec/schema.py and agents/analysis_backend.py, so no backend chooses an engine
+    the sign-off did not check)."""
+    return eng is None or eng == "auto" or (isinstance(eng, dict) and bool(eng.get("auto")))
+
+
+def _engine_conflict(r: dict) -> str | None:
+    """A declaration whose `auto` is not true or false, or that sets auto and a `ref`: a backend may then run another
+    engine than the one named, so the sign-off refuses instead of choosing."""
+    eng = r.get("engine")
+    if isinstance(eng, dict) and "auto" in eng and not isinstance(eng["auto"], bool):
+        return f"{FIELD}: the engine declaration's auto must be true or false (it is {eng['auto']!r})"
+    if isinstance(eng, dict) and _auto(eng) and eng.get("ref") is not None:
+        return (f"{FIELD}: the engine declaration sets both auto: true and ref; give one, so the values are checked "
+                "against the engines the run may use")
+    return None
+
+
+def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[str]:
+    """What blocks signing the spec's engine parameter values, whoever signs: each entry's basis, and the held-out
+    refusals against the pack of every engine the signed spec may run: its ref, else the candidates it lists. The
+    engines come from the spec alone (`candidates` and `run_dir` are accepted for the sheet's signature and not used:
+    engine_choice.json and the pre-sign rows are not part of what is signed). With no engine named, a fitted
+    entry is refused (it cannot be resolved) and the text backstop reads every engine pack in the repository. An
+    engine that does not load, a pack that cannot be used, or a contradictory engine declaration refuses too.
+    toolkit/spec/signoff.py sign, scripts/decision_brief.py sign and agents/stage_machine.py sign all refuse while
+    this is not empty."""
+    from toolkit.spec import schema
+    r = _raw(raw)
+    if r.get(FIELD) is None:
+        return []
+    if not isinstance(r[FIELD], dict):
+        return [f"{FIELD}: a mapping {{parameter: {{value, source, reason, basis, ...}}}}"]
+    bad = basis_problems(r)
+    conflict = _engine_conflict(r)
+    if conflict:
+        bad.append(conflict)
+    ents = {n: e for n, e in declared(r).items() if isinstance(e, dict)}
+    targets = []
+    eng = r.get("engine")
+    if _auto(eng):        # the candidates the signed spec lists; else every engine pack (a later choice is not signed)
+        refs = [c for c in (eng.get("candidates") if isinstance(eng, dict) else None) or [] if isinstance(c, str)]
+    else:
+        refs = [eng] if isinstance(eng, str) else [eng.get("ref")] if isinstance(eng, dict) else []
+        if not all(isinstance(x, str) and x for x in refs):
+            bad.append(f"{FIELD}: the engine declaration names no engine reference")
+            refs = []
+    for ref in refs:
+        try:
+            cls = schema.engine_class(ref)
+        except Exception as e:  # noqa: BLE001 -- fail closed: the values cannot be checked against its pack
+            bad.append(f"{FIELD}: engine {ref} does not load ({type(e).__name__}: {str(e)[:200]}), so its benchmark "
+                       "pack cannot be checked for the spec's values")
+            continue
+        pack, why, err = _pack_of(cls, ref)
+        if err:
+            bad.append(err)
+            continue
+        targets.append((ref, pack, why))
+    if not targets and not any("does not load" in b or "cannot be checked" in b for b in bad):
+        packs, errs = _all_packs()
+        bad += errs
+        targets = [(ref, pk, None) for ref, pk in packs]
+        for n, e in ents.items():
+            if e.get("basis") == "fitted":
+                bad.append(f"{FIELD}.{n}: fitted_to cannot be resolved before the engine is known (engine: auto, "
+                           "no candidate)")
+        ents = {n: dict(e, basis=None) for n, e in ents.items()}    # the text backstop only
+    for n, e in ents.items():
+        for ref, pack, why in targets:
+            bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
+    return list(dict.fromkeys(bad))
 
 
 def values(spec) -> dict:
@@ -503,7 +791,7 @@ def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[
     eng = raw.get("engine")
     if isinstance(eng, str) and eng != "auto":
         return [(eng, {"ref": eng})]
-    if isinstance(eng, dict) and eng.get("ref"):
+    if isinstance(eng, dict) and eng.get("ref") and not _auto(eng):    # auto wins, as in the schema and backends
         return [(eng["ref"], eng)]
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     rows_ = [r for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
@@ -554,7 +842,11 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
         rg = _range(e)
         unc = f"drawn over [{rg[0]:g}, {rg[1]:g}] ({e.get('dist')})" if rg else HELD
         val = _g(e["value"]) if _isnum(e.get("value")) else repr(e.get("value"))
-        out.append(f"- **{n}** = {val}{u}. Source: {e.get('source')}. Reason: {e.get('reason')}. Uncertainty: {unc}.")
+        basis = e.get("basis") if e.get("basis") in BASES else "missing"
+        fit = f" (fitted to {', '.join(map(str, e['fitted_to']))})" if basis == "fitted" and isinstance(
+            e.get("fitted_to"), list) else ""
+        out.append(f"- **{n}** = {val}{u}. Basis: {basis}{fit}. Source: {e.get('source')}. Reason: {e.get('reason')}. "
+                   f"Uncertainty: {unc}.")
         for ref, en in engines.items():
             if isinstance(en, Exception):
                 out.append(f"  - `{ref}`: card not loaded ({type(en).__name__}: {en})")
@@ -573,7 +865,11 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
                 high.append(f"- **HIGH**: {what} the card range of `{ref}` ({_g(cr[0])} to {_g(cr[1])}{u}; "
                             f"outside_card_range: {str(e.get('outside_card_range') is True).lower()}). Signing accepts "
                             "it; its source and reason are above.")
-    return out + ([""] + high if high else []) + [""]
+    refused = [f"- **REFUSED**: {x}" for x in signoff_refusals(raw, candidates, run_dir)]
+    if refused:
+        refused = ["", "Signing is refused while any of these stands; no sign-off, the owner's included, accepts it:"] \
+            + refused
+    return out + ([""] + high if high else []) + refused + [""]
 
 
 def _cli(argv) -> int:
@@ -650,7 +946,7 @@ def _self_test() -> int:
     # ------------------------------------------------------------ schema
     def schema_cases():
         with tempfile.TemporaryDirectory() as d:
-            good = {"value": 0.55, "source": SRC, "reason": WHY}
+            good = {"value": 0.55, "source": SRC, "reason": WHY, "basis": "owner_judgement"}
             r0 = toy_raw(d, base=dict(good))
             ok(schema.validate(schema.Spec(r0, d)) == [], f"EP1 a spec value with source and reason validates: "
                                                            f"{schema.validate(schema.Spec(r0, d))[:3]}")
@@ -665,8 +961,8 @@ def _self_test() -> int:
             bad({"x": dict(good)}, "unit attribute", "EP3 a unit attribute is refused, with where it is bound")
             bad({"eff_a": dict(good, value=0.5)}, "of kind fitted", "EP4a a fitted parameter is refused")
             bad({"c_rate": dict(good, value=1.0)}, "of kind calibrated", "EP4b a calibrated parameter is refused")
-            bad({"base": {"value": 0.55, "reason": WHY}}, "source", "EP5a a value without a source is refused")
-            bad({"base": {"value": 0.55, "source": SRC}}, "reason", "EP5b a value without a reason is refused")
+            bad({"base": {"value": 0.55, "reason": WHY, "basis": "owner_judgement"}}, "source", "EP5a a value without a source is refused")
+            bad({"base": {"value": 0.55, "source": SRC, "basis": "owner_judgement"}}, "reason", "EP5b a value without a reason is refused")
             bad({"base": dict(good, value=0.3)}, "outside_card_range",
                 "EP6a a value outside the card's range without the flag is refused")
             r = toy_raw(d, base=dict(good, value=0.3, outside_card_range=True))
@@ -706,7 +1002,7 @@ def _self_test() -> int:
                and "uncertainty range" in md and "base = 0.55 is outside" not in md,
                f"EP7j the report's HIGH note names the range that is outside, not the value: {md[-260:]!r}")
             # engine: auto. Shape checks at sign-off; each candidate checked against its own card
-            ra = toy_raw(d, base={"value": 0.55, "source": SRC})
+            ra = toy_raw(d, base={"value": 0.55, "source": SRC, "basis": "owner_judgement"})
             ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine",
                                                          "toolkit.engines.empirical.engine:PackageRateEngine"]}
             errs = schema.validate(schema.Spec(ra, d), pending_ok=True)
@@ -721,7 +1017,7 @@ def _self_test() -> int:
                and any(FIELD in e and "not an engine parameter" in e for e in e_bad),
                f"EP9b a candidate engine without the parameter is refused, one with it passes: {e_bad[:1]}")
         with tempfile.TemporaryDirectory() as d:
-            r = toy_raw(d, base={"value": 0.55, "source": SRC, "reason": WHY})
+            r = toy_raw(d, base={"value": 0.55, "source": SRC, "reason": WHY, "basis": "owner_judgement"})
             p = os.path.join(d, "decision_spec.yaml")
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
             yaml.safe_dump({FIELD: {"base": {"value": 0.45}}}, open(os.path.join(d, schema.SETTINGS), "w"))
@@ -761,7 +1057,7 @@ def _self_test() -> int:
             ok(dig(schema.Spec(re_, d)) == got["toy"] and EPm.params(schema.Spec(re_, d), {"a": 1.0}) == {"a": 1.0},
                "EP-H2 an empty field changes nothing")
             rk = copy.deepcopy(s.raw)
-            rk[FIELD] = {"k": {"value": 0.9, "source": SRC, "reason": WHY}}
+            rk[FIELD] = {"k": {"value": 0.9, "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             sk = schema.Spec(rk, d)
             dk, jk = Bt.design(sk)
             d0, j0 = Bt.design(s)
@@ -776,7 +1072,7 @@ def _self_test() -> int:
         from toolkit.analysis import batch as Bt
         with tempfile.TemporaryDirectory() as d:
             r = toy_raw(d, base={"value": 0.3, "range": [0.25, 0.35], "dist": "uniform", "outside_card_range": True,
-                                 "source": SRC, "reason": WHY})
+                                 "source": SRC, "reason": WHY, "basis": "owner_judgement"})
             r["uncertainty"]["excluded"].append({"kind": "priors", "reason": "owner: hold the priors for this test"})
             r["analysis"]["decision_tests"] = [{"id": "DTc", "type": "parameter_value", "parameter": "base",
                                                 "values": [0.5], "text": "Does the plan change at the card value?"}]
@@ -796,7 +1092,7 @@ def _self_test() -> int:
             bench, _v_ok, _v_bad = RUN._toy_bench(d)
             p = schema.toy_spec(d, n=24, bench=bench)
             r = yaml.safe_load(open(p))
-            r[FIELD] = {"synergy": {"value": 0.05, "source": SRC, "reason": WHY}}
+            r[FIELD] = {"synergy": {"value": 0.05, "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
             signoff.sign(d, "lead", note="self-test")
             R = RUN.run(d, log=q, compute_kw={"max_workers": 2})
@@ -993,10 +1289,10 @@ def _self_test() -> int:
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix="ma_toy_log_") as logs:
             TOYS.enable_for_test(logs)
             r = toy_raw(d,
-                        base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY},
-                        k={"value": 0.9, "source": SRC, "reason": WHY},
+                        base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY, "basis": "owner_judgement"},
+                        k={"value": 0.9, "source": SRC, "reason": WHY, "basis": "owner_judgement"},
                         synergy={"value": 0.05, "range": [0.0, 0.1], "dist": "uniform", "source": SRC,
-                                 "reason": WHY})
+                                 "reason": WHY, "basis": "owner_judgement"})
             r["analysis"]["decision_tests"] = [{"id": "DTc", "type": "parameter_value", "parameter": "base",
                                                 "values": [0.5], "finding": "decision_test:DTc",
                                                 "text": "Does the plan change at the engine card value?"}]
@@ -1088,7 +1384,7 @@ def _self_test() -> int:
             p = os.path.join(d, "decision_spec.yaml")
             r = yaml.safe_load(open(p))
             r["engine"]["ref"] = "toolkit.spec.toy_engines:ToySpecRateEngine"
-            r[FIELD] = {"scale": {"value": 1.25, "units": "multiplier", "source": SRC, "reason": WHY}}
+            r[FIELD] = {"scale": {"value": 1.25, "units": "multiplier", "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             r["analysis"]["decision_tests"].append({"id": "DTs", "type": "parameter_value", "parameter": "scale",
                                                     "values": [1.0], "text": "Does the plan change at the card value?"})
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
@@ -1107,6 +1403,200 @@ def _self_test() -> int:
             u = R["uncertainty"]
             ok("held fixed at the spec value: scale" in u["label"], f"EP25 the direct-path label: {u['label']}")
     guard("EP23-EP25 direct path", direct_cases)
+
+    # ------------------------------------------------------------ values chosen with a held-out benchmark (EP43-EP53)
+    # ToySpecEngine's pack (toolkit/spec/toy_engines_pack.yaml): fit targets TF1, TF2; held out TH1, TH2.
+    def held_out_cases():
+        with tempfile.TemporaryDirectory() as d:
+            def errs_of(**entries):
+                return [e for e in schema.validate(schema.Spec(toy_raw(d, **entries), d)) if FIELD in e]
+            base = {"value": 0.55, "source": SRC, "reason": WHY}
+            e = errs_of(base=dict(base, basis="fitted", fitted_to=["TF1", "TH1"]))
+            ok(len(e) == 1 and HELD_OUT_REFUSED in e[0] and "TH1" in e[0] and "TF1" not in e[0],
+               f"EP43 a value fitted to a held-out benchmark is refused (the fit target beside it is not): {e}")
+            e = errs_of(base=dict(base, basis="fitted", fitted_to=["TF1", "TF2"]))
+            ok(e == [], f"EP44 a value fitted to the pack's fit targets is allowed: {e}")
+            for b in ("literature", "setting_data", "owner_judgement"):
+                e = errs_of(base=dict(base, basis=b))
+                ok(e == [], f"EP45 basis {b} is allowed: {e}")
+            for label, ent in (("missing", dict(base)), ("unknown", dict(base, basis="benchmark_sweep")),
+                               ("not text", dict(base, basis=["fitted"]))):
+                e = errs_of(base=ent)
+                ok(any("basis" in x for x in e), f"EP46 a {label} basis is a finding: {e}")
+            e = errs_of(base=dict(base, basis="fitted", fitted_to=["TF9"]))
+            ok(len(e) == 1 and "TF9" in e[0] and "not a benchmark" in e[0], f"EP47 an unknown id is a finding: {e}")
+            for label, ent in (("no fitted_to", dict(base, basis="fitted")),
+                               ("empty fitted_to", dict(base, basis="fitted", fitted_to=[])),
+                               ("fitted_to not a list", dict(base, basis="fitted", fitted_to="TF1")),
+                               ("fitted_to without basis fitted", dict(base, basis="literature", fitted_to=["TF1"]))):
+                e = errs_of(base=ent)
+                ok(any("fitted_to" in x for x in e), f"EP48 {label} is a finding: {e}")
+            # the backstop: a held-out id named in the source or reason, whatever the basis says
+            for k, text in (("reason", "the value that puts TH1 in band"), ("source", "a sweep on th2 (the pack runner)"),
+                            ("reason", "TH1 and TH2 both in band")):
+                e = errs_of(base=dict(base, basis="owner_judgement", **{k: text}))
+                ok(len(e) == 1 and HELD_OUT_REFUSED in e[0], f"EP49 a held-out id in the {k} text is refused: {e}")
+            e = errs_of(base=dict(base, basis="literature", reason="as in TH1b and XTH1; fitted to TF1 elsewhere"))
+            ok(e == [], f"EP49b the text match is by word against the pack's ids (TH1b, XTH1 and a fit target pass): {e}")
+            # where it bites: the sheet shows the refusal; the signer refuses it for the owner and the lead
+            for by in ("owner", "lead"):
+                with tempfile.TemporaryDirectory() as d2:
+                    r = toy_raw(d2, base=dict(base, basis="fitted", fitted_to=["TH1"]))
+                    yaml.safe_dump(r, open(os.path.join(d2, "decision_spec.yaml"), "w"), sort_keys=False)
+                    md = signoff.sheet(d2)
+                    sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
+                    try:
+                        signoff.sign(d2, by, note="self-test")
+                        why = None
+                    except ValueError as x:
+                        why = str(x)
+                    ok(why is not None and HELD_OUT_REFUSED in why and signoff.status(d2) != "signed"
+                       and "**REFUSED**" in sec and "TH1" in sec and "Basis: fitted (fitted to TH1)" in sec,
+                       f"EP50 ({by}) the sheet shows the refusal and signoff.sign refuses it: {why}; {sec[-300:]!r}")
+            # engine: auto: each candidate's own pack; no engine known: a fitted value cannot be resolved, and the text
+            # backstop reads every engine pack in the repository
+            ra = toy_raw(d, base=dict(base, basis="fitted", fitted_to=["TH2"]))
+            ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine"]}
+            e = signoff_refusals(ra)
+            ok(any(HELD_OUT_REFUSED in x and "TH2" in x for x in e), f"EP51a engine: auto: the candidate's pack: {e}")
+            ra["engine"] = {"auto": True}
+            e = signoff_refusals(ra)
+            ok(any("before the engine is known" in x for x in e), f"EP51b no engine known: fitted is refused: {e}")
+            real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
+            if real:
+                hid = sorted(pack_ids(real[0][1])[1])[0]
+                ra[FIELD]["base"] = dict(base, basis="literature", reason=f"puts {hid} in band")
+                e = signoff_refusals(ra)
+                ok(any(HELD_OUT_REFUSED in x and hid in x for x in e),
+                   f"EP51c no engine known: a held-out id of any engine pack in the reason is refused: {e}")
+            else:
+                ok(False, "EP51c no engine pack with a held-out benchmark found under toolkit/engines")
+            # the pack is the engine's own: never named by the spec or the configuration, and it must name the class
+            pk, where = benchmark_pack(TOYS.ToySpecEngine(results_path=os.path.join(d, "elsewhere.yaml")))
+            ok(isinstance(pk, dict) and where.endswith("toy_engines_pack.yaml")
+               and pack_ids(pk) == ({"TF1", "TF2", "TH1", "TH2"}, {"TH1", "TH2"}),
+               f"EP52a the toy engine's pack comes from its code, not its configuration: {where}")
+            pk2, why2 = benchmark_pack(TOYS.ToySpecRateEngine)
+            ok(pk2 is None and "no benchmark pack" in why2, f"EP52b an engine without a pack has none: {why2}")
+            e = held_out_problems({FIELD: {"scale": dict(base, value=1.2, basis="fitted", fitted_to=["TF1"])}},
+                                  TOYS.ToySpecRateEngine)
+            ok(any("cannot be resolved" in x for x in e), f"EP52c fitted on an engine without a pack is refused: {e}")
+            # a real engine pack: every benchmark not in the fit targets is held out (read only)
+            # (review round 1, P2): independent of pack_ids: the raw yaml's ids and fit targets, and every pack found
+            import glob as _gl
+            from toolkit.engines import benchmark as BM
+            files = sorted(_gl.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "pack.yaml")))
+            packs, errs = _all_packs()
+            ok(len(packs) == len(files) >= 2 and not errs, f"EP53a every engine pack is read: {len(packs)} of "
+                                                           f"{len(files)}; {errs}")
+            for f in files:
+                pk = yaml.safe_load(open(f))
+                raw_ids = [b["id"] for b in pk["benchmarks"]]
+                fit = set(BM.fit_targets(pk))
+                ids, held = pack_ids(pk)
+                ok(ids == set(raw_ids) and len(raw_ids) == len(pk["benchmarks"]) > 0
+                   and held == set(raw_ids) - fit and fit <= ids,
+                   f"EP53b {pk['engine']}: ids are the pack's {len(raw_ids)} benchmarks; held out are the {len(held)} "
+                   f"not among its {len(fit)} fit targets")
+    guard("EP43-EP53 held-out benchmarks", held_out_cases)
+
+    # ------------------------------------------------------------ review round 1 (Codex): fail closed (EP54-EP57)
+    def held_out_fail_closed():
+        clean = {"value": 0.55, "source": SRC, "reason": "the value at which TH1 is in band", "basis": "owner_judgement"}
+        spec_raw = {FIELD: {"base": clean}}
+        with tempfile.TemporaryDirectory() as d:
+            got = {}
+            packs = {"unreadable": ":: [not yaml", "another engine": None,
+                     "benchmark not a mapping": {"benchmarks": ["TH1"]},
+                     "numeric id": {"benchmarks": [{"id": 7}], "fit_joint": {"targets": [7]}},
+                     "targets a mapping": {"benchmarks": [{"id": "TH1"}], "fit_joint": {"targets": {"TH1": "x"}}},
+                     "unknown target": {"benchmarks": [{"id": "TH1"}], "fit_joint": {"targets": ["TZ9"]}},
+                     "repeated id": {"benchmarks": [{"id": "TH1"}, {"id": "TH1"}]}}
+            for name, doc in packs.items():
+                path = os.path.join(d, name.replace(" ", "_") + ".yaml")
+                cls = type("PackProbe", (TOYS.ToySpecEngine,), {"BENCHMARK_PACK": path})
+                ref = f"{cls.__module__}:{cls.__qualname__}"
+                if isinstance(doc, dict):
+                    doc = yaml.safe_dump(dict(doc, engine=ref))
+                elif doc is None:
+                    doc = yaml.safe_dump({"engine": "toolkit.spec.toy_engines:ToySpecEngine",
+                                          "benchmarks": [{"id": "TH1"}]})
+                open(path, "w").write(doc)
+                e = held_out_problems(spec_raw, cls)
+                got[name] = bool(e) and all("cannot be checked" in x for x in e)
+            ok(all(got.values()), f"EP54 a pack that cannot be used refuses every value, whatever its basis "
+                                  f"(owner_judgement, text naming an id): {got}")
+            # EP55: auto: true with a ref checks the candidates (as the schema runs them), and the conflict is refused
+            ra = toy_raw(d, base=dict(clean))
+            ra["engine"] = {"auto": True, "ref": "toolkit.engines.contract:ToyEngine",
+                            "candidates": ["toolkit.spec.toy_engines:ToySpecEngine"]}
+            e = signoff_refusals(ra)
+            ok(any("both auto: true and ref" in x for x in e) and any(HELD_OUT_REFUSED in x and "TH1" in x for x in e),
+               f"EP55 auto with a ref: refused, and the candidate's pack is checked: {e}")
+            # EP56: with no engine known, an engine pack that cannot be read refuses instead of being skipped
+            ra["engine"] = {"auto": True}
+            ra[FIELD]["base"]["reason"] = "the owner's planning value"
+            fake = os.path.join(d, "fake_root")
+            os.makedirs(os.path.join(fake, "toolkit", "engines", "x", "benchmarks"))
+            open(os.path.join(fake, "toolkit", "engines", "x", "benchmarks", "pack.yaml"), "w").write(":: [")
+            real_root = EPm.ROOT
+            EPm.ROOT = fake
+            try:
+                e = EPm.signoff_refusals(ra)
+            finally:
+                EPm.ROOT = real_root
+            ok(any("cannot be read as a benchmark pack" in x for x in e), f"EP56 an unreadable pack is a refusal: {e}")
+            # EP57: an engine that does not load refuses a spec with the field
+            ra["engine"] = {"ref": "toolkit.engines.nowhere:Nothing"}
+            e = signoff_refusals(ra)
+            ok(any("does not load" in x for x in e), f"EP57 an engine that does not load refuses: {e}")
+    guard("EP54-EP57 held-out checks fail closed", held_out_fail_closed)
+
+    # ------------------------------------------------------------ review round 2 (Codex): EP58-EP60
+    def held_out_round2():
+        real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
+        hid = sorted(pack_ids(real[0][1])[1])[0]
+        ent = {"value": 0.55, "source": SRC, "reason": f"puts {hid} in band", "basis": "owner_judgement"}
+        with tempfile.TemporaryDirectory() as d:
+            # EP58: an engine choice outside the signed spec never narrows the check (it can change after signing)
+            json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}},
+                      open(os.path.join(d, "engine_choice.json"), "w"))
+            ra = toy_raw(d, base=dict(ent))
+            ra["engine"] = {"auto": True}
+            e = signoff_refusals(ra, run_dir=d)
+            ok(any(HELD_OUT_REFUSED in x and hid in x for x in e),
+               f"EP58 engine: auto with an engine_choice.json naming a packless engine still checks every pack: {e}")
+            # EP59: a pack that cannot be reached (not absent) refuses; so does an engines directory that cannot be listed
+            real_lstat, real_scandir = EPm.os.lstat, EPm.os.scandir
+
+            def lstat(p, *a, **k):
+                if str(p).endswith("toy_engines_pack.yaml") or str(p).endswith(os.path.join("benchmarks", "pack.yaml")):
+                    raise PermissionError(13, "denied", p)
+                return real_lstat(p, *a, **k)
+
+            def scandir(p, *a, **k):
+                raise PermissionError(13, "denied", p)
+            got = {}
+            EPm.os.lstat = lstat
+            try:
+                got["pack"] = EPm.held_out_problems({FIELD: {"base": dict(ent, reason="clean")}}, TOYS.ToySpecEngine)
+                got["fallback pack"] = EPm._all_packs()[1]
+            finally:
+                EPm.os.lstat = real_lstat
+            EPm.os.scandir = scandir
+            try:
+                got["listing"] = EPm._all_packs()[1]
+            finally:
+                EPm.os.scandir = real_scandir
+            ok(all(got.values()) and "cannot be reached" in got["pack"][0] and "cannot be listed" in got["listing"][0],
+               f"EP59 filesystem errors are refusals, not absence: {got}")
+            # EP60: a non-boolean auto is refused, and a truthy one is treated as auto (every pack checked), as the
+            # spike backend reads it
+            ra["engine"] = {"auto": 1, "ref": "toolkit.engines.contract:ToyEngine"}
+            e = signoff_refusals(ra)
+            ok(any("true or false" in x for x in e) and any(HELD_OUT_REFUSED in x and hid in x for x in e),
+               f"EP60 auto: 1 with a ref is refused and the held-out text is still checked: {e}")
+    guard("EP58-EP60 held-out checks, round 2", held_out_round2)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

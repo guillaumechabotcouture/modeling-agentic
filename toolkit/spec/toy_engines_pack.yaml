@@ -1,0 +1,11 @@
+# Self-test only: the benchmark ids of ToySpecEngine (toolkit/spec/toy_engines.py BENCHMARK_PACK). Read by
+# toolkit/spec/engine_parameters.py benchmark_pack() to resolve `fitted_to` and the held-out text backstop; it is not
+# a runnable pack (no settings or arms). Every benchmark not in fit_joint.targets is held out: TH1 and TH2.
+engine: toolkit.spec.toy_engines:ToySpecEngine
+benchmarks:
+  - {id: TF1, metric: "toy fit target one"}
+  - {id: TF2, metric: "toy fit target two"}
+  - {id: TH1, metric: "toy held-out benchmark one"}
+  - {id: TH2, metric: "toy held-out benchmark two"}
+fit_joint:
+  targets: [TF1, TF2]

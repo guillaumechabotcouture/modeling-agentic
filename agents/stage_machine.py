@@ -768,6 +768,12 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
+    # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
+    # toolkit/spec/signoff.py sign and scripts/decision_brief.py sign)
+    from toolkit.spec import engine_parameters as PV
+    held = PV.signoff_refusals(spec_doc if isinstance(spec_doc, dict) else {}, run_dir=run_dir)
+    if held:
+        raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
@@ -2505,6 +2511,34 @@ def _self_test_geometry(ok, td: str) -> None:
            f"IG-M6 the spike signer reads the spec once, then hashes and freezes that content ({len(opens)} opens)")
     except Exception as e:  # noqa: BLE001 -- before the shared fixture exists (step α)
         ok(False, f"IG-M6 the spike signer reads the spec once: {type(e).__name__}: {e}")
+    # IG-M7: the spike signer refuses a spec value justified by a held-out benchmark, or without a basis, for the owner
+    # too (toolkit/spec/engine_parameters.py signoff_refusals); the id is read from a real engine's pack
+    import yaml as _y
+    from toolkit.spec import engine_parameters as PV
+    ref, pk = next(((r, p) for r, p in PV._all_packs()[0] if PV.pack_ids(p)[1]), (None, None))
+    hid = sorted(PV.pack_ids(pk)[1])[0] if pk else "?"
+    got7 = {}
+    for name, entry in (("text", {"value": 1.0, "source": "s", "basis": "owner_judgement",
+                                  "reason": f"puts {hid} in band"}),
+                        ("no basis", {"value": 1.0, "source": "s", "reason": "r"})):
+        d7 = os.path.join(td, f"ig7_{name.replace(' ', '_')}")
+        os.makedirs(d7)
+        try:
+            GEO.toy_spec_with_boundaries(d7)
+            sp = _y.safe_load(open(os.path.join(d7, AB.SPEC_FILE)))
+            sp["engine"] = {"ref": ref}
+            sp["engine_parameters"] = {"p": entry}
+            _y.safe_dump(sp, open(os.path.join(d7, AB.SPEC_FILE), "w"))
+            sign(d7, "owner", "n")
+            why = ""
+        except ValueError as e:
+            why = str(e)
+        got7[name] = (("held-out benchmark" if name == "text" else "basis") in why
+                      and not os.path.exists(os.path.join(d7, SIGNOFF_FILE))
+                      and not os.path.exists(os.path.join(d7, GEO.SIGNOFF_FILE)))
+    ok(ref is not None and all(got7.values()),
+       f"IG-M7 the spike signer refuses, for the owner, a spec value justified by a held-out benchmark or without a "
+       f"basis, and writes no sign-off ({got7})")
 
 
 def _self_test_derived(ok, td: str) -> None:
