@@ -5,13 +5,16 @@ The default for one job: `run` brings the cluster up, submits the job at once, p
 required: success means the job is done and every output is verified in storage. It exits
 non-zero with the reason otherwise. Whatever ends it (success, failure, an error, Ctrl-C,
 a constructor that raised after allocating), the cluster is stopped, unless
-`--keep-on-failure` and the job did not succeed. A cluster of that name that is already
-running is refused, never reused (no second launch). It takes every `up` and `start`
-option; its polls and stops use the cluster object it created and its id, never an attach
-by name.
+`--keep-on-failure` and the job did not succeed. The cluster gets a name of its own,
+<name>-<job_id>-<6 hex>, recorded with its id in job.json, so no other launcher can race it
+for the name; `status`, `wait` and `down <name> <job_id>` find it there. A live cluster
+named <name>, or one already running for this job, is refused (no second launch). It takes
+every `up` and `start` option; its polls and stops use the cluster object it created and
+its id, never an attach by name.
 
     python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> [--workers N]
         [--every 60] [--keep-on-failure] -- <command ...>
+    python cloud/vm_job.py down <name> <job_id>      # stop a kept cluster (found through job.json)
 
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
@@ -68,7 +71,8 @@ start-up and a 20-minute idle tail, shut down by a watcher on the laptop.)
 Rules: the IDM Coiled default workspace only; attach-only for everything but `up` and
 `run`'s creation step (coiled.Cluster(name=...) on a cluster that is gone creates a new,
 empty one), and those create only once no cluster of the name is live or stopping. `run`
-never attaches by name: it keeps the object it created and stops by cluster id.
+never attaches by name: it keeps the object it created and stops by cluster id (or, when
+the constructor raised before returning one, by its unique name).
 """
 from __future__ import annotations
 
@@ -159,12 +163,40 @@ class WorkerGone(RuntimeError):
     """The job's own worker is not in the cluster's worker table."""
 
 
-def _job_worker(dest):
-    """The worker the job was submitted to (job.json, written by `start`), or None."""
+def _job_record(dest) -> dict:
+    """job.json (written by `start` and `run`), or {}."""
     try:
-        return json.load(open(os.path.join(dest, "job.json"))).get("worker")
-    except (OSError, ValueError, AttributeError):
-        return None
+        rec = json.load(open(os.path.join(dest, "job.json")))
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _job_worker(dest):
+    """The worker the job was submitted to, or None."""
+    return _job_record(dest).get("worker")
+
+
+def _job_cluster(dest, name):
+    """The cluster the job runs on: `run`'s unique name from job.json, else `name`."""
+    return _job_record(dest).get("cluster") or name
+
+
+def _slug(x: str) -> str:
+    import re
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", str(x).lower())).strip("-")
+
+
+def run_cluster_name(name: str, job_id: str, suffix: str | None = None) -> str:
+    """`run`'s cluster name: <name>-<job_id>-<6 hex>, lowercase letters, digits and hyphens,
+    starting with a letter, at most 63 characters. Ownership is this name: no other launcher
+    creates it, so no check-then-create race with a same-name launcher can arise."""
+    import secrets
+    sfx = suffix or secrets.token_hex(3)
+    base = "-".join(p for p in (_slug(name), _slug(job_id)) if p)
+    if not base[:1].isalpha():
+        base = "r-" + base
+    return f"{base[:63 - 1 - len(sfx)].rstrip('-')}-{sfx}"
 
 
 def _client(name, cluster=None, want=None):
@@ -203,7 +235,7 @@ def _create(a, if_live="keep", box=None):
     (`up`: "already up", returns False) or refused (`run`: no second launch on a cluster that
     may hold another job); a stopping one is waited out, never attached to or re-created early.
     The new cluster object goes into `box["cl"]` as soon as the constructor returns (`run`
-    stops it by id whatever happens next)."""
+    stops it by id whatever happens next; if the constructor raises, by its unique name)."""
     import coiled
     for _ in range(40):
         act = rc.keeper_wait(rc.cluster_states(a.name))
@@ -220,10 +252,7 @@ def _create(a, if_live="keep", box=None):
         raise SystemExit(f"{a.name} is still stopping; try again later")
     n = int(getattr(a, "workers", 1) or 1)
     if box is not None:
-        # the ids already there, listed just before the constructor: a cluster of this name that is not among them
-        # after a failed construction is the one this call allocated (another launcher's, created before this
-        # line, is in the list and never touched)
-        box["before"] = set(_clusters(a.name))
+        box["constructing"] = True   # from here a cluster with this (unique, for `run`) name may exist
     cl = coiled.Cluster(name=a.name, workspace=rc.WORKSPACE, n_workers=n, worker_cpu=a.cpu, worker_memory=a.memory,
                         scheduler_cpu=2, spot_policy="on-demand", idle_timeout=a.idle_timeout,
                         shutdown_on_close=False)
@@ -264,9 +293,11 @@ def cmd_start(a, cluster=None):
                    shutdown_always=getattr(a, "shutdown_always", False), workers=[w], allow_other_workers=False,
                    pure=False, key=f"job-{a.job_id}-{int(time.time())}")
     fire_and_forget(fut)
-    dest = local_dir(a.name, a.job_id, a.out)
+    dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
-    json.dump({"name": a.name, "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
+    json.dump({"name": getattr(a, "base_name", a.name), "cluster": a.name,
+               "cluster_id": getattr(cluster, "cluster_id", None) if cluster is not None else None,
+               "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
                "max_hours": a.max_hours, "cluster_compute": a.cluster_compute, "store": store,
                "shutdown_when_stored": a.shutdown_when_stored}, open(os.path.join(dest, "job.json"), "w"), indent=1)
     tail = (f"; outputs go to {store['prefix']}/ and the cluster stops itself once they are verified there"
@@ -285,7 +316,7 @@ def _print(st, dest):
 
 def cmd_status(a):
     dest = local_dir(a.name, a.job_id, a.out)
-    c, w = _client(a.name, want=_job_worker(dest))
+    c, w = _client(_job_cluster(dest, a.name), want=_job_worker(dest))
     st = sync_outputs(_runner(c, w), a.job_id, dest)
     _print(st, dest)
     return st
@@ -331,7 +362,9 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None):
 
 
 def cmd_wait(a):
-    return _poll(a, local_dir(a.name, a.job_id, a.out))
+    dest = local_dir(a.name, a.job_id, a.out)
+    a.name = _job_cluster(dest, a.name)
+    return _poll(a, dest)
 
 
 def run_outcome(st, store_requested) -> tuple[bool, str]:
@@ -355,23 +388,27 @@ _ENDED = ("stopping", "stopped", "error")
 
 
 def _clusters(name) -> dict:
-    """{cluster id: state} of every cluster with this name (Coiled keeps stopped ones listed)."""
+    """{cluster id: state} of every cluster with exactly this name (Coiled keeps stopped ones listed)."""
+    return {c.get("id"): ws.state_of(c) for c in _all_clusters() if c.get("name") == name}
+
+
+def _all_clusters() -> list:
     import coiled
     cs = coiled.list_clusters(workspace=rc.WORKSPACE)
-    items = cs if isinstance(cs, list) else list(cs.values())
-    return {c.get("id"): ws.state_of(c) for c in items if c.get("name") == name}
+    return cs if isinstance(cs, list) else list(cs.values())
 
 
 def _gone(name, cid) -> bool:
     return _clusters(name).get(cid, "stopped") in _ENDED
 
 
-def _stop_by_id(name, cid, before, why):
+def _stop_by_id(name, cid, why):
     """Stop the cluster `run` created, by id (coiled.delete_cluster(cluster_id=...), never an
     attach by name). With no id (the constructor raised or was interrupted after allocating),
-    the new cluster is the one of this name that was not listed before creation. A cluster
-    already stopping or stopped (the job stopped it) is left alone, and a failed stop request
-    is reported, not raised: the second of two stop requests is harmless."""
+    it is the cluster with exactly this name: `run`'s names are unique, so that is never
+    another launcher's. A cluster already stopping or stopped (the job stopped it) is left
+    alone, and a failed stop request is reported, not raised: the second of two stop requests
+    is harmless."""
     import coiled
     live = None
     for i in range(3):
@@ -385,7 +422,7 @@ def _stop_by_id(name, cid, before, why):
     if cid is None and live is None:
         print(f"{name}: could not find the new cluster to stop it; it stops after its idle timeout")
         return
-    for i in ([cid] if cid is not None else sorted(k for k in live if k not in before)):
+    for i in ([cid] if cid is not None else sorted(live)):
         state = (live or {}).get(i, "") if live is not None else "unknown"
         if live is not None and (i not in live or state in _ENDED):
             print(f"{name} ({i}): already {state or 'gone'} ({why})")
@@ -420,6 +457,16 @@ def cmd_run(a):
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
     a.shutdown_grace_s = int(2 * a.every + 60)
+    base = a.name
+    prefix = run_cluster_name(base, a.job_id, "x")[:-1]     # <name>-<job_id>-
+    busy = sorted(f"{c.get('name')} ({c.get('id')})" for c in _all_clusters()
+                  if ws.state_of(c) not in _ENDED + ("",)
+                  and (c.get("name") == base or str(c.get("name") or "").startswith(prefix)))
+    if busy:
+        raise SystemExit(f"{base}: a cluster for this name or job is already running ({', '.join(busy)}); `run` "
+                         f"never launches a second one (`status {base} {a.job_id}` or `down`)")
+    a.base_name, a.dest, a.name = base, dest, run_cluster_name(base, a.job_id)
+    print(f"{base}: cluster {a.name} for {a.job_id}")
     box, good, why = {}, False, "interrupted"
     try:
         try:
@@ -444,14 +491,14 @@ def cmd_run(a):
         raise
     finally:
         cl = box.get("cl")
-        if "before" not in box:
+        if "constructing" not in box:
             pass    # refused or failed before the constructor was called: nothing of ours to stop
         elif good or not a.keep_on_failure:
-            _stop_by_id(a.name, getattr(cl, "cluster_id", None) if cl is not None else None, box["before"],
+            _stop_by_id(a.name, getattr(cl, "cluster_id", None) if cl is not None else None,
                         f"{a.job_id} done" if good else f"{a.job_id}: {why}"[:200])
         elif cl is not None:
             print(f"{a.name} kept up for debugging (--keep-on-failure): it stops after {a.idle_timeout} idle, "
-                  f"or now with `down {a.name}`")
+                  f"or now with `down {base} {a.job_id}`")
     if good:
         print(f"{a.job_id} done; outputs -> {dest} and {a.store.rstrip('/')}/ (verified)")
         return
@@ -459,6 +506,14 @@ def cmd_run(a):
 
 
 def cmd_down(a):
+    """`down <name>`: the guarded attach, then shutdown. `down <name> <job_id>`: the job's
+    cluster from job.json (`run`'s unique name), stopped by id."""
+    if getattr(a, "job_id", None):
+        rec = _job_record(local_dir(a.name, a.job_id, a.out))
+        if rec.get("cluster_id") is not None:
+            _stop_by_id(rec.get("cluster") or a.name, rec["cluster_id"], f"down {a.name} {a.job_id}")
+            return
+        a.name = rec.get("cluster") or a.name
     rc.attach(a.name).shutdown()
     print(f"{a.name}: shutdown requested")
 
@@ -1287,6 +1342,7 @@ def main(argv=None) -> int:
             p.add_argument("--every", type=float, default=300)
     dn = sub.add_parser("down")
     dn.add_argument("name")
+    dn.add_argument("job_id", nargs="?", default=None, help="stop this job's cluster (as recorded by `run`)")
     for p in sub.choices.values():
         p.add_argument("--out", default=OUT)
     a = ap.parse_args(argv)

@@ -82,8 +82,11 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> \
   storage. Otherwise it exits non-zero with the reason (state, exit code,
   storage check). The cluster is stopped whatever ends the command,
   Ctrl-C included. `--keep-on-failure` keeps it up after a failure for
-  debugging; it then stops after its idle timeout, or with `down <name>`.
-- A cluster of that name that is already running is refused, never reused.
+  debugging; it then stops after its idle timeout, or with
+  `down <name> <job_id>`.
+- The cluster is named `<name>-<job_id>-<6 hex>` and recorded in the job's
+  local `job.json`; `status`, `wait` and `down <name> <job_id>` find it there.
+  A cluster named `<name>`, or one already running for the job, is refused.
 - The job also stops its own cluster when it ends, whatever the outcome,
   after a short grace period, so a sleeping laptop leaves no idle cluster.
 - Do not split it into `up` then `start`: Coiled counts the idle timeout
