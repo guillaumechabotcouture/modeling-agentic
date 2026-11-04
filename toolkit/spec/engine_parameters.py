@@ -253,10 +253,16 @@ def _class_ref(cls) -> str:
     return f"{cls.__module__}:{cls.__qualname__}"
 
 
+class PackError(ValueError):
+    """The engine has a benchmark pack, but it cannot be read or does not have the shape the checks need: a spec with
+    engine parameter values is refused (fail closed), whatever their basis."""
+
+
 def benchmark_pack(engine_or_cls):
-    """(pack, path) of the engine's own benchmark pack, or (None, why). The pack is the file beside the engine's code:
-    the class attribute BENCHMARK_PACK (a path relative to the class's module directory), else benchmarks/pack.yaml
-    there. Never from the spec or the engine's configuration, which an agent writes. The pack must name this class."""
+    """(pack, path) of the engine's own benchmark pack, or (None, why) when the engine has none. The pack is the file
+    beside the engine's code: the class attribute BENCHMARK_PACK (a path relative to the class's module directory), else
+    benchmarks/pack.yaml there. Never from the spec or the engine's configuration, which an agent writes. A pack that
+    is unreadable, malformed (pack_ids) or names another class raises PackError."""
     import inspect
     import yaml
     cls = engine_or_cls if isinstance(engine_or_cls, type) else type(engine_or_cls)
@@ -265,24 +271,55 @@ def benchmark_pack(engine_or_cls):
     except (TypeError, OSError) as e:
         return None, f"the code of {_class_ref(cls)} has no file ({e})"
     path = os.path.join(here, getattr(cls, "BENCHMARK_PACK", None) or PACK_DEFAULT)
-    if not os.path.exists(path):
+    if not os.path.lexists(path):
         return None, f"{_class_ref(cls)} has no benchmark pack"
     try:
         pack = yaml.safe_load(open(path, encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as e:
-        return None, f"the benchmark pack of {_class_ref(cls)} is unreadable: {e}"
-    if not isinstance(pack, dict) or not isinstance(pack.get("benchmarks"), list):
-        return None, f"the benchmark pack of {_class_ref(cls)} lists no benchmarks"
-    if pack.get("engine") != _class_ref(cls):
-        return None, f"the benchmark pack beside {_class_ref(cls)} is for {pack.get('engine')}"
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise PackError(f"the benchmark pack of {_class_ref(cls)} is unreadable: {e}") from None
+    if not isinstance(pack, dict) or pack.get("engine") != _class_ref(cls):
+        raise PackError(f"the benchmark pack beside {_class_ref(cls)} is for "
+                        f"{pack.get('engine') if isinstance(pack, dict) else 'no engine'}")
+    pack_ids(pack, _class_ref(cls))          # its shape, checked here so every caller fails closed
     return pack, path
 
 
-def pack_ids(pack: dict) -> tuple[set, set]:
-    """(every benchmark id, the held-out ids): held out is every benchmark not in the pack's fit targets."""
-    from toolkit.engines import benchmark as BM
-    ids = {str(b["id"]) for b in pack.get("benchmarks") or [] if isinstance(b, dict) and b.get("id") is not None}
-    return ids, ids - {str(t) for t in BM.fit_targets(pack)}
+def pack_ids(pack: dict, ref: str = "the engine") -> tuple[set, set]:
+    """(every benchmark id, the held-out ids): held out is every benchmark not in the pack's fit targets (`fit` steps'
+    and `fit_joint` targets, as toolkit/engines/benchmark.py fit_targets reads them). The pack's shape is checked, not
+    coerced: benchmarks a list of mappings with distinct non-empty text ids; fit targets lists of those ids. Else
+    PackError."""
+    why = f"the benchmark pack of {ref}"
+    bms = pack.get("benchmarks") if isinstance(pack, dict) else None
+    if not isinstance(bms, list) or not bms:
+        raise PackError(f"{why} lists no benchmarks")
+    ids = []
+    for b in bms:
+        if not (isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"].strip()):
+            raise PackError(f"{why}: every benchmark is a mapping with a text id ({str(b)[:60]})")
+        ids.append(b["id"])
+    if len(set(ids)) != len(ids):
+        raise PackError(f"{why}: benchmark ids repeat")
+
+    def targets(x, where):
+        if not (isinstance(x, list) and all(isinstance(t, str) for t in x)):
+            raise PackError(f"{why}: {where} targets must be a list of benchmark ids")
+        if set(x) - set(ids):
+            raise PackError(f"{why}: {where} targets name unknown benchmarks {sorted(set(x) - set(ids))}")
+        return set(x)
+    fit = set()
+    steps = pack.get("fit")
+    if steps is not None:
+        if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+            raise PackError(f"{why}: fit must be a list of steps")
+        for s in steps:
+            fit |= targets(s.get("targets"), "fit")
+    fj = pack.get("fit_joint")
+    if fj is not None:
+        if not isinstance(fj, dict):
+            raise PackError(f"{why}: fit_joint must be a mapping")
+        fit |= targets(fj.get("targets"), "fit_joint")
+    return set(ids), set(ids) - fit
 
 
 def _names(text: str, ident: str) -> bool:
@@ -291,15 +328,25 @@ def _names(text: str, ident: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
 
 
+def _pack_of(cls_or_engine, ref: str) -> tuple:
+    """(pack, why, error): error is a refusal (the pack exists but cannot be used), whatever the basis."""
+    try:
+        pack, why = benchmark_pack(cls_or_engine)
+        return pack, why, None
+    except PackError as e:
+        return None, str(e), (f"{FIELD}: {e}; the spec's engine parameter values cannot be checked against the held-out "
+                              f"benchmarks of {ref}")
+
+
 def _held_out_entry(w: str, e: dict, ref: str, pack, why) -> list[str]:
-    """The refusals of one entry against one engine's pack (pack None: `why` says why there is none)."""
+    """The refusals of one entry against one engine's pack (pack None: the engine has none; `why` says so)."""
     bad = []
     if pack is None:
         if e.get("basis") == "fitted":
             bad.append(f"{w}: fitted_to cannot be resolved: {why}; a value fitted to benchmarks needs the engine's own "
                        "pack to show they are fit targets, not held out")
         return bad
-    ids, held = pack_ids(pack)
+    ids, held = pack_ids(pack, ref)
     if e.get("basis") == "fitted" and isinstance(e.get("fitted_to"), list):
         for t in e["fitted_to"]:
             if not isinstance(t, str):
@@ -320,35 +367,56 @@ def _held_out_entry(w: str, e: dict, ref: str, pack, why) -> list[str]:
 
 def held_out_problems(spec, engine) -> list[str]:
     """The held-out refusals of every entry on this engine, an instance or its class (its own benchmark pack)."""
-    pack, why = benchmark_pack(engine)
+    ents = {n: e for n, e in declared(spec).items() if isinstance(e, dict)}
+    if not ents:
+        return []
     ref = _class_ref(engine if isinstance(engine, type) else type(engine))
+    pack, why, err = _pack_of(engine, ref)
+    if err:
+        return [err]
     bad = []
-    for n, e in declared(spec).items():
-        if isinstance(e, dict):
-            bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
+    for n, e in ents.items():
+        bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
     return bad
 
 
-def _all_packs() -> list[tuple]:
-    """(engine ref, pack) for every pack under toolkit/engines/*/benchmarks/ (the fallback when no engine is known)."""
+def _all_packs() -> tuple[list, list]:
+    """([(engine ref, pack)], [refusal]) for every pack under toolkit/engines/*/benchmarks/ (the fallback when no
+    engine is known). A pack that cannot be read or has the wrong shape is a refusal, never skipped."""
     import glob
     import yaml
-    out = []
+    out, errs = [], []
     for p in sorted(glob.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "pack.yaml"))):
+        rel = os.path.relpath(p, ROOT)
         try:
             pk = yaml.safe_load(open(p, encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
+            ref = str(pk.get("engine")) if isinstance(pk, dict) else rel
+            pack_ids(pk, ref)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, PackError) as e:
+            errs.append(f"{FIELD}: {rel} cannot be read as a benchmark pack ({e}); with no engine known, the spec's "
+                        "values cannot be checked against every engine's held-out benchmarks")
             continue
-        if isinstance(pk, dict) and isinstance(pk.get("benchmarks"), list):
-            out.append((str(pk.get("engine")), pk))
-    return out
+        out.append((ref, pk))
+    return out, errs
+
+
+def _engine_conflict(r: dict) -> str | None:
+    """A declaration that names both `auto: true` and a `ref`: the schema runs the candidates, so the sign-off must
+    not check another engine; refused instead of choosing."""
+    eng = r.get("engine")
+    if isinstance(eng, dict) and eng.get("auto") is True and eng.get("ref") is not None:
+        return (f"{FIELD}: the engine declaration sets both auto: true and ref; give one, so the values are checked "
+                "against the engines the run may use")
+    return None
 
 
 def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[str]:
     """What blocks signing the spec's engine parameter values, whoever signs: each entry's basis, and the held-out
     refusals against the pack of every engine the spec may run (_sheet_refs). With no engine known yet, a fitted
-    entry is refused (it cannot be resolved) and the text backstop reads every engine pack in the repository.
-    toolkit/spec/signoff.py sign and scripts/decision_brief.py sign both refuse while this is not empty."""
+    entry is refused (it cannot be resolved) and the text backstop reads every engine pack in the repository. An
+    engine that does not load, a pack that cannot be used, or a contradictory engine declaration refuses too.
+    toolkit/spec/signoff.py sign, scripts/decision_brief.py sign and agents/stage_machine.py sign all refuse while
+    this is not empty."""
     from toolkit.spec import schema
     r = _raw(raw)
     if r.get(FIELD) is None:
@@ -356,6 +424,9 @@ def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[s
     if not isinstance(r[FIELD], dict):
         return [f"{FIELD}: a mapping {{parameter: {{value, source, reason, basis, ...}}}}"]
     bad = basis_problems(r)
+    conflict = _engine_conflict(r)
+    if conflict:
+        bad.append(conflict)
     ents = {n: e for n, e in declared(r).items() if isinstance(e, dict)}
     targets = []
     for ref, _decl in _sheet_refs(r, candidates, run_dir):
@@ -364,12 +435,16 @@ def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[s
         except Exception as e:  # noqa: BLE001 -- fail closed: the values cannot be checked against its pack
             bad.append(f"{FIELD}: engine {ref} does not load ({type(e).__name__}: {str(e)[:200]}), so its benchmark "
                        "pack cannot be checked for the spec's values")
-            targets.append((ref, None, f"{ref} does not load"))
             continue
-        pack, why = benchmark_pack(cls)
+        pack, why, err = _pack_of(cls, ref)
+        if err:
+            bad.append(err)
+            continue
         targets.append((ref, pack, why))
-    if not targets:
-        targets = [(ref, pk, None) for ref, pk in _all_packs()]
+    if not targets and not any("does not load" in b or "cannot be checked" in b for b in bad):
+        packs, errs = _all_packs()
+        bad += errs
+        targets = [(ref, pk, None) for ref, pk in packs]
         for n, e in ents.items():
             if e.get("basis") == "fitted":
                 bad.append(f"{FIELD}.{n}: fitted_to cannot be resolved before the engine is known (engine: auto, "
@@ -678,7 +753,7 @@ def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[
     eng = raw.get("engine")
     if isinstance(eng, str) and eng != "auto":
         return [(eng, {"ref": eng})]
-    if isinstance(eng, dict) and eng.get("ref"):
+    if isinstance(eng, dict) and eng.get("ref") and eng.get("auto") is not True:    # auto wins, as in the schema
         return [(eng["ref"], eng)]
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     rows_ = [r for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
@@ -1348,7 +1423,7 @@ def _self_test() -> int:
             ra["engine"] = {"auto": True}
             e = signoff_refusals(ra)
             ok(any("before the engine is known" in x for x in e), f"EP51b no engine known: fitted is refused: {e}")
-            real = [(ref, pk) for ref, pk in _all_packs() if pack_ids(pk)[1]]
+            real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
             if real:
                 hid = sorted(pack_ids(real[0][1])[1])[0]
                 ra[FIELD]["base"] = dict(base, basis="literature", reason=f"puts {hid} in band")
@@ -1368,12 +1443,75 @@ def _self_test() -> int:
                                   TOYS.ToySpecRateEngine)
             ok(any("cannot be resolved" in x for x in e), f"EP52c fitted on an engine without a pack is refused: {e}")
             # a real engine pack: every benchmark not in the fit targets is held out (read only)
+            # (review round 1, P2): independent of pack_ids: the raw yaml's ids and fit targets, and every pack found
+            import glob as _gl
             from toolkit.engines import benchmark as BM
-            for ref, pk in _all_packs():
+            files = sorted(_gl.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "pack.yaml")))
+            packs, errs = _all_packs()
+            ok(len(packs) == len(files) >= 2 and not errs, f"EP53a every engine pack is read: {len(packs)} of "
+                                                           f"{len(files)}; {errs}")
+            for f in files:
+                pk = yaml.safe_load(open(f))
+                raw_ids = [b["id"] for b in pk["benchmarks"]]
+                fit = set(BM.fit_targets(pk))
                 ids, held = pack_ids(pk)
-                ok(held == ids - set(BM.fit_targets(pk)) and not (held & set(BM.fit_targets(pk))),
-                   f"EP53 {ref}: held out = the pack's ids minus its fit targets ({len(held)} of {len(ids)})")
+                ok(ids == set(raw_ids) and len(raw_ids) == len(pk["benchmarks"]) > 0
+                   and held == set(raw_ids) - fit and fit <= ids,
+                   f"EP53b {pk['engine']}: ids are the pack's {len(raw_ids)} benchmarks; held out are the {len(held)} "
+                   f"not among its {len(fit)} fit targets")
     guard("EP43-EP53 held-out benchmarks", held_out_cases)
+
+    # ------------------------------------------------------------ review round 1 (Codex): fail closed (EP54-EP57)
+    def held_out_fail_closed():
+        clean = {"value": 0.55, "source": SRC, "reason": "the value at which TH1 is in band", "basis": "owner_judgement"}
+        spec_raw = {FIELD: {"base": clean}}
+        with tempfile.TemporaryDirectory() as d:
+            got = {}
+            packs = {"unreadable": ":: [not yaml", "another engine": None,
+                     "benchmark not a mapping": {"benchmarks": ["TH1"]},
+                     "numeric id": {"benchmarks": [{"id": 7}], "fit_joint": {"targets": [7]}},
+                     "targets a mapping": {"benchmarks": [{"id": "TH1"}], "fit_joint": {"targets": {"TH1": "x"}}},
+                     "unknown target": {"benchmarks": [{"id": "TH1"}], "fit_joint": {"targets": ["TZ9"]}},
+                     "repeated id": {"benchmarks": [{"id": "TH1"}, {"id": "TH1"}]}}
+            for name, doc in packs.items():
+                path = os.path.join(d, name.replace(" ", "_") + ".yaml")
+                cls = type("PackProbe", (TOYS.ToySpecEngine,), {"BENCHMARK_PACK": path})
+                ref = f"{cls.__module__}:{cls.__qualname__}"
+                if isinstance(doc, dict):
+                    doc = yaml.safe_dump(dict(doc, engine=ref))
+                elif doc is None:
+                    doc = yaml.safe_dump({"engine": "toolkit.spec.toy_engines:ToySpecEngine",
+                                          "benchmarks": [{"id": "TH1"}]})
+                open(path, "w").write(doc)
+                e = held_out_problems(spec_raw, cls)
+                got[name] = bool(e) and all("cannot be checked" in x for x in e)
+            ok(all(got.values()), f"EP54 a pack that cannot be used refuses every value, whatever its basis "
+                                  f"(owner_judgement, text naming an id): {got}")
+            # EP55: auto: true with a ref checks the candidates (as the schema runs them), and the conflict is refused
+            ra = toy_raw(d, base=dict(clean))
+            ra["engine"] = {"auto": True, "ref": "toolkit.engines.contract:ToyEngine",
+                            "candidates": ["toolkit.spec.toy_engines:ToySpecEngine"]}
+            e = signoff_refusals(ra)
+            ok(any("both auto: true and ref" in x for x in e) and any(HELD_OUT_REFUSED in x and "TH1" in x for x in e),
+               f"EP55 auto with a ref: refused, and the candidate's pack is checked: {e}")
+            # EP56: with no engine known, an engine pack that cannot be read refuses instead of being skipped
+            ra["engine"] = {"auto": True}
+            ra[FIELD]["base"]["reason"] = "the owner's planning value"
+            fake = os.path.join(d, "fake_root")
+            os.makedirs(os.path.join(fake, "toolkit", "engines", "x", "benchmarks"))
+            open(os.path.join(fake, "toolkit", "engines", "x", "benchmarks", "pack.yaml"), "w").write(":: [")
+            real_root = EPm.ROOT
+            EPm.ROOT = fake
+            try:
+                e = EPm.signoff_refusals(ra)
+            finally:
+                EPm.ROOT = real_root
+            ok(any("cannot be read as a benchmark pack" in x for x in e), f"EP56 an unreadable pack is a refusal: {e}")
+            # EP57: an engine that does not load refuses a spec with the field
+            ra["engine"] = {"ref": "toolkit.engines.nowhere:Nothing"}
+            e = signoff_refusals(ra)
+            ok(any("does not load" in x for x in e), f"EP57 an engine that does not load refuses: {e}")
+    guard("EP54-EP57 held-out checks fail closed", held_out_fail_closed)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

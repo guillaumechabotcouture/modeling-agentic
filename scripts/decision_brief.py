@@ -1079,7 +1079,7 @@ def _self_test_held_out(ok) -> None:
         sys.path.insert(0, root)
     import subprocess
     from toolkit.spec import geometry as GEO, engine_parameters as PV
-    ref, pk = next(((r, p) for r, p in PV._all_packs() if PV.pack_ids(p)[1]), (None, None))
+    ref, pk = next(((r, p) for r, p in PV._all_packs()[0] if PV.pack_ids(p)[1]), (None, None))
     if ref is None:
         ok(False, "DB38 no engine pack with a held-out benchmark under toolkit/engines")
         return
@@ -1101,6 +1101,7 @@ def _self_test_held_out(ok) -> None:
              "no basis": {"value": 1.0, "source": "s", "reason": "r"}}
     got = {}
     for name, entry in cases.items():
+        want = "basis" if name == "no basis" else "held-out benchmark"
         for by in ("owner", "lead"):
             with tempfile.TemporaryDirectory() as d:
                 run_dir(d, entry)
@@ -1109,13 +1110,12 @@ def _self_test_held_out(ok) -> None:
                     why = None
                 except ValueError as e:
                     why = str(e)
-                got[(name, by)] = (why is not None and status(d) == "awaiting"
+                got[(name, by)] = (why is not None and want in why and status(d) == "awaiting"
                                    and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)))
         with tempfile.TemporaryDirectory() as d:
             run_dir(d, entry)
             r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
                                 "--accept-proposed"], env=env, capture_output=True, text=True, timeout=300)
-            want = "basis" if name == "no basis" else "held-out benchmark"
             got[(name, "cli")] = (r.returncode == 1 and want in r.stderr and status(d) == "awaiting")
     ok(all(got.values()), f"DB38 the brief's sign-off (in process for the owner and the lead, and the CLI with --by "
                           f"owner) refuses a spec value fitted to, or justified by, held-out {hid}, or without a basis: "
