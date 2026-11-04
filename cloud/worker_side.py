@@ -935,17 +935,31 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
                  ended=time.time(), duration_s=round(time.time() - t0))
     if store:
+        import threading
+        lock, done_ev = threading.Lock(), threading.Event()
+
         def beat():
-            st["heartbeat"] = time.time()
-            _job_write(d, st)
+            with lock:
+                st["heartbeat"] = time.time()
+                _job_write(d, st)
+
+        def beater():   # one upload or read-back can take longer than JOB_STALE_S: never read as 'lost'
+            while not done_ev.wait(heartbeat_s):
+                beat()
+        t = threading.Thread(target=beater, daemon=True)
+        t.start()
         try:
             smod = store_mod or _load_by_path("_ma_job_results_store", os.path.join(work, "scripts",
                                                                                      "results_store.py"))
         except Exception as e:  # noqa: BLE001
-            st["stored"] = {"prefix": store.get("prefix"), "verified": False,
-                            "why": f"no results_store in the shipped tree ({type(e).__name__}: {e})"[:300]}
+            stored = {"prefix": store.get("prefix"), "verified": False,
+                      "why": f"no results_store in the shipped tree ({type(e).__name__}: {e})"[:300]}
         else:
-            st["stored"] = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
+            stored = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
+        finally:
+            done_ev.set()
+            t.join()
+        st["stored"] = stored
     st.update(final, heartbeat=time.time())
     down = bool(shutdown_always or (shutdown_when_stored and st["state"] == "done"
                                     and (st.get("stored") or {}).get("verified")))
