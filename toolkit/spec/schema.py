@@ -16,7 +16,7 @@ docs/design/v2-spec-and-analysis.md §1):
                                                            # {auto: true, candidates: [...]}: chosen after sign-off,
                                                            # read from engine_choice.json (harness-written)
     engine_parameters:                     # optional: a fixed or scenario parameter's point value for this run
-      p: {value, units, source, reason, outside_card_range, range, dist}    # toolkit/spec/engine_parameters.py
+      p: {value, units, source, reason, basis, fitted_to, outside_card_range, range, dist}   # engine_parameters.py
     horizon: {start: 2016.0, stop: 2027.0}                 # simulated period
     decision_units:
       csv: data/units.csv

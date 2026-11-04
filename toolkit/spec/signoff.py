@@ -166,6 +166,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
+    _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
@@ -192,6 +193,21 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except (LinkRefused, OSError) as e:
         raise ValueError(f"sign-off not written: {e}") from None
     return record
+
+
+def _refuse_held_out(spec_bytes: bytes, run_dir: str) -> None:
+    """Refuse (ValueError) a spec whose engine parameter values have no basis, or were chosen with a held-out benchmark
+    of an engine the spec may run (toolkit/spec/engine_parameters.py signoff_refusals). No signer, flag or note
+    overrides it. `spec_bytes`: the bytes being signed."""
+    import yaml
+    from toolkit.spec import engine_parameters as PV
+    try:
+        doc = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"{SPEC} does not parse: {e}") from None
+    bad = PV.signoff_refusals(doc if isinstance(doc, dict) else {}, run_dir=run_dir)
+    if bad:
+        raise ValueError("spec not signable (engine_parameters): " + "; ".join(bad[:10]))
 
 
 SHEET_SOURCES = "<!-- signoff-sheet-sources: "
@@ -565,8 +581,9 @@ def _self_test() -> int:
         raw = yaml.safe_load(open(p))
         raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine"}
         raw["engine_parameters"] = {
-            "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline"},
-            "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting"}}
+            "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline",
+                     "basis": "owner_judgement"},
+            "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting", "basis": "setting_data"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         md = sheet(d)
         sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \
@@ -616,6 +633,50 @@ def _self_test() -> int:
         ok("PackageRateEngine`: not a parameter of this engine" in sec and "card not loaded" not in sec
            and "ToySpecEngine`: card value" in sec,
            f"SV7 the spec's candidate refs are merged with the supplied candidate configurations: {sec[:500]!r}")
+    # SV8-SV10: a spec value chosen with a held-out benchmark (toolkit/spec/engine_parameters.py signoff_refusals) is
+    # refused by every entry point, whoever signs. ToySpecEngine's pack: fit targets TF1, TF2; held out TH1, TH2.
+    import subprocess
+    toy = "toolkit.spec.toy_engines:ToySpecEngine"
+    for by in ("owner", "lead"):
+        with tempfile.TemporaryDirectory() as d:
+            p = schema.toy_spec(d)
+            raw = yaml.safe_load(open(p))
+            raw["engine"] = {"auto": True, "candidates": [toy]}        # validate(pending_ok) checks the shape only
+            raw["engine_parameters"] = {"k": {"value": 0.9, "source": "a toy sweep", "reason": "toy headline",
+                                              "basis": "fitted", "fitted_to": ["TH1"]}}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            pend = schema.validate(schema.load(p), pending_ok=True)
+            try:
+                sign(d, by)
+                why = None
+            except ValueError as e:
+                why = str(e)
+            ok(not pend and why and "held-out benchmark" in why and status(d) != "signed"
+               and not os.path.exists(os.path.join(d, SPEC_SIGNOFF)),
+               f"SV8 ({by}) engine: auto: a value fitted to a candidate's held-out benchmark is refused at sign-off even "
+               f"though the pending checks pass ({pend[:2]}): {why}")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"ref": toy}
+        raw["engine_parameters"] = {"k": {"value": 0.9, "source": "a toy sweep", "basis": "owner_judgement",
+                                          "reason": "the value at which TH2 is in band"}}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from toolkit.spec import toy_engines as T; "
+                "T.enable_for_test(); from toolkit.spec import signoff as S; sys.exit(S.main(sys.argv[2:]))")
+        r = subprocess.run([sys.executable, "-c", code, ROOT, "sign", d, "--by", "owner", "--note", "accept"],
+                           capture_output=True, text=True, timeout=300)
+        ok("**REFUSED**" in sec and "TH2" in sec and "no sign-off, the owner's included" in sec
+           and r.returncode != 0 and "held-out benchmark" in r.stderr and status(d) != "signed",
+           f"SV9 the sheet shows the refusal and the signoff CLI refuses it with --by owner (exit {r.returncode}): "
+           f"{r.stderr[-300:]!r}; {sec[-300:]!r}")
+        raw["engine_parameters"]["k"]["reason"] = "the owner's planning value for this setting"
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
+        sign(d, "owner")
+        ok("REFUSED" not in sec and "Basis: owner_judgement" in sec and status(d) == "signed",
+           f"SV10 without the held-out benchmark the value signs and the sheet shows its basis: {sec[:300]!r}")
     # DI6, DI7, DI10 (docs/design/v2-derived-inputs.md): the sign-off freezes the derivation record, and the sheet
     # shows the owner the accepted defaults and the columns the run chose not to use.
     try:

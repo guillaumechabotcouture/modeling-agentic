@@ -182,6 +182,17 @@ Domain knowledge reaches the model only as prose, and a self-graded severity dec
 | F5 | **Replicate count:** 3 replicates on two questions to size the noise, so F4's "beyond the spread" rule has a basis. | Spread per question; a recommended replicate count. | Planned, with F3 |
 | F6 | Optional: a small real-data subset question with a rubric for expert scoring (no synthetic truth). | Owner-scored rubric beside the deterministic score. | Not started |
 
+## Determinism roadmap (after the F5 Nigeria run)
+
+The owner approved these four items on 2026-11-03 and deferred them until the F5 run is done end to end.
+
+| # | Item | Status |
+|---|---|---|
+| R1 | Every parameter value comes from a registered prior, with its source and table cited, never from free text typed into a spec. Calibration is a harness procedure (`fit_joint`) over declared targets. | Partly done: spec values now need a structured `basis`, and a value fitted to or justified by a held-out benchmark cannot be signed (`toolkit/spec/engine_parameters.py`; changes/spec-values-held-out.md) |
+| R2 | A literature reference for each engine part: for each mechanism, the standard published model the engine uses, or why it departs from it. A missing entry blocks engine release. | Not started |
+| R3 | A direct measure of determinism: the same signed spec run on different seeds and engine stamps, reporting how much the decision changes. In the eval suite, each question runs twice. | Not started |
+| R4 | Freeze the harness's operations code, so that review effort goes into the engine and the evidence. | Not started |
+
 ## Order and checkpoints
 
 1. A1, A2, A3 (in progress), then A4 with a smoke run.
