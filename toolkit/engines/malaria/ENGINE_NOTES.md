@@ -25,6 +25,67 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.9 scope: smooth-compact net survival (written before the v0.9 pack run)
+
+**The change.** From v0.3 to v0.8 nets were lost at the constant daily rate ln2 / `net_retention_half`. That is
+an exponential survival curve whose half-life equals the published median retention. v0.9 uses the survival
+function that the source of that median fits, the smooth-compact curve:
+
+    S(t) = exp(k - k / (1 - (t/L)^2))   for t < L,   S(t) = 0 for t >= L.
+
+- **k = 20, fixed.** New engine parameter `net_survival_k` (kind `fixed`). Bertozzi-Villa et al. 2021, Supplementary
+  Note 1.4 (stock-and-flow model, p. 19): "κ was fixed at a value of 20 and τ was given a wide prior τ ∼ Unif(5.5,
+  20.7). After model fitting, net retention half-life was calculated analytically as the time t at which
+  Loss(t, κ, τ) = 0.5." The paper gives no range for k. Briët, Hardy and Smith 2012 (Malar J 11:20, PMC3273435,
+  appendix on `attritionOfNets`) used the same function with k = 18.
+- **L from the median.** S(median) = 1/2 gives L = median × sqrt((k + ln2) / ln2), which is 5.46 × the median at
+  k = 20. At the continental median of 1.64 y, L = 8.96 y. The prior bounds agree: τ = 5.5 y and 20.7 y give medians
+  of 1.01 y and 3.79 y. The paper's Fig. 5 notes the 1-year floor, and 3.79 y is the highest upper 95% bound in
+  its Supplementary Table 1.7.
+- **`net_retention_half` is still the median.** Its name, value (1.64 y = 598.6 d) and card range (IQR 1.33–2.37 y,
+  main text "Net retention time" and Supplementary Table 1.7) are unchanged. It is no longer used as a half-life.
+- **Per-net daily loss.** The sim already tracks each person's net age (`net_t`) for holes. A net of age a days is
+  now lost each day with the conditional hazard 1 − S(a+1)/S(a) (`model.net_loss_prob`). Compounded from age 0, this
+  gives S(t) exactly (self-test N2b), and the sim reproduces S(a0 + T)/S(a0) by net age (N3).
+- **Access at distribution** (`access_for_use`) divides reported use by the same S(t) (N4).
+- **Insecticide decay (Churcher 2016) and holes (Briët 2020)** are unchanged.
+
+| Net age | Exponential (v0.8) | Smooth-compact (v0.9) |
+|---|---|---|
+| 6 months | 0.81 | 0.94 |
+| 1 year | 0.66 | 0.78 |
+| 1.64 years (median) | 0.50 | 0.50 |
+| 2 years | 0.43 | 0.35 |
+| 3 years | 0.28 | 0.08 |
+| 4 years | 0.18 | 0.007 |
+
+At the same median, nets last longer in the first year and are almost all gone by year 4.
+
+**Muleba keeps its own retention, re-derived for the new shape.** v0.3 derived Muleba's 949 days from the trial's
+reported use: 77.3% in year 1 (surveys at 4 and 9 months, mean 0.54 y) and 59.2% in year 2 (16 and 21 months, mean
+1.54 y). Under the exponential, those two values give a half-life of ln2 / ln(0.773 / 0.592) = 949 d. Under the
+smooth-compact curve, the same two values give a median of 841.3 d (2.30 y): S(1.54 y) / S(0.54 y) = 0.592 / 0.773
+(self-test N5). Keeping 949 d would mean a ratio of 0.81, which the trial did not report. The value comes from the
+trial's use data only. The spec-value precedence test (EP36) now reads the setting's own value from the pack.
+
+**Nigeria.** Supplementary Table 1.7 gives Nigeria (NGA) a median LLIN retention of 2.22 y (95% CI 2.00–2.47) from
+9 surveys. It is recorded in `priors.yaml` (`country_values`) for a run spec to cite through `engine_parameters`.
+The engine default stays the 40-country median, because the paper reports the country value as one country's fit.
+The upper bound (2.47 y) is above the card range (2.37 y), so such a spec needs `outside_card_range: true`.
+
+**What did not choose anything.** No value in v0.9 was chosen or tuned by any benchmark result:
+- k and the median come from Bertozzi-Villa 2021;
+- Muleba's median comes from its trial's reported use;
+- B7, B8 and B16c stay held out, as do B9, B9b, B9c, B13, B15 and B17–B20.
+
+The change is not byte-identical, so `validate_once.sh` recomputes the equilibration, guess sensitivity, joint fit,
+pack run, B15 mechanism scan and per-run cost. The v0.8 files move to `history/` (`*_v0.8.yaml`) and the tables
+below show both versions.
+
+**Earlier candidate 8 (v0.4 table).** The v0.4 notes listed the S-shaped loss curve as candidate 8, "not implemented:
+a parameter would be guessed", because Supplementary Note 1.4 was not accessible then. It has now been read, and k
+is the paper's own value.
+
 ## v0.8 scope: the figure hooks, schedule() and run_series() (written before the v0.8 code)
 
 **The problem.** The v2 figure set (`docs/design/v2-figures.md` §5, PR #127) has two figures the
@@ -436,7 +497,7 @@ all ages, and the other three used three different child age bands.
 | 5 | Outdoor and early biting of the Asian trials' vectors (*An. dirus*, *An. minimus*, *An. culicifacies*) | trial settings (Sochantha: forest malaria) | up | not implemented: the D6 prior has no Asian bionomics, and they do not apply to the Nigeria decision. Recorded as a basis mismatch of B7 |
 | 6 | Transmission intensity per trial (EIR 6 to 500) | table above | mixed | not implemented: needs a setting per trial |
 | 7 | Trial nets maintained or re-treated (less attrition than LLIN campaigns) | trial descriptions (e.g. 6-monthly re-treatment in the ITN trials of that era) | down (a stronger effect) | not implemented: no trial-specific retention data. Recorded as a known risk in the opposite direction |
-| 8 | S-shaped net loss curve (Bertozzi-Villa 2021 smooth-compact function) | the main text says the curve is S-shaped; its steepness is in Supplementary Note 1.4, which is not accessible | down at 12 m | not implemented: a parameter would be guessed; the exponential stays flagged |
+| 8 | S-shaped net loss curve (Bertozzi-Villa 2021 smooth-compact function) | the main text says the curve is S-shaped; its steepness is in Supplementary Note 1.4, which is not accessible | down at 12 m | not implemented: a parameter would be guessed; the exponential stays flagged. **v0.9: implemented from Supplementary Note 1.4 (k = 20); see the v0.9 section** |
 
 **Committed (1): B7 is measured in each identified trial's own ages.**
 - **Estimand:** B7 becomes the geometric mean of the RR in each identified trial's age band:
@@ -488,7 +549,8 @@ results are superseded:
 **Field use of nets (owner decision: model why field effects are lower than hut effects,
 with no fitted field-efficacy factor).** Each mechanism is tested on its own, then together:
 - **Attrition:** nets are lost with the LLIN median retention of 1.64 years (Bertozzi-Villa
-  2021, 40 countries, IQR 1.33–2.37), used as an exponential half-life. Muleba uses its own
+  2021, 40 countries, IQR 1.33–2.37), used as an exponential half-life (v0.9: the median of the
+  smooth-compact curve, k = 20). Muleba uses its own
   trial-reported decline in use instead (77.3% in year 1, 59.2% in year 2, a 2.60-year
   half-life).
 - **Use below access:** people with a net use it on 87.1% of nights on average
@@ -823,7 +885,8 @@ grid before the next pack run.
 - The product mix of the Cochrane IRS-added-to-ITN trials (set to the short-lived product).
 - Trial-site seasonality and past net campaigns.
 - Field use (v0.3):
-  - the exponential shape of net loss (the paper's loss curve is S-shaped);
+  - the exponential shape of net loss (the paper's loss curve is S-shaped); resolved in v0.9
+    (smooth-compact, k = 20, Bertozzi-Villa 2021 Supplementary Note 1.4);
   - the split of the use gap between persistent and night-to-night non-use (0.5);
   - interpolating the holes slope by bioassay mortality;
   - growth of holed area as linear in log area, with a cap at 3 years;

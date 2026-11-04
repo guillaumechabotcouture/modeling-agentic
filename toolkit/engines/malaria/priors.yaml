@@ -10,10 +10,11 @@ priors:
     dist: triangular
     range: [485.45, 865.05]            # 1.33-2.37 years, in days
     source: "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080): LLIN median retention
-      1.64 y, IQR 1.33-2.37 across 40 countries"
+      1.64 y, IQR 1.33-2.37 across 40 countries (main text, Net retention time; Supplementary Table 1.7)"
     verified: matched
     note: "an interquartile range across countries, used as the range for one country's value: it covers the central
-      half of countries, so it is narrower than a 95% range would be"
+      half of countries, so it is narrower than a 95% range would be. v0.9: the median of the smooth-compact survival
+      curve (shape net_survival_k), no longer an exponential half-life"
   use_rate:
     dist: triangular
     range: [0.833, 0.901]
@@ -49,6 +50,10 @@ priors:
     note: "the two trial arms; attempt 8's upper bound of 0.15 (referral delay outside trial hospitals) was a modeller
       judgment and is not used"
 fixed:
+  net_survival_k: "Bertozzi-Villa 2021 Supplementary Note 1.4 fixes the smooth-compact shape at k = 20 to aid
+    identifiability and fits only the curve's end point (tau ~ Unif(5.5, 20.7) y); the paper gives no range for k.
+    Briet et al. 2012 Malar J 11:20 (PMC3273435) used k = 18 for the same function. The median retention, which the
+    paper estimates, carries the uncertainty (net_retention_half)"
   cfp_half: "attempt 8's range (1.5-3.5 y, registry cfp_half_life_years) is a modeller reading of Mosha 2022/2024
     durability, not a published half-life estimate"
   irs_rep: "no published range on the card or in the attempt 8 registry"
@@ -76,3 +81,16 @@ not_exposed:
   smc_protection_days: "the SMC protection duration is a module constant (model.py), not an engine parameter"
   species_bionomics: "Q0, phi_I, phi_B, mu0 per species are module constants (vector.SPECIES), not engine parameters"
   natural_history: "the Griffin-lite natural-history constants (model.py) are fixed by design (GRIFFIN)"
+# v0.9: country-specific values a run spec can cite (not read by toolkit/spec/priors.py). A spec sets one through
+# engine_parameters.net_retention_half {value, range, dist, source, reason}; the Nigeria upper bound (2.47 y = 901.6 d)
+# is above the card's range (865.05 d), so such a spec needs outside_card_range: true.
+country_values:
+  net_retention_half:
+    Nigeria:
+      value: 810.3                       # 2.22 y, in days
+      ci95: [730.0, 901.55]              # 2.00-2.47 y
+      units: days
+      surveys: 9
+      source: "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080), Supplementary Table 1.7
+        (LLIN median retention times from the stock-and-flow model): Nigeria (NGA) 2.22 y (95% CI 2.00-2.47), 9 surveys"
+      note: "the median of the same smooth-compact curve (k = 20) the engine uses; a national value, not a state value"

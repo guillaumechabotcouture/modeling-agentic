@@ -61,6 +61,12 @@ run_series() returns monthly series of the card's outputs["series"] (under-5 pre
 all-age and under-5 clinical incidence per person-year; two more prevalence bands), read from the model's daily
 records through run_batch's member loop (shared burn-in and history). run and run_batch are unchanged (self-test S7;
 benchmarks/restamp_proof.py compares the v0.7 and v0.8 code).
+
+v0.9: net attrition follows the smooth-compact survival function of Bertozzi-Villa 2021 (Supplementary Note 1.4),
+S(t) = exp(k - k / (1 - (t/L)^2)) for t < L and 0 after, k = 20 (new fixed parameter net_survival_k) and L from the
+median retention net_retention_half (unchanged name, value and range). A net of age a days is lost each day with
+probability 1 - S(a+1)/S(a) (model.net_loss_prob), and access_for_use divides by the same S(t). Not byte-identical
+to v0.8: every benchmark was recomputed (ENGINE_NOTES.md, v0.9). Self-tests N0-N4.
 """
 from __future__ import annotations
 
@@ -89,7 +95,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.8"
+VERSION = "0.9"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -106,7 +112,11 @@ _PARAMS = [
     ("exp_corr", 0.2, "fixed", "correlation", 0.0, 0.6, "assumption: correlation of log biting rate with net non-use", "unverified"),
     ("irs_coverage", 0.8, "scenario", "share", None, None, "policy assumption (attempt 8 IRS_COVERAGE)", "unverified"),
     ("net_retention_half", 1.64 * 365., "fixed", "days", 1.33 * 365., 2.37 * 365., BV + ": LLIN median retention 1.64 y "
-     "(IQR 1.33-2.37) across 40 countries; used as an exponential half-life (the paper's loss curve is S-shaped: shape unverified)", "matched"),
+     "(IQR 1.33-2.37) across 40 countries (main text, Net retention time; Fig. 5; Supplementary Table 1.7); the median of "
+     "the smooth-compact survival curve (v0.9; shape constant net_survival_k)", "matched"),
+    ("net_survival_k", 20.0, "fixed", "shape", None, None, BV + ", Supplementary Note 1.4 (stock-and-flow model): "
+     "smooth-compact loss exp(k - k / (1 - (t/tau)^2)) for t < tau, else 0, with k fixed at 20; the median retention is "
+     "where the curve is 0.5", "matched"),
     ("use_rate", 0.871, "fixed", "share", 0.833, 0.901, BV + ": ITN use among those with access, all-country 87.1% (83.3-90.1)", "matched"),
     ("use_persist", 0.5, "fixed", "share", 0.0, 1.0, "assumption: share of the use gap that is persistent non-use (the rest is "
      "night-to-night variation)", "unverified"),
@@ -180,7 +190,7 @@ def access_for_use(use: float, at_years: float, P: dict) -> tuple:
     `at_years` after distribution: use = access x retention(t) x use_rate. Capped at 1;
     the flag is True when the reported use cannot be reached under the engine's retention
     and use rate."""
-    ret = float(np.exp(-np.log(2) * at_years * 365.0 / P["net_retention_half"]))
+    ret = float(M.net_survival(at_years * 365.0, P["net_retention_half"], P["net_survival_k"]))   # v0.9: the sim's S(t)
     need = use / max(ret * P["use_rate"], 1e-9)
     return min(need, 1.0), bool(need > 1.0)
 
@@ -254,7 +264,8 @@ class MalariaEngine:
                 + "); dual-AI adds a fitted chlorfenapyr kill",
                 "IRS: deterrence on entry (a share diverted to outdoor biting) and killing of indoor-resting fed "
                 "mosquitoes, product-specific decay (pirimiphos-methyl CS from the trial's wall cone bioassays)",
-                "field use of nets: attrition (median retention, Bertozzi-Villa 2021), use below access with nightly "
+                "field use of nets: attrition by net age on the smooth-compact survival curve (median retention and "
+                "shape k = 20, Bertozzi-Villa 2021; v0.9), use below access with nightly "
                 "variation (use rate, same source), holes growing with net age (Briet 2020); survey use mapped to access",
                 "households: correlated net use within households, correlated net use and spraying, "
                 "biting heterogeneity correlated with net non-use",
@@ -1764,6 +1775,17 @@ def _self_test_v09(ok, e, unit) -> None:
            f"exponential {0.5 ** (1 / 1.64):.3f})")
     case("N4", n4)
 
+    def n5():
+        # the Muleba setting keeps its own trial-derived retention: reported use 77.3% in year 1 (surveys at 4 and 9
+        # months, mean 0.54 y) and 59.2% in year 2 (16 and 21 months, mean 1.54 y; Protopopoff 2018). Under the
+        # engine's survival curve its median must give that ratio (v0.3 derived 949 d for the exponential)
+        pk = yaml.safe_load(open(os.path.join(HERE, "benchmarks", "pack.yaml")))
+        med = float(pk["settings"]["muleba"]["params"]["net_retention_half"])
+        r = float(M.net_survival(1.54 * 365, med, P0["net_survival_k"]) / M.net_survival(0.54 * 365, med, P0["net_survival_k"]))
+        ok(abs(r - 0.592 / 0.773) < 0.002, f"N5 Muleba's median retention ({med:g} d) reproduces its trial's year-2 / "
+                                           f"year-1 use ratio under S(t): {r:.4f} vs {0.592 / 0.773:.4f}")
+    case("N5", n5)
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
@@ -1776,8 +1798,14 @@ def write_card(path: str) -> None:
                          for k, v in V.IRS_CONE.items()}
     card["irs_decay"]["short"] = {"source": V.IRS_SOURCE["short"], "verified": "unverified"}
     card["field_use"] = {
-        "attrition": {"net_retention_half_days": 1.64 * 365, "source": BV + " (median LLIN retention 1.64 y, IQR 1.33-2.37)",
-                      "verified": "matched", "unverified_parts": ["exponential shape (the paper's loss curve is S-shaped)"],
+        "attrition": {"net_retention_half_days": 1.64 * 365, "net_survival_k": 20.0,
+                      "function": "S(t) = exp(k - k / (1 - (t/L)^2)) for t < L, else 0; L = median sqrt((k + ln2) / ln2) "
+                                  "(8.96 y at the 1.64 y median); daily loss 1 - S(a+1)/S(a) at net age a (v0.9)",
+                      "source": BV + " (median LLIN retention 1.64 y, IQR 1.33-2.37, main text and Supplementary Table "
+                                "1.7; smooth-compact form and k = 20, Supplementary Note 1.4)",
+                      "verified": "matched",
+                      "country_values": {"Nigeria": {"median_years": 2.22, "ci95": [2.00, 2.47], "surveys": 9,
+                                                     "source": BV + " Supplementary Table 1.7"}},
                       "range_note": "Briet 2020 Table 3 cohorts: 24-month survival 0.69-0.98 (longer retention)"},
         "use_given_access": {"use_rate": 0.871, "source": BV + " (all-country use rate 87.1%, 83.3-90.1)", "verified": "matched"},
         "nightly_variation": {"use_persist": 0.5, "source": "assumption", "verified": "unverified"},
