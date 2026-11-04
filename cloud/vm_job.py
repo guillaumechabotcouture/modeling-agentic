@@ -155,12 +155,26 @@ def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
     return None
 
 
-def _client(name, cluster=None):
+class WorkerGone(RuntimeError):
+    """The job's own worker is not in the cluster's worker table."""
+
+
+def _job_worker(dest):
+    """The worker the job was submitted to (job.json, written by `start`), or None."""
+    try:
+        return json.load(open(os.path.join(dest, "job.json"))).get("worker")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _client(name, cluster=None, want=None):
     """The VM cluster's client and its worker. The table is read with worker_side's bounded
     reader (scheduler_info() is {} while the client is not connected; a closed client is
     replaced from the cluster), so only a connected scheduler with no worker says so.
     `cluster` is the object `run` created (its clients come from that object, never from a
-    coiled.Cluster(name=...) attach); otherwise the guarded attach by name."""
+    coiled.Cluster(name=...) attach); otherwise the guarded attach by name. `want` is the
+    job's own worker: the job's state lives on that VM's disk only, so a poll goes there
+    (another worker would read 'missing'), and its absence raises WorkerGone."""
     cl, box = (cluster if cluster is not None else rc.attach(name)), [None]
 
     def client():
@@ -173,9 +187,11 @@ def _client(name, cluster=None):
         raise SystemExit(f"{name}: {e}") from e
     if not w:
         raise SystemExit(f"{name} has no worker yet")
+    if want is not None and want not in w:
+        raise WorkerGone(f"the job's worker {want} is not in {name}'s worker table")
     c = client()
     c.upload_file(os.path.join(HERE, "worker_side.py"))   # the side functions below live in it
-    return c, w[0]
+    return c, (want if want is not None else w[0])
 
 
 def _runner(c, w):
@@ -268,8 +284,8 @@ def _print(st, dest):
 
 
 def cmd_status(a):
-    c, w = _client(a.name)
     dest = local_dir(a.name, a.job_id, a.out)
+    c, w = _client(a.name, want=_job_worker(dest))
     st = sync_outputs(_runner(c, w), a.job_id, dest)
     _print(st, dest)
     return st
@@ -279,10 +295,21 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None):
     """Poll (saving outputs each time) until the job ends; returns its last status. With
     `gone_ok` (`run`), a cluster that is no longer running (by id `cid`) returns None, and
     every other error (a dropped connection, a failing cluster listing) is retried, up to
-    `deadline`."""
+    `deadline`. Every poll goes to the job's own worker (job.json); that worker missing from
+    the table on three polls in a row reads as 'lost'."""
+    want, gone_polls = _job_worker(dest), 0
     while True:
         try:
-            c, w = _client(a.name, cluster)
+            try:
+                c, w = _client(a.name, cluster, want)
+            except WorkerGone as e:
+                gone_polls += 1
+                if gone_polls >= 3:
+                    print(f"{a.job_id}: lost ({e})")
+                    return {"state": {"job_id": a.job_id, "state": "lost", "why": str(e)}, "files": {},
+                            "fetched": [], "log_tail": ""}
+                raise
+            gone_polls = 0
             st = sync_outputs(_runner(c, w), a.job_id, dest)
             _print(st, dest)
             if st["state"]["state"] in DONE + ("missing", "lost"):
