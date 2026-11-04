@@ -8,7 +8,8 @@ a constructor that raised after allocating), the cluster is stopped, unless
 `--keep-on-failure` and the job did not succeed. The cluster gets a name of its own,
 <name>-<job_id>-<6 hex>, recorded with its id in job.json, so no other launcher can race it
 for the name; `status`, `wait` and `down <name> <job_id>` find it there. A live cluster
-named <name>, or one already running for this job, is refused (no second launch). It takes
+named <name>, or one already running for this job, is refused (no second launch), and a
+lock on the job's local directory refuses a second `run` of the job on this machine. It takes
 every `up` and `start` option; its polls and stops use the cluster object it created and
 its id, never an attach by name.
 
@@ -217,10 +218,10 @@ def _client(name, cluster=None, want=None):
         w = sorted(ws.scheduler_workers(client, log=print))
     except ws.SchedulerInfoUnavailable as e:
         raise SystemExit(f"{name}: {e}") from e
+    if want is not None and want not in w:     # an empty table included: the job's VM is gone
+        raise WorkerGone(f"the job's worker {want} is not in {name}'s worker table")
     if not w:
         raise SystemExit(f"{name} has no worker yet")
-    if want is not None and want not in w:
-        raise WorkerGone(f"the job's worker {want} is not in {name}'s worker table")
     c = client()
     c.upload_file(os.path.join(HERE, "worker_side.py"))   # the side functions below live in it
     return c, (want if want is not None else w[0])
@@ -453,12 +454,29 @@ def cmd_run(a):
         raise SystemExit(f"bad job id {a.job_id!r}: {e}") from e
     if not a.command:
         raise SystemExit("no command given (put it after --)")
+    import fcntl
+    os.makedirs(dest, exist_ok=True)
+    lock = open(os.path.join(dest, ".run.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit(f"{a.job_id}: another `run` of this job is in progress on this machine "
+                         f"({os.path.join(dest, '.run.lock')}); `status {a.name} {a.job_id}` checks it") from None
+    try:
+        return _run_locked(a, dest)
+    finally:
+        lock.close()
+
+
+def _run_locked(a, dest):
+    """`run` once the job's lock is held (see cmd_run)."""
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
     a.shutdown_grace_s = int(2 * a.every + 60)
     base = a.name
-    prefix = run_cluster_name(base, a.job_id, "x")[:-1]     # <name>-<job_id>-
+    prefix = run_cluster_name(base, a.job_id, "0" * 6)[:-6]     # <name>-<job_id>-, truncated as real names are
     busy = sorted(f"{c.get('name')} ({c.get('id')})" for c in _all_clusters()
                   if ws.state_of(c) not in _ENDED + ("",)
                   and (c.get("name") == base or str(c.get("name") or "").startswith(prefix)))

@@ -928,9 +928,11 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     except Exception as e:  # noqa: BLE001 — a job that cannot start is recorded, not lost
         st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time(),
                   shutdown=bool(shutdown_always))
-        _job_write(d, st)
-        if shutdown_always:
-            _job_shutdown(shutdown_grace_s)
+        try:
+            _job_write(d, st)
+        finally:   # a failed write (disk full) never skips the stop
+            if shutdown_always:
+                _job_shutdown(shutdown_grace_s)
         return st
     final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
                  ended=time.time(), duration_s=round(time.time() - t0))
@@ -964,9 +966,11 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     down = bool(shutdown_always or (shutdown_when_stored and st["state"] == "done"
                                     and (st.get("stored") or {}).get("verified")))
     st["shutdown"] = down
-    _job_write(d, st)
-    if down:
-        _job_shutdown(shutdown_grace_s)
+    try:
+        _job_write(d, st)
+    finally:   # a failed final-state write (disk full) never skips the stop
+        if down:
+            _job_shutdown(shutdown_grace_s)
     return st
 
 
