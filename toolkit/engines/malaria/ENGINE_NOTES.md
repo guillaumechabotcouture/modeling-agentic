@@ -17,7 +17,7 @@ B7 moved from 0.578 to 0.501, B8 from 0.449 to 0.410, and B16c stayed at 4 of 5 
 The joint fit moved to cfp_kill 0.405 and irs_kill 0.433. The equilibration values are unchanged: the burn-in has no
 nets. The v0.5–v0.8 column below is `history/results_v0.8.yaml`.
 
-**Open item: engine self-test V7 fails on the recomputed guess-sensitivity evidence.** V7 asks that four decision
+**Engine self-test V7 failed on the 6-seed guess-sensitivity evidence, and passes at 24 seeds.** V7 asks that four decision
 outputs move by at most 3% between the x0.25 and x4 burn-in starting guesses, at every level. Two outputs miss at
 v0.9: treated_all at m0 3.5 (−3.2%, paired seed SE 1.0%) and DALYs averted at m0 9.0 (+7.1%, paired seed SE 4.9%).
 At v0.8 every output was within 3%, with paired SEs up to 6.3%. Six seeds cannot resolve a 3% tolerance for these
@@ -26,7 +26,15 @@ re-tuned to make V7 pass.
 
 *Extension declared before running it (review round 2):* `guess_sensitivity.py` goes from 6 to 24 seeds. The 3%
 tolerance, the levels, the guesses and the outputs stay the same. 24 seeds about halve the paired SE. The result is
-reported whether it passes or not, and nothing else is changed to make it pass. The paragraph that follows describes the v0.6–v0.8
+reported whether it passes or not, and nothing else is changed to make it pass.
+
+*Result (Coiled cluster 2325371, run `gs24`, 19.3 credits):* every output is within 3% at every level, and V7
+passes. The largest moves between the x0.25 and x4 guesses are:
+- DALYs averted: +2.3% at m0 3.5 (paired SE 1.5%), +2.2% at m0 9.0 (SE 2.3%), −1.4% at m0 28 (SE 1.7%);
+- PfPR 6–59 m: +1.8% at m0 9.0 (SE 2.1%);
+- treated_all: −0.8% at m0 3.5 (SE 1.2%).
+
+The 6-seed misses were within seed noise. `guess_sensitivity.yaml` now holds the 24-seed run. The paragraph that follows describes the v0.6–v0.8
 re-stamps; those numbers are now history.
 
 **v0.8, v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit
