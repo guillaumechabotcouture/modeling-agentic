@@ -1,6 +1,6 @@
 producer: toolkit/engines/malaria/benchmarks/guess_sensitivity.py
-engine_version: '0.8'
-code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
+engine_version: '0.9'
+code_sha256: 2a194886e13b30a610575d5f17c04958745f10b36a1dbdd571294f65420d3c8b
 tol: 0.03
 burnin_years: 50
 seeds:
@@ -17,713 +17,511 @@ levels:
 - m0: 3.5
   mean:
     pfpr_u5_cal:
-      x0.25: 0.11369
-      x1: 0.11384
-      x4: 0.11098
+      x0.25: 0.10515
+      x1: 0.10207
+      x4: 0.10232
     cases_all:
-      x0.25: 1.62803
-      x1: 1.62516
-      x4: 1.60664
+      x0.25: 1.64978
+      x1: 1.60205
+      x4: 1.61254
     treated_all:
-      x0.25: 0.48921
-      x1: 0.49034
-      x4: 0.48092
+      x0.25: 0.49651
+      x1: 0.47891
+      x4: 0.48055
     dalys_averted:
-      x0.25: 0.14186
-      x1: 0.14891
-      x4: 0.14268
+      x0.25: 0.13731
+      x1: 0.13607
+      x4: 0.13976
   seed_sd:
-    pfpr_u5_cal: 0.01769
-    cases_all: 0.04541
-    treated_all: 0.01705
-    dalys_averted: 0.00388
+    pfpr_u5_cal: 0.01067
+    cases_all: 0.04842
+    treated_all: 0.01432
+    dalys_averted: 0.00681
   rel_x4_vs_x025:
-    pfpr_u5_cal: -0.0238
-    cases_all: -0.0131
-    treated_all: -0.0169
-    dalys_averted: 0.0058
+    pfpr_u5_cal: -0.0269
+    cases_all: -0.0226
+    treated_all: -0.0321
+    dalys_averted: 0.0178
   rel_x025_vs_x1:
-    pfpr_u5_cal: -0.0013
-    cases_all: 0.0018
-    treated_all: -0.0023
-    dalys_averted: -0.0473
+    pfpr_u5_cal: 0.0302
+    cases_all: 0.0298
+    treated_all: 0.0368
+    dalys_averted: 0.0091
   rel_x4_vs_x1:
-    pfpr_u5_cal: -0.0251
-    cases_all: -0.0114
-    treated_all: -0.0192
-    dalys_averted: -0.0418
+    pfpr_u5_cal: 0.0025
+    cases_all: 0.0066
+    treated_all: 0.0034
+    dalys_averted: 0.0271
   paired_se_x4_vs_x025:
-    pfpr_u5_cal: 0.0325
-    cases_all: 0.0146
-    treated_all: 0.0209
-    dalys_averted: 0.0481
+    pfpr_u5_cal: 0.0478
+    cases_all: 0.0096
+    treated_all: 0.0101
+    dalys_averted: 0.0403
 - m0: 9.0
   mean:
     pfpr_u5_cal:
-      x0.25: 0.24397
-      x1: 0.25046
-      x4: 0.24733
+      x0.25: 0.22628
+      x1: 0.23349
+      x4: 0.22493
     cases_all:
-      x0.25: 2.14845
-      x1: 2.12126
-      x4: 2.16716
+      x0.25: 2.137
+      x1: 2.15134
+      x4: 2.16813
     treated_all:
-      x0.25: 0.64373
-      x1: 0.63367
-      x4: 0.65398
+      x0.25: 0.63903
+      x1: 0.63745
+      x4: 0.64358
     dalys_averted:
-      x0.25: 0.14609
-      x1: 0.13373
-      x4: 0.14541
+      x0.25: 0.13217
+      x1: 0.12969
+      x4: 0.1415
   seed_sd:
-    pfpr_u5_cal: 0.01139
-    cases_all: 0.06287
-    treated_all: 0.01345
-    dalys_averted: 0.00896
+    pfpr_u5_cal: 0.01741
+    cases_all: 0.04366
+    treated_all: 0.01841
+    dalys_averted: 0.00807
   rel_x4_vs_x025:
-    pfpr_u5_cal: 0.0137
-    cases_all: 0.0087
-    treated_all: 0.0159
-    dalys_averted: -0.0047
+    pfpr_u5_cal: -0.006
+    cases_all: 0.0146
+    treated_all: 0.0071
+    dalys_averted: 0.0706
   rel_x025_vs_x1:
-    pfpr_u5_cal: -0.0259
-    cases_all: 0.0128
-    treated_all: 0.0159
-    dalys_averted: 0.0924
+    pfpr_u5_cal: -0.0309
+    cases_all: -0.0067
+    treated_all: 0.0025
+    dalys_averted: 0.0191
   rel_x4_vs_x1:
-    pfpr_u5_cal: -0.0125
-    cases_all: 0.0216
-    treated_all: 0.032
-    dalys_averted: 0.0873
+    pfpr_u5_cal: -0.0367
+    cases_all: 0.0078
+    treated_all: 0.0096
+    dalys_averted: 0.0911
   paired_se_x4_vs_x025:
-    pfpr_u5_cal: 0.0626
-    cases_all: 0.0202
-    treated_all: 0.0168
-    dalys_averted: 0.0284
+    pfpr_u5_cal: 0.0465
+    cases_all: 0.0126
+    treated_all: 0.0123
+    dalys_averted: 0.0491
 - m0: 28.0
   mean:
     pfpr_u5_cal:
-      x0.25: 0.43688
-      x1: 0.43427
-      x4: 0.44133
+      x0.25: 0.42465
+      x1: 0.41465
+      x4: 0.43595
     cases_all:
-      x0.25: 2.5585
-      x1: 2.54197
-      x4: 2.52494
+      x0.25: 2.57378
+      x1: 2.55442
+      x4: 2.5488
     treated_all:
-      x0.25: 0.76659
-      x1: 0.76438
-      x4: 0.75646
+      x0.25: 0.77544
+      x1: 0.77332
+      x4: 0.76532
     dalys_averted:
-      x0.25: 0.12231
-      x1: 0.1222
-      x4: 0.12176
+      x0.25: 0.11129
+      x1: 0.10759
+      x4: 0.11236
   seed_sd:
-    pfpr_u5_cal: 0.01098
-    cases_all: 0.05196
-    treated_all: 0.01882
-    dalys_averted: 0.00914
+    pfpr_u5_cal: 0.01587
+    cases_all: 0.05895
+    treated_all: 0.01749
+    dalys_averted: 0.00488
   rel_x4_vs_x025:
-    pfpr_u5_cal: 0.0102
-    cases_all: -0.0131
-    treated_all: -0.0132
-    dalys_averted: -0.0045
+    pfpr_u5_cal: 0.0266
+    cases_all: -0.0097
+    treated_all: -0.0131
+    dalys_averted: 0.0096
   rel_x025_vs_x1:
-    pfpr_u5_cal: 0.006
-    cases_all: 0.0065
-    treated_all: 0.0029
-    dalys_averted: 0.0009
+    pfpr_u5_cal: 0.0241
+    cases_all: 0.0076
+    treated_all: 0.0027
+    dalys_averted: 0.0343
   rel_x4_vs_x1:
-    pfpr_u5_cal: 0.0162
-    cases_all: -0.0067
+    pfpr_u5_cal: 0.0514
+    cases_all: -0.0022
     treated_all: -0.0104
-    dalys_averted: -0.0036
+    dalys_averted: 0.0443
   paired_se_x4_vs_x025:
-    pfpr_u5_cal: 0.0108
-    cases_all: 0.0132
-    treated_all: 0.0131
-    dalys_averted: 0.0407
+    pfpr_u5_cal: 0.0181
+    cases_all: 0.0058
+    treated_all: 0.0094
+    dalys_averted: 0.0341
 rows:
 - m0: 3.5
   guess: x0.25
   seed: 1
-  pfpr_u5_cal: 0.12444698780286
-  cases_all: 1.7156436645181454
-  treated_all: 0.5112783230328025
-  dalys_averted: 0.13865729281564654
+  pfpr_u5_cal: 0.12578434030255373
+  cases_all: 1.6809330260737165
+  treated_all: 0.5060248209979701
+  dalys_averted: 0.12244192000843301
 - m0: 3.5
   guess: x0.25
   seed: 2
-  pfpr_u5_cal: 0.11929930141591487
-  cases_all: 1.6163863232074742
-  treated_all: 0.4916339966025829
-  dalys_averted: 0.14623306722522691
+  pfpr_u5_cal: 0.1166833037462909
+  cases_all: 1.6953095568045995
+  treated_all: 0.4981788501203933
+  dalys_averted: 0.14362063946354767
 - m0: 3.5
   guess: x0.25
   seed: 3
-  pfpr_u5_cal: 0.09066718325620653
-  cases_all: 1.572240677054058
-  treated_all: 0.4583271175920573
-  dalys_averted: 0.13025389333312803
+  pfpr_u5_cal: 0.08808043397942743
+  cases_all: 1.631673708213569
+  treated_all: 0.48950211246407077
+  dalys_averted: 0.15339686137886746
 - m0: 3.5
   guess: x0.25
   seed: 4
-  pfpr_u5_cal: 0.1125452120656481
-  cases_all: 1.5881554350545968
-  treated_all: 0.48503024143513057
-  dalys_averted: 0.14173022267080576
+  pfpr_u5_cal: 0.10011426143384984
+  cases_all: 1.617767018573434
+  treated_all: 0.49290167502874555
+  dalys_averted: 0.14250917499892374
 - m0: 3.5
   guess: x0.25
   seed: 5
-  pfpr_u5_cal: 0.12777777631652115
-  cases_all: 1.6465762875760892
-  treated_all: 0.4971058228508256
-  dalys_averted: 0.15358238460380796
+  pfpr_u5_cal: 0.09547012525956823
+  cases_all: 1.6673964357210183
+  treated_all: 0.5042441593576583
+  dalys_averted: 0.1376056662844905
 - m0: 3.5
   guess: x0.25
   seed: 6
-  pfpr_u5_cal: 0.10738932717476397
-  cases_all: 1.629161657948606
-  treated_all: 0.49185688663094834
-  dalys_averted: 0.14069466458192542
+  pfpr_u5_cal: 0.10479231043604018
+  cases_all: 1.6055947852310553
+  treated_all: 0.4881999581058112
+  dalys_averted: 0.12429367487080786
 - m0: 3.5
   guess: x1
   seed: 1
-  pfpr_u5_cal: 0.12636649136229322
-  cases_all: 1.592373991772255
-  treated_all: 0.4806954361871707
-  dalys_averted: 0.14880533170905216
+  pfpr_u5_cal: 0.10971209677917246
+  cases_all: 1.5434038478047096
+  treated_all: 0.45968142804784085
+  dalys_averted: 0.13135307315671804
 - m0: 3.5
   guess: x1
   seed: 2
-  pfpr_u5_cal: 0.13207044598753118
-  cases_all: 1.6903046688203918
-  treated_all: 0.507418643322008
-  dalys_averted: 0.15178004250192806
+  pfpr_u5_cal: 0.11402049610138472
+  cases_all: 1.668360159966557
+  treated_all: 0.4985638415037939
+  dalys_averted: 0.1306115403083447
 - m0: 3.5
   guess: x1
   seed: 3
-  pfpr_u5_cal: 0.09242251661595592
-  cases_all: 1.6141719567064738
-  treated_all: 0.48658515387955487
-  dalys_averted: 0.15461344374610325
+  pfpr_u5_cal: 0.10308954987782808
+  cases_all: 1.5718760572309938
+  treated_all: 0.47345884024923346
+  dalys_averted: 0.14752689501010816
 - m0: 3.5
   guess: x1
   seed: 4
-  pfpr_u5_cal: 0.09747010409682036
-  cases_all: 1.5802840014609818
+  pfpr_u5_cal: 0.08353560106480197
+  cases_all: 1.5671649454716237
   treated_all: 0.46816288373452714
-  dalys_averted: 0.14753966009195124
+  dalys_averted: 0.1352318779009619
 - m0: 3.5
   guess: x1
   seed: 5
-  pfpr_u5_cal: 0.10462420610798934
-  cases_all: 1.6009702487824355
-  treated_all: 0.4856051695898173
-  dalys_averted: 0.1472718403888304
+  pfpr_u5_cal: 0.10433238592279663
+  cases_all: 1.6231784068036932
+  treated_all: 0.48659660521576625
+  dalys_averted: 0.14074117960105537
 - m0: 3.5
   guess: x1
   seed: 6
-  pfpr_u5_cal: 0.13006136609098132
-  cases_all: 1.6728416375544108
-  treated_all: 0.5135952950859304
-  dalys_averted: 0.14344328981507534
+  pfpr_u5_cal: 0.09775470537168385
+  cases_all: 1.6383039792614489
+  treated_all: 0.48698098193076544
+  dalys_averted: 0.13098270224591302
 - m0: 3.5
   guess: x4
   seed: 1
-  pfpr_u5_cal: 0.12261968477601873
-  cases_all: 1.6593561427163688
-  treated_all: 0.5075258215793508
-  dalys_averted: 0.14507479788327993
+  pfpr_u5_cal: 0.09977307325291673
+  cases_all: 1.6452842622659247
+  treated_all: 0.48463556271329505
+  dalys_averted: 0.1455692414764613
 - m0: 3.5
   guess: x4
   seed: 2
-  pfpr_u5_cal: 0.10986135466160149
-  cases_all: 1.6017566506382508
-  treated_all: 0.4775818111084605
-  dalys_averted: 0.14997367960214003
+  pfpr_u5_cal: 0.1039907007978627
+  cases_all: 1.6123439136817677
+  treated_all: 0.47469437573295586
+  dalys_averted: 0.13151176353013966
 - m0: 3.5
   guess: x4
   seed: 3
-  pfpr_u5_cal: 0.08624922881476864
-  cases_all: 1.657926335474212
-  treated_all: 0.49369524042931234
-  dalys_averted: 0.15521992880263086
+  pfpr_u5_cal: 0.09264080220984053
+  cases_all: 1.6531862777743738
+  treated_all: 0.49734143865995717
+  dalys_averted: 0.1561961707529498
 - m0: 3.5
   guess: x4
   seed: 4
-  pfpr_u5_cal: 0.11633536499886897
-  cases_all: 1.5740993036374273
-  treated_all: 0.4698496195045875
-  dalys_averted: 0.14425498736213613
+  pfpr_u5_cal: 0.1043499465377266
+  cases_all: 1.6078340190386344
+  treated_all: 0.4764091474992666
+  dalys_averted: 0.13373005594840268
 - m0: 3.5
   guess: x4
   seed: 5
-  pfpr_u5_cal: 0.11257304887767197
-  cases_all: 1.5734083383810535
-  treated_all: 0.4834240112127295
-  dalys_averted: 0.12808799016702796
+  pfpr_u5_cal: 0.10495397066724377
+  cases_all: 1.5920473281488947
+  treated_all: 0.4776736845822253
+  dalys_averted: 0.14712376170809427
 - m0: 3.5
   guess: x4
   seed: 6
-  pfpr_u5_cal: 0.11822497227383284
-  cases_all: 1.5732919165923436
-  treated_all: 0.45345913711700814
-  dalys_averted: 0.1334730551378857
+  pfpr_u5_cal: 0.10823771695962835
+  cases_all: 1.5645559206711828
+  treated_all: 0.4725564305260578
+  dalys_averted: 0.12443357366007882
 - m0: 9.0
   guess: x0.25
   seed: 1
-  pfpr_u5_cal: 0.23101310752331033
-  cases_all: 2.12053857134559
-  treated_all: 0.6396138727408528
-  dalys_averted: 0.1359050632400773
+  pfpr_u5_cal: 0.23641351501074956
+  cases_all: 2.1614408371882146
+  treated_all: 0.647306500720429
+  dalys_averted: 0.14189996973152735
 - m0: 9.0
   guess: x0.25
   seed: 2
-  pfpr_u5_cal: 0.26644172030761226
-  cases_all: 2.258166959336296
-  treated_all: 0.6727724424925713
-  dalys_averted: 0.14939000976969952
+  pfpr_u5_cal: 0.2373855197595177
+  cases_all: 2.212352984711623
+  treated_all: 0.6671900674332624
+  dalys_averted: 0.1392837882268742
 - m0: 9.0
   guess: x0.25
   seed: 3
-  pfpr_u5_cal: 0.24893113449156998
-  cases_all: 2.15125695608046
-  treated_all: 0.6470178760279282
-  dalys_averted: 0.16061786804412212
+  pfpr_u5_cal: 0.1945039554529717
+  cases_all: 2.134302134307961
+  treated_all: 0.6441009174434122
+  dalys_averted: 0.13746401775784545
 - m0: 9.0
   guess: x0.25
   seed: 4
-  pfpr_u5_cal: 0.2605775809124756
-  cases_all: 2.0409502817730187
-  treated_all: 0.6122850845319056
-  dalys_averted: 0.13255042839076997
+  pfpr_u5_cal: 0.24712762973840854
+  cases_all: 2.045448243826513
+  treated_all: 0.6117228392752188
+  dalys_averted: 0.11380650189539981
 - m0: 9.0
   guess: x0.25
   seed: 5
-  pfpr_u5_cal: 0.18859166228584173
-  cases_all: 2.1095767248942696
-  treated_all: 0.6351136619829256
-  dalys_averted: 0.1513165505979403
+  pfpr_u5_cal: 0.18488066997694705
+  cases_all: 2.073885042360106
+  treated_all: 0.6202421275936907
+  dalys_averted: 0.13211270993646634
 - m0: 9.0
   guess: x0.25
   seed: 6
-  pfpr_u5_cal: 0.26828420396204683
-  cases_all: 2.2102069680537326
-  treated_all: 0.6556060194787569
-  dalys_averted: 0.146757066550744
+  pfpr_u5_cal: 0.25737460767078146
+  cases_all: 2.1945634404739796
+  treated_all: 0.6436194204241406
+  dalys_averted: 0.1284233168830526
 - m0: 9.0
   guess: x1
   seed: 1
-  pfpr_u5_cal: 0.254607655363353
-  cases_all: 2.1760755928566766
-  treated_all: 0.6428034989762869
-  dalys_averted: 0.14202035437612154
+  pfpr_u5_cal: 0.22264747420066844
+  cases_all: 2.158438836025453
+  treated_all: 0.6461807502843934
+  dalys_averted: 0.11657159161006525
 - m0: 9.0
   guess: x1
   seed: 2
-  pfpr_u5_cal: 0.2530218038607729
-  cases_all: 2.1567217298102346
-  treated_all: 0.6358132696861124
-  dalys_averted: 0.14427131689695538
+  pfpr_u5_cal: 0.2643087611439519
+  cases_all: 2.22294024775514
+  treated_all: 0.6648801191328587
+  dalys_averted: 0.13660150383680347
 - m0: 9.0
   guess: x1
   seed: 3
-  pfpr_u5_cal: 0.23368240668289028
-  cases_all: 2.148157687584412
-  treated_all: 0.6455593967356702
-  dalys_averted: 0.13569333140166523
+  pfpr_u5_cal: 0.21429095280638538
+  cases_all: 2.168029467941426
+  treated_all: 0.64391860753188
+  dalys_averted: 0.13857871232311197
 - m0: 9.0
   guess: x1
   seed: 4
-  pfpr_u5_cal: 0.2675515005813377
-  cases_all: 2.1500258615702545
-  treated_all: 0.6315888383448184
-  dalys_averted: 0.13319127085651172
+  pfpr_u5_cal: 0.237483861500114
+  cases_all: 2.144028578832262
+  treated_all: 0.6329007439437543
+  dalys_averted: 0.12682632807045505
 - m0: 9.0
   guess: x1
   seed: 5
-  pfpr_u5_cal: 0.24331759650780943
-  cases_all: 2.007657142546713
-  treated_all: 0.6081466129571129
-  dalys_averted: 0.12120018607256955
+  pfpr_u5_cal: 0.22600058745750295
+  cases_all: 2.1157236257751535
+  treated_all: 0.6121123554609089
+  dalys_averted: 0.13281006675944154
 - m0: 9.0
   guess: x1
   seed: 6
-  pfpr_u5_cal: 0.2505677000855745
-  cases_all: 2.0889188386366833
-  treated_all: 0.6381340276364348
-  dalys_averted: 0.12598316480208602
+  pfpr_u5_cal: 0.23618395152238472
+  cases_all: 2.0988738107328904
+  treated_all: 0.6247252897109319
+  dalys_averted: 0.12675776666588795
 - m0: 9.0
   guess: x4
   seed: 1
-  pfpr_u5_cal: 0.24487095110929277
-  cases_all: 2.2158521082632654
-  treated_all: 0.6506837520285355
-  dalys_averted: 0.14455005205243435
+  pfpr_u5_cal: 0.24368006478121548
+  cases_all: 2.1987782266500595
+  treated_all: 0.6529352529006066
+  dalys_averted: 0.13846207537068383
 - m0: 9.0
   guess: x4
   seed: 2
-  pfpr_u5_cal: 0.2517147867083975
-  cases_all: 2.222362760680039
-  treated_all: 0.6766223563265774
-  dalys_averted: 0.14687650811444153
+  pfpr_u5_cal: 0.20944689714486037
+  cases_all: 2.272411640522119
+  treated_all: 0.66565010189966
+  dalys_averted: 0.14281494082514318
 - m0: 9.0
   guess: x4
   seed: 3
-  pfpr_u5_cal: 0.23374060452427414
-  cases_all: 2.2353018252968235
-  treated_all: 0.6736351231116355
-  dalys_averted: 0.1552509218673318
+  pfpr_u5_cal: 0.2028289630940298
+  cases_all: 2.1944644051136013
+  treated_all: 0.6450124670010735
+  dalys_averted: 0.13947072699917473
 - m0: 9.0
   guess: x4
   seed: 4
-  pfpr_u5_cal: 0.24298673200644033
-  cases_all: 2.1792626149179672
-  treated_all: 0.6600759313502821
-  dalys_averted: 0.1463131943592604
+  pfpr_u5_cal: 0.24128314061189352
+  cases_all: 2.153399333110375
+  treated_all: 0.650705177072169
+  dalys_averted: 0.14840403227772184
 - m0: 9.0
   guess: x4
   seed: 5
-  pfpr_u5_cal: 0.25018781085467434
-  cases_all: 2.083799398619596
-  treated_all: 0.6363033847340643
-  dalys_averted: 0.1401920346919355
+  pfpr_u5_cal: 0.22077404681758328
+  cases_all: 2.0788422204898507
+  treated_all: 0.6212335632196396
+  dalys_averted: 0.147686998552041
 - m0: 9.0
   guess: x4
   seed: 6
-  pfpr_u5_cal: 0.26045253854885
-  cases_all: 2.066367779398338
-  treated_all: 0.6265537539735004
-  dalys_averted: 0.13925693209277812
+  pfpr_u5_cal: 0.2315570559992682
+  cases_all: 2.1108604097875068
+  treated_all: 0.6259442658859776
+  dalys_averted: 0.1321666182623509
 - m0: 28.0
   guess: x0.25
   seed: 1
-  pfpr_u5_cal: 0.4297801547013792
-  cases_all: 2.574966497358599
-  treated_all: 0.7840851786987456
-  dalys_averted: 0.1159002290057608
+  pfpr_u5_cal: 0.4063447841312564
+  cases_all: 2.571776871123165
+  treated_all: 0.7825841781173649
+  dalys_averted: 0.1097349740110573
 - m0: 28.0
   guess: x0.25
   seed: 2
-  pfpr_u5_cal: 0.444760465846683
-  cases_all: 2.627951183092585
-  treated_all: 0.7890398402795564
-  dalys_averted: 0.13490937670054787
+  pfpr_u5_cal: 0.4399707682233702
+  cases_all: 2.570202475582493
+  treated_all: 0.7697902711095258
+  dalys_averted: 0.11513811672759244
 - m0: 28.0
   guess: x0.25
   seed: 3
-  pfpr_u5_cal: 0.4439004877328506
-  cases_all: 2.5534326209205864
-  treated_all: 0.7693478266660628
-  dalys_averted: 0.1328249012052003
+  pfpr_u5_cal: 0.4032245846082018
+  cases_all: 2.6611777786361417
+  treated_all: 0.8069036684417047
+  dalys_averted: 0.12397038570011293
 - m0: 28.0
   guess: x0.25
   seed: 4
-  pfpr_u5_cal: 0.43571987305885834
-  cases_all: 2.481188317758769
-  treated_all: 0.7477861913934201
-  dalys_averted: 0.10797563875174288
+  pfpr_u5_cal: 0.40681399463141094
+  cases_all: 2.4778148462186484
+  treated_all: 0.7446001349388616
+  dalys_averted: 0.10153240926042639
 - m0: 28.0
   guess: x0.25
   seed: 5
-  pfpr_u5_cal: 0.43436532369308123
-  cases_all: 2.54283409343398
-  treated_all: 0.7530945014708559
-  dalys_averted: 0.12060199191647308
+  pfpr_u5_cal: 0.4461913716517364
+  cases_all: 2.5541364595697984
+  treated_all: 0.7735180753654052
+  dalys_averted: 0.09553945356051946
 - m0: 28.0
   guess: x0.25
   seed: 6
-  pfpr_u5_cal: 0.4327665404996567
-  cases_all: 2.5706175904755844
-  treated_all: 0.7561715539200288
-  dalys_averted: 0.12166100673312497
+  pfpr_u5_cal: 0.44534147808977287
+  cases_all: 2.607593201118638
+  treated_all: 0.7752688473290784
+  dalys_averted: 0.12179564398757114
 - m0: 28.0
   guess: x1
   seed: 1
-  pfpr_u5_cal: 0.44772428552950944
-  cases_all: 2.564834743434279
-  treated_all: 0.7799574270999488
-  dalys_averted: 0.128105142456723
+  pfpr_u5_cal: 0.4271254602861871
+  cases_all: 2.534814731806665
+  treated_all: 0.7589434189606188
+  dalys_averted: 0.10840164784366413
 - m0: 28.0
   guess: x1
   seed: 2
-  pfpr_u5_cal: 0.43496016792982156
-  cases_all: 2.574052389416499
-  treated_all: 0.7901948144297583
-  dalys_averted: 0.11370919275859137
+  pfpr_u5_cal: 0.4385239632134258
+  cases_all: 2.655670562697429
+  treated_all: 0.801937051623477
+  dalys_averted: 0.10931635742918117
 - m0: 28.0
   guess: x1
   seed: 3
-  pfpr_u5_cal: 0.43968390011960257
-  cases_all: 2.6165118503107423
-  treated_all: 0.758956161708725
-  dalys_averted: 0.1291441844929881
+  pfpr_u5_cal: 0.3993875646858075
+  cases_all: 2.593723111369212
+  treated_all: 0.7841149295001745
+  dalys_averted: 0.11201329796486814
 - m0: 28.0
   guess: x1
   seed: 4
-  pfpr_u5_cal: 0.4161280008122746
-  cases_all: 2.4856862798122634
-  treated_all: 0.7582814361849066
-  dalys_averted: 0.12072387959404363
+  pfpr_u5_cal: 0.40160676281942675
+  cases_all: 2.508363505165297
+  treated_all: 0.7549079646447859
+  dalys_averted: 0.11171244147891968
 - m0: 28.0
   guess: x1
   seed: 5
-  pfpr_u5_cal: 0.4280155953111781
-  cases_all: 2.4888999953823547
-  treated_all: 0.7362400958297229
-  dalys_averted: 0.13208644279878884
+  pfpr_u5_cal: 0.4036367516907317
+  cases_all: 2.5285574204203143
+  treated_all: 0.7663797388585724
+  dalys_averted: 0.09909411432389176
 - m0: 28.0
   guess: x1
   seed: 6
-  pfpr_u5_cal: 0.43912575889489813
-  cases_all: 2.5218585434737553
-  treated_all: 0.7626727601869393
-  dalys_averted: 0.109433864228897
+  pfpr_u5_cal: 0.4176019546919553
+  cases_all: 2.505402365110638
+  treated_all: 0.7736435457623508
+  dalys_averted: 0.10502785973954093
 - m0: 28.0
   guess: x4
   seed: 1
-  pfpr_u5_cal: 0.4534421990738628
-  cases_all: 2.447381447941239
-  treated_all: 0.7403685367660326
-  dalys_averted: 0.10827639247825105
+  pfpr_u5_cal: 0.43582191684663024
+  cases_all: 2.528247854263124
+  treated_all: 0.7608196696873447
+  dalys_averted: 0.11152808299716827
 - m0: 28.0
   guess: x4
   seed: 2
-  pfpr_u5_cal: 0.4507845986282143
-  cases_all: 2.635073523685496
-  treated_all: 0.785574917828951
-  dalys_averted: 0.12627018478435748
+  pfpr_u5_cal: 0.4307257233340293
+  cases_all: 2.617363920049068
+  treated_all: 0.7911572928882599
+  dalys_averted: 0.11859276942034447
 - m0: 28.0
   guess: x4
   seed: 3
-  pfpr_u5_cal: 0.4386905168835727
-  cases_all: 2.6631831876629963
-  treated_all: 0.7983351025996893
-  dalys_averted: 0.12945099723855708
+  pfpr_u5_cal: 0.4222763778412418
+  cases_all: 2.623257317037435
+  treated_all: 0.8019813008303341
+  dalys_averted: 0.11878548334562855
 - m0: 28.0
   guess: x4
   seed: 4
-  pfpr_u5_cal: 0.4360556589999873
-  cases_all: 2.4305862446569586
-  treated_all: 0.7232348151847638
-  dalys_averted: 0.12186160623902553
+  pfpr_u5_cal: 0.4396428788525403
+  cases_all: 2.456074696293426
+  treated_all: 0.7314810789495033
+  dalys_averted: 0.1059130560052648
 - m0: 28.0
   guess: x4
   seed: 5
-  pfpr_u5_cal: 0.4268925686063557
-  cases_all: 2.487710272631216
-  treated_all: 0.735248660203774
-  dalys_averted: 0.1350641705289345
+  pfpr_u5_cal: 0.43999776938461593
+  cases_all: 2.5132893117807003
+  treated_all: 0.7433784323365558
+  dalys_averted: 0.10964539293468611
 - m0: 28.0
   guess: x4
   seed: 6
-  pfpr_u5_cal: 0.44210203688288924
-  cases_all: 2.4856955836140657
-  treated_all: 0.7559683912241878
-  dalys_averted: 0.10964832210075354
-problems: []
-restamped:
-  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-  proof_identical: true
-  scope:
-    pack_settings:
-    - benin
-    - ce_ref
-    - ce_res
-    - cochrane_itn
-    - eir_1
-    - eir_10
-    - eir_100
-    - eir_3
-    - eir_30
-    - eir_300
-    - irs_added
-    - misungwi
-    - muleba
-    - sahel_smc
-    pack_arms: every arm of each setting, in one run_batch per setting and seed
-    seeds:
-    - 11
-    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
-      sensitivity the card's 4000
-    burnin_years: the card's (50), the pack's own
-    evidence_cases:
-    - - equilibration
-      - - 3.5
-        - base
-        - burnin_years: 50
-        - 1
-    - - equilibration
-      - - 28.0
-        - doubled
-        - burnin_years: 100
-        - 1
-    - - equilibration
-      - - 9.0
-        - guess_hi
-        - burnin_years: 50
-          init_eir_per_m0: 2.4
-        - 2
-    - - guess_sensitivity
-      - - 3.5
-        - x1
-        - 1
-        - 50
-    - - guess_sensitivity
-      - - 28.0
-        - x0.25
-        - 2
-        - 50
-    scenarios:
-      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-      heterogeneous: 5 members, seed 23, delivery None
-    not_repeated: calibration-grid runs (same code path at other attribute values)
-    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-      dicts exactly
-  old_engine_version: '0.7'
-  proof_script_commit: 22aa80c4cc3002517a08555cd82186dfb21a75b7
-  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
-    is pending.
-  confirmation:
-    validate_once: done
-    evidence:
-      run_id: run1
-      commit: c0ed7675a4fbdfb198cabf64fad4d3607a075587
-      environment:
-        python: 3.14.3
-        numpy: 2.4.4
-        starsim: 3.3.4
-        platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
-        machine: x86_64
-      date: '2026-11-03'
-      command: bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12
-      coiled_cluster_id: '2319071'
-      workspace: idm-coiled-idmad-r2
-      stored: outputs/engine-v08-confirm/run1 (storage account modelingagentic)
-      compared: every value equal to this file's; only wall-clock fields and identity hashes differ
-  old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
-  previous:
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.6'
-    proof_script_commit: 71619f531a21196771cb1654c96ed63a5fe8a421
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) confirms it.
-    old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.5'
-    proof_script_commit: 110691735e832a5b18df93aa56ab96d43c500dd2
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) confirms it.
-    old_code_sha256: 675650c80e7d9c3df9bf234d1f50c135c1fdf6ab9f0a5186f2d610f6e1dea5ee
+  pfpr_u5_cal: 0.4472259579836073
+  cases_all: 2.554567737504149
+  treated_all: 0.7630790855786213
+  dalys_averted: 0.10968289270475612
+problems:
+- 'output: m0 3.5: treated_all differs -3.2% between the x0.25 and x4 guesses'
+- 'output: m0 9.0: dalys_averted differs +7.1% between the x0.25 and x4 guesses'
