@@ -783,9 +783,23 @@ def _cluster_env(work):
 
 
 def _shutdown_cluster():
-    """Stop this cluster from inside one of its tasks (as run_to_disk does once every run is stored)."""
-    from distributed import get_client
-    get_client().shutdown()
+    """Stop this cluster from inside one of its tasks (as run_to_disk does once every run is stored).
+    Idempotent: when the cluster is already stopping (the launcher stopped it first), the
+    request is dropped, never raised."""
+    try:
+        from distributed import get_client
+        get_client().shutdown()
+    except Exception:  # noqa: BLE001 -- already stopping: nothing left to stop
+        pass
+
+
+def _job_shutdown(grace_s):
+    """The job's own stop, after `grace_s` (so a launcher polling the job reads its final state
+    and stops the cluster itself first)."""
+    import time
+    if grace_s:
+        time.sleep(grace_s)
+    _shutdown_cluster()
 
 
 def store_outputs(out, prefix, account, store, beat=None):
@@ -833,7 +847,7 @@ def store_outputs(out, prefix, account, store, beat=None):
 
 def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None,
              cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None,
-             shutdown_grace_s=0):
+             shutdown_grace_s=0, shutdown_always=False):
     """The job, as a dask task: claim the id (the 'queued' record with this submission's
     token; with no token, an id that is neither queued nor running), unpack `code` (a
     tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
@@ -846,7 +860,9 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     reads every file back (store_outputs); `shutdown_when_stored` then stops the cluster from
     here, but only for a job that is done with every output verified in storage. Otherwise
     the cluster is left to its idle timeout, so the outputs can still be collected. None of
-    this depends on the laptop. `shutdown_grace_s` delays that shutdown (the final state is
+    this depends on the laptop. `shutdown_always` (`vm_job.py run` without --keep-on-failure)
+    stops the cluster at the end whatever the outcome: failed, timed out, unverified, or a
+    command that cannot start. `shutdown_grace_s` delays either stop (the final state is
     already written), so a poller (`vm_job.py run`) reads the final state and stops the
     cluster itself; with no poller, the job still stops it after the grace period."""
     import io, os, re, shutil, signal, subprocess, sys, tarfile, time
@@ -910,8 +926,11 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
                 time.sleep(min(5, heartbeat_s))
             rc = p.wait()
     except Exception as e:  # noqa: BLE001 — a job that cannot start is recorded, not lost
-        st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time())
+        st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time(),
+                  shutdown=bool(shutdown_always))
         _job_write(d, st)
+        if shutdown_always:
+            _job_shutdown(shutdown_grace_s)
         return st
     final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
                  ended=time.time(), duration_s=round(time.time() - t0))
@@ -928,13 +947,12 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
         else:
             st["stored"] = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
     st.update(final, heartbeat=time.time())
-    down = bool(shutdown_when_stored and st["state"] == "done" and (st.get("stored") or {}).get("verified"))
+    down = bool(shutdown_always or (shutdown_when_stored and st["state"] == "done"
+                                    and (st.get("stored") or {}).get("verified")))
     st["shutdown"] = down
     _job_write(d, st)
     if down:
-        if shutdown_grace_s:
-            time.sleep(shutdown_grace_s)
-        _shutdown_cluster()
+        _job_shutdown(shutdown_grace_s)
     return st
 
 
