@@ -22,8 +22,11 @@ outputs move by at most 3% between the x0.25 and x4 burn-in starting guesses, at
 v0.9: treated_all at m0 3.5 (−3.2%, paired seed SE 1.0%) and DALYs averted at m0 9.0 (+7.1%, paired seed SE 4.9%).
 At v0.8 every output was within 3%, with paired SEs up to 6.3%. Six seeds cannot resolve a 3% tolerance for these
 outputs, so the result does not show whether the net change matters for burn-in convergence. Nothing was re-run or
-re-tuned to make V7 pass. One option is more seeds in `guess_sensitivity.py`; another is a criterion stated
-relative to the seed SE. Either is a decision for the reviewer. The paragraph that follows describes the v0.6–v0.8
+re-tuned to make V7 pass.
+
+*Extension declared before running it (review round 2):* `guess_sensitivity.py` goes from 6 to 24 seeds. The 3%
+tolerance, the levels, the guesses and the outputs stay the same. 24 seeds about halve the paired SE. The result is
+reported whether it passes or not, and nothing else is changed to make it pass. The paragraph that follows describes the v0.6–v0.8
 re-stamps; those numbers are now history.
 
 **v0.8, v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit
@@ -95,7 +98,7 @@ two surveys of each year instead gives 838 d. The spec-value precedence test (EP
 The engine default stays the 40-country median, because the paper reports the country value as one country's fit.
 The upper bound (2.47 y) is above the card range (2.37 y), so such a spec needs `outside_card_range: true`.
 
-**What did not choose anything.** No value in v0.9 was chosen or tuned by any benchmark result:
+**What did not choose anything.** No net-survival value was chosen using any benchmark result. Only the two existing fitted parameters (cfp_kill, irs_kill) were refitted, to their usual targets B10, B11, B12, B12b and B12m:
 - k and the median come from Bertozzi-Villa 2021;
 - Muleba's median comes from its trial's reported use;
 - B7, B8 and B16c stay held out, as do B9, B9b, B9c, B13, B15 and B17–B20.
