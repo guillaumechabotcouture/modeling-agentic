@@ -39,6 +39,7 @@ import math
 import os
 import stat
 import sys
+import time
 import traceback
 from typing import Any, Callable, Iterable, Optional
 
@@ -296,6 +297,26 @@ def dir_fd_nofollow(base, parts, create: bool = False) -> int:
         raise
 
 
+# Follow-up to #133: two processes creating the same new file through a directory fd at once can get ENOENT from
+# openat(O_CREAT) (seen on macOS: 4 processes x 400 appends, about 1 in 30 creations). The open is retried as the same
+# single openat (no check-then-open, links still refused by O_NOFOLLOW); only ENOENT in a directory that still exists is
+# retried, a bounded number of times.
+CREATE_ATTEMPTS = 100
+
+
+def _openat_create(dfd: int, name: str, flags: int) -> int:
+    """os.open(name, flags | O_CREAT | O_NOFOLLOW, dir_fd=dfd), retried on the concurrent-creation ENOENT window.
+    Other errors (a link: ELOOP; a directory: EISDIR) are raised at once."""
+    for attempt in range(CREATE_ATTEMPTS):
+        try:
+            return os.open(name, flags | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except FileNotFoundError:
+            if os.fstat(dfd).st_nlink == 0 or attempt == CREATE_ATTEMPTS - 1:
+                raise                     # the directory was removed, or the window never closed
+            time.sleep(0.0005 * min(attempt + 1, 20))
+    raise AssertionError("unreachable")
+
+
 def open_nofollow(base: str, rel: str) -> int:
     """A read-only fd on the plain file base/rel, opened with no link followed at any component. The caller closes
     it."""
@@ -467,7 +488,7 @@ def open_append_nofollow(base: str, rel: str):
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
     try:
         try:
-            fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+            fd = _openat_create(dfd, parts[-1], os.O_WRONLY | os.O_APPEND)
         except OSError as e:
             raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
     finally:
@@ -526,10 +547,9 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
                 os.close(fd)
             os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
             return rel if isinstance(base, int) else os.path.join(base, rel)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive
-                                                                                            else 0)
+        flags = os.O_WRONLY | (os.O_APPEND if append else 0) | (os.O_EXCL if exclusive else 0)
         try:
-            fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+            fd = _openat_create(dfd, parts[-1], flags)
         except OSError as e:
             raise LinkRefused(f"{rel}: cannot be written without following a link ({e.strerror})") from None
         try:
@@ -695,6 +715,43 @@ def _self_test() -> int:
            and read_nofollow(d, "link")[0] == b"new",
            f"SI-NF links and hard links are refused; an atomic write replaces a link, never follows it ({res})")
 
+    # SI-AR (follow-up to #133): several processes creating then appending to the same new files at once. Every line
+    # is written exactly once and no call raises (macOS returned ENOENT from openat(O_CREAT) under this race).
+    import multiprocessing as _mp
+    with tempfile.TemporaryDirectory() as d:
+        n_proc, n_app, n_names = 4, 400, 40
+        jobs = [(d, mode, w, n_app, n_names) for mode in ("write", "open", "text") for w in range(n_proc)]
+        with _mp.get_context("spawn").Pool(n_proc) as pool:
+            errs = [e for got in pool.map(_append_stress, jobs) for e in got]
+        lines = []
+        for mode in ("write", "open", "text"):
+            for k in range(n_names):
+                p = os.path.join(d, mode, f"f{k}.log")
+                lines += open(p).read().splitlines() if os.path.exists(p) else []
+        want = {f"{mode} {w} {k}" for mode in ("write", "open", "text") for w in range(n_proc) for k in range(n_app)}
+        ok(not errs and len(lines) == len(want) and set(lines) == want,
+           f"SI-AR {n_proc} processes x {n_app} appends to new files: every line once, no exception "
+           f"({len(errs)} errors, e.g. {errs[:2]}; {len(lines)} of {len(want)} lines)")
+    # SI-AR2: the append paths keep refusing links and hard links (the retry never opens one)
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("outside")
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "link"))
+        os.symlink(out, os.path.join(d, "ldir"))
+        os.link(os.path.join(out, "v"), os.path.join(d, "hard"))
+        res = []
+        for fn in (lambda: open_append_nofollow(d, "link").close(), lambda: open_append_nofollow(d, "ldir/new").close(),
+                   lambda: open_append_nofollow(d, "hard").close(), lambda: write_nofollow(d, "link", b"x", append=True),
+                   lambda: write_nofollow(d, "hard", b"x", append=True),
+                   lambda: append_text(os.path.join(d, "ldir", "new"), "x", d),
+                   lambda: append_text(os.path.join(d, "link"), "x", d)):
+            try:
+                fn()
+                res.append(False)
+            except LinkRefused:
+                res.append(True)
+        ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.exists(os.path.join(out, "new")),
+           f"SI-AR2 appends through a link, a linked directory or a hard link are refused ({res})")
+
     if failures:
         print("FAIL:", file=sys.stderr)
         for fl in failures:
@@ -702,6 +759,25 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _append_stress(job) -> list:
+    """SI-AR worker (a spawned process): `n` appends cycling over `names` new files under <d>/<mode>/."""
+    d, mode, w, n, names = job
+    errs = []
+    for k in range(n):
+        rel, line = f"{mode}/f{k % names}.log", f"{mode} {w} {k}\n"
+        try:
+            if mode == "write":
+                write_nofollow(d, rel, line.encode(), append=True)
+            elif mode == "open":
+                with open_append_nofollow(d, rel) as f:
+                    f.write(line)
+            else:
+                append_text(os.path.join(d, rel), line, d)
+        except Exception as e:  # noqa: BLE001 -- the case reports every failure
+            errs.append(f"{type(e).__name__}: {e}"[:200])
+    return errs
 
 
 if __name__ == "__main__":

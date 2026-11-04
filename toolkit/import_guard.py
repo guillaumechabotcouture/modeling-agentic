@@ -15,7 +15,9 @@ Policies (a module must also be a file of this repo, checked without importing i
               toolkit.engines.benchmark (its self-test generator, used across worker processes)
   calibrator  toolkit.analysis.calibration, or a module under toolkit.engines (benchmark calibrators)
 Attribute names starting with "_" are refused. Self-tests may allow a module of their own in-process
-(`allow_for_test`); nothing reads that from a file.
+(`allow_for_test`); nothing reads that from a file. The self-test toy engines (TEST_ONLY_REFS) are enabled only by
+code in a self-test process (`allow_test_refs`) and reach its worker processes as a pool initializer's argument
+(`pool_kwargs`), never through the environment.
 """
 from __future__ import annotations
 
@@ -35,11 +37,13 @@ POLICIES = {
                    "suffix": None},
 }
 _TEST_MODULES: dict = {k: set() for k in POLICIES}
-# Self-test toy engines that are never allowed in production (ToySpecEngine appends to a path its configuration names).
-# Only these references can be enabled, and only by a self-test (allow_test_refs), for its process and the worker
-# processes it starts (an environment variable they inherit); a production run never sets it.
+# Self-test toy engines that are never allowed in production (ToySpecEngine appends to a call log). Only these
+# references can be enabled, and only by code in a self-test process (allow_test_refs); no file and no environment
+# variable is read (Codex P1 on #133: an agent-set environment must enable nothing). The worker processes a self-test
+# starts receive the registration explicitly, as their pool initializer's argument (pool_kwargs, init_worker).
 TEST_ONLY_REFS = {"engine": ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")}
-_TEST_REFS_ENV = "MA_IMPORT_GUARD_TEST_REFS"
+_TEST_REFS: set = set()          # "kind|ref", this process only
+_TEST_STATE: dict = {}           # plain values the self-test hands its workers with the registration (toy log root)
 ENGINE_METHODS = ("describe", "parameters", "run")      # the Engine contract (toolkit/engines/contract.py)
 _MOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 _ATTR = re.compile(r"[A-Za-z]\w*")
@@ -49,27 +53,52 @@ class ImportRefused(ValueError):
     """A data-supplied module or attribute name the kind's policy does not allow (nothing was imported)."""
 
 
-def allow_test_refs(kind: str, refs) -> None:
-    """Self-tests only: enable named self-test toy engines (TEST_ONLY_REFS) in this process and its worker processes.
-    Any other reference is refused."""
-    import json as _json
+def _checked(kind: str, refs) -> list:
     refs = list(refs)
     bad = [r for r in refs if r not in TEST_ONLY_REFS.get(kind, ())]
     if bad:
         raise ImportRefused(f"{kind} {bad}: only the self-test toy engines {TEST_ONLY_REFS.get(kind, ())} can be "
                             "enabled for a test")
-    cur = set(_test_refs())
-    cur |= {f"{kind}|{r}" for r in refs}
-    os.environ[_TEST_REFS_ENV] = _json.dumps(sorted(cur))
+    return refs
 
 
-def _test_refs() -> list:
-    import json as _json
-    try:
-        v = _json.loads(os.environ.get(_TEST_REFS_ENV) or "[]")
-    except ValueError:
-        return []
-    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+def allow_test_refs(kind: str, refs, state: dict | None = None) -> None:
+    """Self-tests only: enable named self-test toy engines (TEST_ONLY_REFS) in this process; any other reference is
+    refused. `state` (plain values, e.g. the toy call log's root) travels with the registration to the worker
+    processes started with pool_kwargs()."""
+    _TEST_REFS.update(f"{kind}|{r}" for r in _checked(kind, refs))
+    if state:
+        _TEST_STATE.update(state)
+
+
+def test_state(key: str):
+    """A value a self-test registered with allow_test_refs (in this process, or in its parent through init_worker)."""
+    return _TEST_STATE.get(key)
+
+
+def worker_registration() -> dict | None:
+    """This process's test registration, for a worker process's initializer; None in production."""
+    if not _TEST_REFS:
+        return None
+    return {"refs": sorted(_TEST_REFS), "state": dict(_TEST_STATE)}
+
+
+def init_worker(registration: dict | None) -> None:
+    """Worker initializer: apply the registration the parent passed explicitly (each reference checked again)."""
+    if not registration:
+        return
+    for item in registration.get("refs") or []:
+        kind, _, ref = str(item).partition("|")
+        _checked(kind, [ref])
+        _TEST_REFS.add(f"{kind}|{ref}")
+    _TEST_STATE.update(registration.get("state") or {})
+
+
+def pool_kwargs() -> dict:
+    """ProcessPoolExecutor keyword arguments that carry this process's test registration to its workers: {} in
+    production (nothing registered), else the initializer and its argument."""
+    reg = worker_registration()
+    return {"initializer": init_worker, "initargs": (reg,)} if reg else {}
 
 
 def allow_for_test(kind: str, module: str) -> None:
@@ -109,7 +138,7 @@ def check_ref(kind: str, ref) -> tuple[str, str]:
     if ref in POLICIES.get(kind, {}).get("refs", ()):
         return mod, attr
     if ref in TEST_ONLY_REFS.get(kind, ()):        # never by module prefix: only a self-test's registration
-        if f"{kind}|{ref}" in _test_refs() and _repo_module(mod):
+        if f"{kind}|{ref}" in _TEST_REFS and _repo_module(mod):
             return mod, attr
         raise ImportRefused(f"{kind} {ref}: a self-test toy engine, refused outside a self-test")
     return check_module(kind, mod), attr
@@ -147,6 +176,15 @@ def _describe(kind: str) -> str:
     bits = [f"modules under {', '.join(p['prefixes'])}" + (f" named *.{p['suffix']}" if p["suffix"] else "")]
     bits += list(p["modules"]) + list(p["refs"])
     return "; ".join(bits)
+
+
+def _ref_state(ref: str) -> str:
+    """IG6 worker: whether this process allows `ref` (a spawned worker)."""
+    try:
+        check_ref("engine", ref)
+        return "allowed"
+    except ImportRefused:
+        return "refused"
 
 
 def _self_test() -> int:
@@ -195,6 +233,41 @@ def _self_test() -> int:
         r = True
     allow_for_test("calibrator", "_ig_test_mod")
     ok(r and resolve("calibrator", "_ig_test_mod:f")() == 1, "IG3 a self-test's own module needs allow_for_test")
+    # IG5 (Codex P1 on #133): no environment variable enables a test-only reference; a fresh process with the former
+    # MA_IMPORT_GUARD_TEST_REFS set refuses them, and a pool started there carries no registration to its workers.
+    import json
+    import subprocess
+    toys = list(TEST_ONLY_REFS["engine"])
+    code = ("import sys, json; sys.path.insert(0, %r)\n"
+            "from toolkit import import_guard as G\n"
+            "out = {}\n"
+            "for r in %r:\n"
+            "    try:\n"
+            "        G.check_ref('engine', r); out[r] = 'allowed'\n"
+            "    except G.ImportRefused:\n"
+            "        out[r] = 'refused'\n"
+            "out['pool'] = repr(getattr(G, 'pool_kwargs', lambda: 'missing')())\n"
+            "print(json.dumps(out))") % (ROOT, toys)
+    env = dict(os.environ, MA_IMPORT_GUARD_TEST_REFS=json.dumps([f"engine|{r}" for r in toys] + toys))
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT)
+    got = json.loads(res.stdout or "{}") if res.returncode == 0 else {}
+    ok(got and all(got.get(r) == "refused" for r in toys) and got.get("pool") == "{}",
+       f"IG5 the environment enables no test-only reference, and a production pool gets no initializer: "
+       f"{got or res.stderr[-300:]}")
+    # IG6: a registration made in this process reaches a worker only through the explicit pool initializer
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+    try:
+        allow_test_refs("engine", toys[:1])
+        kw = pool_kwargs()
+        with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn"), **kw) as ex:
+            with_init = ex.submit(_ref_state, toys[0]).result(60)
+        with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as ex:
+            without = ex.submit(_ref_state, toys[0]).result(60)
+        ig6 = (with_init, without)
+    except Exception as e:  # noqa: BLE001 -- reported in the case
+        ig6 = (f"{type(e).__name__}: {e}"[:200], None)
+    ok(ig6 == ("allowed", "refused"), f"IG6 a worker allows a test reference only with the pool initializer ({ig6})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

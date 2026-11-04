@@ -277,13 +277,27 @@ def _breaker(rows, min_n: int | None = None, prior_ok: int = 0) -> str | None:
 _LOCAL_FN = None
 
 
-def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None):
+def _guard_registration():
+    """A self-test's import-guard registration in this process (toolkit/import_guard.py: test-only toy engines), for
+    the pool's workers; None in production. Read from the module only if this process already imported it (code
+    registered it), never from the environment (follow-up to #133)."""
+    g = sys.modules.get("toolkit.import_guard")
+    return g.worker_registration() if g is not None else None
+
+
+def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None, guard_reg=None):
     """Pool initializer. Each process records its model load time in
     `init_dir`, so loads are charged even in processes that get no chunk; a
     load that raises is recorded there too (`<pid>.err`), so a pool that breaks
-    at start is reported as the model's load error, not as a crash."""
+    at start is reported as the model's load error, not as a crash. `guard_reg`:
+    the parent self-test's import-guard registration, applied before the model loads."""
     global _LOCAL_FN
     t0 = time.time()
+    if guard_reg:
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from toolkit import import_guard
+        import_guard.init_worker(guard_reg)
     # Own process group: whatever the model spawns (an external simulator)
     # is killed with this process. A child that starts its own session escapes.
     # Inside a remote chunk the whole chunk is already one group (killed as one).
@@ -433,7 +447,8 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
 
     def new_pool(k):
         return cf.ProcessPoolExecutor(max_workers=k, mp_context=mp.get_context("spawn"),
-                                      initializer=_local_init, initargs=(run_dir, fn_spec, init_dir.name))
+                                      initializer=_local_init,
+                                      initargs=(run_dir, fn_spec, init_dir.name, _guard_registration()))
 
     def load_error():
         for name in os.listdir(init_dir.name):
@@ -3660,14 +3675,23 @@ def _self_test_p45d(ok) -> None:
                     except (OSError, ValueError):
                         pass
                 wall = (max(e for _, e in spans) - min(b for b, _ in spans)) if len(spans) == 8 else None
+                # Peak concurrency from the tasks' own spans (structure, not wall clock: a loaded runner stretched
+                # the wall time past 0.6 x serial while the batch was parallel). With one process per worker,
+                # overlapping spans ran on different workers at the same time.
+                ev = sorted([(b, 1) for b, _ in spans] + [(e, -1) for _, e in spans], key=lambda x: (x[0], x[1]))
+                peak, cur = 0, 0
+                for _, step in ev:
+                    cur += step
+                    peak = max(peak, cur)
                 serial = 8 * s_task
                 ok(len(rows) == 8 and all(r["ok"] for r in rows) and [r["result"] for r in rows] == list(range(8))
                    and w_run not in used and len(used) >= 4 and s.get("workers") == len(used)
                    and s.get("workers_seen") == 4,
                    f"P45D-3 every chunk done on {len(used)} compute workers, none on the run worker, "
                    f"and the ledger's worker count is the workers used: {used} {s}")
-                ok(wall is not None and wall < 0.6 * serial,
-                   f"P45D-4 the batch ran in parallel: {wall} s against {serial} s serial")
+                ok(len(spans) == 8 and peak >= 2,
+                   f"P45D-4 the batch ran in parallel: {peak} of its 8 tasks ran at once on separate workers "
+                   f"(wall {wall} s against {serial} s serial, information only)")
                 left = cc.run_on_scheduler(state)
                 ok(left["unrunnable"] == 0 and not any(left["proc"].values()),
                    f"P45D-5 no demand marker or chunk outlives the call: {left}")

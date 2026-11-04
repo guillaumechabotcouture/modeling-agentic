@@ -45,7 +45,9 @@ jobs:
       # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
       # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
       - name: Self-tests (every module with --self-test, found by scripts/self_tests.py)
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2
+        # --per-test-timeout: a hung self-test is killed with its process group, named, and failed;
+        # the others still run (the job timeout above would cancel the whole step with no name).
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 900
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"

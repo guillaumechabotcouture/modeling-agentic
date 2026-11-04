@@ -620,7 +620,7 @@ def _self_test() -> int:
     from toolkit.spec import engine_parameters as EPm     # the module the engine loader imports, not __main__
     from toolkit.spec import toy_engines as TOYS
     from toolkit import import_guard as G
-    G.allow_test_refs("engine", TOYS.REFS)     # this process and the workers it starts (never a production run)
+    TOYS.enable_for_test()    # this process; its workers through import_guard.pool_kwargs() (never a production run)
     fails = []
 
     def ok(cond, msg):
@@ -642,8 +642,7 @@ def _self_test() -> int:
     def toy_raw(d, **entries):
         raw = yaml.safe_load(open(schema.toy_spec(d, n=24)))
         raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine",
-                         "config": {"log": True}}
-        os.environ[TOYS.LOG_ENV] = d          # the call log's root, inherited by worker processes
+                         "config": {"log": True}}     # logs only where the self-test registered a root (EP10-EP19)
         if entries:
             raw[FIELD] = entries
         return raw
@@ -970,12 +969,28 @@ def _self_test() -> int:
                 pass
         ok(hasattr(G, "allow_test_refs") and not bad,
            f"EP41 a test registration can enable only the named self-test toy engines: accepted {bad}")
-    guard("EP40-EP41 test-only toy engines", guard_cases)
+        # EP42 (Codex P1 on #133): the environment never enables anything. A production entry point
+        # (toolkit/analysis/run.py) with both former variables set refuses the toy engine, and no call log is written.
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as logs:
+            yaml.safe_dump(toy_raw(d), open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("MA_IMPORT_GUARD", "MA_TOY_SPEC"))}
+            env.update(MA_IMPORT_GUARD_TEST_REFS=json.dumps(sorted(f"engine|{r}" for r in TOYS.REFS) + list(TOYS.REFS)),
+                       MA_TOY_SPEC_LOG_DIR=logs)
+            res = subprocess.run([sys.executable, os.path.join(ROOT, "toolkit", "analysis", "run.py"), d, "--unsigned"],
+                                 capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
+            err = res.stdout[-400:] + res.stderr[-400:]
+            ok(res.returncode != 0 and "refused outside a self-test" in err and not os.listdir(logs)
+               and not glob.glob(os.path.join(d, "calls.*.jsonl")),
+               f"EP42 with MA_IMPORT_GUARD_TEST_REFS and MA_TOY_SPEC_LOG_DIR set, a production run refuses the toy "
+               f"engine and writes no call log (exit {res.returncode}; logs {os.listdir(logs)}): {err[-300:]!r}")
+    guard("EP40-EP42 test-only toy engines", guard_cases)
 
     # ------------------------------------------------------------ emulator path: application, UQ, decision test, reports
     def emulator_cases():
         from toolkit.analysis import run as RUN, trajectories as TR
-        with tempfile.TemporaryDirectory() as d:
+        # the call log's root: a temporary directory this self-test owns (outside the run dir), registered explicitly
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix="ma_toy_log_") as logs:
+            TOYS.enable_for_test(logs)
             r = toy_raw(d,
                         base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY},
                         k={"value": 0.9, "source": SRC, "reason": WHY},
@@ -1007,7 +1022,7 @@ def _self_test() -> int:
                f"EP11 the batch: k held at its spec value in every job; base (a decision test varies it) an emulator "
                f"input over the box from its spec value to the tested value; synergy drawn over its range: "
                f"{design.get('spec_value_names')}, {design.get('prior_names')}")
-            calls = [json.loads(x) for f in sorted(glob.glob(os.path.join(d, "calls.*.jsonl"))) for x in open(f)]
+            calls = [json.loads(x) for f in sorted(glob.glob(os.path.join(logs, "calls.*.jsonl"))) for x in open(f)]
             runs = [c for c in calls if c["call"] == "run"]
             sch = [c for c in calls if c["call"] == "schedule"]
             ok(runs and all(c["k"] == 0.9 for c in calls) and sch and all(c["base"] == 0.3 for c in sch),
