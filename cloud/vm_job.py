@@ -844,14 +844,14 @@ def _self_test_run(ok) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None, after_submit=None, ctor_side=None, then=()):
+              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
         appears after n cluster listings."""
         W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
              "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None,
-             "table": ["tls://w1"], "job_worker": None, "polled": [], "names": {}, "then": []}
+             "table": ["tls://w1"], "job_worker": None, "polled": [], "names": dict(pre_names or {}), "then": []}
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
@@ -930,6 +930,8 @@ def _self_test_run(ok) -> None:
                     W["table"] = ["tls://w0", "tls://w1"]
                 elif after_submit == "leaves":    # the job's worker leaves; another remains
                     W["table"] = ["tls://w0"]
+                elif after_submit == "empty":     # the job's (only) worker leaves
+                    W["table"] = []
                 jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
                 task = lambda: fn(*args, store_mod=fs, **jkw)  # noqa: E731
                 if threaded:
@@ -977,6 +979,8 @@ def _self_test_run(ok) -> None:
 
         def sleep(s):
             ev.append(("sleep", s))
+            if sum(1 for e in ev if isinstance(e, tuple) and e[0] == "sleep") > 400:
+                raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
             real_sleep(s / 600 if threaded else min(s, 0.01))
 
         argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", *extra]
@@ -1271,6 +1275,58 @@ def _self_test_run(ok) -> None:
                 ok(len(got) <= 63 and re.fullmatch(r"[a-z][a-z0-9-]*-[0-9a-f]{6}", got) is not None,
                    f"RN24c the unique name stays within 63 lowercase characters for long names and ids: {got!r}")
             case("RN24", rn24)
+
+            def rn25():
+                import fcntl
+                dest = os.path.join(d, "local", "vm1", "r25")
+                os.makedirs(dest, exist_ok=True)
+                held = open(os.path.join(dest, ".run.lock"), "w")
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)     # another `run` of this job holds it
+                try:
+                    W, msg, out, exc = world(d, "r25")
+                finally:
+                    held.close()
+                ok(msg is not None and not W["ctor"] and "r25" in msg,
+                   f"RN25 a second `run` of the same job while the first holds its lock is refused before any "
+                   f"cluster is created (the listing check alone races): {msg} ctor={len(W['ctor'])}")
+                jid = "j" * 60
+                other = run_cluster_name("vm1", jid, "abcdef")
+                W, msg, out, exc = world(d, jid, pre={9: "running"}, pre_names={9: other})
+                ok(msg is not None and not W["ctor"] and W["clusters"][9] == "running",
+                   f"RN25b a job already running on a cluster whose long name was truncated is still found, and the "
+                   f"second launch refused: {other!r} -> {msg} ctor={len(W['ctor'])}")
+            case("RN25", rn25)
+
+            def rn22b():
+                W, msg, out, exc = world(d, "r22b", after_submit="empty")
+                ok(msg is not None and "lost" in msg and ("delete", 100) in W["events"],
+                   f"RN22b the job's only worker leaving (an empty worker table) reads as lost after three polls, "
+                   f"not as retries until the deadline: msg={msg}")
+            case("RN22b", rn22b)
+
+            def rn26():
+                import errno
+                rows = []
+                for label, cmd in (("ends", [sys.executable, "-c", "pass"]), ("cannot start", ["--no-such-program-x"])):
+                    downs, orig = [], ws._job_write
+
+                    def failing(d_, st_, orig=orig):
+                        if st_.get("state") in ("done", "failed", "timed_out") or st_.get("ended"):
+                            raise OSError(errno.ENOSPC, "No space left on device")
+                        return orig(d_, st_)
+                    jid = "wf" + str(len(rows))
+                    with mock.patch.object(ws, "_job_write", failing), \
+                            mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1)):
+                        try:
+                            ws.job_task(jid, None, cmd, None, 1.0, shutdown_always=True, shutdown_grace_s=0)
+                            raised = None
+                        except OSError as e:
+                            raised = e
+                    rows.append((label, len(downs), type(raised).__name__ if raised else None))
+                ok(all(n == 1 for _, n, _ in rows),
+                   f"RN26 a final-state write that fails (disk full) still stops the cluster under shutdown_always: "
+                   f"{rows}")
+            case("RN26", rn26)
         finally:
             ws.JOBS = old
 
