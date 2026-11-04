@@ -1056,11 +1056,72 @@ def _run_self_test() -> int:
            and "schema 1" in render_md(d) and signoff_text(d),
            f"DB34: a schema 1 brief signed before Phase 43 is still signed: {load_brief(d)[1]}")
     _self_test_lead_and_geometry(ok)
+    _self_test_held_out(ok)
     if fails:
         print("FAIL:", *fails, sep="\n  ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_held_out(ok) -> None:
+    """DB38-DB39: signing the brief also signs the decision spec, so it refuses a spec value chosen with a held-out
+    benchmark of the spec's engine (toolkit/spec/engine_parameters.py signoff_refusals), in process and through the CLI,
+    for the owner too. The engine is a real one (only its class and benchmark pack are read); the id is taken from its
+    pack, never written here."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import subprocess
+    from toolkit.spec import geometry as GEO, engine_parameters as PV
+    ref, pk = next(((r, p) for r, p in PV._all_packs() if PV.pack_ids(p)[1]), (None, None))
+    if ref is None:
+        ok(False, "DB38 no engine pack with a held-out benchmark under toolkit/engines")
+        return
+    hid = sorted(PV.pack_ids(pk)[1])[0]
+    env = {k: v for k, v in os.environ.items() if k != "MA_SIGNOFF_MODE"}
+
+    def run_dir(d, entry):
+        GEO.toy_inputs(d)
+        sp = yaml.safe_load(open(os.path.join(d, DECISION_SPEC)))
+        sp["engine"] = {"ref": ref}
+        sp["engine_parameters"] = {"p": entry}
+        yaml.safe_dump(sp, open(os.path.join(d, DECISION_SPEC), "w"))
+        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, CRITERIA), "w"))
+        yaml.safe_dump(example_brief(), open(os.path.join(d, BRIEF), "w"))
+        GEO.toy_write_sheet(d)
+
+    cases = {"fitted": {"value": 1.0, "source": "s", "reason": "r", "basis": "fitted", "fitted_to": [hid]},
+             "text": {"value": 1.0, "source": "s", "reason": f"puts {hid} in band", "basis": "owner_judgement"},
+             "no basis": {"value": 1.0, "source": "s", "reason": "r"}}
+    got = {}
+    for name, entry in cases.items():
+        for by in ("owner", "lead"):
+            with tempfile.TemporaryDirectory() as d:
+                run_dir(d, entry)
+                try:
+                    sign(d, by, accept_proposed=True)
+                    why = None
+                except ValueError as e:
+                    why = str(e)
+                got[(name, by)] = (why is not None and status(d) == "awaiting"
+                                   and not os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)))
+        with tempfile.TemporaryDirectory() as d:
+            run_dir(d, entry)
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                                "--accept-proposed"], env=env, capture_output=True, text=True, timeout=300)
+            want = "basis" if name == "no basis" else "held-out benchmark"
+            got[(name, "cli")] = (r.returncode == 1 and want in r.stderr and status(d) == "awaiting")
+    ok(all(got.values()), f"DB38 the brief's sign-off (in process for the owner and the lead, and the CLI with --by "
+                          f"owner) refuses a spec value fitted to, or justified by, held-out {hid}, or without a basis: "
+                          f"{got}")
+    with tempfile.TemporaryDirectory() as d:
+        run_dir(d, {"value": 1.0, "source": "s", "reason": "r", "basis": "literature"})
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                            "--accept-proposed"], env=env, capture_output=True, text=True, timeout=300)
+        ok(r.returncode == 0 and status(d) == "signed",
+           f"DB39 a spec value with a literature basis signs through the brief CLI (exit {r.returncode}): "
+           f"{r.stderr[-300:]!r}")
 
 
 def cli_parser() -> argparse.ArgumentParser:
