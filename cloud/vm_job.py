@@ -50,6 +50,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -331,6 +332,7 @@ def _self_test() -> int:
             ws.JOBS = old
     _self_test_sched(ok)
     _self_test_batch(ok)
+    _self_test_run(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -395,12 +397,35 @@ def _self_test_sched(ok) -> None:
                 ok("no worker yet" in str(e), f"VJ4 a connected scheduler with no worker still says so: {e}")
 
 
+class _FakeStore:
+    """results_store's interface over a local directory; `corrupt` changes what a download returns."""
+
+    def __init__(self, root, corrupt=False):
+        self.root, self.corrupt, self.uploads = root, corrupt, []
+
+    def is_sensitive_path(self, rel):
+        return rel.split("/")[0].startswith("_truth") or rel.endswith(".env")
+
+    def upload_retry(self, path, blob, account=None):
+        self.uploads.append(blob)
+        dest = os.path.join(self.root, blob)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy(path, dest)
+        return {"blob": blob}
+
+    def download(self, blob, path, account=None):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        shutil.copy(os.path.join(self.root, blob), path)
+        if self.corrupt:
+            open(path, "a").write("x")
+        return {"blob": blob}
+
+
 def _self_test_batch(ok) -> None:
     """One cluster, one scheduler, N workers for a whole batch, stopping itself once the outputs are verified in
     storage (the Nigeria re-run used 6 one-worker clusters, each with its own scheduler, ~5 min start-up and a
     20-minute idle tail after its shard ended, shut down from a laptop watcher). No network: fake coiled, store and
     shutdown."""
-    import shutil
     import tempfile
     import types
     from unittest import mock
@@ -447,29 +472,6 @@ def _self_test_batch(ok) -> None:
            f"OC1b --shutdown-when-stored needs --store, and --cluster-compute needs the shipped tree: {ap_err}")
     case("OC1b", oc1b)
 
-    class FakeStore:
-        """results_store's interface over a local directory; `corrupt` changes what a download returns."""
-
-        def __init__(self, root, corrupt=False):
-            self.root, self.corrupt, self.uploads = root, corrupt, []
-
-        def is_sensitive_path(self, rel):
-            return rel.split("/")[0].startswith("_truth") or rel.endswith(".env")
-
-        def upload_retry(self, path, blob, account=None):
-            self.uploads.append(blob)
-            dest = os.path.join(self.root, blob)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.copy(path, dest)
-            return {"blob": blob}
-
-        def download(self, blob, path, account=None):
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            shutil.copy(os.path.join(self.root, blob), path)
-            if self.corrupt:
-                open(path, "a").write("x")
-            return {"blob": blob}
-
     with tempfile.TemporaryDirectory() as d:
         old = ws.JOBS
         ws.JOBS = os.path.join(d, "vm")
@@ -492,7 +494,7 @@ def _self_test_batch(ok) -> None:
                                    create=True), \
                     mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1), create=True):
                 def oc2():
-                    fs = FakeStore(os.path.join(d, "blob1"))
+                    fs = _FakeStore(os.path.join(d, "blob1"))
                     st = ws.job_task("b1", code, [sys.executable, "job.py"], None, 1.0, cluster_compute=True,
                                      store={"prefix": "outputs/t/b1", "account": "acct"}, shutdown_when_stored=True,
                                      store_mod=fs)
@@ -511,7 +513,7 @@ def _self_test_batch(ok) -> None:
 
                 def oc4():
                     downs.clear()
-                    fs = FakeStore(os.path.join(d, "blob2"), corrupt=True)
+                    fs = _FakeStore(os.path.join(d, "blob2"), corrupt=True)
                     st = ws.job_task("b2", code, [sys.executable, "job.py"], None, 1.0, store={"prefix": "outputs/t/b2"},
                                      shutdown_when_stored=True, store_mod=fs)
                     ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is False and not downs
@@ -522,7 +524,7 @@ def _self_test_batch(ok) -> None:
 
                 def oc5():
                     downs.clear()
-                    fs = FakeStore(os.path.join(d, "blob3"))
+                    fs = _FakeStore(os.path.join(d, "blob3"))
                     with mock.patch.dict(os.environ, {"RC": "3"}):
                         st = ws.job_task("b3", code, [sys.executable, "job.py"], None, 1.0,
                                          store={"prefix": "outputs/t/b3"}, shutdown_when_stored=True, store_mod=fs)
@@ -542,6 +544,207 @@ def _self_test_batch(ok) -> None:
                 case("OC6", oc6)
         finally:
             ws.JOBS = old
+
+
+def _self_test_run(ok) -> None:
+    """RN: `run` brings the cluster up, submits at once, waits with status lines, then stops it. On 2026-11-03 an
+    agent ran `up`, ended its turn to wait, never sent `start`, and the VM idled out after 20 minutes with no job:
+    about two hours lost. No network: fake coiled, cluster table, client, store and shutdown; the job itself runs
+    for real (worker_side.job_task) in a temporary JOBS directory."""
+    import contextlib
+    import tempfile
+    import types
+    from unittest import mock
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    real_sleep = time.sleep
+
+    def world(d, jid, job_rc=0, state=None, corrupt=False, wait_fails=False, self_stop=False, extra=()):
+        """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout)."""
+        W = {"state": state, "events": [], "made": 0, "pending": None, "submit_kw": None, "create_kw": None}
+        ev = W["events"]
+        src = os.path.join(d, f"src_{jid}")
+        os.makedirs(src)
+        open(os.path.join(src, "job.py"), "w").write(
+            "import os\nopen(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
+            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n")
+        fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
+
+        def down():
+            ev.append("shutdown")
+            W["state"] = "stopped"
+
+        class FakeCluster:
+            def __init__(self, **kw):
+                W["made"] += 1
+                W["create_kw"] = kw
+                W["state"] = "running"
+                ev.append("create")
+
+            def get_client(self):
+                def wfw(n, timeout=None):
+                    ev.append("wait_workers")
+                    if wait_fails:
+                        raise TimeoutError("no worker within 1500 s")
+                return types.SimpleNamespace(wait_for_workers=wfw)
+
+            def shutdown(self):
+                down()
+
+        def attach(name):
+            if W["state"] not in rc._ATTACH:
+                raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
+            return types.SimpleNamespace(shutdown=down)
+
+        class FC:
+            def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+                r = fn(*a)
+                if fn is ws.job_state:
+                    ev.append("poll")
+                    if W["pending"]:      # the task starts after the first poll, so that poll reads 'queued'
+                        task, W["pending"] = W["pending"], None
+                        task()
+                return {workers[0]: r}
+
+            def submit(self, fn, *args, **kw):
+                ev.append("submit")
+                W["submit_kw"] = dict(kw)
+                jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
+                W["pending"] = lambda: fn(*args, store_mod=fs, **jkw)
+                return object()
+
+        def client(name):
+            if W["state"] not in rc._ATTACH:
+                raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
+            ev.append("client")
+            return FC(), "w1"
+
+        def job_down():
+            ev.append("job_shutdown")
+            if self_stop:             # the job stopped the cluster before any poll read its final state
+                W["state"] = "stopped"
+
+        def sleep(s):
+            ev.append(("sleep", s))
+            real_sleep(min(s, 0.01))
+
+        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60",
+                "--store", f"outputs/t/{jid}", "--shutdown-when-stored", *extra, "--", sys.executable, "job.py"]
+        out, msg = io.StringIO(), None
+        fake_dist = types.SimpleNamespace(fire_and_forget=lambda f: None)
+        with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster),
+                                           "distributed": fake_dist}), \
+                mock.patch.dict(globals(), {"_client": client}), \
+                mock.patch.object(rc, "cluster_states", lambda n: [W["state"]] if W["state"] else []), \
+                mock.patch.object(rc, "is_running", lambda n, lister=None: W["state"] in rc._ATTACH), \
+                mock.patch.object(rc, "attach", attach), \
+                mock.patch.object(ws, "_shutdown_cluster", job_down), \
+                mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out):
+            try:
+                main(argv)
+            except SystemExit as e:
+                msg = str(e.code) if e.code not in (None, 0) else None
+        return W, msg, out.getvalue()
+
+    with tempfile.TemporaryDirectory() as d:
+        old = ws.JOBS
+        ws.JOBS = os.path.join(d, "vm")
+        try:
+            def rn1():
+                W, msg, out = world(d, "r1")
+                ev = W["events"]
+                first = ev[:ev.index("submit") + 1] if "submit" in ev else ev
+                ok(W["made"] == 1 and first[:1] == ["create"] and "submit" in first
+                   and not [e for e in first if isinstance(e, tuple)]
+                   and (W["create_kw"] or {}).get("shutdown_on_close") is False,
+                   f"RN1 `run` submits the job right after the cluster is up, with no wait in between: {first}")
+                kw = W["submit_kw"] or {}
+                polls = [i for i, e in enumerate(ev) if e == "poll"]
+                ok(msg is None and len(polls) >= 2 and ("sleep", 60.0) in ev[polls[0]:polls[1]]
+                   and "job_shutdown" in ev and ev[-1:] == ["shutdown"] and W["state"] == "stopped"
+                   and "queued" in out and "done" in out
+                   and os.path.exists(os.path.join(d, "local", "vm1", "r1", "out", "result.txt")),
+                   f"RN2 `run` waits with a status line per poll, saves the outputs, and the cluster is stopped once "
+                   f"they are stored: msg={msg} events={ev}")
+                grace = kw.get("shutdown_grace_s") or 0
+                ok(kw.get("shutdown_when_stored") is True and grace >= 60
+                   and ("sleep", grace) in ev and "job_shutdown" in ev
+                   and ev.index(("sleep", grace)) < ev.index("job_shutdown"),
+                   f"RN3 the job's own shutdown (laptop-independent) waits a grace period of at least one poll "
+                   f"interval, so `run` reads the final state first: grace={grace}")
+            case("RN1-3", rn1)
+
+            def rn4():
+                W, msg, out = world(d, "r4", job_rc=3)
+                ev = W["events"]
+                ok(msg is not None and "failed" in msg and "rc=3" in msg and "shutdown" in ev
+                   and "job_shutdown" not in ev and W["state"] == "stopped"
+                   and max(i for i, e in enumerate(ev) if e == "poll") < ev.index("shutdown")
+                   and os.path.exists(os.path.join(d, "local", "vm1", "r4", "job.log")),
+                   f"RN4 a failed job: `run` exits non-zero with the reason, after saving the log, and stops the "
+                   f"cluster: msg={msg} events={ev}")
+            case("RN4", rn4)
+
+            def rn5():
+                W, msg, out = world(d, "r5", corrupt=True)
+                ok(msg is not None and "verified" in msg and W["events"][-1:] == ["shutdown"]
+                   and "job_shutdown" not in W["events"],
+                   f"RN5 a done job whose stored copy differs is a failure (non-zero) and the cluster is stopped "
+                   f"(its outputs were saved locally first): {msg}")
+            case("RN5", rn5)
+
+            def rn6():
+                W, msg, out = world(d, "r6", job_rc=3, extra=("--keep-on-failure",))
+                ok(msg is not None and "rc=3" in msg and "shutdown" not in W["events"] and W["state"] == "running"
+                   and "down" in out,
+                   f"RN6 --keep-on-failure keeps the cluster up for debugging and says how to stop it: {msg}")
+            case("RN6", rn6)
+
+            def rn7():
+                W, msg, out = world(d, "r7", state="running")
+                ok(msg is not None and W["made"] == 0 and "submit" not in W["events"]
+                   and "shutdown" not in W["events"] and "vm1" in msg,
+                   f"RN7 a cluster of that name already running is neither reused nor stopped (no second launch): "
+                   f"{msg} {W['events']}")
+            case("RN7", rn7)
+
+            def rn8():
+                W, msg, out = world(d, "r8", wait_fails=True)
+                ok(msg is not None and W["made"] == 1 and "submit" not in W["events"]
+                   and W["events"][-1:] == ["shutdown"] and W["state"] == "stopped",
+                   f"RN8 a cluster whose first worker never arrives is stopped and `run` exits non-zero: {msg}")
+            case("RN8", rn8)
+
+            def rn9():
+                W, msg, out = world(d, "r9", self_stop=True)
+                ok(msg is not None and "final state" in msg and W["made"] == 1,
+                   f"RN9 a cluster that stops before `run` reads the job's final state is reported, not taken as "
+                   f"success, and never re-created: {msg}")
+            case("RN9", rn9)
+        finally:
+            ws.JOBS = old
+
+    def rn10():
+        class FakeCluster:
+            def __init__(self, **kw):
+                pass
+
+            def get_client(self):
+                return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+        a = types.SimpleNamespace(name="vm2", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1)
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                mock.patch.object(rc, "cluster_states", lambda n: []), contextlib.redirect_stdout(out):
+            cmd_up(a)
+        text = out.getvalue()
+        ok("WARNING" in text and "20 minutes" in text and "`start`" in text and "`run`" in text,
+           f"RN10 `up` warns that the cluster stops after its idle timeout unless `start` follows: {text!r}")
+    case("RN10", rn10)
 
 
 def main(argv=None) -> int:
