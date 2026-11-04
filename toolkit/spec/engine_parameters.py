@@ -271,8 +271,12 @@ def benchmark_pack(engine_or_cls):
     except (TypeError, OSError) as e:
         return None, f"the code of {_class_ref(cls)} has no file ({e})"
     path = os.path.join(here, getattr(cls, "BENCHMARK_PACK", None) or PACK_DEFAULT)
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return None, f"{_class_ref(cls)} has no benchmark pack"
+    except OSError as e:          # not absence: a pack that may exist cannot be reached (fail closed)
+        raise PackError(f"the benchmark pack of {_class_ref(cls)} cannot be reached: {e}") from None
     try:
         pack = yaml.safe_load(open(path, encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
@@ -383,28 +387,52 @@ def held_out_problems(spec, engine) -> list[str]:
 def _all_packs() -> tuple[list, list]:
     """([(engine ref, pack)], [refusal]) for every pack under toolkit/engines/*/benchmarks/ (the fallback when no
     engine is known). A pack that cannot be read or has the wrong shape is a refusal, never skipped."""
-    import glob
     import yaml
     out, errs = [], []
-    for p in sorted(glob.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "pack.yaml"))):
+    base = os.path.join(ROOT, "toolkit", "engines")
+    what = ("with no engine known, the spec's values cannot be checked against every engine's held-out benchmarks")
+    try:                          # explicit listing: a directory that cannot be read is a refusal, never skipped
+        subs = sorted(x.path for x in os.scandir(base) if x.is_dir(follow_symlinks=False))
+    except OSError as e:
+        return [], [f"{FIELD}: {os.path.relpath(base, ROOT)} cannot be listed ({e}); {what}"]
+    paths = []
+    for sub in subs:
+        p = os.path.join(sub, "benchmarks", "pack.yaml")
+        try:
+            os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            errs.append(f"{FIELD}: {os.path.relpath(p, ROOT)} cannot be reached ({e}); {what}")
+            continue
+        paths.append(p)
+    for p in paths:
         rel = os.path.relpath(p, ROOT)
         try:
             pk = yaml.safe_load(open(p, encoding="utf-8"))
             ref = str(pk.get("engine")) if isinstance(pk, dict) else rel
             pack_ids(pk, ref)
         except (OSError, UnicodeDecodeError, yaml.YAMLError, PackError) as e:
-            errs.append(f"{FIELD}: {rel} cannot be read as a benchmark pack ({e}); with no engine known, the spec's "
-                        "values cannot be checked against every engine's held-out benchmarks")
+            errs.append(f"{FIELD}: {rel} cannot be read as a benchmark pack ({e}); {what}")
             continue
         out.append((ref, pk))
     return out, errs
 
 
+def _auto(eng) -> bool:
+    """Whether a backend may choose the engine after sign-off: no engine, "auto", or a mapping whose `auto` is truthy
+    (the broadest reading among toolkit/spec/schema.py and agents/analysis_backend.py, so no backend chooses an engine
+    the sign-off did not check)."""
+    return eng is None or eng == "auto" or (isinstance(eng, dict) and bool(eng.get("auto")))
+
+
 def _engine_conflict(r: dict) -> str | None:
-    """A declaration that names both `auto: true` and a `ref`: the schema runs the candidates, so the sign-off must
-    not check another engine; refused instead of choosing."""
+    """A declaration whose `auto` is not true or false, or that sets auto and a `ref`: a backend may then run another
+    engine than the one named, so the sign-off refuses instead of choosing."""
     eng = r.get("engine")
-    if isinstance(eng, dict) and eng.get("auto") is True and eng.get("ref") is not None:
+    if isinstance(eng, dict) and "auto" in eng and not isinstance(eng["auto"], bool):
+        return f"{FIELD}: the engine declaration's auto must be true or false (it is {eng['auto']!r})"
+    if isinstance(eng, dict) and _auto(eng) and eng.get("ref") is not None:
         return (f"{FIELD}: the engine declaration sets both auto: true and ref; give one, so the values are checked "
                 "against the engines the run may use")
     return None
@@ -412,7 +440,9 @@ def _engine_conflict(r: dict) -> str | None:
 
 def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[str]:
     """What blocks signing the spec's engine parameter values, whoever signs: each entry's basis, and the held-out
-    refusals against the pack of every engine the spec may run (_sheet_refs). With no engine known yet, a fitted
+    refusals against the pack of every engine the signed spec may run: its ref, else the candidates it lists. The
+    engines come from the spec alone (`candidates` and `run_dir` are accepted for the sheet's signature and not used:
+    engine_choice.json and the pre-sign rows are not part of what is signed). With no engine named, a fitted
     entry is refused (it cannot be resolved) and the text backstop reads every engine pack in the repository. An
     engine that does not load, a pack that cannot be used, or a contradictory engine declaration refuses too.
     toolkit/spec/signoff.py sign, scripts/decision_brief.py sign and agents/stage_machine.py sign all refuse while
@@ -429,7 +459,15 @@ def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[s
         bad.append(conflict)
     ents = {n: e for n, e in declared(r).items() if isinstance(e, dict)}
     targets = []
-    for ref, _decl in _sheet_refs(r, candidates, run_dir):
+    eng = r.get("engine")
+    if _auto(eng):        # the candidates the signed spec lists; else every engine pack (a later choice is not signed)
+        refs = [c for c in (eng.get("candidates") if isinstance(eng, dict) else None) or [] if isinstance(c, str)]
+    else:
+        refs = [eng] if isinstance(eng, str) else [eng.get("ref")] if isinstance(eng, dict) else []
+        if not all(isinstance(x, str) and x for x in refs):
+            bad.append(f"{FIELD}: the engine declaration names no engine reference")
+            refs = []
+    for ref in refs:
         try:
             cls = schema.engine_class(ref)
         except Exception as e:  # noqa: BLE001 -- fail closed: the values cannot be checked against its pack
@@ -753,7 +791,7 @@ def _sheet_refs(raw: dict, candidates=None, run_dir: str | None = None) -> list[
     eng = raw.get("engine")
     if isinstance(eng, str) and eng != "auto":
         return [(eng, {"ref": eng})]
-    if isinstance(eng, dict) and eng.get("ref") and eng.get("auto") is not True:    # auto wins, as in the schema
+    if isinstance(eng, dict) and eng.get("ref") and not _auto(eng):    # auto wins, as in the schema and backends
         return [(eng["ref"], eng)]
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     rows_ = [r for r in candidates or [] if isinstance(r, dict) and r.get("ref")]
@@ -1512,6 +1550,52 @@ def _self_test() -> int:
             e = signoff_refusals(ra)
             ok(any("does not load" in x for x in e), f"EP57 an engine that does not load refuses: {e}")
     guard("EP54-EP57 held-out checks fail closed", held_out_fail_closed)
+
+    # ------------------------------------------------------------ review round 2 (Codex): EP58-EP60
+    def held_out_round2():
+        real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
+        hid = sorted(pack_ids(real[0][1])[1])[0]
+        ent = {"value": 0.55, "source": SRC, "reason": f"puts {hid} in band", "basis": "owner_judgement"}
+        with tempfile.TemporaryDirectory() as d:
+            # EP58: an engine choice outside the signed spec never narrows the check (it can change after signing)
+            json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}},
+                      open(os.path.join(d, "engine_choice.json"), "w"))
+            ra = toy_raw(d, base=dict(ent))
+            ra["engine"] = {"auto": True}
+            e = signoff_refusals(ra, run_dir=d)
+            ok(any(HELD_OUT_REFUSED in x and hid in x for x in e),
+               f"EP58 engine: auto with an engine_choice.json naming a packless engine still checks every pack: {e}")
+            # EP59: a pack that cannot be reached (not absent) refuses; so does an engines directory that cannot be listed
+            real_lstat, real_scandir = EPm.os.lstat, EPm.os.scandir
+
+            def lstat(p, *a, **k):
+                if str(p).endswith("toy_engines_pack.yaml") or str(p).endswith(os.path.join("benchmarks", "pack.yaml")):
+                    raise PermissionError(13, "denied", p)
+                return real_lstat(p, *a, **k)
+
+            def scandir(p, *a, **k):
+                raise PermissionError(13, "denied", p)
+            got = {}
+            EPm.os.lstat = lstat
+            try:
+                got["pack"] = EPm.held_out_problems({FIELD: {"base": dict(ent, reason="clean")}}, TOYS.ToySpecEngine)
+                got["fallback pack"] = EPm._all_packs()[1]
+            finally:
+                EPm.os.lstat = real_lstat
+            EPm.os.scandir = scandir
+            try:
+                got["listing"] = EPm._all_packs()[1]
+            finally:
+                EPm.os.scandir = real_scandir
+            ok(all(got.values()) and "cannot be reached" in got["pack"][0] and "cannot be listed" in got["listing"][0],
+               f"EP59 filesystem errors are refusals, not absence: {got}")
+            # EP60: a non-boolean auto is refused, and a truthy one is treated as auto (every pack checked), as the
+            # spike backend reads it
+            ra["engine"] = {"auto": 1, "ref": "toolkit.engines.contract:ToyEngine"}
+            e = signoff_refusals(ra)
+            ok(any("true or false" in x for x in e) and any(HELD_OUT_REFUSED in x and hid in x for x in e),
+               f"EP60 auto: 1 with a ref is refused and the held-out text is still checked: {e}")
+    guard("EP58-EP60 held-out checks, round 2", held_out_round2)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
