@@ -755,15 +755,20 @@ def _self_test_run(ok) -> None:
     LIVE = ("pending", "starting", "running", "ready")
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
-              drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py"):
-        """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception)."""
+              drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
+              appear=None):
+        """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
+        `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
+        stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
+        appears after n cluster listings."""
         W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
-             "deferred": [], "polls": 0, "list_fail": 0, "stops": 0}
+             "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None}
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
         open(os.path.join(src, "job.py"), "w").write(
-            "import os\nopen(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
+            f"import os, time\ntime.sleep({job_sleep})\n"
+            "open(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
             f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n")
         fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
 
@@ -776,6 +781,9 @@ def _self_test_run(ok) -> None:
                 ev.append((who + "_noop", cid))
 
         def list_clusters(workspace=None):
+            W["list_calls"] += 1
+            if appear and W["list_calls"] > appear[0] and appear[1] not in W["clusters"]:
+                W["clusters"][appear[1]] = "running"
             if W["list_fail"] > 0:
                 W["list_fail"] -= 1
                 raise RuntimeError("listing failed")
@@ -825,7 +833,13 @@ def _self_test_run(ok) -> None:
                 ev.append("submit")
                 W["submit_kw"] = dict(kw)
                 jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
-                W["pending"] = lambda: fn(*args, store_mod=fs, **jkw)
+                task = lambda: fn(*args, store_mod=fs, **jkw)  # noqa: E731
+                if threaded:
+                    import threading
+                    W["thread"] = threading.Thread(target=task, daemon=True)
+                    W["thread"].start()
+                else:
+                    W["pending"] = task
                 return object()
 
         class FakeCluster:
@@ -851,7 +865,7 @@ def _self_test_run(ok) -> None:
         def job_down():
             ev.append("job_shutdown_request")
             cid = max(W["clusters"])
-            if job_stop == "now":     # the job stopped the cluster before any poll read its final state
+            if job_stop == "now" or threaded:     # the job stops the cluster now (its grace has run)
                 stop(cid, "job_shutdown")
             else:
                 W["deferred"].append(lambda: stop(cid, "job_shutdown"))
@@ -862,7 +876,7 @@ def _self_test_run(ok) -> None:
 
         def sleep(s):
             ev.append(("sleep", s))
-            real_sleep(min(s, 0.01))
+            real_sleep(s / 600 if threaded else min(s, 0.01))
 
         argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", *extra]
         if store:
@@ -883,6 +897,8 @@ def _self_test_run(ok) -> None:
                 msg = str(e.code) if e.code not in (None, 0) else None
             except BaseException as e:  # noqa: BLE001 -- an interrupt is the case under test
                 exc = e
+            if W["thread"] is not None:
+                W["thread"].join(20)
             W["after"] = lambda: [f() for f in W["deferred"]]
         return W, msg, out.getvalue(), exc
 
@@ -1056,6 +1072,46 @@ def _self_test_run(ok) -> None:
                 ok(calls and err is None,
                    f"RN14b the job's shutdown request on a cluster that is already stopping is harmless: {err!r}")
             case("RN14", rn14)
+
+            def rn18():
+                class SlowStore(_FakeStore):
+                    """An upload that takes longer than the job's heartbeat interval; records the state file's
+                    heartbeat age seen during it."""
+                    ages = []
+
+                    def upload_retry(self, path, blob, account=None):
+                        t_end = time.time() + 1.2
+                        while time.time() < t_end:
+                            raw = ws._read_json(os.path.join(ws.JOBS, "slow", "state.json")) or {}
+                            self.ages.append(time.time() - float(raw.get("heartbeat") or 0))
+                            real_sleep(0.05)
+                        return super().upload_retry(path, blob, account)
+                fs = SlowStore(os.path.join(d, "blob_slow"))
+                st = ws.job_task("slow", None, [sys.executable, "-c", "import os; open(os.path.join(os.environ["
+                                 "'JOB_OUT'], 'a'), 'w').write('1')"], None, 1.0, heartbeat_s=0.2,
+                                 store={"prefix": "outputs/t/slow"}, store_mod=fs)
+                worst = max(SlowStore.ages or [99.0])
+                ok(st["state"] == "done" and worst < 0.6,
+                   f"RN18 the job keeps its heartbeat up while it uploads and verifies its outputs, so a long upload "
+                   f"never reads as 'lost' (worst heartbeat age {worst:.2f} s with a 0.2 s interval)")
+            case("RN18", rn18)
+
+            def rn19():
+                W, msg, out, exc = world(d, "r19", appear=(1, 8))
+                ok(W["clusters"].get(8) == "running" and ("delete", 8) not in W["events"] and clean(W),
+                   f"RN19 another launcher's cluster of the same name that appears while `run` starts is never "
+                   f"stopped by `run`'s cleanup: msg={msg} events={W['events'][-3:]}")
+            case("RN19", rn19)
+
+            def rn20():
+                W, msg, out, exc = world(d, "r20", threaded=True, job_sleep=0.3)
+                ok(msg is None and exc is None and W["stops"] == 1 and W["clusters"][100] == "stopped"
+                   and ("job_shutdown_noop", 100) in W["events"] and clean(W)
+                   and not (W["thread"] and W["thread"].is_alive()),
+                   f"RN20 with the job running concurrently in its own thread, `run` reads its final state within "
+                   f"the job's grace period and stops the cluster; the job's later stop is a no-op: msg={msg} "
+                   f"exc={exc!r} stops={W['stops']} events={[e for e in W['events'] if not isinstance(e, tuple) or e[0] != 'sleep'][-5:]}")
+            case("RN20", rn20)
         finally:
             ws.JOBS = old
 
