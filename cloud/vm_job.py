@@ -1345,6 +1345,30 @@ def _self_test_run(ok) -> None:
                    f"RN26 a final-state write that fails (disk full) still stops the cluster under shutdown_always: "
                    f"{rows}")
             case("RN26", rn26)
+
+            def rn27():
+                import errno
+                downs, orig = [], ws._job_write
+                tok = ws.job_queue("init1")
+
+                def failing(d_, st_):
+                    if st_.get("state") == "running":       # the first write after the claim
+                        raise OSError(errno.ENOSPC, "No space left on device")
+                    return orig(d_, st_)
+                with mock.patch.object(ws, "_job_write", failing), \
+                        mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1)):
+                    try:
+                        ws.job_task("init1", None, ["true"], None, 1.0, token=tok, shutdown_always=True,
+                                    shutdown_grace_s=0)
+                        raised = None
+                    except OSError as e:
+                        raised = e
+                    refused = ws.job_task("init1", None, ["true"], None, 1.0, token="not-mine", shutdown_always=True)
+                ok(len(downs) == 1 and refused.get("state") == "refused",
+                   f"RN27 a claimed job whose initial running-state write fails (disk full) still stops its cluster "
+                   f"under shutdown_always; a refused submission stops nothing: stops={len(downs)} "
+                   f"raised={type(raised).__name__ if raised else None} refused={refused.get('state')}")
+            case("RN27", rn27)
         finally:
             ws.JOBS = old
 
