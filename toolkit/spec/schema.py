@@ -1213,6 +1213,19 @@ def _self_test() -> int:
             "SP7 an envelope below its fixed costs is refused")
         bad(lambda r: r["uncertainty"].update(excluded=[{"kind": "costs", "reason": "toy"}]), "neither declared",
             "SP8 lesson 6: an uncertainty source neither declared nor excluded with a reason is refused")
+        # a list column whose empty list is written as a declared token (a blank cell is refused as
+        # attribute_column_empty, so an empty list needs an explicit marker)
+        ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}
+        sx = Spec({"decision_units": {"engine_attributes": ea}}, d)
+        try:
+            got = [sx.unit_attributes({"yrs": v})["yrs"] for v in ("none", "2019 2020", " none ")]
+            ok(got == [[], [2019.0, 2020.0], []], f"SP8b a split column's declared empty token gives []: {got}")
+        except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+            ok(False, f"SP8b a split column's declared empty token gives [] ({type(e).__name__}: {e})")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "empty": "none"}),
+            "empty", "SP8c `empty` without `split` is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": " "}),
+            "empty", "SP8d a blank `empty` token is refused")
         bad(lambda r: r["uncertainty"]["excluded"][0].update(reason=""), "neither declared",
             "SP9 an exclusion without a reason is refused")
         bad(lambda r: r["constraints"].update(group_rules=[{"id": "g", "components": ["a"], "by": "nocol"}]),
