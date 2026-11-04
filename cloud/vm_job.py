@@ -789,14 +789,14 @@ def _self_test_run(ok) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None, after_submit=None):
+              appear=None, after_submit=None, ctor_side=None, then=()):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
         appears after n cluster listings."""
         W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
              "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None,
-             "table": ["tls://w1"], "job_worker": None, "polled": []}
+             "table": ["tls://w1"], "job_worker": None, "polled": [], "names": {}, "then": []}
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
@@ -821,7 +821,8 @@ def _self_test_run(ok) -> None:
             if W["list_fail"] > 0:
                 W["list_fail"] -= 1
                 raise RuntimeError("listing failed")
-            return [{"id": i, "name": "vm1", "current_state": {"state": s}} for i, s in W["clusters"].items()]
+            return [{"id": i, "name": W["names"].get(i, "vm1"), "current_state": {"state": s}}
+                    for i, s in W["clusters"].items()]
 
         def delete_cluster(name=None, cluster_id=None, workspace=None, pause=False):
             if name is not None:
@@ -890,6 +891,9 @@ def _self_test_run(ok) -> None:
                 cid = W["next"]
                 W["next"] += 1
                 W["clusters"][cid] = "pending"     # allocated before the constructor returns
+                W["names"][cid] = kw.get("name")
+                if ctor_side is not None:          # another launcher allocates meanwhile
+                    W["clusters"][ctor_side[0]], W["names"][ctor_side[0]] = "running", ctor_side[1]
                 if ctor_fail is not None:
                     raise ctor_fail
                 W["clusters"][cid] = "running"
@@ -913,7 +917,7 @@ def _self_test_run(ok) -> None:
                 W["deferred"].append(lambda: stop(cid, "job_shutdown"))
 
         def no_attach(name):
-            ev.append("attach_by_name")
+            ev.append(("attach", name))
             raise SystemExit("rc.attach called")
 
         def sleep(s):
@@ -941,12 +945,19 @@ def _self_test_run(ok) -> None:
                 exc = e
             if W["thread"] is not None:
                 W["thread"].join(20)
+            for extra_argv in then:     # later commands against the same fake (status, wait, down)
+                try:
+                    main(list(extra_argv))
+                    W["then"].append(None)
+                except BaseException as e:  # noqa: BLE001
+                    W["then"].append(e)
             W["after"] = lambda: [f() for f in W["deferred"]]
         return W, msg, out.getvalue(), exc
 
     def clean(W):
         ev = W["events"]
-        return len(W["ctor"]) <= 1 and "attach_by_name" not in ev and "delete_by_name" not in ev
+        return (len(W["ctor"]) <= 1 and "delete_by_name" not in ev
+                and not any(isinstance(e, tuple) and e[0] == "attach" for e in ev))
 
     with tempfile.TemporaryDirectory() as d:
         old = ws.JOBS
@@ -1169,6 +1180,42 @@ def _self_test_run(ok) -> None:
                    f"RN22 the job's worker leaving the cluster reads as lost (non-zero, cluster stopped), never as "
                    f"another worker's 'missing': msg={msg} polled={W['polled']}")
             case("RN22", rn22)
+
+            def rn23():
+                import re
+                for label, err, other in (("RuntimeError", RuntimeError("allocation failed"), "vm1"),
+                                          ("Ctrl-C", KeyboardInterrupt(), "vm1-r23c-a1b2c3")):
+                    jid = "r23" + label[0].lower()
+                    W, msg, out, exc = world(d, jid, ctor_fail=err, ctor_side=(8, other))
+                    mine = W["names"].get(100) or ""
+                    ok(re.fullmatch(rf"vm1-{jid}-[0-9a-f]{{6}}", mine) and ("delete", 100) in W["events"]
+                       and ("delete", 8) not in W["events"] and W["clusters"][8] == "running" and clean(W),
+                       f"RN23 {label} in a constructor that returns no id: only the cluster with this run's unique "
+                       f"name is stopped, never a concurrent launcher's {other!r}: mine={mine!r} {W['events']}")
+            case("RN23", rn23)
+
+            def rn24():
+                import re
+                local = os.path.join(d, "local")
+                W, msg, out, exc = world(d, "r24", job_rc=3, extra=("--keep-on-failure",),
+                                         then=(["status", "vm1", "r24", "--out", local],
+                                               ["wait", "vm1", "r24", "--out", local, "--every", "1"],
+                                               ["down", "vm1", "r24", "--out", local]))
+                name = (W["ctor"][0] if W["ctor"] else {}).get("name") or ""
+                rec = ws._read_json(os.path.join(local, "vm1", "r24", "job.json")) or {}
+                ok(re.fullmatch(r"vm1-r24-[0-9a-f]{6}", name) and len(name) <= 63
+                   and rec.get("cluster") == name and rec.get("cluster_id") == 100,
+                   f"RN24 `run` names its cluster <name>-<job_id>-<6 hex> and records the name and id in job.json: "
+                   f"{name!r} {({k: rec.get(k) for k in ('cluster', 'cluster_id')})}")
+                attaches = [e[1] for e in W["events"] if isinstance(e, tuple) and e[0] == "attach"]
+                ok(attaches and set(attaches) == {name} and ("delete", 100) in W["events"]
+                   and W["clusters"][100] == "stopped",
+                   f"RN24b `status`, `wait` and `down <name> <job_id>` find the run's cluster through job.json (no "
+                   f"suffix typed); `down` stops it by id: attaches={attaches} then={W['then']}")
+                got = run_cluster_name("V" * 40, "J_" * 32)
+                ok(len(got) <= 63 and re.fullmatch(r"[a-z][a-z0-9-]*-[0-9a-f]{6}", got) is not None,
+                   f"RN24c the unique name stays within 63 lowercase characters for long names and ids: {got!r}")
+            case("RN24", rn24)
         finally:
             ws.JOBS = old
 
