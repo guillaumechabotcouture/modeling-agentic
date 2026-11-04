@@ -46,7 +46,8 @@ settings:
                        # use has half-life ln2 / ln(0.773 / 0.592) = 2.60 y (949 days), from the trial.
                        # v0.9: the engine's net survival is smooth-compact (k = 20), so the same two survey
                        # values give a median of 841.3 days (2.30 y): S(1.54 y) / S(0.54 y) = 0.592 / 0.773
-                       # (engine self-test N5). Derived from the trial's reported use only.
+                       # (engine self-test N5), at each year's mean survey time as in v0.3. Derived from
+                       # the trial's reported use only.
     unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1],
            resistance: {gambiae: 0.088, arabiensis: 0.088, funestus: 0.545},
            species: {gambiae: 0.915, arabiensis: 0.042, funestus: 0.037}, cm_ft: 0.3, itn_use: 0.773, itn_use_at: 0.54,

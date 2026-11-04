@@ -46,7 +46,9 @@ function that the source of that median fits, the smooth-compact curve:
   main text "Net retention time" and Supplementary Table 1.7) are unchanged. It is no longer used as a half-life.
 - **Per-net daily loss.** The sim already tracks each person's net age (`net_t`) for holes. A net of age a days is
   now lost each day with the conditional hazard 1 − S(a+1)/S(a) (`model.net_loss_prob`). Compounded from age 0, this
-  gives S(t) exactly (self-test N2b), and the sim reproduces S(a0 + T)/S(a0) by net age (N3).
+  gives S(t) exactly (self-test N2b), and the sim reproduces S(a0 + T)/S(a0) by net age (N3). On a campaign's step
+  the age is 0, for a first net and for a replacement of a net still held (N7). A shape or median that is not
+  finite and positive fails closed (N6).
 - **Access at distribution** (`access_for_use`) divides reported use by the same S(t) (N4).
 - **Insecticide decay (Churcher 2016) and holes (Briët 2020)** are unchanged.
 
@@ -66,7 +68,9 @@ reported use: 77.3% in year 1 (surveys at 4 and 9 months, mean 0.54 y) and 59.2%
 1.54 y). Under the exponential, those two values give a half-life of ln2 / ln(0.773 / 0.592) = 949 d. Under the
 smooth-compact curve, the same two values give a median of 841.3 d (2.30 y): S(1.54 y) / S(0.54 y) = 0.592 / 0.773
 (self-test N5). Keeping 949 d would mean a ratio of 0.81, which the trial did not report. The value comes from the
-trial's use data only. The spec-value precedence test (EP36) now reads the setting's own value from the pack.
+trial's use data only. Two assumptions carry over from v0.3: each year's use is evaluated at the mean time of its two
+surveys, and the decline in use is all attrition (use among those with access is constant). Averaging S over the
+two surveys of each year instead gives 838 d. The spec-value precedence test (EP36) now reads the setting's own value from the pack.
 
 **Nigeria.** Supplementary Table 1.7 gives Nigeria (NGA) a median LLIN retention of 2.22 y (95% CI 2.00–2.47) from
 9 surveys. It is recorded in `priors.yaml` (`country_values`) for a run spec to cite through `engine_parameters`.

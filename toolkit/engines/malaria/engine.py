@@ -66,7 +66,7 @@ v0.9: net attrition follows the smooth-compact survival function of Bertozzi-Vil
 S(t) = exp(k - k / (1 - (t/L)^2)) for t < L and 0 after, k = 20 (new fixed parameter net_survival_k) and L from the
 median retention net_retention_half (unchanged name, value and range). A net of age a days is lost each day with
 probability 1 - S(a+1)/S(a) (model.net_loss_prob), and access_for_use divides by the same S(t). Not byte-identical
-to v0.8: every benchmark was recomputed (ENGINE_NOTES.md, v0.9). Self-tests N0-N4.
+to v0.8, so the benchmark evidence is recomputed (validate_once.sh; ENGINE_NOTES.md, v0.9). Self-tests N0-N7.
 """
 from __future__ import annotations
 
@@ -1785,6 +1785,57 @@ def _self_test_v09(ok, e, unit) -> None:
         ok(abs(r - 0.592 / 0.773) < 0.002, f"N5 Muleba's median retention ({med:g} d) reproduces its trial's year-2 / "
                                            f"year-1 use ratio under S(t): {r:.4f} vs {0.592 / 0.773:.4f}")
     case("N5", n5)
+
+    def n6():
+        # review r1 (P2): a non-positive or non-finite shape or median fails closed (k < 0 gives S > 1)
+        bad = []
+        for med, k in ((598.6, 0.0), (598.6, -0.5), (598.6, float("nan")), (598.6, float("inf")), (0.0, 20.0),
+                       (-1.0, 20.0), (float("nan"), 20.0), (float("inf"), 20.0)):
+            for fn in (M.net_survival, M.net_loss_prob):
+                try:
+                    fn(np.array([100.0]), med, k)
+                    bad.append((fn.__name__, med, k))
+                except ValueError:
+                    pass
+        try:
+            access_for_use(0.5, 1.0, dict(P0, net_survival_k=-0.5))
+            bad.append(("access_for_use", "k", -0.5))
+        except ValueError:
+            pass
+        ok(not bad, f"N6 the survival helpers and access_for_use refuse k or a median that is not finite and positive "
+                    f"(accepted: {bad})")
+    case("N6", n6)
+
+    def n7():
+        # review r1 (P2): the hazard's net age on campaign days. Two campaigns reach the same people (the second
+        # replaces nets they still hold); the age passed to net_loss_prob is 0 on each campaign's step and 1 the day after
+        hz = Horizon(2019.0, 2020.0, (2019.0, 2020.0), {})
+        u = UnitSpec("t", dict(unit.attributes, itn_hist_years=[2019.2, 2019.6], itn_use=0.6, campaign_year=2019.9,
+                               irs_month=None))
+        sim, _ = e.build_sim({"n_agents": 800, "burnin_years": 0, "net_retention_half": 1e9}, u, Package("n", {}), hz, 3)
+        rec, orig = [], M.net_loss_prob
+
+        def spy(age, med, k):
+            rec.append((np.asarray(sim.people.auids).copy(), np.asarray(age, float).copy()))
+            return orig(age, med, k)
+        M.net_loss_prob = spy
+        try:
+            sim.run()
+        finally:
+            M.net_loss_prob = orig
+        s1, s2 = sorted(M.event_steps(sim.t.yearvec, [2019.2, 2019.6]))
+        dz = sim.diseases.malaria
+        held = set(np.asarray(sim.people.auids)[np.asarray(dz.has_net[sim.people.auids], bool)].tolist())
+        at = {}
+        for s in (s1, s1 + 1, s2, s2 + 1):
+            ids, ages = rec[s]
+            at[s] = {int(i): float(a) for i, a in zip(ids, ages) if int(i) in held}
+        both = set(at[s1]) & set(at[s2 + 1])
+        ok(len(rec) == len(sim.timevec) and len(both) > 100
+           and all(at[s1][i] == 0 and at[s1 + 1][i] == 1 and at[s2][i] == 0 and at[s2 + 1][i] == 1 for i in both),
+           f"N7 net age in the loss hazard is 0 on a campaign's step and 1 the next day, for first nets and for "
+           f"replacements of nets still held ({len(both)} people, campaign steps {s1}, {s2})")
+    case("N7", n7)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""

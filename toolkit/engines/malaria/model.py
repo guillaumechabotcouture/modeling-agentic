@@ -65,8 +65,12 @@ DAILY = tuple(PFPR_BANDS) + ("inc_u5", "inc_all", "inc_u5_smc", "eir", "net_use"
 
 def net_survival_L(median_days, k) -> float:
     """v0.9: the smooth-compact time by which every net is gone, from the median retention: S(median) = 1/2 gives
-    (median / L)^2 = ln2 / (k + ln2)."""
-    return float(median_days) * float(np.sqrt((k + LN2) / LN2))
+    (median / L)^2 = ln2 / (k + ln2). A shape or median that is not finite and positive fails closed (k < 0 would
+    give S > 1)."""
+    m, k = float(median_days), float(k)
+    if not (np.isfinite(m) and m > 0 and np.isfinite(k) and k > 0):
+        raise ValueError(f"net survival needs a finite positive median and shape k (median {m!r} d, k {k!r})")
+    return m * float(np.sqrt((k + LN2) / LN2))
 
 
 def _log_net_survival(age_days, median_days, k):
