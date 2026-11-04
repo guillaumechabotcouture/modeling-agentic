@@ -783,9 +783,23 @@ def _cluster_env(work):
 
 
 def _shutdown_cluster():
-    """Stop this cluster from inside one of its tasks (as run_to_disk does once every run is stored)."""
-    from distributed import get_client
-    get_client().shutdown()
+    """Stop this cluster from inside one of its tasks (as run_to_disk does once every run is stored).
+    Idempotent: when the cluster is already stopping (the launcher stopped it first), the
+    request is dropped, never raised."""
+    try:
+        from distributed import get_client
+        get_client().shutdown()
+    except Exception:  # noqa: BLE001 -- already stopping: nothing left to stop
+        pass
+
+
+def _job_shutdown(grace_s):
+    """The job's own stop, after `grace_s` (so a launcher polling the job reads its final state
+    and stops the cluster itself first)."""
+    import time
+    if grace_s:
+        time.sleep(grace_s)
+    _shutdown_cluster()
 
 
 def store_outputs(out, prefix, account, store, beat=None):
@@ -832,7 +846,22 @@ def store_outputs(out, prefix, account, store, beat=None):
 
 
 def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None,
-             cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None):
+             cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None,
+             shutdown_grace_s=0, shutdown_always=False):
+    """The job, as a dask task (see _job_task). With `shutdown_always`, a job that claimed its
+    id and then ends in any way (an exception included, e.g. a state write on a full disk)
+    requests its cluster's stop exactly once; a refused submission stops nothing."""
+    ctl = {"claimed": False, "stopped": False}
+    try:
+        return _job_task(job_id, code, cmd, secrets, max_hours, setup_sdk, heartbeat_s, token, cluster_compute,
+                         store, shutdown_when_stored, store_mod, shutdown_grace_s, shutdown_always, ctl)
+    finally:
+        if shutdown_always and ctl["claimed"] and not ctl["stopped"]:
+            _job_shutdown(shutdown_grace_s)
+
+
+def _job_task(job_id, code, cmd, secrets, max_hours, setup_sdk, heartbeat_s, token, cluster_compute, store,
+              shutdown_when_stored, store_mod, shutdown_grace_s, shutdown_always, ctl):
     """The job, as a dask task: claim the id (the 'queued' record with this submission's
     token; with no token, an id that is neither queued nor running), unpack `code` (a
     tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
@@ -845,7 +874,11 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     reads every file back (store_outputs); `shutdown_when_stored` then stops the cluster from
     here, but only for a job that is done with every output verified in storage. Otherwise
     the cluster is left to its idle timeout, so the outputs can still be collected. None of
-    this depends on the laptop."""
+    this depends on the laptop. `shutdown_always` (`vm_job.py run` without --keep-on-failure)
+    stops the cluster at the end whatever the outcome: failed, timed out, unverified, or a
+    command that cannot start. `shutdown_grace_s` delays either stop (the final state is
+    already written), so a poller (`vm_job.py run`) reads the final state and stops the
+    cluster itself; with no poller, the job still stops it after the grace period."""
     import io, os, re, shutil, signal, subprocess, sys, tarfile, time
     d = _job_dir(job_id)
     with _JobLock(d):
@@ -857,6 +890,7 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
             ok = cur["state"] not in ("running", "queued")
         if not ok:
             return {"job_id": job_id, "state": "refused", "why": f"the id is {cur['state']} under another submission"}
+        ctl["claimed"] = True     # from here every way out requests the stop (job_task)
         work, out = os.path.join(d, "work"), os.path.join(d, "out")
         for sub in (work, out, os.path.join(d, "job.log")):
             if os.path.isdir(sub):
@@ -907,29 +941,53 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
                 time.sleep(min(5, heartbeat_s))
             rc = p.wait()
     except Exception as e:  # noqa: BLE001 — a job that cannot start is recorded, not lost
-        st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time())
-        _job_write(d, st)
+        st.update(state="failed", error=f"{type(e).__name__}: {e}"[:500], ended=time.time(), heartbeat=time.time(),
+                  shutdown=bool(shutdown_always))
+        try:
+            _job_write(d, st)
+        finally:   # a failed write (disk full) never skips the stop
+            if shutdown_always:
+                ctl["stopped"] = True
+                _job_shutdown(shutdown_grace_s)
         return st
     final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
                  ended=time.time(), duration_s=round(time.time() - t0))
     if store:
+        import threading
+        lock, done_ev = threading.Lock(), threading.Event()
+
         def beat():
-            st["heartbeat"] = time.time()
-            _job_write(d, st)
+            with lock:
+                st["heartbeat"] = time.time()
+                _job_write(d, st)
+
+        def beater():   # one upload or read-back can take longer than JOB_STALE_S: never read as 'lost'
+            while not done_ev.wait(heartbeat_s):
+                beat()
+        t = threading.Thread(target=beater, daemon=True)
+        t.start()
         try:
             smod = store_mod or _load_by_path("_ma_job_results_store", os.path.join(work, "scripts",
                                                                                      "results_store.py"))
         except Exception as e:  # noqa: BLE001
-            st["stored"] = {"prefix": store.get("prefix"), "verified": False,
-                            "why": f"no results_store in the shipped tree ({type(e).__name__}: {e})"[:300]}
+            stored = {"prefix": store.get("prefix"), "verified": False,
+                      "why": f"no results_store in the shipped tree ({type(e).__name__}: {e})"[:300]}
         else:
-            st["stored"] = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
+            stored = store_outputs(out, store["prefix"], store.get("account"), smod, beat)
+        finally:
+            done_ev.set()
+            t.join()
+        st["stored"] = stored
     st.update(final, heartbeat=time.time())
-    down = bool(shutdown_when_stored and st["state"] == "done" and (st.get("stored") or {}).get("verified"))
+    down = bool(shutdown_always or (shutdown_when_stored and st["state"] == "done"
+                                    and (st.get("stored") or {}).get("verified")))
     st["shutdown"] = down
-    _job_write(d, st)
-    if down:
-        _shutdown_cluster()
+    try:
+        _job_write(d, st)
+    finally:   # a failed final-state write (disk full) never skips the stop
+        if down:
+            ctl["stopped"] = True
+            _job_shutdown(shutdown_grace_s)
     return st
 
 
