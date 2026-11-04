@@ -166,6 +166,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
+    _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
@@ -192,6 +193,21 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except (LinkRefused, OSError) as e:
         raise ValueError(f"sign-off not written: {e}") from None
     return record
+
+
+def _refuse_held_out(spec_bytes: bytes, run_dir: str) -> None:
+    """Refuse (ValueError) a spec whose engine parameter values have no basis, or were chosen with a held-out benchmark
+    of an engine the spec may run (toolkit/spec/engine_parameters.py signoff_refusals). No signer, flag or note
+    overrides it. `spec_bytes`: the bytes being signed."""
+    import yaml
+    from toolkit.spec import engine_parameters as PV
+    try:
+        doc = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"{SPEC} does not parse: {e}") from None
+    bad = PV.signoff_refusals(doc if isinstance(doc, dict) else {}, run_dir=run_dir)
+    if bad:
+        raise ValueError("spec not signable (engine_parameters): " + "; ".join(bad[:10]))
 
 
 SHEET_SOURCES = "<!-- signoff-sheet-sources: "
@@ -565,8 +581,9 @@ def _self_test() -> int:
         raw = yaml.safe_load(open(p))
         raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecEngine"}
         raw["engine_parameters"] = {
-            "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline"},
-            "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting"}}
+            "base": {"value": 0.3, "outside_card_range": True, "source": "a toy sweep", "reason": "toy headline",
+                     "basis": "owner_judgement"},
+            "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting", "basis": "setting_data"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         md = sheet(d)
         sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \

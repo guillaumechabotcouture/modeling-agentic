@@ -14,6 +14,9 @@ choice the owner signs, not an engine change and not a fit:
         units: days                      # optional; must equal the engine card's units
         source: "<where the value comes from>"
         reason: "<why this run uses it>"
+        basis: literature | setting_data | owner_judgement | fitted    # required: how the value was chosen
+        fitted_to: [<benchmark id>, ...]  # required with basis: fitted, refused otherwise: the fit targets of the
+                                         # engine's own benchmark pack that the value was chosen with
         outside_card_range: true         # required when the value (or its range) lies outside the
                                          # engine card's range; refused when it does not
         range: [lo, hi]                  # optional: the uncertainty draws vary it over this range
@@ -23,6 +26,13 @@ Rules (every check names the entry it failed):
   - the parameter is on the engine card, of kind `fixed` or `scenario`; fitted and calibrated
     values come from fitting and are refused; a unit attribute is bound in decision_units;
   - source and reason are required;
+  - basis is required (missing or unknown: refused). `fitted` needs `fitted_to`, a list of benchmark ids of the
+    engine's own benchmark pack (benchmark_pack(): the pack beside the engine's code, never named by the spec).
+    An id that is not in the pack is refused; an id the pack holds out (every benchmark not in its fit targets,
+    toolkit/engines/benchmark.py fit_targets) is refused, and no flag, owner or lead sign-off accepts it: a value
+    chosen with a held-out benchmark leaves that benchmark nothing to test;
+  - backstop (not the main check): a source or reason that names a held-out benchmark id of the engine's pack
+    (word-boundary match against the pack's own ids) is refused the same way, whatever the basis says;
   - the card's range is the parameter's own `lo`/`hi`, else its engine-card prior's range. A
     value outside it needs `outside_card_range: true`; the sign-off sheet, results.md and the
     report then show it as a HIGH note;
@@ -64,7 +74,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 FIELD = "engine_parameters"
-KEYS = ("value", "units", "source", "reason", "outside_card_range", "range", "dist", "verified")
+KEYS = ("value", "units", "source", "reason", "basis", "fitted_to", "outside_card_range", "range", "dist", "verified")
+BASES = ("literature", "setting_data", "owner_judgement", "fitted")   # how the value was chosen (required)
+HELD_OUT_REFUSED = "held-out benchmark"      # every refusal of a value chosen with a held-out benchmark names this
 KINDS = ("fixed", "scenario")
 DISTS = ("uniform", "loguniform", "triangular")      # toolkit/spec/priors.py DISTS: bounded, so the design box spans them
 HELD = "held fixed at the spec value"
@@ -105,6 +117,7 @@ def _entry_shape(n, e) -> list[str]:
     for k, what in (("source", "where the value comes from"), ("reason", "why this run uses it")):
         if not str(e.get(k) or "").strip():
             bad.append(f"{w}: {k} ({what}) is empty")
+    bad += _basis_shape(w, e)
     if "outside_card_range" in e and not isinstance(e["outside_card_range"], bool):
         bad.append(f"{w}: outside_card_range is true or false")
     if "units" in e and not isinstance(e["units"], str):
@@ -119,6 +132,32 @@ def _entry_shape(n, e) -> list[str]:
             bad.append(f"{w}: a loguniform range must be positive")
     elif "dist" in e:
         bad.append(f"{w}: dist without range (give range [lo, hi], or drop dist: the value is then held fixed)")
+    return bad
+
+
+def _basis_shape(w: str, e: dict) -> list[str]:
+    """basis is one of BASES; fitted_to is a non-empty list of distinct ids with basis: fitted, absent otherwise."""
+    b, ft = e.get("basis"), e.get("fitted_to")
+    if not isinstance(b, str) or b not in BASES:
+        return [f"{w}: basis {'is missing' if b is None else repr(b) + ' is not known'} (one of {', '.join(BASES)}: "
+                "how the value was chosen)"]
+    if b != "fitted":
+        return [f"{w}: fitted_to is only for basis: fitted"] if "fitted_to" in e else []
+    if not (isinstance(ft, list) and ft and all(isinstance(x, str) and x.strip() for x in ft)
+            and len(set(ft)) == len(ft)):
+        return [f"{w}: basis: fitted needs fitted_to, a list of the benchmark ids the value was fitted to (fit "
+                "targets of the engine's benchmark pack)"]
+    return []
+
+
+def basis_problems(spec) -> list[str]:
+    """The basis checks alone (every entry; no engine needed)."""
+    bad = []
+    for n, e in declared(spec).items():
+        if isinstance(e, dict):
+            bad += _basis_shape(f"{FIELD}.{n}", e)
+        else:
+            bad.append(f"{FIELD}.{n}: a mapping {{value, source, reason, basis, ...}}")
     return bad
 
 
@@ -203,7 +242,143 @@ def problems(spec, engine) -> list[str]:
         elif flag and side is None:
             bad.append(f"{w}: outside_card_range is true but the value{' and its range lie' if rg else ' lies'} inside "
                        f"the card's range [{cr[0]:g}, {cr[1]:g}]")
+    return bad + held_out_problems(spec, engine)
+
+
+# ---- values chosen with a held-out benchmark (refused at sign-off; no flag or signer accepts them)
+PACK_DEFAULT = os.path.join("benchmarks", "pack.yaml")
+
+
+def _class_ref(cls) -> str:
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def benchmark_pack(engine_or_cls):
+    """(pack, path) of the engine's own benchmark pack, or (None, why). The pack is the file beside the engine's code:
+    the class attribute BENCHMARK_PACK (a path relative to the class's module directory), else benchmarks/pack.yaml
+    there. Never from the spec or the engine's configuration, which an agent writes. The pack must name this class."""
+    import inspect
+    import yaml
+    cls = engine_or_cls if isinstance(engine_or_cls, type) else type(engine_or_cls)
+    try:
+        here = os.path.dirname(os.path.abspath(inspect.getfile(cls)))
+    except (TypeError, OSError) as e:
+        return None, f"the code of {_class_ref(cls)} has no file ({e})"
+    path = os.path.join(here, getattr(cls, "BENCHMARK_PACK", None) or PACK_DEFAULT)
+    if not os.path.exists(path):
+        return None, f"{_class_ref(cls)} has no benchmark pack"
+    try:
+        pack = yaml.safe_load(open(path, encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        return None, f"the benchmark pack of {_class_ref(cls)} is unreadable: {e}"
+    if not isinstance(pack, dict) or not isinstance(pack.get("benchmarks"), list):
+        return None, f"the benchmark pack of {_class_ref(cls)} lists no benchmarks"
+    if pack.get("engine") != _class_ref(cls):
+        return None, f"the benchmark pack beside {_class_ref(cls)} is for {pack.get('engine')}"
+    return pack, path
+
+
+def pack_ids(pack: dict) -> tuple[set, set]:
+    """(every benchmark id, the held-out ids): held out is every benchmark not in the pack's fit targets."""
+    from toolkit.engines import benchmark as BM
+    ids = {str(b["id"]) for b in pack.get("benchmarks") or [] if isinstance(b, dict) and b.get("id") is not None}
+    return ids, ids - {str(t) for t in BM.fit_targets(pack)}
+
+
+def _names(text: str, ident: str) -> bool:
+    """Whether `text` names the id `ident` as a word (case-insensitive; B7 is not named by B7b or AB7)."""
+    import re
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+
+
+def _held_out_entry(w: str, e: dict, ref: str, pack, why) -> list[str]:
+    """The refusals of one entry against one engine's pack (pack None: `why` says why there is none)."""
+    bad = []
+    if pack is None:
+        if e.get("basis") == "fitted":
+            bad.append(f"{w}: fitted_to cannot be resolved: {why}; a value fitted to benchmarks needs the engine's own "
+                       "pack to show they are fit targets, not held out")
+        return bad
+    ids, held = pack_ids(pack)
+    if e.get("basis") == "fitted" and isinstance(e.get("fitted_to"), list):
+        for t in e["fitted_to"]:
+            if not isinstance(t, str):
+                continue
+            if t not in ids:
+                bad.append(f"{w}: fitted_to names {t}, not a benchmark of {ref}'s pack")
+            elif t in held:
+                bad.append(f"{w}: REFUSED: fitted_to names {t}, a {HELD_OUT_REFUSED} of {ref} (not one of the "
+                           "pack's fit targets). A value chosen with a held-out benchmark cannot be signed by the "
+                           "owner or the lead: the benchmark would no longer test the engine")
+    named = sorted(i for i in held if any(_names(str(e.get(k) or ""), i) for k in ("source", "reason")))
+    if named:
+        bad.append(f"{w}: REFUSED: its source or reason names {', '.join(named)}, {HELD_OUT_REFUSED}"
+                   f"{'s' if len(named) > 1 else ''} of {ref}. A value justified by a held-out benchmark cannot be "
+                   "signed by the owner or the lead (if the value does not come from it, say where it does come from)")
     return bad
+
+
+def held_out_problems(spec, engine) -> list[str]:
+    """The held-out refusals of every entry on this engine, an instance or its class (its own benchmark pack)."""
+    pack, why = benchmark_pack(engine)
+    ref = _class_ref(engine if isinstance(engine, type) else type(engine))
+    bad = []
+    for n, e in declared(spec).items():
+        if isinstance(e, dict):
+            bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
+    return bad
+
+
+def _all_packs() -> list[tuple]:
+    """(engine ref, pack) for every pack under toolkit/engines/*/benchmarks/ (the fallback when no engine is known)."""
+    import glob
+    import yaml
+    out = []
+    for p in sorted(glob.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "pack.yaml"))):
+        try:
+            pk = yaml.safe_load(open(p, encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(pk, dict) and isinstance(pk.get("benchmarks"), list):
+            out.append((str(pk.get("engine")), pk))
+    return out
+
+
+def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[str]:
+    """What blocks signing the spec's engine parameter values, whoever signs: each entry's basis, and the held-out
+    refusals against the pack of every engine the spec may run (_sheet_refs). With no engine known yet, a fitted
+    entry is refused (it cannot be resolved) and the text backstop reads every engine pack in the repository.
+    toolkit/spec/signoff.py sign and scripts/decision_brief.py sign both refuse while this is not empty."""
+    from toolkit.spec import schema
+    r = _raw(raw)
+    if r.get(FIELD) is None:
+        return []
+    if not isinstance(r[FIELD], dict):
+        return [f"{FIELD}: a mapping {{parameter: {{value, source, reason, basis, ...}}}}"]
+    bad = basis_problems(r)
+    ents = {n: e for n, e in declared(r).items() if isinstance(e, dict)}
+    targets = []
+    for ref, _decl in _sheet_refs(r, candidates, run_dir):
+        try:
+            cls = schema.engine_class(ref)
+        except Exception as e:  # noqa: BLE001 -- fail closed: the values cannot be checked against its pack
+            bad.append(f"{FIELD}: engine {ref} does not load ({type(e).__name__}: {str(e)[:200]}), so its benchmark "
+                       "pack cannot be checked for the spec's values")
+            targets.append((ref, None, f"{ref} does not load"))
+            continue
+        pack, why = benchmark_pack(cls)
+        targets.append((ref, pack, why))
+    if not targets:
+        targets = [(ref, pk, None) for ref, pk in _all_packs()]
+        for n, e in ents.items():
+            if e.get("basis") == "fitted":
+                bad.append(f"{FIELD}.{n}: fitted_to cannot be resolved before the engine is known (engine: auto, "
+                           "no candidate)")
+        ents = {n: dict(e, basis=None) for n, e in ents.items()}    # the text backstop only
+    for n, e in ents.items():
+        for ref, pack, why in targets:
+            bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
+    return list(dict.fromkeys(bad))
 
 
 def values(spec) -> dict:
@@ -554,7 +729,11 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
         rg = _range(e)
         unc = f"drawn over [{rg[0]:g}, {rg[1]:g}] ({e.get('dist')})" if rg else HELD
         val = _g(e["value"]) if _isnum(e.get("value")) else repr(e.get("value"))
-        out.append(f"- **{n}** = {val}{u}. Source: {e.get('source')}. Reason: {e.get('reason')}. Uncertainty: {unc}.")
+        basis = e.get("basis") if e.get("basis") in BASES else "missing"
+        fit = f" (fitted to {', '.join(map(str, e['fitted_to']))})" if basis == "fitted" and isinstance(
+            e.get("fitted_to"), list) else ""
+        out.append(f"- **{n}** = {val}{u}. Basis: {basis}{fit}. Source: {e.get('source')}. Reason: {e.get('reason')}. "
+                   f"Uncertainty: {unc}.")
         for ref, en in engines.items():
             if isinstance(en, Exception):
                 out.append(f"  - `{ref}`: card not loaded ({type(en).__name__}: {en})")
@@ -573,7 +752,11 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
                 high.append(f"- **HIGH**: {what} the card range of `{ref}` ({_g(cr[0])} to {_g(cr[1])}{u}; "
                             f"outside_card_range: {str(e.get('outside_card_range') is True).lower()}). Signing accepts "
                             "it; its source and reason are above.")
-    return out + ([""] + high if high else []) + [""]
+    refused = [f"- **REFUSED**: {x}" for x in signoff_refusals(raw, candidates, run_dir)]
+    if refused:
+        refused = ["", "Signing is refused while any of these stands; no sign-off, the owner's included, accepts it:"] \
+            + refused
+    return out + ([""] + high if high else []) + refused + [""]
 
 
 def _cli(argv) -> int:
@@ -650,7 +833,7 @@ def _self_test() -> int:
     # ------------------------------------------------------------ schema
     def schema_cases():
         with tempfile.TemporaryDirectory() as d:
-            good = {"value": 0.55, "source": SRC, "reason": WHY}
+            good = {"value": 0.55, "source": SRC, "reason": WHY, "basis": "owner_judgement"}
             r0 = toy_raw(d, base=dict(good))
             ok(schema.validate(schema.Spec(r0, d)) == [], f"EP1 a spec value with source and reason validates: "
                                                            f"{schema.validate(schema.Spec(r0, d))[:3]}")
@@ -665,8 +848,8 @@ def _self_test() -> int:
             bad({"x": dict(good)}, "unit attribute", "EP3 a unit attribute is refused, with where it is bound")
             bad({"eff_a": dict(good, value=0.5)}, "of kind fitted", "EP4a a fitted parameter is refused")
             bad({"c_rate": dict(good, value=1.0)}, "of kind calibrated", "EP4b a calibrated parameter is refused")
-            bad({"base": {"value": 0.55, "reason": WHY}}, "source", "EP5a a value without a source is refused")
-            bad({"base": {"value": 0.55, "source": SRC}}, "reason", "EP5b a value without a reason is refused")
+            bad({"base": {"value": 0.55, "reason": WHY, "basis": "owner_judgement"}}, "source", "EP5a a value without a source is refused")
+            bad({"base": {"value": 0.55, "source": SRC, "basis": "owner_judgement"}}, "reason", "EP5b a value without a reason is refused")
             bad({"base": dict(good, value=0.3)}, "outside_card_range",
                 "EP6a a value outside the card's range without the flag is refused")
             r = toy_raw(d, base=dict(good, value=0.3, outside_card_range=True))
@@ -706,7 +889,7 @@ def _self_test() -> int:
                and "uncertainty range" in md and "base = 0.55 is outside" not in md,
                f"EP7j the report's HIGH note names the range that is outside, not the value: {md[-260:]!r}")
             # engine: auto. Shape checks at sign-off; each candidate checked against its own card
-            ra = toy_raw(d, base={"value": 0.55, "source": SRC})
+            ra = toy_raw(d, base={"value": 0.55, "source": SRC, "basis": "owner_judgement"})
             ra["engine"] = {"auto": True, "candidates": ["toolkit.spec.toy_engines:ToySpecEngine",
                                                          "toolkit.engines.empirical.engine:PackageRateEngine"]}
             errs = schema.validate(schema.Spec(ra, d), pending_ok=True)
@@ -721,7 +904,7 @@ def _self_test() -> int:
                and any(FIELD in e and "not an engine parameter" in e for e in e_bad),
                f"EP9b a candidate engine without the parameter is refused, one with it passes: {e_bad[:1]}")
         with tempfile.TemporaryDirectory() as d:
-            r = toy_raw(d, base={"value": 0.55, "source": SRC, "reason": WHY})
+            r = toy_raw(d, base={"value": 0.55, "source": SRC, "reason": WHY, "basis": "owner_judgement"})
             p = os.path.join(d, "decision_spec.yaml")
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
             yaml.safe_dump({FIELD: {"base": {"value": 0.45}}}, open(os.path.join(d, schema.SETTINGS), "w"))
@@ -761,7 +944,7 @@ def _self_test() -> int:
             ok(dig(schema.Spec(re_, d)) == got["toy"] and EPm.params(schema.Spec(re_, d), {"a": 1.0}) == {"a": 1.0},
                "EP-H2 an empty field changes nothing")
             rk = copy.deepcopy(s.raw)
-            rk[FIELD] = {"k": {"value": 0.9, "source": SRC, "reason": WHY}}
+            rk[FIELD] = {"k": {"value": 0.9, "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             sk = schema.Spec(rk, d)
             dk, jk = Bt.design(sk)
             d0, j0 = Bt.design(s)
@@ -776,7 +959,7 @@ def _self_test() -> int:
         from toolkit.analysis import batch as Bt
         with tempfile.TemporaryDirectory() as d:
             r = toy_raw(d, base={"value": 0.3, "range": [0.25, 0.35], "dist": "uniform", "outside_card_range": True,
-                                 "source": SRC, "reason": WHY})
+                                 "source": SRC, "reason": WHY, "basis": "owner_judgement"})
             r["uncertainty"]["excluded"].append({"kind": "priors", "reason": "owner: hold the priors for this test"})
             r["analysis"]["decision_tests"] = [{"id": "DTc", "type": "parameter_value", "parameter": "base",
                                                 "values": [0.5], "text": "Does the plan change at the card value?"}]
@@ -796,7 +979,7 @@ def _self_test() -> int:
             bench, _v_ok, _v_bad = RUN._toy_bench(d)
             p = schema.toy_spec(d, n=24, bench=bench)
             r = yaml.safe_load(open(p))
-            r[FIELD] = {"synergy": {"value": 0.05, "source": SRC, "reason": WHY}}
+            r[FIELD] = {"synergy": {"value": 0.05, "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)
             signoff.sign(d, "lead", note="self-test")
             R = RUN.run(d, log=q, compute_kw={"max_workers": 2})
@@ -992,10 +1175,10 @@ def _self_test() -> int:
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix="ma_toy_log_") as logs:
             TOYS.enable_for_test(logs)
             r = toy_raw(d,
-                        base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY},
-                        k={"value": 0.9, "source": SRC, "reason": WHY},
+                        base={"value": 0.3, "outside_card_range": True, "source": SRC, "reason": WHY, "basis": "owner_judgement"},
+                        k={"value": 0.9, "source": SRC, "reason": WHY, "basis": "owner_judgement"},
                         synergy={"value": 0.05, "range": [0.0, 0.1], "dist": "uniform", "source": SRC,
-                                 "reason": WHY})
+                                 "reason": WHY, "basis": "owner_judgement"})
             r["analysis"]["decision_tests"] = [{"id": "DTc", "type": "parameter_value", "parameter": "base",
                                                 "values": [0.5], "finding": "decision_test:DTc",
                                                 "text": "Does the plan change at the engine card value?"}]
@@ -1087,7 +1270,7 @@ def _self_test() -> int:
             p = os.path.join(d, "decision_spec.yaml")
             r = yaml.safe_load(open(p))
             r["engine"]["ref"] = "toolkit.spec.toy_engines:ToySpecRateEngine"
-            r[FIELD] = {"scale": {"value": 1.25, "units": "multiplier", "source": SRC, "reason": WHY}}
+            r[FIELD] = {"scale": {"value": 1.25, "units": "multiplier", "source": SRC, "reason": WHY, "basis": "owner_judgement"}}
             r["analysis"]["decision_tests"].append({"id": "DTs", "type": "parameter_value", "parameter": "scale",
                                                     "values": [1.0], "text": "Does the plan change at the card value?"})
             yaml.safe_dump(r, open(p, "w"), sort_keys=False)

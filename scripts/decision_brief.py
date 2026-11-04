@@ -471,6 +471,11 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if root not in sys.path:
             sys.path.insert(0, root)
+        # The spec's engine parameter values: no basis, or a value chosen with a held-out benchmark, is refused here
+        # too, whoever signs (this entry point does not run the spec's schema validation; toolkit/spec/signoff.py
+        # sign does, and refuses the same)
+        from toolkit.spec import signoff as SO
+        SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
