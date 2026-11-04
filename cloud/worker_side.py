@@ -848,6 +848,20 @@ def store_outputs(out, prefix, account, store, beat=None):
 def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None,
              cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None,
              shutdown_grace_s=0, shutdown_always=False):
+    """The job, as a dask task (see _job_task). With `shutdown_always`, a job that claimed its
+    id and then ends in any way (an exception included, e.g. a state write on a full disk)
+    requests its cluster's stop exactly once; a refused submission stops nothing."""
+    ctl = {"claimed": False, "stopped": False}
+    try:
+        return _job_task(job_id, code, cmd, secrets, max_hours, setup_sdk, heartbeat_s, token, cluster_compute,
+                         store, shutdown_when_stored, store_mod, shutdown_grace_s, shutdown_always, ctl)
+    finally:
+        if shutdown_always and ctl["claimed"] and not ctl["stopped"]:
+            _job_shutdown(shutdown_grace_s)
+
+
+def _job_task(job_id, code, cmd, secrets, max_hours, setup_sdk, heartbeat_s, token, cluster_compute, store,
+              shutdown_when_stored, store_mod, shutdown_grace_s, shutdown_always, ctl):
     """The job, as a dask task: claim the id (the 'queued' record with this submission's
     token; with no token, an id that is neither queued nor running), unpack `code` (a
     tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
@@ -876,6 +890,7 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
             ok = cur["state"] not in ("running", "queued")
         if not ok:
             return {"job_id": job_id, "state": "refused", "why": f"the id is {cur['state']} under another submission"}
+        ctl["claimed"] = True     # from here every way out requests the stop (job_task)
         work, out = os.path.join(d, "work"), os.path.join(d, "out")
         for sub in (work, out, os.path.join(d, "job.log")):
             if os.path.isdir(sub):
@@ -932,6 +947,7 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
             _job_write(d, st)
         finally:   # a failed write (disk full) never skips the stop
             if shutdown_always:
+                ctl["stopped"] = True
                 _job_shutdown(shutdown_grace_s)
         return st
     final = dict(state="timed_out" if st.get("timed_out") else ("done" if rc == 0 else "failed"), rc=rc,
@@ -970,6 +986,7 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
         _job_write(d, st)
     finally:   # a failed final-state write (disk full) never skips the stop
         if down:
+            ctl["stopped"] = True
             _job_shutdown(shutdown_grace_s)
     return st
 
