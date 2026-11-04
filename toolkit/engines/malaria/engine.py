@@ -943,6 +943,7 @@ def _self_test() -> int:
     _self_test_v06(ok, e, unit)
     _self_test_v07(ok, e, unit)
     _self_test_v08(ok, e, unit)
+    _self_test_v09(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1664,6 +1665,104 @@ def _self_test_v08(ok, e, unit) -> None:
            f"S15e a step 1e-12 after d0 is reported exactly at d0; one 1e-12 before it is not charged by the sim's "
            f"test and is refused, not moved ({why2})")
     case("S15", s15)
+
+
+def _self_test_v09(ok, e, unit) -> None:
+    """v0.9: net loss follows the smooth-compact survival function of Bertozzi-Villa 2021 (Supplementary Note 1.4),
+    S(t) = exp(k - k / (1 - (t/L)^2)) for t < L and 0 after, with k fixed at 20 and L set by the median retention
+    (net_retention_half). Each day a net of age a is lost with the conditional hazard 1 - S(a+1)/S(a)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    P0 = resolve_params(e, {})
+
+    def n0():
+        specs = {p.name: p for p in e.parameters()}
+        k, med = specs.get("net_survival_k"), specs["net_retention_half"]
+        ok(VERSION == "0.9" and k is not None and k.kind == "fixed" and k.value == 20.0 and k.lo is None
+           and "Supplementary Note 1.4" in k.source and med.value == 1.64 * 365 and med.lo == 1.33 * 365
+           and med.hi == 2.37 * 365 and "median" in med.source and "exponential" not in med.source,
+           "N0 engine v0.9: k = 20 is a fixed, sourced parameter; net_retention_half stays the median (1.64 y, card "
+           "range 1.33-2.37 y) and no longer reads as an exponential half-life")
+    case("N0", n0)
+
+    def n1():
+        k = 20.0
+        for med in (365.0, 1.64 * 365, 949.0):
+            L = M.net_survival_L(med, k)
+            ok(abs(L - med * np.sqrt((k + np.log(2)) / np.log(2))) < 1e-9 * L,
+               f"N1a L = median x sqrt((k + ln2) / ln2) ({med:g} d -> L {L:.1f} d)")
+            s = M.net_survival(np.array([0.0, med, L, L + 1.0, 2 * L]), med, k)
+            ok(abs(s[0] - 1.0) < 1e-12 and abs(s[1] - 0.5) < 1e-9 and s[2] == 0.0 and s[3] == 0.0 and s[4] == 0.0,
+               f"N1b S(0) = 1, S(median) = 0.5, S(t) = 0 for t >= L (median {med:g} d): {s.round(12).tolist()}")
+            g = M.net_survival(np.linspace(0, L, 400), med, k)
+            ok(bool(np.all(np.diff(g) <= 0)) and np.all(np.isfinite(g)), f"N1c S is finite and non-increasing ({med:g} d)")
+        ok(abs(M.net_survival_L(1.64 * 365, 20.0) / 365 - 8.96) < 0.01,
+           "N1d the continental median 1.64 y gives L = 8.96 y (all nets gone by then)")
+        s_off = M.net_survival(np.array([0.0, 1000.0, 3650.0]), 1e9, 20.0)
+        ok(np.all(np.isfinite(s_off)) and float(s_off.min()) > 1 - 1e-9,
+           "N1e a very long median (1e9 d: attrition switched off) keeps every net, without overflow")
+    case("N1", n1)
+
+    def n2():
+        med, k = 300.0, 20.0
+        L = M.net_survival_L(med, k)
+        a = np.arange(0, int(L) + 3, dtype=float)
+        p = M.net_loss_prob(a, med, k)
+        s = M.net_survival(a, med, k)
+        want = np.where(s > 0, 1 - M.net_survival(a + 1, med, k) / np.where(s > 0, s, 1.0), 1.0)
+        ok(np.allclose(p, want, atol=1e-12) and np.all((p >= 0) & (p <= 1)) and p[-1] == 1.0,
+           "N2a the daily loss probability is the conditional hazard 1 - S(a+1)/S(a), and 1 at or past L")
+        kept = np.concatenate([[1.0], np.cumprod(1 - p)])[: len(a)]
+        ok(np.allclose(kept, s, atol=1e-9), "N2b compounding the daily hazard from age 0 reproduces S(t) at every age")
+    case("N2", n2)
+
+    def n3():
+        # agent level: nets of four ages at the start; after T days the share of each group still holding its net is
+        # S(a0 + T) / S(a0), among the people alive throughout (deaths remove people, not nets)
+        med = 365.0
+        hz = Horizon(2019.0, 2020.0, (2019.0, 2020.0), {})
+        u = UnitSpec("t", dict(unit.attributes, itn_hist_years=[], campaign_year=2019.5, irs_month=None))
+        sim, _ = e.build_sim({"n_agents": 4000, "burnin_years": 0, "net_retention_half": med}, u, Package("n", {}), hz, 5)
+        sim.init()
+        dz = sim.diseases.malaria
+        uu = np.asarray(sim.people.auids)
+        ages0 = np.array([0.0, 180.0, 365.0, 600.0])
+        grp = np.arange(len(uu)) % len(ages0)
+        dz.has_net[sim.people.auids] = True
+        dz.net_t[sim.people.auids] = -ages0[grp]
+        sim.run()
+        T = float(len(sim.timevec))
+        alive = np.isin(uu, np.asarray(sim.people.auids))
+        kept = np.asarray(dz.has_net.raw)[uu]          # by uid, including people who died (masked out below)
+        rows = []
+        for i, a0 in enumerate(ages0):
+            m = alive & (grp == i)
+            want = float(M.net_survival(a0 + T, med, 20.0) / M.net_survival(a0, med, 20.0))
+            got, nn = float(kept[m].mean()), int(m.sum())
+            sd = np.sqrt(max(want * (1 - want), 1e-4) / nn)
+            exp_ = float(0.5 ** (T / med))
+            rows.append((a0, round(got, 3), round(want, 3), round(exp_, 3), abs(got - want) < 4 * sd + 0.005))
+        ok(all(r[-1] for r in rows), f"N3 agent-level loss matches S(a0 + T) / S(a0) by net age (age, kept, "
+                                     f"smooth-compact, exponential): {rows}")
+    case("N3", n3)
+
+    def n4():
+        rows = []
+        for use, t in ((0.6, 0.0), (0.5, 0.54), (0.3, 1.64), (0.2, 3.0)):
+            acc, capped = access_for_use(use, t, P0)
+            s = float(M.net_survival(t * 365.0, P0["net_retention_half"], P0["net_survival_k"]))
+            need = use / (s * P0["use_rate"])
+            rows.append(abs(acc - min(need, 1.0)) < 1e-12 and capped == (need > 1.0))
+        a1, _ = access_for_use(0.4, 1.0, P0)
+        s1 = float(M.net_survival(365.0, P0["net_retention_half"], P0["net_survival_k"]))
+        ok(all(rows) and abs(a1 - 0.4 / (s1 * 0.871)) < 1e-12 and abs(s1 - 0.5 ** (1 / 1.64)) > 0.05,
+           f"N4 access at distribution divides by the same S(t) the sim uses (S(1 y) = {s1:.3f}, not the "
+           f"exponential {0.5 ** (1 / 1.64):.3f})")
+    case("N4", n4)
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
