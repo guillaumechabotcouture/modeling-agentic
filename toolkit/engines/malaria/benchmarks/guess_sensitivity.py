@@ -5,7 +5,7 @@
 
 The equilibration evidence found adult IC (30+) differing by 6-9% between starting guesses x0.25 and x4 after a
 50-year burn-in. This script measures what that does to decision outputs, at m0 3.5, 9 and 28 (the levels that
-missed), 6 seeds, guesses x0.25, x1 (the card's) and x4: microscopy PfPR 6-59 months in the calibration window
+missed), 24 seeds (v0.9; 6 before), guesses x0.25, x1 (the card's) and x4: microscopy PfPR 6-59 months in the calibration window
 (2021.67-2022.0), all-age clinical cases and treated_all over 2024-2027 (package none), and all-age DALYs averted
 by PBO nets + enhanced case management vs none. Same synthetic unit as equilibration.py. Writes
 guess_sensitivity.yaml beside this file; the engine self-test (V7) checks it with problems(): every output within
@@ -28,7 +28,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 from toolkit.engines.malaria.benchmarks.equilibration import UNIT  # noqa: E402
 
 LEVELS = [3.5, 9.0, 28.0]
-SEEDS = [1, 2, 3, 4, 5, 6]
+# v0.9 (review r2, declared before the run): 24 seeds, so the paired seed SE of each output is about half of what
+# 6 seeds gave (1.0-4.9% at v0.9, against the 3% tolerance). TOL and the rule are unchanged; the result is
+# reported whether or not it passes.
+SEEDS = list(range(1, 25))
 GUESS = {"x0.25": 0.25, "x1": 1.0, "x4": 4.0}
 PACK = {"net": "pbo", "cm": 1}
 OUT = os.path.join(HERE, "guess_sensitivity.yaml")

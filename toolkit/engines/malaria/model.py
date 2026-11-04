@@ -17,8 +17,13 @@ decision-window accumulators feed per-capita outcomes and cost drivers.
 
 v0.3: use below access. has_net is ACCESS (a net to sleep under); each night a person with
 access uses it with the nightly-use rule in using_net (use_rate from Bertozzi-Villa 2021).
-Nets are lost at rate ln2 / net_retention_half (attrition; median retention from the same
-source); holes grow with net age (vector.apply_holes, Briet 2020).
+Holes grow with net age (vector.apply_holes, Briet 2020).
+
+v0.9: attrition follows the smooth-compact net survival function the same source fits (Bertozzi-Villa 2021,
+Supplementary Note 1.4): S(t) = exp(k - k / (1 - (t/L)^2)) for t < L and 0 after, with k fixed at 20 and L set by
+the median retention net_retention_half (S(median) = 1/2, so L = median sqrt((k + ln2) / ln2)). Each day a net of
+age a days is lost with the conditional hazard 1 - S(a+1)/S(a) (net_loss_prob). v0.3-v0.8 lost nets at the constant
+rate ln2 / net_retention_half (an exponential with the median as its half-life).
 
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
@@ -56,6 +61,40 @@ S_, D_, T_, A_, U_ = 0, 1, 2, 3, 4
 PFPR_BANDS = {"pfpr_u5": (0.5, 5.0), "pfpr_6m14y": (0.5, 15.0), "pfpr_2_10": (2.0, 10.0),
               "pfpr_lt5": (0.0, 5.0), "pfpr_lt10": (0.0, 10.0), "pfpr_le15": (0.0, 16.0), "pfpr_all": (0.0, 1e9)}
 DAILY = tuple(PFPR_BANDS) + ("inc_u5", "inc_all", "inc_u5_smc", "eir", "net_use", "net_access")
+
+
+def net_survival_L(median_days, k) -> float:
+    """v0.9: the smooth-compact time by which every net is gone, from the median retention: S(median) = 1/2 gives
+    (median / L)^2 = ln2 / (k + ln2). A shape or median that is not finite and positive fails closed (k < 0 would
+    give S > 1)."""
+    m, k = float(median_days), float(k)
+    if not (np.isfinite(m) and m > 0 and np.isfinite(k) and k > 0):
+        raise ValueError(f"net survival needs a finite positive median and shape k (median {m!r} d, k {k!r})")
+    return m * float(np.sqrt((k + LN2) / LN2))
+
+
+def _log_net_survival(age_days, median_days, k):
+    """log S(t) = k - k / (1 - x^2) = -k x^2 / (1 - x^2) with x = t / L (the second form keeps very long medians
+    exact); -inf at or after L."""
+    x = np.maximum(np.asarray(age_days, float), 0.0) / net_survival_L(median_days, k)
+    x2 = x * x
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(x2 < 1.0, -k * x2 / (1.0 - x2), -np.inf)
+
+
+def net_survival(age_days, median_days, k):
+    """v0.9: share of nets still held at age `age_days` (days), smooth-compact (Bertozzi-Villa 2021 Supplementary
+    Note 1.4): exp(k - k / (1 - (t/L)^2)) for t < L, else 0. The sim's attrition and access_for_use both use it."""
+    return np.exp(_log_net_survival(age_days, median_days, k))
+
+
+def net_loss_prob(age_days, median_days, k):
+    """v0.9: probability that a net of age a (days) held this morning is lost today, 1 - S(a+1)/S(a); 1 at or past
+    L. Compounded from age 0 it reproduces S(t)."""
+    a = np.maximum(np.asarray(age_days, float), 0.0)
+    l0, l1 = _log_net_survival(a, median_days, k), _log_net_survival(a + 1.0, median_days, k)
+    with np.errstate(invalid="ignore"):
+        return np.where(np.isfinite(l0), -np.expm1(l1 - l0), 1.0)
 
 
 def prevalence_bands(det, age_d) -> dict:
@@ -288,7 +327,8 @@ class Malaria(ss.Disease):
             self.prot_eff[u[toP]] = 1.0
         for nm, d in (('IB', G['db']), ('IC', G['dc']), ('ID', G['dd']), ('IV', G['dv'])):
             getattr(self, nm)[u] = getattr(self, nm)[u] * np.exp(-1 / d)
-        lose = self.has_net[u] & (self.rs.random(n) < LN2 / P['net_retention_half'])
+        # v0.9: smooth-compact attrition by net age (net_loss_prob); one uniform draw per person, as before
+        lose = self.has_net[u] & (self.rs.random(n) < net_loss_prob(net_age, P['net_retention_half'], P['net_survival_k']))
         if lose.any():
             self.has_net[u[lose]] = False
         if ti % 365 == 0:

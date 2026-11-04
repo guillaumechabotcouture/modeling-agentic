@@ -1,0 +1,530 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: malaria-starsim
+  version: '0.8'
+  code_sha256: 425a4d16d29c812a7ced39de9ad5bcacab62b7df16e1f3bf8c7307bbd558f6ca
+  params_sha256: 3a59c8c63600676a6ed6b09596c3eb295be590419e38d56e7e9104cddd123817
+  config_sha256: 4b86811a290ba8b0d9cff872a840ee2d2e4543eee525495e640008bcf214032c
+engine: toolkit.engines.malaria.engine:MalariaEngine
+engine_version: '0.8'
+fitted_at: '2026-11-02 05:35:33'
+seeds:
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+n_sims: 1748
+wall_s: 2753.4
+parameters:
+  cfp_kill:
+    value: 0.43
+    lo: 0.41
+    hi: 0.58
+    box:
+    - 0.0
+    - 0.8
+    benchmarks: &id001
+    - B10
+    - B11
+    - B12
+    - B12b
+    - B12m
+  irs_kill:
+    value: 0.415625
+    lo: 0.3087
+    hi: 0.5284
+    box:
+    - 0.0
+    - 0.95
+    benchmarks: *id001
+fit_rule:
+  version: joint-v1
+  description: LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic
+    surrogate of each target's log value; infeasible targets dropped; argmin (n out
+    of band, band-scaled squared log error) on a dense grid; range = region with all
+    feasible targets in band; verification re-run with re-calibration at the chosen
+    value
+  seeds:
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  design_points: 25
+  design_seed: 7
+  targets: *id001
+feasibility:
+  feasible_in_box:
+  - B10
+  - B11
+  - B12
+  - B12b
+  - B12m
+  infeasible_in_box: []
+  conflicting_pairs: []
+  all_feasible_in_band_at_value: true
+  surrogate_all_feasible_in_band: true
+  disproved_by_verification: []
+  feasibility_verified: true
+surrogate:
+  B10:
+    loo_rmse_log: 0.0146
+  B11:
+    loo_rmse_log: 0.024
+  B12:
+    loo_rmse_log: 0.0121
+  B12b:
+    loo_rmse_log: 0.0187
+  B12m:
+    loo_rmse_log: 0.0164
+calibration:
+  at_box_centre:
+    benin: 13.4548
+    irs_added: 29.056
+    misungwi: 12.2808
+    muleba: 127.406
+  at_fitted_value:
+    benin: 13.4548
+    irs_added: 29.056
+    misungwi: 12.2808
+    muleba: 127.406
+verification:
+  B10:
+    computed: 0.6491
+    predicted: 0.6537
+    in_band: true
+    seed_min: 0.5872
+    seed_max: 0.6939
+  B11:
+    computed: 0.5013
+    predicted: 0.4983
+    in_band: true
+    seed_min: 0.4666
+    seed_max: 0.5353
+  B12:
+    computed: 0.8017
+    predicted: 0.7997
+    in_band: true
+    seed_min: 0.7233
+    seed_max: 0.8487
+  B12b:
+    computed: 0.5716
+    predicted: 0.5726
+    in_band: true
+    seed_min: 0.5529
+    seed_max: 0.598
+  B12m:
+    computed: 0.4492
+    predicted: 0.4477
+    in_band: true
+    seed_min: 0.4046
+    seed_max: 0.4817
+design:
+  x:
+  - cfp_kill: 0.250152
+    irs_kill: 0.931837
+  - cfp_kill: 0.589734
+    irs_kill: 0.826513
+  - cfp_kill: 0.176768
+    irs_kill: 0.348043
+  - cfp_kill: 0.100176
+    irs_kill: 0.255118
+  - cfp_kill: 0.320739
+    irs_kill: 0.437156
+  - cfp_kill: 0.159902
+    irs_kill: 0.035515
+  - cfp_kill: 0.754657
+    irs_kill: 0.113745
+  - cfp_kill: 0.020837
+    irs_kill: 0.176856
+  - cfp_kill: 0.769717
+    irs_kill: 0.900195
+  - cfp_kill: 0.661002
+    irs_kill: 0.680857
+  - cfp_kill: 0.34051
+    irs_kill: 0.712648
+  - cfp_kill: 0.05919
+    irs_kill: 0.550888
+  - cfp_kill: 0.076672
+    irs_kill: 0.574517
+  - cfp_kill: 0.387085
+    irs_kill: 0.603547
+  - cfp_kill: 0.516562
+    irs_kill: 0.495381
+  - cfp_kill: 0.401189
+    irs_kill: 0.402175
+  - cfp_kill: 0.716993
+    irs_kill: 0.758197
+  - cfp_kill: 0.29985
+    irs_kill: 0.048498
+  - cfp_kill: 0.448874
+    irs_kill: 0.395396
+  - cfp_kill: 0.533726
+    irs_kill: 0.151257
+  - cfp_kill: 0.208496
+    irs_kill: 0.298993
+  - cfp_kill: 0.487641
+    irs_kill: 0.864783
+  - cfp_kill: 0.612318
+    irs_kill: 0.640949
+  - cfp_kill: 0.675587
+    irs_kill: 0.208938
+  - cfp_kill: 0.4
+    irs_kill: 0.475
+  computed:
+    B10:
+    - 0.7873
+    - 0.5353
+    - 0.8421
+    - 0.913
+    - 0.7272
+    - 0.8588
+    - 0.4335
+    - 0.9894
+    - 0.4255
+    - 0.4902
+    - 0.7327
+    - 0.9581
+    - 0.9517
+    - 0.682
+    - 0.5974
+    - 0.6904
+    - 0.4597
+    - 0.7474
+    - 0.65
+    - 0.575
+    - 0.8116
+    - 0.6221
+    - 0.5195
+    - 0.4728
+    - 0.6763
+    B11:
+    - 0.6731
+    - 0.3721
+    - 0.765
+    - 0.8594
+    - 0.6052
+    - 0.7981
+    - 0.2688
+    - 0.9928
+    - 0.2675
+    - 0.3129
+    - 0.5721
+    - 0.9319
+    - 0.8816
+    - 0.5427
+    - 0.4286
+    - 0.5348
+    - 0.292
+    - 0.6081
+    - 0.4821
+    - 0.4269
+    - 0.7286
+    - 0.4512
+    - 0.3531
+    - 0.3285
+    - 0.5157
+    B12:
+    - 0.5779
+    - 0.6166
+    - 0.8304
+    - 0.8837
+    - 0.7993
+    - 0.9903
+    - 0.9566
+    - 0.906
+    - 0.5995
+    - 0.6655
+    - 0.6703
+    - 0.7419
+    - 0.7284
+    - 0.7267
+    - 0.7617
+    - 0.8124
+    - 0.6515
+    - 0.988
+    - 0.8035
+    - 0.9365
+    - 0.8544
+    - 0.6026
+    - 0.6882
+    - 0.904
+    - 0.7651
+    B12b:
+    - 0.2819
+    - 0.3325
+    - 0.613
+    - 0.7211
+    - 0.5554
+    - 0.9487
+    - 0.8622
+    - 0.7654
+    - 0.2963
+    - 0.4036
+    - 0.3887
+    - 0.4845
+    - 0.4639
+    - 0.4398
+    - 0.5092
+    - 0.581
+    - 0.368
+    - 0.9396
+    - 0.582
+    - 0.8355
+    - 0.6643
+    - 0.3181
+    - 0.422
+    - 0.7481
+    - 0.5313
+    B12m:
+    - 0.2116
+    - 0.235
+    - 0.5182
+    - 0.6107
+    - 0.436
+    - 0.9364
+    - 0.8037
+    - 0.7141
+    - 0.2143
+    - 0.2847
+    - 0.2751
+    - 0.3595
+    - 0.3407
+    - 0.3231
+    - 0.3896
+    - 0.4643
+    - 0.2576
+    - 0.9158
+    - 0.4666
+    - 0.752
+    - 0.5584
+    - 0.2215
+    - 0.3052
+    - 0.6715
+    - 0.4002
+restamped:
+  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+  proof_identical: true
+  scope:
+    pack_settings:
+    - benin
+    - ce_ref
+    - ce_res
+    - cochrane_itn
+    - eir_1
+    - eir_10
+    - eir_100
+    - eir_3
+    - eir_30
+    - eir_300
+    - irs_added
+    - misungwi
+    - muleba
+    - sahel_smc
+    pack_arms: every arm of each setting, in one run_batch per setting and seed
+    seeds:
+    - 11
+    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
+      sensitivity the card's 4000
+    burnin_years: the card's (50), the pack's own
+    evidence_cases:
+    - - equilibration
+      - - 3.5
+        - base
+        - burnin_years: 50
+        - 1
+    - - equilibration
+      - - 28.0
+        - doubled
+        - burnin_years: 100
+        - 1
+    - - equilibration
+      - - 9.0
+        - guess_hi
+        - burnin_years: 50
+          init_eir_per_m0: 2.4
+        - 2
+    - - guess_sensitivity
+      - - 3.5
+        - x1
+        - 1
+        - 50
+    - - guess_sensitivity
+      - - 28.0
+        - x0.25
+        - 2
+        - 50
+    scenarios:
+      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+      heterogeneous: 5 members, seed 23, delivery None
+    not_repeated: calibration-grid runs (same code path at other attribute values)
+    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+      dicts exactly
+  old_engine_version: '0.7'
+  proof_script_commit: 22aa80c4cc3002517a08555cd82186dfb21a75b7
+  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
+    is pending.
+  confirmation:
+    validate_once: done
+    evidence:
+      run_id: run1
+      commit: c0ed7675a4fbdfb198cabf64fad4d3607a075587
+      environment:
+        python: 3.14.3
+        numpy: 2.4.4
+        starsim: 3.3.4
+        platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
+        machine: x86_64
+      date: '2026-11-03'
+      command: bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12
+      coiled_cluster_id: '2319071'
+      workspace: idm-coiled-idmad-r2
+      stored: outputs/engine-v08-confirm/run1 (storage account modelingagentic)
+      compared: every value equal to this file's; only wall-clock fields and identity hashes differ
+  old_identity:
+    name: malaria-starsim
+    version: '0.7'
+    code_sha256: d4e8a852eff1b69ef324393f1efa899289e6fbfdea10d8493be6bd9684f1ed86
+    params_sha256: 3a59c8c63600676a6ed6b09596c3eb295be590419e38d56e7e9104cddd123817
+    config_sha256: 50edd3784a2d8d31dcad3f7c1726c32dd810a53a8a137042c6b676ed91dc5172
+  previous:
+  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+    proof_identical: true
+    scope:
+      pack_settings:
+      - benin
+      - ce_ref
+      - ce_res
+      - cochrane_itn
+      - eir_1
+      - eir_10
+      - eir_100
+      - eir_3
+      - eir_30
+      - eir_300
+      - irs_added
+      - misungwi
+      - muleba
+      - sahel_smc
+      pack_arms: every arm of each setting, in one run_batch per setting and seed
+      seeds:
+      - 11
+      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
+        guess sensitivity the card's 4000
+      burnin_years: the card's (50), the pack's own
+      evidence_cases:
+      - - equilibration
+        - - 3.5
+          - base
+          - burnin_years: 50
+          - 1
+      - - equilibration
+        - - 28.0
+          - doubled
+          - burnin_years: 100
+          - 1
+      - - equilibration
+        - - 9.0
+          - guess_hi
+          - burnin_years: 50
+            init_eir_per_m0: 2.4
+          - 2
+      - - guess_sensitivity
+        - - 3.5
+          - x1
+          - 1
+          - 50
+      - - guess_sensitivity
+        - - 28.0
+          - x0.25
+          - 2
+          - 50
+      not_repeated: calibration-grid runs (same code path at other attribute values)
+      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+        dicts exactly
+    old_engine_version: '0.6'
+    proof_script_commit: 71619f531a21196771cb1654c96ed63a5fe8a421
+    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+      on these inputs. A Coiled pack run (validate_once.sh) confirms it.
+    old_identity:
+      name: malaria-starsim
+      version: '0.6'
+      code_sha256: 108665c0c1af3a21362ea55853caf8d147ce5b37ee1b98433eb19d84a749c393
+      params_sha256: 3a59c8c63600676a6ed6b09596c3eb295be590419e38d56e7e9104cddd123817
+      config_sha256: 32abb939985579aca3bfa2ca2b30201ea61d29bfc1d0a81e7e1265b2e11625e5
+  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+    proof_identical: true
+    scope:
+      pack_settings:
+      - benin
+      - ce_ref
+      - ce_res
+      - cochrane_itn
+      - eir_1
+      - eir_10
+      - eir_100
+      - eir_3
+      - eir_30
+      - eir_300
+      - irs_added
+      - misungwi
+      - muleba
+      - sahel_smc
+      pack_arms: every arm of each setting, in one run_batch per setting and seed
+      seeds:
+      - 11
+      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
+        guess sensitivity the card's 4000
+      burnin_years: the card's (50), the pack's own
+      evidence_cases:
+      - - equilibration
+        - - 3.5
+          - base
+          - burnin_years: 50
+          - 1
+      - - equilibration
+        - - 28.0
+          - doubled
+          - burnin_years: 100
+          - 1
+      - - equilibration
+        - - 9.0
+          - guess_hi
+          - burnin_years: 50
+            init_eir_per_m0: 2.4
+          - 2
+      - - guess_sensitivity
+        - - 3.5
+          - x1
+          - 1
+          - 50
+      - - guess_sensitivity
+        - - 28.0
+          - x0.25
+          - 2
+          - 50
+      not_repeated: calibration-grid runs (same code path at other attribute values)
+      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+        dicts exactly
+    old_engine_version: '0.5'
+    proof_script_commit: 110691735e832a5b18df93aa56ab96d43c500dd2
+    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+      on these inputs. A Coiled pack run (validate_once.sh) confirms it.
+    old_identity:
+      name: malaria-starsim
+      version: '0.5'
+      code_sha256: 1a4b27a4315a440dbd64b3b7fcde1d53e1bb9f2c7399d4a62cb15239d20b036e
+      params_sha256: 3a59c8c63600676a6ed6b09596c3eb295be590419e38d56e7e9104cddd123817
+      config_sha256: eb9d39627ddda563f781e8a6f7a32f71f13e454576e7e2de0f77b946ad4c7489

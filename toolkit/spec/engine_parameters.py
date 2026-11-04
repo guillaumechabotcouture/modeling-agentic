@@ -1191,9 +1191,10 @@ def _self_test() -> int:
         rn = BM.Runner(pk, eng, 1, [1], base_params={"net_retention_half": 273.75})
         mul = rn._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2]
         coch = rn._arm_jobs("coch_pyr", {"irs_kill": 0.4})[0][2]
-        ok(mul.get("net_retention_half") == 949.0 and coch.get("net_retention_half") == 273.75
+        own = pk["settings"]["muleba"]["params"]["net_retention_half"]        # engine v0.9: 841.3 days (v0.8: 949)
+        ok(mul.get("net_retention_half") == own and own != 273.75 and coch.get("net_retention_half") == 273.75
            and mul.get("irs_kill") == 0.4 and mul.get("n_agents") == 5000,
-           f"EP36 the real B15 setting keeps its own observed net retention (Muleba 949 days) under a spec value; a "
+           f"EP36 the real B15 setting keeps its own observed net retention (Muleba, from its trial) under a spec value; a "
            f"setting without one takes the spec value; fitted values still apply: {mul.get('net_retention_half')}, "
            f"{coch.get('net_retention_half')}")
         rn0 = BM.Runner(pk, eng, 1, [1])
