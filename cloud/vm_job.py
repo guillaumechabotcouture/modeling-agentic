@@ -762,13 +762,14 @@ def _self_test_run(ok) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None):
+              appear=None, after_submit=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
         appears after n cluster listings."""
         W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
-             "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None}
+             "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None,
+             "table": ["tls://w1"], "job_worker": None, "polled": []}
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
@@ -807,7 +808,7 @@ def _self_test_run(ok) -> None:
                 self.cid = cid
 
             def scheduler_info(self):
-                return {"workers": {"tls://w1": {}}}
+                return {"workers": {w: {} for w in W["table"]}}
 
             def upload_file(self, *a):
                 pass
@@ -820,6 +821,9 @@ def _self_test_run(ok) -> None:
             def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
                 if fn is ws.job_state:
                     W["polls"] += 1
+                    W["polled"].append(workers[0])
+                    if workers[0] != W["job_worker"]:     # another VM's disk has no record of this job
+                        return {workers[0]: {"state": {"state": "missing"}, "files": {}, "log_tail": ""}}
                     if W["polls"] == interrupt_at:
                         raise KeyboardInterrupt
                     if W["polls"] == drop_at:
@@ -838,6 +842,11 @@ def _self_test_run(ok) -> None:
             def submit(self, fn, *args, **kw):
                 ev.append("submit")
                 W["submit_kw"] = dict(kw)
+                W["job_worker"] = kw["workers"][0]
+                if after_submit == "joins":       # a worker that sorts first joins after submission
+                    W["table"] = ["tls://w0", "tls://w1"]
+                elif after_submit == "leaves":    # the job's worker leaves; another remains
+                    W["table"] = ["tls://w0"]
                 jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
                 task = lambda: fn(*args, store_mod=fs, **jkw)  # noqa: E731
                 if threaded:
@@ -1118,6 +1127,21 @@ def _self_test_run(ok) -> None:
                    f"the job's grace period and stops the cluster; the job's later stop is a no-op: msg={msg} "
                    f"exc={exc!r} stops={W['stops']} events={[e for e in W['events'] if not isinstance(e, tuple) or e[0] != 'sleep'][-5:]}")
             case("RN20", rn20)
+
+            def rn21():
+                W, msg, out, exc = world(d, "r21", after_submit="joins")
+                ok(msg is None and exc is None and set(W["polled"]) == {"tls://w1"} and ("delete", 100) in W["events"],
+                   f"RN21 with several workers, every poll goes to the job's own worker, not the first in the table "
+                   f"(a worker that joined later reads 'missing'): msg={msg} polled={W['polled']}")
+            case("RN21", rn21)
+
+            def rn22():
+                W, msg, out, exc = world(d, "r22", after_submit="leaves")
+                ok(msg is not None and "lost" in msg and ("delete", 100) in W["events"]
+                   and "tls://w0" not in W["polled"],
+                   f"RN22 the job's worker leaving the cluster reads as lost (non-zero, cluster stopped), never as "
+                   f"another worker's 'missing': msg={msg} polled={W['polled']}")
+            case("RN22", rn22)
         finally:
             ws.JOBS = old
 
