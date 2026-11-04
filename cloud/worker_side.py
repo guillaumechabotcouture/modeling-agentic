@@ -832,7 +832,8 @@ def store_outputs(out, prefix, account, store, beat=None):
 
 
 def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, heartbeat_s=30, token=None,
-             cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None):
+             cluster_compute=False, store=None, shutdown_when_stored=False, store_mod=None,
+             shutdown_grace_s=0):
     """The job, as a dask task: claim the id (the 'queued' record with this submission's
     token; with no token, an id that is neither queued nor running), unpack `code` (a
     tar.gz, or None), run `cmd` (a shell string or an argv list) in it with JOB_OUT set,
@@ -845,7 +846,9 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     reads every file back (store_outputs); `shutdown_when_stored` then stops the cluster from
     here, but only for a job that is done with every output verified in storage. Otherwise
     the cluster is left to its idle timeout, so the outputs can still be collected. None of
-    this depends on the laptop."""
+    this depends on the laptop. `shutdown_grace_s` delays that shutdown (the final state is
+    already written), so a poller (`vm_job.py run`) reads the final state and stops the
+    cluster itself; with no poller, the job still stops it after the grace period."""
     import io, os, re, shutil, signal, subprocess, sys, tarfile, time
     d = _job_dir(job_id)
     with _JobLock(d):
@@ -929,6 +932,8 @@ def job_task(job_id, code, cmd, secrets=None, max_hours=24.0, setup_sdk=False, h
     st["shutdown"] = down
     _job_write(d, st)
     if down:
+        if shutdown_grace_s:
+            time.sleep(shutdown_grace_s)
         _shutdown_cluster()
     return st
 

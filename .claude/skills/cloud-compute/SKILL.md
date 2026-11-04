@@ -66,6 +66,29 @@ python3 scripts/compute.py map {run_dir} --fn models/<module>.py::<fn> \
 - **Iterative calibration:** batch it. Ask K trials, evaluate them with one
   `map` call, tell K.
 
+# A job on its own VM: `cloud/vm_job.py run` (from the laptop)
+
+For a job outside a run (an engine benchmark, a batch on its own cluster),
+use one command. It brings the cluster up, submits the job at once, prints a
+status line every `--every` seconds (outputs saved locally each time), then
+stops the cluster:
+
+```bash
+python cloud/vm_job.py run <name> <job_id> --tree . [--workers N --cluster-compute] \
+    [--store outputs/<prefix> --shutdown-when-stored] -- <command ...>
+```
+
+- It exits non-zero with the failure reason (state, exit code, storage
+  check) and stops the cluster. `--keep-on-failure` keeps it up for
+  debugging; it then stops after its idle timeout, or with `down <name>`.
+- A cluster of that name that is already running is refused, never reused.
+- With `--shutdown-when-stored` the job also stops the cluster itself once
+  its outputs are verified in storage, so a sleeping laptop loses nothing.
+- Do not split it into `up` then `start`: Coiled counts the idle timeout
+  from cluster start, so a cluster with no job submitted stops after the
+  idle timeout (20 minutes by default) with nothing done. `up`/`start`/
+  `wait` are for interactive use.
+
 # Legacy: Cloud Compute via Azure Batch (opt-in, `--cloud`)
 
 ## What this skill chose and why

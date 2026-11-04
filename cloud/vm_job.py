@@ -1,5 +1,20 @@
 """Durable detached jobs on a small Coiled VM (the dev VM, or any one-VM cluster).
 
+The default for one job: `run` brings the cluster up, submits the job at once, polls every
+`--every` seconds (status line, outputs saved), then stops the cluster. It exits non-zero
+with the reason when the job fails, and stops the cluster then too unless
+`--keep-on-failure`. A cluster of that name that is already running is refused, never
+reused (no second launch). It takes every `up` and `start` option.
+
+    python cloud/vm_job.py run <name> <job_id> --tree . [--workers N] [--every 60]
+        [--store outputs/<prefix> --shutdown-when-stored] [--keep-on-failure] -- <command ...>
+
+Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
+and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
+were lost. Coiled counts `idle_timeout` from cluster start, not from the first task (there
+is no setting for "only after work"), so an `up` with no `start` behind it is wasted.
+`up`, `start`, `status`, `wait` and `down` remain for interactive use; `up` warns.
+
     python cloud/vm_job.py up <name> [--cpu 4] [--memory "16 GiB"] [--idle-timeout "20 minutes"]
     python cloud/vm_job.py start <name> <job_id> [--tree PATH | --dir PATH] [--max-hours 24]
                                   [--setup-sdk] [--anthropic-key] -- <command ...>
@@ -37,12 +52,17 @@ job, so N workers give N - 1 compute VMs: ask for one more than the batch needs.
 (sha256); `--shutdown-when-stored` then stops the cluster from inside the job, but only
 when the job is done and every output is verified in storage. A failed or unverified job
 leaves the cluster to its idle timeout, so its outputs can still be collected. Nothing
-waits on the laptop: start returns at once and the cluster stops itself. (The Nigeria
+waits on the laptop: start returns at once and the cluster stops itself. Under `run`, the
+job's own shutdown waits a grace period of two poll intervals plus a minute, so `run`
+reads the final state and stops the cluster itself; if the laptop is gone, the job still
+stops it after the grace period. A failure under `run` is collected by its last poll and
+then stopped (unless --keep-on-failure). (The Nigeria
 re-run used six one-worker clusters, each with its own scheduler, about 5 minutes of
 start-up and a 20-minute idle tail, shut down by a watcher on the laptop.)
 
-Rules: the IDM Coiled default workspace only; attach-only for everything but `up`
-(coiled.Cluster(name=...) on a cluster that is gone creates a new, empty one).
+Rules: the IDM Coiled default workspace only; attach-only for everything but `up` and
+`run`'s creation step (coiled.Cluster(name=...) on a cluster that is gone creates a new,
+empty one), and those create only once no cluster of the name is live or stopping.
 """
 from __future__ import annotations
 
@@ -154,13 +174,21 @@ def _runner(c, w):
     return lambda fn, *a: c.run(fn, *a, workers=[w], wait=True, on_error="raise")[w]
 
 
-def cmd_up(a):
+def _create(a, if_live="keep", stop_on_error=False):
+    """Create the cluster once no cluster of that name is live or stopping. A live one is kept
+    (`up`: "already up", returns False) or refused (`run`: no second launch on a cluster that
+    may hold another job); a stopping one is waited out, never attached to or re-created early.
+    With `stop_on_error`, a cluster whose first worker never arrives is stopped through the
+    object just created (not by name)."""
     import coiled
     for _ in range(40):
         act = rc.keeper_wait(rc.cluster_states(a.name))
         if act == "stop":
+            if if_live == "refuse":
+                raise SystemExit(f"{a.name} is already running; `run` never launches on an existing cluster "
+                                 f"(use `start {a.name} <job_id>` to add a job to it, or another name)")
             print(f"{a.name} is already up")
-            return
+            return False
         if act == "start":
             break
         time.sleep(15)    # stopping: never create (or attach) until it has stopped
@@ -172,9 +200,24 @@ def cmd_up(a):
                         shutdown_on_close=False)
     # the first worker is enough to start: compute.py re-reads the worker table every 2 s and gives a worker that
     # joins later a chunk at once (Phase 45 δ)
-    cl.get_client().wait_for_workers(1, timeout=1500)
+    try:
+        cl.get_client().wait_for_workers(1, timeout=1500)
+    except BaseException:
+        if stop_on_error:
+            cl.shutdown()
+            print(f"{a.name}: no worker arrived; cluster stopped")
+        raise
     print(f"{a.name} up with {n} worker(s) requested (idle timeout {a.idle_timeout}; a running job holds it "
           "regardless)")
+    return True
+
+
+def cmd_up(a):
+    if _create(a):
+        # Coiled counts idle time from cluster start, not from the first task: there is no setting for "only after
+        # work", so an `up` with no `start` behind it idles out with nothing done (2026-11-03, about two hours lost)
+        print(f"WARNING: {a.name} stops after {a.idle_timeout} idle unless `start` follows now. For a single job, "
+              f"`run` brings the cluster up, submits, waits and stops it in one command.")
 
 
 def cmd_start(a):
@@ -192,7 +235,7 @@ def cmd_start(a):
     store = {"prefix": a.store.rstrip("/"), "account": a.store_account} if a.store else None
     fut = c.submit(ws.job_task, a.job_id, code, shell, secrets, a.max_hours, a.setup_sdk, token=token,
                    cluster_compute=a.cluster_compute, store=store, shutdown_when_stored=a.shutdown_when_stored,
-                   workers=[w], allow_other_workers=False, pure=False, key=f"job-{a.job_id}-{int(time.time())}")
+                   shutdown_grace_s=getattr(a, "shutdown_grace_s", 0), workers=[w], allow_other_workers=False, pure=False, key=f"job-{a.job_id}-{int(time.time())}")
     fire_and_forget(fut)
     dest = local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
@@ -221,8 +264,10 @@ def cmd_status(a):
     return st
 
 
-def cmd_wait(a):
-    dest = local_dir(a.name, a.job_id, a.out)
+def _poll(a, dest, gone_ok=False, deadline=None):
+    """Poll (saving outputs each time) until the job ends; returns its last status. With
+    `gone_ok` (`run`), a cluster that is no longer running returns None, and other errors
+    are retried while it runs, up to `deadline`."""
     while True:
         try:
             c, w = _client(a.name)
@@ -230,11 +275,95 @@ def cmd_wait(a):
             _print(st, dest)
             if st["state"]["state"] in DONE + ("missing", "lost"):
                 return st
-        except Exception as e:  # noqa: BLE001 — a dropped connection is not the end of the job
-            if isinstance(e, SystemExit):
-                raise
+        except (Exception, SystemExit) as e:  # noqa: BLE001 — a dropped connection is not the end of the job
+            if isinstance(e, SystemExit) and not gone_ok:
+                raise     # `wait`/`status`: the attach guard's refusal ends the command
+            if gone_ok and not rc.is_running(a.name):
+                return None
             print(f"poll failed ({type(e).__name__}: {str(e)[:120]}); retrying")
+        if deadline is not None and time.time() > deadline:
+            raise SystemExit(f"{a.job_id}: still not finished {a.max_hours} h after submission (plus 1 h); "
+                             f"`status {a.name} {a.job_id}` checks it")
         time.sleep(a.every)
+
+
+def cmd_wait(a):
+    return _poll(a, local_dir(a.name, a.job_id, a.out))
+
+
+def run_outcome(st, store_requested) -> tuple[bool, str]:
+    """Whether `run` succeeded, and why not: the job is done and, when storage was asked for,
+    every output is verified there. No final state read (the cluster stopped first) is a
+    failure, never taken as success."""
+    if st is None:
+        return False, ("the cluster stopped before the job's final state was read (the outputs saved so far are "
+                       "local; check the store prefix)")
+    s = st["state"]
+    if s.get("state") != "done":
+        bits = [s.get("state", "?")] + [f"{k}={s[k]}" for k in ("rc", "error", "why") if s.get(k) not in (None, "")]
+        return False, " ".join(str(b) for b in bits)
+    stored = s.get("stored") or {}
+    if store_requested and not stored.get("verified"):
+        return False, f"done, but its outputs are not verified in storage: {stored.get('why') or 'no record'}"
+    return True, ""
+
+
+def _stop(name, why):
+    """Stop the cluster if it still runs (the job may have stopped it already). rc.attach is
+    the guarded attach: it never creates a cluster."""
+    if not rc.is_running(name):
+        print(f"{name}: already stopped or stopping ({why})")
+        return
+    try:
+        rc.attach(name).shutdown()
+        print(f"{name}: stopped ({why})")
+    except SystemExit as e:   # it stopped between the check and the attach
+        print(f"{name}: not stopped by run ({e})")
+
+
+def cmd_run(a):
+    """up + start + wait + down in one command, with no gap for a human or agent to fill:
+    the job is submitted as soon as the first worker is up, then polled every `--every`
+    seconds (outputs saved each time) until it ends, then the cluster is stopped. A cluster of
+    this name that is already running is never reused (no second launch). On failure the
+    command exits non-zero with the reason and stops the cluster, unless --keep-on-failure.
+    The job's own --shutdown-when-stored stays the laptop-independent backstop: it waits a
+    grace period of two poll intervals, so this command normally reads the final state first."""
+    a.shutdown_grace_s = int(2 * a.every + 60) if a.shutdown_when_stored else 0
+    try:
+        _create(a, if_live="refuse", stop_on_error=not a.keep_on_failure)
+    except Exception as e:  # noqa: BLE001 -- e.g. no worker within the wait: report it, the cluster is handled
+        raise SystemExit(f"{a.name} did not come up: {type(e).__name__}: {e}") from e
+    dest = local_dir(a.name, a.job_id, a.out)
+    try:
+        cmd_start(a)
+    except BaseException as e:
+        why = f"submission failed: {type(e).__name__}: {e}"
+        if not a.keep_on_failure:
+            _stop(a.name, why)
+        raise
+    deadline = time.time() + a.max_hours * 3600 + 3600
+    try:
+        st = _poll(a, dest, gone_ok=True, deadline=deadline)
+    except KeyboardInterrupt:
+        print(f"interrupted: {a.job_id} keeps running on {a.name}; `wait {a.name} {a.job_id}` resumes, "
+              f"`down {a.name}` stops it")
+        raise
+    except SystemExit as e:   # past the deadline: the job should have timed out long ago
+        if not a.keep_on_failure:
+            _stop(a.name, str(e))
+        raise
+    good, why = run_outcome(st, bool(a.store))
+    if good:
+        _stop(a.name, f"{a.job_id} done")
+        print(f"{a.job_id} done; outputs -> {dest}" + (f" and {a.store.rstrip('/')}/ (verified)" if a.store else ""))
+        return
+    if a.keep_on_failure:
+        print(f"{a.name} kept up for debugging (--keep-on-failure): it stops after {a.idle_timeout} idle, "
+              f"or now with `down {a.name}`")
+    elif st is not None:
+        _stop(a.name, f"{a.job_id} failed")
+    raise SystemExit(f"{a.job_id} on {a.name}: {why}")
 
 
 def cmd_down(a):
@@ -754,28 +883,41 @@ def main(argv=None) -> int:
     argv, command = split_command(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
+    def up_args(p):
+        p.add_argument("--cpu", type=int, default=4)
+        p.add_argument("--memory", default="16 GiB")
+        p.add_argument("--idle-timeout", default="20 minutes")
+        p.add_argument("--workers", type=int, default=1, help="workers of the one cluster (one scheduler for all)")
+
+    def start_args(p):
+        p.add_argument("job_id")
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--tree")
+        g.add_argument("--dir")
+        p.add_argument("--max-hours", type=float, default=24.0)
+        p.add_argument("--setup-sdk", action="store_true")
+        p.add_argument("--anthropic-key", action="store_true")
+        p.add_argument("--cluster-compute", action="store_true",
+                       help="the job's compute.py run_map uses every worker of this cluster")
+        p.add_argument("--store", metavar="PREFIX", default=None,
+                       help="when the job ends, upload $JOB_OUT to <PREFIX>/ and verify each file read back (sha256)")
+        p.add_argument("--store-account", default=None, help="storage account (default: the worker's configured one)")
+        p.add_argument("--shutdown-when-stored", action="store_true",
+                       help="the job stops its cluster once it is done and every output is verified in storage")
+
     up = sub.add_parser("up")
     up.add_argument("name")
-    up.add_argument("--cpu", type=int, default=4)
-    up.add_argument("--memory", default="16 GiB")
-    up.add_argument("--idle-timeout", default="20 minutes")
-    up.add_argument("--workers", type=int, default=1, help="workers of the one cluster (one scheduler for all)")
+    up_args(up)
     st = sub.add_parser("start")
     st.add_argument("name")
-    st.add_argument("job_id")
-    g = st.add_mutually_exclusive_group()
-    g.add_argument("--tree")
-    g.add_argument("--dir")
-    st.add_argument("--max-hours", type=float, default=24.0)
-    st.add_argument("--setup-sdk", action="store_true")
-    st.add_argument("--anthropic-key", action="store_true")
-    st.add_argument("--cluster-compute", action="store_true",
-                    help="the job's compute.py run_map uses every worker of this cluster")
-    st.add_argument("--store", metavar="PREFIX", default=None,
-                    help="when the job ends, upload $JOB_OUT to <PREFIX>/ and verify each file read back (sha256)")
-    st.add_argument("--store-account", default=None, help="storage account (default: the worker's configured one)")
-    st.add_argument("--shutdown-when-stored", action="store_true",
-                    help="the job stops its cluster once it is done and every output is verified in storage")
+    start_args(st)
+    rn = sub.add_parser("run", help="up + start + wait + down in one command (the default for a single job)")
+    rn.add_argument("name")
+    start_args(rn)
+    up_args(rn)
+    rn.add_argument("--every", type=float, default=60, help="seconds between status polls")
+    rn.add_argument("--keep-on-failure", action="store_true",
+                    help="leave the cluster up after a failure, for debugging (it then stops after its idle timeout)")
     for nm in ("status", "wait"):
         p = sub.add_parser(nm)
         p.add_argument("name")
@@ -788,12 +930,13 @@ def main(argv=None) -> int:
         p.add_argument("--out", default=OUT)
     a = ap.parse_args(argv)
     a.command = command
-    if a.cmd == "start":
+    if a.cmd in ("start", "run"):
         if a.shutdown_when_stored and not a.store:
             ap.error("--shutdown-when-stored needs --store PREFIX: the cluster stops only once outputs are verified")
         if a.cluster_compute and not (a.tree or a.dir):
             ap.error("--cluster-compute needs the shipped tree (--tree, or --dir with scripts/compute.py)")
-    {"up": cmd_up, "start": cmd_start, "status": cmd_status, "wait": cmd_wait, "down": cmd_down}[a.cmd](a)
+    {"up": cmd_up, "start": cmd_start, "run": cmd_run, "status": cmd_status, "wait": cmd_wait,
+     "down": cmd_down}[a.cmd](a)
     return 0
 
 
