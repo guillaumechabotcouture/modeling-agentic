@@ -34,7 +34,7 @@ passes. The largest moves between the x0.25 and x4 guesses are:
 - PfPR 6–59 m: +1.8% at m0 9.0 (SE 2.1%);
 - treated_all: −0.8% at m0 3.5 (SE 1.2%).
 
-The 6-seed misses were within seed noise. `guess_sensitivity.yaml` now holds the 24-seed run. The paragraph that follows describes the v0.6–v0.8
+The 24-seed point estimates meet the unchanged V7 criterion. Monte Carlo uncertainty remains, and some intervals still reach past 3%, so a stronger convergence claim would need a criterion that accounts for uncertainty. `guess_sensitivity.yaml` now holds the 24-seed run. The paragraph that follows describes the v0.6–v0.8
 re-stamps; those numbers are now history.
 
 **v0.8, v0.7 and v0.6 numbers are v0.5's.** The v0.6 changes act only when a horizon gives a delivery period or a unit
