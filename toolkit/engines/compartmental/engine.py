@@ -51,6 +51,8 @@ v0.2 (age-structured questions; every field below defaults to the v0.1 behaviour
   components.<c>.day   days after horizon.start at which the component acts (default 0: before the epidemic,
                        the v0.1 behaviour); a later day acts during the epidemic on the susceptibles left then
   hooks                schedule() and run_series() (toolkit/engines/hooks.py, figures-hooks/1), time_unit year
+  final_size           to_extinction: outcomes count the whole epidemic (its final size), not only the decision
+                       window; near-critical epidemics last decades of model time but carry few infections
 
 Unit attributes: N (group sizes), s0 (given), contact (G x G) or contact_rate, birth_year,
 decision_year, coverage:<dose> (latent true coverage per cohort), always_immune, always_susceptible,
@@ -459,7 +461,7 @@ class CompartmentalEngine:
                  forcing_ref_phase=0.0, importation="deterministic", offspring="poisson", components=None,
                  targets_susceptible=False, doses=(), dose_dependence="independent", outcomes=(), tol=1e-9,
                  step_cap=20000, segment=256, rt_trajectory=True, results_path=None, time_unit="day",
-                 per_group_parameters=()):
+                 per_group_parameters=(), final_size=False):
         for val, allowed, what in ((structure, STRUCTURES, "structure"), (mode, MODES, "mode"),
                                    (initialiser, INITIALISERS, "initialiser"), (dt, tuple(DT_DAYS), "dt"),
                                    (transmission, TRANSMISSION, "transmission"), (forcing, FORCING, "forcing"),
@@ -533,6 +535,9 @@ class CompartmentalEngine:
         if len(set(pg)) != len(pg):
             raise ValueError("per_group_parameters: listed twice")
         self.per_group = pg
+        self.final_size = bool(final_size)
+        if self.final_size and mode != "to_extinction":
+            raise ValueError("final_size needs mode to_extinction")
         self.tol = _num(tol, "tol")
         self.step_cap, self.segment = int(step_cap), int(segment)
         if self.tol <= 0 or self.step_cap < 1 or self.segment < 1:
@@ -567,6 +572,7 @@ class CompartmentalEngine:
                 # v0.2 fields only when they differ from v0.1's behaviour (a v0.1 configuration's digest is unchanged)
                 **({"time_unit": self.time_unit} if self.time_unit != "day" else {}),
                 **({"per_group_parameters": list(self.per_group)} if self.per_group else {}),
+                **({"final_size": True} if self.final_size else {}),
                 **({"generation_interval_declared": self.gi_decl} if self.gi_decl and "seir" in self.gi_decl else {})}
 
     def parameters(self) -> list:
@@ -652,7 +658,10 @@ class CompartmentalEngine:
                 "given to immune people are wasted unless targets_susceptible is declared",
                 "p_major: multitype branching-process extinction equations (derived from an equation, not from the "
                 "sim)",
-                f"run mode {self.mode}"],
+                f"run mode {self.mode}"] + (
+                ["final_size: per-capita outcomes are the final size of the epidemic seeded at horizon.start (to "
+                 "extinction, whatever its duration); the decision window's end bounds only the figures"]
+                if self.final_size else []),
             components=comps or {"none": [0]},
             unit_attributes=self._unit_attributes(),
             outputs={"per_capita": ["infections"] + self.outcomes, "windows": self._window_metrics(),
@@ -958,7 +967,15 @@ class CompartmentalEngine:
         fref = ctx["forcing"](self.forcing_ref_phase)
         r0 = q * spectral_radius(C)
         w0, w1 = self.days(horizon.window[0], horizon), self.days(horizon.window[1], horizon)
-        if self.time_unit == "year" and self.mode == "to_extinction":
+        w1_declared = w1
+        after = inc[times >= w1].sum(axis=(0, 2)) / Ntot           # infections after the window's end
+        if self.final_size:
+            # v0.2 final_size: outcomes are the epidemic's final size (to extinction), whatever its duration; the
+            # window must start at the importation, and its end bounds only the figures (meta after_window_share)
+            if w0 > 0:
+                raise ValueError("final_size: the decision window must start at horizon.start (the importation)")
+            w1 = math.inf
+        elif self.time_unit == "year" and self.mode == "to_extinction":
             # the final size is counted in the decision window: infections after its end above the stop tolerance
             # (tol x N, the run's own convergence criterion) fail closed rather than being dropped
             after = inc[times >= w1].sum(axis=(0, 2)) / Ntot
@@ -978,6 +995,8 @@ class CompartmentalEngine:
             wins = {}
             for wn, (t0, t1) in (horizon.windows or {}).items():
                 t0, t1 = self.days(t0, horizon), self.days(t1, horizon)
+                if self.final_size and t1 >= w1_declared:
+                    t1 = math.inf
                 sel = (times >= t0) & (times < t1)
                 ks = np.nonzero(sel)[0]
                 k0 = int(ks[0]) if len(ks) else int(np.searchsorted(times, t0))
@@ -1015,6 +1034,8 @@ class CompartmentalEngine:
                     "seed_clipped": bool(np.any(ctx["seed"][b] > s_start0[b] * N[b] + 1e-300))}
             if self.mode == "to_extinction":
                 meta["converged"] = bool(not state["active"][b])
+            if self.final_size:
+                meta["after_window_share"] = float(after[b])
             if self.mode == "windowed" and self.rt_trajectory:
                 s_traj = S_after[:, b] / N[b]
                 f_t = np.asarray([ctx["forcing"](t)[b] for t in times])

@@ -197,6 +197,20 @@ def _self_test() -> int:
     ok(err is not None and "outside the delivery period" in err,
        f"A23 time_unit year: a component acting outside the delivery period fails closed: {err}")
 
+    # A25-A27 final_size: the whole epidemic counts, whatever the window end
+    efs = _age(time_unit="year", final_size=True)
+    o_fs = efs.run(P, _unit(), Package("0", {}), short, 1)
+    ok(abs(o_fs.windows["all"]["attack_rate"] - od.windows["all"]["attack_rate"]) < 1e-15
+       and abs(o_fs.per_capita["infections"]["a2"] - od.per_capita["infections"]["a2"]) < 1e-15
+       and o_fs.meta["after_window_share"] > 0.1,
+       f"A25 final_size: a window shorter than the epidemic still counts its final size "
+       f"(after the window: {o_fs.meta['after_window_share']:.3f})")
+    _, err = safe(lambda: _age(mode="windowed", final_size=True))
+    ok(err is not None and "to_extinction" in err, f"A26 final_size needs to_extinction: {err}")
+    late_w = Horizon(2026.0, 2046.0, (2026.5, 2046.0), {"all": [2026.5, 2046.0]})
+    _, err = safe(lambda: efs.run(P, _unit(), Package("0", {}), late_w, 1))
+    ok(err is not None and "must start at horizon.start" in err, f"A27 final_size: a window after the start fails: {err}")
+
     # A24 a contract check of each new configuration
     ok(check_engine(eyh, _unit(), pk, hy) == [] and check_engine(e_mid, u1, Package("v", {"vax": 1}), hd) == [],
        "A24 the year-unit and mid-epidemic configurations pass the contract test")

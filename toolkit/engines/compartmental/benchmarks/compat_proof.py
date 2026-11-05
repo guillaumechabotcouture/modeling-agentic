@@ -183,6 +183,9 @@ def restamp() -> dict:
         raise SystemExit("refused: coverage_results.yaml is already stamped for this code")
     cov["engine_identity"] = ident
     cov["engine_config_sha256"] = B.config_digest(eng) if hasattr(B, "config_digest") else cov.get("engine_config_sha256")
+    prev = cov.get("restamped") or {}
+    if prev:     # re-stamped before: the identity of the code that computed the values is the earliest one
+        old = prev.get("old_identity", old)
     cov["restamped"] = {"by": "compat_proof.py", "proof": os.path.basename(OUT),
                         "proof_cases": proof["cases"], "old_identity": old, "old_ref": proof["old_ref"],
                         "old_commit": proof["old_commit"],

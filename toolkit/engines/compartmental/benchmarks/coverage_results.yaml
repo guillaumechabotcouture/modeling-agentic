@@ -2,7 +2,7 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: compartmental-starsim
   version: '0.2'
-  code_sha256: 4f4ea65f6df0e86378d506c22433cdba231da95e9ee070d4eb16ff18a344bd73
+  code_sha256: 5b6f2ec81a7133e9c73ef1d207d5ab986797af89c9332b43ae015264ae43d19f
   params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
   config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
 engine_config_sha256: 6430f390a3fc3746f15649cdcfe6c65ea257d47a896b6ffa069d5ecdaae006c8
