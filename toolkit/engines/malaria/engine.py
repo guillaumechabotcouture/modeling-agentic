@@ -2210,7 +2210,7 @@ def _self_test_v010(ok, e, unit) -> None:
             ok("smc_hist_years" in str(ex), f"H7b a past round executed at or after the delivery start is refused in "
                                             f"the sim path ({ex})")
         # Codex r1 P1-3: SMC months the past rounds use must be whole, distinct months 1-12
-        for mo in ([7.9], [0], [13], [True], [7, 7]):
+        for mo in ([7.9], [0], [13], [True], [7, 7], False, 0, "6 7", 7):     # Codex r2 P1: falsy and non-list values too
             refused({"smc_months": mo, "smc_hist_years": [2015]}, "smc_months",
                     f"H7c with past SMC, smc_months {mo} fails closed")
         # Codex r1 P2-5: year keys of mixed type are accepted by the run as by the schedule
