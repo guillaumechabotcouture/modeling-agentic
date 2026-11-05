@@ -51,3 +51,12 @@ attribute_binding:
   smc_routine:
     default: 0
     meaning: "no routine SMC after the delivery period (v0.7): the package's SMC ends with the delivery period and no arm gets SMC afterwards"
+  smc_hist_years:
+    default: "[]"
+    meaning: "no past SMC (v0.10): no unit had SMC before the delivery period, so a calibration to an earlier survey treats every unit as never having had SMC"
+  smc_hist_rounds:
+    default: "the number of the unit's SMC months"
+    meaning: "each past SMC year had a round in every one of the unit's SMC months (v0.10)"
+  hist_net_by_year:
+    default: none
+    meaning: "every past net campaign distributed the net type hist_net (v0.10)"

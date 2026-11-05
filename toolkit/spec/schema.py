@@ -24,7 +24,8 @@ docs/design/v2-spec-and-analysis.md §1):
       label: name                          # optional
       region: region_column                # optional: region-level effects and uncertainty
       engine_attributes:                   # engine unit attribute <- column(s) or a value
-        a: {column: col}                   # {column, split}, {columns: [..] or {k: col}}, {value, source}
+        a: {column: col}                   # {column, split[, empty]}, {columns: [..] or {k: col}}, {value, source}
+                                           # (empty: the cell token of an empty list, e.g. "none")
       populations:                         # population group <- unit column and engine age groups
         all: {column: pop, age_groups: [all]}
       defaults_accepted: {attr: "<reason>"}   # an engine card default taken by name (the card's attribute_binding.yaml);
@@ -322,7 +323,12 @@ class Spec:
                 out[attr] = m["value"]
             elif "column" in m:
                 v = row[m["column"]]
-                out[attr] = [float(x) for x in str(v).split(m["split"])] if "split" in m else _num(v)
+                if "split" not in m:
+                    out[attr] = _num(v)
+                elif "empty" in m and str(v).strip() == str(m["empty"]).strip():
+                    out[attr] = []          # the declared token of an empty list (a blank cell is refused)
+                else:
+                    out[attr] = [float(x) for x in str(v).split(m["split"])]
             elif isinstance(m["columns"], dict):
                 out[attr] = {k: float(row[c]) for k, c in m["columns"].items()}
             else:
@@ -729,6 +735,9 @@ def _validate(s: Spec) -> list[str]:
             bad.append(f"decision_units.engine_attributes.{attr}: must be a mapping")
         elif "column" in m:
             need.add(m["column"])
+            if "empty" in m and ("split" not in m or not str(m["empty"]).strip()):
+                bad.append(f"decision_units.engine_attributes.{attr}: `empty` (the token of an empty list) needs "
+                           "`split` and a non-blank value")
         elif "columns" in m:
             need |= set(m["columns"].values() if isinstance(m["columns"], dict) else m["columns"])
         elif "value" not in m:
