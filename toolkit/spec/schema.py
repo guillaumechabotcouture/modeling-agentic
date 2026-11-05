@@ -735,9 +735,11 @@ def _validate(s: Spec) -> list[str]:
             bad.append(f"decision_units.engine_attributes.{attr}: must be a mapping")
         elif "column" in m:
             need.add(m["column"])
-            if "empty" in m and ("split" not in m or not str(m["empty"]).strip()):
+            if "empty" in m and ("split" not in m or not isinstance(m["empty"], str) or not m["empty"].strip()
+                                 or isinstance(_num(m["empty"]), float)):
+                # Codex r1 P1-4 / P2-6: a non-blank, non-numeric string, so no reader can take the token for data
                 bad.append(f"decision_units.engine_attributes.{attr}: `empty` (the token of an empty list) needs "
-                           "`split` and a non-blank value")
+                           "`split` and a non-blank, non-numeric string (e.g. none)")
         elif "columns" in m:
             need |= set(m["columns"].values() if isinstance(m["columns"], dict) else m["columns"])
         elif "value" not in m:
@@ -1239,6 +1241,8 @@ def _self_test() -> int:
             "empty", "SP8e a null `empty` token is refused (Codex r1 P1-4)")
         bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": -1}),
             "empty", "SP8f a non-string `empty` token is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": "-1"}),
+            "empty", "SP8g a numeric `empty` token is refused (a reader could plot it as data; Codex r1 P2-6)")
         bad(lambda r: r["uncertainty"]["excluded"][0].update(reason=""), "neither declared",
             "SP9 an exclusion without a reason is refused")
         bad(lambda r: r["constraints"].update(group_rules=[{"id": "g", "components": ["a"], "by": "nocol"}]),

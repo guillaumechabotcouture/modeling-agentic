@@ -79,7 +79,7 @@ or one per year) keeps the first n SMC months of a year. Every past round preced
 `hist_net_by_year` gives a past campaign its own net type; campaigns it does not name, and routine campaigns, keep
 hist_net. Past SMC puts smc_pe and smc_hi_frac, and a past dual-AI campaign cfp_kill and cfp_half, in the burn-in
 key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
-benchmarks/restamp_proof.py). Self-tests H0-H6.
+benchmarks/restamp_proof.py). Self-tests H0-H7.
 """
 from __future__ import annotations
 
@@ -253,11 +253,12 @@ def _is_num(x) -> bool:
     return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, (bool, np.bool_))
 
 
-def smc_history(a: dict, d0: float, months) -> dict | None:
+def smc_history(a: dict, d0: float, months, later=()) -> dict | None:
     """v0.10: a unit's past SMC from smc_hist_years (whole calendar years) and smc_hist_rounds (optional: one number
     for every past year, or one per year; default every SMC month). A year's n rounds are at the month starts of the
     first n of the unit's SMC `months` in that year (model.smc_targets, as the package's SMC). Every round precedes
-    the delivery start d0. None when there is no past year (the v0.9 sim). Fails closed on any other form."""
+    the delivery start d0 and the first of the package's and routine SMC rounds `later` (Codex r1 P1-1). None when
+    there is no past year (the v0.9 sim). Fails closed on any other form."""
     ys, rr = a.get("smc_hist_years"), a.get("smc_hist_rounds")
     if ys is None:
         ys = []
@@ -270,7 +271,13 @@ def smc_history(a: dict, d0: float, months) -> dict | None:
         years.append(int(float(y)))
     if len(set(years)) != len(years):
         raise ValueError(f"smc_hist_years: a year is given twice ({years})")
-    months = [int(m) for m in months]
+    if years:     # Codex r1 P1-3: the months past SMC uses are whole, distinct calendar months (order kept)
+        bad_m = [m for m in months if not _is_num(m) or not np.isfinite(float(m)) or float(m) != int(float(m))
+                 or not 1 <= int(float(m)) <= 12]
+        if bad_m or len({int(float(m)) for m in months}) != len(list(months)) or not list(months):
+            raise ValueError(f"smc_months {list(months)!r}: with past SMC (smc_hist_years) the SMC months must be "
+                             "distinct whole months 1-12")
+    months = [int(float(m)) for m in months]
 
     def n_rounds(x):
         if not _is_num(x) or not np.isfinite(float(x)) or float(x) != int(float(x)) or not 1 <= int(x) <= len(months):
@@ -292,11 +299,11 @@ def smc_history(a: dict, d0: float, months) -> dict | None:
         return None
     pairs = sorted(zip(years, ns))
     rounds = [t for y, n in pairs for t in M.smc_targets([y], months[:n])]
-    late = [round(t, 3) for t in rounds if t >= d0]
+    first = min([float(d0)] + [float(t) for t in later])
+    late = [round(t, 3) for t in rounds if t >= first]
     if late:
-        raise ValueError(f"smc_hist_years: past SMC round(s) at {late[:4]} are at or after the delivery start "
-                         f"{d0:g}; past SMC precedes the delivery period (the package's or routine SMC covers later "
-                         "seasons)")
+        raise ValueError(f"smc_hist_years: past SMC round(s) at {late[:4]} are at or after {first:g}, the "
+                         f"delivery start {d0:g} or the first package or routine SMC round; past SMC precedes both")
     return {"years": [y for y, _ in pairs], "rounds_per_year": [n for _, n in pairs], "months": months,
             "rounds": rounds}
 
@@ -550,7 +557,8 @@ class MalariaEngine:
                 raise ValueError("; ".join(bad))
         plan["smc_routine"] = rs
         # v0.10: past SMC in the unit's SMC months, before the delivery period (None without smc_hist_years)
-        plan["smc_hist"] = smc_history(a, float(d0), a.get("smc_months") or default_smc_months(season))
+        later = [t for c, t in timed if c == "SMC round"] + list((rs or {}).get("rounds", []))
+        plan["smc_hist"] = smc_history(a, float(d0), a.get("smc_months") or default_smc_months(season), later)
         # one intervention (itn_hist) runs past and routine campaigns, in this order (as _base_sim builds it)
         hn = plan["hist_nets"] or [plan["hist_net"]] * len(plan["hist_years"])
         ev += [("itn_hist", "net", f"past net campaign ({n})", "history", t) for t, n in zip(plan["hist_years"], hn)]
@@ -645,6 +653,8 @@ class MalariaEngine:
         skip = POST_FORK | (frozenset() if dual else DUAL_NET)
         if a.get("smc_hist_years"):
             skip = skip - SMC_PARAMS
+        if isinstance(a.get("hist_net_by_year"), dict):   # Codex r1 P2-5: keys of mixed type cannot be sorted
+            a = dict(a, hist_net_by_year=sorted([float(k), str(v)] for k, v in a["hist_net_by_year"].items()))
         return json.dumps({"P": {k: v for k, v in P.items() if k not in skip}, "unit": a}, sort_keys=True,
                           default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x))   # arrays in full (review P3)
 
@@ -691,6 +701,13 @@ class MalariaEngine:
                                      count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
         sh = dp["smc_hist"]
         if sh is not None:     # v0.10: built only when set, last, so a unit without it gets the v0.9 sim exactly
+            # Codex r1 P1-2: every past round runs on a step before the delivery start (the steps the sim uses)
+            yv = self._yearvec(P, horizon)
+            d0 = float(delivery_period(horizon)[0])
+            late = sorted(round(float(yv[i]), 6) for i in M.event_steps(yv, sh["rounds"]) if float(yv[i]) >= d0)
+            if late:
+                raise ValueError(f"smc_hist_years: past SMC round(s) run on step(s) {late[:4]}, at or after the "
+                                 f"delivery start {d0:g}")
             itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
                                      count=False, times=sh["rounds"], name="smc_hist"))
         if cfg is not None:

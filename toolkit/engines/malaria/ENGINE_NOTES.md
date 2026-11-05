@@ -82,7 +82,10 @@ events (label `past SMC round`) and names each past campaign's own net type (`pa
 **Fail closed.** The engine refuses (ValueError, before any sim is built):
 - `smc_hist_years` that is not a list (a string or a bare number), or holds a fractional year, NaN, a boolean, a
   string, or a repeated year;
-- a past SMC round at or after the delivery start (past SMC precedes the delivery period);
+- a past SMC round at or after the delivery start or the first package or routine SMC round (past SMC precedes
+  both; without a delivery period the package's SMC can start before the window, in its first calendar year), or
+  one that the sim would run on a daily step at or after the delivery start (checked on the sim's own steps);
+- with past SMC, SMC months that are not distinct whole months 1–12;
 - `smc_hist_rounds` that is not a whole number from 1 to the number of SMC months, or a list of another length;
 - `hist_net_by_year` with a net type other than pyr, pbo or dual, a year that is not one of `itn_hist_years`
   (within 1e-6 y), a year given twice, a token that is not `year:type`, or a value that is neither a mapping nor a
@@ -94,8 +97,8 @@ events (label `past SMC round`) and names each past campaign's own net type (`pa
 
 **Spec binding (disease-agnostic).** A bound column may not be blank (`attribute_column_empty`), so an empty list
 needs an explicit token. `toolkit/spec/schema.py` gains an optional `empty` field for split columns:
-`{column: c, split: " ", empty: "none"}` reads a cell equal to `none` as `[]`. `empty` needs `split` and a non-blank
-value (self-tests SP8b–d).
+`{column: c, split: " ", empty: "none"}` reads a cell equal to `none` as `[]`. `empty` needs `split` and a non-blank,
+non-numeric string, so no reader can take the token for data (self-tests SP8b–g).
 
 **Back-compatibility.** With the attributes absent, empty (`[]`, `{}`, `""`, `"none"`), `smc_hist_rounds` given
 without past years, or `hist_net_by_year` naming every campaign at `hist_net`, the sim has the v0.9 interventions and
@@ -108,7 +111,8 @@ steps the sim runs, and the rounds-per-year override; H2 the trajectory is ident
 under-5 incidence is lower in the past SMC months (sum of the monthly rates over June–September 2015,
 0.153 vs 1.034 per child-year, 1,500 agents), never charged; H3 byte-identity with empty values; H4 malformed formats fail closed, in `schedule()`
 and in the sim path; H5 each past campaign gives its own net type and routine campaigns keep `hist_net`; H6 burn-in
-key.
+key; H7 (Codex review round 1) overlap with the package's SMC, the sim-step check, SMC months and year keys of
+mixed type.
 
 ## v0.9 scope: smooth-compact net survival (written before the v0.9 pack run)
 
