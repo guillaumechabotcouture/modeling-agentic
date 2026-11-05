@@ -153,17 +153,26 @@ What this says for the engine:
 - clearance at dosing has probability 1 (step 3);
 - the partial-course multiplier (step 4).
 
-**New engine parameters.** All are kind `fixed`, and each has its source on the card.
+**v0.11 fixes the mechanism's form, not the values.** Each literature value is a reference point, taken in other
+years, places and programmes, and the values vary. The engine's point value for each parameter is a central
+reference. Every parameter except the shape `smc_k` is carried as a sourced range in `priors.yaml`. Which values
+inside those ranges agree with data has to be found jointly with the other parameters. That is the joint
+calibration, the next step, not this PR. The reachability check in the PR is a diagnostic over the joint ranges. It
+picks no point.
 
-| Parameter | Value | Range for priors | Source |
+**New engine parameters.** All are kind `fixed`. The source is on the card and the range is in `priors.yaml`. To
+keep the engine code identical to the benchmarked commit, the card's lo/hi for `smc_rho`, `smc_e0` and
+`smc_partial` are empty, and their ranges live only in `priors.yaml`.
+
+| Parameter | Value | Range (priors.yaml) | Literature spread the range covers |
 |---|---|---|---|
-| `smc_cov` | 0.796 | 0.521–0.957 | Table 21 above; range: ACCESS-SMC Nigeria 2016 mean per month (52.1%) to Malaria Consortium 2022 end-of-cycle C2 (95.7%) |
-| `smc_rho` | 0.417 | none (fixed) | beta-binomial fit to Table 21 |
-| `smc_adh` | 0.944 | 0.842–0.986 | Table 16; range as in the literature table |
-| `smc_e0` | 1.0 | none (fixed) | Burgert 2022 Table 1 |
-| `smc_half` | 32 days | 24–32 days | Burgert 2022 Table 1; Braunack-Mayer 2024 (24–30 days) |
-| `smc_k` | 5.4 | none (fixed) | Burgert 2022 Table 1 (Braunack-Mayer 2024: 5.34) |
-| `smc_partial` | 0.910 | none (fixed) | Cairns 2022 (79.8% / 87.7%) |
+| `smc_cov` | 0.796 | 0.521–0.957 | Nigeria mean per-round reach by survey: ACCESS-SMC 2016 52.1% and 2015 83.0% (Table 1); beta-binomial means of the cycle distributions: 0.648 (ACCESS-SMC 2015 key indicators), 0.796 (Malaria Consortium 2020, Table 21), 0.933 (2023, Table 33), 0.943 (2022, Table 30); end-of-cycle day-1 coverage per cycle 93–96% (2022 and 2023, Table 0). The range runs from the lowest to the highest. |
+| `smc_rho` | 0.417 | 0.417–0.600 | Beta-binomial fits to the same four distributions: 0.417 (2020), 0.446 (2023), 0.555 (ACCESS-SMC 2015, binned), 0.600 (2022). The point value is the 2020 survey, the one that covers Jigawa, Kano and Katsina. |
+| `smc_adh` | 0.944 | 0.842–0.986 | Full course among day-1 recipients, Nigeria: 84.2% (ACCESS-SMC 2015), 86.8% and 89.0% (ACCESS-SMC 2016 and 2015, Table 1), 94.4% (2020, Table 16), 97.1–97.8% (2022, Table 0), 98.6% (2021, Table 18) |
+| `smc_e0` | 1.0 | 0.90–1.00 | Burgert 2022 Table 1: 100%. Cairns 2022: "exceeded 90% … but was not 100%, even immediately post-administration". |
+| `smc_half` | 32 days | 24–32 days | Burgert 2022 Table 1: 32 days. Braunack-Mayer 2024: 24–30 days. Both are fitted to the same trial (Zongo 2015) with nearly the same shape. |
+| `smc_k` | 5.4 | fixed | Burgert 2022: 5.4. Braunack-Mayer 2024: 5.34. The spread is negligible. |
+| `smc_partial` | 0.910 | 0.384–1.00 | Cairns 2022: day-1-only 30-day PE 79.8% (33.7–93.8) against 87.7% for the full course. The range is the CI divided by 87.7, capped at 1. |
 
 A unit's own coverage, such as a state's survey value, can be set through a run spec's `engine_parameters`, as for
 `net_retention_half`. Out-of-range values fail closed: `smc_cov` outside (0, 1], `smc_rho` outside [0, 1),

@@ -39,6 +39,34 @@ priors:
       94.4% (93.2-95.1). Range: ACCESS-SMC Nigeria 2015 key indicators 84.2%; Malaria Consortium 2021 report Table 18,
       98.6%"
     verified: matched
+  # owner guidance 2026-11-05: every SMC parameter but the shape smc_k is carried as a sourced range; the engine's
+  # point value is the central reference, and which values inside the ranges agree with data is for a joint calibration.
+  # The card's lo/hi for smc_rho, smc_e0 and smc_partial stay empty (engine code unchanged after the benchmark run);
+  # their ranges are here.
+  smc_rho:
+    dist: triangular
+    range: [0.417, 0.600]
+    source: "beta-binomial fits (maximum likelihood, mean and intra-child correlation) to the Nigeria distributions of
+      cycles received: Malaria Consortium 2020 report Table 21 (rho 0.417, mean 0.796), 2022 report Table 30 4-cycle
+      areas (0.600, 0.943), 2023 report Table 33 4-cycle areas (0.446, 0.933); ACCESS-SMC Nigeria 2015 key
+      indicators, binned (0.555, 0.648)"
+    verified: matched
+    note: "derived by this engine from the published distributions (ENGINE_NOTES.md, v0.11); the point value is the
+      2020 survey, the one covering Jigawa, Kano and Katsina"
+  smc_e0:
+    dist: triangular
+    range: [0.90, 1.00]
+    source: "Burgert et al. 2022 Table 1 (initial efficacy 100%); Cairns et al. 2022 BMC Med 20:352, Abstract:
+      protection 'exceeded 90% in the first 2-3 weeks ... but was not 100%, even immediately post-administration'"
+    verified: matched
+  smc_partial:
+    dist: triangular
+    range: [0.384, 1.00]
+    source: "Cairns et al. 2022 BMC Med 20:352, Results: 30-day PE 79.8% (95% CI 33.7-93.8) with the day-1 dose only vs
+      87.7% with all three; range 33.7 / 87.7 to 93.8 / 87.7 capped at 1"
+    verified: unverified
+    note: "the mapping of a clinical-PE ratio onto initial infection-blocking efficacy is an assumption
+      (ENGINE_NOTES.md, v0.11)"
   smc_half:
     dist: triangular
     range: [24.0, 32.0]
@@ -83,12 +111,7 @@ fixed:
   cov_corr: "the card's range [0, 0.9] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
   exp_corr: "the card's range [0, 0.6] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
   use_persist: "the card's range [0, 1] is an assumption with no source"
-  smc_rho: "fitted to the one Table 21 distribution (Malaria Consortium 2020 coverage report); no published range"
-  smc_e0: "Burgert 2022 Table 1 gives 100% with no range; Cairns 2022 notes protection 'was not 100%, even immediately
-    post-administration' without a value"
   smc_k: "Burgert 2022 Table 1 (5.4) and Braunack-Mayer 2024 Table 1 (5.34) agree; no range is published"
-  smc_partial: "Cairns 2022 BMC Med: 79.8% (95% CI 33.7-93.8) day-1 only vs 87.7% full course; the ratio has no
-    published interval (few non-adherent children in the trial)"
   cfr_severe_untreated: "attempt 8's range 0.15-0.50 (C49) is a modeller assumption; no published estimate was located"
   severe_access_add: "no published range (attempt 8 value)"
   dur_moderate_d: "no published range (attempt 8 value)"
