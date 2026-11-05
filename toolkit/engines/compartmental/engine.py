@@ -162,6 +162,8 @@ def seir_generation_interval(latent_days, infectious_days, dt_days: float = 1.0,
     n = 400                                              # midpoint sub-steps per dt (weights to ~1e-6 relative)
     u = (np.arange(n) + 0.5) / n                         # position within a step, in steps
     cap = _num(max_days, "max_days") if max_days is not None else None
+    if cap is not None and abs(round(cap / dt) * dt - cap) > 1e-9 * max(1.0, cap):
+        raise ValueError(f"seir generation interval: max_days {cap} is not a whole number of {dt}-day steps")
     if cap is not None and cap < dt:
         raise ValueError(f"seir generation interval: max_days {cap} must be at least one step ({dt} days)")
     if not (isinstance(tail, float) and 0 < tail < 1):
@@ -979,6 +981,26 @@ class CompartmentalEngine:
         x = extinction_probability(K, self.offspring)
         return np.sum(ctx["pi"] * (1.0 - x), axis=1)
 
+    def _p_major_safe(self, ctx, s_start) -> np.ndarray:
+        """p_major for every member. Under branching importation it scales the outcomes, so a member whose extinction
+        equations do not converge fails closed, as in v0.1. Under deterministic importation it is only a reported
+        diagnostic: such a member reports NaN (v0.2; the flu dry run's near-critical vaccinated arms), and the batch
+        and its outcomes are kept. Members that converge get exactly the v0.1 values."""
+        try:
+            return self._p_major(ctx, s_start)
+        except RuntimeError:
+            if self.importation == "branching":
+                raise
+        out = np.full(ctx["B"], np.nan)
+        for b in range(ctx["B"]):
+            sub = {"N": ctx["N"][b:b + 1], "C": ctx["C"][b:b + 1], "q": ctx["q"][b:b + 1], "pi": ctx["pi"][b:b + 1],
+                   "forcing": lambda t, _b=b: ctx["forcing"](t)[_b:_b + 1]}
+            try:
+                out[b] = float(self._p_major(sub, s_start[b:b + 1])[0])
+            except RuntimeError:
+                pass
+        return out
+
     def _outcomes(self, ctx, state, horizon, seed) -> list:
         B, G = ctx["B"], ctx["G"]
         N, C, q = ctx["N"], ctx["C"], ctx["q"]
@@ -988,7 +1010,7 @@ class CompartmentalEngine:
         times = np.arange(T1) * self.dt_days
         s_start0 = state["s_first"]                               # after interventions, before seeding
         S_after = self._s_after(state, ctx, inc)                  # S after each step
-        pm = self._p_major(ctx, s_start0) if self.forcing == "none" else None
+        pm = self._p_major_safe(ctx, s_start0) if self.forcing == "none" else None
         scale = pm if self.importation == "branching" else np.ones(B)      # branching implies no forcing
         fref = ctx["forcing"](self.forcing_ref_phase)
         r0 = q * spectral_radius(C)
@@ -1046,16 +1068,21 @@ class CompartmentalEngine:
                 # the forcing at the window's ends, in days; a final-size window ends at its last step (Codex r1 P1-5:
                 # never at infinity)
                 d0 = self.days(t0, horizon)
-                d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_last, 0), T1 - 1)])
+                # Codex r2 P1-4: a final-size window ends at this member's own last step (its stop), never at a
+                # batch companion's, so batched and single runs give the same endpoint diagnostics
+                k_end = int(state["stopped"][b]) if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1
+                d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_end, 0), T1 - 1)])
+                if not math.isfinite(t1):
+                    S1 = S_after[min(k_end, T1 - 1), b]
                 f0, f1 = ctx["forcing"](d0)[b], ctx["forcing"](d1)[b]
                 rho0 = float(spectral_radius((S0 / N[b])[:, None] * C[b]))
                 rho1 = float(spectral_radius((S1 / N[b])[:, None] * C[b]))
                 series = inc[sel, b].sum(axis=1)
                 pos = series > 0
-                if pos.sum() >= 2:
+                if pos.sum() >= 2 and not gens:
                     gr = float(np.polyfit(times[sel][pos], np.log(series[pos]), 1)[0])
                     gdef = 1.0
-                else:
+                else:                  # Codex r2 P2-5: no calendar growth rate on the generation grid
                     gr, gdef = 0.0, 0.0
                 m = {"attack_rate": float(tot.sum() / Ntot[b] * scale[b]), "s_start": float(S0.sum() / Ntot[b]),
                      "s_end": float(S1.sum() / Ntot[b]), "r0": float(r0[b]), "reff_start": float(q[b] * f0 * rho0),

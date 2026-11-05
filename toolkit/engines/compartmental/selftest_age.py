@@ -257,6 +257,33 @@ def _self_test() -> int:
         _, err = safe(lambda: seir_generation_interval(1.5, 3.0, 1.0, max_days=cap))
         ok(err is not None, f"A32 (r1 P2-15) max_days {cap} is refused: {err}")
 
+    # Codex r2: A35-A37
+    efs_s = _age(time_unit="year", final_size=True, forcing="cosine", forcing_period=365.0)
+    ps = [dict(P, r0=2.0, forcing_amplitude=0.3, forcing_phase=40.0), dict(P, r0=3.0, forcing_amplitude=0.3,
+                                                                            forcing_phase=40.0)]
+    hb = Horizon(2026.0, 2046.0, (2026.0, 2046.0), {"all": [2026.0, 2046.0]})
+    bat = efs_s.run_batch(ps, _unit(), Package("0", {}), hb, 1)
+    one = efs_s.run(ps[1], _unit(), Package("0", {}), hb, 1)
+    ok(bat[1].windows["all"]["reff_end"] == one.windows["all"]["reff_end"]
+       and bat[1].windows["all"]["s_end"] == one.windows["all"]["s_end"],
+       f"A35 (r2 P1-4) a seasonal final-size member's endpoint diagnostics do not depend on its batch companions "
+       f"({bat[1].windows['all']['reff_end']} vs {one.windows['all']['reff_end']})")
+    o36 = efs.run(P, _unit(), Package("0", {}), short, 1)
+    ok(o36.windows["all"]["growth_defined"] == 0.0, "A36 (r2 P2-5) no calendar growth rate on the generation grid")
+    _, err = safe(lambda: seir_generation_interval(1.5, 3.0, 1.0, max_days=1.01))
+    ok(err is not None and "whole number" in err, f"A37 (r2 P2-7) an off-grid max_days is refused: {err}")
+
+    # A38: under deterministic importation a near-critical member's p_major is NaN, not a failed batch
+    w38 = CompartmentalEngine(groups=["all"], mode="windowed", generation_interval=[1.0])
+    u38 = UnitSpec("n", {"N": [1.0e6], "s0": [1.0], "seed": 1e-9})
+    o38, err = safe(lambda: w38.run_batch([{"r0": 1.000001}, {"r0": 2.0}], u38, Package("0", {}),
+                                          Horizon(0, 10, (0, 10), {"all": [0, 10]}), 1))
+    ok(err is None and math.isnan(o38[0].windows["all"]["p_major"]) and o38[1].windows["all"]["p_major"] > 0.7,
+       f"A38 a near-critical p_major is reported NaN under deterministic importation; the batch is kept: {err}")
+    b38 = CompartmentalEngine(groups=["all"], mode="windowed", generation_interval=[1.0], importation="branching")
+    _, err = safe(lambda: b38.run({"r0": 1.000001}, u38, Package("0", {}), Horizon(0, 10, (0, 10), {"all": [0, 10]}), 1))
+    ok(err is not None and "did not converge" in err, f"A38b under branching importation it still fails closed: {err}")
+
     # A24 a contract check of each new configuration
     ok(check_engine(eyh, _unit(), pk, hy) == [] and check_engine(e_mid, u1, Package("v", {"vax": 1}), hd) == [],
        "A24 the year-unit and mid-epidemic configurations pass the contract test")

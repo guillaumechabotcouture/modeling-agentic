@@ -39,7 +39,15 @@ ALLOCATION_CSV = f"{OUT_DIR}/allocation.csv"
 def _empirical_config(spec: dict) -> dict:
     """The package-rate engine is configured by the spec: its components and the outcome."""
     comps = list(((spec.get("options") or {}).get("components") or {}).keys())
+    if len(comps) > EMPIRICAL_MAX_COMPONENTS:
+        # the engine enumerates every combination of its components (2^n rate ratios): a joint dose-block space with
+        # dozens of level components would exhaust memory while the harness only asks whether it fits (flu run 1)
+        raise ValueError(f"the package-rate engine takes at most {EMPIRICAL_MAX_COMPONENTS} components (one rate ratio "
+                         f"per combination); this spec has {len(comps)}")
     return {"components": comps, "outcome": (spec.get("objective") or {}).get("outcome") or "cases"}
+
+
+EMPIRICAL_MAX_COMPONENTS = 16
 
 
 COMPARTMENTAL = "toolkit.engines.compartmental.engine:CompartmentalEngine"
@@ -793,6 +801,12 @@ def _self_test() -> int:
     r2 = {r["ref"]: r for r in eligible_engines(sp2)}
     ok(not r2[COMPARTMENTAL]["eligible"] and "configured by the signed spec" in str(r2[COMPARTMENTAL]["why_not"]),
        "B26 without its configuration in the signed spec the compartmental engine is not eligible")
+    many = dict(sp2, options={"components": {f"c{i}": {} for i in range(40)}, "engine_map": {}})
+    r3 = {r["ref"]: r for r in eligible_engines(many)}
+    emp = next(v for k, v in r3.items() if "PackageRateEngine" in k)
+    ok(not emp["eligible"] and "at most" in str(emp["why_not"]),
+       "B27 a spec with 40 components makes the package-rate engine ineligible at once (it would enumerate 2^40 "
+       "combinations)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

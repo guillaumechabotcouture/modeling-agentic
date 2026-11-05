@@ -152,8 +152,16 @@ sys.path.insert(0, root)
 from toolkit.engines import benchmark as B
 from toolkit.engines.contract import engine_identity
 cv = yaml.safe_load(open(cov))
-print(json.dumps(engine_identity(B.load_engine(cv["engine"], cv["configs"][cv["default_config"]]))))
+rows = {b["id"]: B.calibrator_code_digest(cv, b["estimand"]) for b in cv["benchmarks"]
+        if b["estimand"]["type"] == "coverage"}
+print(json.dumps({"identity": engine_identity(B.load_engine(cv["engine"], cv["configs"][cv["default_config"]])),
+                  "row_code_sha256": rows}))
 '''
+
+
+def file_hashes(root: str = ROOT) -> dict:
+    import hashlib
+    return {rel: hashlib.sha256(open(os.path.join(root, rel), "rb").read()).hexdigest() for rel in CALIBRATOR_FILES}
 
 
 def definitions(src: str) -> dict:
@@ -197,7 +205,8 @@ def prove(old_ref: str, python: str = sys.executable) -> dict:
         cc = code_changes(d)
         ip = subprocess.run([python, "-c", IDENTITY_RUNNER, d, os.path.join(d, os.path.relpath(COVERAGE_PACK, ROOT))],
                             capture_output=True, text=True, check=True)
-        old_cov_identity = json.loads(ip.stdout.strip().splitlines()[-1])
+        old_side = json.loads(ip.stdout.strip().splitlines()[-1])
+        old_cov_identity = old_side["identity"]
         sys.path.insert(0, d)
         old_commit = subprocess.run(["git", "-C", ROOT, "rev-parse", old_ref], capture_output=True, text=True,
                                     check=True).stdout.strip()
@@ -210,6 +219,9 @@ def prove(old_ref: str, python: str = sys.executable) -> dict:
            "old_ref": old_ref, "old_commit": old_commit, "old_configs": old_cfgs,
            "new_identity": engine_identity(eng), "old_coverage_identity": old_cov_identity,
            "calibrator_code": cc,
+           # Codex r2 P1-3: what the restamp re-checks before it moves any stamp
+           "old_row_code_sha256": old_side["row_code_sha256"],
+           "new_calibrator_file_sha256": file_hashes(),
            "digests": {c["id"]: {"old": dig_old.get(c["id"]), "new": dig_new.get(c["id"])} for c in cs}}
     rec.update(compare(dig_old, dig_new))
     rec["identical"] = bool(rec["identical"] and cc["ok"])
@@ -236,6 +248,16 @@ def restamp() -> dict:
                          f"{(proof.get('old_coverage_identity') or {}).get('code_sha256', '?')[:12]})")
     if not (proof.get("calibrator_code") or {}).get("ok"):
         raise SystemExit("refused: the calibrator, observation or generator code changed on the coverage path")
+    if proof.get("new_calibrator_file_sha256") != file_hashes():
+        raise SystemExit("refused: the calibrator, observation or generator files changed after the proof; run prove "
+                         "again")
+    old_rows = proof.get("old_row_code_sha256") or {}
+    unbound = []           # rows computed by calibrator code other than the proof's old side: never re-bound
+    for r in cov.get("benchmarks") or []:
+        if "code_sha256" in r:
+            hist = r.get("computed_code_sha256", r["code_sha256"])
+            if old_rows.get(r["id"]) != hist:
+                unbound.append(r["id"])
     cv = yaml.safe_load(open(COVERAGE_PACK))
     eng = B.load_engine(cv["engine"], cv["configs"][cv["default_config"]])        # the coverage pack's own identity
     ident = engine_identity(eng)
@@ -246,9 +268,16 @@ def restamp() -> dict:
     prev = cov.get("restamped") or {}
     if prev:     # re-stamped before: the identity of the code that computed the values is the earliest one
         old = prev.get("old_identity", old)
-    for r in cov.get("benchmarks") or []:      # rows re-bound to the current calibrator code digest, the old kept
+    for r in cov.get("benchmarks") or []:
+        if "code_sha256" not in r:
+            continue
+        if r["id"] in unbound:
+            # Codex r2 P1-3: the row keeps the digest of the code that computed it, so benchmark.py's rescore and merge
+            # refuse it until the coverage pack is re-run (fail closed)
+            r["code_sha256"] = r.pop("computed_code_sha256", r["code_sha256"])
+            continue
         b = next((x for x in cv["benchmarks"] if x["id"] == r["id"]), None)
-        if b is not None and b["estimand"]["type"] == "coverage" and "code_sha256" in r:
+        if b is not None and b["estimand"]["type"] == "coverage":   # proven on the old side: re-bound, the old kept
             new = B.calibrator_code_digest(cv, b["estimand"])
             if r["code_sha256"] != new:
                 r.setdefault("computed_code_sha256", r["code_sha256"])
@@ -256,13 +285,17 @@ def restamp() -> dict:
     cov["restamped"] = {"by": "compat_proof.py", "proof": os.path.basename(OUT),
                         "proof_cases": proof["cases"], "old_identity": old, "old_ref": proof["old_ref"],
                         "old_commit": proof["old_commit"],
-                        "note": "coverage values computed by the old code, carried by a byte-identity proof on every "
-                                "configuration the packs use; not recomputed"}
+                        "rows_not_rebound": unbound,
+                        "note": "coverage values computed by the old code, carried by a byte-identity proof of the engine "
+                                "on every configuration the packs use; not recomputed. Rows in rows_not_rebound were "
+                                "computed by calibrator code other than the proof's old side (before this change), so "
+                                "they keep that code's digest and stay unusable for rescore and merge until re-run"}
     yaml.safe_dump(cov, open(COVERAGE, "w"), sort_keys=False, width=110)
     return cov["restamped"]
 
 
 def _self_test() -> int:
+    global OUT, COVERAGE
     fails = []
 
     def ok(c, m):
@@ -299,8 +332,39 @@ def _self_test() -> int:
            "CP7 an added definition is allowed; a changed one on the coverage path (posterior) is not")
     if os.path.exists(OUT):
         rec = yaml.safe_load(open(OUT))
-        ok(rec.get("calibrator_code", {}).get("ok") is True and rec.get("old_coverage_identity"),
-           "CP8 the committed proof binds the old coverage identity and the calibrator code check")
+        ok(rec.get("calibrator_code", {}).get("ok") is True and rec.get("old_coverage_identity")
+           and rec.get("old_row_code_sha256") and rec.get("new_calibrator_file_sha256") == file_hashes(),
+           "CP8 the committed proof binds the old coverage identity, the old row digests and the live calibrator files")
+        # CP9 (Codex r2 P1-3): restamp refuses a row computed by other calibrator code, and changed live files
+
+        saved = (OUT, COVERAGE)
+        with tempfile.TemporaryDirectory() as d:
+            pr, cv = os.path.join(d, "proof.yaml"), os.path.join(d, "cov.yaml")
+            rec2 = dict(rec)
+            yaml.safe_dump(rec2, open(pr, "w"))
+            cov = yaml.safe_load(open(COVERAGE))
+            cov["engine_identity"] = {"stale": True}
+            for r in cov["benchmarks"]:
+                if "code_sha256" in r:
+                    r["computed_code_sha256"] = "UNRELATED_CALIBRATOR"
+                    break
+            yaml.safe_dump(cov, open(cv, "w"))
+            OUT, COVERAGE = pr, cv
+            rs = restamp()
+            c2 = yaml.safe_load(open(cv))
+            r0 = next(r for r in c2["benchmarks"] if "code_sha256" in r)
+            ok(r0["id"] in rs["rows_not_rebound"] and r0["code_sha256"] == "UNRELATED_CALIBRATOR",
+               "CP9 a row computed by other calibrator code is not re-bound: it keeps that code's digest")
+            yaml.safe_dump(cov, open(cv, "w"))
+            rec2["new_calibrator_file_sha256"] = {k: "0" * 64 for k in rec["new_calibrator_file_sha256"]}
+            yaml.safe_dump(rec2, open(pr, "w"))
+            try:
+                restamp()
+                ok(False, "CP10 calibrator files changed after the proof refuse the restamp")
+            except SystemExit as e:
+                ok("changed after the proof" in str(e), f"CP10 calibrator files changed after the proof refuse "
+                                                        f"the restamp: {e}")
+        OUT, COVERAGE = saved
         ok(rec.get("identical") is True and rec.get("cases", 0) > 0,
            f"CP5 the committed proof says identical ({rec.get('identical_cases')}/{rec.get('cases')} cases)")
         cov = yaml.safe_load(open(COVERAGE))

@@ -150,6 +150,8 @@ by birth cohort, an outbreak's final size), the engine is
     `immunity`, `susceptible`, `attack_rate` or `outcome:<o>`.
   - Each source declares a frame, bias mechanisms (or `{none: reason}`) and a noise model: binomial or
     beta-binomial for shares, Poisson or negative binomial for counts.
+  - A per-unit attribute needs `scale` (`linear`, or `log` where the attribute is exp(z)); its `range` and prior
+    are on that scale.
   - A parameter the data do not inform, such as a declared R0 range, may be calibrated with that range
     as its prior. It is then classed prior-dominated and gets its prior_range test.
 

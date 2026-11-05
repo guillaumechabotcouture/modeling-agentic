@@ -108,6 +108,11 @@ def problems(spec, card, pnames) -> list[str]:
     attr = cal.get("attribute")
     if attr is not None and attr not in card.unit_attributes:
         bad.append(f"calibration.attribute: {attr} is not declared by the engine")
+    if attr is not None and cal.get("scale") not in ("log", "linear"):
+        # measles run 3: an attribute declared on its natural scale ([0.6, 1.2]) was read on the default log scale
+        # (exp(z): 1.8-3.3), every coverage clipped at 1 and the survey likelihood went flat. The scale is declared.
+        bad.append("calibration.scale: declare log or linear for the attribute: the range and the prior are on that "
+                   "scale (log: the attribute is exp(z))")
     for p in cal["parameters"]:
         if p not in pnames:
             bad.append(f"calibration.parameters: {p} is not an engine parameter")
@@ -269,7 +274,14 @@ class ObservedProblem:
         if self.state_only:
             for i, u, k, th, us, p in jobs:
                 st = self.eng.initial_state(th, us, p)
-                res[i][(u, k)] = (np.asarray(st["N"], float), np.asarray(st["s_start"], float), None)
+                # Codex r2 P1-1: one population mapping on every path (the aggregate's group_sizes), the engine's own
+                # group sizes giving only the shares within each population band
+                from toolkit.analysis.model import group_sizes
+                Ne = np.asarray(st["N"], float)
+                sh = {g: float(n) / float(Ne.sum()) for g, n in zip(self.groups, Ne)}
+                gsz = group_sizes({"meta": {"age_shares": sh}}, self.pops, self.unit_rows[u])
+                res[i][(u, k)] = (np.asarray([float(gsz.get(g, 0.0)) for g in self.groups]),
+                                  np.asarray(st["s_start"], float), None)
             return [r if ok[i] else None for i, r in enumerate(res)]
         outs = self._run([j[3] for j in jobs], [j[4] for j in jobs], [j[5] for j in jobs])
         for (i, u, k, th, us, p), o in zip(jobs, outs):
@@ -373,7 +385,9 @@ def _fit_row(E, r, e) -> dict:
         row.update(expected=float(e) * r["n"], expected_share=float(e), observed_share=r["observed"] / r["n"],
                    variance=r["n"] * float(e) * (1.0 - float(e)) * de)
     else:
-        row.update(expected=float(e), variance=float(e))
+        k = E.sources[r["source"]].noise.get("dispersion")
+        row.update(expected=float(e), variance=float(e) + (float(e) ** 2 / float(k) if m == "negbin" else 0.0),
+                   **({"dispersion": float(k)} if m == "negbin" else {}))
     return row
 
 
@@ -421,7 +435,11 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
             start = _scan_start(P)
             scan_failed, E.failed = E.failed, 0
         xh, conv, msg = C._map_point(P, start)
+        if not conv:          # Codex r2 P1-2: one restart from the point reached; a mode that still fails is refused
+            xh, conv, msg = C._map_point(P, xh)
         refuse_failures("while finding the posterior mode")
+        if not conv:
+            raise C.CalibrationRefused("posterior_mode", f"the posterior mode search did not converge ({msg})")
     else:                                # every parameter fixed (a prior_range refit of the last free one)
         xh, conv, msg = [], True, "every parameter fixed: the configuration is evaluated as given"
     x = dict(E.fixed_params, **dict(zip(P.names, (float(v) for v in xh))))
@@ -594,7 +612,8 @@ def _self_test() -> int:
         for mut, needle in ((lambda r: r["calibration"]["targets"].pop("groups"), "groups: required"),
                             (lambda r: r["calibration"]["priors"].pop("coverage_scale"), "has no prior"),
                             (lambda r: r["calibration"]["sources"][0].update(noise={"model": "poisson"}), "noise model"),
-                            (lambda r: r["calibration"].pop("range"), "attribute and range together")):
+                            (lambda r: r["calibration"].pop("range"), "attribute and range together"),
+                            (lambda r: r["calibration"].pop("scale"), "calibration.scale: declare")):
             r3 = copy.deepcopy(sp.raw)
             mut(r3)
             e3 = schema.validate(schema.Spec(r3, d, os.path.join(d, "decision_spec.yaml")))
@@ -685,6 +704,42 @@ def _self_test() -> int:
                                                         "prior": {"dist": "uniform", "range": rg}, "source": "t"}]
         e7 = schema.validate(schema.Spec(r7, d, os.path.join(d, "decision_spec.yaml")))
         ok(any("two different priors" in x for x in e7), f"OT21 (r1 P2-16) conflicting shared priors are refused: {e7[:2]}")
+        # OT23 (r2 P1-2): a mode search that does not converge is refused
+        from toolkit.analysis import calibration as C
+        orig_map = C._map_point
+        C._map_point = lambda P, start=None: (orig_map(P, start)[0], False, "ABNORMAL (test)")
+        try:
+            fit(sp, m, fixed_params={k: v for k, v in fx.items() if k != "r0"}, sample_it=False)
+            ok(False, "OT23 (r2 P1-2) an unconverged mode is refused")
+        except C.CalibrationRefused as e:
+            ok("did not converge" in str(e), f"OT23 (r2 P1-2) an unconverged mode is refused: {e}")
+        finally:
+            C._map_point = orig_map
+        # OT24 (r2 P2-6): a negative-binomial count row carries its own variance
+        r8 = copy.deepcopy(sp.raw)
+        r8["calibration"]["sources"][2]["noise"] = {"model": "negbin", "dispersion": 2.0}
+        s8 = schema.Spec(r8, d, os.path.join(d, "decision_spec.yaml"))
+        f8 = fit(s8, DirectModel(s8), fixed_params=fx, sample_it=False)
+        nb = [r for r in f8["diagnostics"]["fit"] if r["noise"] == "negbin"][0]
+        ok(abs(nb["variance"] - (nb["expected"] + nb["expected"] ** 2 / 2.0)) < 1e-9,
+           f"OT24 (r2 P2-6) a negative-binomial row's variance is mu + mu^2 / k ({nb['variance']:.1f})")
+    with tempfile.TemporaryDirectory() as d:
+        # OT22 (r2 P1-1): one population mapping for state-only and run-based targets
+        sp = _toy(d, attr=True)
+        r = copy.deepcopy(sp.raw)
+        with open(os.path.join(d, "units.csv"), "w") as fh:
+            fh.write("id,pop_old,pop_c1,pop_c2,N,cov1\nu1,100000,100000,900000,500000;500000;500000,0;0.8;0.7\n"
+                     "u2,100000,500000,500000,500000;500000;500000,0;0.9;0.6\n")
+        r["decision_units"]["populations"] = {"old": {"column": "pop_old", "age_groups": ["old"]},
+                                              "c1": {"column": "pop_c1", "age_groups": ["c1"]},
+                                              "c2": {"column": "pop_c2", "age_groups": ["c2"]}}
+        r["options"]["populations"] = {"total": "pop_c1"}
+        s9 = schema.Spec(r, d, os.path.join(d, "decision_spec.yaml"))
+        E9 = ObservedProblem(s9, DirectModel(s9))
+        st = E9._states({"z:u1": np.asarray([1.0]), "z:u2": np.asarray([1.0])}, 1)[0]
+        Nm = st[("u1", "none")][0]
+        ok(E9.state_only and list(Nm) == [100000.0, 100000.0, 900000.0],
+           f"OT22 (r2 P1-1) state-only targets use the population bands' sizes, as run-based ones do ({list(Nm)})")
     with tempfile.TemporaryDirectory() as d:
         # OT15 (r1 P1-1): the whole analysis with no per-unit attribute (per-group parameters only)
         import yaml

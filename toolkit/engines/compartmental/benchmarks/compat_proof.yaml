@@ -2,7 +2,7 @@ producer: toolkit/engines/compartmental/benchmarks/compat_proof.py
 scope: every pack setting of a configuration the old pack declared, and one representative unit per coverage-pack
   configuration (all arms in one run_batch, each arm's run(), and initial_state()), seed 1
 old_ref: origin/v2
-old_commit: ce79ccf2017b918f813be073651b4297c3826b2e
+old_commit: 4a4944ab312ee9deb9d20c472b09b346f3b80c9e
 old_configs:
 - single_day
 - single_week
@@ -23,7 +23,7 @@ old_configs:
 new_identity:
   name: compartmental-starsim
   version: '0.2'
-  code_sha256: f6bbe31c02573696fdc04f0b7ba7ae6edd3ee2e9532754fc63881270a909782f
+  code_sha256: 289e4fa029931a1196942fff0946aa2bd9ee289023a9891e94d69ffdbedc7f91
   params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
   config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
 old_coverage_identity:
@@ -62,6 +62,21 @@ calibrator_code:
       allowed_changes: []
       ok: true
   ok: true
+old_row_code_sha256:
+  SB1: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB2a: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB2a_neg: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB2b: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB2c: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB3a: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB3b_admin_truth: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB3b_sero_truth: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB3c: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+  SB5: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
+new_calibrator_file_sha256:
+  toolkit/analysis/calibration.py: edb3dd13f38aee21b1e29e70a355faaea2d560b5cedbc783a4fc6a51b703a131
+  toolkit/analysis/observation.py: ae53f8fbe4056987d6e018b957b58cb79da2879ec09f22557d20b94d95cc1cb3
+  toolkit/engines/compartmental/benchmarks/oracles.py: db73e3264b4f4126e606d5ae8b0a92f05bc8b7aa6cb6f3daf4c85148cf1f2c26
 digests:
   asym5#seed1:
     old: c2561f0a967530643cb35f6c38ec67813588e835da1667aa85f255e7508c76a7
