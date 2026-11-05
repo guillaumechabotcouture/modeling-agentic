@@ -649,6 +649,58 @@ def _synthetic(r0=1.8, rho=0.1, n=30, N=1e5, seed_share=3e-4, gi=(0.5, 0.5), k=5
     return [int(x) for x in rng.poisson(rng.gamma(k, mu / k))]
 
 
+def _self_test_codex_r1(ok, rows) -> None:
+    """Codex review round 1 (failing first): delay convolution with the seed, invalid means, output classes that a
+    narrow prior can set, benchmark acceptance, endpoint fits, and the contract reading the automatic tests."""
+    import tempfile
+    import yaml
+    from toolkit.spec import estimates as ES, schema
+
+    def safe(fn):
+        try:
+            return fn(), None
+        except Exception as e:  # noqa: BLE001 -- a missing function is a failing case
+            return None, f"{type(e).__name__}: {e}"
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        sp = ES.toy_dir(d, rows=rows)
+        raw = yaml.safe_load(open(sp))
+        raw["observations"]["sources"][0]["delay"] = {"pmf": [0.5, 0.5], "source": "toy"}
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        s = schema.load(sp)
+        E = EstimatesProblem(s, s.engine())
+        V = {"r0": np.array([1.8]), "seed": np.array([1e-3]), "reporting": np.array([1.0]), "k": np.array([50.0])}
+        outs = E.run(V, 1)
+        mu = E.expected(outs, V)[0]
+        inc0 = outs[0].meta["incidence"][0] * E.population
+        ok(abs(mu[0] - (0.5 * 1e-3 * E.population + 0.5 * inc0)) < 1e-6 * mu[0],
+           f"AE13 (Codex r1-5) the delay convolution includes the seed infections before the horizon "
+           f"({mu[0]:.4g} vs {0.5 * 1e-3 * E.population + 0.5 * inc0:.4g})")
+        V2 = dict(V, reporting=np.array([-0.1]))
+        ll, _ = E.loglik(V2)
+        ok(not np.isfinite(ll[0]), f"AE14 (Codex r1-6) a negative expected count gets no likelihood (ll {ll[0]})")
+    c, err = safe(lambda: classify_output(np.full(200, 1.0) + 1e-3 * np.arange(200) / 200, np.linspace(0.9, 1.1, 400),
+                                          {"r0": 0.01}, 0.1, 0.1))
+    ok(c == "set_by_declared_ranges", f"AE15 (Codex r1-2) an output the data hardly contract (its posterior as wide as "
+                                      f"under the priors) is not 'determined by the data': {c or err}")
+    c, err = safe(lambda: classify_output(np.linspace(0.99, 1.01, 200), np.linspace(0.0, 2.0, 400), {"r0": 0.01},
+                                          0.1, 0.1))
+    ok(c == "determined_by_data", f"AE15b a contracted output with no dependence is determined by the data: {c or err}")
+    from toolkit.engines.renewal.engine import RenewalEngine
+    _, err = safe(lambda: benchmark_acceptance(RenewalEngine(generation_interval=[0.5, 0.5], results_path=None)))
+    ok(err is not None, f"AE17 (Codex r1-12) an engine without verified benchmark results is refused: {err}")
+    lab, err = safe(lambda: benchmark_acceptance(RenewalEngine(generation_interval=[0.5, 0.5])))
+    ok(err is None and "validated" in str(lab), f"AE17c the shipped results are accepted with their label: {lab or err}")
+    from toolkit.analysis import contract
+    bad, err = safe(lambda: contract.estimates_test_findings("analysis/estimates.yaml", {"decision_tests": [
+        {"id": "prior_range_x", "status": "not_assessable", "ends": [{"value": 1, "refused": "posterior_ess"}]}]}))
+    ok(bool(bad), f"AE18 (Codex r1-7) the contract reports an automatic test that could not be run: {bad or err}")
+    P = C.Problem(["x"], {"x": C.Prior("x", "uniform", 0.0, 1.0)},
+                  lambda X: (-((X["x"] - 0.3) ** 2) / 0.001, {}))
+    m, err = safe(lambda: max_loglik(P, np.array([0.6])))
+    ok(m is not None and m > -1e-6, f"AE19 (Codex r1-11) endpoint fits use the optimised likelihood maximum: {m or err}")
+
+
 def _self_test() -> int:
     import tempfile
     import yaml
@@ -706,6 +758,12 @@ def _self_test() -> int:
         cal = yaml.safe_load(open(os.path.join(d, "analysis", "calibration.yaml")))["data"]
         ok(bool(_posterior_provenance("analysis/calibration.yaml", cal, doc["data"])),
            "AE9 a draw that is not a row of the canonical sample fails the provenance check")
+        ins = yaml.safe_load(open(os.path.join(d, "analysis", "estimates.yaml")))["inputs"]
+        ok(any(k.endswith("gi.csv") for k in ins), f"AE16 (Codex r1-9) the generation-interval file is an input of "
+                                                     f"the estimates artifact: {sorted(ins)}")
+        txt = open(os.path.join(d, "results.md")).read()
+        ok("validated against" in txt, "AE17b (Codex r1-12) results.md carries the engine's validation label")
+    _self_test_codex_r1(ok, rows)
         # the reporting fraction and s0 trade off: with s0 unknown, reporting is not determined
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)

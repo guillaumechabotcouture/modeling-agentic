@@ -547,6 +547,11 @@ def _self_test() -> int:
     ok(max(errs) < 0.02 and inv < 2e-3,
        f"K10 Cori recovers the known R_t of a simulated series (worst rel {max(errs):.3f}) and, up to its gamma prior, "
        f"does not depend on a constant reporting fraction (worst rel {inv:.1e} at 1/10 reporting)")
+    ok(cr["t"][0] == len(w) + 3 - 1, f"K10b (Codex r1-13) Cori's first window is the first with full generation "
+                                     f"history (ends at L + tau - 1 = {len(w) + 2}; got {cr['t'][0]})")
+    ob = e.run({"r0": 1.7}, u, Package("none", {}), h, 1)
+    ok(ob.meta.get("incidence_before") == [2e-4], f"K10c (Codex r1-5) the seed infections before the horizon are in "
+                                                 f"the outputs (meta incidence_before {ob.meta.get('incidence_before')})")
     # K11 hooks
     hd = Horizon(2025.0, 2026.0, (2025.0, 2026.0), {})
     sc = hook_schedule(ek, {"effect:ctl": 0.4}, u, Package("c", {"ctl": 1}), hd)

@@ -421,6 +421,31 @@ def _self_test() -> int:
             "ES10 a target that names no declared source is refused")
         mut(lambda r: r["observations"]["sources"][0].update(delay={"pmf": [0.5, 0.4], "source": "x"}), "delay",
             "ES11 a reporting delay that does not sum to 1 is refused")
+        # ---- Codex r1
+        mut(lambda r: r["engine"]["config"].update(generation_interval={"dt": "week", "w": [1.0]}), "dynamics",
+            "ES14 (Codex r1-1) an engine configured with another generation interval than dynamics declares is refused")
+        mut(lambda r: r["observations"]["sources"][0]["noise"]["dispersion"].update(param="reporting"),
+            "parameter_name_collision", "ES15 (Codex r1-3) two observation parameters with one name are refused")
+        mut(lambda r: r["observations"]["sources"][0]["bias"][0].update(param="s0"), "parameter_name_collision",
+            "ES15b (Codex r1-3) an observation parameter named like an engine unit attribute is refused")
+        mut(lambda r: r["observations"]["sources"][0]["frame"].update(excluded=[{
+            "who": "x", "param": "rel", "share": 0.1, "relative_value_prior": {"dist": "uniform", "range": [0.1, 0.9]},
+            "source": "x"}]), "not supported", "ES16 (Codex r1-4) a frame exclusion (not modelled here) is refused")
+        mut(lambda r: r["observations"]["sources"][0]["bias"][0]["prior"].update(dist="uniform", range=[-1.0, 0.5]),
+            "support", "ES17 (Codex r1-6) a reporting-fraction prior outside [0, 1] is refused")
+        mut(lambda r: r["analysis"].update(decision_tests=[{"id": "t", "type": "envelope", "text": "x"}]),
+            "decision_tests", "ES18 (Codex r1-7) declared decision tests (not run for estimates) are refused")
+        mut(lambda r: r["uncertainty"].update(excluded=[{"parameter": "reporting", "reason": "x"}]), "excluded",
+            "ES18b (Codex r1-8) uncertainty exclusions (not applied by the estimates path) are refused")
+
+        def frac(r):
+            open(os.path.join(d, "data", "cases2.csv"), "w").write("week,cases\n" + "".join(
+                f"{i + 1.75},{v}\n" for i, v in enumerate([3, 5, 9])))
+            r["calibration"]["targets"]["csv"] = "data/cases2.csv"
+        mut(frac, "integer", "ES19 (Codex r1-10) fractional target steps are refused, not truncated")
+        open(os.path.join(d, "data", "gi2.csv"), "w").write("lag,p\n1.5,0.5\n2.5,0.5\n")
+        mut(lambda r: r["dynamics"]["generation_interval"].update(csv="data/gi2.csv"), "integer",
+            "ES19b (Codex r1-10) fractional generation-interval lags are refused")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))

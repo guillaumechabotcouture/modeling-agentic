@@ -165,6 +165,24 @@ def probe_cori_coverage(make_engine, config: str, r_before: float, r_after: floa
     return hit / tot
 
 
+def probe_cori_quantile_error(make_engine) -> float:
+    """RW5d: the estimator's interval for one window against a hand computation of the gamma posterior (shape
+    a + sum of cases in the window, rate 1/b + sum of the infectiousness Lambda_s = sum_k w_k I_{s-k}); the largest
+    absolute difference of mean, lower and upper bound."""
+    from scipy import stats
+    from toolkit.engines.renewal.engine import cori_rt
+    w = [0.2, 0.4, 0.25, 0.15]
+    y = [10, 14, 20, 26, 33, 41, 50, 58, 66]
+    t, tau, a, b = 8, 3, 1.0, 5.0
+    lam = [sum(w[k - 1] * y[s - k] for k in range(1, 5) if s - k >= 0) for s in range(len(y))]
+    shape = a + sum(y[t - tau + 1:t + 1])
+    rate = 1 / b + sum(lam[t - tau + 1:t + 1])
+    ref = (shape / rate, stats.gamma.ppf(0.025, shape, scale=1 / rate), stats.gamma.ppf(0.975, shape, scale=1 / rate))
+    cr = cori_rt(y, w, tau=tau, a=a, b=b)
+    i = cr["t"].index(t)
+    return float(max(abs(cr["mean"][i] - ref[0]), abs(cr["lo"][i] - ref[1]), abs(cr["hi"][i] - ref[2])))
+
+
 def probe_refit_r0(make_engine, config: str, r0: float, s0: float, reporting: float, seed: float, n: int,
                    N: float = 1.5e6, what: str = "r0") -> float:
     """RW6: expected weekly reported counts from the reference implementation (R0, s0 known, reporting fraction),

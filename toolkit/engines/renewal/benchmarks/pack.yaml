@@ -129,6 +129,14 @@ benchmarks:
      estimand: {type: value, compare: le, a: 0.90,
                 b: {probe: cori_coverage, args: {config: week4_piece, r_before: 1.6, r_after: 0.8, n: 40, switch: 20,
                     reporting: 0.1, replicates: 200, seed: 7}}, tol: {abs: 0.0}}}
+  - {id: RW5c, metric: "same, and the intervals are not inflated: coverage at most 0.99 (Codex r1-14)",
+     source: "Cori et al. (2013) Am J Epidemiol 178:1505",
+     estimand: {type: value, compare: le,
+                a: {probe: cori_coverage, args: {config: week4_piece, r_before: 1.6, r_after: 0.8, n: 40, switch: 20,
+                    reporting: 0.1, replicates: 200, seed: 7}}, b: 0.99, tol: {abs: 0.0}}}
+  - {id: RW5d, metric: "Cori gamma posterior quantiles equal scipy's for a hand-computed window (shape a + sum I,
+       rate 1/b + sum Lambda)", source: "Cori et al. (2013) Am J Epidemiol 178:1505, web appendix",
+     estimand: {type: value, a: {probe: cori_quantile_error, args: {}}, b: 0.0, tol: {abs: 1.0e-12}}}
   # ---------------------------------------------------------------- recovery of a known R0 from simulated data
   - {id: RW6a, metric: "refit of noise-free reported counts from the reference implementation: R0 = 1.65 recovered",
      source: "the pack's reference implementation",
