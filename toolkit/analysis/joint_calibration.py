@@ -354,19 +354,28 @@ class Simulator:
 
     def _shared(self, pts, six, out):
         """Benchmark targets at each point's shared values: the pack's settings re-calibrated there, then each
-        benchmark evaluated (the runner's own process pool)."""
+        benchmark evaluated by the benchmark runner, in a child process of its own (its process pool is never forked
+        from this process, whose other thread drives the unit batch)."""
+        import subprocess
+        import tempfile
         from toolkit.analysis.batch import fitted_ranges
-        from toolkit.engines import benchmark as BM
-        pack, _, _ = _benchmarks(self.eng)
-        byid = {b["id"]: b for b in pack["benchmarks"]}
         fitted = {k: v[2] for k, v in fitted_ranges(self.eng).items()}
-        want = [t for t in self.spec.raw["calibration"][FIELD]["targets"] if t["kind"] == "benchmark"]
-        settings = sorted({pack["arms"][a]["setting"] for t in want for a in BM._arms_of(byid[t["id"]]["estimand"])})
-        for n in six:
-            R = BM.Runner(pack, self.eng, workers=int(self.kw.get("bench_workers", self.kw.get("max_workers", 2))),
-                          base_params={k: v for k, v in self._theta(pts[n]["theta"]).items() if k not in fitted})
-            R.calibrate_settings(fitted, settings)
-            out[n] = {f"bench.{t['id']}": float(R.evaluate(byid[t["id"]], fitted)["computed"]) for t in want}
+        want = [t["id"] for t in self.spec.raw["calibration"][FIELD]["targets"] if t["kind"] == "benchmark"]
+        with tempfile.TemporaryDirectory(prefix="jc-bench-") as d:
+            for n in six:
+                job = {"engine": self.spec.raw["engine"], "targets": want, "fitted": fitted,
+                       "base_params": {k: v for k, v in self._theta(pts[n]["theta"]).items() if k not in fitted},
+                       "workers": int(self.kw.get("bench_workers", self.kw.get("max_workers", 2)))}
+                fi, fo = os.path.join(d, f"in{n}.json"), os.path.join(d, f"out{n}.json")
+                with open(fi, "w") as f:
+                    json.dump(job, f)
+                p = subprocess.run([sys.executable, "-W", "ignore", os.path.abspath(__file__), "--bench-eval", fi, fo],
+                                   cwd=ROOT, capture_output=True, text=True)
+                if p.returncode or not os.path.exists(fo):
+                    raise HM.CalibrationInputError([f"benchmark evaluation failed at shared point {n}: "
+                                                    f"{(p.stderr or p.stdout)[-800:]}"])
+                with open(fo) as f:
+                    out[n] = {f"bench.{k}": float(v) for k, v in json.load(f).items()}
 
     def __call__(self, pts):
         from toolkit.analysis import batch as Bt
@@ -490,7 +499,33 @@ def summary(rep) -> str:
     return "\n".join(L)
 
 
+def bench_eval(fi, fo) -> int:
+    """The child process of Simulator._shared: {benchmark id: computed value} at the given parameters."""
+    from toolkit.engines import benchmark as BM
+    from toolkit.spec.schema import load_engine
+    with open(fi) as f:
+        job = json.load(f)
+    eng = load_engine(job["engine"])
+    pack, fit, why = _benchmarks(eng)
+    if pack is None:
+        raise SystemExit(f"no benchmark pack: {why}")
+    bad = [t for t in job["targets"] if t not in fit]
+    if bad:                                   # held out: never evaluated for a fit (fail closed here too)
+        raise SystemExit(f"not fit targets of the pack: {bad}")
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    settings = sorted({pack["arms"][a]["setting"] for t in job["targets"] for a in BM._arms_of(byid[t]["estimand"])})
+    R = BM.Runner(pack, eng, workers=int(job["workers"]), base_params=job["base_params"])
+    R.calibrate_settings(job["fitted"], settings)
+    res = {t: float(R.evaluate(byid[t], job["fitted"])["computed"]) for t in job["targets"]}
+    with open(fo, "w") as f:
+        json.dump(res, f)
+    return 0
+
+
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--bench-eval"]:
+        return bench_eval(argv[1], argv[2])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--spec", default="decision_spec.yaml")
