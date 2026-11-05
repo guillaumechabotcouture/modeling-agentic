@@ -300,12 +300,27 @@ VALID_TARGET_STAGE = {"PLAN", "DATA", "MODEL", "ANALYZE", "WRITE"}
 
 
 class SchemaError(Exception):
-    pass
+    """A critique file the gate refuses. `errors` lists every problem found in the file (the
+    message is the first): a schema repair carries all of them at once, so a critic that fixes
+    exactly what it is told converges in one pass (v2 eval runs 2026-11-05, T74-T75)."""
+
+    def __init__(self, msg: str, errors: list[str] | None = None):
+        super().__init__(msg)
+        self.errors = list(errors) if errors else [msg]
 
 
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise SchemaError(msg)
+
+
+class _Errors(list):
+    """Collects schema errors in check order; `need` records one and returns the condition."""
+
+    def need(self, cond: bool, msg: str) -> bool:
+        if not cond:
+            self.append(msg)
+        return bool(cond)
 
 
 def _load(path: str) -> dict:
@@ -320,121 +335,142 @@ def _load(path: str) -> dict:
     return doc
 
 
-def _validate_blocker(b: Any, ctx: str, prefix: str) -> None:
-    _require(isinstance(b, dict), f"{ctx}: each blocker must be a mapping")
+def _validate_blocker(b: Any, ctx: str, prefix: str, errs: _Errors) -> bool:
+    """Record every problem with one blocker; True when it is well formed."""
+    n0 = len(errs)
+    if not errs.need(isinstance(b, dict), f"{ctx}: each blocker must be a mapping"):
+        return False
     for key in ("id", "severity", "category", "target_stage",
                 "first_seen_round", "claim", "evidence", "fix_requires",
                 "resolved"):
-        _require(key in b, f"{ctx}: blocker missing required key '{key}'")
-    _require(isinstance(b["id"], str) and b["id"].startswith(prefix),
-             f"{ctx}: blocker id '{b.get('id')}' must start with '{prefix}'")
-    _require(b["severity"] in VALID_SEVERITY,
-             f"{ctx}: blocker {b['id']} severity must be one of {VALID_SEVERITY}")
-    _require(b["category"] in VALID_CATEGORY,
-             f"{ctx}: blocker {b['id']} category must be one of {VALID_CATEGORY}")
-    _require(b["target_stage"] in VALID_TARGET_STAGE,
-             f"{ctx}: blocker {b['id']} target_stage must be one of {VALID_TARGET_STAGE}")
-    _require(isinstance(b["first_seen_round"], int) and b["first_seen_round"] >= 1,
-             f"{ctx}: blocker {b['id']} first_seen_round must be int >= 1")
-    _require(isinstance(b["resolved"], bool),
-             f"{ctx}: blocker {b['id']} resolved must be bool")
-    if b["resolved"]:
+        errs.need(key in b, f"{ctx}: blocker missing required key '{key}'")
+    bid = b.get("id")
+    if "id" in b:
+        errs.need(isinstance(bid, str) and bid.startswith(prefix),
+                  f"{ctx}: blocker id '{bid}' must start with '{prefix}'")
+    if "severity" in b:
+        errs.need(b["severity"] in VALID_SEVERITY,
+                  f"{ctx}: blocker {bid} severity must be one of {VALID_SEVERITY}")
+    if "category" in b:
+        errs.need(b["category"] in VALID_CATEGORY,
+                  f"{ctx}: blocker {bid} category must be one of {VALID_CATEGORY}")
+    if "target_stage" in b:
+        errs.need(b["target_stage"] in VALID_TARGET_STAGE,
+                  f"{ctx}: blocker {bid} target_stage must be one of {VALID_TARGET_STAGE}")
+    if "first_seen_round" in b:
+        errs.need(isinstance(b["first_seen_round"], int) and b["first_seen_round"] >= 1,
+                  f"{ctx}: blocker {bid} first_seen_round must be int >= 1")
+    if "resolved" in b and errs.need(isinstance(b["resolved"], bool),
+                                     f"{ctx}: blocker {bid} resolved must be bool") and b["resolved"]:
         for key in ("resolved_in_round", "resolved_evidence"):
-            _require(key in b,
-                     f"{ctx}: resolved blocker {b['id']} missing '{key}'")
+            errs.need(key in b, f"{ctx}: resolved blocker {bid} missing '{key}'")
+    return len(errs) == n0
 
 
-def _validate_structural(sm: Any, ctx: str, reviewer: str) -> None:
-    _require(isinstance(sm, dict),
-             f"{ctx}: structural_mismatch must be a mapping")
-    _require("detected" in sm and isinstance(sm["detected"], bool),
-             f"{ctx}: structural_mismatch.detected must be bool")
+def _validate_structural(sm: Any, ctx: str, reviewer: str, errs: _Errors) -> None:
+    if not errs.need(isinstance(sm, dict), f"{ctx}: structural_mismatch must be a mapping"):
+        return
+    if not errs.need("detected" in sm and isinstance(sm["detected"], bool),
+                     f"{ctx}: structural_mismatch.detected must be bool"):
+        return
     if reviewer == "critique-presentation":
-        _require(sm["detected"] is False,
-                 f"{ctx}: critique-presentation must not set structural_mismatch.detected=true; "
-                 f"use a HIGH blocker instead")
+        errs.need(sm["detected"] is False,
+                  f"{ctx}: critique-presentation must not set structural_mismatch.detected=true; "
+                  f"use a HIGH blocker instead")
     if sm["detected"]:
         for key in ("description", "evidence_files", "fix_requires"):
-            _require(key in sm,
-                     f"{ctx}: structural_mismatch.detected=true requires '{key}'")
-        _require(sm["fix_requires"] == "RETHINK",
-                 f"{ctx}: structural_mismatch.fix_requires must be 'RETHINK'")
+            errs.need(key in sm, f"{ctx}: structural_mismatch.detected=true requires '{key}'")
+        if "fix_requires" in sm:
+            errs.need(sm["fix_requires"] == "RETHINK",
+                      f"{ctx}: structural_mismatch.fix_requires must be 'RETHINK'")
 
 
 def _validate_carried_forward(cf: Any, ctx: str, current_round: int,
-                              blockers: list[dict]) -> None:
-    _require(isinstance(cf, list),
-             f"{ctx}: carried_forward must be a list")
-    blocker_ids = {b["id"]: b for b in blockers}
+                              blockers: list[dict], errs: _Errors) -> None:
+    if not errs.need(isinstance(cf, list), f"{ctx}: carried_forward must be a list"):
+        return
+    blocker_ids = {b["id"]: b for b in blockers
+                   if isinstance(b, dict) and isinstance(b.get("id"), str)}
     for entry in cf:
-        _require(isinstance(entry, dict),
-                 f"{ctx}: each carried_forward entry must be a mapping")
+        if not errs.need(isinstance(entry, dict),
+                         f"{ctx}: each carried_forward entry must be a mapping "
+                         f"{{id, prior_round, still_present, notes}}, got {entry!r}"[:300]):
+            continue
         for key in ("id", "prior_round", "still_present", "notes"):
-            _require(key in entry,
-                     f"{ctx}: carried_forward entry missing '{key}'")
-        _require(isinstance(entry["still_present"], bool),
-                 f"{ctx}: carried_forward.still_present must be bool")
+            errs.need(key in entry, f"{ctx}: carried_forward entry missing '{key}'")
+        if "still_present" not in entry or not errs.need(
+                isinstance(entry["still_present"], bool),
+                f"{ctx}: carried_forward.still_present must be bool"):
+            continue
         # cross-check with blockers
-        bid = entry["id"]
+        bid = entry.get("id")
+        b = blocker_ids.get(bid) if isinstance(bid, str) else None
         if entry["still_present"]:
-            _require(bid in blocker_ids and blocker_ids[bid]["resolved"] is False,
-                     f"{ctx}: carried_forward {bid} still_present=true, "
-                     f"but no matching unresolved blocker in current blockers list")
+            errs.need(b is not None and b.get("resolved") is False,
+                      f"{ctx}: carried_forward {bid} still_present=true, "
+                      f"but no matching unresolved blocker in current blockers list")
         else:
-            _require(bid in blocker_ids and blocker_ids[bid]["resolved"] is True,
-                     f"{ctx}: carried_forward {bid} still_present=false, "
-                     f"but no matching resolved blocker in current blockers list")
+            errs.need(b is not None and b.get("resolved") is True,
+                      f"{ctx}: carried_forward {bid} still_present=false, "
+                      f"but no matching resolved blocker in current blockers list")
 
 
 def validate_critique(path: str, expected_reviewer: str,
                       current_round: int) -> dict:
+    """The parsed critique, or SchemaError listing every problem in the file (`.errors`)."""
     doc = _load(path)
     ctx = os.path.basename(path)
     prefix = PREFIXES[expected_reviewer]
+    errs = _Errors()
 
-    _require(doc.get("reviewer") == expected_reviewer,
-             f"{ctx}: reviewer must be '{expected_reviewer}', "
-             f"got {doc.get('reviewer')!r}")
-    _require(doc.get("round") == current_round,
-             f"{ctx}: round must be {current_round}, got {doc.get('round')!r}")
+    errs.need(doc.get("reviewer") == expected_reviewer,
+              f"{ctx}: reviewer must be '{expected_reviewer}', "
+              f"got {doc.get('reviewer')!r}")
+    errs.need(doc.get("round") == current_round,
+              f"{ctx}: round must be {current_round}, got {doc.get('round')!r}")
     valid_verdicts = (VALID_VERDICT | {"UNAVAILABLE"}
                       if expected_reviewer in OPTIONAL_REVIEWERS else VALID_VERDICT)
-    _require(doc.get("verdict") in valid_verdicts,
-             f"{ctx}: verdict must be one of {valid_verdicts}")
+    errs.need(doc.get("verdict") in valid_verdicts,
+              f"{ctx}: verdict must be one of {valid_verdicts}")
     if doc.get("verdict") == "UNAVAILABLE":
-        _require(isinstance(doc.get("unavailable_reason"), str)
-                 and doc["unavailable_reason"].strip(),
-                 f"{ctx}: verdict UNAVAILABLE requires a non-empty "
-                 f"unavailable_reason")
+        errs.need(isinstance(doc.get("unavailable_reason"), str)
+                  and doc["unavailable_reason"].strip(),
+                  f"{ctx}: verdict UNAVAILABLE requires a non-empty "
+                  f"unavailable_reason")
 
-    _validate_structural(doc.get("structural_mismatch"), ctx, expected_reviewer)
+    _validate_structural(doc.get("structural_mismatch"), ctx, expected_reviewer, errs)
 
     # Phase 21 β: `blockers:` is required (an omitted list used to read as
     # "no blockers" → ACCEPT), and a REVISE verdict must name at least one
     # unresolved blocker — REVISE with nothing open is self-contradictory.
-    _require("blockers" in doc, f"{ctx}: missing required key 'blockers' "
-                                f"(use `blockers: []` for none)")
-    blockers = doc["blockers"]
-    _require(isinstance(blockers, list), f"{ctx}: blockers must be a list")
-    seen_ids = set()
-    for b in blockers:
-        _validate_blocker(b, ctx, prefix)
-        _require(b["id"] not in seen_ids, f"{ctx}: duplicate blocker id {b['id']}")
-        seen_ids.add(b["id"])
-
-    if doc.get("verdict") == "REVISE":
-        _require(any(isinstance(b, dict) and b.get("resolved") is False
-                     for b in blockers),
-                 f"{ctx}: verdict REVISE requires at least one unresolved "
-                 f"blocker")
+    blockers = doc.get("blockers")
+    if errs.need("blockers" in doc, f"{ctx}: missing required key 'blockers' "
+                                    f"(use `blockers: []` for none)") \
+            and errs.need(isinstance(blockers, list), f"{ctx}: blockers must be a list"):
+        seen_ids = set()
+        for b in blockers:
+            _validate_blocker(b, ctx, prefix, errs)
+            bid = b.get("id") if isinstance(b, dict) else None
+            if isinstance(bid, str):
+                errs.need(bid not in seen_ids, f"{ctx}: duplicate blocker id {bid}")
+                seen_ids.add(bid)
+        if doc.get("verdict") == "REVISE":
+            errs.need(any(isinstance(b, dict) and b.get("resolved") is False
+                          for b in blockers),
+                      f"{ctx}: verdict REVISE requires at least one unresolved "
+                      f"blocker")
+    else:
+        blockers = []
 
     if current_round == 1:
-        _require(doc.get("carried_forward", []) == [],
-                 f"{ctx}: carried_forward must be [] on round 1")
+        errs.need(doc.get("carried_forward", []) == [],
+                  f"{ctx}: carried_forward must be [] on round 1")
     else:
         _validate_carried_forward(doc.get("carried_forward"), ctx,
-                                  current_round, blockers)
+                                  current_round, blockers, errs)
 
+    if errs:
+        raise SchemaError(errs[0], errs)
     return doc
 
 

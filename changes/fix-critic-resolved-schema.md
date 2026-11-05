@@ -1,0 +1,13 @@
+---
+phase: "v2"
+commit: "CS"
+status_group: "In review (v2 core)"
+---
+
+## Changelog
+
+**A critique schema repair carries every error in the file at once.** Two v2 eval runs on 2026-11-05 ended `completed_gate_error` with no gate decision. In round 2 the critics marked blockers `resolved: true` without `resolved_in_round` or `resolved_evidence` and wrote `carried_forward` as a list of ids. `validate_critique` stopped at the first problem, so each repair told the critic about one error. The critic fixed exactly that one, and the next one surfaced (`resolved_in_round`, then `resolved_evidence`, then the `carried_forward` shape). The two allowed repairs ran out with errors still in the file. Now `validate_critique` collects every schema error in a file. `SchemaError.errors` lists them, and the message is still the first one, so other callers see no change. `v2_gate` passes all of them to the repair, and it also checks the `done_when` tests of a refused file's blockers in the same pass. The critique prompt now states that a resolved blocker needs `resolved_in_round: <this round>` and `resolved_evidence`, and that from round 2 `carried_forward` holds one `{id, prior_round, still_present, notes}` mapping per blocker of the previous round. It also says the repair list is every error in the file. The schema is unchanged and still fails closed: a file with any error gives no verdict, and errors that persist after the repairs still end `completed_gate_error`. Resolution stays checked by the harness: a resolved blocker's frozen `done_when` test is re-run at every gate (`done_when.py`). Self-tests were written first and failed before the change: SE1-SE4 (`validate_critique_yaml.py`), T74-T75 (`stage_machine.py`; T75 uses a critic that fixes only the errors it is told, as the real ones did, and before the fix it ended `completed_gate_error`) and S17 (`v2_sdk_tasks.py`). No cloud run.
+
+## Status
+
+- **CS:** critique schema repairs carry every error in a file, and the critique prompt states the resolved-blocker and `carried_forward` requirements.

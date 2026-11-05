@@ -344,7 +344,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     harness's checks (`extra`), and optionally spec-compliance and registry findings."""
     import done_when
     import validate_critique_yaml as V
-    critiques, schema_errors = {}, []
+    critiques, schema_errors, refused = {}, [], {}
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -363,15 +363,26 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
         try:
             critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
         except V.SchemaError as e:
-            schema_errors.append(str(e))
+            # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
+            # blockers still have their done_when tests checked below, for the same reason.
+            schema_errors.extend(getattr(e, "errors", None) or [str(e)])
+            import yaml
+            try:
+                with open(path) as fh:
+                    raw = yaml.safe_load(fh)
+                if isinstance(raw, dict) and isinstance(raw.get("blockers"), list):
+                    refused[reviewer] = raw
+            except (OSError, ValueError, yaml.YAMLError):
+                pass
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
         # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
         # here: one that does not parse is repaired like any schema error (the T37 path).
         import done_when as DW
-        for reviewer, doc in critiques.items():
+        for reviewer, doc in list(critiques.items()) + list(refused.items()):
             for b in doc.get("blockers") or []:
-                if b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
+                if not isinstance(b, dict) or b.get("resolved") is True \
+                        or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
                     continue
                 probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
                 if probs:
