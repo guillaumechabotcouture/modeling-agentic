@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Malaria engine behind the `Engine` contract (toolkit/engines/contract.py).
 
-    python3 -m toolkit.engines.malaria.engine --self-test
+    python3 -m toolkit.engines.malaria.engine --self-test     # M1-M21 and the v0.5-v0.7 sections
+    python3 toolkit/engines/malaria/selftest_late.py --self-test  # the v0.8-v0.10 sections (a second process)
     python3 -m toolkit.engines.malaria.engine --card [path]    # writes card.yaml (after the pack is run)
 
 Our own Starsim code (model.py, vector.py). Fitted engine-level parameters come from the
@@ -980,7 +981,16 @@ def to_jsonable(o: Outcomes) -> dict:
     return {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers, "meta": o.meta}
 
 
+def _self_test_unit() -> UnitSpec:
+    """The unit every self-test section starts from (here and in selftest_late.py)."""
+    return UnitSpec("t", {"m0": 8.0, "season": [1.0] * 12, "resistance": 0.5, "species": {"gambiae": 0.7, "arabiensis": 0.3},
+                          "cm_ft": 0.3, "itn_use": 0.6, "itn_hist_years": [2016.3], "campaign_year": 2018.1})
+
+
 def _self_test() -> int:
+    """Cases M1-M21 and the v0.5-v0.7 sections. The v0.8-v0.10 sections run in a second process,
+    `python3 toolkit/engines/malaria/selftest_late.py --self-test`, so each module stays well inside CI's per-test
+    time limit (scripts/self_tests.py discovers and runs both)."""
     fails = []
 
     def ok(cond, msg):
@@ -990,8 +1000,7 @@ def _self_test() -> int:
 
     e = MalariaEngine()
     e_par = {"n_agents": 600, "burnin_years": 0}      # mechanism tests: no burn-in (v0.5 cases below)
-    unit = UnitSpec("t", {"m0": 8.0, "season": [1.0] * 12, "resistance": 0.5, "species": {"gambiae": 0.7, "arabiensis": 0.3},
-                          "cm_ft": 0.3, "itn_use": 0.6, "itn_hist_years": [2016.3], "campaign_year": 2018.1})
+    unit = _self_test_unit()
     h = Horizon(2015.0, 2019.0, (2018.0, 2019.0), {"pre": [2017.0, 2018.0], "post": [2018.3, 2019.0]})
 
     class Small(MalariaEngine):
@@ -1111,9 +1120,6 @@ def _self_test() -> int:
     _self_test_v05(ok, e, unit)
     _self_test_v06(ok, e, unit)
     _self_test_v07(ok, e, unit)
-    _self_test_v08(ok, e, unit)
-    _self_test_v09(ok, e, unit)
-    _self_test_v010(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -2017,6 +2023,10 @@ def _self_test_v010(ok, e, unit) -> None:
     wins = {"y14": [2014.0, 2015.0], "y15": [2015.0, 2016.0], "d": [2016.0, 2017.0]}
     attrs = dict(unit.attributes, season=season, itn_hist_years=[2014.3, 2015.2], campaign_year=2016.1, irs_month=4)
     hd = DeliveryHorizon(2014.0, 2018.0, (2016.0, 2018.0), dict(wins), delivery=(2016.0, 2017.0))
+    # the runs below use a shorter horizon (CI time): 2015 for past SMC and one delivery year, one burn-in year
+    hs = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"y15": [2015.0, 2016.0], "d": [2016.0, 2017.0]},
+                         delivery=(2016.0, 2017.0))
+    small = {"n_agents": 300, "burnin_years": 1}
     none, smc = Package("none", {}), Package("smc", {"smc": 1})
     full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
     strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
@@ -2074,9 +2084,10 @@ def _self_test_v010(ok, e, unit) -> None:
     def h2():
         uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
         u0 = UnitSpec("t", dict(attrs))
-        p = dict(base, n_agents=1500)
-        sh = e.run_series(p, uh, [none], hd, 5, ["inc_u5"])[0]
-        s0 = e.run_series(p, u0, [none], hd, 5, ["inc_u5"])[0]
+        p = {"n_agents": 1000, "burnin_years": 1}
+        # one run per unit gives the series and the outcomes (run_series reads run_batch's member loop, S7)
+        (oh,), (sh,) = e._run_members([p], [uh], [none], hs, 5, series=["inc_u5"])
+        (o0,), (s0,) = e._run_members([p], [u0], [none], hs, 5, series=["inc_u5"])
         t = np.asarray(sh["t"])
         first = 2015 + (months[0] - 1) / 12
         pre = t < first - 1e-9
@@ -2086,7 +2097,6 @@ def _self_test_v010(ok, e, unit) -> None:
         a, b = float(np.sum(np.asarray(sh["values"]["inc_u5"])[on])), float(np.sum(np.asarray(s0["values"]["inc_u5"])[on]))
         ok(a < 0.7 * b, f"H2b under-5 clinical incidence is lower in the past SMC months of 2015 ({a:.3f} vs {b:.3f} "
                         "without past SMC)")
-        oh, o0 = e.run(p, uh, none, hd, 5), e.run(p, u0, none, hd, 5)
         paid = ("nets_given", "smc_doses", "irs_sprayed")           # treated_all follows the health outcomes
         ok(oh.windows["y15"]["inc_u5_smc"] < 0.7 * o0.windows["y15"]["inc_u5_smc"]
            and all(oh.cost_drivers[k] == o0.cost_drivers[k] for k in paid) and oh.cost_drivers["smc_doses"] == 0,
@@ -2095,9 +2105,8 @@ def _self_test_v010(ok, e, unit) -> None:
     case("H2", h2)
 
     def h3():
-        small = {"n_agents": 400, "burnin_years": 2}
-        pk = [none, smc, full]
-        ref = [strip(o) for o in e.run_batch([small] * 3, UnitSpec("t", attrs), pk, hd, 5)]
+        pk = [none, full]
+        ref = [strip(o) for o in e.run_batch([small] * 2, UnitSpec("t", attrs), pk, hs, 5)]
         ref_names = None
         for extra, nm in (({"smc_hist_years": []}, "smc_hist_years []"),
                           ({"smc_hist_years": [], "smc_hist_rounds": 4}, "smc_hist_rounds without past years"),
@@ -2106,13 +2115,13 @@ def _self_test_v010(ok, e, unit) -> None:
                           ({"hist_net_by_year": "none"}, "hist_net_by_year 'none'"),
                           ({"hist_net_by_year": {2014.3: "pyr", 2015.2: "pyr"}}, "every campaign at hist_net")):
             ux = UnitSpec("t", dict(attrs, **extra))
-            got = [strip(o) for o in e.run_batch([small] * 3, ux, pk, hd, 5)]
+            got = [strip(o) for o in e.run_batch([small] * 2, ux, pk, hs, 5)]
             ok(got == ref, f"H3 ({nm}) byte-identical outcomes, cost drivers and meta to the attributes absent")
-            sim, _ = e.build_sim(small, ux, full, hd, 5)
+            sim, _ = e.build_sim(small, ux, full, hs, 5)
             sim.init()
             names = list(sim.interventions.keys())
             if ref_names is None:
-                s0, _ = e.build_sim(small, UnitSpec("t", attrs), full, hd, 5)
+                s0, _ = e.build_sim(small, UnitSpec("t", attrs), full, hs, 5)
                 s0.init()
                 ref_names = list(s0.interventions.keys())
             ok(names == ref_names, f"H3b ({nm}) the same interventions as v0.9: {names}")
@@ -2175,21 +2184,20 @@ def _self_test_v010(ok, e, unit) -> None:
     case("H5", h5)
 
     def h6():
-        small = {"n_agents": 400, "burnin_years": 2}
         uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
         ps = [dict(small, smc_pe=0.6), dict(small, smc_pe=0.9)]
-        b = e.run_batch(ps, uh, none, hd, 3)
-        solo = [e.run(q, uh, none, hd, 3) for q in ps]
+        b = e.run_batch(ps, uh, none, hs, 3)
+        solo = [e.run(q, uh, none, hs, 3) for q in ps]
         ok([o.meta["burnin_members"] for o in b] == [1, 1] and [strip(o) for o in b] == [strip(o) for o in solo],
            "H6 with past SMC, parameter sets that differ in smc_pe do not share a burn-in (it acts before the fork); "
            "each member equals its own run")
-        b0 = e.run_batch(ps, UnitSpec("t", attrs), none, hd, 3)
+        b0 = e.run_batch(ps, UnitSpec("t", attrs), none, hs, 3)
         ok([o.meta["burnin_members"] for o in b0] == [2, 2], "H6b without past SMC they still share one (v0.9)")
         ud = UnitSpec("t", dict(attrs, hist_net_by_year={2015.2: "dual"}))
         pc = [dict(small, cfp_kill=0.2), dict(small, cfp_kill=0.6)]
-        bd = e.run_batch(pc, ud, none, hd, 3)
+        bd = e.run_batch(pc, ud, none, hs, 3)
         ok([o.meta["burnin_members"] for o in bd] == [1, 1]
-           and [strip(o) for o in bd] == [strip(e.run(q, ud, none, hd, 3)) for q in pc],
+           and [strip(o) for o in bd] == [strip(e.run(q, ud, none, hs, 3)) for q in pc],
            "H6c a past dual-AI campaign from hist_net_by_year puts cfp_kill in the burn-in key, as hist_net: dual does")
     case("H6", h6)
 
@@ -2220,7 +2228,7 @@ def _self_test_v010(ok, e, unit) -> None:
                     f"H7c with past SMC, smc_months {mo} fails closed")
         # Codex r1 P2-5: year keys of mixed type are accepted by the run as by the schedule
         um = UnitSpec("t", dict(attrs, hist_net_by_year={2014.3: "pbo", "2015.2": "dual"}))
-        o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hd, 1)
+        o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hs, 1)
         ok(o.per_capita is not None, "H7d hist_net_by_year with float and string year keys runs (burn-in key)")
     case("H7", h7)
 
