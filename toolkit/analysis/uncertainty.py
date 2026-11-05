@@ -219,6 +219,30 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     return {"data": data, "report": report}
 
 
+def scalar_report(outputs, values: dict, level: float, label: str, n_draws: int, method: str, **extra) -> dict:
+    """uncertainty_report.yaml for a deliverable whose headline outputs are scalars (design note v2d §2.3), in the
+    shape the allocation path writes and every reader of that file expects: `scalar_outputs: {name: {mean, median,
+    sd, ci_low, ci_high, n}}`, one entry per declared output, in the declared order. `outputs` are the deliverable's
+    declared output entries ({name, ...}); `values` maps each name to its draws. A declared output without finite draws
+    fails closed (ValueError): the report never omits a headline."""
+    a = (1.0 - float(level)) / 2.0
+    so = {}
+    for o in outputs:
+        n = o["name"] if isinstance(o, dict) else str(o)
+        v = np.asarray(values.get(n, []), float)
+        if v.size == 0 or not np.all(np.isfinite(v)):
+            raise ValueError(f"uncertainty report: output {n} has no draws or non-finite draws")
+        so[n] = {"mean": float(np.mean(v)), "median": float(np.median(v)), "sd": float(np.std(v, ddof=1))
+                 if v.size > 1 else 0.0, "ci_low": float(np.quantile(v, a)), "ci_high": float(np.quantile(v, 1 - a)),
+                 "n": int(v.size)}
+        for k in ("metric", "window", "scale"):
+            if isinstance(o, dict) and o.get(k) is not None:
+                so[n][k] = o[k]
+    return dict({"producer": PRODUCER, "produced_by": "harness", "n_draws": int(n_draws),
+                 "n_successful": int(n_draws), "n_failed": 0, "interval_label": label, "level": float(level),
+                 "method": method, "backend": "local", "scalar_outputs": so}, **extra)
+
+
 def write_report(run_dir, report) -> str:
     p = os.path.join(run_dir, "uncertainty_report.yaml")
     from toolkit.analysis.artifacts import plain
