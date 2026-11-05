@@ -1,0 +1,114 @@
+producer: toolkit/engines/compartmental/benchmarks/compat_proof.py
+scope: every pack setting of a configuration the old pack declared, and one representative unit per coverage-pack
+  configuration (all arms in one run_batch, each arm's run(), and initial_state()), seed 1
+old_ref: origin/v2
+old_commit: ce79ccf2017b918f813be073651b4297c3826b2e
+old_configs:
+- single_day
+- single_week
+- single_w1
+- campaign
+- multi3
+- multi5
+- branch_poisson
+- branch_geometric
+- branch_blocks
+- win_day
+- win_week
+- win_growth
+- win_forced
+- win_refit
+- cohort
+- cohort_nested
+new_identity:
+  name: compartmental-starsim
+  version: '0.2'
+  code_sha256: 4f4ea65f6df0e86378d506c22433cdba231da95e9ee070d4eb16ff18a344bd73
+  params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
+  config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+digests:
+  asym5#seed1:
+    old: c2561f0a967530643cb35f6c38ec67813588e835da1667aa85f255e7508c76a7
+    new: c2561f0a967530643cb35f6c38ec67813588e835da1667aa85f255e7508c76a7
+  bg_2#seed1:
+    old: ca96453cb843acc5fea4ba6768001361c478c7215916126f81e0bbfc217d14ef
+    new: ca96453cb843acc5fea4ba6768001361c478c7215916126f81e0bbfc217d14ef
+  blocks_sub#seed1:
+    old: 7c1102cb9ece3721a8072e70df568eb016b091367375acd1b4b8126dde783f2f
+    new: 7c1102cb9ece3721a8072e70df568eb016b091367375acd1b4b8126dde783f2f
+  blocks_super#seed1:
+    old: 8335512f636bb34f5d8210205066b4877687a17bc8f87e9ae758ae3e021f8861
+    new: 8335512f636bb34f5d8210205066b4877687a17bc8f87e9ae758ae3e021f8861
+  bp_2#seed1:
+    old: ae5c9a46590c80f884bf4a564782eca90c02ee9dc79ee5012f4cf55441ab22d4
+    new: ae5c9a46590c80f884bf4a564782eca90c02ee9dc79ee5012f4cf55441ab22d4
+  ci_cohort#seed1:
+    old: 5c624e870bfaf394628b9cefcc07aa87a58ee2a89421859f7d93d06193142318
+    new: 5c624e870bfaf394628b9cefcc07aa87a58ee2a89421859f7d93d06193142318
+  crit_1p01#seed1:
+    old: 7d9d667527f31925deadaff35d29f1b5d794bab3152b70b14cdc267dac2450ee
+    new: 7d9d667527f31925deadaff35d29f1b5d794bab3152b70b14cdc267dac2450ee
+  identity3#seed1:
+    old: ae24deadcd105b040f6cde59de9ea857c521628934b98ac83ecd32dc9dc2a91b
+    new: ae24deadcd105b040f6cde59de9ea857c521628934b98ac83ecd32dc9dc2a91b
+  r0_12#seed1:
+    old: cf057a046656acf1d3682cbab9b621606c91f6d74db4be6c109a81528f1bfc79
+    new: cf057a046656acf1d3682cbab9b621606c91f6d74db4be6c109a81528f1bfc79
+  r0_18#seed1:
+    old: 9d22a6e0b53831cd695107f4ee1bae0b30a7172b05c721d540f673f33e78ed63
+    new: 9d22a6e0b53831cd695107f4ee1bae0b30a7172b05c721d540f673f33e78ed63
+  r0_1p5#seed1:
+    old: 90034fc491949b85e50ad12abb9070c9aabb5289d0f6d28c31ea84dbc71dc5cb
+    new: 90034fc491949b85e50ad12abb9070c9aabb5289d0f6d28c31ea84dbc71dc5cb
+  r0_2#seed1:
+    old: 51c39da721f939b86fc02ca8b7ab2edad25e907067c2ed2abd55e9bf5b14c930
+    new: 51c39da721f939b86fc02ca8b7ab2edad25e907067c2ed2abd55e9bf5b14c930
+  r0_2_week#seed1:
+    old: fa38291c42fb2208be496282e442be2f80f5d20c0b57be13a3e8621abe664f81
+    new: fa38291c42fb2208be496282e442be2f80f5d20c0b57be13a3e8621abe664f81
+  r0_4#seed1:
+    old: 6539a6d288bc42c2255b160359341d3f52d08f1121282f2459058d067a43d871
+    new: 6539a6d288bc42c2255b160359341d3f52d08f1121282f2459058d067a43d871
+  rank_one#seed1:
+    old: a00a06fa5dbd92535cb86587fd4f6ec565b7fb4434cf1fbd89c3362504b6e3af
+    new: a00a06fa5dbd92535cb86587fd4f6ec565b7fb4434cf1fbd89c3362504b6e3af
+  rank_one_ode#seed1:
+    old: d5a87d9cc3e0b0919e8cab3d4ad0ba357d8f7e9104163c78d01c75dded47f437
+    new: d5a87d9cc3e0b0919e8cab3d4ad0ba357d8f7e9104163c78d01c75dded47f437
+  rn_day#seed1:
+    old: ab1a19abc22405be75a86ebaedf1052baef6836e1e6d9b3002fc71e520e11a87
+    new: ab1a19abc22405be75a86ebaedf1052baef6836e1e6d9b3002fc71e520e11a87
+  rn_forced#seed1:
+    old: bfa502230b3d2d7a94bd3d7ed9df9ed55998eb927e5b7b841ceeae62fca70357
+    new: bfa502230b3d2d7a94bd3d7ed9df9ed55998eb927e5b7b841ceeae62fca70357
+  rn_growth#seed1:
+    old: 1bb11e812c801260d6a7f28d20ade1fe5fa6da45b7bdc1e3130a97bbc03e3540
+    new: 1bb11e812c801260d6a7f28d20ade1fe5fa6da45b7bdc1e3130a97bbc03e3540
+  rn_week#seed1:
+    old: 8209c0c0d6bec2198da0b96f9fa9fccf476f30561b0231842b7ad9fde4bd3825
+    new: 8209c0c0d6bec2198da0b96f9fa9fccf476f30561b0231842b7ad9fde4bd3825
+  sub_0p5#seed1:
+    old: b5fa2d1cf537f60daf9867f798a89176b0a113e7e92cf47318c924072b54039a
+    new: b5fa2d1cf537f60daf9867f798a89176b0a113e7e92cf47318c924072b54039a
+  vax_half#seed1:
+    old: f7c44d6629ea24644916f384bb1126b6267dcdf71761944fb2570b5c5aed60f3
+    new: f7c44d6629ea24644916f384bb1126b6267dcdf71761944fb2570b5c5aed60f3
+  vax_herd#seed1:
+    old: 28789d7108191316204e82bf6fe7826afcae27d4674981b815740187be6c90be
+    new: 28789d7108191316204e82bf6fe7826afcae27d4674981b815740187be6c90be
+  coverage:renewal#seed1:
+    old: a8c1b77c4122f0d4169afd35422847804eede7ab17a4cc7b5d71bea33f52d3d8
+    new: a8c1b77c4122f0d4169afd35422847804eede7ab17a4cc7b5d71bea33f52d3d8
+  coverage:renewal_forced#seed1:
+    old: 508f75023eccda643f17937e6ea6829c6f6029a9638faa3795e23a001b7ff0fe
+    new: 508f75023eccda643f17937e6ea6829c6f6029a9638faa3795e23a001b7ff0fe
+  coverage:cohorts#seed1:
+    old: ba8d915bfdde800cbf4bacfb88a52d99fd4ea0a7b654ee3617aa17fa6013a396
+    new: ba8d915bfdde800cbf4bacfb88a52d99fd4ea0a7b654ee3617aa17fa6013a396
+  coverage:groups3#seed1:
+    old: 016d066b119f5b1d5d157a1a229bb7b1c0322e9d74614b084080fc296bca8fef
+    new: 016d066b119f5b1d5d157a1a229bb7b1c0322e9d74614b084080fc296bca8fef
+cases: 27
+identical_cases: 27
+differing: []
+identical: true

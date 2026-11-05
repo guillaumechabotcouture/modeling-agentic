@@ -1,5 +1,5 @@
 name: compartmental-starsim
-version: '0.1'
+version: '0.2'
 mechanisms:
 - closed population of groups (age bands with a contact matrix, or birth cohorts with homogeneous mixing C_ij =
   c N_j / N); no births, deaths, waning or migration within the horizon
@@ -205,23 +205,23 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
-  computed: 5.051514762044462e-15
+  computed: 5.10702591327572e-15
   reference:
-  - 0.4638279198514079
-  - 0.7125194993192097
-  - 0.26776227820404097
-  error_abs: 5.051514762044462e-15
-  error_rel: 1.1816958092097471e-14
+  - 0.4638279198514076
+  - 0.7125194993192094
+  - 0.26776227820404075
+  error_abs: 5.10702591327572e-15
+  error_rel: 1.1402327983602831e-14
   tolerance:
     rel: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 5.051514762044462e-15
-  - 5.051514762044462e-15
+  - 5.10702591327572e-15
+  - 5.10702591327572e-15
   computed_vector:
   - 0.46382791985140287
-  - 0.7125194993192047
-  - 0.2677622782040378
+  - 0.7125194993192043
+  - 0.2677622782040377
   in_band: true
   status: in_band
 - id: FS4a
@@ -230,16 +230,16 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  computed: 0.2914058219340202
+  computed: 0.29140582193402026
   reference: 0.29140582193290576
-  error_abs: 1.1144418721187321e-12
-  error_rel: 3.824363784932632e-12
+  error_abs: 1.1144973832699634e-12
+  error_rel: 3.824554279243498e-12
   tolerance:
     rel: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 1.1144418721187321e-12
-  - 1.1144418721187321e-12
+  - 1.1144973832699634e-12
+  - 1.1144973832699634e-12
   in_band: true
   status: in_band
 - id: FS4b
@@ -248,16 +248,16 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  computed: 0.5828116438680404
+  computed: 0.5828116438680405
   reference: 0.5828116438658115
-  error_abs: 2.2288837442374643e-12
-  error_rel: 3.824363784932632e-12
+  error_abs: 2.2289947665399268e-12
+  error_rel: 3.824554279243498e-12
   tolerance:
     rel: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 2.2288837442374643e-12
-  - 2.2288837442374643e-12
+  - 2.2289947665399268e-12
+  - 2.2289947665399268e-12
   in_band: true
   status: in_band
 - id: FS4c
@@ -285,16 +285,16 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Metz (1990)
-  computed: 3.220480117485684
+  computed: 3.2204801174856823
   reference: 3.22048005763425
-  error_abs: 5.98514340310885e-08
-  error_rel: 1.8584631160565265e-08
+  error_abs: 5.985143225473166e-08
+  error_rel: 1.858463060898388e-08
   tolerance:
     rel: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 5.98514340310885e-08
-  - 5.98514340310885e-08
+  - 5.985143225473166e-08
+  - 5.985143225473166e-08
   in_band: true
   status: in_band
 - id: FS6a
@@ -303,19 +303,19 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
-  computed: 2.6911806116913795e-13
+  computed: 2.6900703886667543e-13
   reference:
-  - 0.7968128145862969
+  - 0.7968128145862968
   - 0.0
   - 0.0
-  error_abs: 2.6911806116913795e-13
-  error_rel: 3.3774313896904795e-13
+  error_abs: 2.6900703886667543e-13
+  error_rel: 3.376038059909255e-13
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 2.6911806116913795e-13
-  - 2.6911806116913795e-13
+  - 2.6900703886667543e-13
+  - 2.6900703886667543e-13
   computed_vector:
   - 0.7968128145860278
   - 0.0
@@ -328,23 +328,23 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 6.161737786669619e-15
+  computed: 6.772360450213455e-15
   reference:
-  - 0.3386991229263173
-  - 0.45014352056074514
-  - 0.1681155953709314
-  error_abs: 6.161737786669619e-15
-  error_rel: 1.7665503217114414e-14
+  - 0.33869912292631776
+  - 0.4501435205607459
+  - 0.1681155953709316
+  error_abs: 6.772360450213455e-15
+  error_rel: 1.865609218256006e-14
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 6.161737786669619e-15
-  - 6.161737786669619e-15
+  - 6.772360450213455e-15
+  - 6.772360450213455e-15
   computed_vector:
-  - 0.33869912292631194
-  - 0.450143520560739
-  - 0.16811559537092843
+  - 0.338699122926312
+  - 0.45014352056073914
+  - 0.16811559537092846
   in_band: true
   status: in_band
 - id: FS6c
@@ -353,21 +353,21 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 1.078026556911027e-13
+  computed: 1.0802470029602773e-13
   reference:
-  - 0.9192900487786668
-  - 0.8631882864871626
-  - 0.6178062746082027
+  - 0.9192900487786672
+  - 0.8631882864871628
+  - 0.6178062746082034
   - 0.6582465122853505
   - 0.67386809545775
-  error_abs: 1.078026556911027e-13
-  error_rel: 1.248889232844171e-13
+  error_abs: 1.0802470029602773e-13
+  error_rel: 1.2514616102547663e-13
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 1.078026556911027e-13
-  - 1.078026556911027e-13
+  - 1.0802470029602773e-13
+  - 1.0802470029602773e-13
   computed_vector:
   - 0.9192900487786215
   - 0.8631882864870548
@@ -454,16 +454,16 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  computed: 1.3322676295501878e-15
+  computed: 1.2212453270876722e-15
   reference: 0.0
-  error_abs: 1.3322676295501878e-15
-  error_rel: 1.332267629550188e+285
+  error_abs: 1.2212453270876722e-15
+  error_rel: 1.2212453270876722e+285
   tolerance:
     abs: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 1.3322676295501878e-15
-  - 1.3322676295501878e-15
+  - 1.2212453270876722e-15
+  - 1.2212453270876722e-15
   in_band: true
   status: in_band
 - id: BR1d
@@ -686,15 +686,15 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 1.81847197215557
+  computed: 1.8184719730900294
   reference: 1.8
-  error_abs: 0.01847197215556995
-  error_rel: 0.010262206753094416
+  error_abs: 0.018471973090029348
+  error_rel: 0.010262207272238526
   tolerance:
     rel: 0.05
   compare: eq
   per_seed_error_abs:
-  - 0.01847197215556995
+  - 0.018471973090029348
   in_band: true
   status: in_band
 - id: CI1a
@@ -986,6 +986,239 @@ benchmarks:
   - 0.0
   in_band: true
   status: in_band
+- id: AS1
+  metric: '5 age groups, SEIR generation interval, pre-existing immunity by age as calibrated s0:<group> parameters:
+    per-group final size equals the reference ODE (the SEIR final size equals the SIR one)'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE; Ma & Earn (2006) Bull Math Biol (final size independent of the latent period)
+  computed: 1.0835776720341528e-13
+  reference:
+  - 0.9192900487786672
+  - 0.8631882864871628
+  - 0.6178062746082034
+  - 0.6582465122853505
+  - 0.67386809545775
+  error_abs: 1.0835776720341528e-13
+  error_rel: 1.2553201763706597e-13
+  tolerance:
+    abs: 1.0e-05
+  compare: eq
+  per_seed_error_abs:
+  - 1.0835776720341528e-13
+  - 1.0835776720341528e-13
+  computed_vector:
+  - 0.9192900487786224
+  - 0.8631882864870545
+  - 0.6178062746081974
+  - 0.6582465122853601
+  - 0.6738680954577478
+  in_band: true
+  status: in_band
+- id: AS1b
+  metric: per-group s0 parameters and the s0 unit attribute give the same epidemic
+  role: held_out
+  target: null
+  band: null
+  source: identity (v0.2)
+  computed: 0.0
+  reference:
+  - 0.9192900487786224
+  - 0.8631882864870545
+  - 0.6178062746081974
+  - 0.6582465122853601
+  - 0.6738680954577478
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  computed_vector:
+  - 0.9192900487786224
+  - 0.8631882864870545
+  - 0.6178062746081974
+  - 0.6582465122853601
+  - 0.6738680954577478
+  in_band: true
+  status: in_band
+- id: AS2
+  metric: 'SEIR generation interval (latent 1.5 d, infectious 3 d), R0 = 1.8: the engine''s growth rate r satisfies
+    the SEIR relation R0 = (1 + r L)(1 + r D) to the discretisation'
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B, eq. for SEIR with exponential periods
+  computed: 1.7902707711849164
+  reference: 1.8
+  error_abs: 0.009729228815083646
+  error_rel: 0.005405127119490915
+  tolerance:
+    rel: 0.01
+  compare: eq
+  per_seed_error_abs:
+  - 0.009729228815083646
+  - 0.009729228815083646
+  in_band: true
+  status: in_band
+- id: AS3a
+  metric: age-targeted dose blocks (1, 3, 1, 1, 0 blocks of 50,000) bring the next-generation radius below 1 (R0
+    = 1.5, asymmetric 5x5)
+  role: held_out
+  target: null
+  band: null
+  source: 'multigroup herd-immunity threshold: rho(diag(s) K) < 1 (Diekmann, Heesterbeek & Metz 1990)'
+  computed: 0.9673873676413498
+  reference: 0.97
+  error_abs: 0.0026126323586501687
+  error_rel: 0.0026934354212888338
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.0026126323586501687
+  - 0.0026126323586501687
+  in_band: true
+  status: in_band
+- id: AS3b
+  metric: 'same: below the threshold no major outbreak (attack rate within the seed-size bound)'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 3.0351514495426206e-08
+  reference: 1.0e-07
+  error_abs: 6.96484855045738e-08
+  error_rel: 0.696484855045738
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 6.96484855045738e-08
+  - 6.96484855045738e-08
+  in_band: true
+  status: in_band
+- id: AS3c
+  metric: 'same matrix, one block fewer to the highest-contact group (1, 2, 1, 1, 0): above the threshold, a major
+    outbreak'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 0.01
+  reference: 0.08799592746032008
+  error_abs: 0.07799592746032008
+  error_rel: 0.8863583771588829
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.07799592746032008
+  - 0.07799592746032008
+  in_band: true
+  status: in_band
+- id: AS4
+  metric: a campaign acting after extinction (day 3000) leaves the final size unchanged
+  role: held_out
+  target: null
+  band: null
+  source: identity (v0.2 component timing)
+  computed: 0.7968121334428566
+  reference: 0.7968121334428566
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: AS5a
+  metric: 'birth cohorts with homogeneous mixing, an always-immune cohort and cohort susceptibilities 0.08-1, R0
+    = 12: per-cohort final size equals the rank-one relation'
+  role: held_out
+  target: null
+  band: null
+  source: Ma & Earn (2006); Andreasen (2011)
+  computed: 3.3306690738754696e-15
+  reference:
+  - 0.0
+  - 0.06370126386158473
+  - 0.09555189579237708
+  - 0.19906644956745223
+  - 0.3185063193079236
+  - 0.7962658005335224
+  error_abs: 3.3306690738754696e-15
+  error_rel: 4.182860888466916e-15
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 3.3306690738754696e-15
+  - 3.3306690738754696e-15
+  computed_vector:
+  - 0.0
+  - 0.06370126386158456
+  - 0.09555189579237691
+  - 0.19906644956745198
+  - 0.31850631930792356
+  - 0.796265800533519
+  in_band: true
+  status: in_band
+- id: AS5b
+  metric: same at R0 = 18
+  role: held_out
+  target: null
+  band: null
+  source: Ma & Earn (2006); Andreasen (2011)
+  computed: 2.3314683517128287e-15
+  reference:
+  - 0.0
+  - 0.07522199761569504
+  - 0.11283299642354255
+  - 0.235068742549047
+  - 0.37610998807847523
+  - 0.9402749708597995
+  error_abs: 2.3314683517128287e-15
+  error_rel: 3.1978454391900774e-15
+  tolerance:
+    rel: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.3314683517128287e-15
+  - 2.3314683517128287e-15
+  computed_vector:
+  - 0.0
+  - 0.07522199761569487
+  - 0.11283299642354219
+  - 0.23506874254904675
+  - 0.3761099880784746
+  - 0.9402749708597972
+  in_band: true
+  status: in_band
+- id: AS6
+  metric: run_series() monthly incidence integrates to the run's attack rate, and its last susceptible share is
+    the run's s_end (time_unit year, a dose package)
+  role: held_out
+  target: null
+  band: null
+  source: identity (figures-hooks/1)
+  computed: 2.220446049250313e-16
+  reference: 0.0
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.220446049250313e+284
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
 - id: FS7
   metric: published age-specific final sizes from a contact-matrix model
   role: held_out
@@ -1110,9 +1343,11 @@ parameters:
   units: basic reproduction number (all groups susceptible)
   lo: 0.05
   hi: 40.0
-  source: calibrated per run, or declared per question (decision spec), with its source
+  source: calibrated per run (with a declared prior), or declared per question (decision spec), with its source;
+    pathogen-specific literature ranges are in literature.yaml beside this engine (priors with their spread across
+    settings, not truths)
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: ff861f1561f1db57ca6c08fcdf089535717d38b313b59bf0b149365437459b9c
+results_sha256: 4014e8820301028f35755b8561b7c5f6d1442b7bc3061fb1ca80ce8775b96fb7
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

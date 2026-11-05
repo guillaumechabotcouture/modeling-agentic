@@ -31,3 +31,6 @@ attribute_binding:
     default: "the component's configured reach"
     meaning: "the share of the targeted groups the component reaches, as configured"
   "ratio:*": required
+  coverage_scale:
+    default: 1.0
+    meaning: "the declared coverage:<dose> series is the latent true coverage (no reporting bias)"
