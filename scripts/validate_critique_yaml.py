@@ -314,6 +314,11 @@ def _require(cond: bool, msg: str) -> None:
         raise SchemaError(msg)
 
 
+def _one_of(v: Any, allowed: set) -> bool:
+    """`v in allowed` that is False, not a TypeError, for an unhashable value (a list or mapping)."""
+    return isinstance(v, str) and v in allowed
+
+
 class _Errors(list):
     """Collects schema errors in check order; `need` records one and returns the condition."""
 
@@ -349,13 +354,13 @@ def _validate_blocker(b: Any, ctx: str, prefix: str, errs: _Errors) -> bool:
         errs.need(isinstance(bid, str) and bid.startswith(prefix),
                   f"{ctx}: blocker id '{bid}' must start with '{prefix}'")
     if "severity" in b:
-        errs.need(b["severity"] in VALID_SEVERITY,
+        errs.need(_one_of(b["severity"], VALID_SEVERITY),
                   f"{ctx}: blocker {bid} severity must be one of {VALID_SEVERITY}")
     if "category" in b:
-        errs.need(b["category"] in VALID_CATEGORY,
+        errs.need(_one_of(b["category"], VALID_CATEGORY),
                   f"{ctx}: blocker {bid} category must be one of {VALID_CATEGORY}")
     if "target_stage" in b:
-        errs.need(b["target_stage"] in VALID_TARGET_STAGE,
+        errs.need(_one_of(b["target_stage"], VALID_TARGET_STAGE),
                   f"{ctx}: blocker {bid} target_stage must be one of {VALID_TARGET_STAGE}")
     if "first_seen_round" in b:
         errs.need(isinstance(b["first_seen_round"], int) and b["first_seen_round"] >= 1,
@@ -430,9 +435,9 @@ def validate_critique(path: str, expected_reviewer: str,
               f"{ctx}: round must be {current_round}, got {doc.get('round')!r}")
     valid_verdicts = (VALID_VERDICT | {"UNAVAILABLE"}
                       if expected_reviewer in OPTIONAL_REVIEWERS else VALID_VERDICT)
-    errs.need(doc.get("verdict") in valid_verdicts,
+    errs.need(_one_of(doc.get("verdict"), valid_verdicts),
               f"{ctx}: verdict must be one of {valid_verdicts}")
-    if doc.get("verdict") == "UNAVAILABLE":
+    if _one_of(doc.get("verdict"), {"UNAVAILABLE"}):
         errs.need(isinstance(doc.get("unavailable_reason"), str)
                   and doc["unavailable_reason"].strip(),
                   f"{ctx}: verdict UNAVAILABLE requires a non-empty "
@@ -454,7 +459,7 @@ def validate_critique(path: str, expected_reviewer: str,
             if isinstance(bid, str):
                 errs.need(bid not in seen_ids, f"{ctx}: duplicate blocker id {bid}")
                 seen_ids.add(bid)
-        if doc.get("verdict") == "REVISE":
+        if _one_of(doc.get("verdict"), {"REVISE"}):
             errs.need(any(isinstance(b, dict) and b.get("resolved") is False
                           for b in blockers),
                       f"{ctx}: verdict REVISE requires at least one unresolved "
@@ -4615,8 +4620,13 @@ def _run_self_test() -> int:
                                      "D-002 category", "D-002 missing 'resolved_in_round'",
                                      "carried_forward entry must be a mapping")),
            f"SE1 a refused critique lists every schema error, not the first: {errs}")
-        ok(errs and errs[0].endswith("resolved blocker D-001 missing 'resolved_in_round'"),
-           f"SE2 the error message is the first error, as before: {errs[:1]}")
+        try:
+            validate_critique(pth, "critique-domain", 2)
+            msg = ""
+        except SchemaError as e:
+            msg = str(e)
+        ok(msg == "critique_domain.yaml: resolved blocker D-001 missing 'resolved_in_round'" and errs and errs[0] == msg,
+           f"SE2 the exception message is the first error, as before (other callers read it): {msg!r}")
         rb2 = dict(rb, resolved_in_round=2, resolved_evidence="manuscript.md Methods")
         with open(pth, "w") as fh:
             yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
@@ -4628,6 +4638,32 @@ def _run_self_test() -> int:
         with open(pth, "w") as fh:
             yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
                             "structural_mismatch": "no", "blockers": "none"}, fh)
+        with open(os.path.join(d, "critique_redteam.yaml"), "w") as fh:
+            yaml.safe_dump({"reviewer": "critique-redteam", "round": 2, "verdict": ["PASS"],
+                            "structural_mismatch": {"detected": False},
+                            "carried_forward": [{"id": ["R-001"], "prior_round": 1, "still_present": True,
+                                                 "notes": "n"}],
+                            "blockers": [dict(rb, id=["R-001"], severity=["HIGH"], category={"a": 1},
+                                              target_stage=["WRITE"], resolved=False)]}, fh)
+        try:
+            validate_critique(os.path.join(d, "critique_redteam.yaml"), "critique-redteam", 2)
+            errs5 = []
+        except SchemaError as e:
+            errs5 = list(e.errors)
+        ok(len(errs5) >= 5 and all(e.startswith("critique_redteam.yaml: ") for e in errs5),
+           f"SE5 unhashable values (lists, mappings) are schema errors, not a crash: {errs5}")
+        nb = {k: v for k, v in rb.items() if k != "claim"}
+        with open(os.path.join(d, "critique_redteam.yaml"), "w") as fh:
+            yaml.safe_dump({"reviewer": "critique-redteam", "round": 2, "verdict": "PASS",
+                            "structural_mismatch": {"detected": False}, "carried_forward": [],
+                            "blockers": [dict(nb, id="R-001", severity=["HIGH"])]}, fh)
+        try:
+            validate_critique(os.path.join(d, "critique_redteam.yaml"), "critique-redteam", 2)
+            errs6 = []
+        except SchemaError as e:
+            errs6 = list(e.errors)
+        ok(any("missing required key 'claim'" in e for e in errs6) and any("R-001 severity" in e for e in errs6),
+           f"SE6 a missing key followed by an unhashable value: both are schema errors, no crash: {errs6}")
         try:
             validate_critique(pth, "critique-domain", 2)
             errs = []

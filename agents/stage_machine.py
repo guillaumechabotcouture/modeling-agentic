@@ -1944,6 +1944,20 @@ def _self_test() -> int:
         ok(g.get("action") is None and all(any(w in e for e in dom) for w in want),
            f"T74 the gate names every schema error in a critic's file at once, not the first ({dom})")
 
+        # T76: a refused file's open HIGH/MEDIUM blockers still have their done_when tests checked, so
+        # a prose test reaches the same repair as the file's schema errors.
+        r3 = os.path.join(td, "refused_done_when")
+        os.makedirs(r3)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001"],
+                        "blockers": [dict(resolved_b, resolved=False, done_when="the text says so")]},
+                       open(os.path.join(r3, "critique_domain.yaml"), "w"), sort_keys=False)
+        g = v2_gate(r3, 2, 3, False, [], history=False, strict_done_when=True)
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        ok(g.get("action") is None and any("carried_forward entry must be a mapping" in e for e in dom)
+           and any("blocker D-001 done_when" in e for e in dom),
+           f"T76 a refused file's schema errors and its open blockers' done_when problems reach one repair ({dom})")
+
         class Literal(StubTasks):
             """A critic that, like the real ones, fixes exactly the errors it is told and nothing else."""
             def critique(self, run_dir, reviewer, round_n, feedback=None):
