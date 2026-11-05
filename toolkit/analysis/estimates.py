@@ -823,6 +823,59 @@ def _self_test_codex_r1(ok, rows) -> None:
     ok(m is not None and m > -1e-6, f"AE19 (Codex r1-11) endpoint fits use the optimised likelihood maximum: {m or err}")
 
 
+def _self_test_codex_r2(ok) -> None:
+    """Codex review round 2 (failing first): output classes from the likelihood's flat directions, benchmark acceptance
+    against the pack, and the contract reconciling the automatic tests with the calibration's."""
+    from toolkit.analysis import contract
+
+    def safe(fn):
+        try:
+            return fn(), None
+        except Exception as e:  # noqa: BLE001 -- a missing function is a failing case
+            return None, f"{type(e).__name__}: {e}"
+    # an exact ridge: the data fix a*b; output y = a moves along it, output z = a*b does not
+    P = C.Problem(["a", "b"], {"a": C.Prior("a", "uniform", 0.9, 1.1), "b": C.Prior("b", "uniform", 0.9, 1.1)},
+                  lambda X: (-((X["a"] * X["b"] - 1.0) ** 2) / 1e-6, {"y": X["a"], "z": X["a"] * X["b"]}))
+    fd, err = safe(lambda: flat_dependence(P, np.array([1.0, 1.0]), ["y", "z"]))
+    ok(fd is not None and fd["y"] > 10 * fd["z"], f"AE20 (Codex r2-1) an output that moves along the likelihood's flat "
+                                                  f"direction is seen to, one that does not is not: {fd or err}")
+    c, err = safe(lambda: classify_output(np.linspace(0.99, 1.01, 200), np.linspace(0.0, 2.0, 400), 0.9, 0.1, 0.5))
+    ok(c == "set_by_declared_ranges", f"AE20b a contracted output whose spread lies along a flat direction is set by "
+                                      f"the declared ranges (a narrow prior, not the data): {c or err}")
+    c, err = safe(lambda: classify_output(np.linspace(0.99, 1.01, 200), np.linspace(0.0, 2.0, 400), 0.05, 0.1, 0.5))
+    ok(c == "determined_by_data", f"AE20c a contracted output off the flat directions is determined by the data: "
+                                  f"{c or err}")
+    import yaml
+    from toolkit.engines.renewal.engine import RenewalEngine, RESULTS
+    eng = RenewalEngine(generation_interval=[0.5, 0.5])
+    doc = yaml.safe_load(open(RESULTS))
+    short = dict(doc, benchmarks=doc["benchmarks"][:3])
+    _, err = safe(lambda: benchmark_acceptance(eng, doc=short))
+    ok(err is not None, f"AE21 (Codex r2-2) results missing benchmarks of the pack are refused: {err}")
+    waived = dict(doc, benchmarks=[dict(r, status="not_assessable") if r["id"] == "RW2a" else r
+                                   for r in doc["benchmarks"]])
+    _, err = safe(lambda: benchmark_acceptance(eng, doc=waived))
+    ok(err is not None, f"AE21b an analytic benchmark marked not_assessable is refused (only untranscribed ones may "
+                        f"be): {err}")
+    _, err = safe(lambda: benchmark_acceptance(RenewalEngine(generation_interval=[0.5, 0.5],
+                                                             results_path="/tmp/forged_results.yaml")))
+    ok(err is not None, f"AE21c a results file outside the engine's own directory is refused: {err}")
+    exp = ["prior_range_s0", "prior_range_r0"]
+    run_ok = {"id": "prior_range_s0", "status": "run", "decision_changes": False,
+              "ends": [{"value": 0.3, "kind": "declared", "verdict": "no", "median": {"x": 1.0}},
+                       {"value": 1.0, "kind": "declared", "verdict": "no", "median": {"x": 1.0}}]}
+    rule = {"verdict": "no"}
+    f1, err = safe(lambda: contract.estimates_test_findings("e", {"decision_tests": [run_ok], "decision": rule}, exp))
+    ok(bool(f1) and any("prior_range_r0" in x["claim"] for x in f1),
+       f"AE22 (Codex r2-3) an expected automatic test that is missing is a finding: {f1 or err}")
+    f2, err = safe(lambda: contract.estimates_test_findings("e", {"decision_tests": [
+        dict(run_ok, ends=[])], "decision": rule}, ["prior_range_s0"]))
+    ok(bool(f2), f"AE22b a test recorded as run with no declared ends is a finding: {f2 or err}")
+    f3, err = safe(lambda: contract.estimates_test_findings("e", {"decision_tests": [run_ok], "decision": rule},
+                                                            ["prior_range_s0"]))
+    ok(f3 == [], f"AE22c a complete test passes: {f3 or err}")
+
+
 def _self_test() -> int:
     import tempfile
     import yaml
@@ -886,12 +939,14 @@ def _self_test() -> int:
         txt = open(os.path.join(d, "results.md")).read()
         ok("validated against" in txt, "AE17b (Codex r1-12) results.md carries the engine's validation label")
     _self_test_codex_r1(ok, rows)
+    _self_test_codex_r2(ok)
         # the reporting fraction and s0 trade off: with s0 unknown, reporting is not determined
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)
         sp = ES.toy_dir(d, rows=rows)
         raw = yaml.safe_load(open(sp))
         raw["calibration"]["priors"]["s0"] = {"dist": "uniform", "range": [0.3, 1.0], "source": "toy: no serosurvey"}
+        raw["decision_units"].pop("defaults_accepted", None)
         yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
         s2 = schema.load(sp)          # the analysis alone, with the automatic test of s0 only (self-test time)
         res = analyse(s2, s2.engine(), n_draws=400, prior_range=["s0"], log=lambda *a: None)

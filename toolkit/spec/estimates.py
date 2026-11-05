@@ -420,7 +420,8 @@ def toy_spec(gi=(0.5, 0.5), n_weeks=16) -> dict:
                    "config": {"generation_interval": {"dt": "week", "w": list(gi)}, "dt": "week"}},
         "horizon": {"start": 0.0, "stop": n_weeks * wk + 1e-9},
         "decision_units": {"csv": "data/pop.csv", "id": "unit_id", "engine_attributes": {"N": {"column": "population"}},
-                           "populations": {"all": {"column": "population", "age_groups": ["all"]}}},
+                           "populations": {"all": {"column": "population", "age_groups": ["all"]}},
+                           "defaults_accepted": {"s0": "toy: everyone susceptible at the start (no prior immunity)"}},
         "dynamics": {"generation_interval": {"csv": "data/gi.csv", "lag": "lag", "probability": "p", "step": "week",
                                              "values": list(gi)}, "transmissibility": "constant"},
         "observations": {"sources": [{
@@ -522,6 +523,20 @@ def _self_test() -> int:
         open(os.path.join(d, "data", "gi2.csv"), "w").write("lag,p\n1.5,0.5\n2.5,0.5\n")
         mut(lambda r: r["dynamics"]["generation_interval"].update(csv="data/gi2.csv"), "integer",
             "ES19b (Codex r1-10) fractional generation-interval lags are refused")
+        # ---- Codex r2
+        mut(lambda r: r["decision_units"].pop("defaults_accepted"), "engine_attribute_unbound",
+            "ES20 (Codex r2-4) an engine unit attribute neither bound, calibrated nor accepted by name is refused")
+        mut(lambda r: r.update(engine_parameters={"r0": {"value": 99, "source": "x", "reason": "x"}}),
+            "engine_parameters", "ES21 (Codex r2-5) engine_parameters (not applied by the estimates path) are refused")
+        mut(lambda r: r["observations"]["sources"].append(dict(r["observations"]["sources"][0], bias={"none": "x"})),
+            "duplicate", "ES22 (Codex r2-6) two sources with one id are refused")
+        mut(lambda r: r["observations"]["sources"][0]["bias"].append(
+            {"mechanism": "under_ascertainment", "param": "rep2", "prior": {"dist": "uniform", "range": [0.1, 0.5]},
+             "source": "x"}), "more than once", "ES22b (Codex r2-6) a mechanism repeated in one source is refused")
+        mut(lambda r: r["observations"]["sources"][0]["latent"].update(quantity="attack_rate"), "incidence",
+            "ES23 (Codex r2-7) a target source whose latent quantity is not incidence is refused")
+        mut(lambda r: r["engine"]["config"].update(results_path="/tmp/forged.yaml"), "results_path",
+            "ES24 (Codex r2-2) an engine configuration key that dynamics does not declare (results_path) is refused")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))
