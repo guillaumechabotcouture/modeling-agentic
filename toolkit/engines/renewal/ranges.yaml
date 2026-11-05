@@ -1,0 +1,59 @@
+# Published ranges for the quantities a renewal analysis declares, with their spread and source (card metadata, not
+# engine code; never drawn automatically). The planner reads them when it declares calibration priors in a spec; the
+# signed spec, not this file, is what a run uses. `spread` says what the range is (a 95% interval, an interquartile
+# range, a range of estimates across settings) so a range is not read as more certain than it is. `verified`
+# follows the evidence-service vocabulary: unverified until a quoted span is matched.
+#
+# Generic quantities (any pathogen):
+generic:
+  seed:
+    what: "infections in the step before the series starts, as a share of the population"
+    range: [1.0e-7, 1.0e-3]
+    dist: loguniform
+    spread: "wide by design: the series' first weeks inform it; set the lower end near one infection in the population"
+    source: "assumption: no published value; the data inform it"
+    verified: unverified
+  s0:
+    what: "susceptible share at the start of the series (1 minus prior immunity to this strain or serotype)"
+    range: [0.0, 1.0]
+    spread: "not identified by a case series alone (RW4 scale invariance): with a case series only, the attack rate
+      scales with s0 while reff_end does not; declare it from a serosurvey or the question, or carry its full range"
+    source: "the question or a serosurvey"
+    verified: unverified
+  dispersion:
+    what: "negative-binomial size k of the reported counts (variance mu + mu^2 / k)"
+    range: [1.0, 1000.0]
+    dist: loguniform
+    spread: "weakly informative; the series informs it"
+    source: "assumption: no published value"
+    verified: unverified
+
+# Per pathogen. Ranges across settings are not confidence intervals.
+dengue:
+  r0:
+    what: "basic reproduction number (vector dynamics absorbed), from outbreak growth rates"
+    range: [1.3, 5.0]
+    spread: "range of published estimates across settings and seasons"
+    source: "to transcribe: Johansson, Hombach & Cummings (2011) Vaccine 29:5860 (review of dengue model
+      parameters); Favier et al. (2006) Trop Med Int Health 11:332 (early growth-rate estimates, Brazil)"
+    verified: unverified
+  reporting_fraction:
+    what: "reported cases per infection (all infections, inapparent included)"
+    range: [0.0333, 0.333]
+    dist: loguniform
+    spread: "range of published ratios across settings, stated as rough; a spec may widen it with a reason"
+    source: "Bhatt et al. (2013) Nature 496:504 (about one in four infections apparent); Undurraga et al. (2013) PLoS
+      Negl Trop Dis 7:e2056 (expansion factors from reported to symptomatic cases)"
+    verified: unverified
+  intrinsic_incubation_days:
+    what: "infection to symptom onset in humans (part of the infection-to-report delay)"
+    range: [3.0, 10.0]
+    spread: "about 95% of cases; mean about 6 days"
+    source: "Chan & Johansson (2012) PLoS One 7:e50972"
+    verified: unverified
+  generation_interval_weeks:
+    what: "human-to-human generation interval (through the mosquito)"
+    range: [2.0, 4.0]
+    spread: "mean, depends on temperature"
+    source: "Siraj et al. (2017) PLoS Negl Trop Dis 11:e0005797"
+    verified: unverified

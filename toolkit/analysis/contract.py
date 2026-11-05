@@ -52,7 +52,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc = None, None
+    cal_doc, unc_doc, est_doc = None, None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -63,10 +63,17 @@ def gate_findings(run_dir: str) -> list[dict]:
     exp = man.get("expected") or {}
     kinds = {e.get("kind") for e in (man.get("artifacts") or {}).values()}
     roles = {e.get("role") for e in (man.get("deliverables") or {}).values()}
-    need_k = set(EXPECTED_KINDS) | set(exp.get("kinds") or [])
+    base_k, base_r = EXPECTED_KINDS, EXPECTED_ROLES
+    if man.get("deliverable_kind") == "estimates":      # no allocation units (toolkit/analysis/estimates.py)
+        from toolkit.analysis.estimates import EXPECTED_KINDS as base_k, EXPECTED_ROLES as base_r
+        cur_kind = _deliverable_kind(run_dir)
+        if cur_kind != "estimates":
+            out.append(_f("analysis_contract_stale", f"the manifest records an estimates run, the spec's deliverable "
+                                                     f"kind is {cur_kind!r}"))
+    need_k = set(base_k) | set(exp.get("kinds") or [])
     for k in sorted(need_k - kinds):
         out.append(_f("analysis_contract_incomplete", f"the completed run has no {k} artifact", k))
-    for r in sorted(set(EXPECTED_ROLES) - roles):
+    for r in sorted(set(base_r) - roles):
         out.append(_f("analysis_contract_incomplete", f"the completed run has no {r} deliverable", r))
     listed = set(man.get("deliverables") or {})
     for tid, rel in sorted((exp.get("decision_tests") or {}).items()):
@@ -127,6 +134,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             cal_doc = (rel, doc.get("data") or {})
         if kind == "uncertainty":
             unc_doc = doc.get("data") or {}
+        if kind == "estimates":
+            est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
             out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):
@@ -136,12 +145,65 @@ def gate_findings(run_dir: str) -> list[dict]:
         elif sha256(p) != ent.get("sha256"):
             out.append(_f("analysis_contract_tampered", f"deliverable {rel} ({ent.get('role')}) changed after the "
                                                         "harness wrote it", rel))
+    if est_doc is not None:        # the automatic tests against the ones the calibration requires (Codex r2-3)
+        exp_ids = (cal_doc[1].get("prior_range_tests") if cal_doc else None)
+        out += estimates_test_findings(est_doc[0], est_doc[1], exp_ids if isinstance(exp_ids, list) else [])
     if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
     return out
+
+
+VERDICTS = ("yes", "no", "undetermined")
+
+
+def estimates_test_findings(rel, data, expected=None) -> list[dict]:
+    """Codex r1-7, r2-3: the automatic prior_range tests of an estimates run are required. `expected`: the test ids the
+    calibration lists (calibration.yaml prior_range_tests); each must be present exactly once, run, with both declared
+    ends evaluated (finite medians, a recognised verdict when the spec has a rule) and a boolean decision_changes. A
+    missing, extra, refused or incomplete test is a finding, never a quiet pass."""
+    import math
+    out = []
+    F = lambda c, k: out.append(_f("analysis_contract_decision_test", f"{rel}: {c}", k))  # noqa: E731
+    tests = data.get("decision_tests") if isinstance(data, dict) else None
+    if not isinstance(tests, list):
+        F("no decision_tests list (the automatic prior_range tests)", rel)
+        return out
+    has_rule = isinstance(data.get("decision"), dict) and "verdict" in data["decision"]
+    ids = [str((t or {}).get("id")) for t in tests]
+    if expected is not None:
+        for tid in sorted(set(expected) - set(ids)):
+            F(f"automatic test {tid}, which the calibration requires, is missing", tid)
+        for tid in sorted(set(ids) - set(expected)):
+            F(f"automatic test {tid} is not one the calibration lists", tid)
+    for tid in sorted({i for i in ids if ids.count(i) > 1}):
+        F(f"automatic test {tid} is recorded more than once", tid)
+    for t, tid in zip(tests, ids):
+        if not isinstance(t, dict) or t.get("status") != "run":
+            F(f"automatic test {tid} was not run (status {(t or {}).get('status')!r})", tid)
+            continue
+        ends = [e for e in t.get("ends") or [] if isinstance(e, dict)]
+        decl = [e for e in ends if e.get("kind", "declared") == "declared"]
+        if len(decl) != 2:
+            F(f"automatic test {tid} has {len(decl)} declared ends evaluated (2 required)", tid)
+        for e in ends:
+            meds = (e.get("median") or {}).values()
+            if "refused" in e or not meds or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in meds):
+                F(f"automatic test {tid}: the end at {e.get('value')!r} has no finite result", tid)
+            elif has_rule and e.get("verdict") not in VERDICTS:
+                F(f"automatic test {tid}: the end at {e.get('value')!r} has no recognised verdict", tid)
+        if has_rule and not isinstance(t.get("decision_changes"), bool):
+            F(f"automatic test {tid} has no verdict", tid)
+    return out
+
+
+def _deliverable_kind(run_dir):
+    try:
+        return ((yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("deliverable") or {}).get("kind")
+    except (OSError, yaml.YAMLError, AttributeError):
+        return None
 
 
 def _calibration(rel, d) -> list[dict]:

@@ -129,6 +129,11 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         data_in.append(spec.resolve(spec["calibration"]["targets"]["csv"]))
+    from toolkit.spec import estimates as ES_SPEC
+    if ES_SPEC.is_estimates(spec.raw):     # no allocation units: quantities with intervals (v2d §2.3)
+        from toolkit.analysis import estimates as ES
+        data_in.append(spec.resolve(spec["dynamics"]["generation_interval"]["csv"]))    # Codex r1-9
+        return ES.run(run_dir, spec, S, eng, arts, data_in, eng_files, draws=draws, log=log)
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":
         design, jobs = Bt.design(spec)
@@ -994,6 +999,10 @@ def main(argv=None) -> int:
             ap.error("--shipped and --adopt are alternatives")
         ad = {"shipped": a.shipped}
     R = run(a.run_dir, a.spec, ad, a.draws, a.unsigned)
+    if "estimates" in R:                  # deliverable kind estimates: its outputs (toolkit/analysis/estimates.py)
+        print(json.dumps({"outputs": R["estimates"]["outputs"], "decision": R["estimates"]["decision"],
+                          "label": R["uncertainty"]["label"], "wall_s": R["wall_s"]}, indent=1, default=float))
+        return 0
     print(json.dumps({"point": {k: R["point"][k] for k in ("averted", "cost_allocated", "mix")},
                       "uncertainty": R["uncertainty"]["fixed_plan"], "label": R["uncertainty"]["label"],
                       "stability": {k: R["stability"].get(k) for k in ("verdict", "value_verdict")},
