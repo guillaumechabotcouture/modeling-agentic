@@ -204,9 +204,9 @@ The layers (core, engine families, domain packs, questions and runs), the promot
 | L3 | Joint calibration across all targets, literature priors with their spread, no unit clamped at its range edge (§5.3) | Not started; design note first |
 | L4 | Incremental rebuilds from a content-addressed step cache (§5.4) | Not started |
 | L5 | One golden launch path, tested nightly on a real cluster; orchestration on a cloud VM (§5.5) | Not started |
-| L6 | Per-run postmortems with layer-tagged lessons and delivery metrics (§5.6) | Not started |
+| L6 | Layer-tagged lessons and delivery metrics, extending `run_autopsy.py` and the lessons ledger (§5.6) | Autopsy and ledger merged; tags and metrics not started |
 | L7 | Repository-wide disease-term scan of `toolkit/` and `scripts/` (§4, AC1) | Not started |
-| L8 | Track B engines: age-structured compartmental, then renewal, then TB (§3.2) | Compartmental and renewal started 2026-11-05 |
+| L8 | Track B engines: age-structured compartmental (graded v2 runs, published benchmark, notes, hooks), then renewal (with the estimate-only deliverable), then TB (§3.2) | Compartmental and renewal work started 2026-11-05 |
 
 ## Order and checkpoints
 

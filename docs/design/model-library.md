@@ -3,8 +3,8 @@
 Status: design note, docs only. The owner approved the direction on 2026-11-05; this note
 writes it down so that each piece can be built and reviewed as its own PR into `v2`. It
 complements `architecture-v2` (PR #82), `v2-spec-and-analysis.md` (the decision spec and
-the analysis engine), `v2d-compartmental-engines.md` (the compartmental engine and the
-empirical yield mode) and the determinism roadmap in `improvement-plan.md`.
+the analysis engine), `v2d-compartmental-engines.md` (the compartmental engine, and the
+empirical yield mode it proposes) and the determinism roadmap in `improvement-plan.md`.
 
 ## Why
 
@@ -20,8 +20,14 @@ test each layer on more than one disease area before calling it general.
 
 ## 1. Layers and what belongs in each
 
-Four layers, from the most general to the most specific. A layer may use the layers above it
-in this list, never the ones below it.
+Four layers, from the most general to the most specific.
+
+**Dependency rule.** Code depends only on layers above it. Core code defines the interfaces
+(the `Engine` contract, the spec schema, manifest loaders) and never imports a concrete
+engine or names a domain pack. At run time, core receives an engine, priors, contracts and
+thresholds as inputs, named by the signed spec and loaded through those interfaces. So the
+calibration step runs any engine it is handed, and reads its thresholds from a manifest,
+without knowing which disease either belongs to.
 
 | Layer | Holds | Must not hold |
 |---|---|---|
@@ -43,7 +49,7 @@ in this list, never the ones below it.
 | Data contracts | `toolkit/spec/geometry.py` (unit coordinates inside their own polygon), `scripts/data_schema.py` | partial; per-source contracts are §5.2 |
 | Launch | `cloud/run_cluster.py`, `cloud/vm_job.py`, `scripts/compute.py` | more than one path in use; one golden path is §5.5 |
 | Figure tiers | `toolkit/analysis/figures.py`, `docs/design/v2-figures.md` | merged |
-| Postmortems | none | §5.6 |
+| Postmortems | `scripts/run_autopsy.py` (`autopsy.md`/`.json`, primary failing layer) and `scripts/lessons.py` with `docs/lessons/` (lessons ledger and recurrence checks), both called at run finish by `agents/run_finish.py` | merged (Phase 29 and the lessons ledger); layer tags for the promotion rule and delivery metrics are §5.6 |
 
 Core code is checked against the acceptance criteria in §4 on every change.
 
@@ -68,9 +74,9 @@ validated once. Each engine in a family ships four things:
 | Family | Engine | Questions | State on 2026-11-05 |
 |---|---|---|---|
 | Malaria agent-based | `toolkit/engines/malaria/` (v0.10) | Nigeria flagship, `malaria_alloc` | card, priors, pack, ENGINE_NOTES, hooks; v0.11 in progress |
-| Compartmental, age-structured | `toolkit/engines/compartmental/` (v0.1) | `flu_vaccine`, `measles_campaign` | card and pack (analytic identities, simulation-based coverage); published benchmark FS7 not yet assessed; no ENGINE_NOTES or hooks yet; age-structured extension started 2026-11-05 |
+| Compartmental, age-structured | `toolkit/engines/compartmental/` (v0.1) | `flu_vaccine`, `measles_campaign` | card and pack (analytic identities, simulation-based coverage). The age-structured pieces already exist: age bands with a contact matrix, birth-cohort initialisation from coverage history, dose blocks and campaigns (`engine.py`, card `capabilities`). Remaining: published benchmark FS7, ENGINE_NOTES, the hooks contract, and graded end-to-end v2 runs of both questions, with any spec or optimiser support those runs show missing (v2d §2). This work started 2026-11-05 |
 | Renewal (generation interval) | started 2026-11-05 | `dengue_outbreak` | the compartmental engine's `windowed` mode already uses a renewal step; the family gets its own card and pack, with an observation model for an unknown reporting fraction |
-| Tuberculosis natural history | later | `tb_acf` (the empirical yield mode answers it today) | not started |
+| Tuberculosis natural history | later | `tb_acf` | not started. Interim route: the empirical yield mode of v2d §1.2 (`reference` and `structural_zero` packages, a yield objective), which is designed but not built: the engine has neither field and the spec accepts only `objective.sense: avert` |
 | Empirical package-rate | `toolkit/engines/empirical/` | panels with a reference package | merged; a helper engine, not a family to grow |
 
 A family is added when a question needs it and no existing card covers it
@@ -132,7 +138,8 @@ for a second disease area before the rules could be called generic.
 
 How it works in practice:
 - The first occurrence goes into the domain pack, with a pointer in the postmortem
-  (`lessons.yaml`: id, statement, tag, disease area, run, evidence, the change made).
+  and an entry in the lessons ledger (`docs/lessons/ledger.yaml`, extended with the tag and
+  the disease area: id, statement, tag, disease area, run, evidence, the change made).
 - When a second disease area shows the same lesson, a core PR generalises it. The PR cites
   both postmortem entries and passes the acceptance criteria in §4.
 - The eval suite counts: a synthetic measles or dengue question is a different disease area
@@ -157,7 +164,10 @@ is. So only Track A asks the owner to sign.
 Real data, an owner-signed spec, the malaria engine. Its job is to produce the decision the
 programme will use, and to be the hardest test of the library. After a signed launch, new
 findings go into one fix queue for the next run; they do not trigger a rebuild of the current
-one.
+one. The freeze never overrides failing closed: an integrity failure, an invalid input or a
+finding that bears on the decision still blocks acceptance of the current run (the gate and
+the owner sign-off of scope declarations are unchanged). What the freeze saves is the
+computation, not the verdict.
 
 ### 3.2 Track B: the eval suite
 
@@ -169,9 +179,9 @@ Engine order, one family at a time:
 
 | Order | Engine family | Questions | What it adds to the library |
 |---|---|---|---|
-| 1 | Compartmental, age-structured | `flu_vaccine`, `measles_campaign` | a contact matrix by age band; birth-cohort immunity from coverage history and a serosurvey; dose blocks coupled within a unit |
-| 2 | Renewal | `dengue_outbreak` | the case with **no allocation units**: estimates only (a reproduction number and an attack rate), and a reporting fraction that the data do not determine, carried through to the interval |
-| 3 | Tuberculosis | `tb_acf` | screening yield and natural history; today answered by the empirical yield mode |
+| 1 | Compartmental, age-structured | `flu_vaccine`, `measles_campaign` | the engine's existing age bands, birth cohorts and dose blocks, taken through graded v2 runs; the published benchmark, ENGINE_NOTES and hooks |
+| 2 | Renewal | `dengue_outbreak` | the case with **no allocation units**: estimates only (a reproduction number and an attack rate), and a reporting fraction that the data do not determine, carried through to the interval. Needs the estimate-only deliverable of v2d §2.3 first: today the spec requires `decision_units` and allocation sections, and `package_per_unit` is the only deliverable kind |
+| 3 | Tuberculosis | `tb_acf` | screening yield and natural history; until then the empirical yield mode (v2d §1.2, not built) is the interim route |
 
 `malaria_alloc` already runs on v2 (the blind v2 run graded 1.0 on 2026-10-31).
 
@@ -191,10 +201,17 @@ Engine order, one family at a time:
 |---|---|---|---|---|
 | AC1 | No disease, country, intervention or unit terms in the logic of `toolkit/` or `scripts/` | a scan of code (identifiers and string literals, not comments) against a vocabulary built from the domain-pack indexes and the eval questions; exemptions in a manifest, each with a reason; run in CI | `pipeline.py` DI13 scans one section; other modules rely on review | one repository-wide scan, as a self-test and a CI step |
 | AC2 | Passes on at least two disease areas | the PR's canary results: the Nigeria malaria canary plus one eval canary on a different engine family | not required | the canary job reports per question; the PR template asks for both |
-| AC3 | The canary self-tests include a question with no allocation units | `dengue_outbreak`'s canary is in the set every core PR runs | no | added when the renewal family lands; until then a toy estimate-only spec |
-| AC4 | Thresholds live in manifests or priors, not in code | review, plus the AC1 scan flagging numeric literals in check functions | manifests exist (`rigor_artifacts.yaml`, `effort_floors.yaml`, `toolkit/analysis/thresholds.yaml`, `scope_declaration_policy.yaml`) | the literal check in the AC1 scan |
+| AC3 | The canary self-tests include a question with no allocation units | `dengue_outbreak`'s canary is in the set every core PR runs | no; the spec cannot express such a question yet | the estimate-only deliverable (v2d §2.3), then the `dengue_outbreak` canary |
+| AC4 | Thresholds live in manifests or priors, not in code | a threshold is a value a check compares a result with to decide pass or fail; such a comparison must read its value through a manifest loader. The scan lists module-level numeric constants and literals used in comparisons in check code; each is either loaded from a manifest or listed as a mathematical or numerical constant (a tolerance, a unit conversion) with a reason | manifests exist (`rigor_artifacts.yaml`, `effort_floors.yaml`, `toolkit/analysis/thresholds.yaml`, `scope_declaration_policy.yaml`); some thresholds are still module constants (for example `FLAT_SLOPE` in `toolkit/analysis/calibration.py`) | the scan, and moving each listed threshold into a manifest |
 
 A core PR description states the result of each criterion, with the canary run ids.
+
+**Bootstrap.** AC2 needs a second engine family with a canary, and AC3 needs the
+estimate-only deliverable. Until each exists, a core PR states "AC2 (or AC3) not yet
+available" and runs every canary there is; the criterion becomes blocking on the day its
+first canary passes nightly. The first canary PR therefore ships the Nigeria and
+`malaria_alloc` canaries, and the compartmental canaries follow with the age-structured
+PR (§7).
 
 ## 5. The F6 factory package
 
@@ -214,8 +231,10 @@ recorded.
 - It must exercise the real path at full width where size matters: one full-size batch chunk,
   the real analyze timeout and the real memory peak (lesson of 2026-11-02: no full-size batch
   had gone through `pipeline.py` before the first full run).
-- Acceptance: every canary passes nightly for a week on `v2`; a planted defect in core
-  (for example a dropped batch row) fails the canary of every question.
+- Acceptance: every canary passes nightly for a week on `v2`. A set of planted defects, each
+  declared with the execution paths it touches (for example a dropped batch row touches the
+  emulator path; a wrong per-unit outcome touches the direct path too), fails the canary of
+  every question whose path it touches and leaves the others passing.
 
 ### 5.2 Data contract tests at pre-sign
 
@@ -243,9 +262,18 @@ Calibration fits all uncertain parameters together, not one at a time.
   fit targets. Held-out benchmarks stay held out and are used only to validate.
 - **Output:** the compatible region (all parameter sets consistent with the data), carried
   into the allocation uncertainty as draws. No single picked value is reported as the answer.
-- **Acceptance:** no unit is clamped at the edge of its range. A cheap reachability check
-  (can the engine reach each unit's target anywhere in the prior box?) runs before the batch;
-  a unit that cannot is a finding at that point, not after the batch.
+- **Observation models:** each target has its measurement model and a declared model
+  discrepancy (v2d §3.4), so "consistent with the data" has a stated meaning.
+- **Acceptance**, each failing closed, with thresholds in a manifest:
+  - no unit is clamped at the edge of its range;
+  - the compatible region is not empty: at least one parameter set meets every target
+    jointly, not each target at its own value of a shared parameter;
+  - the method's own diagnostics pass (implausibility over all targets for history matching;
+    effective sample size and convergence for a sampler);
+  - the fit is checked on the held-out benchmarks and reported beside them.
+- **Reachability first.** A cheap check (can the engine reach each unit's target anywhere
+  in the prior box, and all of them together?) runs before the batch; a unit that cannot is
+  a finding at that point, not after the batch. Passing it is necessary, not sufficient.
 - When a target is missed, the question is which joint region fits, and the first check is
   whether the mechanism follows the standard published model (determinism roadmap R2).
 
@@ -257,9 +285,14 @@ whose key changed. Today `compute.py` reuses results by function and code finger
 fingerprint covers all of `scripts/` and `toolkit/`, so any code change recomputes the whole
 batch.
 
+- **Provenance.** What is reused is the computed payload (engine results, fitted draws),
+  never a whole artifact. Artifact envelopes bind the full signed spec hash, and the contract
+  check refuses an artifact from another spec (`toolkit/analysis/contract.py`). So after a
+  spec change, the harness writes fresh envelopes and manifest hashes for the current spec
+  around reused payloads, each recording the cache key it reused.
 - Acceptance: a change to one unit's input recomputes that unit's rows and the steps
-  downstream, and nothing else; a canary run twice on the same tree does no engine work the
-  second time.
+  downstream, and nothing else, and the run passes the contract check; a canary run twice on
+  the same tree does no engine work the second time.
 
 ### 5.5 One golden launch path
 
@@ -273,8 +306,12 @@ sleeps or loses its network only loses its view of the run.
 
 ### 5.6 Postmortems and delivery metrics
 
-Each run, canary failure and eval run ends with a postmortem written from its records:
-`postmortem.md` and `lessons.yaml` (each lesson tagged as in §2). Three delivery metrics are
+This extends what exists: `run_autopsy.py` already writes each run's autopsy with its
+primary failing layer, and `lessons.py` keeps the lessons ledger in `docs/lessons/` and checks
+whether a known error class came back. The additions are a layer tag on every lesson
+(core, engine, domain or question, §2), the disease area, a link between two occurrences
+for promotion, autopsies for canary failures and eval runs, and a check that every v2 run
+path calls them. Three delivery metrics are
 reported across runs, from the trace, the findings ledger and git:
 
 | Metric | Definition |
@@ -312,7 +349,8 @@ them; the parameter that changed twice and the chemoprevention effect are `engin
 | Age-structured compartmental engine (started) | engine agent | PR into `v2` by 2026-11-08 |
 | Renewal engine (started) | engine agent | PR into `v2` by 2026-11-08 |
 | Malaria v0.11 (in progress) | engine agent | PR into `v2` by 2026-11-07 |
-| §5.1 canary pipeline, first PR (Nigeria canary and `malaria_alloc`) | lead | 2026-11-09 |
+| §5.1 canary pipeline, first PR (Nigeria canary and `malaria_alloc`; AC2 and AC3 not yet blocking, §4) | lead | 2026-11-09 |
+| Estimate-only deliverable (v2d §2.3), so the `dengue_outbreak` canary can exist | lead | with the renewal PR |
 | §5.2 data contracts at pre-sign, replayed on the first Nigeria inputs | lead | 2026-11-11 |
 | §5.3 joint calibration, design note first | lead | note by 2026-11-11 |
 | §5.4, §5.5, §5.6 | lead | after §5.3, dated in its note |
