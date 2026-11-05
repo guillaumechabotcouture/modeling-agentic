@@ -87,20 +87,31 @@ class EstimatesProblem:
         self.decls = {s["id"]: s for s in srcs}
         self.sources = {s["id"]: ob.Source(s) for s in srcs}
         self.fixed = {k: float(v) for k, v in (fixed or {}).items()}
+        from toolkit.spec import estimates as ESPEC
         pri = {}
+        # Codex r1-3: each name has one role. Engine parameters and unit attributes come only from calibration.priors;
+        # observation parameters only reach their source's measurement model. A collision is refused (the spec
+        # validator refuses it too).
+        self.engine_names = set()
+        self.unit_names = set()
         for n, d in (cal.get("priors") or {}).items():
             pri[n] = C.Prior.from_decl(n, d)
-        for s in self.sources.values():
-            for n, d in s.priors().items():
-                pri[n] = C.Prior.from_decl(n, d)
-            disp = (s.noise or {}).get("dispersion")
-            if isinstance(disp, dict):
-                pri[disp["param"]] = C.Prior.from_decl(disp["param"], dict(disp["prior"], source=disp.get("source")))
+            if n in self.pnames:
+                self.engine_names.add(n)
+            elif n in self.card.unit_attributes:
+                self.unit_names.add(n)
+            else:
+                raise ValueError(f"calibration.priors.{n}: neither an engine parameter nor a unit attribute")
+        for n, d, where in ESPEC.source_params(srcs):
+            if n in pri or n in self.pnames or n in self.card.unit_attributes:
+                raise ValueError(f"parameter_name_collision: {where}: {n}")
+            pri[n] = C.Prior.from_decl(n, dict(d, source=d.get("source", "")) if isinstance(d, dict) else d)
         self.all_priors = dict(pri)
         names = [n for n in pri if n not in self.fixed]
         t = cal["targets"]
         rows = _csv(spec.resolve(t["csv"]))
-        self.target = {"source": t["source"], "steps": np.array([int(float(r[t["step"]])) for r in rows]),
+        self.target = {"source": t["source"],
+                       "steps": np.array([ESPEC.integral(r[t["step"]], "calibration.targets: step") for r in rows]),
                        "y": np.array([float(r[t["observed"]]) for r in rows])}
         n_steps = self._steps()
         if self.target["steps"].max() > n_steps:
@@ -126,11 +137,11 @@ class EstimatesProblem:
         return out
 
     def _engine_params(self, V: dict, i: int) -> dict:
-        return {k: float(v[i]) for k, v in V.items() if k in self.pnames}
+        return {k: float(v[i]) for k, v in V.items() if k in self.engine_names}
 
     def _unit(self, V: dict, i: int) -> UnitSpec:
         a = dict(self.base_unit)
-        a.update({k: float(v[i]) for k, v in V.items() if k in self.card.unit_attributes})
+        a.update({k: float(v[i]) for k, v in V.items() if k in self.unit_names})
         return UnitSpec("population", a)
 
     def run(self, V: dict, n: int) -> list:
@@ -156,17 +167,26 @@ class EstimatesProblem:
         src, decl = self.sources[sid], self.decls[sid]
         n = len(outs)
         T = max(len(o.meta["incidence"]) for o in outs if o is not None) if any(o is not None for o in outs) else 0
-        inc = np.full((n, T), np.nan)
-        for i, o in enumerate(outs):
-            if o is not None:
-                inc[i] = np.asarray(o.meta["incidence"], float) * self.population
         pmf = (decl.get("delay") or {}).get("pmf")
+        K = len(pmf) - 1 if pmf else 0
+        # Codex r1-5: the infections before the horizon (the engine's `incidence_before`, oldest first, e.g. the seed)
+        # report inside it after a delay, so the convolution runs over them and is cropped to the horizon's steps
+        inc = np.full((n, K + T), np.nan)
+        for i, o in enumerate(outs):
+            if o is None:
+                continue
+            before = [float(x) for x in (o.meta.get("incidence_before") or [])][-K:] if K else []
+            row = np.zeros(K + T)
+            row[K - len(before):K] = before
+            row[K:] = np.asarray(o.meta["incidence"], float)
+            inc[i] = row * self.population
         if pmf:
             k = np.asarray(pmf, float)
             lag = np.zeros_like(inc)
             for j, pj in enumerate(k):
-                lag[:, j:] += pj * inc[:, :T - j] if j else pj * inc
+                lag[:, j:] += pj * inc[:, :K + T - j] if j else pj * inc
             inc = lag
+        inc = inc[:, K:]
         vals = {p: np.asarray(V[p], float)[:, None] for p in src.params() if p in V}
         mu = src.expected(np.where(np.isfinite(inc), inc, 0.0), vals) if src.bias else inc
         mu = np.where(np.isfinite(inc), mu, np.nan)
@@ -195,10 +215,13 @@ class EstimatesProblem:
         y = self.target["y"]
         model = self.sources[self.target["source"]].noise["model"]
         kw = {"dispersion": self._dispersion(V, n)} if model == "negbin" else {}
-        mu_ok = np.where(np.isfinite(mu), np.maximum(mu, 0.0), 0.0)
+        # Codex r1-6: a member whose expected counts are negative or not finite has no likelihood (never clipped to a
+        # valid mean); the prior supports the validator enforces keep the canonical sample away from them
+        valid = ok & np.all(np.isfinite(mu) & (mu >= 0), axis=1)
+        mu_ok = np.where(valid[:, None], mu, 0.0)
         with np.errstate(divide="ignore", invalid="ignore"):
             lr = ob.loglik(model, y[None, :], mu=mu_ok, **kw)
-        ll = np.where(ok, np.sum(lr, axis=1), -np.inf)
+        ll = np.where(valid, np.sum(lr, axis=1), -np.inf)
         for i, o in enumerate(outs):
             if o is None:
                 continue
@@ -218,6 +241,92 @@ class EstimatesProblem:
             lam = rng.gamma(k, mu / k)
             return rng.poisson(lam), mu, outs
         return rng.poisson(mu), mu, outs
+
+
+def classify_output(vq, vp, dependence: dict, dmax: float, cmin: float) -> str:
+    """An output's class (Codex r1-2): `set_by_declared_ranges` when an undetermined parameter moves it by more than
+    `dmax` of its median, OR when the data hardly contract it (1 - var_posterior / var_prior-only below `cmin`, on the
+    log scale for a positive output): a narrow prior can then fix it while the data say nothing. Otherwise
+    `determined_by_data`."""
+    vq, vp = np.asarray(vq, float), np.asarray(vp, float)
+    vp = vp[np.isfinite(vp)]
+    pos = bool(np.all(vp > 0) and np.all(vq > 0))
+    f = np.log if pos else (lambda x: x)
+    c = float(1.0 - np.var(f(vq)) / np.var(f(vp))) if np.var(f(vp)) > 0 else 0.0
+    if any(v > dmax for v in dependence.values()) or c < cmin:
+        return "set_by_declared_ranges"
+    return "determined_by_data"
+
+
+def dependence(x, y, level: float) -> float:
+    """How much an output y moves across a parameter x's own posterior range, relative to y's median: the larger of
+    the marginal linear slope times x's central interval, and the spread of y's medians over x's quintiles (which
+    catches a non-linear, non-monotone dependence)."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    scale = max(abs(float(np.median(y))), 1e-300)
+    vx = float(np.var(x))
+    lin = abs(float(np.cov(x, y)[0, 1] / vx)) * float(np.diff(C.interval(x, level))[0]) if vx > 0 else 0.0
+    qs = np.quantile(x, np.linspace(0, 1, 6))
+    meds = [float(np.median(y[(x >= a) & (x <= b)])) for a, b in zip(qs, qs[1:]) if np.any((x >= a) & (x <= b))]
+    rng_ = (max(meds) - min(meds)) if meds else 0.0
+    return max(lin, rng_) / scale
+
+
+def benchmark_acceptance(eng) -> str:
+    """Codex r1-12: the engine runs only with benchmark results written by the runner for its current code, every
+    assessable benchmark in band (held-out published ones may be not_assessable). The configuration may differ from
+    the pack's in values (a question's generation interval), not in code. Returns the validation label every report
+    carries; ValueError otherwise (fail closed)."""
+    import yaml
+    from toolkit.engines import benchmark as B
+    from toolkit.engines.contract import code_fingerprint
+    path = getattr(eng, "results_path", None)
+    if not path or not os.path.exists(path):
+        raise ValueError(f"engine {eng.describe().name}: no benchmark results file: it has not been validated")
+    doc = yaml.safe_load(open(path)) or {}
+    if doc.get("producer") != B.PRODUCER:
+        raise ValueError(f"{os.path.basename(path)} was not written by {B.PRODUCER}: re-run the pack")
+    if (doc.get("engine_identity") or {}).get("code_sha256") != code_fingerprint(eng):
+        raise ValueError(f"{os.path.basename(path)} was computed for other engine code: re-run the pack")
+    rows = doc.get("benchmarks") or []
+    bad = [r.get("id") for r in rows if r.get("status") != "in_band"
+           and not (r.get("status") == "not_assessable" and r.get("role") == "held_out")]
+    if not rows or bad:
+        raise ValueError(f"engine {eng.describe().name}: benchmarks not in band: {bad or 'none recorded'}")
+    return str(getattr(eng, "validation_label", "") or f"validated against its benchmark pack ({len(rows)} benchmarks)")
+
+
+def max_loglik(P: C.Problem, x0) -> float:
+    """The likelihood's maximum over the prior's support (no prior term), optimised from x0 in the sampler's z
+    coordinates (Codex r1-11: endpoint fits compare optimised maxima, not the best point a sampler happened to
+    evaluate). Never below the value at x0."""
+    from scipy.optimize import minimize
+    from scipy.special import ndtri
+    from scipy import stats
+    z0 = []
+    for j, n in enumerate(P.names):
+        pr = P.priors[n]
+        if pr.dist in ("uniform", "loguniform"):
+            lo, hi = pr.natural_support()
+            u = (float(pr.natural(x0[j])) - lo) / (hi - lo)
+        elif pr.dist == "beta":
+            u = float(stats.beta.cdf(x0[j], pr.a, pr.b))
+        else:
+            c = (pr.mode - pr.lo) / (pr.hi - pr.lo)
+            u = float(stats.triang.cdf(x0[j], c, loc=pr.lo, scale=pr.hi - pr.lo))
+        z0.append(ndtri(min(max(u, 1e-9), 1 - 1e-9)))
+    z0 = np.asarray(z0, float)
+    f = lambda z: -float(P.evaluate(P.x_of_z(z[None, :]))[0][0])  # noqa: E731
+    v0 = f(z0)
+    best = v0
+    for method in ("Nelder-Mead", "L-BFGS-B"):
+        try:
+            r = minimize(f, z0, method=method, options={"maxiter": 2000})
+            if np.isfinite(r.fun) and r.fun < best:
+                best, z0 = float(r.fun), r.x
+        except (ValueError, FloatingPointError):
+            continue
+    return -best
 
 
 def _decision(dec, v: np.ndarray) -> dict:
@@ -263,6 +372,7 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     u = raw["uncertainty"]
     lvl = float(u.get("level", 0.95))
     seed = int(u.get("seed", seed))
+    validation = benchmark_acceptance(eng)          # fail closed before any fit (Codex r1-12)
     E = EstimatesProblem(spec, eng)
     P = E.problem
     s = _sample(P, seed)
@@ -283,47 +393,61 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     # automatic prior_range tests: every parameter the data do not determine, at each end of its declared range: the
     # posterior of the others re-sampled, the outputs and the decision recomputed
     th = thresholds()
+    ll_max = max_loglik(P, s["best"])
     tests = []
+
+    def end_fit(name, v, kind):
+        """The posterior with `name` held at v: outputs, decision, and the optimised likelihood drop against the full
+        fit (an end the data reject cannot change the decision)."""
+        try:
+            Ef = EstimatesProblem(spec, eng, fixed={name: v})
+            sf = _sample(Ef.problem, seed)
+        except C.CalibrationRefused as e:
+            return {"value": v, "kind": kind, "refused": str(e)}
+        dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": np.asarray(sf["rows"])},
+                       min(nd, 1000), seed)
+        Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
+        _, auxf = Ef.loglik(Xf)
+        drop = float(ll_max - max_loglik(Ef.problem, sf["best"]))
+        end = {"value": float(v), "kind": kind, "median": {o["name"]: float(np.median(auxf[o["name"]]))
+                                                           for o in E.outputs},
+               "interval": {o["name"]: C.interval(auxf[o["name"]], lvl) for o in E.outputs},
+               "loglik_drop": drop, "rejected_by_data": drop > th["end_loglik_drop_max"]}
+        if dec:
+            df = _decision(dec, auxf[dec["output"]])
+            end.update(verdict=df["verdict"], probability=df["probability"])
+        return end
+
     for t in C.prior_range_tests(cls, P) if prior_range else []:
         if prior_range is not True and t["parameter"] not in prior_range:     # a self-test's subset
             continue
-        res = {"id": t["id"], "parameter": t["parameter"], "class": t["class"], "values": t["values"],
-               "source": t["source"], "status": "run", "ends": []}
-        for v in t["values"]:
-            try:
-                Ef = EstimatesProblem(spec, eng, fixed={t["parameter"]: v})
-                sf = _sample(Ef.problem, seed)
-            except C.CalibrationRefused as e:
-                res["ends"].append({"value": v, "refused": str(e)})
-                continue
-            dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": np.asarray(sf["rows"])},
-                           min(nd, 1000), seed)
-            Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
-            _, auxf = Ef.loglik(Xf)
-            drop = float(s["best_ll"] - sf["best_ll"])
-            end = {"value": v, "median": {o["name"]: float(np.median(auxf[o["name"]])) for o in E.outputs},
-                   "interval": {o["name"]: C.interval(auxf[o["name"]], lvl) for o in E.outputs},
-                   "loglik_drop": drop, "rejected_by_data": drop > th["end_loglik_drop_max"]}
-            if dec:
-                df = _decision(dec, auxf[dec["output"]])
-                end.update(verdict=df["verdict"], probability=df["probability"])
-            res["ends"].append(end)
+        p = t["parameter"]
+        res = {"id": t["id"], "parameter": p, "class": t["class"], "values": t["values"], "source": t["source"],
+               "status": "run", "ends": []}
+        j = smp["names"].index(p)
+        post_q = C.interval(smp["rows"][:, j], lvl)
+        for side, v in enumerate(t["values"]):
+            e = end_fit(p, v, "declared")
+            res["ends"].append(e)
+            if e.get("rejected_by_data"):
+                # Codex r1-11: the declared end is rejected; the decision is also checked at the end of the range the
+                # data support (the parameter's posterior interval on that side)
+                res["ends"].append(end_fit(p, post_q[side], "supported"))
         if any("refused" in e for e in res["ends"]):
             res["status"] = "not_assessable"
         if dec and res["status"] == "run":
-            # an end the data reject (its best fit is worse by more than the threshold) cannot change the decision
             kept = [e for e in res["ends"] if not e["rejected_by_data"]]
             res["decision_changes"] = any(e["verdict"] != decision["verdict"] for e in kept)
             res["ends_rejected_by_data"] = [e["value"] for e in res["ends"] if e["rejected_by_data"]]
         tests.append(res)
-    # what the data determine, per output: the prior alone against the posterior (contraction on the output's own
-    # scale), and how much each undetermined parameter moves it across the parameter's own posterior range (the
-    # marginal slope in the canonical draws times the parameter's central interval, relative to the output's median:
-    # `dependence`). Above thresholds.yaml estimates.dependence_max the output is set by that declared range.
+    # what the data determine, per output: how much each undetermined parameter moves it across its own posterior
+    # range (`dependence`), and how much the data contract it against the priors alone; set by the declared ranges
+    # when either says so (classify_output)
     rng = np.random.default_rng([seed, 17])
     Xp = P.x_of_z(rng.standard_normal((PRIOR_DRAWS, len(P.names))))
     _, auxp = E.loglik(_rows_dict(P.names, Xp))
     undetermined = [t["parameter"] for t in C.prior_range_tests(cls, P)]
+    cmin = float(C.thresholds()["contraction_prior_dominated"])
     determined = {}
     for o in E.outputs:
         n = o["name"]
@@ -331,20 +455,15 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
         pos = bool(np.all(vp > 0) and np.all(vq > 0))
         f = np.log if pos else (lambda x: x)
         c = float(1.0 - np.var(f(vq)) / np.var(f(vp))) if np.var(f(vp)) > 0 else 0.0
-        lo_q, hi_q = C.interval(vq, lvl)
-        scale = max(abs(float(np.median(vq))), 1e-300)
-        dep = {}
-        for p in undetermined:
-            x = P.priors[p].natural(X[p])
-            vx = float(np.var(x))
-            slope = float(np.cov(x, vq)[0, 1] / vx) if vx > 0 else 0.0
-            span = float(np.diff(C.interval(x, lvl))[0])
-            dep[p] = abs(slope) * span / scale
+        dep = {p: dependence(P.priors[p].natural(X[p]), vq, lvl) for p in undetermined}
         dmax = th["dependence_max"]
+        cl_ = classify_output(vq, vp, dep, dmax, cmin)
         on = sorted(k for k, v in dep.items() if v > dmax)
-        determined[n] = {"prior_interval": C.interval(vp, lvl), "posterior_interval": [lo_q, hi_q],
+        if cl_ == "set_by_declared_ranges" and not on:        # not contracted: every undetermined parameter's range
+            on = sorted(undetermined) or ["the declared priors"]
+        determined[n] = {"prior_interval": C.interval(vp, lvl), "posterior_interval": C.interval(vq, lvl),
                          "contraction": c, "scale": "log" if pos else "linear", "dependence": dep,
-                         "depends_on": on, "class": "set_by_declared_ranges" if on else "determined_by_data"}
+                         "depends_on": on, "class": cl_}
     # posterior predictive check of the target series
     yrep, mu, outs = E.predictive({n: v[:PPC_DRAWS] for n, v in X.items()}, rng)
     lo, hi = np.quantile(yrep, (1 - lvl) / 2, axis=0), np.quantile(yrep, 1 - (1 - lvl) / 2, axis=0)
@@ -361,7 +480,8 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     post = {n: {"median": float(np.median(smp["rows"][:, j])), "interval": C.interval(smp["rows"][:, j], lvl),
                 "prior": P.priors[n].describe()} for j, n in enumerate(smp["names"])}
     return {"E": E, "P": P, "sample": s, "classes": cls, "map": dict(zip(P.names, (float(v) for v in xh))),
-            "converged": conv, "message": msg, "draws": dr, "values": vals, "level": lvl, "determined": determined,
+            "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
+            "determined": determined,
             "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post, "seed": seed}
 
 
@@ -513,7 +633,8 @@ def results_template(spec, res) -> str:
     raw = spec.raw
     L = [f"# Results: {raw['question'].strip()}", "",
          "Rendered by the harness (toolkit/analysis/estimates.py) from its artifacts; no number below was typed by an "
-         "agent.", "", "## Estimates", "",
+         "agent.", "", f"Engine: {(raw.get('engine') or {}).get('ref', '') if isinstance(raw.get('engine'), dict) else ''}"
+         f" ({res['validation']}).", "", "## Estimates", "",
          f"Over [CLAIM:uq.draws] draws of the joint posterior ({res['label']}). Each output's interval names the "
          "declared ranges that set it.", "",
          "| Output | Window metric | Median and interval | Interval under the priors alone | What the data determine |",
@@ -550,7 +671,7 @@ def results_template(spec, res) -> str:
               "| Test | Parameter | End | Verdict | Rejected by the data |", "|---|---|---|---|---|"]
         for t in res["tests"]:
             for e in t.get("ends") or []:
-                L.append(f"| {t['id']} | {t['parameter']} | {_f(e['value'])} | "
+                L.append(f"| {t['id']} | {t['parameter']} | {_f(e['value'])} ({e.get('kind', 'declared')} end) | "
                          f"{e.get('verdict', 'refused: ' + str(e.get('refused', ''))[:60])} | "
                          f"{'yes' if e.get('rejected_by_data') else 'no'} |")
             L.append(f"| {t['id']} | | | decision changes: {t.get('decision_changes', 'not assessable')} | |")
@@ -605,7 +726,8 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
            "decision": res["decision"] or {"not_applicable": "the spec declares no threshold rule"},
            "determined": res["determined"], "decision_tests": res["tests"], "posterior_predictive": res["ppc"],
            "rt": res["rt"], "parameters": res["posterior"], "population": res["E"].population,
-           "label": lab, "level": res["level"]}
+           "label": lab, "level": res["level"], "validation": res["validation"],
+           "engine": {"name": eng.describe().name, "version": eng.describe().version}}
     arts["estimates"] = S.write("estimates", est, PRODUCER, [arts["calibration"], arts["uncertainty"]] + data_in)
     figs = figures(run_dir, spec, res, arts["estimates"])
     arts["figures"] = S.write("figures", {"figures": figs, "not_produced": [], "tiers": {}, "groups": {},
@@ -679,7 +801,7 @@ def _self_test_codex_r1(ok, rows) -> None:
         V2 = dict(V, reporting=np.array([-0.1]))
         ll, _ = E.loglik(V2)
         ok(not np.isfinite(ll[0]), f"AE14 (Codex r1-6) a negative expected count gets no likelihood (ll {ll[0]})")
-    c, err = safe(lambda: classify_output(np.full(200, 1.0) + 1e-3 * np.arange(200) / 200, np.linspace(0.9, 1.1, 400),
+    c, err = safe(lambda: classify_output(np.linspace(0.9, 1.1, 200), np.linspace(0.9, 1.1, 400),
                                           {"r0": 0.01}, 0.1, 0.1))
     ok(c == "set_by_declared_ranges", f"AE15 (Codex r1-2) an output the data hardly contract (its posterior as wide as "
                                       f"under the priors) is not 'determined by the data': {c or err}")
@@ -783,7 +905,8 @@ def _self_test() -> int:
            f"AE11 with s0 unknown the attack rate is set by s0's declared range and reff is determined by the data "
            f"(attack {dd['attack']['class']} {dd['attack']['dependence']}; reff {dd['reff_next']['class']} "
            f"{dd['reff_next']['dependence']})")
-        ok(any(t["parameter"] == "s0" and t["status"] == "run" and len(t["ends"]) == 2 for t in est["decision_tests"]),
+        ok(any(t["parameter"] == "s0" and t["status"] == "run"
+               and sum(e.get("kind") == "declared" for e in t["ends"]) == 2 for t in est["decision_tests"]),
            "AE12 an automatic prior_range test runs for s0 at both ends of its range")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

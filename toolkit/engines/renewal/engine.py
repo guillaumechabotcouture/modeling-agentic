@@ -145,7 +145,7 @@ def cori_rt(cases, w, tau: int = 3, a: float = 1.0, b: float = 5.0, level: float
     w = np.asarray(w, float)
     L = len(w)
     lam = np.array([sum(w[k - 1] * y[s - k] for k in range(1, L + 1) if s - k >= 0) for s in range(len(y))])
-    t0 = max(L, tau) if start is None else int(start)
+    t0 = L + tau - 1 if start is None else int(start)      # every Lambda in the window has its full history
     out = {"t": [], "mean": [], "lo": [], "hi": [], "cv": []}
     q = (1 - level) / 2
     for t in range(t0, len(y)):
@@ -164,6 +164,7 @@ class RenewalEngine:
     """The renewal engine (see the module docstring)."""
 
     hooks_contract = HOOKS_CONTRACT
+    validation_label = PUBLISHED_LABEL      # rendered in every report from this engine (toolkit/analysis/estimates.py)
     mode = "windowed"
     groups = ["all"]
 
@@ -372,6 +373,7 @@ class RenewalEngine:
             cost[f"person_years:{c}"] = float(on * max(0.0, min(b, w1) - max(a, w0)))
         meta = {"incidence": [float(x) for x in inc], "rt": [float(x) for x in rt], "s": [float(x) for x in Sp],
                 "t": [float(x) for x in t], "s_start": [float(S0 + u[2])], "N": u[0], "dt_years": self.dt_years,
+                "incidence_before": [float(u[2])],      # infections in the steps before the start, oldest first
                 "seed": seed, "age_shares": {"all": 1.0}}
         return Outcomes(per_capita={"infections": {"all": float(inc[widx].sum())}}, windows=wins, cost_drivers=cost,
                         meta=meta)

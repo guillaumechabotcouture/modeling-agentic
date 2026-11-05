@@ -132,6 +132,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     from toolkit.spec import estimates as ES_SPEC
     if ES_SPEC.is_estimates(spec.raw):     # no allocation units: quantities with intervals (v2d §2.3)
         from toolkit.analysis import estimates as ES
+        data_in.append(spec.resolve(spec["dynamics"]["generation_interval"]["csv"]))    # Codex r1-9
         return ES.run(run_dir, spec, S, eng, arts, data_in, eng_files, draws=draws, log=log)
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":

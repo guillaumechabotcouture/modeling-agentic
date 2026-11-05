@@ -349,6 +349,41 @@ benchmarks:
   - 0.030652173913043423
   in_band: true
   status: in_band
+- id: RW5c
+  metric: 'same, and the intervals are not inflated: coverage at most 0.99 (Codex r1-14)'
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.9306521739130434
+  reference: 0.99
+  error_abs: 0.059347826086956545
+  error_rel: 0.059947299077733884
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.059347826086956545
+  in_band: true
+  status: in_band
+- id: RW5d
+  metric: Cori gamma posterior quantiles equal scipy's for a hand-computed window (shape a + sum I, rate 1/b + sum
+    Lambda)
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505, web appendix
+  computed: 2.220446049250313e-16
+  reference: 0.0
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.220446049250313e+284
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
 - id: RW6a
   metric: 'refit of noise-free reported counts from the reference implementation: R0 = 1.65 recovered'
   role: held_out
@@ -562,5 +597,5 @@ published_ranges:
       verified: unverified
 validation_label: validated against analytic identities (final size, Wallinga-Lipsitch, reproduction-number identities,
   scale invariance) and known-R_t recovery; published benchmark RW9 (Cori et al. 2013 worked examples) not yet assessed
-results_sha256: 74fe8705c9e327d09c91a8904f71b5dfe4c04ea3f47bdac3c5ab34e737707a51
+results_sha256: 10a30f65f5169a38ed4343fd0a5ace952d797dc29bd52c465f1d7a81fe68a7e2
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

@@ -91,7 +91,7 @@ def gi_from_spec(raw: dict, base: str | None = None) -> dict:
         p = gi["csv"] if os.path.isabs(gi["csv"]) else os.path.join(base, gi["csv"])
         rows = _read_csv(p)
         try:
-            pairs = sorted((int(float(r[gi["lag"]])), float(r[gi["probability"]])) for r in rows)
+            pairs = sorted((integral(r[gi["lag"]], "lag"), float(r[gi["probability"]])) for r in rows)
         except (KeyError, ValueError) as e:
             raise ValueError(f"dynamics.generation_interval: {gi['csv']} unreadable as lag/probability: {e}") from None
         lags = [a for a, _ in pairs]
@@ -110,20 +110,37 @@ def engine_config(raw: dict) -> dict:
     return {"generation_interval": gi, "dt": gi["dt"], "transmissibility": d.get("transmissibility", "constant")}
 
 
-def _source_params(sources) -> dict:
-    """{param: prior} of every observation parameter: bias mechanisms, frame gaps and a declared dispersion."""
-    out = {}
+def integral(x, what="value") -> int:
+    """A whole number written in a table (1, 1.0), or ValueError: a fractional value is never truncated."""
+    v = float(x)
+    if not math.isfinite(v) or v != round(v):
+        raise ValueError(f"{what} {x!r} is not an integer")
+    return int(round(v))
+
+
+# Bias mechanisms and the support their parameter must keep (the prior's whole range): a reporting fraction is a share.
+BIAS_SUPPORT = {"under_ascertainment": (0.0, 1.0)}
+SUPPORTED_BIAS = tuple(BIAS_SUPPORT)        # the mechanisms the estimates path applies to a count series
+
+
+def source_params(sources) -> list:
+    """[(param, prior, where)] of every observation parameter, in declaration order (duplicates kept, so a collision
+    can be refused): bias mechanisms and a declared dispersion."""
+    out = []
     for s in sources or []:
+        if not isinstance(s, dict):
+            continue
         for b in s.get("bias") or [] if isinstance(s.get("bias"), list) else []:
             if isinstance(b, dict) and b.get("param"):
-                out[b["param"]] = b.get("prior")
-        for e in ((s.get("frame") or {}).get("excluded") or []):
-            if isinstance(e, dict) and e.get("param"):
-                out[e["param"]] = e.get("relative_value_prior")
+                out.append((b["param"], b.get("prior"), f"observations.{s.get('id')}.bias.{b.get('mechanism')}"))
         disp = (s.get("noise") or {}).get("dispersion")
         if isinstance(disp, dict) and disp.get("param"):
-            out[disp["param"]] = disp.get("prior")
+            out.append((disp["param"], disp.get("prior"), f"observations.{s.get('id')}.noise.dispersion"))
     return out
+
+
+def _source_params(sources) -> dict:
+    return {n: p for n, p, _ in source_params(sources)}
 
 
 def validate_pending(s) -> list[str]:
@@ -171,6 +188,23 @@ def validate_pending(s) -> list[str]:
                 (_isnum(disp) and disp > 0) or (isinstance(disp, dict) and disp.get("param")
                                                 and ob._prior_ok(disp.get("prior")) and str(disp.get("source") or ""))):
             bad.append(f"observations.{x.get('id')}.noise.dispersion: a number > 0 or {{param, prior, source}}")
+        if (x.get("frame") or {}).get("excluded"):
+            bad.append(f"observations.{x.get('id')}.frame.excluded: frame exclusions are not supported for a count "
+                       "series in an estimates spec (the out-of-frame population would not change the prediction): "
+                       "declare the frame's population instead, or leave the source out")
+        for b in x.get("bias") if isinstance(x.get("bias"), list) else []:
+            m = (b or {}).get("mechanism") if isinstance(b, dict) else None
+            if m in ob.BIAS and m not in SUPPORTED_BIAS:
+                bad.append(f"observations.{x.get('id')}.bias: mechanism {m} is not applied to a count series by the "
+                           f"estimates path (supported: {', '.join(SUPPORTED_BIAS)})")
+            lo_hi = BIAS_SUPPORT.get(m)
+            pr = (b or {}).get("prior") if isinstance(b, dict) else None
+            if lo_hi and isinstance(pr, dict):
+                r_ = [0.0, 1.0] if pr.get("dist") == "beta" else pr.get("range")
+                if not (isinstance(r_, list) and len(r_) == 2 and all(_isnum(v) for v in r_)
+                        and lo_hi[0] <= r_[0] and r_[1] <= lo_hi[1] and r_[1] > 0):
+                    bad.append(f"observations.{x.get('id')}.bias.{m}: the prior's range must lie in the parameter's "
+                               f"support [{lo_hi[0]:g}, {lo_hi[1]:g}]")
         dl = x.get("delay")
         if dl is not None:
             pmf = dl.get("pmf") if isinstance(dl, dict) else None
@@ -192,10 +226,15 @@ def validate_pending(s) -> list[str]:
             bad.append(f"calibration.priors.{n}: {e}")
         if not str((d or {}).get("source") or "").strip():
             bad.append(f"calibration.priors.{n}: a source is required")
-    for n, d in _source_params(srcs).items():
+    seen = {}
+    for n, d, where in source_params(srcs):
         if n in pri:
-            bad.append(f"calibration.priors.{n}: declared again; observation parameters take their prior from the "
-                       "source")
+            bad.append(f"parameter_name_collision: {where}: {n} is also a calibration prior; observation parameters "
+                       "take their prior from the source and need their own names")
+        if n in seen:
+            bad.append(f"parameter_name_collision: {where}: {n} is also declared at {seen[n]}; give each observation "
+                       "parameter its own name")
+        seen.setdefault(n, where)
         try:
             Prior.from_decl(n, d)
         except ValueError as e:
@@ -209,7 +248,7 @@ def validate_pending(s) -> list[str]:
     if not bad:
         try:
             rows = _read_csv(s.resolve(t["csv"]))
-            steps = [int(float(x[t["step"]])) for x in rows]
+            steps = [integral(x[t["step"]], "calibration.targets: step") for x in rows]
             ys = [float(x[t["observed"]]) for x in rows]
             if not rows or min(steps) < 1 or len(set(steps)) != len(steps):
                 bad.append("calibration.targets: steps must be distinct integers >= 1 (1 = the first step of the horizon)")
@@ -222,8 +261,14 @@ def validate_pending(s) -> list[str]:
     srcs_k = [x.get("kind") for x in (u.get("sources") or []) if isinstance(x, dict)]
     exc = [x for x in (u.get("excluded") or []) if isinstance(x, dict)]
     for k in UQ_KINDS:
-        if k not in srcs_k and not any(e.get("kind") == k and str(e.get("reason") or "").strip() for e in exc):
-            bad.append(f"uncertainty: kind {k} must be a source or excluded with a reason")
+        if k not in srcs_k:
+            bad.append(f"uncertainty: kind {k} must be a source (the joint posterior always carries it)")
+    if exc:
+        bad.append("uncertainty.excluded: not supported for an estimates spec (the posterior samples every declared "
+                   "prior and observation parameter; fix a quantity by declaring it as data instead)")
+    if (r.get("analysis") or {}).get("decision_tests"):
+        bad.append("analysis.decision_tests: not run for an estimates spec (its automatic prior_range tests are); "
+                   "remove them")
     bad += [f"uncertainty.sources: kind {k!r} not in {UQ_KINDS} for an estimates spec" for k in srcs_k
             if k not in UQ_KINDS]
     lv = u.get("level", 0.95)
@@ -305,6 +350,37 @@ def validate(s, eng) -> list[str]:
                        f"{sorted(wm)}")
     if not callable(getattr(eng, "run_batch", None)):
         bad.append(f"engine {card.name}: an estimates spec needs run_batch() (the posterior evaluates many points)")
+    for n, _, where in source_params((s.raw.get("observations") or {}).get("sources")):
+        if n in pnames or n in card.unit_attributes:
+            bad.append(f"parameter_name_collision: {where}: {n} is also an engine "
+                       f"{'parameter' if n in pnames else 'unit attribute'} of {card.name}; observation parameters "
+                       "need their own names")
+    bad += dynamics_problems(s.raw, eng)
+    return bad
+
+
+def dynamics_problems(raw: dict, eng) -> list[str]:
+    """The engine runs the dynamics the spec declares (Codex r1-1): its configuration (`config()`) has the declared
+    generation interval, step and transmissibility. An engine that does not report its configuration cannot be
+    checked and is refused."""
+    cfgf = getattr(eng, "config", None)
+    if not callable(cfgf):
+        return [f"dynamics: engine {eng.describe().name} does not report its configuration (config()), so the "
+                "declared dynamics cannot be checked against what it runs"]
+    try:
+        want = engine_config(raw)
+    except ValueError as e:
+        return [str(e)]
+    got = cfgf()
+    bad = []
+    gw, ww = (got.get("generation_interval") or {}), want["generation_interval"]
+    if got.get("dt") != want["dt"] or gw.get("dt", got.get("dt")) != ww["dt"] or len(gw.get("w") or []) != len(ww["w"]) \
+            or any(abs(float(a) - float(b)) > 1e-12 for a, b in zip(gw.get("w") or [], ww["w"])):
+        bad.append(f"dynamics: the engine runs generation interval {gw} on a {got.get('dt')!r} grid; the spec declares "
+                   f"{ww}")
+    if (got.get("transmissibility") or "constant") != want["transmissibility"]:
+        bad.append(f"dynamics: the engine's transmissibility {got.get('transmissibility')!r} is not the declared "
+                   f"{want['transmissibility']!r}")
     return bad
 
 

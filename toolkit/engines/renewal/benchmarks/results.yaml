@@ -2,7 +2,7 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: renewal
   version: '0.1'
-  code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+  code_sha256: c96d82b550343da48e50dab3293b513f732528b6323f0492fad320dd3d7a26e2
   params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
   config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
 engine_config_sha256: 94e711ded58d7f224c331a0a2451080f249258e8835b5a427fe8ae75b40ce6f0
@@ -306,6 +306,42 @@ benchmarks:
   - 0.030652173913043423
   in_band: true
   status: in_band
+- id: RW5c
+  metric: 'same, and the intervals are not inflated: coverage at most 0.99 (Codex
+    r1-14)'
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.9306521739130434
+  reference: 0.99
+  error_abs: 0.059347826086956545
+  error_rel: 0.059947299077733884
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.059347826086956545
+  in_band: true
+  status: in_band
+- id: RW5d
+  metric: Cori gamma posterior quantiles equal scipy's for a hand-computed window
+    (shape a + sum I, rate 1/b + sum Lambda)
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505, web appendix
+  computed: 2.220446049250313e-16
+  reference: 0.0
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.220446049250313e+284
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
 - id: RW6a
   metric: 'refit of noise-free reported counts from the reference implementation:
     R0 = 1.65 recovered'
@@ -430,7 +466,7 @@ configs_validated:
     engine_identity:
       name: renewal
       version: '0.1'
-      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      code_sha256: c96d82b550343da48e50dab3293b513f732528b6323f0492fad320dd3d7a26e2
       params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
       config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
     config_sha256: f744c114481be70af8fc7b3e687245aa2120a8ef556b0f6d60d198bb2bd6ccbd
@@ -445,7 +481,7 @@ configs_validated:
     engine_identity:
       name: renewal
       version: '0.1'
-      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      code_sha256: c96d82b550343da48e50dab3293b513f732528b6323f0492fad320dd3d7a26e2
       params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
       config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
     config_sha256: 94e711ded58d7f224c331a0a2451080f249258e8835b5a427fe8ae75b40ce6f0
@@ -463,7 +499,7 @@ configs_validated:
     engine_identity:
       name: renewal
       version: '0.1'
-      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      code_sha256: c96d82b550343da48e50dab3293b513f732528b6323f0492fad320dd3d7a26e2
       params_sha256: b964eab4b847df84b953ba3b6b8a77ced3e6bac1f13d3246576a3e2e6af20391
       config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
     config_sha256: 75ffa7222de843d49f079f223fda06ef4fc4e1fd8080ef87a4d275e7c2a3b7c9
@@ -475,7 +511,7 @@ configs_validated:
     engine_identity:
       name: renewal
       version: '0.1'
-      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      code_sha256: c96d82b550343da48e50dab3293b513f732528b6323f0492fad320dd3d7a26e2
       params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
       config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
     config_sha256: b82e6290812283a7b3adcd29fa37ee0052c1eabb56141b6f49332d6a56a15969
@@ -484,15 +520,15 @@ seeds:
 - 1
 n_sims: 10
 summary:
-  in_band: 22
-  total: 23
+  in_band: 24
+  total: 25
   by_status:
-    in_band: 22
+    in_band: 24
     out_of_band: 0
     not_assessable: 1
     band_mis_based: 0
-  held_out_in_band: 22
-  held_out_total: 23
+  held_out_in_band: 24
+  held_out_total: 25
 engine_version: '0.1'
 fit_rule: null
-wall_s: 1.9
+wall_s: 2.3

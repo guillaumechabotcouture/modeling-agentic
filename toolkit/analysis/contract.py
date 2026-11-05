@@ -134,6 +134,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             cal_doc = (rel, doc.get("data") or {})
         if kind == "uncertainty":
             unc_doc = doc.get("data") or {}
+        if kind == "estimates":
+            out += estimates_test_findings(rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
             out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):
@@ -148,6 +150,25 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
+    return out
+
+
+def estimates_test_findings(rel, data) -> list[dict]:
+    """Codex r1-7: the automatic prior_range tests of an estimates run are required. A test that could not be run (an
+    end whose fit was refused), or a result without its verdict, is a finding, never a quiet pass."""
+    out = []
+    tests = data.get("decision_tests") if isinstance(data, dict) else None
+    if not isinstance(tests, list):
+        return [_f("analysis_contract_decision_test", f"{rel}: no decision_tests list (the automatic prior_range "
+                                                      "tests)", rel)]
+    has_rule = isinstance(data.get("decision"), dict) and "verdict" in data["decision"]
+    for t in tests:
+        tid = str((t or {}).get("id"))
+        if not isinstance(t, dict) or t.get("status") != "run":
+            out.append(_f("analysis_contract_decision_test", f"{rel}: automatic test {tid} was not run "
+                                                             f"(status {(t or {}).get('status')!r})", tid))
+        elif has_rule and not isinstance(t.get("decision_changes"), bool):
+            out.append(_f("analysis_contract_decision_test", f"{rel}: automatic test {tid} has no verdict", tid))
     return out
 
 

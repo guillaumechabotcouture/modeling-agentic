@@ -134,7 +134,11 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   keep their stated spread. A quantity the question does not give is a prior over its plausible range, never a
   midpoint. `calibration.targets` names the series file, its source, its step column (1 is the first step of the
   horizon) and its count column.
-- **Uncertainty.** List `calibration` and `observation` as sources, or exclude them with a reason.
+- **Names.** Each observation parameter (a bias parameter, a dispersion) has its own name. It must not be the name of a
+  calibration prior, an engine parameter or an engine unit attribute. Frame exclusions are not supported for a count
+  series. A reporting fraction's prior lies within [0, 1].
+- **Uncertainty.** List `calibration` and `observation` as sources. Exclusions and declared decision tests are
+  refused: the posterior carries every declared prior, and the automatic tests are run.
 - **Outputs.** `deliverable.windows` names the windows. Each output in `deliverable.outputs` is an engine window
   metric (read its card) with the name the question asks for. Check which reproduction number the question means.
   For example, `reff_ref` is the end of the window with the transmissibility of its start; `reff_end` uses the last

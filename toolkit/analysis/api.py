@@ -78,6 +78,9 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
         deps.append(schema.ENGINE_CHOICE)
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
+    gi = ((spec.raw.get("dynamics") or {}).get("generation_interval") or {}).get("csv")
+    if gi:                                  # an estimates spec's cited generation interval (Codex r1-9)
+        deps.append(os.path.relpath(spec.resolve(gi), run_dir))
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
     # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.
     from toolkit.spec import estimates as ES
