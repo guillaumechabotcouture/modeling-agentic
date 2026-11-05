@@ -372,7 +372,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                     raw = yaml.safe_load(fh)
                 if isinstance(raw, dict) and isinstance(raw.get("blockers"), list):
                     refused[reviewer] = raw
-            except (OSError, ValueError, yaml.YAMLError):
+            except Exception:                                # unreadable: its schema errors stand
                 pass
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
@@ -384,7 +384,10 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 if not isinstance(b, dict) or b.get("resolved") is True \
                         or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
                     continue
-                probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
+                try:
+                    probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
+                except Exception as e:                       # a test that cannot be checked is a problem
+                    probs = [f"done_when could not be checked ({type(e).__name__})"]
                 if probs:
                     schema_errors.append(f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: "
                                          f"{'; '.join(probs)[:300]}")
@@ -1957,6 +1960,19 @@ def _self_test() -> int:
         ok(g.get("action") is None and any("carried_forward entry must be a mapping" in e for e in dom)
            and any("blocker D-001 done_when" in e for e in dom),
            f"T76 a refused file's schema errors and its open blockers' done_when problems reach one repair ({dom})")
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001"],
+                        "blockers": [dict(resolved_b, resolved=False,
+                                          done_when=[{"file": "a.md", "contains": "a{4294967296}"}])]},
+                       open(os.path.join(r3, "critique_domain.yaml"), "w"), sort_keys=False)
+        try:
+            g = v2_gate(r3, 2, 3, False, [], history=False, strict_done_when=True)
+        except Exception as e:                                # noqa: BLE001 - the test is that it does not raise
+            g = {"crash": repr(e)}
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        ok(g.get("action") is None and any("carried_forward" in e for e in dom)
+           and any("D-001 done_when" in e for e in dom),
+           f"T76b a done_when the checker cannot evaluate is a schema error, not a crash ({g.get('crash') or dom})")
 
         class Literal(StubTasks):
             """A critic that, like the real ones, fixes exactly the errors it is told and nothing else."""

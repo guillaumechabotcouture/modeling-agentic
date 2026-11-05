@@ -336,6 +336,10 @@ def _load(path: str) -> dict:
         raise SchemaError(f"missing file: {path}")
     except yaml.YAMLError as e:
         raise SchemaError(f"invalid YAML in {path}: {e}")
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError) as e:
+        # A tag or scalar PyYAML cannot construct (`2026-99-99`, `!!bool nonsense`) is not a
+        # YAMLError: still a refused file, never a crash (Codex review round 2).
+        raise SchemaError(f"{os.path.basename(path)}: YAML that cannot be read: {type(e).__name__}: {e}"[:300])
     _require(isinstance(doc, dict), f"{path}: top-level must be a mapping")
     return doc
 
@@ -4672,6 +4676,22 @@ def _run_self_test() -> int:
         ok(len(errs) >= 3 and any("structural_mismatch" in e for e in errs)
            and any("blockers must be a list" in e for e in errs) and any("carried_forward" in e for e in errs),
            f"SE4 a malformed file fails closed with each problem named, without crashing: {errs}")
+
+    # SE7 (Codex review round 2): YAML PyYAML cannot construct is a refused file, not a crash.
+    with tempfile.TemporaryDirectory() as d:
+        bad = []
+        for i, body in enumerate(("x: 2026-99-99\n", "x: !!bool nonsense\n", "x: !!timestamp nope\n")):
+            pth = os.path.join(d, f"critique_domain_{i}.yaml")
+            with open(pth, "w") as fh:
+                fh.write("reviewer: critique-domain\nround: 1\n" + body)
+            try:
+                validate_critique(pth, "critique-domain", 1)
+                bad.append((i, "accepted"))
+            except SchemaError:
+                pass
+            except Exception as e:                            # noqa: BLE001 - the test is that it does not raise
+                bad.append((i, repr(e)))
+        ok(not bad, f"SE7 unconstructible YAML is a SchemaError: {bad}")
 
     # --- Phase 39 α: presentation polish waits for the first draft ---
     with tempfile.TemporaryDirectory() as d:
