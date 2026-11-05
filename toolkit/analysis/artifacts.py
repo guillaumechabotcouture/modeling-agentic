@@ -45,6 +45,7 @@ KINDS = {
     "figures": ("figures",),
     "trajectories": ("status", "sample", "series"),
     "claims": ("n_claims", "unresolved"),
+    "estimates": ("outputs", "windows", "decision", "determined"),     # deliverable kind estimates (v2d §2.3)
     "blocked": ("reason", "corrections"),
 }
 

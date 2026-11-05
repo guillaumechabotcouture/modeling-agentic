@@ -324,6 +324,7 @@ REVIEWED: dict = {
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
     "toolkit/engines/compartmental/benchmarks/runtime_spike.py": {"open-write": (1, _REPO)},
     "toolkit/engines/compartmental/engine.py": {"open-write": (1, _REPO + " (write_card)")},
+    "toolkit/engines/renewal/engine.py": {"open-write": (1, _REPO + " (write_card)")},
     "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/equilibration.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/guess_sensitivity.py": {"open-write": (1, _REPO)},

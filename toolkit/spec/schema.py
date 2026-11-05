@@ -137,7 +137,7 @@ OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-car
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
                      "emulator": "emulator error"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope")
-DELIVERABLE_KINDS = ("package_per_unit",)
+DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
     "likelihood": ("attribute", "range", "parameters", "targets"),
@@ -586,6 +586,8 @@ def attribute_problems(s: Spec, eng) -> list[str]:
         acc = {}
     cal = s.raw.get("calibration") or {}
     moved = {cal.get("attribute")} if cal.get("method") not in (None, "none") else set()
+    if cal.get("method") == "posterior":     # a unit attribute with a declared prior is moved by the calibration
+        moved |= set(cal.get("priors") or {})
     for a in card.unit_attributes:
         if a in ea or a in moved:
             continue
@@ -625,6 +627,10 @@ def frame_problems(s: Spec) -> list[str]:
     else:
         t = cal.get("targets") or {}
         compared = t.get("outcome", (s.raw.get("objective") or {}).get("outcome"))
+        if compared is None:            # an estimates spec: the latent quantity of the target's source
+            src = [x for x in ((s.raw.get("observations") or {}).get("sources") or [])
+                   if isinstance(x, dict) and x.get("id") == t.get("source")]
+            compared = ((src[0].get("latent") or {}).get("quantity")) if src else None
         fr, where = t.get("frame"), "calibration.targets.frame"
     if not (isinstance(fr, dict) and str(fr.get("band") or "").strip() and str(fr.get("source") or "").strip()):
         return [f"target_frame_unmapped: {where}: declare the frame of the calibration target {{band, source}}: the "
@@ -651,6 +657,9 @@ def with_engine(s: Spec, ref: str, config: dict | None = None) -> Spec:
 def _validate_pending(s: Spec) -> list[str]:
     """engine: auto before the choice: everything that does not need the engine card."""
     r = s.raw
+    from toolkit.spec import estimates as ES
+    if ES.is_estimates(r):              # no allocation units: its own sections (v2d §2.3)
+        return ES.validate_pending(s)
     bad = [f"missing section {k}" for k in REQUIRED if k not in r]
     if bad:
         return bad
@@ -690,6 +699,18 @@ def _validate_pending(s: Spec) -> list[str]:
 
 def _validate(s: Spec) -> list[str]:
     r = s.raw
+    from toolkit.spec import estimates as ES
+    if ES.is_estimates(r):              # no allocation units: its own sections (v2d §2.3)
+        bad = ES.validate_pending(s)
+        if bad:
+            return bad
+        try:
+            eng = s.engine()
+        except Exception as e:  # noqa: BLE001
+            return [f"engine {r['engine']} does not load: {type(e).__name__}: {e}"]
+        if not isinstance(eng, Engine):
+            return ["engine does not implement the Engine contract (describe, parameters, run)"]
+        return ES.validate(s, eng)
     bad = [f"missing section {k}" for k in REQUIRED if k not in r]
     if bad:
         return bad

@@ -1,0 +1,14 @@
+# How the spec must bind each unit attribute of this engine (docs/design/v2-derived-inputs.md §3.3). Card metadata:
+# not engine code, so the engine's code fingerprint and its benchmark stamps are unchanged.
+#   required                         the spec binds it (decision_units.engine_attributes, or calibration.priors moves it)
+#   {default, meaning}               the engine's value when it is not given; the spec binds it, moves it in the
+#                                    calibration, or accepts the default by name (decision_units.defaults_accepted)
+# The defaults are the values engine.py applies.
+attribute_binding:
+  N: required
+  s0:
+    default: 1.0
+    meaning: "everyone susceptible at the start (no prior immunity)"
+  seed:
+    default: 1.0e-6
+    meaning: "infections in the step before the start, a 1e-6 share of the population"
