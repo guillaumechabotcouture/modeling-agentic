@@ -23,7 +23,7 @@ old_configs:
 new_identity:
   name: compartmental-starsim
   version: '0.2'
-  code_sha256: 5b6f2ec81a7133e9c73ef1d207d5ab986797af89c9332b43ae015264ae43d19f
+  code_sha256: 5e3037eca7230415a11e5ea3b83795aeb945805642eddd4e7ebdcffae914d513
   params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
   config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
 digests:

@@ -34,6 +34,8 @@ docs/design/v2-spec-and-analysis.md §1):
       populations: {total: pop}            # alloc population names -> unit columns
       components: {c1: {group: g}, ...}
       packages: {generate: true} | {name: [components]}
+                                       # {generate: true, within_envelope: true}: drop the generated packages no
+                                       # plan can afford (cost lower bound above the envelope in every unit)
       engine_map: {c1: {engine_component: value}}
       prices: {...}
       cost_items: [...]
@@ -60,6 +62,8 @@ docs/design/v2-spec-and-analysis.md §1):
     calibration:
       method: emulator_inversion | likelihood | posterior | none
       ...                                  # see CALIBRATION_FIELDS
+      targets: {kind: observations, ...}   # posterior on observations of group states and outcomes through
+                                       # declared sources (toolkit/analysis/observed_targets.py)
       target_frame: {band, source, mapping: {to, method, source}}   # the population band the target measures; a
                                            # mapping when it is not the compared output's (targets.frame for a panel)
     uncertainty:                           # spike lesson 6: sources declared up front
@@ -86,6 +90,9 @@ docs/design/v2-spec-and-analysis.md §1):
       allocation_file: allocation_optimized.csv
       columns: {unit: district, package: package, value: cases_averted}
       headline: {name: total_cases_averted, outcome: cases}
+      by_group: {columns: {group, quantity, value}, quantity: {<engine group>: <cost_outputs name>}}
+                                       # optional: one row per (unit, engine group) with the plan's quantity and
+                                       # the outcome averted there (a joint package within a unit)
 
 Every check names the section it failed. Nothing here names a disease, a place or an
 intervention; those live in engines and specs.

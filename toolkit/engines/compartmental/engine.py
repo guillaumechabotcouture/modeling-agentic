@@ -456,6 +456,10 @@ def _component_class():
 
 # ------------------------------------------------------------------------------------ engine
 class CompartmentalEngine:
+    # run_batch() equals run() pair by pair (self-test K3, rel 1e-12), with one unit and one package per pair: the
+    # direct outcome model may evaluate a whole draw in batches (toolkit/analysis/model.py DirectModel)
+    batch_equals_run = True
+
     def __init__(self, groups=("all",), structure="single_group", mode="to_extinction", initialiser="given",
                  dt="day", generation_interval=(1.0,), transmission="r0", forcing="none", forcing_period=365.0,
                  forcing_ref_phase=0.0, importation="deterministic", offspring="poisson", components=None,
