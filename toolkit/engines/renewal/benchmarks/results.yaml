@@ -1,0 +1,498 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: renewal
+  version: '0.1'
+  code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+  params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
+  config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
+engine_config_sha256: 94e711ded58d7f224c331a0a2451080f249258e8835b5a427fe8ae75b40ce6f0
+benchmarks:
+- id: RW1a
+  metric: 'growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine''s growth rate,
+    R0 = 1.3'
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 1.3
+  reference: 1.3000004960871179
+  error_abs: 4.960871178294468e-07
+  error_rel: 3.8160532963073746e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 4.960871178294468e-07
+  in_band: true
+  status: in_band
+- id: RW1b
+  metric: same, R0 = 2.5
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 2.5
+  reference: 2.4999996772739044
+  error_abs: 3.2272609562511434e-07
+  error_rel: 1.2909045491438915e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 3.2272609562511434e-07
+  in_band: true
+  status: in_band
+- id: RW1c
+  metric: same in decline, R0 = 0.8 (negative growth rate)
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 0.8
+  reference: 0.8000008596511359
+  error_abs: 8.596511358316405e-07
+  error_rel: 1.0745627651031737e-06
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 8.596511358316405e-07
+  in_band: true
+  status: in_band
+- id: RW2a
+  metric: final size, R0 = 1.5, weekly steps
+  role: held_out
+  target: null
+  band: null
+  source: Kermack & McKendrick (1927); fixed point
+  computed: 0.5828116439806399
+  reference: 0.5828116439806399
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW2b
+  metric: final size, R0 = 4
+  role: held_out
+  target: null
+  band: null
+  source: Kermack & McKendrick (1927); fixed point
+  computed: 0.9801725977397572
+  reference: 0.980172597739757
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.265362298814089e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW2c
+  metric: final size with 70% initially susceptible, R0 = 2.5
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.49888865957827905
+  reference: 0.4988886595782783
+  error_abs: 7.216449660063518e-16
+  error_rel: 1.4465050510796824e-15
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 7.216449660063518e-16
+  in_band: true
+  status: in_band
+- id: RW2d
+  metric: final size at daily steps (any step length), R0 = 2
+  role: held_out
+  target: null
+  band: null
+  source: exponential-survival identity
+  computed: 0.7968121293623034
+  reference: 0.7968121293623036
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.7866619588576763e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW2e
+  metric: 'negative control: the linear renewal form misses the final size (w_1 =
+    1, R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: design note v2d, Codex review finding 2
+  computed: 0.8687075595459232
+  reference: 0.7968121293623036
+  error_abs: 0.07189543018361955
+  error_rel: 0.09022883504692399
+  tolerance:
+    abs: 0.05
+  compare: differ
+  per_seed_error_abs:
+  - 0.07189543018361955
+  in_band: true
+  status: in_band
+- id: RW2f
+  metric: the engine's own w_1 = 1 configuration meets the final size the linear form
+    misses
+  role: held_out
+  target: null
+  band: null
+  source: exponential-survival identity
+  computed: 0.7968121293623038
+  reference: 0.7968121293623036
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.7866619588576763e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW3a
+  metric: reff_end = R0 S_end / N (constant transmissibility)
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.5296758273296579
+  reference: 0.5296758273296579
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW3b
+  metric: reff_end < 1 after a major epidemic
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 0.5296758273296579
+  reference: 1.0
+  error_abs: 0.4703241726703421
+  error_rel: 0.4703241726703421
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.4703241726703421
+  in_band: true
+  status: in_band
+- id: RW3c
+  metric: attack_rate counts only infections inside a window that starts with S <
+    N
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.49256269510491524
+  reference: 0.4925626951049153
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.126986509188115e-16
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: RW3d
+  metric: 'piecewise transmissibility: reff_ref = R0 S_end / N with the reference
+    piece'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 1.294240671755704
+  reference: 1.294240671755704
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW3e
+  metric: 'piecewise transmissibility: reff_end = R0 m_1 S_end / N with the last piece''s
+    multiplier'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.7765444030534224
+  reference: 0.7765444030534224
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW4
+  metric: 'scale invariance: (R0, s0, N) and (R0 s0, 1, s0 N) give the same counts
+    and reff_end (so a case series alone does not separate the initial susceptible
+    share from R0 or the attack rate)'
+  role: held_out
+  target: null
+  band: null
+  source: identity of the renewal equation in S/N
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-10
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW5a
+  metric: Cori estimator recovers a known piecewise R_t (1.6 then 0.8) from the engine's
+    expected series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.0003043138673866075
+  reference: 0.01
+  error_abs: 0.009695686132613393
+  error_rel: 0.9695686132613393
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.009695686132613393
+  in_band: true
+  status: in_band
+- id: RW5b
+  metric: Cori 95% intervals cover the known R_t on Poisson-reported series (reporting
+    1/10, 200 replicates)
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.9
+  reference: 0.9306521739130434
+  error_abs: 0.030652173913043423
+  error_rel: 0.03293622985283806
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.030652173913043423
+  in_band: true
+  status: in_band
+- id: RW6a
+  metric: 'refit of noise-free reported counts from the reference implementation:
+    R0 = 1.65 recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 1.649999976568264
+  reference: 1.65
+  error_abs: 2.3431735884926752e-08
+  error_rel: 1.420105205147076e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 2.3431735884926752e-08
+  in_band: true
+  status: in_band
+- id: RW6b
+  metric: 'same refit: the reporting fraction 0.03 is recovered when s0 is known and
+    the epidemic turns over'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.030000000524392244
+  reference: 0.03
+  error_abs: 5.243922449049698e-10
+  error_rel: 1.747974149683233e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 5.243922449049698e-10
+  in_band: true
+  status: in_band
+- id: RW6c
+  metric: 'same refit: reff_end recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.5576282312615415
+  reference: 0.5576282187178642
+  error_abs: 1.2543677319065694e-08
+  error_rel: 2.2494696103986542e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 1.2543677319065694e-08
+  in_band: true
+  status: in_band
+- id: RW7
+  metric: the engine's incidence equals a second loop-by-loop implementation of the
+    declared process
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 1.500182690381747e-11
+  reference: 0.0
+  error_abs: 1.500182690381747e-11
+  error_rel: 1.5001826903817469e+289
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.500182690381747e-11
+  in_band: true
+  status: in_band
+- id: RW8
+  metric: the reference implementation's attack rate over one season equals the engine's
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.688225983923731
+  reference: 0.6882259839237311
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.613166388016223e-16
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RW9
+  metric: published reproduction-number estimates from incidence series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505, worked examples (1918 pandemic
+    influenza, SARS 2003, measles 1861)
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed
+    with a quoted span through the evidence service'
+initialisation:
+  method: susceptible share s0 and seed infections set at the start (unit attributes);
+    no burn-in
+  evidence:
+  - RW2a
+  - RW2c
+  - RW7
+settings_calibrated: {}
+fitted_used: {}
+configs_validated:
+  day5:
+    config:
+      generation_interval:
+        dt: day
+        w:
+        - 0.1
+        - 0.3
+        - 0.3
+        - 0.2
+        - 0.1
+      dt: day
+    engine_identity:
+      name: renewal
+      version: '0.1'
+      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
+      config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
+    config_sha256: f744c114481be70af8fc7b3e687245aa2120a8ef556b0f6d60d198bb2bd6ccbd
+  week4:
+    config:
+      generation_interval:
+      - 0.2
+      - 0.4
+      - 0.25
+      - 0.15
+      dt: week
+    engine_identity:
+      name: renewal
+      version: '0.1'
+      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
+      config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
+    config_sha256: 94e711ded58d7f224c331a0a2451080f249258e8835b5a427fe8ae75b40ce6f0
+  week4_piece:
+    config:
+      generation_interval:
+      - 0.2
+      - 0.4
+      - 0.25
+      - 0.15
+      dt: week
+      transmissibility:
+        knots:
+        - 0.38329911019849416
+    engine_identity:
+      name: renewal
+      version: '0.1'
+      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      params_sha256: b964eab4b847df84b953ba3b6b8a77ced3e6bac1f13d3246576a3e2e6af20391
+      config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
+    config_sha256: 75ffa7222de843d49f079f223fda06ef4fc4e1fd8080ef87a4d275e7c2a3b7c9
+  week_w1:
+    config:
+      generation_interval:
+      - 1.0
+      dt: week
+    engine_identity:
+      name: renewal
+      version: '0.1'
+      code_sha256: 1eff7376cebc3477cd6b52ca644c695a7221bf94a508409679cdc0a06159923f
+      params_sha256: 4cd62fb74cc1378ce426a55386ab72c9a80e026e139f8fbd20c11e3404a1c653
+      config_sha256: 6bd01cdeaac7a80795197fdfa916475323b4fc800a34d4083dca8e47f926cff1
+    config_sha256: b82e6290812283a7b3adcd29fa37ee0052c1eabb56141b6f49332d6a56a15969
+configs_not_exercised: []
+seeds:
+- 1
+n_sims: 10
+summary:
+  in_band: 22
+  total: 23
+  by_status:
+    in_band: 22
+    out_of_band: 0
+    not_assessable: 1
+    band_mis_based: 0
+  held_out_in_band: 22
+  held_out_total: 23
+engine_version: '0.1'
+fit_rule: null
+wall_s: 1.9
