@@ -1,9 +1,9 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.10'
-  code_sha256: 64f39ca0a29b44d37b8fd5c4a00173cbe5a9593f4e68e63ee67a32d29a8171f8
-  params_sha256: b681feff078ed0ee914a0adb64035aff97a287370b3dc5c8fe19c4a4ed0f26b8
+  version: '0.11'
+  code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
+  params_sha256: 507912ed97660d905d0cfa2ed2e898383a3debc37858c68be18ddaa18d6ecfbb
   config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3
 benchmarks:
 - id: B7
@@ -254,19 +254,19 @@ benchmarks:
   - 0.14
   - 0.4
   source: C27 Thwing 2024 AJTMH
-  computed: 0.3596
-  se_log: 0.0088
+  computed: 0.2858
+  se_log: 0.0151
   per_seed:
-  - 0.3543
-  - 0.3521
-  - 0.3586
-  - 0.3461
-  - 0.3676
-  - 0.359
-  - 0.3706
-  - 0.3696
-  seed_min: 0.3461
-  seed_max: 0.3706
+  - 0.3023
+  - 0.2665
+  - 0.2814
+  - 0.2894
+  - 0.2969
+  - 0.2948
+  - 0.2739
+  - 0.2831
+  seed_min: 0.2665
+  seed_max: 0.3023
   in_band: true
   status: in_band
 - id: B15
@@ -378,25 +378,25 @@ benchmarks:
   - 7.67
   - 191.9
   source: C28 Gilmartin 2021
-  computed: 19.0239
-  outcome_averted_per_capita: 0.1004
-  cost_per_capita: 1.9091
+  computed: 14.6854
+  outcome_averted_per_capita: 0.1172
+  cost_per_capita: 1.7211
   comparator_outcome_per_capita: 0.3667
-  share_averted: 0.2737
-  price_floor: 5.2061
+  share_averted: 0.3196
+  price_floor: 4.6934
   target_below_price_floor: false
-  share_averted_needed_for_band: 0.0271
+  share_averted_needed_for_band: 0.0245
   per_seed:
-  - 19.8474
-  - 17.1887
-  - 20.0931
-  - 17.959
-  - 21.0743
-  - 17.7573
-  - 19.8907
-  - 19.1449
-  seed_min: 17.1887
-  seed_max: 21.0743
+  - 15.5727
+  - 13.9535
+  - 14.5643
+  - 15.9721
+  - 14.866
+  - 13.8863
+  - 14.3566
+  - 14.6027
+  seed_min: 13.8863
+  seed_max: 15.9721
   in_band: true
   status: in_band
 - id: B18
@@ -665,81 +665,6 @@ summary:
     band_mis_based: 0
   held_out_in_band: 9
   held_out_total: 12
-engine_version: '0.10'
+engine_version: '0.11'
 fit_rule: joint-v1
-wall_s: 2521.3
-restamped:
-  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-  proof_identical: true
-  scope:
-    pack_settings:
-    - benin
-    - ce_ref
-    - ce_res
-    - cochrane_itn
-    - eir_1
-    - eir_10
-    - eir_100
-    - eir_3
-    - eir_30
-    - eir_300
-    - irs_added
-    - misungwi
-    - muleba
-    - sahel_smc
-    pack_arms: every arm of each setting, in one run_batch per setting and seed
-    seeds:
-    - 11
-    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
-      sensitivity the card's 4000
-    burnin_years: the card's (50), the pack's own
-    evidence_cases:
-    - - equilibration
-      - - 3.5
-        - base
-        - burnin_years: 50
-        - 1
-    - - equilibration
-      - - 28.0
-        - doubled
-        - burnin_years: 100
-        - 1
-    - - equilibration
-      - - 9.0
-        - guess_hi
-        - burnin_years: 50
-          init_eir_per_m0: 2.4
-        - 2
-    - - guess_sensitivity
-      - - 3.5
-        - x1
-        - 1
-        - 50
-    - - guess_sensitivity
-      - - 28.0
-        - x0.25
-        - 2
-        - 50
-    scenarios:
-      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-      heterogeneous: 5 members, seed 23, delivery None
-      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-    not_repeated: calibration-grid runs (same code path at other attribute values)
-    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-      dicts exactly
-  old_engine_version: '0.9'
-  proof_script_commit: ade919c26daa87496120d326f08ff5570daf556f
-  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
-    is pending.
-  confirmation:
-    validate_once: pending
-    evidence: null
-  old_identity:
-    name: malaria-starsim
-    version: '0.9'
-    code_sha256: 2a194886e13b30a610575d5f17c04958745f10b36a1dbdd571294f65420d3c8b
-    params_sha256: b681feff078ed0ee914a0adb64035aff97a287370b3dc5c8fe19c4a4ed0f26b8
-    config_sha256: 4b86811a290ba8b0d9cff872a840ee2d2e4543eee525495e640008bcf214032c
+wall_s: 2832.9

@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.10'
+version: '0.11'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -15,7 +15,8 @@ mechanisms:
 - 'households: correlated net use within households, correlated net use and spraying, biting heterogeneity correlated
   with net non-use'
 - ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)
-- SMC (28-day protection, clearance); case management (effective treatment)
+- 'SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); case
+  management (effective treatment)'
 - 'delivery period distinct from the outcome window: components act and cost drivers count only in delivery years;
   routine net campaigns after the package''s campaign in every arm (v0.6)'
 - routine SMC in every arm after the delivery period, uncharged (v0.7)
@@ -406,19 +407,19 @@ benchmarks:
   - 0.14
   - 0.4
   source: C27 Thwing 2024 AJTMH
-  computed: 0.3596
-  se_log: 0.0088
+  computed: 0.2858
+  se_log: 0.0151
   per_seed:
-  - 0.3543
-  - 0.3521
-  - 0.3586
-  - 0.3461
-  - 0.3676
-  - 0.359
-  - 0.3706
-  - 0.3696
-  seed_min: 0.3461
-  seed_max: 0.3706
+  - 0.3023
+  - 0.2665
+  - 0.2814
+  - 0.2894
+  - 0.2969
+  - 0.2948
+  - 0.2739
+  - 0.2831
+  seed_min: 0.2665
+  seed_max: 0.3023
   in_band: true
   status: in_band
 - id: B15
@@ -529,25 +530,25 @@ benchmarks:
   - 7.67
   - 191.9
   source: C28 Gilmartin 2021
-  computed: 19.0239
-  outcome_averted_per_capita: 0.1004
-  cost_per_capita: 1.9091
+  computed: 14.6854
+  outcome_averted_per_capita: 0.1172
+  cost_per_capita: 1.7211
   comparator_outcome_per_capita: 0.3667
-  share_averted: 0.2737
-  price_floor: 5.2061
+  share_averted: 0.3196
+  price_floor: 4.6934
   target_below_price_floor: false
-  share_averted_needed_for_band: 0.0271
+  share_averted_needed_for_band: 0.0245
   per_seed:
-  - 19.8474
-  - 17.1887
-  - 20.0931
-  - 17.959
-  - 21.0743
-  - 17.7573
-  - 19.8907
-  - 19.1449
-  seed_min: 17.1887
-  seed_max: 21.0743
+  - 15.5727
+  - 13.9535
+  - 14.5643
+  - 15.9721
+  - 14.866
+  - 13.8863
+  - 14.3566
+  - 14.6027
+  seed_min: 13.8863
+  seed_max: 15.9721
   in_band: true
   status: in_band
 - id: B18
@@ -780,21 +781,78 @@ parameters:
     equations for P_att, P_Bmu, P_Cmu; Additional file 2 Table S9 (coefficients, H_max) and the PermaNet 2.0 target
     content 55 mg/m2; Table 3 (median of seven cohorts'' mean ln holed area at 24 months)'
   verified: matched
-- name: smc_pe
-  value: 0.882
+- name: smc_cov
+  value: 0.796
   kind: fixed
   units: share
-  lo: 0.787
-  hi: 0.934
-  source: ACCESS-SMC Partnership 2020 Lancet 10.1016/S0140-6736(20)32227-3
+  lo: 0.521
+  hi: 0.957
+  source: 'Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage
+    and quality in Burkina Faso, Chad, Nigeria, and Togo, Table 21 (Nigeria 2020, end-of-round, n = 7,898): cycles
+    received none 6.0%, one 5.2%, two 13.3%, three 15.3%, four 60.2%; mean per-round reach of the beta-binomial
+    fit (mean of the cycles 0.796). Range: ACCESS-SMC Partnership 2020 Lancet (PMC7718580) Table 1, Nigeria 2016
+    mean coverage per month 52.1%, to the Malaria Consortium 2022 report, Table 0, Nigeria cycle 2 day-1 coverage
+    95.7%'
   verified: matched
-- name: smc_hi_frac
-  value: 0.85
+- name: smc_rho
+  value: 0.417
+  kind: fixed
+  units: correlation
+  lo: null
+  hi: null
+  source: 'intra-child correlation of the beta-binomial fitted by maximum likelihood to Malaria Consortium 2021,
+    Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and quality in Burkina Faso, Chad,
+    Nigeria, and Togo, Table 21 (predicts 5.5 / 7.4 / 10.3 / 16.6 / 60.1% for 0-4 cycles)'
+  verified: matched
+- name: smc_adh
+  value: 0.944
+  kind: fixed
+  units: share
+  lo: 0.842
+  hi: 0.986
+  source: 'Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage
+    and quality in Burkina Faso, Chad, Nigeria, and Togo, Table 16: full three-day course among day-1 recipients,
+    Nigeria end-of-round cycle 4, 94.4% (93.2-95.1). Range: ACCESS-SMC Nigeria 2015 key indicators 84.2%; the Malaria
+    Consortium 2021 report, Table 18, 98.6%'
+  verified: matched
+- name: smc_e0
+  value: 1.0
   kind: fixed
   units: share
   lo: null
   hi: null
-  source: E7 attempt 8 value (models/malaria_abm.py VC), kept (SMC access groups)
+  source: 'Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282), Table 1: SMC-SP+AQ initial efficacy
+    100% (pre-erythrocytic protection from infection, Eq 1)'
+  verified: matched
+- name: smc_half
+  value: 32.0
+  kind: fixed
+  units: days
+  lo: 24.0
+  hi: 32.0
+  source: 'Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282), Table 1: SMC-SP+AQ half-life 32
+    days. Range: Braunack-Mayer et al. 2024 Lancet Glob Health (PMC10882206), Results: a liver-stage protection
+    half-life of 24-30 days behaves like SP+AQ'
+  verified: matched
+- name: smc_k
+  value: 5.4
+  kind: fixed
+  units: shape
+  lo: null
+  hi: null
+  source: 'Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282), Table 1: Weibull decay shape k
+    = 5.4, E(t) = E0 exp(-(t/L)^k ln2) (Eq 1); Braunack-Mayer 2024 Table 1: 5.34'
+  verified: matched
+- name: smc_partial
+  value: 0.91
+  kind: fixed
+  units: share
+  lo: null
+  hi: null
+  source: 'Cairns et al. 2022 BMC Med 20:352 (PMC9540742), Results: 30-day protective efficacy 79.8% (33.7-93.8)
+    with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7. Assumption (Codex r1 P2-5): the ratio of
+    two 30-day clinical PEs is applied as a multiplier on the initial infection-blocking efficacy, with the same
+    decay and clearance'
   verified: unverified
 - name: cm_add
   value: 0.15

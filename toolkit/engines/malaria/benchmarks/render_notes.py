@@ -218,7 +218,8 @@ def write(path=NOTES) -> None:
                    extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
                           (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"),
                            ("v0.3", "results_v0.3.yaml"), ("v0.4", "results_v0.4.yaml"),
-                           ("v0.5–v0.8", "results_v0.8.yaml"))     # v0.9: the exponential-attrition numbers
+                           ("v0.5–v0.8", "results_v0.8.yaml"),     # v0.9: the exponential-attrition numbers
+                           ("v0.9–v0.10", "results_v0.10.yaml"))   # v0.11: the v0.10 SMC mechanism (v0.9 numbers)
                           if os.path.exists(os.path.join(HERE, "history", f))])
     eq = _y(os.path.join(HERE, "equilibration.yaml"))
     if eq:

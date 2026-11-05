@@ -21,13 +21,60 @@ priors:
     source: "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080): ITN use among those with
       access, all countries, 87.1% (83.3-90.1)"
     verified: matched
-  smc_pe:
+  # v0.11 (ENGINE_NOTES.md, v0.11): smc_pe and smc_hi_frac are gone; ACCESS-SMC's 88.2% is a check, not an input
+  smc_cov:
     dist: triangular
-    range: [0.787, 0.934]
-    source: "ACCESS-SMC Partnership 2020 Lancet 396:1829, 10.1016/S0140-6736(20)32227-3 (PMC7718580): protective
-      effectiveness 88.2% (95% CI 78.7-93.4) over 28 days, children 3-59 months, 7 Sahel countries incl. Nigeria
-      (attempt 8 C25)"
+    range: [0.521, 0.957]
+    source: "Malaria Consortium 2020 coverage report (Quantitative report on SMC supported by Malaria Consortium in
+      2020), Table 21: Nigeria cycles received 6.0 / 5.2 / 13.3 / 15.3 / 60.2% for 0-4 cycles, mean per round 0.796.
+      Range: ACCESS-SMC Partnership 2020 Lancet (PMC7718580) Table 1, Nigeria 2016 mean coverage per month 52.1%; the
+      Malaria Consortium 2022 report, Table 0, Nigeria cycle 2 day-1 coverage 95.7% (end-of-cycle)"
     verified: matched
+    note: "the range spans survey years, survey types (end-of-round recall vs end-of-cycle) and programmes, not a
+      sampling interval; a state's own survey value can be set through a run spec's engine_parameters"
+  smc_adh:
+    dist: triangular
+    range: [0.842, 0.986]
+    source: "Malaria Consortium 2020 coverage report, Table 16: full three-day course among day-1 recipients, Nigeria
+      94.4% (93.2-95.1). Range: ACCESS-SMC Nigeria 2015 key indicators 84.2%; Malaria Consortium 2021 report Table 18,
+      98.6%"
+    verified: matched
+  # owner guidance 2026-11-05: every SMC parameter but the shape smc_k is carried as a sourced range; the engine's
+  # point value is the central reference, and which values inside the ranges agree with data is for a joint calibration.
+  # The card's lo/hi for smc_rho, smc_e0 and smc_partial stay empty (engine code unchanged after the benchmark run);
+  # their ranges are here.
+  smc_rho:
+    dist: triangular
+    range: [0.417, 0.600]
+    source: "beta-binomial fits (maximum likelihood, mean and intra-child correlation) to the Nigeria distributions of
+      cycles received: Malaria Consortium 2020 report Table 21 (rho 0.417, mean 0.796), 2022 report Table 30 4-cycle
+      areas (0.600, 0.943), 2023 report Table 33 4-cycle areas (0.446, 0.933); ACCESS-SMC Nigeria 2015 key
+      indicators, binned (0.555, 0.648)"
+    verified: matched
+    note: "derived by this engine from the published distributions (ENGINE_NOTES.md, v0.11); the point value is the
+      2020 survey, the one covering Jigawa, Kano and Katsina"
+  smc_e0:
+    dist: triangular
+    range: [0.90, 1.00]
+    source: "Burgert et al. 2022 Table 1 (initial efficacy 100%); Cairns et al. 2022 BMC Med 20:352, Abstract:
+      protection 'exceeded 90% in the first 2-3 weeks ... but was not 100%, even immediately post-administration'"
+    verified: matched
+  smc_partial:
+    dist: triangular
+    range: [0.384, 1.00]
+    source: "Cairns et al. 2022 BMC Med 20:352, Results: 30-day PE 79.8% (95% CI 33.7-93.8) with the day-1 dose only vs
+      87.7% with all three; range 33.7 / 87.7 to 93.8 / 87.7 capped at 1"
+    verified: unverified
+    note: "the mapping of a clinical-PE ratio onto initial infection-blocking efficacy is an assumption
+      (ENGINE_NOTES.md, v0.11)"
+  smc_half:
+    dist: triangular
+    range: [24.0, 32.0]
+    source: "Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282), Table 1: SMC-SP+AQ protection
+      half-life 32 days (Weibull, k 5.4); Braunack-Mayer et al. 2024 Lancet Glob Health 12:e478 (PMC10882206),
+      Results: a liver-stage protection half-life of 24-30 days behaves like SP+AQ"
+    verified: matched
+    note: "two model fits to the same trial (Zongo 2015, clinical malaria); the point value is the upper end"
   dw_moderate:
     dist: triangular
     range: [0.032, 0.074]
@@ -64,7 +111,7 @@ fixed:
   cov_corr: "the card's range [0, 0.9] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
   exp_corr: "the card's range [0, 0.6] is an assumption with no source (varied in the ENGINE_NOTES sensitivity scan)"
   use_persist: "the card's range [0, 1] is an assumption with no source"
-  smc_hi_frac: "no published range (attempt 8 value)"
+  smc_k: "Burgert 2022 Table 1 (5.4) and Braunack-Mayer 2024 Table 1 (5.34) agree; no range is published"
   cfr_severe_untreated: "attempt 8's range 0.15-0.50 (C49) is a modeller assumption; no published estimate was located"
   severe_access_add: "no published range (attempt 8 value)"
   dur_moderate_d: "no published range (attempt 8 value)"
@@ -78,7 +125,8 @@ settings: [n_agents, net_holes, burnin_years, init_eir_per_m0]   # v0.5: numeric
 not_exposed:
   hut_trial_coefficients: "Churcher et al. 2016 Table 6 coefficients are module constants (vector.CHURCHER), not engine
     parameters; drawing them needs an engine change (code fingerprint, benchmark re-stamp)"
-  smc_protection_days: "the SMC protection duration is a module constant (model.py), not an engine parameter"
+  smc_clearance: "v0.11: every child reached is cleared of blood-stage infection at dosing (model.SMCDelivery), as in
+    Burgert 2022's model; no source in hand gives a lower probability, so it is not a parameter"
   species_bionomics: "Q0, phi_I, phi_B, mu0 per species are module constants (vector.SPECIES), not engine parameters"
   natural_history: "the Griffin-lite natural-history constants (model.py) are fixed by design (GRIFFIN)"
 # v0.9: country-specific values a run spec can cite (not read by toolkit/spec/priors.py). A spec sets one through
