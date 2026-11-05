@@ -10,7 +10,7 @@ commit: "v0.11 α–δ"
 Up to v0.10, every child reached was cleared of infection and then protected against infection at a flat `smc_pe` = 0.882 for 28 days. That value is the ACCESS-SMC protective effectiveness against *clinical malaria*. The per-round reach came from two unsourced access groups (`smc_hi_frac` 0.85).
 
 v0.11 changes the mechanism in four places (`model.SMCDelivery`):
-- **Reach.** A child's per-round reach is a persistent beta propensity with mean `smc_cov` = 0.796 and intra-child correlation `smc_rho` = 0.417. These come from a beta-binomial fit to the Nigeria 2020 distribution of SMC cycles received (Malaria Consortium coverage report, Table 21). The fit reproduces 6% of children with no cycle and 60% with all four. Independent rounds would give 0.2% and 40%.
+- **Reach.** A child's per-round reach is a persistent beta propensity with mean `smc_cov` = 0.796 and intra-child correlation `smc_rho` = 0.417. These come from a beta-binomial fit to the Nigeria 2020 distribution of SMC cycles received (Malaria Consortium coverage report, Table 21). The fit approximately matches the survey: it predicts 5.5% of children with no cycle and 60.1% with all four, against the observed 6.0% and 60.2%, but it misses the middle categories (two cycles: 10.3% predicted, 13.3% observed). Independent rounds at the same mean would give 0.2% and 40%.
 - **Adherence.** A reached child completes the course with probability `smc_adh` = 0.944 (Table 16).
 - **Clearance at dosing.** Kept from v0.10.
 - **Protection against new infection.** It decays as E0 exp(−(t/L)^k ln2) (`model.smc_protection`), with `smc_e0` 1, `smc_half` 32 d and `smc_k` 5.4 (Burgert et al. 2022, Table 1). After the day-1 dose only, it is E0 × `smc_partial` 0.910 (Cairns et al. 2022, 79.8/87.7). Applying that ratio to infection protection is a named assumption.
@@ -31,3 +31,9 @@ On owner guidance (2026-11-05), every SMC parameter except `smc_k` is carried in
 **Benchmarks.** `validate_once.sh 16 12` recomputed every evidence file on Coiled (cluster 2331751, about 100 credits). The same 14 of 17 benchmarks are in band, with 9 of 12 held out. Only the held-out SMC benchmarks moved, and both stay in band: B13 went from 0.360 to 0.286 (target 0.27) and B17 from 19.0 to 14.7. All other numbers are unchanged to the last digit.
 
 **Codex review.** Round 1, before the benchmark run, found no P1. Its P2s were fixed test-first.
+Round 2, on the final code and evidence, also found no P1. It listed four items. One P3 was fixed: the wording now says the fit "approximately matches" Table 21. Three items are left open, because each would change engine code and so require recomputing the evidence:
+- P2: `resolve_params` converts booleans and numeric strings to floats before `smc_check` runs.
+- P2: Q6b does not vary `smc_adh`, `smc_e0` or `smc_partial` per member.
+- P3: Q0b does not require all six SMC ranges.
+
+The Nigeria reachability diagnostic is reported in PR #145 as counts only. Compute was 127.1 Coiled credits on two one-VM clusters. Both clusters are stopped.

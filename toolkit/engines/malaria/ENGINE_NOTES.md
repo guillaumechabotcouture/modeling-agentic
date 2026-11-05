@@ -201,7 +201,7 @@ PR, not here, because the run data are licensed.
 **Tests (written first; `selftest_late.py`, section `_self_test_v011`).**
 - Q0: the card, parameters and priors; `smc_pe` and `smc_hi_frac` are gone.
 - Q1: the protection curve: E0 at t0, E0/2 at L, decreasing, 0 before any dose.
-- Q2: the propensity model: rounds received follow the beta-binomial (Table 21 reproduced), the mean per-round
+- Q2: the propensity model: rounds received follow the fitted beta-binomial (an approximate fit to Table 21; it checks the model, not the fit), the mean per-round
   reach is `smc_cov`, and `smc_rho` = 0 gives independent rounds.
 - Q3: in the sim, a round reaches the share `smc_cov`, and the reached children's states and doses are correct
   (clearance, the share with a full course, E0 or E0 × `smc_partial`); Q3e: reach in the intervention's second round
@@ -223,6 +223,13 @@ PR, not here, because the run data are licensed.
 The tiny-`smc_rho` overflow (P3) is handled too. One item is open: `resolve_params` coerces `True` and numeric
 strings to floats before `smc_check` sees them. It is shared by every parameter, so it is left to a contract-level
 change.
+
+**Codex review round 2 (final code and evidence).** No P1 findings. One P3 was fixed: the Table 21 fit is now
+described as approximate. These items are open, and each would change engine code and so require recomputing the
+evidence:
+- P2: the `resolve_params` coercion above;
+- P2: Q6b does not vary `smc_adh`, `smc_e0` or `smc_partial` per member;
+- P3: Q0b does not assert all six SMC ranges.
 
 ## v0.10 scope: past SMC and a net type per past net campaign (owner approval 2026-11-04)
 
