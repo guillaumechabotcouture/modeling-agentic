@@ -103,7 +103,7 @@ def spec_problems(spec) -> list[str]:
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
-                           "shared_points", "targets"})
+                           "shared_points", "targets", "independent"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
     sh = j.get("shared")
@@ -133,11 +133,29 @@ def spec_problems(spec) -> list[str]:
         except Exception as e:  # noqa: BLE001 -- the priors' own check names it
             dr = {}
             bad.append(f"{w}: the priors cannot be read ({e})")
+        from toolkit.analysis.batch import fitted_ranges
+        fr = fitted_ranges(eng)
         for s in sh:
-            if s not in dr:
+            if s not in dr and s not in fr:
                 bad.append(f"{w}.shared: {s} is not a prior the uncertainty draws vary (an engine-card prior, an "
-                           "uncertainty.priors entry or an engine_parameters value with a range): a shared parameter "
-                           "needs a sourced range, and the outcome emulator must span it")
+                           "uncertainty.priors entry or an engine_parameters value with a range) nor an engine-fitted "
+                           "parameter: a shared parameter needs a sourced range, and the outcome emulator must span it")
+        # Codex r2 P1-3: every parameter the uncertainty draws vary moves with the region rows (shared) or is declared
+        # independent of the calibration targets, with the reason; otherwise a draw could pair a region row with a
+        # value that row was never fitted at
+        ind = j.get("independent") or []
+        if not (isinstance(ind, list) and all(isinstance(x, dict) and isinstance(x.get("parameter"), str)
+                                              and str(x.get("reason") or "").strip() for x in ind)):
+            bad.append(f"{w}.independent: a list of {{parameter, reason}}")
+            ind = []
+        indn = {x["parameter"] for x in ind}
+        srcs = {x.get("kind") for x in (raw.get("uncertainty") or {}).get("sources") or [] if isinstance(x, dict)}
+        varying = set(dr) | (set(fr) if "engine_parameters" in srcs else set())
+        for v in sorted(varying - set(sh) - indn):
+            bad.append(f"{w}: {v} is varied by the uncertainty draws but is neither in shared nor declared "
+                       "independent of the calibration targets (independent: [{parameter, reason}])")
+        for v in sorted(indn & set(sh)):
+            bad.append(f"{w}.independent: {v} is also shared")
         card = eng.describe()
         wins = card.outputs.get("windows", [])
     else:
@@ -260,8 +278,13 @@ def build(spec, units=None) -> tuple:
     from toolkit.spec import priors as PRI
     j = declared(spec)
     cal = spec.raw["calibration"]
+    from toolkit.analysis.batch import fitted_ranges
     dr = PRI.drawn(spec)
-    shared = [HM.Param(n, dr[n].lo, dr[n].hi, dr[n].dist, dr[n].value, dr[n].source) for n in j["shared"]]
+    fr = {p.name: p for p in spec.engine().parameters() if p.kind == "fitted"}
+    shared = [HM.Param(n, dr[n].lo, dr[n].hi, dr[n].dist, dr[n].value, dr[n].source) if n in dr else
+              HM.Param(n, fr[n].lo, fr[n].hi, "uniform", None, f"engine card fitted range ({fr[n].source})")
+              for n in j["shared"]]
+    _ = fitted_ranges
     rows = {str(r[spec.uid]): r for r in spec.units()}
     ids = [i for i in spec.unit_ids() if units is None or i in set(units)]
     missing = sorted(set(units or []) - set(rows))
@@ -602,7 +625,9 @@ def _toy_joint(d, n=12, unreachable=None, shared=("base",), held_out=False, grou
     if held_out:
         tg.append({"id": "T2", "kind": "benchmark"})
     raw["calibration"]["joint"] = {"shared": list(shared), "discrepancy_sd": 0.05, "seed": 3, "waves": 1,
-                                   "points_per_unit": 6, "targets": tg}
+                                   "points_per_unit": 6, "targets": tg,
+                                   "independent": [{"parameter": p, "reason": "acts only under its package; the "
+                                                    "calibration simulates the comparator"} for p in ("eff_a", "eff_b")]}
     yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
     return p
 
@@ -696,6 +721,25 @@ def _self_test() -> int:
                                                                    "target_above_reach" for h in hits),
                f"JA5 a unit whose target the toy cannot reach is unmatched and blocks, with the direction ({hits[:2]})")
     safe(ja5, "JA5")
+
+    def ja6():           # Codex r2 P1-3: a parameter the draws vary is calibrated jointly or declared independent
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["independent"] = [x for x in raw["calibration"]["joint"]["independent"]
+                                                          if x["parameter"] != "eff_a"]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            bad = spec_problems(schema.load(p))
+            ok(any("eff_a" in b and "independent" in b for b in bad),
+               f"JA6a a drawn parameter neither calibrated jointly nor declared independent is refused ({bad})")
+            raw["calibration"]["joint"]["shared"] = ["base", "eff_a"]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            bad = spec_problems(schema.load(p))
+            P, _ = build(schema.load(p))
+            ok(not bad and [x.name for x in P.shared] == ["base", "eff_a"] and P.shared[1].lo == 0.3,
+               f"JA6b an engine-fitted parameter can be calibrated jointly, over its card range ({bad})")
+    safe(ja6, "JA6")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

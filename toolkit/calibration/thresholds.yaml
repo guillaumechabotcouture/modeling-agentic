@@ -14,6 +14,11 @@ history_matching:
   refine_rounds: 2
   refine_sd: 0.05            # perturbation sd of a refinement candidate, as a share of each prior range
   z_grid: 41                 # points of the per-unit parameter grid over its declared range
+  # group targets: a component of group targets that share units moves its members by a common share of each
+  # member's non-implausible range, searched on group_t shares; the region sample first tries group_tries draws with
+  # each member at its own share, then group_tries common shares, keeping a draw only when every group target holds
+  group_t: 21
+  group_tries: 20
   waves: 2                   # waves of simulation (wave 1 space-filling over the prior box; later waves in the region)
   points_per_unit: 8         # simulations per unit per wave
   shared_points: 16          # simulations per wave for targets that depend on the shared parameters only

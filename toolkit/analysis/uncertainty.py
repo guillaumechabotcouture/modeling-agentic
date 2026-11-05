@@ -102,7 +102,10 @@ class Drawer:
                 continue
             if kind == "engine_parameters":
                 for k, v in A.fr.items():
-                    theta[k] = float(self.rng.uniform(v[0], v[1]))
+                    x = float(self.rng.uniform(v[0], v[1]))     # drawn either way: the stream is unchanged
+                    if k in self.jc_names and self.jc_draws is not None:
+                        continue                                # jointly calibrated: the region row's value
+                    theta[k] = x
                     sampled[k] = theta[k]
             elif kind == "calibration" and A.method == "emulator_inversion" and A.joint is None:
                 shifts = {r: float(self.rng.normal(0, self.sd)) for r in self.regions}
