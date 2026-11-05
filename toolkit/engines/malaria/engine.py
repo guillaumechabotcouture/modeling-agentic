@@ -2171,6 +2171,37 @@ def _self_test_v010(ok, e, unit) -> None:
            "H6c a past dual-AI campaign from hist_net_by_year puts cfp_kill in the burn-in key, as hist_net: dual does")
     case("H6", h6)
 
+    def h7():
+        # Codex r1 P1-1: without a delivery period the package's SMC may start in the window's first calendar year,
+        # before the window; a past round must not coincide with (or follow) a package or routine SMC round
+        hn = Horizon(2023.0, 2026.0, (2024.5, 2026.0), {})
+        un = UnitSpec("t", dict(attrs, campaign_year=2024.5, smc_months=[5, 6, 7, 8], smc_hist_years=[2024],
+                                smc_hist_rounds=2))
+        for fn, nm in ((lambda: e.schedule(base, un, smc, hn), "schedule"), (lambda: e.run(base, un, smc, hn, 1), "run")):
+            try:
+                fn()
+                ok(False, f"H7 ({nm}) a past SMC round on a package SMC round is refused")
+            except ValueError as ex:
+                ok("smc_hist_years" in str(ex), f"H7 ({nm}) a past SMC round on a package SMC round is refused ({ex})")
+        # Codex r1 P1-2: a round dated before the delivery start that the sim runs on a step at or after it
+        hb = DeliveryHorizon(2023.0, 2025.0, (2023.167, 2025.0), {}, delivery=(2023.167, 2024.0))
+        ub = UnitSpec("t", dict(attrs, campaign_year=2023.5, smc_months=[3], smc_hist_years=[2023]))
+        try:
+            e.run({"n_agents": 200, "burnin_years": 0}, ub, none, hb, 1)
+            ok(False, "H7b a past round executed at or after the delivery start is refused in the sim path")
+        except ValueError as ex:
+            ok("smc_hist_years" in str(ex), f"H7b a past round executed at or after the delivery start is refused in "
+                                            f"the sim path ({ex})")
+        # Codex r1 P1-3: SMC months the past rounds use must be whole, distinct months 1-12
+        for mo in ([7.9], [0], [13], [True], [7, 7]):
+            refused({"smc_months": mo, "smc_hist_years": [2015]}, "smc_months",
+                    f"H7c with past SMC, smc_months {mo} fails closed")
+        # Codex r1 P2-5: year keys of mixed type are accepted by the run as by the schedule
+        um = UnitSpec("t", dict(attrs, hist_net_by_year={2014.3: "pbo", "2015.2": "dual"}))
+        o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hd, 1)
+        ok(o.per_capita is not None, "H7d hist_net_by_year with float and string year keys runs (burn-in key)")
+    case("H7", h7)
+
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""

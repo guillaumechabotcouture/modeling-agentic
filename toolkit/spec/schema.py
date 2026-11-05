@@ -1235,6 +1235,10 @@ def _self_test() -> int:
             "empty", "SP8c `empty` without `split` is refused")
         bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": " "}),
             "empty", "SP8d a blank `empty` token is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": None}),
+            "empty", "SP8e a null `empty` token is refused (Codex r1 P1-4)")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": -1}),
+            "empty", "SP8f a non-string `empty` token is refused")
         bad(lambda r: r["uncertainty"]["excluded"][0].update(reason=""), "neither declared",
             "SP9 an exclusion without a reason is refused")
         bad(lambda r: r["constraints"].update(group_rules=[{"id": "g", "components": ["a"], "by": "nocol"}]),
