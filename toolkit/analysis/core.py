@@ -76,7 +76,9 @@ class Analysis:
             fit = C.fit_likelihood if self.method == "likelihood" else C.fit_posterior_panel
             self.lik = fit(self.spec, self.model)
             self.theta0 = dict(self.theta0, **self.lik["theta"])
-            missing = [i for i in self.ids if i not in self.lik["z"]]
+            # a unit in fixed_z is calibrated at a fixed value (None: a fit with no per-unit attribute, where every
+            # unit runs at its bound attributes)
+            missing = [i for i in self.ids if i not in self.lik["z"] and i not in (self.lik.get("fixed_z") or {})]
             if missing:
                 raise ValueError(f"calibration: units with no targets cannot be calibrated: {missing[:5]}")
         return self.lik

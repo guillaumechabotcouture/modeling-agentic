@@ -200,16 +200,62 @@ def _self_test() -> int:
     # A25-A27 final_size: the whole epidemic counts, whatever the window end
     efs = _age(time_unit="year", final_size=True)
     o_fs = efs.run(P, _unit(), Package("0", {}), short, 1)
-    ok(abs(o_fs.windows["all"]["attack_rate"] - od.windows["all"]["attack_rate"]) < 1e-15
-       and abs(o_fs.per_capita["infections"]["a2"] - od.per_capita["infections"]["a2"]) < 1e-15
-       and o_fs.meta["after_window_share"] > 0.1,
-       f"A25 final_size: a window shorter than the epidemic still counts its final size "
-       f"(after the window: {o_fs.meta['after_window_share']:.3f})")
+    ok(abs(o_fs.windows["all"]["attack_rate"] - od.windows["all"]["attack_rate"]) < 1e-9
+       and abs(o_fs.per_capita["infections"]["a2"] - od.per_capita["infections"]["a2"]) < 1e-9
+       and o_fs.meta["time_axis"] == "generations",
+       f"A25 final_size: a window shorter than the epidemic still counts its final size, on the generation grid "
+       f"({o_fs.windows['all']['attack_rate']:.10f} vs {od.windows['all']['attack_rate']:.10f})")
+    # A33: near criticality the generation grid converges in few steps, to the declared interval's final size
+    near = dict(P, r0=1.0 / 0.6935)
+    o_d = ed.run(near, _unit(), Package("0", {}), hd, 1)
+    o_g = efs.run(near, _unit(), Package("0", {}), short, 1)
+    ok(abs(o_g.windows["all"]["attack_rate"] - o_d.windows["all"]["attack_rate"]) < 1e-8
+       and o_g.meta["steps"] < o_d.meta["steps"] / 3,
+       f"A33 a near-critical final size on the generation grid equals the daily one in fewer steps "
+       f"({o_g.windows['all']['attack_rate']:.3e} vs {o_d.windows['all']['attack_rate']:.3e}; "
+       f"{o_g.meta['steps']} vs {o_d.meta['steps']} steps)")
+    _, err = safe(lambda: efs.run(P, _unit(), Package("0", {}),
+                                  Horizon(2026.0, 2046.0, (2026.0, 2046.0), {"early": [2026.0, 2026.5]}), 1))
+    ok(err is not None and "generations" in err, f"A34 a named window inside a generation-grid run is refused: {err}")
     _, err = safe(lambda: _age(mode="windowed", final_size=True))
     ok(err is not None and "to_extinction" in err, f"A26 final_size needs to_extinction: {err}")
     late_w = Horizon(2026.0, 2046.0, (2026.5, 2046.0), {"all": [2026.5, 2046.0]})
     _, err = safe(lambda: efs.run(P, _unit(), Package("0", {}), late_w, 1))
     ok(err is not None and "must start at horizon.start" in err, f"A27 final_size: a window after the start fails: {err}")
+
+    # Codex r1 (tests first): A28-A32
+    efs_f = _age(time_unit="year", final_size=True, forcing="cosine", forcing_period=365.0)
+    o28 = efs_f.run(dict(P, forcing_amplitude=0.2, forcing_phase=30.0), _unit(), Package("0", {}), short, 1)
+    ok(all(math.isfinite(v) for v in o28.windows["all"].values()),
+       f"A28 (r1 P1-5) final_size with seasonal forcing: every window metric is finite ({o28.windows['all']['reff_end']})")
+    e29 = CompartmentalEngine(groups=["all"], mode="to_extinction", generation_interval=[1.0], time_unit="year",
+                              components={"v": {"kind": "campaign", "targets": ["all"], "reach": 1.0, "day": 10}})
+    h29 = Horizon(2026.0, 2027.0, (2026.0, 2027.0), {"all": [2026.0, 2027.0]})
+    u29 = UnitSpec("z", {"N": [1.0e6], "s0": [1.0], "seed": 0.0})
+    s29 = H.run_series(e29, {"r0": 2.0, "efficacy:v": 1.0}, u29, [Package("v", {"v": 1})], h29, 1, ["susceptible"])
+    want = 10.0 / (YEAR_DAYS / 12.0)
+    ok(abs(s29[0]["values"]["susceptible"][0] - want) < 1e-9 and s29[0]["values"]["susceptible"][1] == 0.0,
+       f"A29 (r1 P1-6) the monthly susceptible share is a time mean ({s29[0]['values']['susceptible'][0]:.4f} vs "
+       f"{want:.4f})")
+    e30 = _age(time_unit="year")
+    cut = 2026.0 + 10.0 / YEAR_DAYS
+    h30 = Horizon(2026.0, 2046.0, (2026.0, 2046.0), {"early": [2026.0, cut], "late": [cut, 2046.0],
+                                                     "all": [2026.0, 2046.0]})
+    o30 = e30.run(P, _unit(), Package("0", {}), h30, 1)
+    by_step = 1e-7 + sum(o30.meta["incidence"][:9])          # seeds at step 0, then steps 1..9 (days 1-9)
+    ok(abs(o30.windows["early"]["attack_rate"] - by_step) < 1e-15
+       and abs(o30.windows["early"]["attack_rate"] + o30.windows["late"]["attack_rate"]
+               - o30.windows["all"]["attack_rate"]) < 1e-14,
+       f"A30 (r1 P1-7) a window ending at an event time excludes that step ({o30.windows['early']['attack_rate']:.3e} "
+       f"vs {by_step:.3e})")
+    e31 = CompartmentalEngine(**dict(camp, components={"vax": {"kind": "campaign", "targets": ["all"], "reach": 0.6,
+                                                               "day": 3000}}))
+    o31 = e31.run(pv, u1, Package("0", {}), hd, 1)
+    ok(o31.windows["all"]["steps"] < 3000, f"A31 (r1 P2-14) a late component the package does not set does not hold "
+       f"the run open ({o31.windows['all']['steps']:.0f} steps)")
+    for cap in (0, -3, float("nan")):
+        _, err = safe(lambda: seir_generation_interval(1.5, 3.0, 1.0, max_days=cap))
+        ok(err is not None, f"A32 (r1 P2-15) max_days {cap} is refused: {err}")
 
     # A24 a contract check of each new configuration
     ok(check_engine(eyh, _unit(), pk, hy) == [] and check_engine(e_mid, u1, Package("v", {"vax": 1}), hd) == [],

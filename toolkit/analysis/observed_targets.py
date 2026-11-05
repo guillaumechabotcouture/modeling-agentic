@@ -119,6 +119,22 @@ def problems(spec, card, pnames) -> list[str]:
     if sb:
         return bad
     sources = {s["id"]: ob.Source(s) for s in srcs}
+    for s in srcs:
+        # Codex r1 P1-2, P1-12: frame gaps (the unit value from the frame population) and antibody waning (years since
+        # vaccination per cohort) are not applied on this path yet: refused rather than sampled with no effect
+        if (s.get("frame") or {}).get("excluded"):
+            bad.append(f"calibration.sources.{s['id']}: frame.excluded is not supported for observation targets yet "
+                       "(frame_gap_unmodelled): restrict the targets to the frame population, or declare none")
+        for b in s.get("bias") if isinstance(s.get("bias"), list) else []:
+            if isinstance(b, dict) and b.get("mechanism") == "antibody_waning":
+                bad.append(f"calibration.sources.{s['id']}: antibody_waning is not supported for observation targets "
+                           "yet (it needs years since vaccination per cohort)")
+    seen = {}
+    for s in sources.values():          # Codex r1 P2-16: one declaration per shared bias parameter
+        for p, d in s.priors().items():
+            if p in seen and seen[p] != d:
+                bad.append(f"calibration.sources: bias parameter {p} is declared with two different priors")
+            seen.setdefault(p, d)
     pri = cal.get("priors") or {}
     if not isinstance(pri, dict):
         return bad + ["calibration.priors: a mapping"]
@@ -203,8 +219,11 @@ class ObservedProblem:
         pri.update({f"z:{u}": Prior.from_decl(f"z:{u}", pri_decl[self.attr]) for u in self.units})
         for s in self.sources.values():
             for p, d in s.priors().items():
-                if p not in self.fixed_params:
-                    pri.setdefault(p, Prior.from_decl(p, d))
+                if p in self.fixed_params:
+                    continue
+                if p in pri and pri[p].describe() != Prior.from_decl(p, d).describe():
+                    raise ValueError(f"{p}: declared with two different priors")
+                pri.setdefault(p, Prior.from_decl(p, d))
         self.names = ([p for p in self.params if p not in self.fixed_params] + [f"z:{u}" for u in self.units]
                       + [p for p in self.nuisance if p not in self.fixed_params])
         self.state_only = (all(r["latent"] in STATE for r in self.rows)
@@ -212,8 +231,8 @@ class ObservedProblem:
         self.pk = spec.packages()
         self.comp = spec.comparator
         self.horizon = spec.horizon()
-        pops = spec["decision_units"]["populations"]
-        self.tot = {str(u[spec.uid]): sum(float(u[pm["column"]]) for pm in pops.values()) for u in spec.units()}
+        self.pops = spec["decision_units"]["populations"]
+        self.unit_rows = {str(u[spec.uid]): u for u in spec.units()}
         self.groups = list(self.eng.describe().age_groups)
         self.pairs = sorted({(r["unit"], r["package"] or self.comp) for r in self.rows})
         self.failed = 0
@@ -257,8 +276,9 @@ class ObservedProblem:
             if o is None:
                 ok[i] = False
                 continue
-            sh = o.meta.get("age_shares") or {}
-            N = np.asarray([float(sh.get(g, 0.0)) * self.tot[u] for g in self.groups])
+            from toolkit.analysis.model import group_sizes
+            gsz = group_sizes({"meta": o.meta}, self.pops, self.unit_rows[u])   # as the aggregate outcomes weight
+            N = np.asarray([float(gsz.get(g, 0.0)) for g in self.groups])
             res[i][(u, k)] = (N, np.asarray(o.meta["s_start"], float), o)
         return [r if ok[i] else None for i, r in enumerate(res)]
 
@@ -323,6 +343,8 @@ class ObservedProblem:
     def loglik(self, X):
         n = len(next(iter(X.values()))) if X else 1
         sts = self._states(X, n)
+        if not X:
+            return np.asarray([self.row_ll({}, sts[0])[0] if sts[0] is not None else -np.inf]), {}
         ll = np.full(n, -np.inf)
         for i, st in enumerate(sts):
             if st is None:
@@ -330,10 +352,29 @@ class ObservedProblem:
             ll[i] = self.row_ll({k: float(v[i]) for k, v in X.items()}, st)[0]
         return ll, {}
 
-    def expected_at(self, x: dict) -> list:
-        X = {k: np.asarray([v]) for k, v in x.items() if k in self.names}
+    def at(self, x: dict):
+        """(log-likelihood, expected observations) at one full parameter set (fixed values included); a run the
+        engine refuses gives (-inf, [])."""
+        X = {k: np.asarray([float(x[k])]) for k in self.names}
         st = self._states(X, 1)[0]
-        return self.row_ll({k: float(v) for k, v in x.items() if k in self.names}, st)[1] if st else []
+        if st is None:
+            return -np.inf, []
+        return self.row_ll({k: float(x[k]) for k in self.names}, st)
+
+
+def _fit_row(E, r, e) -> dict:
+    """One target at the mode, on the observation's own scale (Codex r1 P1-11): a share's expected count (n p)
+    beside its observed positives, with the probability and the binomial variance; a count's expected count."""
+    m = E.sources[r["source"]].noise["model"]
+    row = {"unit": r["unit"], "groups": r["groups"], "source": r["source"], "latent": r["latent"],
+           "observed": r["observed"], "n": r["n"], "noise": m}
+    if m in ("binomial", "betabinomial"):
+        de = float(E.sources[r["source"]].design_effect) if m == "betabinomial" else 1.0
+        row.update(expected=float(e) * r["n"], expected_share=float(e), observed_share=r["observed"] / r["n"],
+                   variance=r["n"] * float(e) * (1.0 - float(e)) * de)
+    else:
+        row.update(expected=float(e), variance=float(e))
+    return row
 
 
 SCAN_LOG2 = 6
@@ -358,22 +399,40 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
     from toolkit.analysis import calibration as C
     E = ObservedProblem(spec, model, rows, fixed_z, fixed_params)
     P = E.problem
+
+    def refuse_failures(where):
+        # Codex r1 P1-9: the refusal policy holds on every path (sample, classification, mode, final point)
+        if E.failed:
+            raise C.CalibrationRefused("posterior_engine_failure", f"the engine failed closed on {E.failed} parameter "
+                                       f"sets ({where}); the fit would be conditioned on the ones it ran")
     s = c = None
+    scan_failed = 0
     if sample_it:
         sd = spec["calibration"].get("seed", 0) if seed is None else seed
         s = C.sample(P, seed=int(sd))
-        if E.failed:
-            raise C.CalibrationRefused("posterior_engine_failure", f"the engine failed closed on {E.failed} parameter "
-                                       "sets inside the prior's support; the posterior would be conditioned on them")
+        refuse_failures("in the posterior sample")
         c = C.classify(P, s)
-    start = s["best"] if s else _scan_start(P)
-    xh, conv, msg = C._map_point(P, start)
+        refuse_failures("in the identifiability classification")
+    if P.names:
+        if s:
+            start = s["best"]
+        else:
+            # a start search over the prior (not part of any posterior): its refusals are counted and reported
+            start = _scan_start(P)
+            scan_failed, E.failed = E.failed, 0
+        xh, conv, msg = C._map_point(P, start)
+        refuse_failures("while finding the posterior mode")
+    else:                                # every parameter fixed (a prior_range refit of the last free one)
+        xh, conv, msg = [], True, "every parameter fixed: the configuration is evaluated as given"
     x = dict(E.fixed_params, **dict(zip(P.names, (float(v) for v in xh))))
     z = {u: x[f"z:{u}"] for u in E.units}
     fixed = dict(E.fixed_z)
     if not E.attr:                       # no per-unit attribute: every unit runs at its bound attributes
         fixed = {i: None for i in spec.unit_ids()}
-    exp = E.expected_at(x)
+    ll_hat, exp = E.at(x)
+    refuse_failures("at the posterior mode")
+    if not np.isfinite(ll_hat):
+        raise C.CalibrationRefused("posterior_mode", "the posterior mode has no finite likelihood")
     out = {"method": "posterior", "targets_kind": KIND, "x": x, "names": list(P.names), "params": E.params,
            "units_fitted": E.units, "fixed_z": fixed, "fixed_params": dict(E.fixed_params),
            "nuisance": [p for p in E.nuisance if p not in E.fixed_params],
@@ -381,9 +440,8 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
            "diagnostics": {"converged": conv, "message": msg, "n_targets": len(E.rows), "n_parameters": len(P.names),
                            "at_bound": [], "observation": "per-source (calibration.sources)",
                            "evaluation": "initial_state" if E.state_only else "run_batch",
-                           "fit": [{"unit": r["unit"], "groups": r["groups"], "source": r["source"],
-                                    "latent": r["latent"], "observed": r["observed"], "n": r["n"],
-                                    "expected": (exp[j] if exp else None)} for j, r in enumerate(E.rows)]}}
+                           "loglik_at_mode": float(ll_hat), "start_search_refusals": scan_failed,
+                           "fit": [_fit_row(E, r, exp[j]) for j, r in enumerate(E.rows)]}}
     if s is not None:
         out["sample"] = {"sample_id": s["sample_id"], "names": s["names"], "rows": s["rows"].tolist(),
                          "method": s["method"], "seed": s["seed"]}
@@ -516,9 +574,9 @@ def _self_test() -> int:
         m = DirectModel(sp)
         f = fit(sp, m, sample_it=False)
         imm = {r["unit"]: r for r in f["diagnostics"]["fit"]}
-        ok(set(f["z"]) == {"u1", "u2"} and all(abs(imm[u]["expected"] - imm[u]["observed"] / 200) < 0.02
+        ok(set(f["z"]) == {"u1", "u2"} and all(abs(imm[u]["expected_share"] - imm[u]["observed"] / 200) < 0.02
                                                 for u in ("u1", "u2")),
-           f"OT2 the mode reproduces each unit's survey immunity: {[(u, round(imm[u]['expected'], 4)) for u in imm]}")
+           f"OT2 the mode reproduces each unit's survey immunity: {[(u, round(imm[u]['expected_share'], 4)) for u in imm]}")
         # by hand: immunity of c1+c2 = mean of scale x cov x 0.9 -> scale = (obs / 0.9) / mean cov
         for u, cov, obs in (("u1", (0.8, 0.7), 124 / 200), ("u2", (0.9, 0.6), 139 / 200)):
             want = obs / 0.9 / (sum(cov) / 2)
@@ -581,15 +639,72 @@ def _self_test() -> int:
         f = fit(sp, m, sample_it=False)
         fitrows = f["diagnostics"]["fit"]
         imm = [r for r in fitrows if r["latent"] == "immunity"]
-        ok(all(abs(r["expected"] - r["observed"] / 400) < 0.05 for r in imm) and f["z"] == {}
+        ok(all(abs(r["expected_share"] - r["observed"] / 400) < 0.05 for r in imm) and f["z"] == {}
            and f["fixed_z"] == {"all": None},
            f"OT9 the mode reproduces each group's immunity; no per-unit attribute "
-           f"({[round(r['expected'], 3) for r in imm]})")
+           f"({[round(r['expected_share'], 3) for r in imm]})")
         hos = [r for r in fitrows if r["latent"] == "outcome:hosp"]
         ok(all(abs(r["expected"] - r["observed"]) / r["observed"] < 0.05 for r in hos),
            f"OT10 the per-group outcome ratios reproduce the outcome counts ({[round(r['expected']) for r in hos]})")
         E = ObservedProblem(sp, m)
         ok(not E.state_only and len(E.names) == 7, "OT11 attack-rate and outcome targets run the epidemic (run_batch)")
+        # Codex r1 (tests first)
+        fx = {"r0": 2.0, **{f"s0:{g}": 0.6 for g in "abc"}, **{f"ratio:hosp:{g}": 0.001 for g in "abc"}}
+        f0 = fit(sp, m, fixed_params=fx, sample_it=False)
+        ok(f0["names"] == [] and f0["theta"]["r0"] == 2.0 and len(f0["diagnostics"]["fit"]) == 9,
+           "OT18 (r1 P1-10) a refit with every parameter fixed evaluates the fixed configuration")
+        b0 = [r for r in f0["diagnostics"]["fit"] if r["noise"] == "binomial"][0]
+        ok(abs(b0["expected"] - b0["expected_share"] * b0["n"]) < 1e-9 and b0["variance"] > 0
+           and "observed_share" in b0, "OT19 (r1 P1-11) a share's fit row is on the count scale, with its share "
+                                       "and binomial variance")
+        orig = m.eng.run_batch
+
+        def failing(*a, **k):
+            raise RuntimeError("step cap reached (test)")
+        m.eng.run_batch = failing
+        try:
+            fit(sp, m, fixed_params={k: v for k, v in fx.items() if k != "r0"}, sample_it=False)
+            ok(False, "OT17 (r1 P1-9) a mode-only fit whose engine refuses is refused")
+        except Exception as e:  # noqa: BLE001
+            ok("posterior_engine_failure" in str(getattr(e, "code", "")) or "failed closed" in str(e)
+               or "no finite" in str(e), f"OT17 (r1 P1-9) a mode-only fit whose engine refuses is refused: {e}")
+        finally:
+            m.eng.run_batch = orig
+        r6 = copy.deepcopy(sp.raw)
+        r6["calibration"]["sources"][0]["frame"]["excluded"] = [
+            {"who": "x", "share": 0.1, "param": "rel", "relative_value_prior": {"dist": "uniform", "range": [0.5, 1]},
+             "source": "t"}]
+        r6["calibration"]["sources"][1]["bias"] = [{"mechanism": "antibody_waning", "param": "w",
+                                                    "prior": {"dist": "uniform", "range": [0, 0.1]}, "source": "t"}]
+        e6 = schema.validate(schema.Spec(r6, d, os.path.join(d, "decision_spec.yaml")))
+        ok(any("frame.excluded is not supported" in x for x in e6) and any("antibody_waning" in x for x in e6),
+           f"OT16 (r1 P1-2, P1-12) frame gaps and waning are refused on this path: {e6[:2]}")
+        r7 = copy.deepcopy(sp.raw)
+        for k, rg in ((0, [0.9, 1.0]), (1, [0.8, 1.0])):
+            r7["calibration"]["sources"][k]["bias"] = [{"mechanism": "assay_sensitivity", "param": "se",
+                                                        "prior": {"dist": "uniform", "range": rg}, "source": "t"}]
+        e7 = schema.validate(schema.Spec(r7, d, os.path.join(d, "decision_spec.yaml")))
+        ok(any("two different priors" in x for x in e7), f"OT21 (r1 P2-16) conflicting shared priors are refused: {e7[:2]}")
+    with tempfile.TemporaryDirectory() as d:
+        # OT15 (r1 P1-1): the whole analysis with no per-unit attribute (per-group parameters only)
+        import yaml
+        from toolkit.analysis import run as RUN
+        sp = _toy(d, attr=False)
+        r = copy.deepcopy(sp.raw)
+        with open(os.path.join(d, "targets.csv"), "w") as fh:
+            fh.write("unit,groups,source,latent,pos,n\nall,a,pre,immunity,80,400\nall,b,pre,immunity,120,400\n"
+                     "all,c,pre,immunity,200,400\n")
+        r["calibration"]["parameters"] = ["s0:a", "s0:b", "s0:c"] + [f"ratio:hosp:{g}" for g in "abc"]
+        r["calibration"]["priors"] = {k: v for k, v in r["calibration"]["priors"].items() if k != "r0"}
+        r["calibration"]["sources"] = [r["calibration"]["sources"][0]]
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        res, err = None, None
+        try:
+            res = RUN.run(d, unsigned=True, log=lambda *a: None)
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+        ok(err is None and res["calibration"]["units"] == {"all": {"z": None}},
+           f"OT15 (r1 P1-1) the analysis runs a calibration with no per-unit attribute: {err}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

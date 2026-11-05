@@ -189,6 +189,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     elif t == "envelope":
         varied = "the envelope set to each tested value"
         fixed = sum(float(v) for v in (A.spec["constraints"].get("fixed_costs_usd") or {}).values())
+        A.spec.packages()
+        bound = getattr(A.spec, "prune_budget", None)
+        if bound is not None and any(float(v) - fixed > bound * (1 + 1e-12) for v in dt["values"]):
+            return _not_run(A, dt, "an envelope above the declared one, and the packages were generated within the "
+                                   "declared envelope (options.packages.within_envelope): drop within_envelope to "
+                                   "test larger envelopes")
         cases = [(v, ben0, cost0, float(v) - fixed, None) for v in dt["values"]]
         lowers = [False] * len(cases)
     else:

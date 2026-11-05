@@ -395,12 +395,23 @@ class Spec:
         if any(not _isnum(it.get("value")) or it["value"] < 0 for it in items):
             raise SpecError("options.packages.within_envelope: every cost item value must be a non-negative number")
         budget = self.budget()
+        # Codex r1 P1-4: the bound holds in every scenario the analysis evaluates. Costs are taken at the lowest
+        # multiplier any uncertainty draw or sensitivity case applies to the item; budgets above the envelope (the
+        # frontier's upper fractions, envelope decision tests) are refused by those steps (prune_budget).
+        lo = {}
+        for rng_items in ((self.raw.get("uncertainty") or {}).get("sources") or []):
+            if isinstance(rng_items, dict) and rng_items.get("kind") == "costs":
+                for it_id, r in (rng_items.get("items") or {}).items():
+                    lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
+        for it_id, r in (((self.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items") or {}).items():
+            lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
         comp_cost = {}
         for u in self.units():
             uid = str(u[self.uid])
             comp_cost[uid] = {}
             for it in items:
-                comp_cost[uid][it["component"]] = comp_cost[uid].get(it["component"], 0.0) + acosts.item_cost(it, u, a)
+                comp_cost[uid][it["component"]] = (comp_cost[uid].get(it["component"], 0.0)
+                                                   + acosts.item_cost(it, u, a) * min(1.0, lo.get(it["id"], 1.0)))
         comp = self.raw["comparator"].get("package")
         keep = {}
         for name, cs in pk.items():
@@ -408,6 +419,7 @@ class Spec:
             if name == comp or low <= budget * (1 + 1e-12) + 1e-9:
                 keep[name] = cs
         self._pruned = keep
+        self.prune_budget = budget
         return keep
 
     def engine_package(self, comps) -> dict:
@@ -1240,6 +1252,15 @@ def _self_test_joint_packages(ok):
             ok(False, "SPJ3 a negative cost item refuses pruning")
         except SpecError as e:
             ok("non-negative" in str(e), f"SPJ3 a negative cost item refuses pruning: {e}")
+        raw5 = copy.deepcopy(raw)                 # Codex r1 P1-4: a cost draw at half price keeps level-6 plans
+        raw5["uncertainty"]["sources"] = list(raw5["uncertainty"]["sources"]) + [
+            {"kind": "costs", "items": {f"k_{c}": [0.5, 1.5] for c in comps}}]
+        raw5["uncertainty"]["excluded"] = [e for e in raw5["uncertainty"]["excluded"] if e.get("kind") != "costs"]
+        s5 = Spec(raw5, d)
+        pk5 = s5.packages()
+        ok(any(levels(cs) == 6 for cs in pk5.values()) and not any(levels(cs) > 6 for cs in pk5.values())
+           and s5.prune_budget == 3.0,
+           f"SPJ6 pruning keeps every package affordable at the lowest cost multiplier ({len(pk5)} packages)")
         raw3 = copy.deepcopy(raw)
         raw3["options"]["packages"] = {"generate": True}
         ok(len(Spec(raw3, d).packages()) == len(full), "SPJ4 without within_envelope every combination is kept")

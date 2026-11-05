@@ -23,9 +23,45 @@ old_configs:
 new_identity:
   name: compartmental-starsim
   version: '0.2'
-  code_sha256: 5e3037eca7230415a11e5ea3b83795aeb945805642eddd4e7ebdcffae914d513
+  code_sha256: f6bbe31c02573696fdc04f0b7ba7ae6edd3ee2e9532754fc63881270a909782f
   params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
   config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+old_coverage_identity:
+  name: compartmental-starsim
+  version: '0.1'
+  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+  params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+  config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+calibrator_code:
+  files:
+    toolkit/analysis/calibration.py:
+      changed:
+      - fit_posterior_panel
+      - read_targets
+      removed: []
+      added: []
+      module_statements_same: true
+      allowed_changes:
+      - fit_posterior_panel
+      - read_targets
+      ok: true
+    toolkit/analysis/observation.py:
+      changed: []
+      removed: []
+      added: []
+      module_statements_same: true
+      allowed_changes: []
+      ok: true
+    toolkit/engines/compartmental/benchmarks/oracles.py:
+      changed: []
+      removed: []
+      added:
+      - oracle_seir_growth_r0
+      - probe_series_consistency
+      module_statements_same: true
+      allowed_changes: []
+      ok: true
+  ok: true
 digests:
   asym5#seed1:
     old: c2561f0a967530643cb35f6c38ec67813588e835da1667aa85f255e7508c76a7

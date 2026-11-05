@@ -82,6 +82,9 @@ configs:
   cohorts_homog: {groups: [old, c1, c2, c3, c4, c5], structure: birth_cohorts, mode: to_extinction, initialiser: given,
                   dt: day, generation_interval: {seir: {latent_days: 10.0, infectious_days: 8.0}}, tol: 1.0e-14,
                   step_cap: 50000}
+  age5_final: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+               initialiser: given, dt: day, transmission: q, tol: 1.0e-14, time_unit: year, final_size: true,
+               generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}}
   age5_year: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
               initialiser: given, dt: day, transmission: q, tol: 1.0e-12, step_cap: 50000, time_unit: year,
               generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}},
@@ -147,6 +150,13 @@ settings:
                     contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
   as_growth: {config: win_seir, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-14}, params: {r0: 1.8},
               horizon: {start: 0, stop: 200, window: [0, 200], windows: {growth: [60, 100], all: [0, 200]}}}
+  as_final_near: {config: age5_final, params: {q: 0.22},
+                  unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6,
+                         intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]},
+                  horizon: {start: 2026.0, stop: 2046.0, window: [2026.0, 2046.0], windows: {all: [2026.0, 2046.0]}}}
+  as_day_near: {config: age5_attr, params: {q: 0.22},
+                unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6,
+                       intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
   as_late: {config: late_campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-8}, params: {r0: 2.0, "efficacy:vax": 0.9}}
   as_cohorts_12: {config: cohorts_homog, params: {r0: 12.0},
                   unit: {N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s0: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
@@ -186,6 +196,8 @@ arms:
   as_short: {setting: as_doses, package: {d1: 1, d2: 2, d3: 1, d4: 1}}
   as_win: {setting: as_growth, package: {}}
   as_late_none: {setting: as_late, package: {}}
+  as_fin_gen: {setting: as_final_near, package: {}}
+  as_fin_day: {setting: as_day_near, package: {}}
   as_late_vax: {setting: as_late, package: {vax: 1}}
   as_c12: {setting: as_cohorts_12, package: {}}
   as_c18: {setting: as_cohorts_18, package: {}}
@@ -427,6 +439,10 @@ benchmarks:
                 b: {oracle: final_size_rank_one, args: {q: 1.8, a: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
                     b: [0.55, 0.09, 0.09, 0.09, 0.09, 0.09], N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
                     seed: [0.0, 0.0, 0.0, 0.0, 0.0, 1.1111111111111112e-8]}}, tol: {rel: 1.0e-6}}}
+  - {id: AS7, metric: "final_size on the generation grid (one generation per step) equals the declared SEIR interval's final size, near criticality (Reff about 1.05)",
+     source: "exponential-survival identity: the final size does not depend on the generation interval (design note §1.1)",
+     estimand: {type: identity, a: {arm: as_fin_gen, value: per_capita_vec.infections},
+                b: {arm: as_fin_day, value: per_capita_vec.infections}, tol: {rel: 1.0e-7}}}
   - {id: AS6, metric: "run_series() monthly incidence integrates to the run's attack rate, and its last susceptible share is the run's s_end (time_unit year, a dose package)",
      source: "identity (figures-hooks/1)",
      estimand: {type: value, a: {probe: series_consistency, args: {config: age5_year, params: {q: 0.6, "efficacy:d2": 0.7},

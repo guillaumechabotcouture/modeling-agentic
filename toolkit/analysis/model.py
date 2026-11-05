@@ -75,6 +75,20 @@ def _group(res, o, pm):
     return sum(res["per_capita"][o][g] * sh[g] for g in gs) / w if w > 0 else 0.0
 
 
+def group_sizes(res, pops: dict, unit: dict) -> dict:
+    """{engine group: people} with the weighting the aggregate outcomes use: within each population band of
+    decision_units.populations, the engine's age shares renormalised and multiplied by the band's population column,
+    summed over bands. So per-group counts always add up to the unit's aggregate outcome."""
+    sh = res["meta"]["age_shares"]
+    out = {}
+    for pm in pops.values():
+        gs = pm["age_groups"]
+        w = sum(sh[g] for g in gs)
+        for g in gs:
+            out[g] = out.get(g, 0.0) + (sh[g] / w * float(unit[pm["column"]]) if w > 0 else 0.0)
+    return out
+
+
 class EmulatorModel:
     kind = "emulator"
 
@@ -433,10 +447,10 @@ class DirectModel:
                 res = {"per_capita": r.per_capita, "meta": r.meta}
                 row["y"][k] = {o: sum(_group(res, o, pm) * float(u[pm["column"]]) for pm in self.pops.values())
                                for o in self.outcomes}
-                # per engine group (deliverables by group): per-capita x the group's share x the unit's population
-                sh = r.meta.get("age_shares") or {}
-                row["y_group"][k] = {o: {g: float(v) * float(sh.get(g, 0.0)) * tot
-                                         for g, v in (r.per_capita.get(o) or {}).items()} for o in self.outcomes}
+                # per engine group (deliverables by group), weighted as the aggregate is (group_sizes)
+                gsz = group_sizes(res, self.pops, u)
+                row["y_group"][k] = {o: {g: float((r.per_capita.get(o) or {}).get(g, 0.0)) * n
+                                         for g, n in gsz.items()} for o in self.outcomes}
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
                 if k == self.comp:
@@ -514,6 +528,16 @@ def _self_test() -> int:
         yg = a["u1"]["y_group"]["none"]["infections"]
         ok(n_batched == 4 and abs(sum(yg.values()) - a["u1"]["y"]["none"]["infections"]) < 1e-6,
            "MD2 the per-group outcomes sum to the unit total (one row per engine group)")
+    # MD3 (Codex r1 P1-8): per-group counts use the aggregate's weighting when population bands differ from the
+    # engine's own shares
+    res = {"meta": {"age_shares": {"a": 0.5, "b": 0.3, "c": 0.2}}, "per_capita": {"o": {"a": 0.1, "b": 0.2, "c": 0.4}}}
+    pops = {"kids": {"column": "pk", "age_groups": ["a"]}, "adults": {"column": "pa", "age_groups": ["b", "c"]}}
+    urow = {"pk": 100.0, "pa": 200.0}
+    gs = group_sizes(res, pops, urow)
+    agg = sum(_group(res, "o", pm) * urow[pm["column"]] for pm in pops.values())
+    ok(gs == {"a": 100.0, "b": 120.0, "c": 80.0} and abs(sum(res["per_capita"]["o"][g] * n for g, n in gs.items())
+                                                        - agg) < 1e-12,
+       f"MD3 group sizes follow the population bands, so group counts add up to the aggregate ({gs})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

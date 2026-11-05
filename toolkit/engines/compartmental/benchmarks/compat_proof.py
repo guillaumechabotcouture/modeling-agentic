@@ -137,6 +137,53 @@ def compare(old: dict, new: dict) -> dict:
     return {"cases": len(ids), "identical_cases": len(ids) - len(diff), "differing": diff, "identical": not diff}
 
 
+# Codex r1 P1-13: the coverage rows are bound to their calibration, observation and generator code
+# (benchmark.calibrator_code_digest). Those files may change only where the coverage path does not go: these
+# top-level definitions may change, and definitions may be added; nothing else may differ.
+CALIBRATOR_FILES = {
+    "toolkit/analysis/calibration.py": {"read_targets", "fit_posterior_panel"},   # dispatch to observed_targets
+    "toolkit/analysis/observation.py": set(),
+    "toolkit/engines/compartmental/benchmarks/oracles.py": set(),
+}
+IDENTITY_RUNNER = r'''
+import json, sys, yaml
+root, cov = sys.argv[1], sys.argv[2]
+sys.path.insert(0, root)
+from toolkit.engines import benchmark as B
+from toolkit.engines.contract import engine_identity
+cv = yaml.safe_load(open(cov))
+print(json.dumps(engine_identity(B.load_engine(cv["engine"], cv["configs"][cv["default_config"]]))))
+'''
+
+
+def definitions(src: str) -> dict:
+    """{top-level function or class name: its AST dump} (comments and formatting do not count)."""
+    import ast
+    return {n.name: ast.dump(n) for n in ast.parse(src).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+
+def code_changes(old_root: str, new_root: str = ROOT) -> dict:
+    """Per calibrator file: the top-level definitions changed, removed and added; ok when only allowed ones changed
+    and none was removed, and the module-level statements other than definitions are unchanged."""
+    import ast
+    out, ok = {}, True
+    for rel, allowed in CALIBRATOR_FILES.items():
+        a, b = open(os.path.join(old_root, rel)).read(), open(os.path.join(new_root, rel)).read()
+        da, db = definitions(a), definitions(b)
+        changed = sorted(k for k in da if k in db and da[k] != db[k])
+        removed = sorted(set(da) - set(db))
+        added = sorted(set(db) - set(da))
+        rest = lambda s: [ast.dump(n) for n in ast.parse(s).body  # noqa: E731
+                          if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        module_same = rest(a) == rest(b)
+        good = set(changed) <= allowed and not removed and module_same
+        ok = ok and good
+        out[rel] = {"changed": changed, "removed": removed, "added": added, "module_statements_same": module_same,
+                    "allowed_changes": sorted(allowed), "ok": good}
+    return {"files": out, "ok": ok}
+
+
 def prove(old_ref: str, python: str = sys.executable) -> dict:
     from toolkit.engines import benchmark as B
     from toolkit.engines.contract import engine_identity
@@ -147,6 +194,10 @@ def prove(old_ref: str, python: str = sys.executable) -> dict:
         old_cfgs = list(yaml.safe_load(open(old_pack))["configs"])
         cs = cases(PACK, old_cfgs) + coverage_cases()
         dig_old, dig_new = _run(d, cs, python), _run(ROOT, cs, python)
+        cc = code_changes(d)
+        ip = subprocess.run([python, "-c", IDENTITY_RUNNER, d, os.path.join(d, os.path.relpath(COVERAGE_PACK, ROOT))],
+                            capture_output=True, text=True, check=True)
+        old_cov_identity = json.loads(ip.stdout.strip().splitlines()[-1])
         sys.path.insert(0, d)
         old_commit = subprocess.run(["git", "-C", ROOT, "rev-parse", old_ref], capture_output=True, text=True,
                                     check=True).stdout.strip()
@@ -157,9 +208,11 @@ def prove(old_ref: str, python: str = sys.executable) -> dict:
                     "coverage-pack configuration (all arms in one run_batch, each arm's run(), and initial_state()), "
                     "seed 1",
            "old_ref": old_ref, "old_commit": old_commit, "old_configs": old_cfgs,
-           "new_identity": engine_identity(eng),
+           "new_identity": engine_identity(eng), "old_coverage_identity": old_cov_identity,
+           "calibrator_code": cc,
            "digests": {c["id"]: {"old": dig_old.get(c["id"]), "new": dig_new.get(c["id"])} for c in cs}}
     rec.update(compare(dig_old, dig_new))
+    rec["identical"] = bool(rec["identical"] and cc["ok"])
     yaml.safe_dump(rec, open(OUT, "w"), sort_keys=False, width=110)
     return rec
 
@@ -176,6 +229,13 @@ def restamp() -> dict:
         raise SystemExit("refused: the proof is for other engine code; run prove again")
     cov = yaml.safe_load(open(COVERAGE))
     old = cov.get("engine_identity")
+    computed_by = (cov.get("restamped") or {}).get("old_identity", old)    # the code that computed the values
+    if computed_by != proof.get("old_coverage_identity"):
+        raise SystemExit("refused: coverage_results.yaml was computed by other code than the proof's old side "
+                         f"({(computed_by or {}).get('code_sha256', '?')[:12]} vs "
+                         f"{(proof.get('old_coverage_identity') or {}).get('code_sha256', '?')[:12]})")
+    if not (proof.get("calibrator_code") or {}).get("ok"):
+        raise SystemExit("refused: the calibrator, observation or generator code changed on the coverage path")
     cv = yaml.safe_load(open(COVERAGE_PACK))
     eng = B.load_engine(cv["engine"], cv["configs"][cv["default_config"]])        # the coverage pack's own identity
     ident = engine_identity(eng)
@@ -186,6 +246,13 @@ def restamp() -> dict:
     prev = cov.get("restamped") or {}
     if prev:     # re-stamped before: the identity of the code that computed the values is the earliest one
         old = prev.get("old_identity", old)
+    for r in cov.get("benchmarks") or []:      # rows re-bound to the current calibrator code digest, the old kept
+        b = next((x for x in cv["benchmarks"] if x["id"] == r["id"]), None)
+        if b is not None and b["estimand"]["type"] == "coverage" and "code_sha256" in r:
+            new = B.calibrator_code_digest(cv, b["estimand"])
+            if r["code_sha256"] != new:
+                r.setdefault("computed_code_sha256", r["code_sha256"])
+                r["code_sha256"] = new
     cov["restamped"] = {"by": "compat_proof.py", "proof": os.path.basename(OUT),
                         "proof_cases": proof["cases"], "old_identity": old, "old_ref": proof["old_ref"],
                         "old_commit": proof["old_commit"],
@@ -217,8 +284,23 @@ def _self_test() -> int:
     small = [c for c in v01 if c["id"].startswith("r0_2#")][:1]
     d = _run(ROOT, small, sys.executable)
     ok(len(d) == 1 and d == _run(ROOT, small, sys.executable), "CP4 the case runner is deterministic (same digests)")
+    with tempfile.TemporaryDirectory() as d:          # CP7 (Codex r1 P1-13): calibrator code changes are classified
+        for rel in CALIBRATOR_FILES:
+            os.makedirs(os.path.dirname(os.path.join(d, "old", rel)), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.join(d, "new", rel)), exist_ok=True)
+            src = open(os.path.join(ROOT, rel)).read()
+            open(os.path.join(d, "old", rel), "w").write(src)
+            open(os.path.join(d, "new", rel), "w").write(src + "\n\ndef added_helper():\n    return 1\n")
+        same = code_changes(os.path.join(d, "old"), os.path.join(d, "new"))
+        rel = "toolkit/analysis/calibration.py"
+        open(os.path.join(d, "new", rel), "a").write("\n\ndef posterior(*a, **k):\n    return None\n")
+        changed = code_changes(os.path.join(d, "old"), os.path.join(d, "new"))
+        ok(same["ok"] and not changed["ok"] and changed["files"][rel]["changed"] == ["posterior"],
+           "CP7 an added definition is allowed; a changed one on the coverage path (posterior) is not")
     if os.path.exists(OUT):
         rec = yaml.safe_load(open(OUT))
+        ok(rec.get("calibrator_code", {}).get("ok") is True and rec.get("old_coverage_identity"),
+           "CP8 the committed proof binds the old coverage identity and the calibrator code check")
         ok(rec.get("identical") is True and rec.get("cases", 0) > 0,
            f"CP5 the committed proof says identical ({rec.get('identical_cases')}/{rec.get('cases')} cases)")
         cov = yaml.safe_load(open(COVERAGE))

@@ -58,10 +58,16 @@ def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
     env = float(A.spec["constraints"]["envelope_usd"])
     fixed = sum(_fixed(A.spec).values())
     rows, skipped, infeasible, excluded = [], [], [], []
+    A.spec.packages()
+    bound = getattr(A.spec, "prune_budget", None)      # packages dropped above this budget (within_envelope)
     for f in fractions:
         b = f * env - fixed
         if b <= 0:
             skipped.append({"fraction": f, "reason": "the fixed costs exceed this envelope"})
+            continue
+        if bound is not None and b > bound * (1 + 1e-12):
+            skipped.append({"fraction": f, "reason": "above the declared envelope, and the packages were generated "
+                            "within it (options.packages.within_envelope): a plan there could use a dropped package"})
             continue
         try:
             sol = A.solve(ben0, cost0, budget=b)

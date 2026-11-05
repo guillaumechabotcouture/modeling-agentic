@@ -161,7 +161,11 @@ def seir_generation_interval(latent_days, infectious_days, dt_days: float = 1.0,
         return (L * math.exp(-t / L) - D * math.exp(-t / D)) / (L - D)
     n = 400                                              # midpoint sub-steps per dt (weights to ~1e-6 relative)
     u = (np.arange(n) + 0.5) / n                         # position within a step, in steps
-    cap = float(max_days) if max_days is not None else None
+    cap = _num(max_days, "max_days") if max_days is not None else None
+    if cap is not None and cap < dt:
+        raise ValueError(f"seir generation interval: max_days {cap} must be at least one step ({dt} days)")
+    if not (isinstance(tail, float) and 0 < tail < 1):
+        raise ValueError("seir generation interval: tail must be in (0, 1)")
     w, k = [], 1
     while True:
         gk = g((k - 1 + u) * dt)                         # on the step ((k-1) dt, k dt), t / dt = k - 1 + u
@@ -172,8 +176,10 @@ def seir_generation_interval(latent_days, infectious_days, dt_days: float = 1.0,
         else:
             w[-1] += down
             w.append(up)
-        if (cap is not None and k * dt >= cap) or (cap is None and tail_beyond(k * dt) < tail) or k > 100000:
+        if (cap is not None and k * dt >= cap) or (cap is None and tail_beyond(k * dt) < tail):
             break
+        if k > 100000:
+            raise ValueError("seir generation interval: the tail did not fall below the tolerance within 100,000 steps")
         k += 1
     s = sum(w)
     return [x / s for x in w]
@@ -385,7 +391,10 @@ def _module_class():
             self.hist[0] = new
             self.inc.append(new)
             self._last = new.sum(axis=1)
-            if c["mode"] == "to_extinction" and act.any() and k >= c["k_late_max"]:
+            # a member may stop only after its own package's components acting during the epidemic have acted
+            # (Codex r1 P2-14: per member, from the components its package sets)
+            act = act & (k >= c["k_late_b"])
+            if c["mode"] == "to_extinction" and act.any():
                 # Stop rule. A member whose whole infectious history is zero can never infect again. Otherwise,
                 # with v the incidence over one generation interval per group (an upper bound on the infection
                 # pressure still to act) and K the next-generation matrix at the forcing's maximum and the
@@ -464,7 +473,7 @@ class CompartmentalEngine:
                  dt="day", generation_interval=(1.0,), transmission="r0", forcing="none", forcing_period=365.0,
                  forcing_ref_phase=0.0, importation="deterministic", offspring="poisson", components=None,
                  targets_susceptible=False, doses=(), dose_dependence="independent", outcomes=(), tol=1e-9,
-                 step_cap=20000, segment=256, rt_trajectory=True, results_path=None, time_unit="day",
+                 step_cap=None, segment=256, rt_trajectory=True, results_path=None, time_unit="day",
                  per_group_parameters=(), final_size=False):
         for val, allowed, what in ((structure, STRUCTURES, "structure"), (mode, MODES, "mode"),
                                    (initialiser, INITIALISERS, "initialiser"), (dt, tuple(DT_DAYS), "dt"),
@@ -542,7 +551,11 @@ class CompartmentalEngine:
         self.final_size = bool(final_size)
         if self.final_size and mode != "to_extinction":
             raise ValueError("final_size needs mode to_extinction")
+        self.final_generations = (self.final_size and forcing == "none"
+                                  and not any(cfg.get("day") for cfg in self.components.values()))
         self.tol = _num(tol, "tol")
+        # v0.2: a final-size run counts generations (below), and a near-critical one needs many of them
+        step_cap = (1000000 if self.final_size else 20000) if step_cap is None else step_cap
         self.step_cap, self.segment = int(step_cap), int(segment)
         if self.tol <= 0 or self.step_cap < 1 or self.segment < 1:
             raise ValueError("tol, step_cap and segment must be positive")
@@ -823,6 +836,8 @@ class CompartmentalEngine:
                "reach": {c: np.asarray([m["reach"][c] for m in mem]) for c in self.components},
                "members": mem, "late": self.late_components()}
         ctx["k_late_max"] = max([k for _, k in ctx["late"]], default=0)
+        ctx["k_late_b"] = np.asarray([max([k for cn, k in ctx["late"] if ctx["levels"][cn][b] > 0], default=0)
+                                      for b in range(B)], int)
         ctx["seed"] = (ctx["seed_share"] * N.sum(axis=1))[:, None] * ctx["pi"]
         ctx["reach_mask"] = reachable(ctx["C"], ctx["seed"] > 0)
         return ctx
@@ -942,9 +957,16 @@ class CompartmentalEngine:
         ctx = self._context(list(param_sets), unit, packages)
         if self.time_unit == "year":
             self._check_year_horizon(horizon, packages if isinstance(packages, (list, tuple)) else [packages])
-        late = [k for _, k in ctx["late"]]
+        late = [k for cn, k in ctx["late"] if np.any(ctx["levels"][cn] > 0)]     # components a package sets
         if self.mode == "windowed" and late and max(late) >= self._first_steps(horizon):
             raise ValueError(f"a component acts at step {max(late)}, after the windowed horizon ends")
+        if self.final_generations:
+            # v0.2 final_size without forcing or components acting during the epidemic: the outcome does not depend
+            # on the generation interval or the step length (the exponential-survival identity, FS8, AS7), so the
+            # epidemic runs one generation per step; a near-critical epidemic then converges in thousands of steps
+            # instead of hundreds of thousands. run_series() keeps the declared interval (the figures' timing).
+            ctx["w"] = np.ones(1)
+            ctx["generations"] = True
         state, sim = self._simulate(ctx, horizon, seed)
         return self._outcomes(ctx, state, horizon, seed)
 
@@ -970,25 +992,38 @@ class CompartmentalEngine:
         scale = pm if self.importation == "branching" else np.ones(B)      # branching implies no forcing
         fref = ctx["forcing"](self.forcing_ref_phase)
         r0 = q * spectral_radius(C)
-        w0, w1 = self.days(horizon.window[0], horizon), self.days(horizon.window[1], horizon)
+        # Codex r1 P1-7: windows are compared in the horizon's own unit (decimal years for time_unit year: the step
+        # times as hooks.run_series computes them), so a boundary at an event time keeps its half-open membership
+        tcmp = float(horizon.start) + times / YEAR_DAYS if self.time_unit == "year" else times
+        conv = float
+        w0, w1 = conv(horizon.window[0]), conv(horizon.window[1])
         w1_declared = w1
-        after = inc[times >= w1].sum(axis=(0, 2)) / Ntot           # infections after the window's end
+        after = inc[tcmp >= w1].sum(axis=(0, 2)) / Ntot            # infections after the window's end
+        gens = False
         if self.final_size:
             # v0.2 final_size: outcomes are the epidemic's final size (to extinction), whatever its duration; the
-            # window must start at the importation, and its end bounds only the figures (meta after_window_share)
-            if w0 > 0:
+            # window must start at horizon.start (the importation), and its end bounds only the figures
+            # (meta after_window_share)
+            if w0 > float(tcmp[0]):
                 raise ValueError("final_size: the decision window must start at horizon.start (the importation)")
             w1 = math.inf
+            gens = bool(ctx.get("generations"))
+            if gens:
+                after = np.zeros(B)                    # steps are generations: no calendar time to compare with
+                for wn, (a, z) in (horizon.windows or {}).items():
+                    if conv(a) > float(tcmp[0]) or conv(z) < w1_declared:
+                        raise ValueError(f"final_size counts generations, not days: window {wn} must cover the decision "
+                                         "window (declare forcing or a component day to time the epidemic)")
         elif self.time_unit == "year" and self.mode == "to_extinction":
             # the final size is counted in the decision window: infections after its end above the stop tolerance
             # (tol x N, the run's own convergence criterion) fail closed rather than being dropped
-            after = inc[times >= w1].sum(axis=(0, 2)) / Ntot
+            after = inc[tcmp >= w1].sum(axis=(0, 2)) / Ntot
             late = [int(b) for b in np.nonzero(after > self.tol)[0]]
             if late:
                 raise RuntimeError(f"the epidemic outlasts the decision window (a share {float(np.max(after)):.3g} of the "
                                    f"population is infected after window end day {w1:g}; batch members {late[:10]}): "
                                    "lengthen the window")
-        sel_dec = (times >= w0) & (times < w1)
+        sel_dec = (tcmp >= w0) & (tcmp < w1)
         out = []
         for b in range(B):
             Sb_before = lambda k: (s_start0[b] * N[b]) if k <= 0 else S_after[k - 1, b]  # noqa: E731
@@ -998,17 +1033,21 @@ class CompartmentalEngine:
                 per_capita[o] = {g: float(pc_inf[i] * ratio[i]) for i, g in enumerate(self.groups)}
             wins = {}
             for wn, (t0, t1) in (horizon.windows or {}).items():
-                t0, t1 = self.days(t0, horizon), self.days(t1, horizon)
+                t0, t1 = conv(t0), conv(t1)
                 if self.final_size and t1 >= w1_declared:
                     t1 = math.inf
-                sel = (times >= t0) & (times < t1)
+                sel = (tcmp >= t0) & (tcmp < t1)
                 ks = np.nonzero(sel)[0]
-                k0 = int(ks[0]) if len(ks) else int(np.searchsorted(times, t0))
+                k0 = int(ks[0]) if len(ks) else int(np.searchsorted(tcmp, t0))
                 k_last = int(ks[-1]) if len(ks) else k0 - 1
                 S0 = Sb_before(k0)
                 S1 = S_after[min(k_last, T1 - 1), b] if k_last >= 0 else s_start0[b] * N[b]
                 tot = inc[sel, b].sum(axis=0)
-                f0, f1 = ctx["forcing"](t0)[b], ctx["forcing"](t1)[b]
+                # the forcing at the window's ends, in days; a final-size window ends at its last step (Codex r1 P1-5:
+                # never at infinity)
+                d0 = self.days(t0, horizon)
+                d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_last, 0), T1 - 1)])
+                f0, f1 = ctx["forcing"](d0)[b], ctx["forcing"](d1)[b]
                 rho0 = float(spectral_radius((S0 / N[b])[:, None] * C[b]))
                 rho1 = float(spectral_radius((S1 / N[b])[:, None] * C[b]))
                 series = inc[sel, b].sum(axis=1)
@@ -1039,7 +1078,8 @@ class CompartmentalEngine:
             if self.mode == "to_extinction":
                 meta["converged"] = bool(not state["active"][b])
             if self.final_size:
-                meta["after_window_share"] = float(after[b])
+                meta["after_window_share"] = None if gens else float(after[b])
+                meta["time_axis"] = "generations" if gens else "days"
             if self.mode == "windowed" and self.rt_trajectory:
                 s_traj = S_after[:, b] / N[b]
                 f_t = np.asarray([ctx["forcing"](t)[b] for t in times])
@@ -1114,11 +1154,12 @@ class CompartmentalEngine:
                 if "incidence" in vals:
                     vals["incidence"].append(float(tot[sel, b].sum() / (e - a)))
                 if "susceptible" in vals:
-                    if sel.any():
-                        vals["susceptible"].append(float(sus[sel, b].mean()))
-                    else:
-                        last = int(np.searchsorted(ty, a, side="right")) - 1
-                        vals["susceptible"].append(float(sus[min(max(last, 0), T1 - 1), b]))
+                    # Codex r1 P1-6: the time mean of the piecewise-constant share over [a, e): the value after step j
+                    # holds over [ty_j, ty_j + dt), and after the last step it holds to the end
+                    lo = np.maximum(ty, a)
+                    hi = np.minimum(np.append(ty[1:], np.inf), e)
+                    w = np.maximum(hi - lo, 0.0)
+                    vals["susceptible"].append(float(np.dot(w, sus[:, b]) / (e - a)))
             out.append({"package": p.id, "t": list(grid), "values": vals})
         return out
 

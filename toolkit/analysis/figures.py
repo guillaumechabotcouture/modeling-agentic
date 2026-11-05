@@ -1534,7 +1534,7 @@ def fig_calibration(R, t):
         a1.set_ylabel("model expected", fontsize=8)
         pr = []
         for yv, r in enumerate(regs[::-1]):
-            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f["expected"]), 1e-9))
+            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f.get("variance", f["expected"])), 1e-9))
                  for f in fit if str(f.get("unit")) in R.by_id and R.region(str(f["unit"])) == r]
             pr += v
             a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], zorder=3)
