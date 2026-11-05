@@ -9,7 +9,14 @@ Engine `malaria-starsim` v0.10 (workstream A of architecture v2). Design note:
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
 **v0.10 numbers are v0.9's.** v0.10 adds past SMC and a net type per past net campaign as unit attributes (section below); they act
-only when a unit sets them, and the pack and the evidence set none. PROOF_RESULT
+only when a unit sets them, and the pack and the evidence set none. So the results, fit, equilibration and guess-sensitivity files keep the numbers
+v0.9 computed, and their identity fields were re-stamped by
+`benchmarks/restamp_proof.py` after it found v0.9 (d24d28d) and v0.10 (2714296) outputs identical in 23 of 23 cases: the
+14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and 4 pinned scenarios,
+including `empty_history_v010`, which sets the new attributes at their empty values. The proof ran locally (Python
+3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v010-2`). Each file's `restamped:` record says
+`confirmation: {validate_once: pending}` until a `validate_once.sh` run reports. The v0.9 paragraphs below describe
+the v0.9 recompute, whose numbers these are.
 
 **v0.9 numbers are recomputed.** v0.9 changes net attrition to the smooth-compact survival curve (section below),
 so every evidence file was recomputed by `bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12`. The run
