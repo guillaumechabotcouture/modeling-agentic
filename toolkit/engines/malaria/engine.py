@@ -166,7 +166,9 @@ _PARAMS = [
     ("smc_k", 5.4, "fixed", "shape", None, None, BURGERT + ", Table 1: Weibull decay shape k = 5.4, E(t) = E0 "
      "exp(-(t/L)^k ln2) (Eq 1); Braunack-Mayer 2024 Table 1: 5.34", "matched"),
     ("smc_partial", 0.910, "fixed", "share", None, None, "Cairns et al. 2022 BMC Med 20:352 (PMC9540742), Results: 30-day "
-     "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7", "matched"),
+     "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7. "
+     "Assumption (Codex r1 P2-5): the ratio of two 30-day clinical PEs is applied as a multiplier on the initial "
+     "infection-blocking efficacy, with the same decay and clearance", "unverified"),
     ("cm_add", 0.15, "scenario", "probability", None, None, A8 + " (enhanced CM: +0.15 effective treatment)", "unverified"),
     ("cfr_severe_treated", 0.10, "fixed", "probability", None, None, "AQUAMAT (attempt 8 C48)", "unverified"),
     ("cfr_severe_untreated", 0.30, "fixed", "probability", None, None, "assumption (attempt 8 C49)", "unverified"),
@@ -890,6 +892,7 @@ class MalariaEngine:
         mem = []
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
+            M.smc_check(P)          # v0.11: every member, not only the one whose parameters build the shared burn-in
             a = dict(u.attributes)
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
@@ -2328,7 +2331,8 @@ def _self_test_v011(ok, e, unit) -> None:
     case("Q2", q2)
 
     hz = Horizon(2016.0, 2017.0, (2016.0, 2017.0), {"in": [2016 + 5 / 12, 2016 + 9 / 12],
-                                                   "post": [2016 + 9 / 12 + 29 / 365, 2016 + 9 / 12 + 42 / 365]})
+                                                   "post": [2016 + 8 / 12 + 29 / 365, 2016 + 8 / 12 + 42 / 365]})
+    # Codex r1 P2-2: the last round is at the start of September (2016 + 8/12), so "post" is 29-42 days after it
     usmc = UnitSpec("t", dict(unit.attributes, m0=20.0, itn_hist_years=[], campaign_year=2016.5, irs_month=None,
                               smc_months=[6, 7, 8, 9]))
 
@@ -2357,6 +2361,18 @@ def _self_test_v011(ok, e, unit) -> None:
            "their infections")
         older = uu[a >= 5]
         ok(not np.any(np.asarray(dz.smc_t[older]) == s1), "Q3d children 5 and over are never dosed")
+        # Codex r1 P2-3: reach persists across the intervention's own rounds (the beta propensity, not the test's draws)
+        s2 = sorted(M.event_steps(yv, sim.interventions["smc"].targets()))[1]
+        sim.run(until=yv[s2])
+        both = np.isin(el, np.asarray(sim.people.auids))
+        el2 = el[both]
+        a2 = np.asarray(sim.people.age[el2])
+        el2 = el2[a2 < 5]
+        r1 = np.isin(el2, el[got])
+        r2 = np.asarray(dz.smc_t[el2]) == s2
+        phi = float(np.corrcoef(r1, r2)[0, 1])
+        ok(0.2 < phi < 0.7, f"Q3e reach in round 2 is correlated with reach in round 1 (phi {phi:.3f}; independent "
+                            "rounds give 0)")
     case("Q3", q3)
 
     def q4():
@@ -2368,8 +2384,10 @@ def _self_test_v011(ok, e, unit) -> None:
             lr_post.append(o1.windows["post"]["inc_u5"] / max(o0.windows["post"]["inc_u5"], 1e-9))
         pe_in, pe_post = 1 - float(np.mean(lr_in)), 1 - float(np.mean(lr_post))
         ok(pe_in > 0.7 and pe_post < pe_in - 0.1,
-           f"Q4 emergent clinical effect under 5: {pe_in:.3f} during the rounds (ACCESS-SMC 0.882 within 28 days), "
-           f"{pe_post:.3f} at 29-42 days after the last round (ACCESS-SMC 0.614); a check, not an input")
+           f"Q4 population-level diagnostic, all children under 5 (reached or not): incidence reduction "
+           f"{pe_in:.3f} over the rounds, {pe_post:.3f} at 29-42 days after the last round. Not the recipients' "
+           f"effectiveness that ACCESS-SMC estimates (0.882 within 28 days, 0.614 at 29-42 days); a check, not an "
+           f"input")
     case("Q4", q4)
 
     def q5():
@@ -2384,6 +2402,13 @@ def _self_test_v011(ok, e, unit) -> None:
                 if k not in str(ex):
                     bad.append((k, v, str(ex)[:60]))
         ok(not bad, f"Q5 out-of-range SMC parameters fail closed, naming the parameter (accepted: {bad})")
+        # a member forked from another member's burn-in (SMC parameters are post-fork without past SMC) is checked too
+        try:
+            e.run_batch([{"n_agents": 200, "burnin_years": 0}, {"n_agents": 200, "burnin_years": 0, "smc_cov": 1.5}],
+                        usmc, Package("s", {"smc": 1}), hz, 1)
+            ok(False, "Q5b a forked member's out-of-range SMC parameter fails closed")
+        except ValueError as ex:
+            ok("smc_cov" in str(ex), f"Q5b a forked member's out-of-range SMC parameter fails closed ({ex})")
     case("Q5", q5)
 
     def q6():
@@ -2398,6 +2423,18 @@ def _self_test_v011(ok, e, unit) -> None:
             b0 = e.run_batch(ps, UnitSpec("t", attrs), Package("none", {}), hs, 3)
             ok([o.meta["burnin_members"] for o in b] == [1, 1] and [o.meta["burnin_members"] for o in b0] == [2, 2],
                f"Q6 ({k}) with past SMC the SMC parameters are in the burn-in key; without it they act after the fork")
+        # Codex r1 P2-3: members that share one burn-in each act with their own SMC parameters (dz.P and the
+        # interventions are set per member), including the decay read from dz.P at each step
+        hq = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"d": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        uq = UnitSpec("t", dict(attrs, m0=20.0))
+        ps = [dict(small), dict(small, smc_half=24.0), dict(small, smc_k=2.0), dict(small, smc_cov=0.5, smc_rho=0.0)]
+        b = e.run_batch(ps, uq, Package("s", {"smc": 1}), hq, 4)
+        solo = [e.run(q, uq, Package("s", {"smc": 1}), hq, 4) for q in ps]
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        ok([o.meta["burnin_members"] for o in b] == [4] * 4 and [strip(o) for o in b] == [strip(o) for o in solo]
+           and len({repr(o.windows["d"]) for o in b}) == 4,
+           "Q6b members sharing one burn-in each equal their own run and differ from one another (smc_half, smc_k, "
+           "smc_cov / smc_rho act per member)")
     case("Q6", q6)
 
 

@@ -172,7 +172,8 @@ class Malaria(ss.Disease):
         import hashlib
         h = hashlib.sha256()
         for nm in ('st', 'zeta', 'IB', 'IC', 'ID', 'IV', 'lb', 'lc', 'ld', 'lv', 'prot_until', 'prot_eff', 'smc_t',
-                   'smc_eff', 'has_net', 'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use'):
+                   'smc_eff', 'has_net', 'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use',
+                   'prop_smc'):
             h.update(np.ascontiguousarray(np.asarray(getattr(self, nm)[u], float)).tobytes())
         h.update(np.ascontiguousarray(np.asarray(self.sim.people.age[u], float)).tobytes())
         for mo in self.mos:
@@ -519,7 +520,7 @@ def smc_propensity(u, mean, rho):
     mean (independent rounds); mean 1: every child is reached."""
     u = np.asarray(u, float)
     m, r = float(mean), float(rho)
-    if r <= 0.0 or m >= 1.0:
+    if r < 1e-9 or m >= 1.0:          # Codex r1 P3: a tiny positive rho is the independent limit (1/rho overflows)
         return np.full(u.shape, m)
     from scipy.special import betaincinv
     s = 1.0 / r - 1.0

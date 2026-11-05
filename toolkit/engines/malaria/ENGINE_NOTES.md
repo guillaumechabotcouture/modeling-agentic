@@ -99,7 +99,8 @@ held out.
 What this says for the engine:
 - **During the season, the trials measured almost the same effect on infection as on clinical malaria.** Dicko
   reports 85% against infection and 82% against clinical malaria; Konaté reports RR 0.40 and 0.30. So a strong
-  in-season effect on infection is supported, and v0.11 does **not** weaken it with a separate factor.
+  in-season effect on infection is supported, and v0.11 does **not** weaken it with a separate factor. This
+  supports a modelling choice; it does not prove that no separate clinical mechanism exists.
 - **Protection is not a 28-day step.** It stays above 90% for about three weeks, falls after day 28 and is gone by
   about day 38–45. The Weibull curve of Burgert 2022 gives 0.93 at day 21, 0.71 at day 28, 0.61 at day 30, 0.17 at
   day 38 and 0.01 at day 45.
@@ -122,7 +123,10 @@ What this says for the engine:
 4. **Prophylaxis against new infection (replaces the 28-day step).** From the day of a dose t0, a new infection is
    blocked with probability E(t) = E0 exp(−((t − t0)/L)^k ln2). The values are E0 = `smc_e0` = 1, L = `smc_half` =
    32 days and k = `smc_k` = 5.4 (Burgert 2022, Table 1). A child who took only the day-1 dose gets
-   E0 × `smc_partial`, where `smc_partial` = 0.910 = 79.8 / 87.7 is the ratio of Cairns 2022's two 30-day PEs. This
+   E0 × `smc_partial`, where `smc_partial` = 0.910 = 79.8 / 87.7 is the ratio of Cairns 2022's two 30-day PEs
+   against clinical malaria. Applying that ratio to the initial infection-blocking efficacy, with the same decay and
+   clearance, is an **assumption** (Codex review round 1), so the parameter is marked unverified; its CI is wide
+   (33.7–93.8%) because few trial children skipped days 2–3. This
    protection is held apart from the 25-day post-treatment prophylaxis of case management, and the two combine as
    1 − (1 − a)(1 − b). A new dose restarts the curve.
 5. **Clinical effect: no separate factor (dropped).** The trials' near-equal in-season effect on infection and on
@@ -144,7 +148,10 @@ What this says for the engine:
 - uncharged past and routine SMC;
 - the smc_doses cost driver, which counts children given the day-1 dose.
 
-**Assumption, named:** a child's propensity persists across seasons. The surveys measure one season.
+**Assumptions, named:**
+- a child's propensity persists across seasons. The surveys measure one season;
+- clearance at dosing has probability 1 (step 3);
+- the partial-course multiplier (step 4).
 
 **New engine parameters.** All are kind `fixed`, and each has its source on the card.
 
@@ -175,10 +182,25 @@ PR, not here, because the run data are licensed.
 - Q2: the propensity model: rounds received follow the beta-binomial (Table 21 reproduced), the mean per-round
   reach is `smc_cov`, and `smc_rho` = 0 gives independent rounds.
 - Q3: in the sim, a round reaches the share `smc_cov`, and the reached children's states and doses are correct
-  (clearance, the share with a full course, E0 or E0 × `smc_partial`).
-- Q4: the emergent clinical effect is high within 28 days and lower at 29–42 days.
-- Q5: out-of-range values fail closed.
-- Q6: the burn-in key.
+  (clearance, the share with a full course, E0 or E0 × `smc_partial`); Q3e: reach in the intervention's second round
+  is correlated with reach in its first.
+- Q4: a population-level diagnostic over all children under 5, reached or not: the reduction in clinical incidence
+  is high over the rounds and lower at 29–42 days after the last round. It is not the recipients' effectiveness that
+  ACCESS-SMC estimates, so the two are not compared numerically.
+- Q5: out-of-range values fail closed; Q5b: also for a member forked from another member's burn-in.
+- Q6: the burn-in key; Q6b: members sharing one burn-in each equal their own run and differ from one another.
+
+**Codex review round 1 (before the benchmark run).** No P1 findings. These P2s were fixed, each test-first:
+- validation of every batch member (Q5b);
+- Q4's post-dose window, which started a month late, and its wording;
+- per-member SMC parameters in a shared burn-in (Q6b) and reach persistence across the intervention's own rounds
+  (Q3e);
+- `prop_smc` added to the start-state hash;
+- the partial-course multiplier named as an assumption.
+
+The tiny-`smc_rho` overflow (P3) is handled too. One item is open: `resolve_params` coerces `True` and numeric
+strings to floats before `smc_check` sees them. It is shared by every parameter, so it is left to a contract-level
+change.
 
 ## v0.10 scope: past SMC and a net type per past net campaign (owner approval 2026-11-04)
 
