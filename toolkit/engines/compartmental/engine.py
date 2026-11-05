@@ -337,6 +337,10 @@ def _module_class():
                 self.S = c["s_init"] * c["N"]
                 self.hist = np.zeros((len(c["w"]),) + self.S.shape)
                 self.inc = []
+                # v0.2 generation grid (final_size): no per-step history, only the running total per group, so memory
+                # does not grow with the number of generations (a near-critical batch ran to ~77 GB otherwise)
+                self.cum = np.zeros_like(self.S)
+                self.n_steps = 0
                 self.active = np.ones(self.S.shape[0], bool)
                 self.stopped = np.full(self.S.shape[0], -1)
                 self.s_first = None
@@ -356,7 +360,7 @@ def _module_class():
 
         def export(self) -> dict:
             return {k: getattr(self, k) for k in ("S", "hist", "inc", "active", "stopped", "s_first", "doses",
-                                                  "removed")}
+                                                  "removed", "cum", "n_steps")}
 
         @property
         def k(self) -> int:
@@ -391,7 +395,11 @@ def _module_class():
                 self.S[act] = self.S[act] - new[act]
             self.hist = np.roll(self.hist, 1, axis=0)
             self.hist[0] = new
-            self.inc.append(new)
+            if c.get("generations"):
+                self.cum += new
+            else:
+                self.inc.append(new)
+            self.n_steps = k
             self._last = new.sum(axis=1)
             # a member may stop only after its own package's components acting during the epidemic have acted
             # (Codex r1 P2-14: per member, from the components its package sets)
@@ -1005,7 +1013,11 @@ class CompartmentalEngine:
         B, G = ctx["B"], ctx["G"]
         N, C, q = ctx["N"], ctx["C"], ctx["q"]
         Ntot = N.sum(axis=1)
-        inc = np.stack(state["inc"])                              # (T + 1, B, G); step 0 holds the seeds
+        if ctx.get("generations"):
+            # the generation grid keeps the seeds and the running total only: two rows, (seeds, every later infection)
+            inc = np.stack([state["inc"][0], state["cum"]])
+        else:
+            inc = np.stack(state["inc"])                          # (T + 1, B, G); step 0 holds the seeds
         T1 = inc.shape[0]
         times = np.arange(T1) * self.dt_days
         s_start0 = state["s_first"]                               # after interventions, before seeding
@@ -1093,13 +1105,16 @@ class CompartmentalEngine:
                 m.update({f"attack_rate:{g}": float(tot[i] / N[b, i] * scale[b]) for i, g in enumerate(self.groups)})
                 if self.mode == "to_extinction":
                     m["converged"] = float(not state["active"][b])
-                    m["steps"] = float(state["stopped"][b] if state["stopped"][b] >= 0 else T1 - 1)
+                    m["steps"] = float(state["stopped"][b] if state["stopped"][b] >= 0 else
+                                       (state["n_steps"] if ctx.get("generations") else T1 - 1))
                 wins[wn] = m
             cost = {f"doses:{c}": float(state["doses"][c][b] / Ntot[b]) for c in self.components}
-            meta = {"seed": int(seed), "dt_days": self.dt_days, "steps": int(T1 - 1),
+            meta = {"seed": int(seed), "dt_days": self.dt_days,
+                    "steps": int(state["n_steps"]) if ctx.get("generations") else int(T1 - 1),
                     "age_shares": {g: float(N[b, i] / Ntot[b]) for i, g in enumerate(self.groups)},
                     "s_initialiser": [float(x) for x in ctx["s_init"][b]], "s_start": [float(x) for x in s_start0[b]],
-                    "incidence": [float(x) for x in inc[1:, b].sum(axis=1) / Ntot[b]],
+                    "incidence": ([] if ctx.get("generations") else
+                                  [float(x) for x in inc[1:, b].sum(axis=1) / Ntot[b]]),
                     "p_major_derived": True, "importation": self.importation,
                     "seed_clipped": bool(np.any(ctx["seed"][b] > s_start0[b] * N[b] + 1e-300))}
             if self.mode == "to_extinction":

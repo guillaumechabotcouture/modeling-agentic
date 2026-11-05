@@ -284,6 +284,16 @@ def _self_test() -> int:
     _, err = safe(lambda: b38.run({"r0": 1.000001}, u38, Package("0", {}), Horizon(0, 10, (0, 10), {"all": [0, 10]}), 1))
     ok(err is not None and "did not converge" in err, f"A38b under branching importation it still fails closed: {err}")
 
+    # A39: the generation grid keeps no per-step history (memory does not grow with the number of generations)
+    ctx39 = efs._context([near], _unit(), [Package("0", {})])
+    ctx39["w"], ctx39["generations"] = np.ones(1), True
+    st39, _ = efs._simulate(ctx39, short, 1)
+    o39 = efs.run(near, _unit(), Package("0", {}), short, 1)
+    ok(len(st39["inc"]) == 1 and st39["n_steps"] > 100 and o39.meta["incidence"] == []
+       and abs(o39.windows["all"]["attack_rate"] - o_d.windows["all"]["attack_rate"]) < 1e-8,
+       f"A39 the generation grid stores the seeds and a running total only ({len(st39['inc'])} rows over "
+       f"{st39['n_steps']} generations), with the same final size")
+
     # A24 a contract check of each new configuration
     ok(check_engine(eyh, _unit(), pk, hy) == [] and check_engine(e_mid, u1, Package("v", {"vax": 1}), hd) == [],
        "A24 the year-unit and mid-epidemic configurations pass the contract test")

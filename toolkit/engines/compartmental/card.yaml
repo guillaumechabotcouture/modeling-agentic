@@ -1380,5 +1380,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: 16ad45e27f2fbc531bdf15fdca7acf3d90d9c2673f244f2d8a5b6c16841a6862
+results_sha256: c28e7f149fd03ef6496cf0a370f026ef2ca4f72d028a60a2940c3ba9a0dd66d6
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'
