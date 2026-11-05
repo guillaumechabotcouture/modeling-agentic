@@ -1,12 +1,25 @@
-# Malaria engine v0.10: benchmark notes
+# Malaria engine v0.11: benchmark notes
 
-Engine `malaria-starsim` v0.10 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.11 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
-`results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`) beside them, by
+`results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.11 numbers are recomputed.** v0.11 changes the SMC mechanism (section below). Every evidence file was recomputed by
+`bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12` on one Coiled VM (16 vCPU, 64 GiB; cluster 2331751,
+job `v011a`, workspace `idm-coiled-idmad-r2`) at commit 5fcf64f. The same 14 of 17 benchmarks are in band, and the
+same 9 of 12 held-out ones. Only the two SMC benchmarks moved, and both are held out and stay in band:
+- B13 (in-season clinical incidence RR, 3–59 months; target 0.27, band 0.14–0.40) moved from 0.360 to 0.286 (seed
+  range 0.267–0.302);
+- B17 (SMC cost per DALY averted; band 7.67–192) moved from 19.0 to 14.7.
+
+Every other number is unchanged to the last digit: the fit (cfp_kill 0.405, irs_kill 0.433), B7–B12m, B15, B16c,
+B18–B20, the B15 mechanism scan, the equilibration and the guess sensitivity. Those paths have no SMC. The v0.10
+results, fit and B15 scan are kept in `history/*_v0.10.yaml`; they hold v0.9's numbers. No SMC value was chosen
+using B13, B17 or any calibration target.
 
 **v0.10 numbers are v0.9's.** v0.10 adds past SMC and a net type per past net campaign as unit attributes (section below); they act
 only when a unit sets them, and the pack and the evidence set none. So the results, fit, equilibration and guess-sensitivity files keep the numbers
@@ -859,29 +872,29 @@ Benchmark pack:
   (chlorfenapyr kill, IRS kill), on the same 8 seeds as the final run.
 
 <!-- tables:start -->
-### Benchmark pack: spike v0.1, earlier rounds and v0.9 (this run)
+### Benchmark pack: spike v0.1, earlier rounds and v0.11 (this run)
 
-| ID | Benchmark | Target (band) | v0.1 spike | v0.2 (round 1) | v0.3 round 2 | v0.3 | v0.4 | v0.5–v0.8 | v0.9 | v0.9 seed range | v0.9 status | Role |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands) | 0.83 (0.68–0.98) | 0.735 (in band) | 0.578 (**out of band**) | 0.642 (**out of band**) | 0.595 (**out of band**) | 0.589 (**out of band**) | 0.578 (**out of band**) | 0.501 | 0.466–0.539 | **out of band** | held_out |
-| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 (in band) | 0.45 (**out of band**) | 0.54 (in band) | 0.462 (in band) | 0.462 (in band) | 0.449 (**out of band**) | 0.41 | 0.385–0.451 | **out of band** | held_out |
-| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 (**out of band**) | 0.506 (in band) | 0.377 (in band) | 0.36 (in band) | 0.36 (in band) | 0.359 (in band) | 0.377 | 0.349–0.405 | in band | held_out |
-| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 (**out of band**) | 0.691 (in band) | 0.797 (in band) | 0.662 (in band) | 0.662 (in band) | 0.67 (in band) | 0.666 | 0.635–0.703 | in band | held_out |
-| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 (in band) | 0.75 (in band) | 0.865 (in band) | 0.705 (in band) | 0.705 (in band) | 0.7 (in band) | 0.731 | 0.713–0.757 | in band | held_out |
-| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 (**out of band**) | 0.642 (in band) | 0.667 (in band) | 0.665 (in band) | 0.665 (in band) | 0.649 (in band) | 0.667 | 0.621–0.723 | in band | fit |
-| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 (in band) | 0.501 (in band) | 0.504 (in band) | 0.511 (in band) | 0.511 (in band) | 0.501 (in band) | 0.498 | 0.453–0.553 | in band | fit |
-| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 (in band) | 0.786 (in band) | 0.807 (in band) | 0.8 (in band) | 0.8 (in band) | 0.802 (in band) | 0.804 | 0.77–0.83 | in band | fit |
-| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 (in band) | 0.576 (in band) | 0.59 (in band) | 0.574 (in band) | 0.574 (in band) | 0.572 (in band) | 0.579 | 0.555–0.627 | in band | fit |
-| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | 0.427 (in band) | 0.445 (in band) | 0.451 (in band) | 0.451 (in band) | 0.449 (in band) | 0.451 | 0.411–0.472 | in band | fit |
-| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 (in band) | 0.353 (in band) | 0.361 (in band) | 0.355 (in band) | 0.355 (in band) | 0.358 (in band) | 0.36 | 0.346–0.371 | in band | held_out |
-| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 (in band) | 1.4 (in band) | 1.44 (in band) | 1.48 (in band) | 1.48 (in band) | 1.49 (in band) | 1.51 | 1.26–1.69 | in band | held_out |
-| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
-| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 (in band) | 18.8 (in band) | 18.1 (in band) | 18.1 (in band) | 18.1 (in band) | 19 (in band) | 19 | 17.2–21.1 | in band | held_out |
-| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 (in band) | 14.2 (in band) | 23.2 (in band) | 19.1 (in band) | 19.1 (in band) | 19.5 (in band) | 21.9 | 16.5–34.2 | in band | held_out |
-| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 (**out of band**) | 115 (in band) | 122 (in band) | 114 (in band) | 114 (in band) | 119 (in band) | 116 | 108–126 | in band | held_out |
-| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 (**out of band**) | 4.16 (in band) | 4.33 (in band) | 4.89 (in band) | 4.89 (in band) | 4.58 (in band) | 6.41 | 4.87–9.22 | in band | held_out |
+| ID | Benchmark | Target (band) | v0.1 spike | v0.2 (round 1) | v0.3 round 2 | v0.3 | v0.4 | v0.5–v0.8 | v0.9–v0.10 | v0.11 | v0.11 seed range | v0.11 status | Role |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B7 | ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands) | 0.83 (0.68–0.98) | 0.735 (in band) | 0.578 (**out of band**) | 0.642 (**out of band**) | 0.595 (**out of band**) | 0.589 (**out of band**) | 0.578 (**out of band**) | 0.501 (**out of band**) | 0.501 | 0.466–0.539 | **out of band** | held_out |
+| B8 | ITN vs none, clinical incidence RR 0-24 m (under 5) | 0.55 (0.46–0.64) | 0.578 (in band) | 0.45 (**out of band**) | 0.54 (in band) | 0.462 (in band) | 0.462 (in band) | 0.449 (**out of band**) | 0.41 (**out of band**) | 0.41 | 0.385–0.451 | **out of band** | held_out |
+| B9 | PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m | 0.37 (0.09–0.65) | 0.798 (**out of band**) | 0.506 (in band) | 0.377 (in band) | 0.36 (in band) | 0.36 (in band) | 0.359 (in band) | 0.377 (in band) | 0.377 | 0.349–0.405 | in band | held_out |
+| B9b | PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m | 0.4 (0.2–0.81) | 0.953 (**out of band**) | 0.691 (in band) | 0.797 (in band) | 0.662 (in band) | 0.662 (in band) | 0.67 (in band) | 0.666 (in band) | 0.666 | 0.635–0.703 | in band | held_out |
+| B9c | PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi) | 0.99 (0.67–1.45) | 0.993 (in band) | 0.75 (in band) | 0.865 (in band) | 0.705 (in band) | 0.705 (in band) | 0.7 (in band) | 0.731 (in band) | 0.731 | 0.713–0.757 | in band | held_out |
+| B10 | Dual-AI vs pyrethroid nets, prevalence OR at 24 m | 0.45 (0.23–0.67) | 0.688 (**out of band**) | 0.642 (in band) | 0.667 (in band) | 0.665 (in band) | 0.665 (in band) | 0.649 (in band) | 0.667 (in band) | 0.667 | 0.621–0.723 | in band | fit |
+| B11 | Dual-AI vs pyrethroid nets, incidence RR 0-24 m | 0.54 (0.38–0.7) | 0.402 (in band) | 0.501 (in band) | 0.504 (in band) | 0.511 (in band) | 0.511 (in band) | 0.501 (in band) | 0.498 (in band) | 0.498 | 0.453–0.553 | in band | fit |
+| B12 | Non-pyrethroid IRS added to ITN, prevalence RR at 12 m | 0.61 (0.34–0.88) | 0.878 (in band) | 0.786 (in band) | 0.807 (in band) | 0.8 (in band) | 0.8 (in band) | 0.802 (in band) | 0.804 (in band) | 0.804 | 0.77–0.83 | in band | fit |
+| B12b | Non-pyrethroid IRS added to ITN, incidence RR 0-24 m | 0.86 (0.49–1.23) | 0.746 (in band) | 0.576 (in band) | 0.59 (in band) | 0.574 (in band) | 0.574 (in band) | 0.572 (in band) | 0.579 (in band) | 0.579 | 0.555–0.627 | in band | fit |
+| B12m | Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m | 0.33 (0.19–0.55) | n/a | 0.427 (in band) | 0.445 (in band) | 0.451 (in band) | 0.451 (in band) | 0.449 (in band) | 0.451 (in band) | 0.451 | 0.411–0.472 | in band | fit |
+| B13 | SMC, in-season clinical incidence RR (3-59 m) | 0.27 (0.14–0.4) | 0.346 (in band) | 0.353 (in band) | 0.361 (in band) | 0.355 (in band) | 0.355 (in band) | 0.358 (in band) | 0.36 (in band) | 0.286 | 0.267–0.302 | in band | held_out |
+| B15 | ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial) | 2.43 (1.19–4.97) | 0.982 (in band) | 1.4 (in band) | 1.44 (in band) | 1.48 (in band) | 1.48 (in band) | 1.49 (in band) | 1.51 (in band) | 1.51 | 1.26–1.69 | in band | held_out |
+| B16c | EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%) | rules | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules (**out of band**) | 4/5 rules | per seed: 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5, 4/5 | **out of band** | held_out |
+| B17 | SMC $ per DALY averted (reference setting) | 38.4 (7.67–192) | 18.3 (in band) | 18.8 (in band) | 18.1 (in band) | 18.1 (in band) | 18.1 (in band) | 19 (in band) | 19 (in band) | 14.7 | 13.9–16 | in band | held_out |
+| B18 | ITN vs none $ per DALY averted (reference setting) | 44.5 (8.9–223) | 57.3 (in band) | 14.2 (in band) | 23.2 (in band) | 19.1 (in band) | 19.1 (in band) | 19.5 (in band) | 21.9 (in band) | 21.9 | 16.5–34.2 | in band | held_out |
+| B19 | IRS vs none $ per DALY averted (reference setting) | 25.2 (5.03–126) | 370 (**out of band**) | 115 (in band) | 122 (in band) | 114 (in band) | 114 (in band) | 119 (in band) | 116 (in band) | 116 | 108–126 | in band | held_out |
+| B20 | Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance) | 19 (3.8–95) | 3.63 (**out of band**) | 4.16 (in band) | 4.33 (in band) | 4.89 (in band) | 4.89 (in band) | 4.58 (in band) | 6.41 (in band) | 6.41 | 4.87–9.22 | in band | held_out |
 
-v0.9: 14 in band, 3 out of band, 0 not assessable, 0 band mis-based, of 17 (9 of 12 held-out in band). 298 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
+v0.11: 14 in band, 3 out of band, 0 not assessable, 0 band mis-based, of 17 (9 of 12 held-out in band). 298 engine runs, 8 seeds per arm (common random numbers). v0.1: 10 of 16 in band.
 - B7 by outcome definition (geometric mean of these): Halbluetzel 1996 (0-59 months) 0.4837; Moyou-Somo 1995 (15 and under) 0.5067; Rowland 1996 (all ages) 0.5075; Smithuis 2013 (under 10) 0.5011; Sochantha 2006 (all ages) 0.5075. Diagnostic, not judged: windows.m12.pfpr_6m14y 0.5074.
 - B15 requires {'B9': [0.21, 0.65], 'B12m': [0.19, 0.55]}; computed B9 0.3768, B12m 0.451.
 - B15 arms (OR vs standard LLIN): PBO alone 0.3768, IRS alone 0.451, both 0.2571; prevalence {'a00': 0.5491, 'a10': 0.3146, 'a01': 0.3545, 'a11': 0.2385}.
@@ -964,9 +977,9 @@ Criterion: NOT met: init_guess: m0 3.5: IC 30p differs -6.5% between the x0.25 a
 
 | Start | CPU s per point | CPU s per package run | Relative to v0.4 | Wall s per point | Peak memory (MB) |
 |---|---|---|---|---|---|
-| v0.4 start (no burn-in, one run per package) | 155.3 | 38.8 | 1.00x | 155 | 441 |
-| v0.5: one burn-in per point, packages forked (run_batch) | 207.4 | 51.9 | 1.34x | 207 | 1,832 |
-| v0.5 without sharing (one burn-in per package run) | 533.6 | 133.4 | 3.44x | 534 | 1,006 |
+| v0.4 start (no burn-in, one run per package) | 179.2 | 44.8 | 1.00x | 179 | 441 |
+| v0.5: one burn-in per point, packages forked (run_batch) | 253.1 | 63.3 | 1.41x | 253 | 1,833 |
+| v0.5 without sharing (one burn-in per package run) | 627.6 | 156.9 | 3.50x | 628 | 1,008 |
 <!-- tables:end -->
 
 ## Reading the results (v0.5: one fit and pack run at a 50-year burn-in)
