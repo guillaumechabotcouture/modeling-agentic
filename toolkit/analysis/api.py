@@ -28,6 +28,9 @@ ENGINE_AUTO = True
 def engine_needs(spec: dict) -> dict:
     """What an engine must offer to run this spec (for the stage machine's eligibility filter): engine component values,
     per-capita outputs, cost drivers, window metrics, unit attributes and age groups."""
+    from toolkit.spec import estimates as ES
+    if ES.is_estimates(spec):          # no allocation units: the outputs' window metrics and the bound attributes
+        return ES.needs(spec)
     comps = {}
     for m in ((spec.get("options") or {}).get("engine_map") or {}).values():
         for k, v in (m or {}).items():
@@ -75,9 +78,14 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
         deps.append(schema.ENGINE_CHOICE)
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
+    gi = ((spec.raw.get("dynamics") or {}).get("generation_interval") or {}).get("csv")
+    if gi:                                  # an estimates spec's cited generation interval (Codex r1-9)
+        deps.append(os.path.relpath(spec.resolve(gi), run_dir))
     # uncertainty_report.yaml and models/claims_ledger.yaml are written too, but S1 reserves them for their
     # registered producers (agents/enforcement.py); the manifest (and the contract checks) track them instead.
-    outs = ["analysis/manifest.json", spec["deliverable"]["allocation_file"], "results.md"]
+    from toolkit.spec import estimates as ES
+    outs = ["analysis/manifest.json"] + ([] if ES.is_estimates(spec.raw) else [spec["deliverable"]["allocation_file"]]) \
+        + ["results.md"]
     step = {"id": "analyze", "cmd": f"{sys.executable} {os.path.join(ROOT, 'toolkit', 'analysis', 'run.py')} {run_dir} "
                                     f"--spec {os.path.relpath(spec_path, run_dir)}",
             "inputs": deps, "outputs": outs, "produced_by": "harness"}
@@ -87,6 +95,10 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
 
 
 def headline(run_dir: str) -> dict:
+    if os.path.exists(os.path.join(run_dir, "analysis", "estimates.yaml")) and not os.path.exists(
+            os.path.join(run_dir, "analysis", "point.yaml")):
+        from toolkit.analysis import estimates as ES       # an estimates deliverable: its outputs
+        return ES.headline(run_dir)
     p = read(run_dir, "analysis/point.yaml")["data"]
     u = read(run_dir, "analysis/uncertainty.yaml")["data"]
     o = next(iter(p["averted"]))

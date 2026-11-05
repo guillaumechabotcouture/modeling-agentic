@@ -1,0 +1,168 @@
+# Benchmark pack: renewal engine. Pure validation: the engine has no engine-level fitted parameters (R0, the
+# transmissibility multipliers and the observation parameters are calibrated per run against each question's data),
+# so `fit` is empty and every benchmark is held out. Each benchmark compares the engine with an oracle in
+# oracles.py (a closed form, a fixed point, or a second loop-by-loop implementation of the declared process) or
+# with a second computation of the same quantity. Time is in decimal years; dt is one week unless stated.
+#   python3 -m toolkit.engines.benchmark toolkit/engines/renewal/benchmarks/pack.yaml run --workers 2
+engine: toolkit.engines.renewal.engine:RenewalEngine
+oracles: toolkit.engines.renewal.benchmarks.oracles
+default_config: week4             # the configuration whose engine identity stamps results.yaml
+seeds: [1]
+horizon: {start: 0.0, stop: 30.0, window: [0.0, 30.0], windows: {all: [0.0, 30.0]}}
+# Engine initialisation (benchmark.py validate_initialisation): no burn-in. The state at the start is the unit's
+# susceptible share s0 and the seed infections in the step before it, both set directly; the evidence is the
+# final-size and reference-implementation benchmarks, which start from that state.
+initialisation:
+  method: "susceptible share s0 and seed infections set at the start (unit attributes); no burn-in"
+  evidence: [RW2a, RW2c, RW7]
+
+configs:
+  week4: {generation_interval: [0.2, 0.4, 0.25, 0.15], dt: week}
+  day5: {generation_interval: {dt: day, w: [0.1, 0.3, 0.3, 0.2, 0.1]}, dt: day}
+  week_w1: {generation_interval: [1.0], dt: week}
+  week4_piece: {generation_interval: [0.2, 0.4, 0.25, 0.15], dt: week,
+                transmissibility: {knots: [0.38329911019849415]}}     # 20 weeks minus 1e-9 year
+
+settings:
+  fs_1p5: {config: week4, unit: {N: 1.0e+6, s0: 1.0, seed: 1.0e-9}, params: {r0: 1.5}}
+  fs_4: {config: week4, unit: {N: 1.0e+6, s0: 1.0, seed: 1.0e-9}, params: {r0: 4.0}}
+  fs_s07: {config: week4, unit: {N: 1.0e+6, s0: 0.7, seed: 1.0e-9}, params: {r0: 2.5}}
+  fs_day: {config: day5, unit: {N: 1.0e+6, s0: 1.0, seed: 1.0e-9}, params: {r0: 2.0}}
+  fs_w1: {config: week_w1, unit: {N: 1.0e+6, s0: 1.0, seed: 1.0e-9}, params: {r0: 2.0}}
+  wl_08: {config: week4, unit: {N: 1.0, s0: 1.0, seed: 1.0e-12}, params: {r0: 0.8},
+          horizon: {start: 0.0, stop: 2.0, window: [0.0, 2.0], windows: {all: [0.0, 2.0], growth: [0.3, 0.6]}}}
+  wl_13: {config: week4, unit: {N: 1.0, s0: 1.0, seed: 1.0e-12}, params: {r0: 1.3},
+          horizon: {start: 0.0, stop: 2.0, window: [0.0, 2.0], windows: {all: [0.0, 2.0], growth: [0.3, 0.6]}}}
+  wl_25: {config: week4, unit: {N: 1.0, s0: 1.0, seed: 1.0e-12}, params: {r0: 2.5},
+          horizon: {start: 0.0, stop: 2.0, window: [0.0, 2.0], windows: {all: [0.0, 2.0], growth: [0.3, 0.6]}}}
+  season: {config: week4, unit: {N: 1.5e+6, s0: 1.0, seed: 2.0e-4}, params: {r0: 1.7},
+           horizon: {start: 0.0, stop: 1.0, window: [0.0, 1.0],
+                     windows: {all: [0.0, 1.0], early: [0.0, 0.5], late: [0.5, 1.0]}}}
+  season_piece: {config: week4_piece, unit: {N: 1.5e+6, s0: 1.0, seed: 2.0e-4},
+                 params: {r0: 1.8, "transmissibility:1": 0.6},
+                 horizon: {start: 0.0, stop: 1.0, window: [0.0, 1.0], windows: {all: [0.0, 1.0]}}}
+
+arms:
+  fs_1p5: {setting: fs_1p5, package: {}}
+  fs_4: {setting: fs_4, package: {}}
+  fs_s07: {setting: fs_s07, package: {}}
+  fs_day: {setting: fs_day, package: {}}
+  fs_w1: {setting: fs_w1, package: {}}
+  wl_08: {setting: wl_08, package: {}}
+  wl_13: {setting: wl_13, package: {}}
+  wl_25: {setting: wl_25, package: {}}
+  season: {setting: season, package: {}}
+  season_piece: {setting: season_piece, package: {}}
+
+benchmarks:
+  # ---------------------------------------------------------------- growth rate and R (Wallinga-Lipsitch)
+  - {id: RW1a, metric: "growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine's growth rate, R0 = 1.3",
+     source: "Wallinga & Lipsitch (2007) Proc R Soc B 274:599",
+     estimand: {type: identity, a: {arm: wl_13, value: windows.all.r0},
+                b: {oracle: wallinga_lipsitch, args: {w: [0.2, 0.4, 0.25, 0.15], dt_years: 0.019164955509924708,
+                    r: {arm: wl_13, value: windows.growth.growth_rate}}}, tol: {rel: 1.0e-3}}}
+  - {id: RW1b, metric: "same, R0 = 2.5", source: "Wallinga & Lipsitch (2007) Proc R Soc B 274:599",
+     estimand: {type: identity, a: {arm: wl_25, value: windows.all.r0},
+                b: {oracle: wallinga_lipsitch, args: {w: [0.2, 0.4, 0.25, 0.15], dt_years: 0.019164955509924708,
+                    r: {arm: wl_25, value: windows.growth.growth_rate}}}, tol: {rel: 1.0e-3}}}
+  - {id: RW1c, metric: "same in decline, R0 = 0.8 (negative growth rate)",
+     source: "Wallinga & Lipsitch (2007) Proc R Soc B 274:599",
+     estimand: {type: identity, a: {arm: wl_08, value: windows.all.r0},
+                b: {oracle: wallinga_lipsitch, args: {w: [0.2, 0.4, 0.25, 0.15], dt_years: 0.019164955509924708,
+                    r: {arm: wl_08, value: windows.growth.growth_rate}}}, tol: {rel: 1.0e-3}}}
+  # ---------------------------------------------------------------- final size (exponential-survival identity)
+  - {id: RW2a, metric: "final size, R0 = 1.5, weekly steps", source: "Kermack & McKendrick (1927); fixed point",
+     estimand: {type: value, a: {arm: fs_1p5, value: windows.all.attack_rate},
+                b: {oracle: final_size, args: {r0: 1.5, s0: 1.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RW2b, metric: "final size, R0 = 4", source: "Kermack & McKendrick (1927); fixed point",
+     estimand: {type: value, a: {arm: fs_4, value: windows.all.attack_rate},
+                b: {oracle: final_size, args: {r0: 4.0, s0: 1.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RW2c, metric: "final size with 70% initially susceptible, R0 = 2.5",
+     source: "Diekmann, Heesterbeek & Britton (2013), ch. 1",
+     estimand: {type: value, a: {arm: fs_s07, value: windows.all.attack_rate},
+                b: {oracle: final_size, args: {r0: 2.5, s0: 0.7, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RW2d, metric: "final size at daily steps (any step length), R0 = 2",
+     source: "exponential-survival identity",
+     estimand: {type: value, a: {arm: fs_day, value: windows.all.attack_rate},
+                b: {oracle: final_size, args: {r0: 2.0, s0: 1.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  - {id: RW2e, metric: "negative control: the linear renewal form misses the final size (w_1 = 1, R0 = 2)",
+     source: "design note v2d, Codex review finding 2",
+     estimand: {type: value, compare: differ, a: {oracle: linear_renewal_attack, args: {r0: 2.0, w: [1.0], seed: 1.0e-9}},
+                b: {oracle: final_size, args: {r0: 2.0, s0: 1.0, seed: 1.0e-9}}, tol: {abs: 0.05}}}
+  - {id: RW2f, metric: "the engine's own w_1 = 1 configuration meets the final size the linear form misses",
+     source: "exponential-survival identity",
+     estimand: {type: value, a: {arm: fs_w1, value: windows.all.attack_rate},
+                b: {oracle: final_size, args: {r0: 2.0, s0: 1.0, seed: 1.0e-9}}, tol: {abs: 1.0e-6}}}
+  # ---------------------------------------------------------------- reproduction-number identities
+  - {id: RW3a, metric: "reff_end = R0 S_end / N (constant transmissibility)", source: "identity",
+     estimand: {type: identity, a: {arm: season, value: windows.all.reff_end},
+                b: {oracle: product, args: {a: {arm: season, value: windows.all.r0},
+                                            b: {arm: season, value: windows.all.s_end}}}, tol: {rel: 1.0e-12}}}
+  - {id: RW3b, metric: "reff_end < 1 after a major epidemic", source: "threshold theorem",
+     estimand: {type: value, compare: le, a: {arm: season, value: windows.all.reff_end}, b: 1.0, tol: {abs: 0.0}}}
+  - {id: RW3c, metric: "attack_rate counts only infections inside a window that starts with S < N", source: "identity",
+     estimand: {type: identity, a: {arm: season, value: windows.late.attack_rate},
+                b: {oracle: difference, args: {a: {arm: season, value: windows.all.attack_rate},
+                                               b: {arm: season, value: windows.early.attack_rate}}}, tol: {rel: 1.0e-12}}}
+  - {id: RW3d, metric: "piecewise transmissibility: reff_ref = R0 S_end / N with the reference piece", source: "identity",
+     estimand: {type: identity, a: {arm: season_piece, value: windows.all.reff_ref},
+                b: {oracle: product, args: {a: 1.8, b: {arm: season_piece, value: windows.all.s_end}}},
+                tol: {rel: 1.0e-12}}}
+  - {id: RW3e, metric: "piecewise transmissibility: reff_end = R0 m_1 S_end / N with the last piece's multiplier",
+     source: "identity",
+     estimand: {type: identity, a: {arm: season_piece, value: windows.all.reff_end},
+                b: {oracle: product, args: {a: 1.08, b: {arm: season_piece, value: windows.all.s_end}}},
+                tol: {rel: 1.0e-12}}}
+  # ---------------------------------------------------------------- identifiability identity
+  - {id: RW4, metric: "scale invariance: (R0, s0, N) and (R0 s0, 1, s0 N) give the same counts and reff_end (so a case
+       series alone does not separate the initial susceptible share from R0 or the attack rate)",
+     source: "identity of the renewal equation in S/N",
+     estimand: {type: value, a: {probe: scale_invariance, args: {config: week4, r0: 3.0, s0: 0.5, seed: 1.0e-4, n: 52}},
+                b: 0.0, tol: {abs: 1.0e-10}}}
+  # ---------------------------------------------------------------- time-varying R_t (Cori estimator)
+  - {id: RW5a, metric: "Cori estimator recovers a known piecewise R_t (1.6 then 0.8) from the engine's expected series",
+     source: "Cori et al. (2013) Am J Epidemiol 178:1505",
+     estimand: {type: value, compare: le, a: {probe: cori_recovery, args: {config: week4_piece, r_before: 1.6,
+                r_after: 0.8, n: 40, switch: 20}}, b: 0.01, tol: {abs: 0.0}}}
+  - {id: RW5b, metric: "Cori 95% intervals cover the known R_t on Poisson-reported series (reporting 1/10, 200
+       replicates)", source: "Cori et al. (2013) Am J Epidemiol 178:1505",
+     estimand: {type: value, compare: le, a: 0.90,
+                b: {probe: cori_coverage, args: {config: week4_piece, r_before: 1.6, r_after: 0.8, n: 40, switch: 20,
+                    reporting: 0.1, replicates: 200, seed: 7}}, tol: {abs: 0.0}}}
+  - {id: RW5c, metric: "same, and the intervals are not inflated: coverage at most 0.99 (Codex r1-14)",
+     source: "Cori et al. (2013) Am J Epidemiol 178:1505",
+     estimand: {type: value, compare: le,
+                a: {probe: cori_coverage, args: {config: week4_piece, r_before: 1.6, r_after: 0.8, n: 40, switch: 20,
+                    reporting: 0.1, replicates: 200, seed: 7}}, b: 0.99, tol: {abs: 0.0}}}
+  - {id: RW5d, metric: "Cori gamma posterior quantiles equal scipy's for a hand-computed window (shape a + sum I,
+       rate 1/b + sum Lambda)", source: "Cori et al. (2013) Am J Epidemiol 178:1505, web appendix",
+     estimand: {type: value, a: {probe: cori_quantile_error, args: {}}, b: 0.0, tol: {abs: 1.0e-12}}}
+  # ---------------------------------------------------------------- recovery of a known R0 from simulated data
+  - {id: RW6a, metric: "refit of noise-free reported counts from the reference implementation: R0 = 1.65 recovered",
+     source: "the pack's reference implementation",
+     estimand: {type: value, a: {probe: refit_r0, args: {config: week4, r0: 1.65, s0: 1.0, reporting: 0.03,
+                seed: 2.0e-4, n: 52}}, b: 1.65, tol: {rel: 1.0e-4}}}
+  - {id: RW6b, metric: "same refit: the reporting fraction 0.03 is recovered when s0 is known and the epidemic turns over",
+     source: "the pack's reference implementation",
+     estimand: {type: value, a: {probe: refit_r0, args: {config: week4, r0: 1.65, s0: 1.0, reporting: 0.03,
+                seed: 2.0e-4, n: 52, what: reporting}}, b: 0.03, tol: {rel: 1.0e-4}}}
+  - {id: RW6c, metric: "same refit: reff_end recovered", source: "the pack's reference implementation",
+     estimand: {type: value, a: {probe: refit_r0, args: {config: week4, r0: 1.65, s0: 1.0, reporting: 0.03,
+                seed: 2.0e-4, n: 52, what: reff_end}},
+                b: {oracle: reference_reff_end, args: {r0: 1.65, w: [0.2, 0.4, 0.25, 0.15], s0: 1.0, seed: 2.0e-4,
+                    n: 52}}, tol: {rel: 1.0e-4}}}
+  # ---------------------------------------------------------------- independent implementation
+  - {id: RW7, metric: "the engine's incidence equals a second loop-by-loop implementation of the declared process",
+     source: "the pack's reference implementation",
+     estimand: {type: value, a: {probe: reference_max_rel, args: {config: week4, r0: 1.8, s0: 0.9, seed: 1.0e-5,
+                n: 60}}, b: 0.0, tol: {abs: 1.0e-9}}}
+  - {id: RW8, metric: "the reference implementation's attack rate over one season equals the engine's",
+     source: "the pack's reference implementation",
+     estimand: {type: value, a: {arm: season, value: windows.all.attack_rate},
+                b: {oracle: reference_attack, args: {r0: 1.7, w: [0.2, 0.4, 0.25, 0.15], s0: 1.0, seed: 2.0e-4,
+                    n: 52}}, tol: {rel: 1.0e-9}}}
+  # ---------------------------------------------------------------- held out: published
+  - {id: RW9, metric: "published reproduction-number estimates from incidence series", role: held_out,
+     source: "Cori et al. (2013) Am J Epidemiol 178:1505, worked examples (1918 pandemic influenza, SARS 2003, measles
+       1861)",
+     estimand: {type: value, not_transcribed: "values to be transcribed with a quoted span through the evidence service"}}

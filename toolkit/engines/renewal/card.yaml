@@ -1,0 +1,601 @@
+name: renewal
+version: '0.1'
+mechanisms:
+- one closed population; no births, deaths, waning immunity or migration within the horizon
+- discrete renewal equation on the generation interval's grid (Fraser 2007; Cori et al. 2013) with susceptible depletion
+  in the exponential-survival form (final-size relation exact at any step)
+- 'generation interval declared per question: 4 lags of one week, mean 2.35 weeks'
+- 'R_t = R0 c(t) S_t-1: transmissibility piecewise constant between declared knots (constant)'
+- interventions as multipliers (1 - effect) on R_t over a declared period
+- 'deterministic: no random numbers; the seed is recorded only'
+components:
+  none:
+  - 0
+unit_attributes:
+  N: population (> 0)
+  s0: susceptible share at the start, before the seed [0, 1] (default 1)
+  seed: infections in the step before the start, as a share of N [0, 0.1] (default 1e-6)
+outputs:
+  per_capita:
+  - infections
+  windows:
+  - attack_rate
+  - s_start
+  - s_end
+  - reff_start
+  - reff_end
+  - reff_ref
+  - growth_rate
+  - peak_time
+  - r0
+  cost_drivers: []
+  series:
+    infections:
+      label: new infections
+      units: infections per person-year
+      aggregate: rate
+      denominator: person-year
+    reff:
+      label: instantaneous reproduction number R_t
+      units: infections per infection
+      aggregate: mean
+      denominator: person
+    susceptible:
+      label: susceptible share
+      units: share
+      aggregate: mean
+      denominator: person
+age_groups:
+- all
+valid_ranges:
+  s0:
+  - 0.0
+  - 1.0
+  seed:
+  - 0.0
+  - 0.1
+  r0:
+  - 0.05
+  - 40.0
+fitted: {}
+benchmarks:
+- id: RW1a
+  metric: 'growth phase: R0 = 1 / sum_s w_s exp(-r s) for the engine''s growth rate, R0 = 1.3'
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 1.3
+  reference: 1.3000004960871179
+  error_abs: 4.960871178294468e-07
+  error_rel: 3.8160532963073746e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 4.960871178294468e-07
+  in_band: true
+  status: in_band
+- id: RW1b
+  metric: same, R0 = 2.5
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 2.5
+  reference: 2.4999996772739044
+  error_abs: 3.2272609562511434e-07
+  error_rel: 1.2909045491438915e-07
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 3.2272609562511434e-07
+  in_band: true
+  status: in_band
+- id: RW1c
+  metric: same in decline, R0 = 0.8 (negative growth rate)
+  role: held_out
+  target: null
+  band: null
+  source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
+  computed: 0.8
+  reference: 0.8000008596511359
+  error_abs: 8.596511358316405e-07
+  error_rel: 1.0745627651031737e-06
+  tolerance:
+    rel: 0.001
+  compare: eq
+  per_seed_error_abs:
+  - 8.596511358316405e-07
+  in_band: true
+  status: in_band
+- id: RW2a
+  metric: final size, R0 = 1.5, weekly steps
+  role: held_out
+  target: null
+  band: null
+  source: Kermack & McKendrick (1927); fixed point
+  computed: 0.5828116439806399
+  reference: 0.5828116439806399
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW2b
+  metric: final size, R0 = 4
+  role: held_out
+  target: null
+  band: null
+  source: Kermack & McKendrick (1927); fixed point
+  computed: 0.9801725977397572
+  reference: 0.980172597739757
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.265362298814089e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW2c
+  metric: final size with 70% initially susceptible, R0 = 2.5
+  role: held_out
+  target: null
+  band: null
+  source: Diekmann, Heesterbeek & Britton (2013), ch. 1
+  computed: 0.49888865957827905
+  reference: 0.4988886595782783
+  error_abs: 7.216449660063518e-16
+  error_rel: 1.4465050510796824e-15
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 7.216449660063518e-16
+  in_band: true
+  status: in_band
+- id: RW2d
+  metric: final size at daily steps (any step length), R0 = 2
+  role: held_out
+  target: null
+  band: null
+  source: exponential-survival identity
+  computed: 0.7968121293623034
+  reference: 0.7968121293623036
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.7866619588576763e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW2e
+  metric: 'negative control: the linear renewal form misses the final size (w_1 = 1, R0 = 2)'
+  role: held_out
+  target: null
+  band: null
+  source: design note v2d, Codex review finding 2
+  computed: 0.8687075595459232
+  reference: 0.7968121293623036
+  error_abs: 0.07189543018361955
+  error_rel: 0.09022883504692399
+  tolerance:
+    abs: 0.05
+  compare: differ
+  per_seed_error_abs:
+  - 0.07189543018361955
+  in_band: true
+  status: in_band
+- id: RW2f
+  metric: the engine's own w_1 = 1 configuration meets the final size the linear form misses
+  role: held_out
+  target: null
+  band: null
+  source: exponential-survival identity
+  computed: 0.7968121293623038
+  reference: 0.7968121293623036
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.7866619588576763e-16
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW3a
+  metric: reff_end = R0 S_end / N (constant transmissibility)
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.5296758273296579
+  reference: 0.5296758273296579
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW3b
+  metric: reff_end < 1 after a major epidemic
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  computed: 0.5296758273296579
+  reference: 1.0
+  error_abs: 0.4703241726703421
+  error_rel: 0.4703241726703421
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.4703241726703421
+  in_band: true
+  status: in_band
+- id: RW3c
+  metric: attack_rate counts only infections inside a window that starts with S < N
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.49256269510491524
+  reference: 0.4925626951049153
+  error_abs: 5.551115123125783e-17
+  error_rel: 1.126986509188115e-16
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 5.551115123125783e-17
+  in_band: true
+  status: in_band
+- id: RW3d
+  metric: 'piecewise transmissibility: reff_ref = R0 S_end / N with the reference piece'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 1.294240671755704
+  reference: 1.294240671755704
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW3e
+  metric: 'piecewise transmissibility: reff_end = R0 m_1 S_end / N with the last piece''s multiplier'
+  role: held_out
+  target: null
+  band: null
+  source: identity
+  computed: 0.7765444030534224
+  reference: 0.7765444030534224
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    rel: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW4
+  metric: 'scale invariance: (R0, s0, N) and (R0 s0, 1, s0 N) give the same counts and reff_end (so a case series
+    alone does not separate the initial susceptible share from R0 or the attack rate)'
+  role: held_out
+  target: null
+  band: null
+  source: identity of the renewal equation in S/N
+  computed: 0.0
+  reference: 0.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 1.0e-10
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  in_band: true
+  status: in_band
+- id: RW5a
+  metric: Cori estimator recovers a known piecewise R_t (1.6 then 0.8) from the engine's expected series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.0003043138673866075
+  reference: 0.01
+  error_abs: 0.009695686132613393
+  error_rel: 0.9695686132613393
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.009695686132613393
+  in_band: true
+  status: in_band
+- id: RW5b
+  metric: Cori 95% intervals cover the known R_t on Poisson-reported series (reporting 1/10, 200 replicates)
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.9
+  reference: 0.9306521739130434
+  error_abs: 0.030652173913043423
+  error_rel: 0.03293622985283806
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.030652173913043423
+  in_band: true
+  status: in_band
+- id: RW5c
+  metric: 'same, and the intervals are not inflated: coverage at most 0.99 (Codex r1-14)'
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505
+  computed: 0.9306521739130434
+  reference: 0.99
+  error_abs: 0.059347826086956545
+  error_rel: 0.059947299077733884
+  tolerance:
+    abs: 0.0
+  compare: le
+  per_seed_error_abs:
+  - 0.059347826086956545
+  in_band: true
+  status: in_band
+- id: RW5d
+  metric: Cori gamma posterior quantiles equal scipy's for a hand-computed window (shape a + sum I, rate 1/b + sum
+    Lambda)
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505, web appendix
+  computed: 2.220446049250313e-16
+  reference: 0.0
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.220446049250313e+284
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 2.220446049250313e-16
+  in_band: true
+  status: in_band
+- id: RW6a
+  metric: 'refit of noise-free reported counts from the reference implementation: R0 = 1.65 recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 1.649999976568264
+  reference: 1.65
+  error_abs: 2.3431735884926752e-08
+  error_rel: 1.420105205147076e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 2.3431735884926752e-08
+  in_band: true
+  status: in_band
+- id: RW6b
+  metric: 'same refit: the reporting fraction 0.03 is recovered when s0 is known and the epidemic turns over'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.030000000524392244
+  reference: 0.03
+  error_abs: 5.243922449049698e-10
+  error_rel: 1.747974149683233e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 5.243922449049698e-10
+  in_band: true
+  status: in_band
+- id: RW6c
+  metric: 'same refit: reff_end recovered'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.5576282312615415
+  reference: 0.5576282187178642
+  error_abs: 1.2543677319065694e-08
+  error_rel: 2.2494696103986542e-08
+  tolerance:
+    rel: 0.0001
+  compare: eq
+  per_seed_error_abs:
+  - 1.2543677319065694e-08
+  in_band: true
+  status: in_band
+- id: RW7
+  metric: the engine's incidence equals a second loop-by-loop implementation of the declared process
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 1.500182690381747e-11
+  reference: 0.0
+  error_abs: 1.500182690381747e-11
+  error_rel: 1.5001826903817469e+289
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.500182690381747e-11
+  in_band: true
+  status: in_band
+- id: RW8
+  metric: the reference implementation's attack rate over one season equals the engine's
+  role: held_out
+  target: null
+  band: null
+  source: the pack's reference implementation
+  computed: 0.688225983923731
+  reference: 0.6882259839237311
+  error_abs: 1.1102230246251565e-16
+  error_rel: 1.613166388016223e-16
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.1102230246251565e-16
+  in_band: true
+  status: in_band
+- id: RW9
+  metric: published reproduction-number estimates from incidence series
+  role: held_out
+  target: null
+  band: null
+  source: Cori et al. (2013) Am J Epidemiol 178:1505, worked examples (1918 pandemic influenza, SARS 2003, measles
+    1861)
+  computed: null
+  in_band: false
+  status: not_assessable
+  not_assessable_because: 'published values not yet transcribed: values to be transcribed with a quoted span through
+    the evidence service'
+notes:
+- the observation model (reporting fraction, delay, overdispersion) belongs to each data source and is the harness's
+  (toolkit/analysis/observation.py), never an engine parameter
+- 'out of range: births, deaths, waning, migration, vector dynamics (absorbed into R0 and c(t)), stochastic fade-out,
+  spatial structure'
+- validated against analytic identities (final size, Wallinga-Lipsitch, reproduction-number identities, scale invariance)
+  and known-R_t recovery; published benchmark RW9 (Cori et al. 2013 worked examples) not yet assessed
+- 'configuration: {"components": {}, "dt": "week", "generation_interval": {"dt": "week", "w": [0.2, 0.4, 0.25, 0.15]},
+  "transmissibility": "constant"}'
+configured_as: week4
+configuration_vocabulary:
+  dt:
+  - week
+  - day
+  transmissibility:
+  - constant
+  - '{knots: [...]}'
+  components: '{name: {start, stop}}'
+capabilities:
+  base:
+    dynamics:
+    - closed_epidemic_renewal
+    structure:
+    - single_group
+    outcome_role:
+      infections: prevented
+    intervention_action:
+    - reduce_rate
+    estimands:
+    - r0
+    - reff_start
+    - reff_end
+    - reff_ref
+    - attack_rate
+    - growth_rate
+    - incidence_series
+    calibration_data:
+    - incidence_series
+parameters:
+- name: r0
+  value: 2.0
+  kind: calibrated
+  units: secondary infections per infection in a fully susceptible population, reference transmissibility
+  lo: 0.05
+  hi: 40.0
+  source: calibrated per run; its prior is declared in the signed spec (calibration.priors), published ranges in
+    toolkit/engines/renewal/ranges.yaml
+  verified: unverified
+published_ranges:
+  generic:
+    seed:
+      what: infections in the step before the series starts, as a share of the population
+      range:
+      - 1.0e-07
+      - 0.001
+      dist: loguniform
+      spread: 'wide by design: the series'' first weeks inform it; set the lower end near one infection in the population'
+      source: 'assumption: no published value; the data inform it'
+      verified: unverified
+    s0:
+      what: susceptible share at the start of the series (1 minus prior immunity to this strain or serotype)
+      range:
+      - 0.0
+      - 1.0
+      spread: 'not identified by a case series alone (RW4 scale invariance): with a case series only, the attack
+        rate scales with s0 while reff_end does not; declare it from a serosurvey or the question, or carry its
+        full range'
+      source: the question or a serosurvey
+      verified: unverified
+    dispersion:
+      what: negative-binomial size k of the reported counts (variance mu + mu^2 / k)
+      range:
+      - 1.0
+      - 1000.0
+      dist: loguniform
+      spread: weakly informative; the series informs it
+      source: 'assumption: no published value'
+      verified: unverified
+  dengue:
+    r0:
+      what: basic reproduction number (vector dynamics absorbed), from outbreak growth rates
+      range:
+      - 1.3
+      - 5.0
+      spread: range of published estimates across settings and seasons
+      source: 'to transcribe: Johansson, Hombach & Cummings (2011) Vaccine 29:5860 (review of dengue model parameters);
+        Favier et al. (2006) Trop Med Int Health 11:332 (early growth-rate estimates, Brazil)'
+      verified: unverified
+    reporting_fraction:
+      what: reported cases per infection (all infections, inapparent included)
+      range:
+      - 0.0333
+      - 0.333
+      dist: loguniform
+      spread: range of published ratios across settings, stated as rough; a spec may widen it with a reason
+      source: Bhatt et al. (2013) Nature 496:504 (about one in four infections apparent); Undurraga et al. (2013)
+        PLoS Negl Trop Dis 7:e2056 (expansion factors from reported to symptomatic cases)
+      verified: unverified
+    intrinsic_incubation_days:
+      what: infection to symptom onset in humans (part of the infection-to-report delay)
+      range:
+      - 3.0
+      - 10.0
+      spread: about 95% of cases; mean about 6 days
+      source: Chan & Johansson (2012) PLoS One 7:e50972
+      verified: unverified
+    generation_interval_weeks:
+      what: human-to-human generation interval (through the mosquito)
+      range:
+      - 2.0
+      - 4.0
+      spread: mean, depends on temperature
+      source: Siraj et al. (2017) PLoS Negl Trop Dis 11:e0005797
+      verified: unverified
+validation_label: validated against analytic identities (final size, Wallinga-Lipsitch, reproduction-number identities,
+  scale invariance) and known-R_t recovery; published benchmark RW9 (Cori et al. 2013 worked examples) not yet assessed
+results_sha256: 10a30f65f5169a38ed4343fd0a5ace952d797dc29bd52c465f1d7a81fe68a7e2
+benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'
