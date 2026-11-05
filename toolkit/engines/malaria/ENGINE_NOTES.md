@@ -11,10 +11,10 @@ Engine `malaria-starsim` v0.10 (workstream A of architecture v2). Design note:
 **v0.10 numbers are v0.9's.** v0.10 adds past SMC and a net type per past net campaign as unit attributes (section below); they act
 only when a unit sets them, and the pack and the evidence set none. So the results, fit, equilibration and guess-sensitivity files keep the numbers
 v0.9 computed, and their identity fields were re-stamped by
-`benchmarks/restamp_proof.py` after it found v0.9 (d24d28d) and v0.10 (2714296) outputs identical in 23 of 23 cases: the
+`benchmarks/restamp_proof.py` after it found v0.9 (d24d28d) and v0.10 (2460326) outputs identical in 23 of 23 cases: the
 14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and 4 pinned scenarios,
 including `empty_history_v010`, which sets the new attributes at their empty values. The proof ran locally (Python
-3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v010-2`). Each file's `restamped:` record says
+3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v010-3`). Each file's `restamped:` record says
 `confirmation: {validate_once: pending}` until a `validate_once.sh` run reports. The v0.9 paragraphs below describe
 the v0.9 recompute, whose numbers these are.
 
@@ -116,10 +116,11 @@ new attributes at their empty values.
 **Tests (written first).** H0 card and binding; H1 past SMC rounds in the schedule at their dates, uncharged, on the
 steps the sim runs, and the rounds-per-year override; H2 the trajectory is identical before the first past round and
 under-5 incidence is lower in the past SMC months (sum of the monthly rates over June–September 2015,
-0.153 vs 1.034 per child-year, 1,500 agents), never charged; H3 byte-identity with empty values; H4 malformed formats fail closed, in `schedule()`
+0.081 vs 0.646 per child-year, 1,000 agents, horizon 2015–2017), never charged; H3 byte-identity with empty values; H4 malformed formats fail closed, in `schedule()`
 and in the sim path; H5 each past campaign gives its own net type and routine campaigns keep `hist_net`; H6 burn-in
 key; H7 (Codex review round 1) overlap with the package's SMC, the sim-step check, SMC months and year keys of
-mixed type.
+mixed type. The v0.8–v0.10 sections run in a second process (`selftest_late.py --self-test`; L0 checks every
+section runs in one of the two), so each module stays well inside CI's per-test time limit.
 
 ## v0.9 scope: smooth-compact net survival (written before the v0.9 pack run)
 
