@@ -98,6 +98,18 @@ def inversion_report(spec, model, theta, cal) -> dict:
     }
 
 
+def clamped_units_max() -> int:
+    """toolkit/calibration/thresholds.yaml blocking.clamped_units_max."""
+    from toolkit.calibration.history_matching import thresholds as _t
+    return int(_t()["blocking"]["clamped_units_max"])
+
+
+def clamped_hits(cal: dict) -> list:
+    """AnalysisBlocked hits for the units an emulator inversion clamped at a bound of calibration.range."""
+    return [{"unit": i, "package": "*", "kind": "calibration_clamped", "z": round(float(v["z"]), 4)}
+            for i, v in (cal.get("units") or {}).items() if v.get("clamped")]
+
+
 # --------------------------------------------------------------------------- likelihood
 def read_targets(spec) -> list[dict]:
     t = spec["calibration"]["targets"]

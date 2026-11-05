@@ -27,11 +27,13 @@ def discount_factor(spec) -> float:
 
 
 class AnalysisBlocked(RuntimeError):
-    """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan."""
+    """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan, or (at
+    the calibration step, `reason` given) units the calibration cannot match."""
 
-    def __init__(self, where: str, hits: list):
-        self.where, self.hits = where, list(hits)
-        super().__init__(f"{where}: {len(hits)} model corrections (extrapolation, clips, floors) bear on the plan "
+    def __init__(self, where: str, hits: list, reason: str | None = None):
+        self.where, self.hits, self.reason = where, list(hits), reason
+        super().__init__(f"{where}: {reason} (e.g. {hits[:2]})" if reason else
+                         f"{where}: {len(hits)} model corrections (extrapolation, clips, floors) bear on the plan "
                          f"(e.g. {hits[:2]})")
 
 
@@ -60,7 +62,18 @@ class Analysis:
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None
+        self.joint = None
         self.last_events = []
+
+    def set_joint(self, rep):
+        """The joint calibration (toolkit/analysis/joint_calibration.py): its shared parameters move to the best point
+        of the compatible region, and the uncertainty draws read their values from the region sample instead of the
+        priors. The unit attribute is still found by emulator inversion at each parameter set."""
+        from toolkit.analysis import joint_calibration as JC
+        names = list(rep["shared"])
+        self.joint = {"shared": names, "sample": JC.region_sample(rep), "ranges": rep["region"]["ranges"],
+                      "best": dict(rep["best"]["theta"])}
+        self.theta0 = dict(self.theta0, **{k: float(rep["best"]["theta"][k]) for k in names})
 
     # ------------------------------------------------------------ calibration
     def calibrate(self, theta, shifts=None, ids=None):

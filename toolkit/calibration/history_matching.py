@@ -163,13 +163,16 @@ class Target:
     on the target's `scale`."""
 
     def __init__(self, id, kind, observable, value, scale="identity", sd_obs=0.0, sd_bias=0.0, sd_md=0.0,
-                 unit=None, weights=None, source=""):
+                 unit=None, weights=None, source="", depends_on=None):
         self.id, self.kind, self.observable = str(id), str(kind), str(observable)
         self.value, self.scale = float(value), str(scale)
         self.sd_obs, self.sd_bias, self.sd_md = float(sd_obs), float(sd_bias), float(sd_md)
         self.unit = None if unit is None else str(unit)
         self.weights = None if weights is None else {str(k): float(v) for k, v in weights.items()}
         self.source = str(source or "")
+        # a shared target's declared dependence: the shared parameters its setting uses (None: all of them). The
+        # simulation still sets every shared value; only the emulator's inputs are restricted.
+        self.depends_on = None if depends_on is None else [str(x) for x in depends_on]
 
     @property
     def y(self) -> float:
@@ -275,6 +278,14 @@ class Problem:
                     bad.append(f"{w}: group weights must name calibrated units with weights >= 0 and a positive sum")
             elif t.kind == "shared" and t.unit is not None:
                 bad.append(f"{w}: a shared target names no unit")
+            if t.depends_on is not None and (t.kind != "shared" or not t.depends_on
+                                             or set(t.depends_on) - set(self.names)):
+                bad.append(f"{w}: depends_on is for a shared target and must list shared parameters")
+        deps = {}
+        for t in self.targets:
+            if t.kind == "shared":
+                deps.setdefault(t.observable, set()).add(tuple(t.depends_on) if t.depends_on else None)
+        bad += [f"observable {ob}: its targets declare different dependences" for ob, d in deps.items() if len(d) > 1]
         for u in self.units:
             if not self.unit_targets(u):
                 bad.append(f"unit {u}: no unit target; its parameter would be set by nothing (refused)")
@@ -410,13 +421,21 @@ class UnitEmulator:
 
 
 class SharedEmulator:
-    """One observable that depends on the shared parameters only: a Gaussian process on the unit cube."""
+    """One observable that depends on the shared parameters only: a Gaussian process on the unit cube, over the
+    columns `cols` (the target's declared dependence; all shared parameters by default)."""
+
+    def __init__(self, cols=None):
+        self.cols = None if cols is None else list(cols)
+
+    def _c(self, T):
+        T = np.atleast_2d(np.asarray(T, float))
+        return T if self.cols is None else T[:, self.cols]
 
     def fit(self, T, y):
         import warnings
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-        T = np.asarray(T, float)
+        T = self._c(T)
         k = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(np.ones(T.shape[1]), (0.05, 50), nu=2.5) + \
             WhiteKernel(1e-3, (1e-8, 1e0))
         with warnings.catch_warnings():
@@ -427,7 +446,7 @@ class SharedEmulator:
         return self
 
     def predict(self, T, noise=True):
-        m, s = self.gp.predict(np.atleast_2d(np.asarray(T, float)), return_std=True)
+        m, s = self.gp.predict(self._c(T), return_std=True)
         v = np.maximum(s ** 2, 1e-12)
         if not noise:
             v = np.maximum(v - self.tn, 1e-12)
@@ -583,7 +602,9 @@ class HistoryMatch:
         if srows and self.sobs:
             T = np.array([r["t"] for r in srows]).reshape(len(srows), self.p)
             for ob in self.sobs:
-                em["shared"][ob] = SharedEmulator().fit(T, tr([r["obs"][ob] for r in srows], self.P.scales[ob]))
+                dep = next((t.depends_on for t in self.P.targets if t.observable == ob), None)
+                cols = None if dep is None else [self.P.names.index(n) for n in dep]
+                em["shared"][ob] = SharedEmulator(cols).fit(T, tr([r["obs"][ob] for r in srows], self.P.scales[ob]))
         return em
 
     def _errors(self, kind, held, rest):
@@ -742,7 +763,6 @@ class HistoryMatch:
 
     # ---------------------------------------------------------------- the run
     def run(self, waves=None) -> dict:
-        raise NotImplementedError("alpha: the self-tests come first")
         nw = int(waves if waves is not None else self.th["waves"])
         state = None
         valid = {}

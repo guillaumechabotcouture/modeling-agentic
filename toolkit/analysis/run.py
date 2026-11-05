@@ -91,10 +91,12 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
     except AnalysisBlocked as e:
         S = holder.get("S")
         if S is not None:
-            S.write("blocked", {"reason": f"model corrections bear on a plan at: {e.where}", "where": e.where,
+            why = e.reason or f"model corrections bear on a plan at: {e.where}"
+            S.write("blocked", {"reason": why, "where": e.where,
                                 "corrections": e.hits[:200], "n_on_plan": len(e.hits)}, PRODUCER,
                     [holder["calibration"]] if holder.get("calibration") else [])
-            S.finalize("blocked", f"{e.where}: {len(e.hits)} model corrections bear on the plan")
+            S.finalize("blocked", f"{e.where}: {e.reason}" if e.reason else
+                       f"{e.where}: {len(e.hits)} model corrections bear on the plan")
         raise
 
 
@@ -129,6 +131,20 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     data_in = [spec.resolve(spec["decision_units"]["csv"])]
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         data_in.append(spec.resolve(spec["calibration"]["targets"]["csv"]))
+    # ---- joint calibration (before the outcome batch: units no compatible value matches stop the run here)
+    jc = None
+    if spec["calibration"].get("joint") is not None:
+        from toolkit.analysis import joint_calibration as JC
+        jkw = dict(compute_kw or {})
+        if spec["analysis"].get("workers"):
+            jkw.setdefault("max_workers", int(spec["analysis"]["workers"]))
+        jc = JC.run(spec, run_dir, jkw, log)
+        arts["joint_calibration"] = S.write("joint_calibration", plain(JC.artifact(jc)), JC.PRODUCER,
+                                            [spec_path] + data_in + JC.inputs(spec) + eng_files)
+        holder["calibration"] = arts["joint_calibration"]
+        log(JC.summary(jc))
+        if jc["blocked"]:
+            raise AnalysisBlocked("calibration", JC.block_hits(jc), reason=JC.block_reason(jc))
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":
         design, jobs = Bt.design(spec)
@@ -190,12 +206,18 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         arts["batch"] = S.write("batch", {"evaluation": "direct", "note": "the engine runs per unit, package and draw"},
                                 Bt.PRODUCER, data_in)
     A = Analysis(spec, model, log=log)
+    if jc is not None:
+        A.set_joint(jc)
     # ---- calibration
     A.fit_calibration()
     cal0 = A.calibrate(A.theta0)
     z0 = {i: v[0] for i, v in cal0.items()}
     if A.method == "emulator_inversion":
         cal = C.inversion_report(spec, model, A.theta0, cal0)
+        if jc is not None:
+            cal["joint"] = {"artifact": os.path.relpath(arts["joint_calibration"], run_dir), "shared": A.joint["shared"],
+                            "best": A.joint["best"], "ranges": A.joint["ranges"],
+                            "sample_id": A.joint["sample"]["sample_id"]}
     elif A.method == "likelihood":
         cal = {k: A.lik[k] for k in ("method", "diagnostics", "identifiability", "theta", "names", "cov")}
         cal["units"] = {i: {"z": z0[i]} for i in A.ids}
@@ -205,8 +227,17 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         cal["units"] = {i: {"z": z0[i]} for i in A.ids}
     else:
         cal = {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {"status": "not_applicable"}}
-    arts["calibration"] = S.write("calibration", cal, C.PRODUCER, data_in)
+    arts["calibration"] = S.write("calibration", cal, C.PRODUCER,
+                                  data_in + ([arts["joint_calibration"]] if jc is not None else []))
     holder["calibration"] = arts["calibration"]
+    if A.method == "emulator_inversion":
+        # F5 (2026-11-05): units whose target lies outside what the model reaches at the point values are clamped at
+        # a bound of calibration.range; they stop the run here, before the point plan and the uncertainty draws
+        # (thresholds: toolkit/calibration/thresholds.yaml blocking.clamped_units_max)
+        hits = C.clamped_hits(cal)
+        if len(hits) > C.clamped_units_max():
+            raise AnalysisBlocked("calibration", hits, reason=f"{len(hits)} units' calibration targets lie outside "
+                                  "what the model reaches inside calibration.range (clamped at a bound)")
     # ---- point and optimum
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     events0 = list(A.last_events)
@@ -559,6 +590,7 @@ def _self_test() -> int:
         ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
     _self_test_priors(ok, q)
     _self_test_posterior(ok, q)
+    _self_test_joint(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -620,6 +652,62 @@ def _self_test_posterior(ok, q):
            f"{u.get('draw_provenance', {}).get('findings')}")
         ok(contract.gate_findings(d) == [], f"AN-b7d contract checks pass on the posterior path: "
                                             f"{contract.gate_findings(d)}")
+
+
+def _self_test_joint(ok, q):
+    """Joint calibration in ANALYZE (toolkit/analysis/joint_calibration.py): it runs before the outcome batch, an
+    unmatched unit stops the run there (no batch), a matched one feeds the region into the draws; a clamped emulator
+    inversion stops at the calibration step."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        JC._toy_joint(d, unreachable="5", group=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR1 a unit the joint calibration cannot match blocks the run")
+        except AnalysisBlocked as e:
+            b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "calibration" and any(h["unit"] == "5" for h in e.hits) and "joint calibration" in b["reason"]
+               and not os.path.exists(os.path.join(d, "analysis", "batch", "results.jsonl"))
+               and os.path.exists(os.path.join(d, "analysis", "joint_calibration.yaml")),
+               "JR1 a unit the joint calibration cannot match stops the run at the calibration step, before the "
+               "outcome batch (blocked.yaml names it; the joint calibration artifact is written)")
+    with tempfile.TemporaryDirectory() as d:
+        JC._toy_joint(d)
+        signoff.sign(d, "lead", note="self-test")
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        A = R["_A"]
+        jp = R["uncertainty"].get("draw_provenance", {}).get("joint_calibration") or {}
+        rg = A.joint["ranges"]["base"]
+        ok(jp.get("draws") == 6 and R["calibration"].get("joint", {}).get("shared") == ["base"]
+           and abs(A.theta0["base"] - A.joint["best"]["base"]) < 1e-12,
+           f"JR2 a matched joint calibration: the point uses the region's best value and the draws are region rows "
+           f"(provenance {jp})")
+        prt = [t for t in R["decision_tests"] if t.get("test_id") == "prior_range_base"]
+        ok(prt and prt[0].get("status") != "not_run" or not prt,
+           "JR3 the jointly calibrated parameter's prior_range test runs (at its region's ends)")
+        ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
+           f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+        rows[3]["tgt"] = "0.9999"
+        with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR5 a clamped emulator inversion blocks at the calibration step")
+        except AnalysisBlocked as e:
+            ok(e.where == "calibration" and [h["unit"] for h in e.hits] == [rows[3]["id"]]
+               and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
+               f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
+    _ = p
 
 
 def _self_test_priors(ok, q):
