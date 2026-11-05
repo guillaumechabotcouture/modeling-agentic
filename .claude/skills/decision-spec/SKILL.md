@@ -112,6 +112,38 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
 
+## When the question asks for quantities, not an allocation
+
+Some questions ask for estimates with intervals (a reproduction number, an attack rate) and a yes/no statement,
+with nothing to allocate. Write `deliverable.kind: estimates`. The sections are in the docstring of
+`toolkit/spec/estimates.py`, and `estimates.toy_spec()` is a valid example. Leave out `options`, `constraints`,
+`comparator` and `objective`: they are refused.
+
+- **One population.** The units table has one row (derived like any other), with the population column bound to the
+  engine's population attribute.
+- **Dynamics.** `dynamics.generation_interval` cites the question's file and its columns, and copies its values, lag 1
+  first. The harness checks the values against the file. `dynamics.transmissibility` is `constant`, or
+  `{knots: [...]}` when the question allows the transmissibility to change.
+- **Observation sources.** Each data set is a source with a frame and a measurement model: a reporting fraction is
+  an `under_ascertainment` bias with a prior and a source, never an engine parameter. A reporting delay is
+  `delay: {pmf, source}` on the engine's step grid. Overdispersion is `noise: {model: negbin, dispersion: {param,
+  prior, source}}`. No source is the truth.
+- **Calibration** is `posterior`. `calibration.priors` gives every engine parameter the card marks `calibrated`, and
+  every unit attribute the data do not give (for example the susceptible share at the start, when there is no
+  serosurvey). Each has a prior and a source. Take ranges from the engine's `ranges.yaml` or from the question, and
+  keep their stated spread. A quantity the question does not give is a prior over its plausible range, never a
+  midpoint. `calibration.targets` names the series file, its source, its step column (1 is the first step of the
+  horizon) and its count column.
+- **Uncertainty.** List `calibration` and `observation` as sources, or exclude them with a reason.
+- **Outputs.** `deliverable.windows` names the windows. Each output in `deliverable.outputs` is an engine window
+  metric (read its card) with the name the question asks for. Check which reproduction number the question means.
+  For example, `reff_ref` is the end of the window with the transmissibility of its start; `reff_end` uses the last
+  step's. A yes/no question is `deliverable.decision` (a threshold rule with three descriptive statements). The
+  harness computes the probability and picks the statement.
+- **What the data do and do not determine** is computed, not written. Each undetermined parameter gets an automatic
+  test at both ends of its declared range, and each output is classed `determined_by_data` or
+  `set_by_declared_ranges`.
+
 ## What not to do
 
 - Do not type a result, an effect size from the data, or an interval into the spec: the
