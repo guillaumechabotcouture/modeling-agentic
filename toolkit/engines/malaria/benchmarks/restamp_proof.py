@@ -87,7 +87,7 @@ SCENARIOS = {
         "horizon": {"start": 2023.0, "stop": 2026.0, "window": [2024.0, 2026.0],
                     "windows": {"y1": [2024.0, 2025.0], "y2": [2025.0, 2026.0]}},
         "delivery": None, "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 23,
-        "members": [{"package": {}}, {"package": {"net": "pyr"}, "params": {"smc_pe": 0.8}},
+        "members": [{"package": {}}, {"package": {"net": "pyr"}, "params": {"smc_cov": 0.7}},
                     {"package": {"net": "dual", "smc": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}},
                     {"package": {"irs": 1}, "unit": {"m0": 30.0, "hist_net": "dual"}, "params": {"hh_net_corr": 0.2}},
                     {"package": {"cm": 1}, "params": {"cm_add": 0.25}}]},
@@ -102,7 +102,7 @@ SCENARIOS = {
         "members": [{"package": {}}, {"package": {"net": "dual", "smc": 1}},
                     {"package": {"net": "pyr", "irs": 1}, "unit": {"hist_net_by_year": {2021.25: "pbo", 2022.5: "pbo"}}},
                     {"package": {"smc": 1}, "unit": {"hist_net_by_year": {}, "smc_hist_rounds": [], "hist_net": "dual"},
-                     "params": {"smc_pe": 0.8}}]},
+                     "params": {"smc_cov": 0.7}}]},
 }
 
 # Codex r2 P3: the execution environment of a worker, recorded per side (the source is shared by the worker, which runs

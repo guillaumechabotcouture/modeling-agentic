@@ -78,9 +78,16 @@ default []) runs SMC rounds in the unit's SMC months in each of those years, in 
 never charged, through the same SMC intervention as the package's (model.SMCDelivery); `smc_hist_rounds` (one number,
 or one per year) keeps the first n SMC months of a year. Every past round precedes the delivery period (fail closed).
 `hist_net_by_year` gives a past campaign its own net type; campaigns it does not name, and routine campaigns, keep
-hist_net. Past SMC puts smc_pe and smc_hi_frac, and a past dual-AI campaign cfp_kill and cfp_half, in the burn-in
-key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
+hist_net. Past SMC puts the SMC parameters (smc_pe and smc_hi_frac to v0.10; the seven of v0.11), and a past dual-AI
+campaign cfp_kill and cfp_half, in the burn-in key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
 benchmarks/restamp_proof.py). Self-tests H0-H7.
+
+v0.11: the SMC mechanism from the literature (ENGINE_NOTES.md, v0.11; model.SMCDelivery). A child's per-round reach is
+a persistent beta propensity (smc_cov, smc_rho; Malaria Consortium 2020 Table 21), a reached child completes the course
+with probability smc_adh (Table 16) and is cleared of blood-stage infection, and new infections are blocked with
+E0 exp(-(t/L)^k ln2) from the dose (smc_e0, smc_half, smc_k; Burgert 2022 Table 1), E0 x smc_partial after the day-1
+dose only (Cairns 2022). smc_pe and smc_hi_frac are gone. Not byte-identical where SMC acts, so the benchmark
+evidence is recomputed (validate_once.sh). Self-tests Q0-Q6 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -109,7 +116,11 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.10"
+VERSION = "0.11"
+# v0.11: SMC sources (ENGINE_NOTES.md, v0.11)
+MC20 = ("Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and "
+        "quality in Burkina Faso, Chad, Nigeria, and Togo")
+BURGERT = "Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282)"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -135,8 +146,27 @@ _PARAMS = [
     ("use_persist", 0.5, "fixed", "share", 0.0, 1.0, "assumption: share of the use gap that is persistent non-use (the rest is "
      "night-to-night variation)", "unverified"),
     ("net_holes", 1.0, "fixed", "switch", None, None, "holes in nets in use on (1) / off (0): " + V.HOLES_SOURCE, "matched"),
-    ("smc_pe", 0.882, "fixed", "share", 0.787, 0.934, "ACCESS-SMC Partnership 2020 Lancet 10.1016/S0140-6736(20)32227-3", "matched"),
-    ("smc_hi_frac", 0.85, "fixed", "share", None, None, A8 + " (SMC access groups)", "unverified"),
+    # v0.11: SMC (ENGINE_NOTES.md, v0.11). smc_pe (a clinical effectiveness used as infection protection) and
+    # smc_hi_frac (unsourced access groups) are gone
+    ("smc_cov", 0.796, "fixed", "share", 0.521, 0.957, MC20 + ", Table 21 (Nigeria 2020, end-of-round, n = 7,898): "
+     "cycles received none 6.0%, one 5.2%, two 13.3%, three 15.3%, four 60.2%; mean per-round reach of the beta-binomial "
+     "fit (mean of the cycles 0.796). Range: ACCESS-SMC Partnership 2020 Lancet (PMC7718580) Table 1, Nigeria 2016 mean "
+     "coverage per month 52.1%, to the Malaria Consortium 2022 report, Table 0, Nigeria cycle 2 day-1 coverage 95.7%",
+     "matched"),
+    ("smc_rho", 0.417, "fixed", "correlation", None, None, "intra-child correlation of the beta-binomial fitted by "
+     "maximum likelihood to " + MC20 + ", Table 21 (predicts 5.5 / 7.4 / 10.3 / 16.6 / 60.1% for 0-4 cycles)", "matched"),
+    ("smc_adh", 0.944, "fixed", "share", 0.842, 0.986, MC20 + ", Table 16: full three-day course among day-1 "
+     "recipients, Nigeria end-of-round cycle 4, 94.4% (93.2-95.1). Range: ACCESS-SMC Nigeria 2015 key indicators "
+     "84.2%; the Malaria Consortium 2021 report, Table 18, 98.6%", "matched"),
+    ("smc_e0", 1.0, "fixed", "share", None, None, BURGERT + ", Table 1: SMC-SP+AQ initial efficacy 100% (pre-erythrocytic "
+     "protection from infection, Eq 1)", "matched"),
+    ("smc_half", 32.0, "fixed", "days", 24.0, 32.0, BURGERT + ", Table 1: SMC-SP+AQ half-life 32 days. Range: "
+     "Braunack-Mayer et al. 2024 Lancet Glob Health (PMC10882206), Results: a liver-stage protection half-life of 24-30 "
+     "days behaves like SP+AQ", "matched"),
+    ("smc_k", 5.4, "fixed", "shape", None, None, BURGERT + ", Table 1: Weibull decay shape k = 5.4, E(t) = E0 "
+     "exp(-(t/L)^k ln2) (Eq 1); Braunack-Mayer 2024 Table 1: 5.34", "matched"),
+    ("smc_partial", 0.910, "fixed", "share", None, None, "Cairns et al. 2022 BMC Med 20:352 (PMC9540742), Results: 30-day "
+     "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7", "matched"),
     ("cm_add", 0.15, "scenario", "probability", None, None, A8 + " (enhanced CM: +0.15 effective treatment)", "unverified"),
     ("cfr_severe_treated", 0.10, "fixed", "probability", None, None, "AQUAMAT (attempt 8 C48)", "unverified"),
     ("cfr_severe_untreated", 0.30, "fixed", "probability", None, None, "assumption (attempt 8 C49)", "unverified"),
@@ -167,12 +197,12 @@ MIN_START_YEAR = 1900.0
 # Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
-POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_pe", "smc_hi_frac", "cm_add",
+POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC_PARAM_NAMES, "cm_add",
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
 # v0.10: SMC parameters act before the fork when a unit has past SMC (smc_hist_years), so they join its burn-in key
-SMC_PARAMS = frozenset({"smc_pe", "smc_hi_frac"})
+SMC_PARAMS = frozenset(M.SMC_PARAM_NAMES)      # v0.11: the seven SMC parameters
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
 # v0.8: the monthly series run_series offers (toolkit/engines/hooks.py), each one of the model's daily records
 # (model.DAILY) with the same definition as the window metric of the same name
@@ -392,7 +422,8 @@ class MalariaEngine:
                 "households: correlated net use within households, correlated net use and spraying, "
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
-                "SMC (28-day protection, clearance); case management (effective treatment)",
+                "SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); "
+                "case management (effective treatment)",
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "routine SMC in every arm after the delivery period, uncharged (v0.7)",
@@ -676,6 +707,7 @@ class MalariaEngine:
             raise ValueError(f"the sim would start in {float(horizon.start) - B:g} (horizon.start {horizon.start:g} - "
                              f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
                              "so the population would not grow: shorten the burn-in or move the horizon")
+        M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
@@ -699,12 +731,12 @@ class MalariaEngine:
             nts = None if dp["hist_nets"] is None else dp["hist_nets"] + [dp["hist_net"]] * len(dp["routine_years"])
             itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist", net_types=nts))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
-                M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
+                M.SMCDelivery(years=[], P=P, name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
         rs = dp["smc_routine"]
         if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
-            itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
-                                     count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
+            itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], P=P, count=False, after=rs["after"],
+                                     before=rs["before"], name="smc_routine"))
         sh = dp["smc_hist"]
         if sh is not None:     # v0.10: built only when set, last, so a unit without it gets the v0.9 sim exactly
             # Codex r1 P1-2: every past round runs on a step before the delivery start (the steps the sim uses)
@@ -714,8 +746,8 @@ class MalariaEngine:
             if late:
                 raise ValueError(f"smc_hist_years: past SMC round(s) run on step(s) {late[:4]}, at or after the "
                                  f"delivery start {d0:g}")
-            itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
-                                     count=False, times=sh["rounds"], name="smc_hist"))
+            itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], P=P, count=False, times=sh["rounds"],
+                                     name="smc_hist"))
         if cfg is not None:
             self._configure({i.name: i for i in itv}, None, P, cfg)
         sim = ss.Sim(people=_people(n0), start=float(horizon.start) - B, stop=float(horizon.stop),
@@ -735,11 +767,11 @@ class MalariaEngine:
         smc.years = list(cfg["smc"]["years"]) if cfg["smc"] else []
         if cfg["smc"]:
             smc.months = list(cfg["smc"]["months"])
-        smc.pe, smc.hi_frac = P["smc_pe"], P["smc_hi_frac"]
+        smc.set_smc(P)
         if "smc_routine" in itv:   # v0.7: routine rounds act after the fork, with the member's own SMC parameters
-            itv["smc_routine"].pe, itv["smc_routine"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
+            itv["smc_routine"].set_smc(P)
         if "smc_hist" in itv:      # v0.10: the burn-in key holds the SMC parameters, so this is the shared value
-            itv["smc_hist"].pe, itv["smc_hist"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
+            itv["smc_hist"].set_smc(P)
         irs.years = list(cfg["irs"]["years"]) if cfg["irs"] else []
         if cfg["irs"]:
             irs.month = int(cfg["irs"]["month"])
