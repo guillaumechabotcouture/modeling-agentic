@@ -698,6 +698,13 @@ def _self_test_joint(ok, q):
            and pt_[0].get("joint"),
            f"JR3 the jointly calibrated parameter's prior_range test runs at its region's ends ({pt_ and pt_[0]['values']}"
            f" vs {rg})")
+        jz = yaml.safe_load(open(os.path.join(d, "analysis", "joint_calibration.yaml")))["data"]["best"]["z"]
+        pz = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+        smp = A.joint["sample"]
+        ok(pz == {i: float(v) for i, v in jz.items()} and any(n.startswith("z:") for n in smp["names"])
+           and jp.get("draws") == 6,
+           "JR6 (Codex r1 P1-2) the point uses the joint calibration's unit values and the draws its full rows (shared "
+           "values and unit values together), not a re-inversion of one target")
         ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
            f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
     with tempfile.TemporaryDirectory() as d:

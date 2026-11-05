@@ -427,14 +427,11 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, **override) -> di
 
 
 def region_sample(rep) -> dict:
-    """The canonical sample the uncertainty draws read: the region rows' shared columns only (the unit parameter is
-    re-inverted on the outcome emulator at each drawn value, as for every emulator_inversion draw)."""
-    from toolkit.analysis import calibration as C
+    """The canonical sample the uncertainty draws read: every region row, shared values and each unit's value
+    together (Codex r1 P1-2: a unit's value comes from the joint fit of all its targets, never from re-inverting one
+    target)."""
     s = rep["sample"]
-    k = len(rep["shared"])
-    rows = np.asarray(s["rows"], float)[:, :k]
-    names = list(s["names"][:k])
-    return {"sample_id": C._sample_id(names, rows), "names": names, "rows": rows}
+    return {"sample_id": s["sample_id"], "names": list(s["names"]), "rows": np.asarray(s["rows"], float)}
 
 
 def block_hits(rep) -> list:
@@ -651,7 +648,7 @@ def _self_test() -> int:
                "JA4b the simulations went through the analysis batch (scripts/compute.py), with provenance")
             s = region_sample(rep)
             from toolkit.analysis import calibration as C
-            ok(s["names"] == ["base"] and C.check_provenance(s, C.draws(s, 5, 1)) == [],
+            ok(s["names"] == ["base"] + [f"z:{i}" for i in range(12)] and C.check_provenance(s, C.draws(s, 5, 1)) == [],
                "JA4c the region sample is a canonical sample the uncertainty draws can cite")
     safe(ja4, "JA4")
 

@@ -96,9 +96,19 @@ def dinv(y, scale):
     return np.ones_like(np.asarray(y, float))
 
 
+def in_domain(x, scale) -> bool:
+    """x is a finite value the scale can transform without clipping (Codex r1 P2-10)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float, np.floating)) or not math.isfinite(float(x)):
+        return False
+    x = float(x)
+    return (0 < x < 1) if scale == "logit" else (x > 0) if scale == "log" else True
+
+
 def sd_from_ci(lo, hi, scale, level=0.95) -> float:
     """The sampling sd on the target's scale from a symmetric-on-that-scale interval at `level`."""
     from scipy.stats import norm
+    if not in_domain(lo, scale) or not in_domain(hi, scale):
+        raise ValueError(f"interval [{lo}, {hi}] is outside the {scale} scale's domain")
     zq = float(norm.ppf(0.5 + level / 2))
     a, b = float(tr(lo, scale)), float(tr(hi, scale))
     if not (math.isfinite(a) and math.isfinite(b) and b > a):
@@ -483,6 +493,24 @@ class Data:
         (self.unit if kind == "unit" else self.shared).extend(rows)
 
 
+def _key(r) -> tuple:
+    """A run's inputs (unit, unit parameter, shared values), rounded: repeated inputs share a key."""
+    return (r.get("unit"), round(float(r.get("s", 0.0)), 12), tuple(np.round(np.asarray(r["t"], float), 12)))
+
+
+def _folds(rows, k, rng) -> list:
+    """k cross-validation folds of row indices; rows with the same inputs (_key) always share a fold."""
+    groups = {}
+    for i, r in enumerate(rows):
+        groups.setdefault(_key(r), []).append(i)
+    keys = list(groups)
+    order = rng.permutation(len(keys))
+    folds = [[] for _ in range(k)]
+    for n, j in enumerate(order):
+        folds[n % k].extend(groups[keys[j]])
+    return [f for f in folds if f]
+
+
 def _sobol(d, n, seed):
     from scipy.stats import qmc
     if d == 0:
@@ -520,6 +548,10 @@ class HistoryMatch:
         self.waves = []
         self.uobs = problem.observables("unit")
         self.sobs = problem.observables("shared")
+        mp = int(self.eth["min_points_per_unit"])
+        if problem.units and int(self.th["points_per_unit"]) < mp:     # Codex r1 P2-15
+            raise CalibrationInputError([f"points_per_unit {self.th['points_per_unit']} is below the emulator's "
+                                         f"min_points_per_unit {mp} (toolkit/calibration/thresholds.yaml)"])
 
     # ---------------------------------------------------------------- simulation
     def _run(self, kind, rows):
@@ -541,9 +573,9 @@ class HistoryMatch:
         for r, o in zip(rows, out):
             for ob in need:
                 v = (o or {}).get(ob)
-                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                if not in_domain(v, self.P.scales[ob]):
                     bad.append(f"simulate: point {r.get('unit', 'shared')} seed {r['seed']}: observable {ob} is "
-                               f"missing or not finite ({v!r})")
+                               f"missing, not finite or outside the {self.P.scales[ob]} scale's domain ({v!r})")
             r["obs"] = {ob: float(o[ob]) for ob in need if ob in (o or {})}
         if bad:
             raise CalibrationInputError(bad)
@@ -570,7 +602,8 @@ class HistoryMatch:
             rows_ok = [c for c in acc if ok[c].any()] if len(acc) else []
             if rows_ok:
                 ww = self.P.prior_weight(C[rows_ok])
-                pick = rng.choice(rows_ok, size=n_u, p=ww / ww.sum())
+                # Codex r1 P1-3: without replacement where the region allows, so a wave repeats no input
+                pick = rng.choice(rows_ok, size=n_u, p=ww / ww.sum(), replace=len(rows_ok) < n_u)
                 for i, c in enumerate(pick):
                     zs = self.zg[rng.choice(np.flatnonzero(ok[c]))]
                     zs = float(np.clip(zs + rng.uniform(-0.5, 0.5) / max(self.G - 1, 1), 0, 1))
@@ -585,7 +618,7 @@ class HistoryMatch:
         if n_s:
             src = acc if len(acc) else np.arange(len(C))
             ww = self.P.prior_weight(C[src])
-            for i, c in enumerate(rng.choice(src, size=n_s, p=ww / ww.sum())):
+            for i, c in enumerate(rng.choice(src, size=n_s, p=ww / ww.sum(), replace=len(src) < n_s)):
                 srows.append({"t": C[c].copy(), "seed": _seed(self.seed, wave, "shared", i)})
         return urows, srows
 
@@ -637,17 +670,17 @@ class HistoryMatch:
             if k >= mh:
                 ids = set(rng.choice(len(wave), size=k, replace=False).tolist())
                 held = [wave[i] for i in sorted(ids)]
-                hid = {id(r) for r in held}
-                errs = self._errors(kind, held, [r for r in alld if id(r) not in hid])
-                how = f"held out {k} of this wave's {len(wave)} runs"
+                hk = {_key(r) for r in held}       # Codex r1 P1-3: no copy of a held-out input stays in training
+                errs = self._errors(kind, held, [r for r in alld if _key(r) not in hk])
+                how = f"held out {k} of this wave's {len(wave)} runs (repeated inputs excluded from the fit)"
             else:
-                folds = np.array_split(rng.permutation(len(alld)), 5)
-                for f in folds:
-                    fid = {id(alld[i]) for i in f}
-                    e = self._errors(kind, [alld[i] for i in f], [r for r in alld if id(r) not in fid])
+                for f in _folds(alld, 5, rng):
+                    fk = {_key(alld[i]) for i in f}
+                    e = self._errors(kind, [alld[i] for i in f], [r for r in alld if _key(r) not in fk])
                     for ob, v in e.items():
                         errs.setdefault(ob, []).extend(v)
-                how = f"5-fold cross-validation over {len(alld)} runs (this wave's holdout would be {k} < {mh})"
+                how = (f"5-fold cross-validation over {len(alld)} runs, repeated inputs in one fold (this wave's "
+                       f"holdout would be {k} < {mh})")
             for ob, e in errs.items():
                 out[ob] = dict(validation(e, self.eth), how=how)
         return out
@@ -673,31 +706,94 @@ class HistoryMatch:
                 I = np.maximum(I, it)
             I, sign = I.reshape(N, G), sign.reshape(N, G)
             g = I.argmin(1)
-            rec = {"I": I, "ok": I <= self.cut, "m": I[np.arange(N), g], "g": g,
-                   "sign": sign[np.arange(N), g]}
+            ok_ = I <= self.cut
+            rec = {"I": I, "ok": ok_, "m": I[np.arange(N), g], "g": g, "sign": sign[np.arange(N), g]}
             if u in need_g:
-                rec["grp"] = {}
-                for ob in gobs:
-                    m, v = em["unit"][ob].predict(u, self.zg[g], C, noise=False)
-                    rec["grp"][ob] = (m, v)
+                rec.update(self._group_profile(em, u, S, T, ok_, g, C, gobs))
             units[u] = rec
         shared = {}
         for t in P.targets:
             if t.kind == "shared":
                 m, v = em["shared"][t.observable].predict(C, noise=bool(self.th["include_run_noise"]))
                 shared[t.id] = {"I": np.abs(m - t.y) / np.sqrt(v + t.var), "mean": m}
-            elif t.kind == "group":
-                sc = t.scale
-                wsum = sum(t.weights.values())
-                pbar, sdn = np.zeros(N), np.zeros(N)
-                for u, w in t.weights.items():
-                    m, v = units[u]["grp"][t.observable]
-                    pbar += w / wsum * inv(m, sc)
-                    sdn += w / wsum * np.abs(dinv(m, sc)) * np.sqrt(v)   # perfectly correlated: an upper bound
-                yb = tr(pbar, sc)
-                d = 1.0 / np.maximum(np.abs(dinv(yb, sc)), 1e-12)
-                shared[t.id] = {"I": np.abs(yb - t.y) / np.sqrt((d * sdn) ** 2 + t.var), "mean": yb}
+        if gobs:
+            shared.update(self._group_witness(units, N))
         return {"C": C, "units": units, "targets": shared}
+
+    # ---------------------------------------------------------------- group targets (Codex r1 P1-1)
+    # A group target constrains its units' parameters jointly. For each candidate, each member unit's non-implausible
+    # values of its own parameter (from its unit targets) give a range of the group observable; the unit's value is
+    # indexed by a share t in [0, 1] of that range (the grid value closest to lo + t (hi - lo); its best value when it
+    # has none). One t per group target is chosen per candidate (the least implausible of `group_t` shares), each unit
+    # taking the t of the first group target that contains it, and every group target is then judged at that joint
+    # witness. The region sample draws a t per group among the non-implausible ones and keeps the draw only when
+    # every group target holds at the joint values.
+    def _group_profile(self, em, u, S, T, ok_, g, C, gobs):
+        K = int(self.th.get("group_t", 21))
+        N, G = ok_.shape
+        tk = np.linspace(0.0, 1.0, K)
+        sel = np.empty((K, N), np.int32)
+        gc = {}
+        for ob in gobs:
+            sc = self.P.scales[ob]
+            m, v = em["unit"][ob].predict(u, S, T, noise=False)
+            m, v = m.reshape(N, G), v.reshape(N, G)
+            nat = inv(m, sc)
+            big = np.where(ok_, nat, np.inf)
+            lo = np.where(ok_.any(1), big.min(1), nat[np.arange(N), g])
+            hi = np.where(ok_.any(1), np.where(ok_, nat, -np.inf).max(1), nat[np.arange(N), g])
+            if ob == gobs[0]:
+                for k, t in enumerate(tk):
+                    want = lo + t * (hi - lo)
+                    d = np.where(ok_, np.abs(nat - want[:, None]), np.inf)
+                    sel[k] = np.where(ok_.any(1), d.argmin(1), g)
+            r = np.arange(N)
+            gc[ob] = (np.stack([nat[r, sel[k]] for k in range(K)]).astype(np.float32),
+                      np.stack([np.abs(dinv(m[r, sel[k]], sc)) * np.sqrt(v[r, sel[k]]) for k in range(K)])
+                      .astype(np.float32))
+        return {"sel": sel, "gc": gc}
+
+    def _group_terms(self, t, units, kmap, rows):
+        """(I, transformed mean) of group target t at candidates `rows`, each member unit at share index
+        kmap[unit] (an array over rows)."""
+        sc = t.scale
+        wsum = sum(t.weights.values())
+        pbar, sdn = np.zeros(len(rows)), np.zeros(len(rows))
+        for u, w in t.weights.items():
+            nat, sd = units[u]["gc"][t.observable]
+            k = kmap[u]
+            pbar += w / wsum * nat[k, rows]
+            sdn += w / wsum * sd[k, rows]          # perfectly correlated errors: an upper bound on the sd
+        yb = tr(pbar, sc)
+        d = 1.0 / np.maximum(np.abs(dinv(yb, sc)), 1e-12)
+        return np.abs(yb - t.y) / np.sqrt((d * sdn) ** 2 + t.var), yb
+
+    def _owner(self):
+        own = {}
+        for t in self.P.targets:
+            if t.kind == "group":
+                for u in t.weights:
+                    own.setdefault(u, t.id)
+        return own
+
+    def _group_witness(self, units, N):
+        P = self.P
+        K = int(self.th.get("group_t", 21))
+        rows = np.arange(N)
+        gts = [t for t in P.targets if t.kind == "group"]
+        own = self._owner()
+        Ik, kstar = {}, {}
+        for t in gts:            # pass 1: each group's own share, its members all at that share
+            I = np.stack([self._group_terms(t, units, {u: np.full(N, k) for u in t.weights}, rows)[0]
+                          for k in range(K)])
+            Ik[t.id] = I
+            kstar[t.id] = I.argmin(0)
+        kmap = {u: kstar[own[u]] for u in own}
+        out = {}
+        for t in gts:            # pass 2: every group at the joint witness
+            I, yb = self._group_terms(t, units, kmap, rows)
+            out[t.id] = {"I": I, "mean": yb, "kstar": kstar[t.id], "Ik": Ik[t.id]}
+        return out
 
     def _merge(self, a, b):
         if a is None:
@@ -706,12 +802,17 @@ class HistoryMatch:
         for u in a["units"]:
             x, y = a["units"][u], b["units"][u]
             r = {k: np.concatenate([x[k], y[k]]) for k in ("I", "ok", "m", "g", "sign")}
-            if "grp" in x:
-                r["grp"] = {ob: tuple(np.concatenate([x["grp"][ob][i], y["grp"][ob][i]]) for i in (0, 1))
-                            for ob in x["grp"]}
+            if "sel" in x:
+                r["sel"] = np.concatenate([x["sel"], y["sel"]], axis=1)
+                r["gc"] = {ob: tuple(np.concatenate([x["gc"][ob][i], y["gc"][ob][i]], axis=1) for i in (0, 1))
+                           for ob in x["gc"]}
             out["units"][u] = r
         for k in a["targets"]:
-            out["targets"][k] = {q: np.concatenate([a["targets"][k][q], b["targets"][k][q]]) for q in ("I", "mean")}
+            d = {q: np.concatenate([a["targets"][k][q], b["targets"][k][q]]) for q in ("I", "mean")}
+            if "kstar" in a["targets"][k]:
+                d["kstar"] = np.concatenate([a["targets"][k]["kstar"], b["targets"][k]["kstar"]])
+                d["Ik"] = np.concatenate([a["targets"][k]["Ik"], b["targets"][k]["Ik"]], axis=1)
+            out["targets"][k] = d
         return out
 
     def _classify(self, st, n_sobol):
@@ -723,7 +824,10 @@ class HistoryMatch:
             okT &= v["I"] <= self.cut
         um = {u: r["m"] <= self.cut for u, r in st["units"].items()}
         matchable = [u for u in self.P.units if (um[u] & okT).any()]
-        unmatchable = [u for u in self.P.units if u not in matchable]
+        # Codex r1 P2-6: a unit its own targets can match somewhere, but never where the shared and group targets
+        # hold, is not unreachable: it conflicts with those targets (reported apart, blocks the same way)
+        unmatchable = [u for u in self.P.units if not um[u].any()]
+        shared_conflict = [u for u in self.P.units if u not in matchable and u not in unmatchable]
         if matchable:
             nbad = np.sum([~um[u] for u in matchable], axis=0)
         else:
@@ -739,9 +843,14 @@ class HistoryMatch:
                 conflicting = sorted({u for u in matchable if (~um[u][region]).any()}, key=str)
         score = sum(st["units"][u]["m"] ** 2 for u in self.P.units) if self.P.units else np.zeros(N)
         score = score + sum(v["I"] ** 2 for v in st["targets"].values()) if st["targets"] else score
+        acc = okT & (nbad == 0)
+        share = None
+        if n_sobol:      # Codex r1 P2-5: prior mass, not box volume (the Sobol candidates are uniform on the box)
+            w = self.P.prior_weight(C[:n_sobol]) if self.p else np.ones(n_sobol)
+            share = float(np.sum(w * acc[:n_sobol]) / np.sum(w)) if np.sum(w) > 0 else None
         return {"region": region, "relaxed": relaxed, "matchable": matchable, "unmatchable": unmatchable,
-                "conflicting": conflicting, "okT": okT, "score": score,
-                "share_of_prior": float(np.mean((okT & (nbad == 0))[:n_sobol])) if n_sobol else None}
+                "shared_conflict": shared_conflict, "conflicting": conflicting, "okT": okT, "score": score,
+                "share_of_prior": share, "n_sobol": n_sobol}
 
     def _region(self, em):
         n0 = 2 ** int(self.th["candidates_log2"]) if self.p else 1
@@ -796,6 +905,23 @@ class HistoryMatch:
             out[p.name] = [float(p.natural(R[:, j].min())), float(p.natural(R[:, j].max()))] if len(R) else None
         return out
 
+    def compatible(self, theta: dict) -> bool:
+        """Is this joint shared value non-implausible for every target and unit (on the final emulators)?"""
+        x = np.array([[(float(theta[p.name]) - p.lo) / (p.hi - p.lo) for p in self.P.shared]]).reshape(1, self.p)
+        st = self._evaluate(self.em, x)
+        return bool(all(r["m"][0] <= self.cut for r in st["units"].values())
+                    and all(v["I"][0] <= self.cut for v in st["targets"].values()))
+
+    def _witness_g(self, u, c) -> int:
+        """Unit u's grid index at candidate c: its group witness when it belongs to a group target, else its
+        least implausible value."""
+        st = self.state
+        own = self._owner()
+        if u in own:
+            k = int(st["targets"][own[u]]["kstar"][c])
+            return int(st["units"][u]["sel"][k, c])
+        return int(st["units"][u]["g"][c])
+
     def _verify(self, best_c, zbest):
         """Run the engine at the best shared point for every unit (and the shared targets): simulated implausibility.
         Each unit is run at `z_points` values of its own parameter spread over its non-implausible values there (its
@@ -805,12 +931,13 @@ class HistoryMatch:
         t = st["C"][best_c]
         k = int(self.vth.get("z_points", 3))
         urows = []
+        own = self._owner()
         for u in self.P.units:
             okc = np.flatnonzero(st["units"][u]["ok"][best_c])
             cand = [int(zbest[u])]
-            if len(okc) > 1:
-                cand += [int(okc[int(round(q * (len(okc) - 1)))]) for q in np.linspace(0, 1, k)[1:-1]] if k > 2 else []
-                cand += [int(okc[0]), int(okc[-1])] if k > 1 else []
+            if len(okc) > 1 and u not in own:     # a group member is run at the joint witness only
+                cand += [int(okc[0]), int(okc[-1])]       # Codex r1 P2-9: both ends before interior values
+                cand += [int(okc[int(round(q * (len(okc) - 1)))]) for q in np.linspace(0, 1, max(k, 2))[1:-1]]
             seen = []
             for g in cand:
                 if g not in seen:
@@ -843,7 +970,12 @@ class HistoryMatch:
             if tg.kind == "group":
                 ws = sum(tg.weights.values())
                 pbar = sum(w / ws * byu[u][tg.observable] for u, w in tg.weights.items())
-                i = abs(float(tr(pbar, tg.scale)) - tg.y) / math.sqrt(tg.var)
+                # Codex r1 P2-8: the members' run noise, independent runs, through the aggregate
+                tn = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                sdn = math.sqrt(sum((w / ws * float(dinv(tr(byu[u][tg.observable], tg.scale), tg.scale))) ** 2 * tn
+                                    for u, w in tg.weights.items()))
+                sdy = sdn / max(abs(float(dinv(tr(pbar, tg.scale), tg.scale))), 1e-12)
+                i = abs(float(tr(pbar, tg.scale)) - tg.y) / math.sqrt(sdy ** 2 + tg.var)
                 out["targets"][tg.id] = {"simulated": pbar, "implausibility": round(i, 4), "ok": i <= self.cut}
             elif tg.kind == "shared":
                 v = srows[0]["obs"][tg.observable]
@@ -862,22 +994,24 @@ class HistoryMatch:
         if not len(R):
             blocks.append({"code": "empty_region", "detail": "no candidate satisfies the shared and group targets"})
         unmatched = list(st["unmatchable"])
-        if len(unmatched) + len(st["conflicting"]) > int(self.bth["unmatched_units_max"]):
-            blocks.append({"code": "unmatched_units", "detail": {"unmatched": unmatched,
-                                                                 "conflicting": list(st["conflicting"])}})
+        conflicting = list(st["shared_conflict"]) + [u for u in st["conflicting"] if u not in st["shared_conflict"]]
+        if len(unmatched) + len(conflicting) > int(self.bth["unmatched_units_max"]):
+            blocks.append({"code": "unmatched_units", "detail": {"unmatched": unmatched, "conflicting": conflicting,
+                                                                 "conflicts_with_shared_targets":
+                                                                     list(st["shared_conflict"])}})
         if st["relaxed"]:
             blocks.append({"code": "conflicting_units", "detail": f"the region is relaxed: {st['relaxed']} unit(s) "
                                                                   "unmatched at every accepted value"})
         src = R if len(R) else np.argsort(st["score"])[:1]
         best_c = int(src[np.argmin(st["score"][src])])
-        zbest = {u: int(st["units"][u]["g"][best_c]) for u in P.units}
+        zbest = {u: self._witness_g(u, best_c) for u in P.units}
         best_theta = P.theta_natural(C[best_c])[0] if self.p else {}
         units = {}
         for u in P.units:
             r = st["units"][u]
             okR = r["ok"][R] if len(R) else np.zeros((0, len(self.zg)), bool)
             zset = self.zg[okR.any(0)] if len(okR) else np.array([])
-            gb = int(r["g"][best_c])
+            gb = zbest[u]
             miss = r["m"].argmin()
             d = None
             misses = None
@@ -894,9 +1028,9 @@ class HistoryMatch:
                     misses.append({"target": tg.id, "observed": tg.value, "modelled": float(inv(m[0], tg.scale)),
                                    "implausibility": round(float(abs(m[0] - tg.y) / math.sqrt(v[0] + tg.var)), 3)})
             at_b = [nm for nm, gi in (("lo", 0), ("hi", len(self.zg) - 1)) if len(okR) and okR[:, gi].any()]
-            units[u] = {"matched": u not in unmatched and u not in st["conflicting"],
-                        "status": "unmatched" if u in unmatched else "conflicting" if u in st["conflicting"]
-                        else "matched",
+            units[u] = {"matched": u not in unmatched and u not in conflicting,
+                        "status": "unmatched" if u in unmatched else "conflicts_with_shared_targets"
+                        if u in st["shared_conflict"] else "conflicting" if u in conflicting else "matched",
                         "best_implausibility": float(r["m"].min()),
                         "implausibility_at_best": float(r["m"][best_c]),
                         "z_best": float(P.z_natural(self.zg[gb])),
@@ -912,6 +1046,7 @@ class HistoryMatch:
             ver = self._verify(best_c, zbest)
             for u, v in ver["units"].items():
                 units[u]["z_verified"] = v["z"]
+                units[u]["z_best"] = v["z"]          # the value the engine itself matches best at the best point
                 units[u]["implausibility_verified"] = v["implausibility"]
             bad = [u for u, v in ver["units"].items() if not v["ok"] and units[u]["matched"]]
             badt = [k for k, v in ver["targets"].items() if not v["ok"]]
@@ -938,7 +1073,7 @@ class HistoryMatch:
                            "prior_ranges": {p.name: [p.lo, p.hi] for p in P.shared}, "contraction": contraction},
                 "best": {"theta": best_theta, "z": {u: units[u]["z_best"] for u in P.units},
                          "score": float(st["score"][best_c])},
-                "units": units, "unmatched": unmatched, "conflicting": list(st["conflicting"]),
+                "units": units, "unmatched": unmatched, "conflicting": conflicting,
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
                 "verification": ver, "waves": self.waves,
@@ -954,14 +1089,25 @@ class HistoryMatch:
         st, P = self.state, self.P
         R = st["region"]
         rng = np.random.default_rng([self.seed if seed is None else int(seed), 17])
+        # Codex r1 P2-4: refinement candidates are a proposal around accepted points, not prior draws; the sample uses
+        # the Sobol candidates (uniform on the box, so prior weights are correct) whenever they hold enough
+        Rs = R[R < st["n_sobol"]] if st.get("n_sobol") else R
+        sobol_only = len(Rs) >= int(self.th["region_min_candidates"])
+        R = Rs if sobol_only else R
         w = P.prior_weight(st["C"][R]) if self.p else np.ones(len(R))
         pick = rng.choice(R, size=int(n), p=w / w.sum())
         names = P.names + [f"z:{u}" for u in P.units]
         rows = []
         step = 1.0 / max(len(self.zg) - 1, 1)
+        own = self._owner()
+        gts = [t for t in P.targets if t.kind == "group"]
         for c in pick:
             row = [float(p.natural(st["C"][c][j])) for j, p in enumerate(P.shared)]
+            gsel = self._group_draw(gts, own, int(c), rng) if gts else {}
             for u in P.units:
+                if u in gsel:
+                    row.append(float(P.z_natural(self.zg[gsel[u]])))
+                    continue
                 okc = np.flatnonzero(st["units"][u]["ok"][c])
                 gi = rng.choice(okc) if len(okc) else int(st["units"][u]["g"][c])
                 s = float(np.clip(self.zg[gi] + rng.uniform(-0.5, 0.5) * step, 0, 1)) if len(okc) else self.zg[gi]
@@ -975,8 +1121,25 @@ class HistoryMatch:
         h = hashlib.sha256(json.dumps(names).encode())
         h.update(np.ascontiguousarray(rows).tobytes())
         return {"sample_id": h.hexdigest(), "names": names, "rows": rows.tolist(), "method": "history_matching_region",
-                "weighting": "prior density over the non-implausible region; unit parameter uniform within its "
-                             "non-implausible values"}
+                "weighting": ("prior density over the non-implausible region" + ("" if sobol_only else
+                              " (including refinement candidates, whose proposal density is not corrected)") +
+                              "; a unit's parameter uniform within its non-implausible values; units of a group "
+                              "target at a joint draw that holds every group target")}
+
+    def _group_draw(self, gts, own, c, rng, tries=20) -> dict:
+        """{unit: grid index} for the group members at candidate c: a non-implausible share per group target, kept
+        only when every group target holds at the joint values; else the witness."""
+        st = self.state
+        units = st["units"]
+        for _ in range(tries):
+            kc = {}
+            for t in gts:
+                feas = np.flatnonzero(st["targets"][t.id]["Ik"][:, c] <= self.cut)
+                kc[t.id] = int(rng.choice(feas)) if len(feas) else int(st["targets"][t.id]["kstar"][c])
+            kmap = {u: np.array([kc[own[u]]]) for u in own}
+            if all(self._group_terms(t, units, kmap, np.array([c]))[0][0] <= self.cut for t in gts):
+                return {u: int(units[u]["sel"][kc[own[u]], c]) for u in own}
+        return {u: self._witness_g(u, c) for u in own}
 
 
 def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, **override) -> dict:
@@ -1059,7 +1222,10 @@ def _self_test() -> int:
 
     def hm1():
         P, sim, truth, zt, calls = _toy()
-        r = calibrate(P, sim, seed=3, waves=2, log=q, **fast)
+        h = HistoryMatch(P, sim, 3, q, **fast)
+        r = h.run(2)
+        ok(h.compatible(truth) and not h.compatible({"e": 1.15, "b": 0.5}),
+           "HM1g (Codex r1 P2-14) the planted joint value itself is compatible, a far one is not")
         rg = r["region"]["ranges"]
         ok(r["status"] == "matched" and r["n_matched"] == len(P.units) and not r["unmatched"],
            f"HM1a every unit matched on the toy, nothing blocked ({r['status']}, {r['blocks']})")
@@ -1204,6 +1370,72 @@ def _self_test() -> int:
            and abs(sd_from_n(0.3, 400, "identity") - math.sqrt(0.21 / 400)) < 1e-12,
            "HM10 sampling sd from an interval and from a sample size")
     safe(hm9, "HM9")
+
+    def hm11():          # Codex r1 P1-1: a group target that binds must be profiled with the unit values
+        units = ["a", "b"]
+        tg = [Target(f"{u}:t", "unit", "x", 0.0, "identity", sd_obs=1.0, unit=u, source="toy") for u in units]
+        tg.append(Target("g", "group", "x", 1.0, "identity", sd_obs=0.05, weights={"a": 1.0, "b": 1.0}, source="toy"))
+        P = Problem([], {"name": "z", "lo": -2.0, "hi": 2.0}, units, tg)
+
+        def sim(pts):
+            return [{"x": p["z"] + 0.001 * ((p["seed"] % 7) - 3)} for p in pts]
+        r = calibrate(P, sim, seed=2, waves=2, log=q, points_per_unit=12)
+        R = np.asarray(r["sample"]["rows"]) if r["sample"] else np.zeros((0, 2))
+        gm = R.mean(1) if len(R) else np.array([9.0])
+        ok(r["status"] == "matched" and np.all(np.abs(gm - 1.0) <= 3 * 0.06),
+           f"HM11 a binding group target is profiled jointly with the unit values (z = 0 fits each unit alone, only z "
+           f"near 1 fits the group): matched, and every sample row satisfies the group ({r['status']}, "
+           f"{r['blocks']}, group means {np.round(gm[:5], 3)})")
+    safe(hm11, "HM11")
+
+    def hm12():          # Codex r1 P1-3: identical inputs never sit on both sides of a validation split
+        rows = [{"unit": "a", "s": 0.5, "t": np.array([0.2]), "seed": i} for i in range(4)] + \
+               [{"unit": "a", "s": 0.1 * i, "t": np.array([0.3]), "seed": 10 + i} for i in range(6)]
+        folds = _folds(rows, 5, np.random.default_rng(0))
+        same = [k for k, f in enumerate(folds) if any(rows[i]["s"] == 0.5 and rows[i]["t"][0] == 0.2 for i in f)]
+        ok(len(same) == 1 and sorted(i for f in folds for i in f) == list(range(10)),
+           f"HM12a repeated inputs fall in one cross-validation fold ({same})")
+        P, sim, *_ = _toy(n_units=3)
+        real = UnitEmulator.predict
+
+        def overconfident(self, u, S, T, noise=True):
+            m, v = real(self, u, S, T, noise)
+            return m, v / 400.0
+        UnitEmulator.predict = overconfident
+        try:
+            r = calibrate(P, sim, seed=9, waves=1, log=q, points_per_unit=6, candidates_log2=8)
+        finally:
+            UnitEmulator.predict = real
+        how = [v.get("how", "") for v in r["waves"][-1]["validation"].values()]
+        ok(r["blocked"] and any(b["code"] == "emulator_inadequate" for b in r["blocks"])
+           and all("cross-validation" in h for h in how),
+           f"HM12b the cross-validation fallback (small design) also catches an overconfident emulator ({how})")
+    safe(hm12, "HM12")
+
+    def hm13():          # Codex r1 P2-10 and P2-15: domains and design minimum
+        for lo, hi in ((-1, 0.4), (0.2, 1.2)):
+            try:
+                sd_from_ci(lo, hi, "logit")
+                ok(False, f"HM13a an interval outside (0, 1) is refused on the logit scale ({lo}, {hi})")
+            except ValueError:
+                ok(True, f"HM13a an interval outside (0, 1) is refused on the logit scale ({lo}, {hi})")
+        P, sim, *_ = _toy()
+
+        def bad_sim(pts):
+            out = sim(pts)
+            out[0]["w1"] = 1.5
+            return out
+        try:
+            calibrate(P, bad_sim, seed=1, waves=1, log=q, **fast)
+            ok(False, "HM13b a simulated proportion outside (0, 1) fails closed")
+        except CalibrationInputError:
+            ok(True, "HM13b a simulated proportion outside (0, 1) fails closed")
+        try:
+            HistoryMatch(P, sim, log=q, points_per_unit=2)
+            ok(False, "HM13c fewer runs per unit than min_points_per_unit is refused")
+        except CalibrationInputError:
+            ok(True, "HM13c fewer runs per unit than min_points_per_unit is refused")
+    safe(hm13, "HM13")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

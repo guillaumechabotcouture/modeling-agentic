@@ -93,8 +93,10 @@ class Drawer:
             for k in A.joint["shared"]:
                 theta[k] = float(r["values"][k])
                 sampled[k] = theta[k]
+            zs = {i: float(r["values"][f"z:{i}"]) for i in A.ids}
             self.jc_records.append({"sample_id": r["sample_id"], "row": r["row"],
-                                    "values": {k: theta[k] for k in A.joint["shared"]}})
+                                    "values": dict({k: theta[k] for k in A.joint["shared"]},
+                                                   **{f"z:{i}": zs[i] for i in A.ids})})
         for kind in ORDER:
             if kind not in self.src:
                 continue
@@ -102,7 +104,7 @@ class Drawer:
                 for k, v in A.fr.items():
                     theta[k] = float(self.rng.uniform(v[0], v[1]))
                     sampled[k] = theta[k]
-            elif kind == "calibration" and A.method == "emulator_inversion":
+            elif kind == "calibration" and A.method == "emulator_inversion" and A.joint is None:
                 shifts = {r: float(self.rng.normal(0, self.sd)) for r in self.regions}
                 sampled.update({f"shift:{r}": v for r, v in shifts.items()})
             elif kind == "calibration" and A.method == "likelihood":

@@ -13,7 +13,7 @@ engine (the renewal engine, toolkit/engines/renewal), with planted values: the c
   AC2  the same with one population whose observed attack rate no susceptible share reaches: unmatched, with the
        direction, and blocked.
   AC3  canary, no units: one population, shared R0 and seed only, shared targets (attack rate, peak week).
-The malaria engine's acceptance is the real-data smoke on Coiled (PR description), which these cases complement.
+The production engine's acceptance is the real-data smoke (PR description), which these cases complement.
 Nothing here names a disease; the generation interval and ranges are synthetic.
 """
 from __future__ import annotations
