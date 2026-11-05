@@ -2185,11 +2185,11 @@ def _self_test_v010(ok, e, unit) -> None:
 
     def h6():
         uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
-        ps = [dict(small, smc_pe=0.6), dict(small, smc_pe=0.9)]
+        ps = [dict(small, smc_cov=0.6), dict(small, smc_cov=0.9)]
         b = e.run_batch(ps, uh, none, hs, 3)
         solo = [e.run(q, uh, none, hs, 3) for q in ps]
         ok([o.meta["burnin_members"] for o in b] == [1, 1] and [strip(o) for o in b] == [strip(o) for o in solo],
-           "H6 with past SMC, parameter sets that differ in smc_pe do not share a burn-in (it acts before the fork); "
+           "H6 with past SMC, parameter sets that differ in smc_cov (v0.11; smc_pe up to v0.10) do not share a burn-in (it acts before the fork); "
            "each member equals its own run")
         b0 = e.run_batch(ps, UnitSpec("t", attrs), none, hs, 3)
         ok([o.meta["burnin_members"] for o in b0] == [2, 2], "H6b without past SMC they still share one (v0.9)")
@@ -2231,6 +2231,142 @@ def _self_test_v010(ok, e, unit) -> None:
         o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hs, 1)
         ok(o.per_capita is not None, "H7d hist_net_by_year with float and string year keys runs (burn-in key)")
     case("H7", h7)
+
+
+def _self_test_v011(ok, e, unit) -> None:
+    """v0.11: the SMC mechanism from the literature (ENGINE_NOTES.md, v0.11). Reach from a persistent beta propensity
+    (mean smc_cov, intra-child correlation smc_rho; Malaria Consortium 2020 Table 21), a full course with probability
+    smc_adh, clearance at dosing, and Weibull-decaying protection against new infection E0 exp(-(t/L)^k ln2)
+    (Burgert 2022 Table 1), E0 x smc_partial after the day-1 dose only (Cairns 2022)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    from math import comb
+    from scipy.special import betaln
+    want_p = {"smc_cov": (0.796, "Table 21"), "smc_rho": (0.417, "Table 21"), "smc_adh": (0.944, "Table 16"),
+              "smc_e0": (1.0, "Burgert"), "smc_half": (32.0, "Burgert"), "smc_k": (5.4, "Burgert"),
+              "smc_partial": (0.910, "Cairns")}
+
+    def q0():
+        specs = {p.name: p for p in e.parameters()}
+        good = [k for k, (v, src) in want_p.items() if k in specs and abs(specs[k].value - v) < 1e-9
+                and specs[k].kind == "fixed" and src in specs[k].source]
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 11) and sorted(good) == sorted(want_p)
+           and "smc_pe" not in specs and "smc_hi_frac" not in specs,
+           f"Q0 engine v0.11: the seven SMC parameters are fixed and sourced; smc_pe and smc_hi_frac are gone "
+           f"(sourced: {sorted(good)})")
+        from toolkit.spec.priors import load_card
+        mc = load_card(e)
+        ok(mc["problems"] == [] and {"smc_cov", "smc_adh", "smc_half"} <= set(mc["priors"])
+           and "smc_pe" not in mc["priors"], f"Q0b priors.yaml covers the new parameters: {mc['problems'][:3]}")
+    case("Q0", q0)
+
+    def q1():
+        t = np.array([-1.0, 0.0, 14.0, 21.0, 28.0, 32.0, 38.0, 45.0, 90.0])
+        E = M.smc_protection(t, 1.0, 32.0, 5.4)
+        ref = np.exp(-(np.maximum(t, 0) / 32.0) ** 5.4 * np.log(2))
+        ok(E[0] == 0.0 and abs(E[1] - 1.0) < 1e-12 and abs(E[5] - 0.5) < 1e-12 and np.allclose(E[1:], ref[1:])
+           and bool(np.all(np.diff(E[1:]) <= 0)) and abs(E[3] - 0.931) < 0.002 and abs(E[4] - 0.714) < 0.002
+           and E[7] < 0.02, f"Q1 protection E0 exp(-(t/L)^k ln2): 0 before a dose, E0 at the dose, E0/2 at L, "
+                            f"decreasing: {E.round(3).tolist()}")
+        E2 = M.smc_protection(np.array([0.0, 32.0]), 0.91, 32.0, 5.4)
+        ok(np.allclose(E2, [0.91, 0.455]), f"Q1b E0 scales the curve ({E2.tolist()})")
+    case("Q1", q1)
+
+    def q2():
+        N = 200000
+        u = (np.arange(N) + 0.5) / N
+        pi = M.smc_propensity(u, 0.796, 0.417)
+        rng = np.random.default_rng(1)
+        n = (rng.random((4, N)) < pi).sum(axis=0)
+        got = np.bincount(n, minlength=5) / N
+        s = 1 / 0.417 - 1
+        a, b = 0.796 * s, 0.204 * s
+        bb = np.array([comb(4, k) * np.exp(betaln(k + a, 4 - k + b) - betaln(a, b)) for k in range(5)])
+        ok(abs(pi.mean() - 0.796) < 0.002 and np.allclose(got, bb, atol=0.006)
+           and np.allclose(bb, [0.055, 0.074, 0.103, 0.166, 0.601], atol=0.002),
+           f"Q2 rounds reached over 4 rounds are beta-binomial (Table 21 fit): {got.round(3).tolist()} vs "
+           f"{bb.round(3).tolist()} (observed 0.060 0.052 0.133 0.153 0.602)")
+        p0 = M.smc_propensity(u, 0.796, 0.0)
+        ok(np.allclose(p0, 0.796), "Q2b smc_rho = 0: every child has the mean propensity (independent rounds)")
+        ok(np.all(np.diff(pi) >= 0), "Q2c the propensity is monotone in the child's latent (persistent ranking)")
+    case("Q2", q2)
+
+    hz = Horizon(2016.0, 2017.0, (2016.0, 2017.0), {"in": [2016 + 5 / 12, 2016 + 9 / 12],
+                                                   "post": [2016 + 9 / 12 + 29 / 365, 2016 + 9 / 12 + 42 / 365]})
+    usmc = UnitSpec("t", dict(unit.attributes, m0=20.0, itn_hist_years=[], campaign_year=2016.5, irs_month=None,
+                              smc_months=[6, 7, 8, 9]))
+
+    def q3():
+        sim, _ = e.build_sim({"n_agents": 4000, "burnin_years": 0}, usmc, Package("s", {"smc": 1}), hz, 7)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        s1 = sorted(M.event_steps(yv, sim.interventions["smc"].targets()))[0]
+        sim.run(until=yv[s1 - 1])
+        dz = sim.diseases.malaria
+        uu = sim.people.auids
+        a = np.asarray(sim.people.age[uu])
+        el = uu[(a >= 0.25) & (a < 5)]
+        inf_before = np.asarray(dz.st[el]) != M.S_
+        sim.run(until=yv[s1])
+        got = np.asarray(dz.smc_t[el]) == s1
+        eff = np.asarray(dz.smc_eff[el])[got]
+        full = float(np.mean(np.abs(eff - 1.0) < 1e-12))
+        part = bool(np.all((np.abs(eff - 1.0) < 1e-12) | (np.abs(eff - 0.910) < 1e-12)))
+        ok(abs(got.mean() - 0.796) < 0.04, f"Q3 a round reaches the share smc_cov of children 3-59 m ({got.mean():.3f})")
+        ok(abs(full - 0.944) < 0.03 and part, f"Q3b reached children: full course share {full:.3f} (smc_adh 0.944) "
+                                             "with E0, the others E0 x smc_partial")
+        st_after = np.asarray(dz.st[el])
+        ok(float(np.mean(st_after[got] == M.S_)) > 0.99 and (inf_before & got).sum() > 20 and (st_after[~got] != M.S_).any(),
+           "Q3c clearance at dosing: every reached child is uninfected after the round; children not reached keep "
+           "their infections")
+        older = uu[a >= 5]
+        ok(not np.any(np.asarray(dz.smc_t[older]) == s1), "Q3d children 5 and over are never dosed")
+    case("Q3", q3)
+
+    def q4():
+        lr_in, lr_post = [], []
+        for sd in (3, 4):
+            o0, o1 = e.run_batch([{"n_agents": 3000, "burnin_years": 2}] * 2, usmc,
+                                 [Package("none", {}), Package("s", {"smc": 1})], hz, sd)
+            lr_in.append(o1.windows["in"]["inc_u5"] / max(o0.windows["in"]["inc_u5"], 1e-9))
+            lr_post.append(o1.windows["post"]["inc_u5"] / max(o0.windows["post"]["inc_u5"], 1e-9))
+        pe_in, pe_post = 1 - float(np.mean(lr_in)), 1 - float(np.mean(lr_post))
+        ok(pe_in > 0.7 and pe_post < pe_in - 0.1,
+           f"Q4 emergent clinical effect under 5: {pe_in:.3f} during the rounds (ACCESS-SMC 0.882 within 28 days), "
+           f"{pe_post:.3f} at 29-42 days after the last round (ACCESS-SMC 0.614); a check, not an input")
+    case("Q4", q4)
+
+    def q5():
+        bad = []
+        for k, v in (("smc_cov", 0.0), ("smc_cov", 1.2), ("smc_rho", 1.0), ("smc_rho", -0.1), ("smc_adh", 1.5),
+                     ("smc_e0", -0.1), ("smc_partial", 1.1), ("smc_half", 0.0), ("smc_k", float("nan")),
+                     ("smc_half", float("inf"))):
+            try:
+                e.run({"n_agents": 200, "burnin_years": 0, k: v}, usmc, Package("s", {"smc": 1}), hz, 1)
+                bad.append((k, v))
+            except ValueError as ex:
+                if k not in str(ex):
+                    bad.append((k, v, str(ex)[:60]))
+        ok(not bad, f"Q5 out-of-range SMC parameters fail closed, naming the parameter (accepted: {bad})")
+    case("Q5", q5)
+
+    def q6():
+        from toolkit.engines.horizon import DeliveryHorizon
+        season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+        attrs = dict(unit.attributes, season=season, itn_hist_years=[2015.2], campaign_year=2016.1, irs_month=4)
+        hs = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"y15": [2015.0, 2016.0]}, delivery=(2016.0, 2017.0))
+        small = {"n_agents": 300, "burnin_years": 1}
+        for k, vals in (("smc_cov", (0.6, 0.9)), ("smc_half", (24.0, 32.0))):
+            ps = [dict(small, **{k: vals[0]}), dict(small, **{k: vals[1]})]
+            b = e.run_batch(ps, UnitSpec("t", dict(attrs, smc_hist_years=[2015])), Package("none", {}), hs, 3)
+            b0 = e.run_batch(ps, UnitSpec("t", attrs), Package("none", {}), hs, 3)
+            ok([o.meta["burnin_members"] for o in b] == [1, 1] and [o.meta["burnin_members"] for o in b0] == [2, 2],
+               f"Q6 ({k}) with past SMC the SMC parameters are in the burn-in key; without it they act after the fork")
+    case("Q6", q6)
 
 
 def write_card(path: str) -> None:

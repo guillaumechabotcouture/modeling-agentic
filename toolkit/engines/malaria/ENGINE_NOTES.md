@@ -64,6 +64,122 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.11 scope: SMC mechanism from the literature (owner approval 2026-11-05; written before the v0.11 code)
+
+**Why.** In the F5 Nigeria run, all 57 local government areas (LGAs) that calibrated to the top of the transmission
+range (log m0 = 4.6) had past SMC. Their 2021 survey window (Sep–Dec 2021) overlaps the SMC rounds. In v0.10:
+- every child reached was cleared and then protected against infection at a flat `smc_pe` = 0.882 for exactly 28
+  days. That number is the ACCESS-SMC protective effectiveness against *clinical malaria* (0–28 days, case-control);
+- the per-round reach came from two access groups. `smc_hi_frac` = 0.85 of children were reached with probability
+  0.95 per round and the rest with 0.5, for a mean of 0.88 per round. The 0.85 had no source.
+
+v0.11 replaces both with values that each have a published source and location. No value below was chosen by
+fitting to the Nigeria calibration targets or to any benchmark. B13 and B17 (the pack's two SMC benchmarks) stay
+held out.
+
+### What the literature says
+
+| Quantity | Source | Location | Value (quote or number) |
+|---|---|---|---|
+| Clinical malaria, SMC vs control | Meremikwu et al. 2012, Cochrane CD003756.pub4 (PMC6532713) | Abstract, Main results (full text not accessible) | rate ratio 0.26 (95% CI 0.17–0.38), six trials, 9,321 participants |
+| Clinical malaria, 0–28 and 29–42 days after a dose | ACCESS-SMC Partnership 2020, Lancet 396:1829 (PMC7718580) | Results; Fig. 2A | "88·2% (95% CI 78·7–93·4)" within 28 days; "61·4% (47·4–71·8)" at 29–42 days |
+| Same, Nigeria 2016 | Cairns et al. 2021, PLoS Med 18:e1003727 (PMC8457484) | Table 2 | 83.1% (69.1–90.8) at ≤28 days; 63.7% (12.7–84.9) at 29–42 days |
+| Infection during the season, and about 6 weeks after the last dose (Mali, SP+AQ vs placebo, all children with LLINs) | Dicko et al. 2011, PLoS Med 8:e1000407 (PMC3032550) | Results, malaria infection | weekly surveys 1.9% vs 13.2% ("protective efficacy of 85%", 73–92); end of season 7.2% vs 13.2% (46%); clinical malaria PE 82% (78–85), Table 2 |
+| Same (Burkina Faso) | Konaté et al. 2011, PLoS Med 8:e1000408 (PMC3032552) | Table 4; Table 2 | weekly surveys 18.6% vs 45.8% (RR 0.40); 6 weeks after the last course 11.4% vs 41.5% (RR 0.27); clinical malaria PE 70% (66–74) |
+| Mechanism | Konaté et al. 2011 | Discussion | "IPTc clears existing infections and has a prophylactic effect preventing new blood stage infections" |
+| Protection by days since a dose | Cairns et al. 2022, BMC Med 20:352 (PMC9540742) | Abstract; Results (Fig. 6) | "exceeded 90% in the first 2–3 weeks … but was not 100%, even immediately post-administration … declines more sharply after day 28"; "completely lost … at around 45 days … (at about 38 days) using Smoothed Cox Residuals" |
+| Protection with the day-1 dose only | Cairns et al. 2022 | Results (paragraph before Fig. 4) | 30-day PE 79.8% (33.7–93.8) with SP+AQ on day 1 only, against 87.7% with all three daily doses |
+| Decay shape against infection | Burgert et al. 2022, PLOS Glob Public Health 2:e0000211 (PMC10021282) | Table 1; Methods, Eq 1 | SMC-SP+AQ "Initial efficacy: 100% / Half-life: 32 days / Decay shape: Weibull, k= 5.4", E(t) = E0 exp(−(t/L)^k ln2), applied as "pre-erythrocytic protection from infection"; prevalent blood-stage infections cleared at dosing ("The same initial blood-stage clearance was applied for SMC-SP+AQ") |
+| Same, independent refit | Braunack-Mayer et al. 2024, Lancet Glob Health 12:e478 (PMC10882206) | Table 1; Results | Weibull shape k = 5·34; a liver-stage protection half-life of "24–30 days" behaves like SP+AQ |
+| Per-round reach and its heterogeneity, Nigeria 2020 (Bauchi, Jigawa, Kano, Katsina, Kebbi, Sokoto, Yobe) | Malaria Consortium 2021, "Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and quality in Burkina Faso, Chad, Nigeria, and Togo" | Table 21 (end-of-round survey, n = 7,898, weighted) | cycles received with day-1 SPAQ: none 6.0%, one 5.2%, two 13.3%, three 15.3%, four 60.2% |
+| Full three-day course among day-1 recipients, Nigeria 2020 | same report | Table 16 | 94.4% (93.2–95.1), end-of-round, cycle 4 |
+| Coverage range, other years | ACCESS-SMC 2020 (Table 1); Malaria Consortium 2022 and 2023 reports (Table 0) | as named | mean coverage per month, Nigeria: 83.0% (2015), 52.1% (2016); day-1 coverage per cycle 93–96% (2022, 2023, end-of-cycle) |
+| Full course, range | ACCESS-SMC Nigeria 2015 key indicators; Malaria Consortium 2021 report, Table 18 | as named | 84.2%; 98.6% |
+
+What this says for the engine:
+- **During the season, the trials measured almost the same effect on infection as on clinical malaria.** Dicko
+  reports 85% against infection and 82% against clinical malaria; Konaté reports RR 0.40 and 0.30. So a strong
+  in-season effect on infection is supported, and v0.11 does **not** weaken it with a separate factor.
+- **Protection is not a 28-day step.** It stays above 90% for about three weeks, falls after day 28 and is gone by
+  about day 38–45. The Weibull curve of Burgert 2022 gives 0.93 at day 21, 0.71 at day 28, 0.61 at day 30, 0.17 at
+  day 38 and 0.01 at day 45.
+- **Coverage is heterogeneous.** In 2020, 6.0% of Nigerian children got no cycle and 60.2% got all four. If each
+  round were independent at the same mean (0.796 per round), only 0.2% would get none and 40% all four.
+
+### Mechanism (v0.11)
+
+1. **Who is reached (replaces the access groups).** Each child aged 3–59 months has a persistent propensity
+   π ~ Beta with mean `smc_cov` and intra-child correlation `smc_rho`. It is drawn once from the child's uniform
+   latent `prop_smc`, as before. Each round reaches the child with probability π. The number of rounds reached in
+   a season is then beta-binomial. Fitted to Table 21 by maximum likelihood, it gives mean 0.796 and correlation
+   0.417, and predicts none 5.5%, one 7.4%, two 10.3%, three 16.6%, four 60.1% against the observed 6.0 / 5.2 / 13.3 /
+   15.3 / 60.2. The fit is to the coverage survey only, not to any prevalence or benchmark. `smc_rho` = 0 gives
+   independent rounds.
+2. **Adherence.** A reached child completes the three-day course with probability `smc_adh` = 0.944 (Table 16).
+3. **Treatment at dosing (kept).** Every reached child's blood-stage infection is cleared, as in v0.10 and as in
+   Burgert 2022's model. No source in hand gives a clearance probability below 1 for SP+AQ. This is named as an
+   assumption.
+4. **Prophylaxis against new infection (replaces the 28-day step).** From the day of a dose t0, a new infection is
+   blocked with probability E(t) = E0 exp(−((t − t0)/L)^k ln2). The values are E0 = `smc_e0` = 1, L = `smc_half` =
+   32 days and k = `smc_k` = 5.4 (Burgert 2022, Table 1). A child who took only the day-1 dose gets
+   E0 × `smc_partial`, where `smc_partial` = 0.910 = 79.8 / 87.7 is the ratio of Cairns 2022's two 30-day PEs. This
+   protection is held apart from the 25-day post-treatment prophylaxis of case management, and the two combine as
+   1 − (1 − a)(1 − b). A new dose restarts the curve.
+5. **Clinical effect: no separate factor (dropped).** The trials' near-equal in-season effect on infection and on
+   disease means the clinical effect should follow from the infections prevented, as it does in both
+   Weibull-curve sources. ACCESS-SMC's 88.2% (0–28 days) and 61.4% (29–42 days) are used as a **check** of the
+   effect that emerges, not as an input. The self-test asks only that the 0–28-day effect be high and that it
+   fall after day 28.
+
+**Dropped:**
+- `smc_pe`: a clinical effectiveness used as infection protection, which becomes a check.
+- `smc_hi_frac`, and the hard-coded 0.95 and 0.5 reach of the two groups: unsourced.
+- the 28-day module constant: replaced by the Weibull curve.
+
+**Kept:**
+- clearance at dosing;
+- ages 3–59 months;
+- month-start round dates;
+- the per-child persistent latent;
+- uncharged past and routine SMC;
+- the smc_doses cost driver, which counts children given the day-1 dose.
+
+**Assumption, named:** a child's propensity persists across seasons. The surveys measure one season.
+
+**New engine parameters.** All are kind `fixed`, and each has its source on the card.
+
+| Parameter | Value | Range for priors | Source |
+|---|---|---|---|
+| `smc_cov` | 0.796 | 0.521–0.957 | Table 21 above; range: ACCESS-SMC Nigeria 2016 mean per month (52.1%) to Malaria Consortium 2022 end-of-cycle C2 (95.7%) |
+| `smc_rho` | 0.417 | none (fixed) | beta-binomial fit to Table 21 |
+| `smc_adh` | 0.944 | 0.842–0.986 | Table 16; range as in the literature table |
+| `smc_e0` | 1.0 | none (fixed) | Burgert 2022 Table 1 |
+| `smc_half` | 32 days | 24–32 days | Burgert 2022 Table 1; Braunack-Mayer 2024 (24–30 days) |
+| `smc_k` | 5.4 | none (fixed) | Burgert 2022 Table 1 (Braunack-Mayer 2024: 5.34) |
+| `smc_partial` | 0.910 | none (fixed) | Cairns 2022 (79.8% / 87.7%) |
+
+A unit's own coverage, such as a state's survey value, can be set through a run spec's `engine_parameters`, as for
+`net_retention_half`. Out-of-range values fail closed: `smc_cov` outside (0, 1], `smc_rho` outside [0, 1),
+`smc_adh`, `smc_e0` or `smc_partial` outside [0, 1], and `smc_half` or `smc_k` that is not finite and positive.
+
+**Burn-in key.** With past SMC, the seven new parameters join the key, as `smc_pe` and `smc_hi_frac` did. Without
+past SMC they act after the fork.
+
+**Not byte-identical.** Every run with SMC changes, so `validate_once.sh` recomputes all the evidence. B13 and B17
+stay held out. A Nigeria reachability check on the 57 clamped LGAs is a diagnostic only, and it is reported in the
+PR, not here, because the run data are licensed.
+
+**Tests (written first; `selftest_late.py`, section `_self_test_v011`).**
+- Q0: the card, parameters and priors; `smc_pe` and `smc_hi_frac` are gone.
+- Q1: the protection curve: E0 at t0, E0/2 at L, decreasing, 0 before any dose.
+- Q2: the propensity model: rounds received follow the beta-binomial (Table 21 reproduced), the mean per-round
+  reach is `smc_cov`, and `smc_rho` = 0 gives independent rounds.
+- Q3: in the sim, a round reaches the share `smc_cov`, and the reached children's states and doses are correct
+  (clearance, the share with a full course, E0 or E0 × `smc_partial`).
+- Q4: the emergent clinical effect is high within 28 days and lower at 29–42 days.
+- Q5: out-of-range values fail closed.
+- Q6: the burn-in key.
+
 ## v0.10 scope: past SMC and a net type per past net campaign (owner approval 2026-11-04)
 
 **Why.** Up to v0.9 a unit had no attribute for past SMC, so a calibration to a survey taken after SMC began (for
