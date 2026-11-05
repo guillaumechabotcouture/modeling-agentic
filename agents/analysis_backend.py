@@ -65,6 +65,15 @@ def _signed_config(ref: str):
     return cfg
 
 
+def _renewal_config(spec: dict) -> dict:
+    """The renewal engine is configured by an estimates spec's `dynamics` (generation interval, transmissibility);
+    any other spec gets no configuration, and the card read fails, so the engine is not eligible."""
+    from toolkit.spec import estimates as ES
+    if not ES.is_estimates(spec):
+        raise ValueError("the renewal engine is configured from an estimates spec's dynamics section")
+    return ES.engine_config(spec)
+
+
 # Registered engines: (import ref, card file read without importing the engine or None,
 # config from the spec or None). A configured engine's card depends on its config.
 ENGINES = [
@@ -72,6 +81,7 @@ ENGINES = [
     ("toolkit.engines.malaria.engine:MalariaEngine", "toolkit/engines/malaria/card.yaml", None),
     ("toolkit.engines.empirical.engine:PackageRateEngine", None, _empirical_config),
     (COMPARTMENTAL, None, _signed_config(COMPARTMENTAL)),
+    ("toolkit.engines.renewal.engine:RenewalEngine", None, _renewal_config),
 ]
 # Contract thresholds on the analysis output (B owns these once it lands).
 EMULATOR_R2_MIN = 0.8
@@ -807,6 +817,23 @@ def _self_test() -> int:
     ok(not emp["eligible"] and "at most" in str(emp["why_not"]),
        "B27 a spec with 40 components makes the package-rate engine ineligible at once (it would enumerate 2^40 "
        "combinations)")
+    # an estimates spec (no allocation units): the renewal engine is the one eligible registered engine, configured
+    # from the spec's dynamics; for an allocation spec it is not eligible
+    import tempfile as _tf
+    from toolkit.analysis import api as _api
+    from toolkit.spec import estimates as _ES
+    with _tf.TemporaryDirectory() as d:
+        raw = dict(_ES.toy_spec(), engine="auto")
+        rows = eligible_engines(dict(raw, engine_needs=_api.engine_needs(raw)))
+        el = [r["ref"] for r in rows if r.get("eligible")]
+        ren = next(r for r in rows if r["ref"].endswith("RenewalEngine"))
+        ok(el == ["toolkit.engines.renewal.engine:RenewalEngine"]
+           and ren["config"]["generation_interval"] == {"dt": "week", "w": [0.5, 0.5]},
+           f"B23 an estimates spec: only the renewal engine is eligible, configured from dynamics ({el})")
+        tspec = toy_spec(os.path.join(d, "u.csv"))
+        rows2 = eligible_engines(dict(tspec, engine_needs=_api.engine_needs(tspec)))
+        ok(not next(r for r in rows2 if r["ref"].endswith("RenewalEngine"))["eligible"],
+           "B23b an allocation spec: the renewal engine is not eligible")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

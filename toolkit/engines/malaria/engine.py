@@ -78,9 +78,16 @@ default []) runs SMC rounds in the unit's SMC months in each of those years, in 
 never charged, through the same SMC intervention as the package's (model.SMCDelivery); `smc_hist_rounds` (one number,
 or one per year) keeps the first n SMC months of a year. Every past round precedes the delivery period (fail closed).
 `hist_net_by_year` gives a past campaign its own net type; campaigns it does not name, and routine campaigns, keep
-hist_net. Past SMC puts smc_pe and smc_hi_frac, and a past dual-AI campaign cfp_kill and cfp_half, in the burn-in
-key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
+hist_net. Past SMC puts the SMC parameters (smc_pe and smc_hi_frac to v0.10; the seven of v0.11), and a past dual-AI
+campaign cfp_kill and cfp_half, in the burn-in key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
 benchmarks/restamp_proof.py). Self-tests H0-H7.
+
+v0.11: the SMC mechanism from the literature (ENGINE_NOTES.md, v0.11; model.SMCDelivery). A child's per-round reach is
+a persistent beta propensity (smc_cov, smc_rho; Malaria Consortium 2020 Table 21), a reached child completes the course
+with probability smc_adh (Table 16) and is cleared of blood-stage infection, and new infections are blocked with
+E0 exp(-(t/L)^k ln2) from the dose (smc_e0, smc_half, smc_k; Burgert 2022 Table 1), E0 x smc_partial after the day-1
+dose only (Cairns 2022). smc_pe and smc_hi_frac are gone. Not byte-identical where SMC acts, so the benchmark
+evidence is recomputed (validate_once.sh). Self-tests Q0-Q6 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -109,7 +116,11 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.10"
+VERSION = "0.11"
+# v0.11: SMC sources (ENGINE_NOTES.md, v0.11)
+MC20 = ("Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and "
+        "quality in Burkina Faso, Chad, Nigeria, and Togo")
+BURGERT = "Burgert et al. 2022 PLOS Glob Public Health 2:e0000211 (PMC10021282)"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -135,8 +146,29 @@ _PARAMS = [
     ("use_persist", 0.5, "fixed", "share", 0.0, 1.0, "assumption: share of the use gap that is persistent non-use (the rest is "
      "night-to-night variation)", "unverified"),
     ("net_holes", 1.0, "fixed", "switch", None, None, "holes in nets in use on (1) / off (0): " + V.HOLES_SOURCE, "matched"),
-    ("smc_pe", 0.882, "fixed", "share", 0.787, 0.934, "ACCESS-SMC Partnership 2020 Lancet 10.1016/S0140-6736(20)32227-3", "matched"),
-    ("smc_hi_frac", 0.85, "fixed", "share", None, None, A8 + " (SMC access groups)", "unverified"),
+    # v0.11: SMC (ENGINE_NOTES.md, v0.11). smc_pe (a clinical effectiveness used as infection protection) and
+    # smc_hi_frac (unsourced access groups) are gone
+    ("smc_cov", 0.796, "fixed", "share", 0.521, 0.957, MC20 + ", Table 21 (Nigeria 2020, end-of-round, n = 7,898): "
+     "cycles received none 6.0%, one 5.2%, two 13.3%, three 15.3%, four 60.2%; mean per-round reach of the beta-binomial "
+     "fit (mean of the cycles 0.796). Range: ACCESS-SMC Partnership 2020 Lancet (PMC7718580) Table 1, Nigeria 2016 mean "
+     "coverage per month 52.1%, to the Malaria Consortium 2022 report, Table 0, Nigeria cycle 2 day-1 coverage 95.7%",
+     "matched"),
+    ("smc_rho", 0.417, "fixed", "correlation", None, None, "intra-child correlation of the beta-binomial fitted by "
+     "maximum likelihood to " + MC20 + ", Table 21 (predicts 5.5 / 7.4 / 10.3 / 16.6 / 60.1% for 0-4 cycles)", "matched"),
+    ("smc_adh", 0.944, "fixed", "share", 0.842, 0.986, MC20 + ", Table 16: full three-day course among day-1 "
+     "recipients, Nigeria end-of-round cycle 4, 94.4% (93.2-95.1). Range: ACCESS-SMC Nigeria 2015 key indicators "
+     "84.2%; the Malaria Consortium 2021 report, Table 18, 98.6%", "matched"),
+    ("smc_e0", 1.0, "fixed", "share", None, None, BURGERT + ", Table 1: SMC-SP+AQ initial efficacy 100% (pre-erythrocytic "
+     "protection from infection, Eq 1)", "matched"),
+    ("smc_half", 32.0, "fixed", "days", 24.0, 32.0, BURGERT + ", Table 1: SMC-SP+AQ half-life 32 days. Range: "
+     "Braunack-Mayer et al. 2024 Lancet Glob Health (PMC10882206), Results: a liver-stage protection half-life of 24-30 "
+     "days behaves like SP+AQ", "matched"),
+    ("smc_k", 5.4, "fixed", "shape", None, None, BURGERT + ", Table 1: Weibull decay shape k = 5.4, E(t) = E0 "
+     "exp(-(t/L)^k ln2) (Eq 1); Braunack-Mayer 2024 Table 1: 5.34", "matched"),
+    ("smc_partial", 0.910, "fixed", "share", None, None, "Cairns et al. 2022 BMC Med 20:352 (PMC9540742), Results: 30-day "
+     "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7. "
+     "Assumption (Codex r1 P2-5): the ratio of two 30-day clinical PEs is applied as a multiplier on the initial "
+     "infection-blocking efficacy, with the same decay and clearance", "unverified"),
     ("cm_add", 0.15, "scenario", "probability", None, None, A8 + " (enhanced CM: +0.15 effective treatment)", "unverified"),
     ("cfr_severe_treated", 0.10, "fixed", "probability", None, None, "AQUAMAT (attempt 8 C48)", "unverified"),
     ("cfr_severe_untreated", 0.30, "fixed", "probability", None, None, "assumption (attempt 8 C49)", "unverified"),
@@ -167,12 +199,12 @@ MIN_START_YEAR = 1900.0
 # Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
-POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_pe", "smc_hi_frac", "cm_add",
+POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC_PARAM_NAMES, "cm_add",
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
 # v0.10: SMC parameters act before the fork when a unit has past SMC (smc_hist_years), so they join its burn-in key
-SMC_PARAMS = frozenset({"smc_pe", "smc_hi_frac"})
+SMC_PARAMS = frozenset(M.SMC_PARAM_NAMES)      # v0.11: the seven SMC parameters
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
 # v0.8: the monthly series run_series offers (toolkit/engines/hooks.py), each one of the model's daily records
 # (model.DAILY) with the same definition as the window metric of the same name
@@ -392,7 +424,8 @@ class MalariaEngine:
                 "households: correlated net use within households, correlated net use and spraying, "
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
-                "SMC (28-day protection, clearance); case management (effective treatment)",
+                "SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); "
+                "case management (effective treatment)",
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "routine SMC in every arm after the delivery period, uncharged (v0.7)",
@@ -676,6 +709,7 @@ class MalariaEngine:
             raise ValueError(f"the sim would start in {float(horizon.start) - B:g} (horizon.start {horizon.start:g} - "
                              f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
                              "so the population would not grow: shorten the burn-in or move the horizon")
+        M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
@@ -699,12 +733,12 @@ class MalariaEngine:
             nts = None if dp["hist_nets"] is None else dp["hist_nets"] + [dp["hist_net"]] * len(dp["routine_years"])
             itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist", net_types=nts))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
-                M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
+                M.SMCDelivery(years=[], P=P, name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
         rs = dp["smc_routine"]
         if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
-            itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
-                                     count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
+            itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], P=P, count=False, after=rs["after"],
+                                     before=rs["before"], name="smc_routine"))
         sh = dp["smc_hist"]
         if sh is not None:     # v0.10: built only when set, last, so a unit without it gets the v0.9 sim exactly
             # Codex r1 P1-2: every past round runs on a step before the delivery start (the steps the sim uses)
@@ -714,8 +748,8 @@ class MalariaEngine:
             if late:
                 raise ValueError(f"smc_hist_years: past SMC round(s) run on step(s) {late[:4]}, at or after the "
                                  f"delivery start {d0:g}")
-            itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
-                                     count=False, times=sh["rounds"], name="smc_hist"))
+            itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], P=P, count=False, times=sh["rounds"],
+                                     name="smc_hist"))
         if cfg is not None:
             self._configure({i.name: i for i in itv}, None, P, cfg)
         sim = ss.Sim(people=_people(n0), start=float(horizon.start) - B, stop=float(horizon.stop),
@@ -735,11 +769,11 @@ class MalariaEngine:
         smc.years = list(cfg["smc"]["years"]) if cfg["smc"] else []
         if cfg["smc"]:
             smc.months = list(cfg["smc"]["months"])
-        smc.pe, smc.hi_frac = P["smc_pe"], P["smc_hi_frac"]
+        smc.set_smc(P)
         if "smc_routine" in itv:   # v0.7: routine rounds act after the fork, with the member's own SMC parameters
-            itv["smc_routine"].pe, itv["smc_routine"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
+            itv["smc_routine"].set_smc(P)
         if "smc_hist" in itv:      # v0.10: the burn-in key holds the SMC parameters, so this is the shared value
-            itv["smc_hist"].pe, itv["smc_hist"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
+            itv["smc_hist"].set_smc(P)
         irs.years = list(cfg["irs"]["years"]) if cfg["irs"] else []
         if cfg["irs"]:
             irs.month = int(cfg["irs"]["month"])
@@ -858,6 +892,7 @@ class MalariaEngine:
         mem = []
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
+            M.smc_check(P)          # v0.11: every member, not only the one whose parameters build the shared burn-in
             a = dict(u.attributes)
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
@@ -2185,11 +2220,11 @@ def _self_test_v010(ok, e, unit) -> None:
 
     def h6():
         uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
-        ps = [dict(small, smc_pe=0.6), dict(small, smc_pe=0.9)]
+        ps = [dict(small, smc_cov=0.6), dict(small, smc_cov=0.9)]
         b = e.run_batch(ps, uh, none, hs, 3)
         solo = [e.run(q, uh, none, hs, 3) for q in ps]
         ok([o.meta["burnin_members"] for o in b] == [1, 1] and [strip(o) for o in b] == [strip(o) for o in solo],
-           "H6 with past SMC, parameter sets that differ in smc_pe do not share a burn-in (it acts before the fork); "
+           "H6 with past SMC, parameter sets that differ in smc_cov (v0.11; smc_pe up to v0.10) do not share a burn-in (it acts before the fork); "
            "each member equals its own run")
         b0 = e.run_batch(ps, UnitSpec("t", attrs), none, hs, 3)
         ok([o.meta["burnin_members"] for o in b0] == [2, 2], "H6b without past SMC they still share one (v0.9)")
@@ -2231,6 +2266,176 @@ def _self_test_v010(ok, e, unit) -> None:
         o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hs, 1)
         ok(o.per_capita is not None, "H7d hist_net_by_year with float and string year keys runs (burn-in key)")
     case("H7", h7)
+
+
+def _self_test_v011(ok, e, unit) -> None:
+    """v0.11: the SMC mechanism from the literature (ENGINE_NOTES.md, v0.11). Reach from a persistent beta propensity
+    (mean smc_cov, intra-child correlation smc_rho; Malaria Consortium 2020 Table 21), a full course with probability
+    smc_adh, clearance at dosing, and Weibull-decaying protection against new infection E0 exp(-(t/L)^k ln2)
+    (Burgert 2022 Table 1), E0 x smc_partial after the day-1 dose only (Cairns 2022)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    from math import comb
+    from scipy.special import betaln
+    want_p = {"smc_cov": (0.796, "Table 21"), "smc_rho": (0.417, "Table 21"), "smc_adh": (0.944, "Table 16"),
+              "smc_e0": (1.0, "Burgert"), "smc_half": (32.0, "Burgert"), "smc_k": (5.4, "Burgert"),
+              "smc_partial": (0.910, "Cairns")}
+
+    def q0():
+        specs = {p.name: p for p in e.parameters()}
+        good = [k for k, (v, src) in want_p.items() if k in specs and abs(specs[k].value - v) < 1e-9
+                and specs[k].kind == "fixed" and src in specs[k].source]
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 11) and sorted(good) == sorted(want_p)
+           and "smc_pe" not in specs and "smc_hi_frac" not in specs,
+           f"Q0 engine v0.11: the seven SMC parameters are fixed and sourced; smc_pe and smc_hi_frac are gone "
+           f"(sourced: {sorted(good)})")
+        from toolkit.spec.priors import load_card
+        mc = load_card(e)
+        ok(mc["problems"] == [] and {"smc_cov", "smc_adh", "smc_half"} <= set(mc["priors"])
+           and "smc_pe" not in mc["priors"], f"Q0b priors.yaml covers the new parameters: {mc['problems'][:3]}")
+    case("Q0", q0)
+
+    def q1():
+        t = np.array([-1.0, 0.0, 14.0, 21.0, 28.0, 32.0, 38.0, 45.0, 90.0])
+        E = M.smc_protection(t, 1.0, 32.0, 5.4)
+        ref = np.exp(-(np.maximum(t, 0) / 32.0) ** 5.4 * np.log(2))
+        ok(E[0] == 0.0 and abs(E[1] - 1.0) < 1e-12 and abs(E[5] - 0.5) < 1e-12 and np.allclose(E[1:], ref[1:])
+           and bool(np.all(np.diff(E[1:]) <= 0)) and abs(E[3] - 0.931) < 0.002 and abs(E[4] - 0.714) < 0.002
+           and E[7] < 0.02, f"Q1 protection E0 exp(-(t/L)^k ln2): 0 before a dose, E0 at the dose, E0/2 at L, "
+                            f"decreasing: {E.round(3).tolist()}")
+        E2 = M.smc_protection(np.array([0.0, 32.0]), 0.91, 32.0, 5.4)
+        ok(np.allclose(E2, [0.91, 0.455]), f"Q1b E0 scales the curve ({E2.tolist()})")
+    case("Q1", q1)
+
+    def q2():
+        N = 200000
+        u = (np.arange(N) + 0.5) / N
+        pi = M.smc_propensity(u, 0.796, 0.417)
+        rng = np.random.default_rng(1)
+        n = (rng.random((4, N)) < pi).sum(axis=0)
+        got = np.bincount(n, minlength=5) / N
+        s = 1 / 0.417 - 1
+        a, b = 0.796 * s, 0.204 * s
+        bb = np.array([comb(4, k) * np.exp(betaln(k + a, 4 - k + b) - betaln(a, b)) for k in range(5)])
+        ok(abs(pi.mean() - 0.796) < 0.002 and np.allclose(got, bb, atol=0.006)
+           and np.allclose(bb, [0.055, 0.074, 0.103, 0.166, 0.601], atol=0.002),
+           f"Q2 rounds reached over 4 rounds are beta-binomial (Table 21 fit): {got.round(3).tolist()} vs "
+           f"{bb.round(3).tolist()} (observed 0.060 0.052 0.133 0.153 0.602)")
+        p0 = M.smc_propensity(u, 0.796, 0.0)
+        ok(np.allclose(p0, 0.796), "Q2b smc_rho = 0: every child has the mean propensity (independent rounds)")
+        ok(np.all(np.diff(pi) >= 0), "Q2c the propensity is monotone in the child's latent (persistent ranking)")
+    case("Q2", q2)
+
+    hz = Horizon(2016.0, 2017.0, (2016.0, 2017.0), {"in": [2016 + 5 / 12, 2016 + 9 / 12],
+                                                   "post": [2016 + 8 / 12 + 29 / 365, 2016 + 8 / 12 + 42 / 365]})
+    # Codex r1 P2-2: the last round is at the start of September (2016 + 8/12), so "post" is 29-42 days after it
+    usmc = UnitSpec("t", dict(unit.attributes, m0=20.0, itn_hist_years=[], campaign_year=2016.5, irs_month=None,
+                              smc_months=[6, 7, 8, 9]))
+
+    def q3():
+        sim, _ = e.build_sim({"n_agents": 4000, "burnin_years": 0}, usmc, Package("s", {"smc": 1}), hz, 7)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        s1 = sorted(M.event_steps(yv, sim.interventions["smc"].targets()))[0]
+        sim.run(until=yv[s1 - 1])
+        dz = sim.diseases.malaria
+        uu = sim.people.auids
+        a = np.asarray(sim.people.age[uu])
+        el = uu[(a >= 0.25) & (a < 5)]
+        inf_before = np.asarray(dz.st[el]) != M.S_
+        sim.run(until=yv[s1])
+        got = np.asarray(dz.smc_t[el]) == s1
+        eff = np.asarray(dz.smc_eff[el])[got]
+        full = float(np.mean(np.abs(eff - 1.0) < 1e-12))
+        part = bool(np.all((np.abs(eff - 1.0) < 1e-12) | (np.abs(eff - 0.910) < 1e-12)))
+        ok(abs(got.mean() - 0.796) < 0.04, f"Q3 a round reaches the share smc_cov of children 3-59 m ({got.mean():.3f})")
+        ok(abs(full - 0.944) < 0.03 and part, f"Q3b reached children: full course share {full:.3f} (smc_adh 0.944) "
+                                             "with E0, the others E0 x smc_partial")
+        st_after = np.asarray(dz.st[el])
+        ok(float(np.mean(st_after[got] == M.S_)) > 0.99 and (inf_before & got).sum() > 20 and (st_after[~got] != M.S_).any(),
+           "Q3c clearance at dosing: every reached child is uninfected after the round; children not reached keep "
+           "their infections")
+        older = uu[a >= 5]
+        ok(not np.any(np.asarray(dz.smc_t[older]) == s1), "Q3d children 5 and over are never dosed")
+        # Codex r1 P2-3: reach persists across the intervention's own rounds (the beta propensity, not the test's draws)
+        s2 = sorted(M.event_steps(yv, sim.interventions["smc"].targets()))[1]
+        sim.run(until=yv[s2])
+        both = np.isin(el, np.asarray(sim.people.auids))
+        el2 = el[both]
+        a2 = np.asarray(sim.people.age[el2])
+        el2 = el2[a2 < 5]
+        r1 = np.isin(el2, el[got])
+        r2 = np.asarray(dz.smc_t[el2]) == s2
+        phi = float(np.corrcoef(r1, r2)[0, 1])
+        ok(0.2 < phi < 0.7, f"Q3e reach in round 2 is correlated with reach in round 1 (phi {phi:.3f}; independent "
+                            "rounds give 0)")
+    case("Q3", q3)
+
+    def q4():
+        lr_in, lr_post = [], []
+        for sd in (3, 4):
+            o0, o1 = e.run_batch([{"n_agents": 3000, "burnin_years": 2}] * 2, usmc,
+                                 [Package("none", {}), Package("s", {"smc": 1})], hz, sd)
+            lr_in.append(o1.windows["in"]["inc_u5"] / max(o0.windows["in"]["inc_u5"], 1e-9))
+            lr_post.append(o1.windows["post"]["inc_u5"] / max(o0.windows["post"]["inc_u5"], 1e-9))
+        pe_in, pe_post = 1 - float(np.mean(lr_in)), 1 - float(np.mean(lr_post))
+        ok(pe_in > 0.7 and pe_post < pe_in - 0.1,
+           f"Q4 population-level diagnostic, all children under 5 (reached or not): incidence reduction "
+           f"{pe_in:.3f} over the rounds, {pe_post:.3f} at 29-42 days after the last round. Not the recipients' "
+           f"effectiveness that ACCESS-SMC estimates (0.882 within 28 days, 0.614 at 29-42 days); a check, not an "
+           f"input")
+    case("Q4", q4)
+
+    def q5():
+        bad = []
+        for k, v in (("smc_cov", 0.0), ("smc_cov", 1.2), ("smc_rho", 1.0), ("smc_rho", -0.1), ("smc_adh", 1.5),
+                     ("smc_e0", -0.1), ("smc_partial", 1.1), ("smc_half", 0.0), ("smc_k", float("nan")),
+                     ("smc_half", float("inf"))):
+            try:
+                e.run({"n_agents": 200, "burnin_years": 0, k: v}, usmc, Package("s", {"smc": 1}), hz, 1)
+                bad.append((k, v))
+            except ValueError as ex:
+                if k not in str(ex):
+                    bad.append((k, v, str(ex)[:60]))
+        ok(not bad, f"Q5 out-of-range SMC parameters fail closed, naming the parameter (accepted: {bad})")
+        # a member forked from another member's burn-in (SMC parameters are post-fork without past SMC) is checked too
+        try:
+            e.run_batch([{"n_agents": 200, "burnin_years": 0}, {"n_agents": 200, "burnin_years": 0, "smc_cov": 1.5}],
+                        usmc, Package("s", {"smc": 1}), hz, 1)
+            ok(False, "Q5b a forked member's out-of-range SMC parameter fails closed")
+        except ValueError as ex:
+            ok("smc_cov" in str(ex), f"Q5b a forked member's out-of-range SMC parameter fails closed ({ex})")
+    case("Q5", q5)
+
+    def q6():
+        from toolkit.engines.horizon import DeliveryHorizon
+        season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+        attrs = dict(unit.attributes, season=season, itn_hist_years=[2015.2], campaign_year=2016.1, irs_month=4)
+        hs = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"y15": [2015.0, 2016.0]}, delivery=(2016.0, 2017.0))
+        small = {"n_agents": 300, "burnin_years": 1}
+        for k, vals in (("smc_cov", (0.6, 0.9)), ("smc_half", (24.0, 32.0))):
+            ps = [dict(small, **{k: vals[0]}), dict(small, **{k: vals[1]})]
+            b = e.run_batch(ps, UnitSpec("t", dict(attrs, smc_hist_years=[2015])), Package("none", {}), hs, 3)
+            b0 = e.run_batch(ps, UnitSpec("t", attrs), Package("none", {}), hs, 3)
+            ok([o.meta["burnin_members"] for o in b] == [1, 1] and [o.meta["burnin_members"] for o in b0] == [2, 2],
+               f"Q6 ({k}) with past SMC the SMC parameters are in the burn-in key; without it they act after the fork")
+        # Codex r1 P2-3: members that share one burn-in each act with their own SMC parameters (dz.P and the
+        # interventions are set per member), including the decay read from dz.P at each step
+        hq = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"d": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        uq = UnitSpec("t", dict(attrs, m0=20.0))
+        ps = [dict(small), dict(small, smc_half=24.0), dict(small, smc_k=2.0), dict(small, smc_cov=0.5, smc_rho=0.0)]
+        b = e.run_batch(ps, uq, Package("s", {"smc": 1}), hq, 4)
+        solo = [e.run(q, uq, Package("s", {"smc": 1}), hq, 4) for q in ps]
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        ok([o.meta["burnin_members"] for o in b] == [4] * 4 and [strip(o) for o in b] == [strip(o) for o in solo]
+           and len({repr(o.windows["d"]) for o in b}) == 4,
+           "Q6b members sharing one burn-in each equal their own run and differ from one another (smc_half, smc_k, "
+           "smc_cov / smc_rho act per member)")
+    case("Q6", q6)
 
 
 def write_card(path: str) -> None:

@@ -25,6 +25,12 @@ the median retention net_retention_half (S(median) = 1/2, so L = median sqrt((k 
 age a days is lost with the conditional hazard 1 - S(a+1)/S(a) (net_loss_prob). v0.3-v0.8 lost nets at the constant
 rate ln2 / net_retention_half (an exponential with the median as its half-life).
 
+v0.11: SMC from the literature (ENGINE_NOTES.md, v0.11). A child's per-round reach is a persistent beta propensity
+(smc_propensity: mean smc_cov, intra-child correlation smc_rho), a reached child completes the course with probability
+smc_adh, every reached child's blood-stage infection is cleared, and new infections are blocked with the Weibull
+protection smc_protection (E0 exp(-(t/L)^k ln2), Burgert 2022 Table 1), E0 x smc_partial after the day-1 dose only.
+v0.3-v0.10 cleared, then protected at a flat smc_pe for 28 days, with two access groups (smc_hi_frac).
+
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
   z_hh   household latent; a person's net-use latent is
@@ -122,6 +128,7 @@ class Malaria(ss.Disease):
             ss.FloatArr('IV', default=0.0), ss.FloatArr('lb', default=-1e9), ss.FloatArr('lc', default=-1e9),
             ss.FloatArr('ld', default=-1e9), ss.FloatArr('lv', default=-1e9),
             ss.FloatArr('prot_until', default=-1.0), ss.FloatArr('prot_eff', default=0.0),
+            ss.FloatArr('smc_t', default=-1e9), ss.FloatArr('smc_eff', default=0.0),
             ss.BoolState('has_net', default=False), ss.FloatArr('net_t', default=0.0),
             ss.FloatArr('net_type', default=0.0), ss.FloatArr('spray_t', default=-1e9),
             ss.FloatArr('prop_net', default=ss.random()), ss.FloatArr('prop_smc', default=ss.random()),
@@ -164,8 +171,9 @@ class Malaria(ss.Disease):
         burn-in must agree on it at horizon.start)."""
         import hashlib
         h = hashlib.sha256()
-        for nm in ('st', 'zeta', 'IB', 'IC', 'ID', 'IV', 'lb', 'lc', 'ld', 'lv', 'prot_until', 'prot_eff', 'has_net',
-                   'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use'):
+        for nm in ('st', 'zeta', 'IB', 'IC', 'ID', 'IV', 'lb', 'lc', 'ld', 'lv', 'prot_until', 'prot_eff', 'smc_t',
+                   'smc_eff', 'has_net', 'net_t', 'net_type', 'spray_t', 'hh', 'z_hh', 'z_sp', 'prop_net', 'prop_use',
+                   'prop_smc'):
             h.update(np.ascontiguousarray(np.asarray(getattr(self, nm)[u], float)).tobytes())
         h.update(np.ascontiguousarray(np.asarray(self.sim.people.age[u], float)).tobytes())
         for mo in self.mos:
@@ -300,6 +308,13 @@ class Malaria(ss.Disease):
         self._boost('IB', 'lb', u, bitten, ti, G['ub'])
         bvec = G['b0'] * (G['b1'] + (1 - G['b1']) / (1 + (self.IB[u] / G['IB0']) ** G['kb']))
         prot = np.where(self.prot_until[u] > ti, self.prot_eff[u], 0.0)
+        # v0.11: SMC protection against new infection decays from the last dose; it combines with the post-treatment
+        # prophylaxis as 1 - (1 - a)(1 - b)
+        dosed = self.smc_t[u] > -1e8
+        if dosed.any():
+            ps = np.zeros(n)
+            ps[dosed] = smc_protection(ti - self.smc_t[u][dosed], self.smc_eff[u][dosed], P['smc_half'], P['smc_k'])
+            prot = 1.0 - (1.0 - prot) * (1.0 - ps)
         elig = (st != D_) & (st != T_)
         newinf = bitten & elig & (self.rs.random(n) < bvec * (1 - prot))
         ui = u[newinf]
@@ -468,20 +483,73 @@ class IRSRound(ss.Intervention):
                 dz.acc_cost['irs_sprayed'] += len(hit) / len(u)
 
 
+SMC_PARAM_NAMES = ("smc_cov", "smc_rho", "smc_adh", "smc_e0", "smc_half", "smc_k", "smc_partial")
+
+
+def smc_check(P: dict) -> None:
+    """v0.11: the SMC parameters' domains; a value outside fails closed (ValueError naming the parameter)."""
+    def num(k):
+        v = P[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)) or not np.isfinite(v):
+            raise ValueError(f"{k} must be a finite number (got {v!r})")
+        return float(v)
+    if not 0.0 < num("smc_cov") <= 1.0:
+        raise ValueError(f"smc_cov must be in (0, 1] (got {P['smc_cov']!r})")
+    if not 0.0 <= num("smc_rho") < 1.0:
+        raise ValueError(f"smc_rho must be in [0, 1) (got {P['smc_rho']!r})")
+    for k in ("smc_adh", "smc_e0", "smc_partial"):
+        if not 0.0 <= num(k) <= 1.0:
+            raise ValueError(f"{k} must be in [0, 1] (got {P[k]!r})")
+    for k in ("smc_half", "smc_k"):
+        if not num(k) > 0.0:
+            raise ValueError(f"{k} must be finite and positive (got {P[k]!r})")
+
+
+def smc_protection(dt_days, e0, half, k):
+    """v0.11: SMC protection against new infection dt_days after a dose, E0 exp(-(dt/L)^k ln2) (Burgert et al. 2022,
+    PLOS Glob Public Health, Table 1 and Eq 1: E0 1, L 32 days, k 5.4); 0 before a dose (dt < 0)."""
+    dt = np.asarray(dt_days, float)
+    x = np.maximum(dt, 0.0) / float(half)
+    return np.where(dt >= 0.0, np.asarray(e0, float) * np.exp(-(x ** float(k)) * LN2), 0.0)
+
+
+def smc_propensity(u, mean, rho):
+    """v0.11: a child's per-round SMC reach probability from its uniform latent u: the u-quantile of a beta with mean
+    `mean` and intra-child correlation `rho` (a = mean s, b = (1 - mean) s, s = 1/rho - 1), so the rounds a child is
+    reached in a season are beta-binomial (fitted to Malaria Consortium 2020 Table 21). rho = 0: every child has the
+    mean (independent rounds); mean 1: every child is reached."""
+    u = np.asarray(u, float)
+    m, r = float(mean), float(rho)
+    if r < 1e-9 or m >= 1.0:          # Codex r1 P3: a tiny positive rho is the independent limit (1/rho overflows)
+        return np.full(u.shape, m)
+    from scipy.special import betaincinv
+    s = 1.0 / r - 1.0
+    return betaincinv(m * s, (1.0 - m) * s, np.clip(u, 0.0, 1.0))
+
+
 class SMCDelivery(ss.Intervention):
-    """SMC monthly cycles for 3-59 months: clears infection, 28-day protection with
-    efficacy `pe`; semi-correlated cycle coverage (high / low access groups).
+    """SMC monthly cycles for 3-59 months (v0.11; ENGINE_NOTES.md, v0.11). Each round reaches a child with its
+    persistent propensity (smc_propensity of prop_smc: mean `cov`, correlation `rho`); a reached child is cleared of
+    blood-stage infection and protected from that day by smc_protection, with E0 = `e0` after a full three-day
+    course (probability `adh`) and `e0` x `partial` after the day-1 dose only. The decay (smc_half, smc_k) is read
+    from the disease's parameters at each step.
     v0.7: `count` False never adds doses to the cost driver (routine SMC); `after` / `before` keep only the rounds
     at decimal times after <= t < before (None: no bound).
     v0.10: `times` (optional) gives the rounds' decimal times directly (past SMC, whose rounds per year may differ);
     None: the rounds are the month starts of `months` in `years`."""
-    def __init__(self, years=(), months=(7, 8, 9, 10), pe=0.882, hi_frac=0.85, p_hi=0.95, p_lo=0.5, name=None,
-                 count=True, after=None, before=None, times=None):
+    def __init__(self, years=(), months=(7, 8, 9, 10), P=None, name=None, count=True, after=None, before=None,
+                 times=None):
         super().__init__(name=name)
-        self.years, self.months, self.pe = list(years), list(months), pe
-        self.hi_frac, self.p_hi, self.p_lo = hi_frac, p_hi, p_lo
+        self.years, self.months = list(years), list(months)
+        self.set_smc(P if P is not None else dict(smc_cov=0.796, smc_rho=0.417, smc_adh=0.944, smc_e0=1.0,
+                                                  smc_partial=0.910))
         self.count, self.after, self.before = count, after, before
         self.times = None if times is None else [float(t) for t in times]
+
+    def set_smc(self, P: dict) -> None:
+        """The delivery's reach and dose parameters from an engine parameter dict."""
+        self.cov, self.rho, self.adh = float(P["smc_cov"]), float(P["smc_rho"]), float(P["smc_adh"])
+        self.e0, self.partial = float(P["smc_e0"]), float(P["smc_partial"])
 
     def targets(self):
         """The decimal times of the rounds."""
@@ -497,13 +565,14 @@ class SMCDelivery(ss.Intervention):
             u = self.sim.people.auids
             a = self.sim.people.age[u]
             e = u[(a >= 0.25) & (a < 5)]
-            hi = dz.prop_smc[e] < self.hi_frac
-            got = e[dz.rs.random(len(e)) < np.where(hi, self.p_hi, self.p_lo)]
+            pi = smc_propensity(dz.prop_smc[e], self.cov, self.rho)
+            got = e[dz.rs.random(len(e)) < pi]
+            full = dz.rs.random(len(got)) < self.adh
             if self.count and dz.in_delivery():
                 dz.acc_cost['smc_doses'] += len(got) / len(u)
-            dz.st[got] = S_
-            dz.prot_until[got] = self.ti + 28
-            dz.prot_eff[got] = self.pe
+            dz.st[got] = S_                     # clearance at dosing (kept from v0.10)
+            dz.smc_t[got] = self.ti
+            dz.smc_eff[got] = np.where(full, self.e0, self.e0 * self.partial)
 
 
 class CaseManagement(ss.Intervention):

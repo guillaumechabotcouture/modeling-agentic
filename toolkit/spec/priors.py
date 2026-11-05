@@ -486,7 +486,7 @@ def _self_test() -> int:
         try:
             from toolkit.engines.malaria.engine import MalariaEngine
             mc = load_card(MalariaEngine())
-            ok(mc["path"] and mc["problems"] == [] and {"smc_pe", "use_rate", "net_retention_half", "dw_moderate",
+            ok(mc["path"] and mc["problems"] == [] and {"smc_cov", "use_rate", "net_retention_half", "dw_moderate",
                                                         "dw_severe", "cfr_severe_treated"} <= set(mc["priors"]),
                f"PR18 the malaria priors file is complete and consistent with the engine: {mc['problems'][:3]}")
         except ImportError as e:

@@ -46,11 +46,11 @@ EXEMPT = {
     "toolkit/analysis/decision_tests.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/sensitivity.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/stability.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/uncertainty.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/spec/toy_engines.py": "self-test toy engines (refused in production by toolkit/import_guard.py); "
                                    "exercised by toolkit/spec/engine_parameters.py's self-test",
     "toolkit/engines/malaria/model.py": "engine module; exercised by toolkit/engines/malaria/engine.py --self-test",
     "toolkit/engines/compartmental/benchmarks/runtime_spike.py": "one-off timing script for the dev VM",
+    "toolkit/engines/renewal/benchmarks/oracles.py": "benchmark-pack oracles and probes; exercised by toolkit/engines/renewal/engine.py --self-test",
     "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": "diagnostic scan script, not a library",
     "toolkit/engines/malaria/benchmarks/runtime.py": "timing and peak-memory measurement script for a VM, not a library",
 }

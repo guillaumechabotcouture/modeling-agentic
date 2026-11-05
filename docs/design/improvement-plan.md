@@ -193,6 +193,21 @@ The owner approved these four items on 2026-11-03 and deferred them until the F5
 | R3 | A direct measure of determinism: the same signed spec run on different seeds and engine stamps, reporting how much the decision changes. In the eval suite, each question runs twice. | Not started |
 | R4 | Freeze the harness's operations code, so that review effort goes into the engine and the evidence. | Not started |
 
+## Model library (owner approval, 2026-11-05)
+
+The layers (core, engine families, domain packs, questions and runs), the promotion rule (a lesson becomes core only once it has appeared in two disease areas), the parallel tracks and the acceptance criteria for core changes are in `model-library.md`. Its §5 "F6 factory package" is the work before the next Nigeria run, F6; it is not item F6 of workstream F above.
+
+| # | Item | Status |
+|---|---|---|
+| L1 | Canary pipeline: every question with an engine, nightly on Coiled and on every core PR (`model-library.md` §5.1) | Not started |
+| L2 | Data contract tests at pre-sign, with the dynamics review in the same job (§5.2) | Not started; geometry check merged |
+| L3 | Joint calibration across all targets, literature priors with their spread, no unit clamped at its range edge (§5.3) | Not started; design note first |
+| L4 | Incremental rebuilds from a content-addressed step cache (§5.4) | Not started |
+| L5 | One golden launch path, tested nightly on a real cluster; orchestration on a cloud VM (§5.5) | Not started |
+| L6 | Layer-tagged lessons and delivery metrics, extending `run_autopsy.py` and the lessons ledger (§5.6) | Autopsy and ledger merged; tags and metrics not started |
+| L7 | Repository-wide disease-term scan of `toolkit/` and `scripts/` (§4, AC1) | Not started |
+| L8 | Track B engines: age-structured compartmental (graded v2 runs, published benchmark, notes, hooks), then renewal (with the estimate-only deliverable), then TB (§3.2) | Compartmental and renewal work started 2026-11-05 |
+
 ## Order and checkpoints
 
 1. A1, A2, A3 (in progress), then A4 with a smoke run.

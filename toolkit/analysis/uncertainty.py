@@ -29,9 +29,10 @@ import sys
 import numpy as np
 import yaml
 
-from toolkit.analysis.core import q
-
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from toolkit.analysis.core import q  # noqa: E402
 PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
 
@@ -223,6 +224,30 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     return {"data": data, "report": report}
 
 
+def scalar_report(outputs, values: dict, level: float, label: str, n_draws: int, method: str, **extra) -> dict:
+    """uncertainty_report.yaml for a deliverable whose headline outputs are scalars (design note v2d §2.3), in the
+    shape the allocation path writes and every reader of that file expects: `scalar_outputs: {name: {mean, median,
+    sd, ci_low, ci_high, n}}`, one entry per declared output, in the declared order. `outputs` are the deliverable's
+    declared output entries ({name, ...}); `values` maps each name to its draws. A declared output without finite draws
+    fails closed (ValueError): the report never omits a headline."""
+    a = (1.0 - float(level)) / 2.0
+    so = {}
+    for o in outputs:
+        n = o["name"] if isinstance(o, dict) else str(o)
+        v = np.asarray(values.get(n, []), float)
+        if v.size == 0 or not np.all(np.isfinite(v)):
+            raise ValueError(f"uncertainty report: output {n} has no draws or non-finite draws")
+        so[n] = {"mean": float(np.mean(v)), "median": float(np.median(v)), "sd": float(np.std(v, ddof=1))
+                 if v.size > 1 else 0.0, "ci_low": float(np.quantile(v, a)), "ci_high": float(np.quantile(v, 1 - a)),
+                 "n": int(v.size)}
+        for k in ("metric", "window", "scale"):
+            if isinstance(o, dict) and o.get(k) is not None:
+                so[n][k] = o[k]
+    return dict({"producer": PRODUCER, "produced_by": "harness", "n_draws": int(n_draws),
+                 "n_successful": int(n_draws), "n_failed": 0, "interval_label": label, "level": float(level),
+                 "method": method, "backend": "local", "scalar_outputs": so}, **extra)
+
+
 def write_report(run_dir, report) -> str:
     p = os.path.join(run_dir, "uncertainty_report.yaml")
     from toolkit.analysis.artifacts import plain
@@ -230,3 +255,54 @@ def write_report(run_dir, report) -> str:
     _safe_io().write_nofollow(run_dir, "uncertainty_report.yaml", yaml.safe_dump(plain(report), sort_keys=False).encode(),
                               atomic=True)
     return p
+
+
+def _self_test() -> int:
+    """The shared scalar writer (scalar_report); the allocation path's run() is exercised by run.py --self-test."""
+    import tempfile
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        if not c:
+            fails.append(m)
+
+    rng = np.random.default_rng(1)
+    outs = [{"name": "b", "metric": "m2", "window": "w", "scale": "ratio"}, {"name": "a", "metric": "m1"}]
+    vals = {"a": rng.normal(1.0, 0.1, 4000), "b": rng.normal(5.0, 1.0, 4000)}
+    try:
+        rep = scalar_report(outs, vals, 0.9, "90% UI over calibration", 4000, "posterior")
+    except Exception as e:  # noqa: BLE001 -- a missing writer is a failing case
+        rep = {"error": f"{type(e).__name__}: {e}"}
+    so = rep.get("scalar_outputs") or {}
+    ok(list(so) == ["b", "a"] and all(set(v) >= {"mean", "median", "sd", "ci_low", "ci_high", "n"} for v in so.values()),
+       f"U1 scalar_report: one entry per declared output, in the declared order, with mean, median, sd and interval "
+       f"({rep.get('error') or list(so)})")
+    if so:
+        lo, hi = np.quantile(vals["a"], [0.05, 0.95])
+        ok(abs(so["a"]["ci_low"] - lo) < 1e-12 and abs(so["a"]["ci_high"] - hi) < 1e-12 and so["b"]["metric"] == "m2",
+           "U2 the interval is the declared level's central interval; the output's metric, window and scale are kept")
+        ok(rep["interval_label"] == "90% UI over calibration" and rep["n_draws"] == 4000,
+           "U3 the report carries the label and the number of draws")
+        for label, v in (("no draws", {"a": [], "b": vals["b"]}),
+                         ("a non-finite draw", {"a": [1.0, float("nan")], "b": vals["b"]})):
+            try:
+                scalar_report(outs, v, 0.9, "x", 2, "posterior")
+                ok(False, f"U4 an output with {label} fails closed")
+            except ValueError:
+                ok(True, f"U4 an output with {label} fails closed")
+        with tempfile.TemporaryDirectory() as d:
+            p = write_report(os.path.realpath(d), rep)
+            ok((yaml.safe_load(open(p)) or {}).get("scalar_outputs", {}).get("a", {}).get("n") == 4000,
+               "U5 write_report publishes uncertainty_report.yaml, which reads back")
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(_self_test())
+    print(__doc__)

@@ -1,0 +1,745 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: malaria-starsim
+  version: '0.10'
+  code_sha256: 64f39ca0a29b44d37b8fd5c4a00173cbe5a9593f4e68e63ee67a32d29a8171f8
+  params_sha256: b681feff078ed0ee914a0adb64035aff97a287370b3dc5c8fe19c4a4ed0f26b8
+  config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3
+benchmarks:
+- id: B7
+  metric: ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)
+  role: held_out
+  target: 0.83
+  band:
+  - 0.68
+  - 0.98
+  source: C21 Pryce 2018 Cochrane CD000363.pub3
+  components:
+    Halbluetzel 1996 (0-59 months): 0.4837
+    Moyou-Somo 1995 (15 and under): 0.5067
+    Rowland 1996 (all ages): 0.5075
+    Smithuis 2013 (under 10): 0.5011
+    Sochantha 2006 (all ages): 0.5075
+  diagnostics:
+    windows.m12.pfpr_6m14y: 0.5074
+  computed: 0.5012
+  se_log: 0.0206
+  per_seed:
+  - 0.4729
+  - 0.5104
+  - 0.4661
+  - 0.5339
+  - 0.4941
+  - 0.5255
+  - 0.5389
+  - 0.474
+  seed_min: 0.4661
+  seed_max: 0.5389
+  in_band: false
+  status: out_of_band
+- id: B8
+  metric: ITN vs none, clinical incidence RR 0-24 m (under 5)
+  role: held_out
+  target: 0.55
+  band:
+  - 0.46
+  - 0.64
+  source: C22 Pryce 2018
+  computed: 0.4104
+  se_log: 0.0213
+  per_seed:
+  - 0.3846
+  - 0.4273
+  - 0.3895
+  - 0.4508
+  - 0.4035
+  - 0.4086
+  - 0.4375
+  - 0.3868
+  seed_min: 0.3846
+  seed_max: 0.4508
+  in_band: false
+  status: out_of_band
+- id: B9
+  metric: PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m
+  role: held_out
+  target: 0.37
+  band:
+  - 0.09
+  - 0.65
+  source: C15 Protopopoff 2018 Lancet, Table 2 (PBO LLIN vs standard LLIN, 9 months)
+  computed: 0.3768
+  se_log: 0.0191
+  per_seed:
+  - 0.3588
+  - 0.361
+  - 0.3488
+  - 0.3862
+  - 0.3755
+  - 0.405
+  - 0.4026
+  - 0.38
+  seed_min: 0.3488
+  seed_max: 0.405
+  in_band: true
+  status: in_band
+- id: B9b
+  metric: PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m
+  role: held_out
+  target: 0.4
+  band:
+  - 0.2
+  - 0.81
+  source: C15 Protopopoff 2018, Table 2 (21 months; held-out durability check)
+  computed: 0.6665
+  se_log: 0.0131
+  per_seed:
+  - 0.6863
+  - 0.7034
+  - 0.6476
+  - 0.6531
+  - 0.6496
+  - 0.6675
+  - 0.6347
+  - 0.6927
+  seed_min: 0.6347
+  seed_max: 0.7034
+  in_band: true
+  status: in_band
+- id: B9c
+  metric: PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)
+  role: held_out
+  target: 0.99
+  band:
+  - 0.67
+  - 1.45
+  source: C17 Mosha 2022 Lancet (added held-out durability check)
+  computed: 0.7308
+  se_log: 0.0072
+  per_seed:
+  - 0.7241
+  - 0.7368
+  - 0.7464
+  - 0.7573
+  - 0.7164
+  - 0.7132
+  - 0.7254
+  - 0.7277
+  seed_min: 0.7132
+  seed_max: 0.7573
+  in_band: true
+  status: in_band
+- id: B10
+  metric: Dual-AI vs pyrethroid nets, prevalence OR at 24 m
+  role: fit
+  target: 0.45
+  band:
+  - 0.23
+  - 0.67
+  source: C17 Mosha 2022
+  computed: 0.6671
+  se_log: 0.0198
+  per_seed:
+  - 0.7046
+  - 0.6208
+  - 0.6424
+  - 0.7229
+  - 0.6223
+  - 0.6681
+  - 0.6876
+  - 0.6755
+  seed_min: 0.6208
+  seed_max: 0.7229
+  in_band: true
+  status: in_band
+- id: B11
+  metric: Dual-AI vs pyrethroid nets, incidence RR 0-24 m
+  role: fit
+  target: 0.54
+  band:
+  - 0.38
+  - 0.7
+  source: C20 Accrombessi 2023 Lancet
+  computed: 0.4979
+  se_log: 0.0227
+  per_seed:
+  - 0.5063
+  - 0.5119
+  - 0.521
+  - 0.4685
+  - 0.5018
+  - 0.4527
+  - 0.5526
+  - 0.4757
+  seed_min: 0.4527
+  seed_max: 0.5526
+  in_band: true
+  status: in_band
+- id: B12
+  metric: Non-pyrethroid IRS added to ITN, prevalence RR at 12 m
+  role: fit
+  target: 0.61
+  band:
+  - 0.34
+  - 0.88
+  source: C23 Pryce 2022 Cochrane CD012688.pub3
+  computed: 0.8037
+  se_log: 0.0096
+  per_seed:
+  - 0.8264
+  - 0.8295
+  - 0.8084
+  - 0.77
+  - 0.8064
+  - 0.8063
+  - 0.8108
+  - 0.7741
+  seed_min: 0.77
+  seed_max: 0.8295
+  in_band: true
+  status: in_band
+- id: B12b
+  metric: Non-pyrethroid IRS added to ITN, incidence RR 0-24 m
+  role: fit
+  target: 0.86
+  band:
+  - 0.49
+  - 1.23
+  source: C23 Pryce 2022
+  computed: 0.5794
+  se_log: 0.0177
+  per_seed:
+  - 0.5603
+  - 0.6204
+  - 0.5548
+  - 0.5606
+  - 0.5925
+  - 0.5607
+  - 0.6275
+  - 0.5636
+  seed_min: 0.5548
+  seed_max: 0.6275
+  in_band: true
+  status: in_band
+- id: B12m
+  metric: Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at
+    9 m
+  role: fit
+  target: 0.33
+  band:
+  - 0.19
+  - 0.55
+  source: Protopopoff 2018 Lancet, Table 2 (standard LLIN + IRS vs standard LLIN;
+    band = 95% CI)
+  computed: 0.451
+  se_log: 0.0161
+  per_seed:
+  - 0.4582
+  - 0.4112
+  - 0.433
+  - 0.4523
+  - 0.4587
+  - 0.4695
+  - 0.4717
+  - 0.4566
+  seed_min: 0.4112
+  seed_max: 0.4717
+  in_band: true
+  status: in_band
+- id: B13
+  metric: SMC, in-season clinical incidence RR (3-59 m)
+  role: held_out
+  target: 0.27
+  band:
+  - 0.14
+  - 0.4
+  source: C27 Thwing 2024 AJTMH
+  computed: 0.3596
+  se_log: 0.0088
+  per_seed:
+  - 0.3543
+  - 0.3521
+  - 0.3586
+  - 0.3461
+  - 0.3676
+  - 0.359
+  - 0.3706
+  - 0.3696
+  seed_min: 0.3461
+  seed_max: 0.3706
+  in_band: true
+  status: in_band
+- id: B15
+  metric: ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)
+  role: held_out
+  target: 2.43
+  band:
+  - 1.19
+  - 4.97
+  source: 'C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)'
+  requires:
+    B9:
+    - 0.21
+    - 0.65
+    B12m:
+    - 0.19
+    - 0.55
+  arm_or:
+  - a11: 0.2694
+    a10: 0.3588
+    a01: 0.4582
+  - a11: 0.2484
+    a10: 0.361
+    a01: 0.4112
+  - a11: 0.2486
+    a10: 0.3488
+    a01: 0.433
+  - a11: 0.257
+    a10: 0.3862
+    a01: 0.4523
+  - a11: 0.2521
+    a10: 0.3755
+    a01: 0.4587
+  - a11: 0.2393
+    a10: 0.405
+    a01: 0.4695
+  - a11: 0.2523
+    a10: 0.4026
+    a01: 0.4717
+  - a11: 0.293
+    a10: 0.38
+    a01: 0.4566
+  arm_or_geomean:
+    a11: 0.2571
+    a10: 0.3768
+    a01: 0.451
+  arm_prevalence:
+    a00: 0.5491
+    a10: 0.3146
+    a01: 0.3545
+    a11: 0.2385
+  computed: 1.5127
+  se_log: 0.0398
+  per_seed:
+  - 1.6386
+  - 1.6734
+  - 1.6456
+  - 1.4712
+  - 1.4637
+  - 1.258
+  - 1.3281
+  - 1.6885
+  seed_min: 1.258
+  seed_max: 1.6885
+  in_band: true
+  status: in_band
+  requires_values:
+    B9: 0.3768
+    B12m: 0.451
+- id: B16c
+  metric: 'EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >=
+    200 -> PfPR > 80%)'
+  role: held_out
+  target: null
+  band: null
+  source: C35 Beier 1999 AJTMH
+  points:
+  - - 1.037
+    - 0.1032
+  - - 4.192
+    - 0.2537
+  - - 16.745
+    - 0.4666
+  - - 51.491
+    - 0.6363
+  - - 177.12
+    - 0.778
+  - - 525.854
+    - 0.8545
+  rules_checked: 5
+  rules_met: 4
+  computed: 0.8
+  per_seed_rules_met:
+  - 4/5
+  - 4/5
+  - 4/5
+  - 4/5
+  - 4/5
+  - 4/5
+  - 4/5
+  - 4/5
+  in_band: false
+  status: out_of_band
+- id: B17
+  metric: SMC $ per DALY averted (reference setting)
+  role: held_out
+  target: 38.37
+  band:
+  - 7.67
+  - 191.9
+  source: C28 Gilmartin 2021
+  computed: 19.0239
+  outcome_averted_per_capita: 0.1004
+  cost_per_capita: 1.9091
+  comparator_outcome_per_capita: 0.3667
+  share_averted: 0.2737
+  price_floor: 5.2061
+  target_below_price_floor: false
+  share_averted_needed_for_band: 0.0271
+  per_seed:
+  - 19.8474
+  - 17.1887
+  - 20.0931
+  - 17.959
+  - 21.0743
+  - 17.7573
+  - 19.8907
+  - 19.1449
+  seed_min: 17.1887
+  seed_max: 21.0743
+  in_band: true
+  status: in_band
+- id: B18
+  metric: ITN vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 44.51
+  band:
+  - 8.9
+  - 222.6
+  source: C29 Conteh 2021
+  computed: 21.9262
+  outcome_averted_per_capita: 0.0469
+  cost_per_capita: 1.028
+  comparator_outcome_per_capita: 0.3667
+  share_averted: 0.1279
+  price_floor: 2.8033
+  target_below_price_floor: false
+  share_averted_needed_for_band: 0.0126
+  per_seed:
+  - 18.0627
+  - 21.2844
+  - 22.8709
+  - 31.8847
+  - 34.2163
+  - 16.4886
+  - 22.1529
+  - 19.0439
+  seed_min: 16.4886
+  seed_max: 34.2163
+  in_band: true
+  status: in_band
+- id: B19
+  metric: IRS vs none $ per DALY averted (reference setting)
+  role: held_out
+  target: 25.16
+  band:
+  - 5.03
+  - 125.8
+  source: C29 Conteh 2021
+  computed: 115.6622
+  outcome_averted_per_capita: 0.2147
+  cost_per_capita: 24.8288
+  comparator_outcome_per_capita: 0.3667
+  share_averted: 0.5854
+  price_floor: 67.7073
+  target_below_price_floor: true
+  share_averted_needed_for_band: 0.5382
+  per_seed:
+  - 117.292
+  - 112.042
+  - 118.7898
+  - 115.1588
+  - 125.9343
+  - 114.2866
+  - 115.2066
+  - 107.9342
+  seed_min: 107.9342
+  seed_max: 125.9343
+  in_band: true
+  status: in_band
+- id: B20
+  metric: Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)
+  role: held_out
+  target: 19.0
+  band:
+  - 3.8
+  - 95.0
+  source: C19 Mosha 2022
+  computed: 6.4052
+  outcome_averted_per_capita: 0.0377
+  cost_per_capita: 0.2414
+  comparator_outcome_per_capita: 0.3426
+  share_averted: 0.11
+  price_floor: 0.7048
+  target_below_price_floor: false
+  share_averted_needed_for_band: 0.0074
+  per_seed:
+  - 7.7121
+  - 4.8705
+  - 5.5452
+  - 9.2241
+  - 8.176
+  - 6.7224
+  - 5.8062
+  - 5.5249
+  seed_min: 4.8705
+  seed_max: 9.2241
+  in_band: true
+  status: in_band
+initialisation:
+  method: no-intervention burn-in of burnin_years before horizon.start, from a closed-form
+    immunity guess; the population grows to n_agents at horizon.start; arms of one
+    setting and seed share the burn-in and the history up to their first component
+    event
+  evidence:
+  - equilibration.yaml
+settings_calibrated:
+  cochrane_itn:
+    attribute: m0
+    value: 13.469440271471589
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.3139
+    - 0.4102
+    - 0.5297
+    - 0.6176
+    - 0.6902
+    target: 0.5
+    at_grid_edge: false
+    near_grid_edge: false
+  muleba:
+    attribute: m0
+    value: 115.87402456214336
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    baseline_values:
+    - 0.1727
+    - 0.2657
+    - 0.3549
+    - 0.4793
+    - 0.5619
+    - 0.6508
+    target: 0.55
+    at_grid_edge: false
+    near_grid_edge: false
+  misungwi:
+    attribute: m0
+    value: 11.89802410254117
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    baseline_values:
+    - 0.3792
+    - 0.5168
+    - 0.6027
+    - 0.6809
+    - 0.7396
+    target: 0.458
+    at_grid_edge: false
+    near_grid_edge: false
+  benin:
+    attribute: m0
+    value: 15.402055112854258
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.6665
+    - 1.2392
+    - 2.1077
+    - 3.0344
+    - 4.1291
+    target: 2.06
+    at_grid_edge: false
+    near_grid_edge: false
+  irs_added:
+    attribute: m0
+    value: 37.5908277518058
+    grid:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    baseline_values:
+    - 0.1721
+    - 0.2654
+    - 0.3731
+    - 0.489
+    - 0.5923
+    target: 0.4
+    at_grid_edge: false
+    near_grid_edge: false
+  sahel_smc:
+    attribute: m0
+    value: 22.34330759730701
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.1859
+    - 0.2574
+    - 0.3578
+    - 0.4453
+    - 0.5408
+    target: 0.4
+    at_grid_edge: false
+    near_grid_edge: false
+  ce_ref:
+    attribute: m0
+    value: 17.312127227213516
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.2624
+    - 0.3563
+    - 0.4398
+    - 0.5294
+    - 0.6079
+    target: 0.45
+    at_grid_edge: false
+    near_grid_edge: false
+  ce_res:
+    attribute: m0
+    value: 17.312127227213516
+    grid:
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    baseline_values:
+    - 0.2624
+    - 0.3563
+    - 0.4398
+    - 0.5294
+    - 0.6079
+    target: 0.45
+    at_grid_edge: false
+    near_grid_edge: false
+fitted_used:
+  cfp_kill: 0.405
+  irs_kill: 0.433438
+configs_validated: {}
+configs_not_exercised: []
+seeds:
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+n_sims: 298
+summary:
+  in_band: 14
+  total: 17
+  by_status:
+    in_band: 14
+    out_of_band: 3
+    not_assessable: 0
+    band_mis_based: 0
+  held_out_in_band: 9
+  held_out_total: 12
+engine_version: '0.10'
+fit_rule: joint-v1
+wall_s: 2521.3
+restamped:
+  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+  proof_identical: true
+  scope:
+    pack_settings:
+    - benin
+    - ce_ref
+    - ce_res
+    - cochrane_itn
+    - eir_1
+    - eir_10
+    - eir_100
+    - eir_3
+    - eir_30
+    - eir_300
+    - irs_added
+    - misungwi
+    - muleba
+    - sahel_smc
+    pack_arms: every arm of each setting, in one run_batch per setting and seed
+    seeds:
+    - 11
+    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
+      sensitivity the card's 4000
+    burnin_years: the card's (50), the pack's own
+    evidence_cases:
+    - - equilibration
+      - - 3.5
+        - base
+        - burnin_years: 50
+        - 1
+    - - equilibration
+      - - 28.0
+        - doubled
+        - burnin_years: 100
+        - 1
+    - - equilibration
+      - - 9.0
+        - guess_hi
+        - burnin_years: 50
+          init_eir_per_m0: 2.4
+        - 2
+    - - guess_sensitivity
+      - - 3.5
+        - x1
+        - 1
+        - 50
+    - - guess_sensitivity
+      - - 28.0
+        - x0.25
+        - 2
+        - 50
+    scenarios:
+      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+      heterogeneous: 5 members, seed 23, delivery None
+      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
+    not_repeated: calibration-grid runs (same code path at other attribute values)
+    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+      dicts exactly
+  old_engine_version: '0.9'
+  proof_script_commit: ade919c26daa87496120d326f08ff5570daf556f
+  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
+    is pending.
+  confirmation:
+    validate_once: pending
+    evidence: null
+  old_identity:
+    name: malaria-starsim
+    version: '0.9'
+    code_sha256: 2a194886e13b30a610575d5f17c04958745f10b36a1dbdd571294f65420d3c8b
+    params_sha256: b681feff078ed0ee914a0adb64035aff97a287370b3dc5c8fe19c4a4ed0f26b8
+    config_sha256: 4b86811a290ba8b0d9cff872a840ee2d2e4543eee525495e640008bcf214032c
