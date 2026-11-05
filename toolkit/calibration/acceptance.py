@@ -6,8 +6,8 @@ engine (the renewal engine, toolkit/engines/renewal), with planted values: the c
 
   AC1  units: ten populations, each with its own susceptible share (the per-unit parameter) and a shared R0 and
        intervention effect; targets per population: a serosurvey attack rate (sampling sd from its sample size) and
-       the cumulative incidence before the intervention (declared sd); a shared trial target (attack rate ratio with
-       and without the component in a reference population). Every population matched, the planted values inside
+       the cumulative incidence before the intervention (declared sd); a shared trial target (reproduction-number
+       ratio with and without the component in a reference population). Every population matched, the planted values inside
        the region, the effect contracted. Without the trial the effect is not identified (depletion trades the
        susceptible share against it), and the region says so (AC1d).
   AC2  the same with one population whose observed attack rate no susceptible share reaches: unmatched, with the
@@ -36,7 +36,7 @@ def _engine():
 
 def _horizon():
     from toolkit.engines.contract import Horizon
-    return Horizon(0.0, 1.0, (0.0, 1.0), {"all": [0.0, 1.0], "pre": [0.0, 0.3]})
+    return Horizon(0.0, 1.0, (0.0, 1.0), {"all": [0.0, 1.0], "pre": [0.0, 0.3], "trial": [0.3, 0.35]})
 
 
 def _sim_factory(eng, attrs):
@@ -47,7 +47,7 @@ def _sim_factory(eng, attrs):
         o = eng.run(theta, UnitSpec("u", a), Package("p", comps), h, 0)
         w = o.windows["all"]
         return {"attack": float(w["attack_rate"]), "peak": float(w["peak_time"]),
-                "pre": float(o.windows["pre"]["attack_rate"])}
+                "pre": float(o.windows["pre"]["attack_rate"]), "reff": float(o.windows["trial"]["reff_start"])}
 
     def sim(pts):
         out = []
@@ -60,9 +60,9 @@ def _sim_factory(eng, attrs):
             elif "log10_seed" in th:          # the canary: one population, shared values only
                 a = {"N": 1e6, "seed": float(10 ** th.pop("log10_seed")), "s0": 1.0}
                 o = run_one(th, a, {})
-            else:                             # a trial in a reference population: attack with / without the component
-                a = {"N": 1e6, "seed": 1e-3, "s0": 1.0}
-                o = {"rr": run_one(th, a, {"vc": 1})["attack"] / run_one(th, a, {})["attack"]}
+            else:                             # a trial: R_t with / without the component as it starts (reference population)
+                a = {"N": 1e6, "seed": 1e-6, "s0": 1.0}
+                o = {"rr": run_one(th, a, {"vc": 1})["reff"] / run_one(th, a, {})["reff"]}
             out.append(o)
         return out
     return sim
@@ -85,8 +85,8 @@ def _units_problem(unreachable=None):
         tg.append(HM.Target(f"{u}:pre", "unit", "pre", o["pre"], "log", sd_obs=0.1, sd_md=0.05, unit=u,
                             source="synthetic case series: cumulative incidence before the intervention (declared sd)"))
     rr = sim([{"kind": "shared", "theta": truth, "seed": 0}])[0]["rr"]
-    tg.append(HM.Target("trial_rr", "shared", "rr", rr, "log", sd_obs=0.1, sd_md=0.05,
-                        source="synthetic trial: attack rate ratio with / without the component"))
+    tg.append(HM.Target("trial_rr", "shared", "rr", rr, "log", sd_obs=0.04, sd_md=0.02,
+                        source="synthetic trial: reproduction-number ratio with / without the component"))
     P = HM.Problem([HM.Param("r0", 1.3, 3.5, "uniform", None, "synthetic range"),
                     HM.Param("effect:vc", 0.0, 0.6, "triangular", 0.25, "synthetic range")],
                    {"name": "s0", "lo": 0.3, "hi": 1.0}, units, tg)
@@ -115,7 +115,7 @@ def _self_test() -> int:
             fails.append(m)
     q = lambda *a, **k: None  # noqa: E731
     P, sim, truth, s_true = _units_problem()
-    r = HM.calibrate(P, sim, seed=1, waves=2, log=q, candidates_log2=10, points_per_unit=10, shared_points=40)
+    r = HM.calibrate(P, sim, seed=1, waves=2, log=q, candidates_log2=10, points_per_unit=10, shared_points=24)
     rg = r["region"]["ranges"]
     ok(r["status"] == "matched" and r["n_matched"] == 10, f"AC1a renewal engine: every population matched ({r['blocks']})")
     ok(all(rg[k][0] <= v <= rg[k][1] for k, v in truth.items()) and r["region"]["contraction"]["effect:vc"] > 0.3,

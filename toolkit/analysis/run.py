@@ -692,8 +692,12 @@ def _self_test_joint(ok, q):
            f"JR2 a matched joint calibration: the point uses the region's best value and the draws are region rows "
            f"(provenance {jp})")
         prt = [t for t in R["decision_tests"] if t.get("test_id") == "prior_range_base"]
-        ok(prt and prt[0].get("status") != "not_run" or not prt,
-           "JR3 the jointly calibrated parameter's prior_range test runs (at its region's ends)")
+        from toolkit.analysis import decision_tests as DT_
+        pt_ = [t for t in DT_.prior_range_tests(A) if t["parameter"] == "base"]
+        ok(len(prt) == 1 and prt[0].get("status") != "not_run" and len(pt_) == 1 and pt_[0]["values"] == rg
+           and pt_[0].get("joint"),
+           f"JR3 the jointly calibrated parameter's prior_range test runs at its region's ends ({pt_ and pt_[0]['values']}"
+           f" vs {rg})")
         ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
            f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
     with tempfile.TemporaryDirectory() as d:

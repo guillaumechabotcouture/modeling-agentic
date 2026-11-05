@@ -201,7 +201,7 @@ The layers (core, engine families, domain packs, questions and runs), the promot
 |---|---|---|
 | L1 | Canary pipeline: every question with an engine, nightly on Coiled and on every core PR (`model-library.md` §5.1) | Not started |
 | L2 | Data contract tests at pre-sign, with the dynamics review in the same job (§5.2) | Not started; geometry check merged |
-| L3 | Joint calibration across all targets, literature priors with their spread, no unit clamped at its range edge (§5.3) | Not started; design note first |
+| L3 | Joint calibration across all targets, literature priors with their spread, no unit clamped at its range edge (§5.3) | In review: history matching in `toolkit/calibration/` behind the spec field `calibration.joint`, run before the outcome batch; clamped inversions block at the calibration step (changes/jcal-joint-calibration.md). Not yet: held-out benchmarks reported at region draws, benchmark targets through the compute backend |
 | L4 | Incremental rebuilds from a content-addressed step cache (§5.4) | Not started |
 | L5 | One golden launch path, tested nightly on a real cluster; orchestration on a cloud VM (§5.5) | Not started |
 | L6 | Layer-tagged lessons and delivery metrics, extending `run_autopsy.py` and the lessons ledger (§5.6) | Autopsy and ledger merged; tags and metrics not started |

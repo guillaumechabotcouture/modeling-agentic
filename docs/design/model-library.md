@@ -42,7 +42,7 @@ without knowing which disease either belongs to.
 |---|---|---|
 | Stage machine and fix loop | `agents/stage_machine.py`, `agents/fix_loop.py`, `agents/findings_ledger.py` | merged (v2c, #90) |
 | Decision spec and sign-off | `toolkit/spec/schema.py`, `signoff.py`, `engine_parameters.py`, `priors.py` | merged; held-out values cannot be signed |
-| Calibration | `toolkit/analysis/calibration.py` (`emulator_inversion`, `likelihood`, `posterior`); engine-level `fit_joint` in `toolkit/engines/benchmark.py` | per-unit inversion counts clamped units but does not stop on them; joint calibration across all targets is §5.3 |
+| Calibration | `toolkit/analysis/calibration.py` (`emulator_inversion`, `likelihood`, `posterior`); engine-level `fit_joint` in `toolkit/engines/benchmark.py` | per-unit inversion: clamped units now stop the run at the calibration step; joint calibration across all targets: `toolkit/calibration/history_matching.py` behind `calibration.joint` (§5.3) |
 | Emulator | `toolkit/analysis/model.py` | merged |
 | Allocation and uncertainty | `toolkit/alloc/`, `toolkit/analysis/uncertainty.py`, `stability.py`, `decision_tests.py` | merged |
 | Canary | none | §5.1 |
@@ -280,6 +280,26 @@ Calibration fits all uncertain parameters together, not one at a time.
   a finding at that point, not after the batch. Passing it is necessary, not sufficient.
 - When a target is missed, the question is which joint region fits, and the first check is
   whether the mechanism follows the standard published model (determinism roadmap R2).
+
+**Implementation (2026-11-06, in review).** No maintained Python package gave a compatible region for this problem
+shape (shared parameters plus one parameter per unit across a few hundred units, an expensive stochastic engine):
+mogp-emulator's HistoryMatching (last release 2022) fails on the current numpy; pyabc (maintained) needs thousands of
+engine runs per fit and has no emulator; emukit offers designs and Bayesian optimisation, not implausibility;
+calabaria and Starsim's calibration search for a point with Optuna. So the step is our own, built on scipy and
+scikit-learn: `toolkit/calibration/history_matching.py` (disease-agnostic; thresholds in
+`toolkit/calibration/thresholds.yaml`) and the spec adapter `toolkit/analysis/joint_calibration.py`.
+- Shared parameters are priors the draws already vary (engine-card priors, spec priors, spec values with a range), so
+  their sourced ranges are the priors and the outcome emulator spans them. The per-unit parameter is the existing
+  `calibration.attribute` on `calibration.range`.
+- Targets: unit (one per unit per survey year), group (a survey at a coarser level: a weighted aggregate of units),
+  benchmark (fit targets of the engine's own pack only; a held-out id is refused). Each has a sampling sd (from its
+  interval or sample size), a source-bias sd and a discrepancy sd; a target with none is refused.
+- Profiling: the per-unit parameter moves only its unit, so a shared value is compatible with a unit when some value
+  of the unit's parameter makes all its targets non-implausible. Units no value matches are listed with the direction
+  of the miss and each target's modelled value; units matchable alone but not together are listed as conflicting.
+  Either stops ANALYZE at the calibration step, before the outcome batch.
+- After the last wave the engine runs at the best point for every unit (verification). The region's shared values
+  feed the uncertainty draws (with provenance), and the automatic prior_range tests use the region's ends.
 
 ### 5.4 Incremental rebuilds
 
