@@ -40,6 +40,9 @@ verification:
   # implausible there (observation, discrepancy and run-noise variance only) is flagged, as is a unit no point in the
   # region matches.
   run: true
+  # engine runs per unit at the best shared point: its best value of the unit parameter and values spread over the
+  # rest of its non-implausible interval there; the unit passes when the engine matches at one of them
+  z_points: 3
 blocking:
   # Units that no point of the region matches block the analysis at the calibration step, before the outcome batch.
   # The harness never pins them at a bound silently; how to treat them is the owner's decision.

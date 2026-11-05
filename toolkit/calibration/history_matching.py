@@ -797,26 +797,48 @@ class HistoryMatch:
         return out
 
     def _verify(self, best_c, zbest):
-        """Run the engine at the best point for every unit (and the shared targets): simulated implausibility."""
+        """Run the engine at the best shared point for every unit (and the shared targets): simulated implausibility.
+        Each unit is run at `z_points` values of its own parameter spread over its non-implausible values there (its
+        best value first), and judged at the one the engine matches best: the unit parameter is one-dimensional and
+        moves only its unit, so this checks the engine itself, not the emulator's choice of grid value."""
         st = self.state
         t = st["C"][best_c]
-        urows = [{"unit": u, "s": float(self.zg[zbest[u]]), "t": t.copy(), "seed": _seed(self.seed, "verify", u)}
-                 for u in self.P.units]
+        k = int(self.vth.get("z_points", 3))
+        urows = []
+        for u in self.P.units:
+            okc = np.flatnonzero(st["units"][u]["ok"][best_c])
+            cand = [int(zbest[u])]
+            if len(okc) > 1:
+                cand += [int(okc[int(round(q * (len(okc) - 1)))]) for q in np.linspace(0, 1, k)[1:-1]] if k > 2 else []
+                cand += [int(okc[0]), int(okc[-1])] if k > 1 else []
+            seen = []
+            for g in cand:
+                if g not in seen:
+                    seen.append(g)
+            for n, g in enumerate(seen[:max(k, 1)]):
+                urows.append({"unit": u, "s": float(self.zg[g]), "t": t.copy(), "seed": _seed(self.seed, "verify", u, n),
+                              "g": g})
         srows = [{"t": t.copy(), "seed": _seed(self.seed, "verify", "shared")}] if self.sobs else []
         urows = self._run("unit", urows)
         srows = self._run("shared", srows)
-        byu = {r["unit"]: r["obs"] for r in urows}
         out = {"units": {}, "targets": {}}
+        byu = {}
         for u in self.P.units:
-            worst = 0.0
-            rows = []
-            for tg in self.P.unit_targets(u):
-                noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
-                y = float(tr(byu[u][tg.observable], tg.scale))
-                i = abs(y - tg.y) / math.sqrt(noise + tg.var)
-                worst = max(worst, i)
-                rows.append({"target": tg.id, "simulated": byu[u][tg.observable], "implausibility": round(i, 4)})
-            out["units"][u] = {"implausibility": round(worst, 4), "ok": worst <= self.cut, "targets": rows}
+            best = None
+            for r in (x for x in urows if x["unit"] == u):
+                worst, rows = 0.0, []
+                for tg in self.P.unit_targets(u):
+                    noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                    y = float(tr(r["obs"][tg.observable], tg.scale))
+                    i = abs(y - tg.y) / math.sqrt(noise + tg.var)
+                    worst = max(worst, i)
+                    rows.append({"target": tg.id, "simulated": r["obs"][tg.observable], "implausibility": round(i, 4)})
+                if best is None or worst < best[0]:
+                    best = (worst, rows, r)
+            byu[u] = best[2]["obs"]
+            out["units"][u] = {"implausibility": round(best[0], 4), "ok": best[0] <= self.cut, "targets": best[1],
+                               "z": float(self.P.z_natural(best[2]["s"])),
+                               "runs": sum(1 for x in urows if x["unit"] == u)}
         for tg in self.P.targets:
             if tg.kind == "group":
                 ws = sum(tg.weights.values())
@@ -858,10 +880,19 @@ class HistoryMatch:
             gb = int(r["g"][best_c])
             miss = r["m"].argmin()
             d = None
+            misses = None
             if u in unmatched:
                 gm = int(r["g"][miss])
-                d = ("target_above_reach" if r["sign"][miss] < 0 else "target_below_reach") \
-                    if gm in (0, len(self.zg) - 1) else "no_value_fits_every_target"
+                top, bot = gm == len(self.zg) - 1, gm == 0
+                sg = r["sign"][miss]
+                d = ("target_above_reach" if top and sg < 0 else "target_below_reach" if bot and sg > 0
+                     else "no_value_fits_every_target")
+                misses = []        # each target at the unit's least implausible point: which ones miss, which way
+                for tg in P.unit_targets(u):
+                    m, v = self.em["unit"][tg.observable].predict(u, [self.zg[gm]], np.atleast_2d(C[miss]),
+                                                                  noise=bool(self.th["include_run_noise"]))
+                    misses.append({"target": tg.id, "observed": tg.value, "modelled": float(inv(m[0], tg.scale)),
+                                   "implausibility": round(float(abs(m[0] - tg.y) / math.sqrt(v[0] + tg.var)), 3)})
             at_b = [nm for nm, gi in (("lo", 0), ("hi", len(self.zg) - 1)) if len(okR) and okR[:, gi].any()]
             units[u] = {"matched": u not in unmatched and u not in st["conflicting"],
                         "status": "unmatched" if u in unmatched else "conflicting" if u in st["conflicting"]
@@ -871,14 +902,17 @@ class HistoryMatch:
                         "z_best": float(P.z_natural(self.zg[gb])),
                         "z_interval": [float(P.z_natural(zset.min())), float(P.z_natural(zset.max()))]
                         if len(zset) else None,
-                        "region_touches_bound": at_b, "direction": d}
+                        "region_touches_bound": at_b, "direction": d, "misses": misses}
         ranges = self._ranges(st)
         contraction = {p.name: (None if ranges[p.name] is None else
                                 round(1 - (ranges[p.name][1] - ranges[p.name][0]) / (p.hi - p.lo), 4))
                        for p in P.shared}
         ver = None
-        if self.vth.get("run") and P.units or self.sobs:
+        if self.vth.get("run") and (P.units or self.sobs):
             ver = self._verify(best_c, zbest)
+            for u, v in ver["units"].items():
+                units[u]["z_verified"] = v["z"]
+                units[u]["implausibility_verified"] = v["implausibility"]
             bad = [u for u, v in ver["units"].items() if not v["ok"] and units[u]["matched"]]
             badt = [k for k, v in ver["targets"].items() if not v["ok"]]
             for u in bad:
