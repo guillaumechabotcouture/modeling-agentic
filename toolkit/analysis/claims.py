@@ -26,6 +26,12 @@ def _scripts():
     return build_claims_ledger, render_claims
 
 
+def _cid(test_id) -> str:
+    """A decision test's id in claim ids ([A-Za-z0-9_.-]): a test id may carry a parameter name such as z:<unit>."""
+    import re
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(test_id))
+
+
 def _c(cid, kind, art, field, units="", **kw):
     return {"id": cid, "claim_kind": kind, "units": units, "source_artifact": art, "source_field": field,
             "produced_by": "harness", **kw}
@@ -58,11 +64,12 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
         if stab["metrics"].get("rank_correlation_worst_fold") is not None:
             cl.append(_c("stability.rank_worst", "scalar", arts["stability"], "data.metrics.rank_correlation_worst_fold"))
     for j, d in enumerate(dts):
-        cl.append(_c(f"dt.{d['test_id']}.verdict", "label", arts["decision_tests"], f"data.tests[{j}].verdict"))
-        cl.append(_c(f"dt.{d['test_id']}.threshold", "percentage", arts["decision_tests"],
+        tid = _cid(d["test_id"])
+        cl.append(_c(f"dt.{tid}.verdict", "label", arts["decision_tests"], f"data.tests[{j}].verdict"))
+        cl.append(_c(f"dt.{tid}.threshold", "percentage", arts["decision_tests"],
                      f"data.tests[{j}].threshold_pct", "%"))
         if d.get("status") != "not_run":
-            cl.append(_c(f"dt.{d['test_id']}.share", "percentage", arts["decision_tests"],
+            cl.append(_c(f"dt.{tid}.share", "percentage", arts["decision_tests"],
                          f"data.tests[{j}].share_pct", "%"))
     for r in _spec_rows(A, claimable=True):     # spec-declared engine parameter values and the card values they replace
         n, f = r["name"], f"data.spec_values.{r['name']}"
@@ -208,10 +215,10 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
     L += ["", "## Decision tests", ""]
     for d in dts:   # words from code, numbers from claims (Codex P1-4)
         if d.get("status") == "not_run":
-            L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{d['test_id']}.verdict]. "
+            L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{_cid(d['test_id'])}.verdict]. "
                   "No result file was written.", ""]
             continue
-        L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{d['test_id']}.verdict]; "
-              f"largest share of units changing package [CLAIM:dt.{d['test_id']}.share] (the plan changes when more "
-              f"than [CLAIM:dt.{d['test_id']}.threshold] of units change package). Result file: `{d['path']}`.", ""]
+        L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{_cid(d['test_id'])}.verdict]; "
+              f"largest share of units changing package [CLAIM:dt.{_cid(d['test_id'])}.share] (the plan changes when more "
+              f"than [CLAIM:dt.{_cid(d['test_id'])}.threshold] of units change package). Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"

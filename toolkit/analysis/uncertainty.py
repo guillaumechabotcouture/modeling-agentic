@@ -101,8 +101,13 @@ class Drawer:
                 for p in A.lik["params"]:
                     theta[p] = float(v[p]) if p in v else float(A.lik["fixed_params"][p])
                     sampled[p] = theta[p]
-                zs = {i: float(v[f"z:{i}"]) if f"z:{i}" in v else float(A.lik["fixed_z"][i]) for i in A.ids}
-                applied = {**{p: theta[p] for p in A.lik["params"]}, **{f"z:{i}": zs[i] for i in A.ids}}
+                fz = A.lik["fixed_z"]
+                zs = {i: float(v[f"z:{i}"]) if f"z:{i}" in v else (None if fz[i] is None else float(fz[i]))
+                      for i in A.ids}
+                # observation targets: the sources' bias parameters are sampled jointly (nuisance), recorded with
+                # the row, never passed to the engine
+                applied = {**{p: theta[p] for p in A.lik["params"]}, **{f"z:{i}": zs[i] for i in A.ids},
+                           **{n: float(v[n]) for n in A.lik.get("nuisance") or []}}
                 self.records.append({"sample_id": r["sample_id"], "row": r["row"],
                                      "values": {n: applied[n] for n in A.lik["sample"]["names"]}})
             elif kind == "costs":

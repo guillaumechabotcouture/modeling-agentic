@@ -1719,7 +1719,7 @@ def fig_cost_per_outcome(R, t):
     lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
     inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
     nrow = len(shown) + len(other)
-    fig = _fig(t, 7.6, 0.3 * (nrow + len(inc)) + 2.2)
+    fig = _fig(t, 7.6, 0.3 * max(nrow + len(inc), 4) + 2.2)    # a floor: one package and one component still lay out
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h

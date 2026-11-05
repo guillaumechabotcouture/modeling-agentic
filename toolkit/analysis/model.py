@@ -402,17 +402,41 @@ class DirectModel:
         return self.eng.run(theta, self.unit_spec(i, z), Package(package, self.spec.engine_package(self.pk[package])),
                             horizon or self.horizon, self.seed)
 
+    BATCH = 1024        # members per run_batch call (engines that declare batch_equals_run)
+
+    def _runs(self, theta, ids, zs):
+        """{(unit, package): Outcomes}. An engine that declares `batch_equals_run` (its run_batch equals run pair by
+        pair, a contract self-test of that engine) evaluates every (unit, package) pair in run_batch calls of up to
+        BATCH members; any other engine runs pair by pair, as before."""
+        pairs = [(i, k) for i in ids for k in self.packages]
+        if not (getattr(self.eng, "batch_equals_run", False) and callable(getattr(self.eng, "run_batch", None))):
+            return {(i, k): self.run(theta, i, zs.get(i) if zs else None, k) for i, k in pairs}
+        out = {}
+        for a in range(0, len(pairs), self.BATCH):
+            part = pairs[a:a + self.BATCH]
+            units = [self.unit_spec(i, zs.get(i) if zs else None) for i, _ in part]
+            pks = [Package(k, self.spec.engine_package(self.pk[k])) for _, k in part]
+            self.runs += len(part)
+            for p, r in zip(part, self.eng.run_batch([dict(theta)] * len(part), units, pks, self.horizon, self.seed)):
+                out[p] = r
+        return out
+
     def predict(self, zs, theta, ids, noise=None):
         out = {}
+        runs = self._runs(theta, ids, zs)
         for i in ids:
             u = self.by_id[i]
-            row = {"y": {}, "cost": {}, "diag": {}}
+            row = {"y": {}, "cost": {}, "diag": {}, "y_group": {}}
             tot = sum(float(u[pm["column"]]) for pm in self.pops.values())
             for k in self.packages:
-                r = self.run(theta, i, zs.get(i) if zs else None, k)
+                r = runs[(i, k)]
                 res = {"per_capita": r.per_capita, "meta": r.meta}
                 row["y"][k] = {o: sum(_group(res, o, pm) * float(u[pm["column"]]) for pm in self.pops.values())
                                for o in self.outcomes}
+                # per engine group (deliverables by group): per-capita x the group's share x the unit's population
+                sh = r.meta.get("age_shares") or {}
+                row["y_group"][k] = {o: {g: float(v) * float(sh.get(g, 0.0)) * tot
+                                         for g, v in (r.per_capita.get(o) or {}).items()} for o in self.outcomes}
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
                 if k == self.comp:
@@ -471,6 +495,25 @@ def _self_test() -> int:
     sm = e2.summary()
     ok(sm["holdout_points"] == 400 and sm["sd_common_median"] < sm["sd_unit_median"]
        and "not_captured" in sm, f"ME4 the error model is summarised for the artifact ({sm['sd_common_median']:.4f})")
+    # MD1-MD2: the direct model batches an engine that declares batch_equals_run, with the same outcomes
+    import tempfile
+    from toolkit.analysis import observed_targets as OT
+    with tempfile.TemporaryDirectory() as d:
+        sp = OT._toy(d, attr=True)
+        m = DirectModel(sp)
+        th = {"r0": 12.0}
+        zs = {"u1": 0.9, "u2": 1.1}
+        a = m.predict(zs, th, ["u1", "u2"])
+        n_batched = m.runs
+        m.eng.batch_equals_run = False            # instance attribute: the pair-by-pair path
+        b = m.predict(zs, th, ["u1", "u2"])
+        rel = max(abs(a[i]["y"][k][o] - b[i]["y"][k][o]) / max(abs(b[i]["y"][k][o]), 1e-300)
+                  for i in a for k in a[i]["y"] for o in a[i]["y"][k])
+        ok(rel < 1e-12 and all(a[i]["cost"] == b[i]["cost"] and a[i]["y_group"] == b[i]["y_group"] for i in a),
+           f"MD1 batched direct evaluation equals pair-by-pair runs (worst rel {rel:.1e})")
+        yg = a["u1"]["y_group"]["none"]["infections"]
+        ok(n_batched == 4 and abs(sum(yg.values()) - a["u1"]["y"]["none"]["infections"]) < 1e-6,
+           "MD2 the per-group outcomes sum to the unit total (one row per engine group)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

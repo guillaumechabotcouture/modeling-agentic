@@ -340,6 +340,9 @@ class Spec:
         """The toolkit/alloc spec: options plus the constraints (one place to read eligibility and caps)."""
         o, c = self.raw["options"], self.raw["constraints"]
         a = {k: copy.deepcopy(v) for k, v in o.items() if k in ("components", "packages", "prices", "cost_items")}
+        p = o.get("packages")
+        if isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True:
+            a["packages"] = {n: sorted(cs) for n, cs in self.packages().items()}    # the envelope-pruned list
         a["units"] = {"csv": self.resolve(self.raw["decision_units"]["csv"]), "id": self.uid,
                       "populations": dict(o.get("populations") or {})}
         for k in ("eligibility", "locks", "footprints"):
@@ -368,7 +371,37 @@ class Spec:
         return a
 
     def packages(self) -> dict:
-        return acosts.packages(self.raw["options"])
+        """Package name -> components. With `options.packages: {generate: true, within_envelope: true}`, a generated
+        package whose cost exceeds the envelope in every unit is dropped (no feasible plan can use it): the cost is
+        bounded below by its non-outcome cost items, which must be non-negative. Exact, and it keeps a joint package
+        space (dose blocks over groups) to the packages a plan can afford."""
+        pk = acosts.packages(self.raw["options"])
+        p = self.raw["options"].get("packages")
+        if not (isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True):
+            return pk
+        if getattr(self, "_pruned", None) is not None:
+            return self._pruned
+        o = self.raw["options"]
+        a = {"components": o.get("components") or {}, "prices": o.get("prices") or {},
+             "units": {"populations": dict(o.get("populations") or {})}}
+        items = [it for it in o.get("cost_items") or [] if it.get("basis") != "per_outcome"]
+        if any(not _isnum(it.get("value")) or it["value"] < 0 for it in items):
+            raise SpecError("options.packages.within_envelope: every cost item value must be a non-negative number")
+        budget = self.budget()
+        comp_cost = {}
+        for u in self.units():
+            uid = str(u[self.uid])
+            comp_cost[uid] = {}
+            for it in items:
+                comp_cost[uid][it["component"]] = comp_cost[uid].get(it["component"], 0.0) + acosts.item_cost(it, u, a)
+        comp = self.raw["comparator"].get("package")
+        keep = {}
+        for name, cs in pk.items():
+            low = min(sum(comp_cost[uid].get(c, 0.0) for c in cs) for uid in comp_cost)
+            if name == comp or low <= budget * (1 + 1e-12) + 1e-9:
+                keep[name] = cs
+        self._pruned = keep
+        return keep
 
     def engine_package(self, comps) -> dict:
         out = {}
@@ -888,6 +921,9 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
     m = cal.get("method") if isinstance(cal, dict) else None
     if m not in CALIBRATION_METHODS:
         return [f"calibration.method: one of {CALIBRATION_METHODS}"]
+    from toolkit.analysis import observed_targets as OT
+    if OT.applies(s):          # posterior on observations of group states and outcomes, through declared sources
+        return OT.problems(s, card, pnames)
     bad = [f"calibration.{k}: required for {m}" for k in CALIBRATION_FIELDS[m] if k not in cal]
     if bad or m == "none":
         return bad
@@ -1136,10 +1172,74 @@ def _validate_deliverable(s) -> list[str]:
     hl = d.get("headline") or {}
     if not hl.get("name") or hl.get("outcome") not in s.outcomes():
         bad.append("deliverable.headline: {name, outcome} with outcome in objective/outcomes_reported")
+    bg = d.get("by_group")
+    if bg is not None:
+        gc = (bg or {}).get("columns") if isinstance(bg, dict) else None
+        if not isinstance(gc, dict) or not all(isinstance(gc.get(k), str) and gc[k] for k in ("group", "quantity",
+                                                                                           "value")):
+            bad.append("deliverable.by_group.columns: {group, quantity, value} column names")
+        qm = (bg or {}).get("quantity") if isinstance(bg, dict) else None
+        outs = set((s.raw.get("analysis") or {}).get("cost_outputs") or {})
+        groups = set()
+        if not s.engine_pending:
+            try:
+                groups = set(s.engine().describe().age_groups or [])
+            except Exception:  # noqa: BLE001 -- reported by the engine checks
+                groups = set()
+        if not isinstance(qm, dict) or not qm:
+            bad.append("deliverable.by_group.quantity: {engine group: analysis.cost_outputs name}")
+        else:
+            bad += [f"deliverable.by_group.quantity: {g} is not an engine group" for g in qm
+                    if groups and g not in groups]
+            bad += [f"deliverable.by_group.quantity.{g}: {v!r} is not in analysis.cost_outputs" for g, v in qm.items()
+                    if v not in outs]
+        if (s.raw.get("analysis") or {}).get("evaluation") != "direct":
+            bad.append("deliverable.by_group: needs analysis.evaluation: direct (per-group outcomes)")
     return bad
 
 
 # --------------------------------------------------------------------------- self-test
+def _self_test_joint_packages(ok):
+    """SPJ: packages generated within the envelope (a joint dose-block space) and the by-group deliverable."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_spec(d)))
+        # three groups of mutually exclusive levels a1..a3, b1..b3, c1..c2 (cost = level); envelope 3
+        comps = {f"{g}{k}": {"group": g} for g, n in (("a", 3), ("b", 3), ("c", 2)) for k in range(1, n + 1)}
+        raw["options"]["components"] = comps
+        raw["options"]["engine_map"] = {c: {"a": 1} for c in comps}
+        raw["options"]["cost_items"] = [{"id": f"k_{c}", "component": c, "value": float(c[1:]), "price_year": "2024",
+                                         "price_rule": "as_published", "basis": "fixed", "includes": [c]}
+                                        for c in comps]
+        raw["options"]["packages"] = {"generate": True, "within_envelope": True}
+        raw["constraints"] = {"envelope_usd": 3.0}
+        s = Spec(raw, d, os.path.join(d, "decision_spec.yaml"))
+        pk = s.packages()
+        levels = lambda cs: sum(int(c[1:]) for c in cs)  # noqa: E731
+        full = acosts.packages(raw["options"])
+        ok(len(full) == 4 * 4 * 3 and all(levels(cs) <= 3 for cs in pk.values())
+           and len(pk) == sum(1 for cs in full.values() if levels(cs) <= 3) and "none" in pk,
+           f"SPJ1 within_envelope keeps exactly the generated packages a plan can afford ({len(pk)} of {len(full)})")
+        al = s.alloc_spec()
+        ok(set(acosts.packages(al)) == set(pk), "SPJ2 the alloc spec carries the same pruned package list")
+        raw2 = copy.deepcopy(raw)
+        raw2["options"]["cost_items"][0]["value"] = -1.0
+        try:
+            Spec(raw2, d).packages()
+            ok(False, "SPJ3 a negative cost item refuses pruning")
+        except SpecError as e:
+            ok("non-negative" in str(e), f"SPJ3 a negative cost item refuses pruning: {e}")
+        raw3 = copy.deepcopy(raw)
+        raw3["options"]["packages"] = {"generate": True}
+        ok(len(Spec(raw3, d).packages()) == len(full), "SPJ4 without within_envelope every combination is kept")
+        r4 = yaml.safe_load(open(toy_spec(d)))
+        r4["deliverable"]["by_group"] = {"columns": {"group": "g"}, "quantity": {"zz": "nope"}}
+        errs = _validate_deliverable(Spec(r4, d))
+        ok(any("by_group.columns" in e for e in errs) and any("not an engine group" in e for e in errs)
+           and any("not in analysis.cost_outputs" in e for e in errs) and any("evaluation: direct" in e for e in errs),
+           f"SPJ5 a malformed by_group deliverable is refused: {errs}")
+
+
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
     """A valid toy spec and units table in directory d (used by the analysis self-tests too). `bench`: a benchmark
     results file for the toy engine (its interaction benchmark T2 drives decision test DT1)."""
@@ -1410,6 +1510,7 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     _self_test_engine_refs(ok)
+    _self_test_joint_packages(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

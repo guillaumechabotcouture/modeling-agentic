@@ -42,12 +42,28 @@ def _empirical_config(spec: dict) -> dict:
     return {"components": comps, "outcome": (spec.get("objective") or {}).get("outcome") or "cases"}
 
 
+COMPARTMENTAL = "toolkit.engines.compartmental.engine:CompartmentalEngine"
+
+
+def _signed_config(ref: str):
+    """A configured engine whose configuration is part of the signed spec (`engine: {ref, config}`): its card is the
+    card of that configuration. A spec that names another engine (or `auto`) gives it none, so it is not eligible
+    (its structure, run mode and groups cannot be guessed)."""
+    def cfg(spec: dict) -> dict:
+        e = spec.get("engine")
+        if isinstance(e, dict) and e.get("ref") == ref:
+            return dict(e.get("config") or {})
+        raise ValueError(f"{ref} is configured by the signed spec (engine: {{ref, config}}); this spec does not name it")
+    return cfg
+
+
 # Registered engines: (import ref, card file read without importing the engine or None,
 # config from the spec or None). A configured engine's card depends on its config.
 ENGINES = [
     ("toolkit.engines.contract:ToyEngine", None, None),
     ("toolkit.engines.malaria.engine:MalariaEngine", "toolkit/engines/malaria/card.yaml", None),
     ("toolkit.engines.empirical.engine:PackageRateEngine", None, _empirical_config),
+    (COMPARTMENTAL, None, _signed_config(COMPARTMENTAL)),
 ]
 # Contract thresholds on the analysis output (B owns these once it lands).
 EMULATOR_R2_MIN = 0.8
@@ -762,6 +778,21 @@ def _self_test() -> int:
                 sys.modules[k] = mod
     ok(no_auto is sys.modules[__name__] and isinstance(with_auto, _ToolkitApi),
        "B22 B's API is used only once its schema takes `engine: auto` from engine_choice.json")
+    # B25: the compartmental engine is registered with the configuration its signed spec gives
+    cfg = {"groups": ["a", "b"], "structure": "age_groups_contact_matrix", "outcomes": ["hosp"],
+           "components": {"da": {"kind": "doses", "group": "a", "block_size": 10, "max_blocks": 2}}}
+    sp = {"engine": {"ref": COMPARTMENTAL, "config": cfg}, "objective": {"outcome": "hosp"},
+          "options": {"engine_map": {"x1": {"da": 1}, "x2": {"da": 2}}},
+          "decision_units": {"engine_attributes": {"N": {}, "contact": {}, "s0": {}, "ratio:hosp": {}},
+                             "populations": {"all": {"age_groups": ["a", "b"]}}}}
+    rows = {r["ref"]: r for r in eligible_engines(sp)}
+    ok(COMPARTMENTAL in rows and rows[COMPARTMENTAL]["eligible"] and rows[COMPARTMENTAL]["config"] == cfg,
+       f"B25 the compartmental engine is eligible for a spec that names it with its configuration: "
+       f"{rows.get(COMPARTMENTAL, {}).get('why_not')}")
+    sp2 = dict(sp, engine={"ref": "toolkit.engines.contract:ToyEngine"})
+    r2 = {r["ref"]: r for r in eligible_engines(sp2)}
+    ok(not r2[COMPARTMENTAL]["eligible"] and "configured by the signed spec" in str(r2[COMPARTMENTAL]["why_not"]),
+       "B26 without its configuration in the signed spec the compartmental engine is not eligible")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

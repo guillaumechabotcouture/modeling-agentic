@@ -100,6 +100,9 @@ def inversion_report(spec, model, theta, cal) -> dict:
 
 # --------------------------------------------------------------------------- likelihood
 def read_targets(spec) -> list[dict]:
+    from toolkit.analysis import observed_targets as OT
+    if OT.applies(spec):          # observations of group states and outcomes (each row carries its unit)
+        return OT.read_rows(spec)
     t = spec["calibration"]["targets"]
     pmap = t.get("package_map") or {}
     with open(spec.resolve(t["csv"]), newline="", encoding="utf-8") as f:
@@ -1011,8 +1014,14 @@ def _map_point(P, start=None):
 def fit_posterior_panel(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, sample_it=True) -> dict:
     """`posterior` calibration of a count panel: the canonical joint posterior sample (params and every unit
     attribute), identifiability classes, the point (posterior mode) the plan is solved at, automatic prior_range
-    tests for prior-dominated parameters and the label's names. With sample_it False only the point (stability folds,
+    tests for prior-dominated parameters and the label's names. A spec whose targets are observations of group states
+    and outcomes (calibration.targets.kind: observations) is fitted by toolkit/analysis/observed_targets.py, in the
+    same shape. With sample_it False only the point (stability folds,
     prior_range tests)."""
+    from toolkit.analysis import observed_targets as OT
+    if OT.applies(spec):
+        return OT.fit(spec, model, rows=rows, fixed_z=fixed_z, fixed_params=fixed_params, seed=seed,
+                      sample_it=sample_it)
     P, L = panel_problem(spec, model, rows, fixed_z, fixed_params)
     s = c = None
     if sample_it:
