@@ -1,0 +1,1164 @@
+#!/usr/bin/env python3
+"""Joint calibration by history matching: the region of parameter values compatible with every target.
+
+    python3 toolkit/calibration/history_matching.py --self-test
+
+The problem (disease-agnostic; the harness adapter toolkit/analysis/joint_calibration.py builds it from a spec):
+  shared       parameters common to every unit, each with a bounded prior from a sourced range (a literature value
+               is a reference point with its spread, not a fixed value)
+  unit_param   optionally one parameter per unit (for example a transmission level), on a declared range
+  targets      unit    an observed value of one unit (a unit may have several, e.g. several survey years)
+               group   an observed value of a weighted aggregate over units (e.g. a survey at a coarser level)
+               shared  an observed value that depends on the shared parameters only (e.g. a fit benchmark)
+Every target carries a measurement model: sampling variance from its own interval or sample size, a source bias
+variance and a model discrepancy variance. No source is ground truth: a target whose total sd is zero is refused.
+
+Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
+implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
+non-implausible region of the shared parameters, with each unit's non-implausible interval of its own parameter.
+The per-unit parameter only moves its own unit, so a shared value is compatible with a unit when some value of the
+unit's parameter makes every target of that unit non-implausible (profiling, exact on the grid). The region is the
+set of shared values compatible with every shared and group target and with every unit that some value can match.
+  unmatched    a unit no value in the prior box matches: reported with its best implausibility and the direction of
+               the miss (target above or below what the model reaches), never pinned at a bound silently
+  conflicting  units each matchable alone but not together with the others: the region is relaxed to the values with
+               the fewest such units, and they are reported
+Emulators: unit observables use a regression mean over (unit parameter, shared parameters, unit features) plus a
+per-unit Gaussian-process residual with a unit random effect, hyperparameters shared across units (fitted by the
+summed marginal likelihood); shared observables use one Gaussian process. Each wave holds out a share of its runs and
+checks the standardised errors; an emulator whose stated uncertainty is too small fails closed. After the last wave
+the engine is run at the best point for every unit (verification). Thresholds: toolkit/calibration/thresholds.yaml.
+Nothing here names a disease, a place or an intervention.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import sys
+
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+PRODUCER = "toolkit/calibration/history_matching.py"
+THRESHOLDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")
+KINDS = ("unit", "group", "shared")
+SCALES = ("logit", "log", "identity")
+DISTS = ("uniform", "loguniform", "triangular")
+_EPS = 1e-4
+
+
+class CalibrationInputError(ValueError):
+    """The problem cannot be calibrated as declared (fail closed): every reason is listed."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("joint calibration refused:\n  " + "\n  ".join(self.problems[:20]))
+
+
+def thresholds() -> dict:
+    import yaml
+    with open(THRESHOLDS) as f:
+        return yaml.safe_load(f)
+
+
+# --------------------------------------------------------------------------- scales and measurement model
+def tr(x, scale):
+    x = np.asarray(x, float)
+    if scale == "logit":
+        p = np.clip(x, _EPS, 1 - _EPS)
+        return np.log(p / (1 - p))
+    if scale == "log":
+        return np.log(np.maximum(x, 1e-12))
+    return x
+
+
+def inv(y, scale):
+    y = np.asarray(y, float)
+    if scale == "logit":
+        return 1.0 / (1.0 + np.exp(-y))
+    if scale == "log":
+        return np.exp(y)
+    return y
+
+
+def dinv(y, scale):
+    """d inv(y) / dy."""
+    p = inv(y, scale)
+    if scale == "logit":
+        return p * (1 - p)
+    if scale == "log":
+        return p
+    return np.ones_like(np.asarray(y, float))
+
+
+def sd_from_ci(lo, hi, scale, level=0.95) -> float:
+    """The sampling sd on the target's scale from a symmetric-on-that-scale interval at `level`."""
+    from scipy.stats import norm
+    zq = float(norm.ppf(0.5 + level / 2))
+    a, b = float(tr(lo, scale)), float(tr(hi, scale))
+    if not (math.isfinite(a) and math.isfinite(b) and b > a):
+        raise ValueError(f"interval [{lo}, {hi}] is not increasing and finite on the {scale} scale")
+    return (b - a) / (2 * zq)
+
+
+def sd_from_n(p, n, scale) -> float:
+    """The sampling sd of a proportion p from n (effective) observations, on the target's scale (delta method)."""
+    p, n = float(p), float(n)
+    if not (0 < p < 1 and n > 0):
+        raise ValueError(f"proportion {p} with n {n}: need 0 < p < 1 and n > 0")
+    v = p * (1 - p) / n
+    if scale == "logit":
+        return math.sqrt(v) / (p * (1 - p))
+    if scale == "log":
+        return math.sqrt(v) / p
+    return math.sqrt(v)
+
+
+class Param:
+    """A shared parameter: a bounded prior over a sourced range."""
+
+    def __init__(self, name, lo, hi, dist="uniform", mode=None, source=""):
+        self.name, self.lo, self.hi, self.dist = str(name), float(lo), float(hi), str(dist)
+        self.mode = None if mode is None else float(mode)
+        self.source = str(source or "")
+
+    def problems(self) -> list:
+        bad = []
+        if not (math.isfinite(self.lo) and math.isfinite(self.hi) and self.lo < self.hi):
+            bad.append(f"shared {self.name}: range [{self.lo}, {self.hi}] needs lo < hi")
+        if self.dist not in DISTS:
+            bad.append(f"shared {self.name}: dist {self.dist!r} not in {DISTS}")
+        if self.dist == "loguniform" and self.lo <= 0:
+            bad.append(f"shared {self.name}: a loguniform range must be positive")
+        if self.dist == "triangular" and not (self.mode is not None and self.lo <= self.mode <= self.hi):
+            bad.append(f"shared {self.name}: a triangular prior needs its mode inside the range")
+        if not self.source.strip():
+            bad.append(f"shared {self.name}: no source for its range")
+        return bad
+
+    def natural(self, u):
+        return self.lo + np.asarray(u, float) * (self.hi - self.lo)
+
+    def pdf(self, x):
+        x = np.asarray(x, float)
+        if self.dist == "uniform":
+            return np.full_like(x, 1.0 / (self.hi - self.lo))
+        if self.dist == "loguniform":
+            return 1.0 / (np.maximum(x, 1e-300) * math.log(self.hi / self.lo))
+        a, b, c = self.lo, self.hi, self.mode
+        up = np.where(x < c, 2 * (x - a) / ((b - a) * max(c - a, 1e-300)), 2 * (b - x) / ((b - a) * max(b - c, 1e-300)))
+        return np.maximum(up, 0.0)
+
+    def describe(self) -> dict:
+        return {"range": [self.lo, self.hi], "dist": self.dist, "mode": self.mode, "source": self.source}
+
+
+class Target:
+    """One observed value with its measurement model. `value` is on the natural scale; sd_obs, sd_bias and sd_md are
+    on the target's `scale`."""
+
+    def __init__(self, id, kind, observable, value, scale="identity", sd_obs=0.0, sd_bias=0.0, sd_md=0.0,
+                 unit=None, weights=None, source=""):
+        self.id, self.kind, self.observable = str(id), str(kind), str(observable)
+        self.value, self.scale = float(value), str(scale)
+        self.sd_obs, self.sd_bias, self.sd_md = float(sd_obs), float(sd_bias), float(sd_md)
+        self.unit = None if unit is None else str(unit)
+        self.weights = None if weights is None else {str(k): float(v) for k, v in weights.items()}
+        self.source = str(source or "")
+
+    @property
+    def y(self) -> float:
+        return float(tr(self.value, self.scale))
+
+    @property
+    def var(self) -> float:
+        return self.sd_obs ** 2 + self.sd_bias ** 2 + self.sd_md ** 2
+
+    def describe(self) -> dict:
+        d = {"id": self.id, "kind": self.kind, "observable": self.observable, "value": self.value,
+             "scale": self.scale, "sd_obs": self.sd_obs, "sd_bias": self.sd_bias, "sd_md": self.sd_md,
+             "sd_total": math.sqrt(self.var), "source": self.source}
+        if self.unit is not None:
+            d["unit"] = self.unit
+        if self.weights is not None:
+            d["n_units"] = len(self.weights)
+        return d
+
+
+class Problem:
+    """shared: [Param]; unit_param: {name, lo, hi} or None; units: [ids]; features: {unit: [floats]} (each unit the
+    same length; may be empty); targets: [Target]; scales: {observable: scale}."""
+
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None):
+        self.shared = list(shared)
+        self.unit_param = dict(unit_param) if unit_param else None
+        self.units = [str(u) for u in units]
+        self.targets = list(targets)
+        self.features = {str(k): [float(x) for x in v] for k, v in (features or {}).items()}
+        self.feature_names = list(feature_names or [])
+        self.scales = {}
+        for t in self.targets:
+            self.scales.setdefault(t.observable, t.scale)
+
+    @property
+    def names(self) -> list:
+        return [p.name for p in self.shared]
+
+    def unit_targets(self, u) -> list:
+        return [t for t in self.targets if t.kind == "unit" and t.unit == u]
+
+    def observables(self, kind) -> list:
+        """Observables simulated per unit ('unit': unit and group targets) or per shared point ('shared')."""
+        want = ("unit", "group") if kind == "unit" else ("shared",)
+        return sorted({t.observable for t in self.targets if t.kind in want})
+
+    def problems(self) -> list:
+        bad = []
+        th = thresholds()["history_matching"]
+        for p in self.shared:
+            bad += p.problems()
+        if len(set(self.names)) != len(self.names):
+            bad.append("shared: repeated names")
+        if self.units and not self.unit_param:
+            bad.append("units are listed but no unit parameter is declared")
+        if self.unit_param:
+            lo, hi = self.unit_param.get("lo"), self.unit_param.get("hi")
+            if not (isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and math.isfinite(lo)
+                    and math.isfinite(hi) and lo < hi):
+                bad.append(f"unit parameter {self.unit_param.get('name')}: range [{lo}, {hi}] needs lo < hi")
+            if not self.units:
+                bad.append("a unit parameter is declared but there are no units")
+        if len(set(self.units)) != len(self.units):
+            bad.append("units: repeated ids")
+        uset = set(self.units)
+        k = {len(v) for v in self.features.values()}
+        if self.features and (set(self.features) != uset or len(k) != 1):
+            bad.append("features: one vector of the same length per unit")
+        if self.features and any(not all(math.isfinite(x) for x in v) for v in self.features.values()):
+            bad.append("features: every value must be finite")
+        if not self.targets:
+            bad.append("no targets")
+        ids = [t.id for t in self.targets]
+        if len(set(ids)) != len(ids):
+            bad.append("targets: repeated ids")
+        for t in self.targets:
+            w = f"target {t.id}"
+            if t.kind not in KINDS:
+                bad.append(f"{w}: kind {t.kind!r} not in {KINDS}")
+                continue
+            if t.scale not in SCALES:
+                bad.append(f"{w}: scale {t.scale!r} not in {SCALES}")
+            if self.scales.get(t.observable) != t.scale:
+                bad.append(f"{w}: observable {t.observable} is used on two scales")
+            if not math.isfinite(t.value) or (t.scale == "logit" and not 0 < t.value < 1) or (
+                    t.scale == "log" and not t.value > 0):
+                bad.append(f"{w}: value {t.value!r} is not a finite value on the {t.scale} scale")
+            for nm in ("sd_obs", "sd_bias", "sd_md"):
+                v = getattr(t, nm)
+                if not (math.isfinite(v) and v >= 0):
+                    bad.append(f"{w}: {nm} {v!r} must be finite and >= 0")
+            if not math.sqrt(t.var) >= float(th["min_target_sd"]):
+                bad.append(f"{w}: no declared error (sampling, source bias or discrepancy sd); a target with none is "
+                           "treated as ground truth, which no source is")
+            if t.kind == "unit":
+                if t.unit not in uset:
+                    bad.append(f"{w}: unit {t.unit!r} is not a calibrated unit")
+            elif t.kind == "group":
+                ws = t.weights or {}
+                if not ws or set(ws) - uset or any(not (math.isfinite(v) and v >= 0) for v in ws.values()) or \
+                        not sum(ws.values()) > 0:
+                    bad.append(f"{w}: group weights must name calibrated units with weights >= 0 and a positive sum")
+            elif t.kind == "shared" and t.unit is not None:
+                bad.append(f"{w}: a shared target names no unit")
+        for u in self.units:
+            if not self.unit_targets(u):
+                bad.append(f"unit {u}: no unit target; its parameter would be set by nothing (refused)")
+        if not self.shared and not self.units:
+            bad.append("nothing to calibrate: no shared parameters and no units")
+        if not self.shared and any(t.kind == "shared" for t in self.targets):
+            bad.append("shared targets need shared parameters")
+        return bad
+
+    def z_natural(self, s):
+        return self.unit_param["lo"] + np.asarray(s, float) * (self.unit_param["hi"] - self.unit_param["lo"])
+
+    def theta_natural(self, U) -> list:
+        U = np.atleast_2d(np.asarray(U, float))
+        return [{p.name: float(p.natural(row[j])) for j, p in enumerate(self.shared)} for row in U]
+
+    def prior_weight(self, U) -> np.ndarray:
+        U = np.atleast_2d(np.asarray(U, float))
+        w = np.ones(len(U))
+        for j, p in enumerate(self.shared):
+            w = w * p.pdf(p.natural(U[:, j]))
+        return w
+
+
+# --------------------------------------------------------------------------- emulators
+def _matern52(A, B, ls):
+    d = np.sqrt(np.maximum(((A[:, None, :] - B[None, :, :]) / ls) ** 2, 0).sum(-1))
+    s5 = math.sqrt(5.0) * d
+    return (1 + s5 + 5.0 / 3.0 * d ** 2) * np.exp(-s5)
+
+
+class UnitEmulator:
+    """One observable simulated per unit: regression mean over (unit parameter, shared parameters, unit features)
+    plus a per-unit Gaussian-process residual over (unit parameter, shared parameters) with a unit random effect.
+    Hyperparameters (random-effect variance, GP variance, length scales, run noise) are shared across units and fitted
+    by the summed marginal likelihood. Inputs are on the unit cube; outputs on the observable's scale."""
+
+    def __init__(self, n_shared: int, feats: dict, ridge: float):
+        self.p, self.feats, self.ridge = int(n_shared), feats, float(ridge)
+        self.fm, self.fs = None, None
+
+    def _f(self, u):
+        v = np.asarray(self.feats.get(u, []), float)
+        return (v - self.fm) / self.fs if len(v) else v
+
+    def _basis(self, s, T, F):
+        s = np.asarray(s, float)[:, None]
+        cols = [np.ones_like(s), s, s ** 2]
+        if self.p:
+            cols += [T, T ** 2, s * T]
+        if F.shape[1]:
+            cols += [F, F * s]
+        return np.hstack(cols)
+
+    def fit(self, units, S, T, y):
+        from scipy.optimize import minimize
+        units = [str(u) for u in units]
+        S, T, y = np.asarray(S, float), np.asarray(T, float).reshape(len(units), self.p), np.asarray(y, float)
+        if self.feats:
+            M = np.array(list(self.feats.values()), float)
+            self.fm, self.fs = M.mean(0), np.where(M.std(0) > 0, M.std(0), 1.0)
+        F = np.array([self._f(u) for u in units], float).reshape(len(units), -1)
+        B = self._basis(S, T, F)
+        self.beta = np.linalg.solve(B.T @ B + self.ridge * len(y) * np.eye(B.shape[1]), B.T @ y)
+        r = y - B @ self.beta
+        self.vr = float(max(np.var(r), 1e-10))
+        X = np.column_stack([S, T])
+        by = {}
+        for i, u in enumerate(units):
+            by.setdefault(u, []).append(i)
+        self.X = {u: X[ix] for u, ix in by.items()}
+        self.r = {u: r[ix] for u, ix in by.items()}
+        groups = {}
+        for u, ix in by.items():
+            groups.setdefault(len(ix), []).append(u)
+        D = X.shape[1]
+        vr = self.vr
+
+        def unpack(h):
+            return (math.exp(h[0]) * vr, math.exp(h[1]) * vr, np.exp(h[2:2 + D]), math.exp(h[2 + D]) * vr)
+
+        def nll(h):
+            sb, sg, ls, tn = unpack(h)
+            tot = 0.0
+            for n, us in groups.items():
+                Xs = np.stack([self.X[u] for u in us])
+                Rs = np.stack([self.r[u] for u in us])
+                K = sb + sg * np.stack([_matern52(x, x, ls) for x in Xs]) + (tn + 1e-10 * vr) * np.eye(n)[None]
+                try:
+                    L = np.linalg.cholesky(K)
+                except np.linalg.LinAlgError:
+                    return 1e30
+                a = np.linalg.solve(L, Rs[..., None])[..., 0]
+                tot += 0.5 * float((a ** 2).sum()) + float(np.log(np.diagonal(L, axis1=1, axis2=2)).sum()) \
+                    + 0.5 * n * len(us) * math.log(2 * math.pi)
+            return tot
+        h0 = np.r_[math.log(0.3), math.log(0.5), np.log(np.full(D, 0.5)), math.log(0.05)]
+        bnds = [(math.log(1e-6), math.log(10.0)), (math.log(1e-6), math.log(10.0))] + \
+            [(math.log(0.05), math.log(20.0))] * D + [(math.log(1e-8), math.log(2.0))]
+        best = None
+        for start in (h0, np.r_[math.log(0.05), math.log(1.0), np.log(np.full(D, 1.5)), math.log(0.01)]):
+            res = minimize(nll, start, method="L-BFGS-B", bounds=bnds, options={"maxiter": 200})
+            if best is None or res.fun < best.fun:
+                best = res
+        self.sb, self.sg, self.ls, self.tn = unpack(best.x)
+        self.hyper = {"random_effect_var": self.sb, "gp_var": self.sg, "length_scales": self.ls.tolist(),
+                      "run_noise_var": self.tn, "residual_var": vr, "nll": float(best.fun)}
+        self.L, self.alpha = {}, {}
+        for u, x in self.X.items():
+            K = self.sb + self.sg * _matern52(x, x, self.ls) + (self.tn + 1e-10 * vr) * np.eye(len(x))
+            Lc = np.linalg.cholesky(K)
+            self.L[u] = Lc
+            self.alpha[u] = np.linalg.solve(Lc.T, np.linalg.solve(Lc, self.r[u]))
+        return self
+
+    def predict(self, u, S, T, noise=True):
+        """(mean, var) on the observable's scale for unit u at rows (S, T); var includes the run noise if `noise`."""
+        S = np.asarray(S, float)
+        T = np.asarray(T, float).reshape(len(S), self.p)
+        f = self._f(u)
+        F = np.broadcast_to(f, (len(S), len(f)))
+        m = self._basis(S, T, F) @ self.beta
+        v = np.full(len(S), self.sb + self.sg)
+        if u in self.X:
+            Q = np.column_stack([S, T])
+            k = self.sb + self.sg * _matern52(Q, self.X[u], self.ls)
+            m = m + k @ self.alpha[u]
+            w = np.linalg.solve(self.L[u], k.T)
+            v = np.maximum(v - (w ** 2).sum(0), 1e-12)
+        if noise:
+            v = v + self.tn
+        return m, v
+
+
+class SharedEmulator:
+    """One observable that depends on the shared parameters only: a Gaussian process on the unit cube."""
+
+    def fit(self, T, y):
+        import warnings
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+        T = np.asarray(T, float)
+        k = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(np.ones(T.shape[1]), (0.05, 50), nu=2.5) + \
+            WhiteKernel(1e-3, (1e-8, 1e0))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.gp = GaussianProcessRegressor(k, normalize_y=True, n_restarts_optimizer=2, random_state=0)
+            self.gp.fit(T, np.asarray(y, float))
+        self.tn = float(self.gp.kernel_.k2.noise_level * self.gp._y_train_std ** 2)
+        return self
+
+    def predict(self, T, noise=True):
+        m, s = self.gp.predict(np.atleast_2d(np.asarray(T, float)), return_std=True)
+        v = np.maximum(s ** 2, 1e-12)
+        if not noise:
+            v = np.maximum(v - self.tn, 1e-12)
+        return m, v
+
+
+def standardised_errors(sim, mean, var) -> np.ndarray:
+    return (np.asarray(sim, float) - np.asarray(mean, float)) / np.sqrt(np.asarray(var, float))
+
+
+def validation(errors, th=None) -> dict:
+    """The held-out check: more than outside_share_max of |standardised error| beyond std_error_max fails; fewer than
+    min_holdout errors cannot pass (the check is not run)."""
+    th = th or thresholds()["emulator"]
+    e = np.asarray(errors, float)
+    n = int(len(e))
+    if n < int(th["min_holdout"]) or not np.all(np.isfinite(e)):
+        return {"n": n, "status": "not_run" if np.all(np.isfinite(e)) else "failed", "share_outside": None,
+                "max_abs": None if not n else float(np.nanmax(np.abs(e)))}
+    share = float(np.mean(np.abs(e) > float(th["std_error_max"])))
+    return {"n": n, "status": "passed" if share <= float(th["outside_share_max"]) else "failed",
+            "share_outside": share, "max_abs": float(np.max(np.abs(e))), "mean": float(np.mean(e)),
+            "sd": float(np.std(e))}
+
+
+# --------------------------------------------------------------------------- the calibration
+class Data:
+    """Simulated points: unit rows (unit, s, t, obs) and shared rows (t, obs); s and t on the unit cube."""
+
+    def __init__(self):
+        self.unit, self.shared = [], []
+
+    def add(self, kind, rows):
+        (self.unit if kind == "unit" else self.shared).extend(rows)
+
+
+def _sobol(d, n, seed):
+    from scipy.stats import qmc
+    if d == 0:
+        return np.zeros((n, 0))
+    m = int(math.ceil(math.log2(max(n, 2))))
+    return qmc.Sobol(d=d, scramble=True, seed=int(seed)).random_base2(m)[:n]
+
+
+def _seed(*parts) -> int:
+    h = hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+    return int(h[:8], 16)
+
+
+class HistoryMatch:
+    """Waves of simulation, emulation and implausibility. `simulate(points)` takes a list of
+    {"kind": "unit", "unit", "z", "theta", "seed"} or {"kind": "shared", "theta", "seed"} (z and theta on their
+    natural scales) and returns one {observable: value} per point (natural scale); any missing or non-finite value
+    fails closed."""
+
+    def __init__(self, problem: Problem, simulate, seed: int = 0, log=print, **override):
+        bad = problem.problems()
+        if bad:
+            raise CalibrationInputError(bad)
+        self.P, self.simulate, self.seed, self.log = problem, simulate, int(seed), log
+        th = thresholds()
+        self.th = {**th["history_matching"], **{k: v for k, v in override.items() if k in th["history_matching"]}}
+        self.eth = {**th["emulator"], **{k: v for k, v in override.items() if k in th["emulator"]}}
+        self.vth = th["verification"]
+        self.bth = th["blocking"]
+        self.cut = float(self.th["implausibility_cutoff"])
+        self.G = int(self.th["z_grid"])
+        self.zg = np.linspace(0.0, 1.0, self.G) if problem.unit_param else np.zeros(1)
+        self.p = len(problem.shared)
+        self.data = Data()
+        self.waves = []
+        self.uobs = problem.observables("unit")
+        self.sobs = problem.observables("shared")
+
+    # ---------------------------------------------------------------- simulation
+    def _run(self, kind, rows):
+        pts = []
+        for r in rows:
+            th = self.P.theta_natural(r["t"])[0] if self.p else {}
+            pt = {"kind": kind, "theta": th, "seed": r["seed"]}
+            if kind == "unit":
+                pt.update(unit=r["unit"], z=float(self.P.z_natural(r["s"])))
+            pts.append(pt)
+        if not pts:
+            return []
+        out = self.simulate(pts)
+        need = self.uobs if kind == "unit" else self.sobs
+        if not isinstance(out, list) or len(out) != len(pts):
+            raise CalibrationInputError([f"simulate returned {type(out).__name__} of length "
+                                         f"{len(out) if hasattr(out, '__len__') else '?'} for {len(pts)} points"])
+        bad = []
+        for r, o in zip(rows, out):
+            for ob in need:
+                v = (o or {}).get(ob)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    bad.append(f"simulate: point {r.get('unit', 'shared')} seed {r['seed']}: observable {ob} is "
+                               f"missing or not finite ({v!r})")
+            r["obs"] = {ob: float(o[ob]) for ob in need if ob in (o or {})}
+        if bad:
+            raise CalibrationInputError(bad)
+        return rows
+
+    def _design(self, wave, state):
+        n_u = int(self.th["points_per_unit"])
+        n_s = int(self.th["shared_points"]) if self.sobs else 0
+        urows, srows = [], []
+        rng = np.random.default_rng([self.seed, wave, 1])
+        if wave == 0 or state is None:
+            for k, u in enumerate(self.P.units):
+                X = _sobol(1 + self.p, n_u, _seed(self.seed, "unit", u))
+                for i, x in enumerate(X):
+                    urows.append({"unit": u, "s": float(x[0]), "t": x[1:].copy(),
+                                  "seed": _seed(self.seed, wave, u, i)})
+            for i, x in enumerate(_sobol(self.p, n_s, _seed(self.seed, "shared"))):
+                srows.append({"t": x.copy(), "seed": _seed(self.seed, wave, "shared", i)})
+            return urows, srows
+        C, acc = state["C"], state["region"]
+        w = self.P.prior_weight(C[acc]) if len(acc) else None
+        for u in self.P.units:
+            ok = state["units"][u]["ok"]
+            rows_ok = [c for c in acc if ok[c].any()] if len(acc) else []
+            if rows_ok:
+                ww = self.P.prior_weight(C[rows_ok])
+                pick = rng.choice(rows_ok, size=n_u, p=ww / ww.sum())
+                for i, c in enumerate(pick):
+                    zs = self.zg[rng.choice(np.flatnonzero(ok[c]))]
+                    zs = float(np.clip(zs + rng.uniform(-0.5, 0.5) / max(self.G - 1, 1), 0, 1))
+                    urows.append({"unit": u, "s": zs, "t": C[c].copy(), "seed": _seed(self.seed, wave, u, i)})
+            else:      # no value in the region matches it: simulate at its own best values, to confirm or refute
+                m = state["units"][u]["m"]
+                top = np.argsort(m)[:max(3 * n_u, 1)]
+                pick = rng.choice(top, size=n_u, replace=len(top) < n_u)
+                for i, c in enumerate(pick):
+                    urows.append({"unit": u, "s": float(self.zg[state["units"][u]["g"][c]]), "t": C[c].copy(),
+                                  "seed": _seed(self.seed, wave, u, i)})
+        if n_s:
+            src = acc if len(acc) else np.arange(len(C))
+            ww = self.P.prior_weight(C[src])
+            for i, c in enumerate(rng.choice(src, size=n_s, p=ww / ww.sum())):
+                srows.append({"t": C[c].copy(), "seed": _seed(self.seed, wave, "shared", i)})
+        return urows, srows
+
+    # ---------------------------------------------------------------- emulation
+    def _fit(self, urows, srows):
+        em = {"unit": {}, "shared": {}}
+        if urows:
+            units = [r["unit"] for r in urows]
+            S = np.array([r["s"] for r in urows])
+            T = np.array([r["t"] for r in urows]).reshape(len(urows), self.p)
+            for ob in self.uobs:
+                y = tr([r["obs"][ob] for r in urows], self.P.scales[ob])
+                em["unit"][ob] = UnitEmulator(self.p, self.P.features, float(self.eth["ridge"])).fit(units, S, T, y)
+        if srows and self.sobs:
+            T = np.array([r["t"] for r in srows]).reshape(len(srows), self.p)
+            for ob in self.sobs:
+                em["shared"][ob] = SharedEmulator().fit(T, tr([r["obs"][ob] for r in srows], self.P.scales[ob]))
+        return em
+
+    def _errors(self, kind, held, rest):
+        """Standardised errors of `held` rows under emulators fitted on `rest` (one list per observable)."""
+        em = self._fit(rest, []) if kind == "unit" else self._fit([], rest)
+        out = {}
+        for ob in (self.uobs if kind == "unit" else self.sobs):
+            e = []
+            for r in held:
+                if kind == "unit":
+                    m, v = em["unit"][ob].predict(r["unit"], [r["s"]], np.atleast_2d(r["t"]))
+                else:
+                    m, v = em["shared"][ob].predict(np.atleast_2d(r["t"]))
+                e.append(float(standardised_errors(tr(r["obs"][ob], self.P.scales[ob]), m, v)[0]))
+            out[ob] = e
+        return out
+
+    def _validate(self, wave_u, wave_s):
+        """Hold out a share of this wave's runs, fit on the rest, check the held-out standardised errors. When that
+        share is fewer than min_holdout runs, 5-fold cross-validation over every run so far (so a small design is
+        still checked; never skipped)."""
+        rng = np.random.default_rng([self.seed, len(self.waves), 2])
+        hs, mh = float(self.eth["holdout_share"]), int(self.eth["min_holdout"])
+        out = {}
+        for kind, wave, alld in (("unit", wave_u, self.data.unit), ("shared", wave_s, self.data.shared)):
+            if not wave:
+                continue
+            k = int(round(hs * len(wave)))
+            errs = {}
+            if k >= mh:
+                ids = set(rng.choice(len(wave), size=k, replace=False).tolist())
+                held = [wave[i] for i in sorted(ids)]
+                hid = {id(r) for r in held}
+                errs = self._errors(kind, held, [r for r in alld if id(r) not in hid])
+                how = f"held out {k} of this wave's {len(wave)} runs"
+            else:
+                folds = np.array_split(rng.permutation(len(alld)), 5)
+                for f in folds:
+                    fid = {id(alld[i]) for i in f}
+                    e = self._errors(kind, [alld[i] for i in f], [r for r in alld if id(r) not in fid])
+                    for ob, v in e.items():
+                        errs.setdefault(ob, []).extend(v)
+                how = f"5-fold cross-validation over {len(alld)} runs (this wave's holdout would be {k} < {mh})"
+            for ob, e in errs.items():
+                out[ob] = dict(validation(e, self.eth), how=how)
+        return out
+
+    # ---------------------------------------------------------------- implausibility
+    def _evaluate(self, em, C):
+        """Per unit: implausibility over (candidate, z grid); per shared and group target: over candidates."""
+        P, G, N = self.P, len(self.zg), len(C)
+        units = {}
+        gobs = sorted({t.observable for t in P.targets if t.kind == "group"})
+        need_g = {u for t in P.targets if t.kind == "group" for u in t.weights}
+        S = np.tile(self.zg, N)
+        T = np.repeat(C, G, axis=0)
+        for u in P.units:
+            I = np.zeros(N * G)
+            sign = np.zeros(N * G)
+            tg = P.unit_targets(u)
+            for t in tg:
+                m, v = em["unit"][t.observable].predict(u, S, T, noise=bool(self.th["include_run_noise"]))
+                it = np.abs(m - t.y) / np.sqrt(v + t.var)
+                big = it > I
+                sign = np.where(big, np.sign(m - t.y), sign)
+                I = np.maximum(I, it)
+            I, sign = I.reshape(N, G), sign.reshape(N, G)
+            g = I.argmin(1)
+            rec = {"I": I, "ok": I <= self.cut, "m": I[np.arange(N), g], "g": g,
+                   "sign": sign[np.arange(N), g]}
+            if u in need_g:
+                rec["grp"] = {}
+                for ob in gobs:
+                    m, v = em["unit"][ob].predict(u, self.zg[g], C, noise=False)
+                    rec["grp"][ob] = (m, v)
+            units[u] = rec
+        shared = {}
+        for t in P.targets:
+            if t.kind == "shared":
+                m, v = em["shared"][t.observable].predict(C, noise=bool(self.th["include_run_noise"]))
+                shared[t.id] = {"I": np.abs(m - t.y) / np.sqrt(v + t.var), "mean": m}
+            elif t.kind == "group":
+                sc = t.scale
+                wsum = sum(t.weights.values())
+                pbar, sdn = np.zeros(N), np.zeros(N)
+                for u, w in t.weights.items():
+                    m, v = units[u]["grp"][t.observable]
+                    pbar += w / wsum * inv(m, sc)
+                    sdn += w / wsum * np.abs(dinv(m, sc)) * np.sqrt(v)   # perfectly correlated: an upper bound
+                yb = tr(pbar, sc)
+                d = 1.0 / np.maximum(np.abs(dinv(yb, sc)), 1e-12)
+                shared[t.id] = {"I": np.abs(yb - t.y) / np.sqrt((d * sdn) ** 2 + t.var), "mean": yb}
+        return {"C": C, "units": units, "targets": shared}
+
+    def _merge(self, a, b):
+        if a is None:
+            return b
+        out = {"C": np.vstack([a["C"], b["C"]]), "units": {}, "targets": {}}
+        for u in a["units"]:
+            x, y = a["units"][u], b["units"][u]
+            r = {k: np.concatenate([x[k], y[k]]) for k in ("I", "ok", "m", "g", "sign")}
+            if "grp" in x:
+                r["grp"] = {ob: tuple(np.concatenate([x["grp"][ob][i], y["grp"][ob][i]]) for i in (0, 1))
+                            for ob in x["grp"]}
+            out["units"][u] = r
+        for k in a["targets"]:
+            out["targets"][k] = {q: np.concatenate([a["targets"][k][q], b["targets"][k][q]]) for q in ("I", "mean")}
+        return out
+
+    def _classify(self, st, n_sobol):
+        """The region, matchable / unmatched / conflicting units (see the module docstring)."""
+        C = st["C"]
+        N = len(C)
+        okT = np.ones(N, bool)
+        for k, v in st["targets"].items():
+            okT &= v["I"] <= self.cut
+        um = {u: r["m"] <= self.cut for u, r in st["units"].items()}
+        matchable = [u for u in self.P.units if (um[u] & okT).any()]
+        unmatchable = [u for u in self.P.units if u not in matchable]
+        if matchable:
+            nbad = np.sum([~um[u] for u in matchable], axis=0)
+        else:
+            nbad = np.zeros(N, int)
+        nbad = np.where(okT, nbad, len(self.P.units) + 1)
+        region = np.flatnonzero(okT & (nbad == 0))
+        relaxed, conflicting = 0, []
+        if not len(region) and okT.any():
+            relaxed = int(nbad.min())
+            region = np.flatnonzero(nbad == relaxed)
+            conflicting = sorted({u for u in matchable if not um[u][region].any()}, key=str)
+            if not conflicting:      # different candidates miss different units: every unit missed somewhere
+                conflicting = sorted({u for u in matchable if (~um[u][region]).any()}, key=str)
+        score = sum(st["units"][u]["m"] ** 2 for u in self.P.units) if self.P.units else np.zeros(N)
+        score = score + sum(v["I"] ** 2 for v in st["targets"].values()) if st["targets"] else score
+        return {"region": region, "relaxed": relaxed, "matchable": matchable, "unmatchable": unmatchable,
+                "conflicting": conflicting, "okT": okT, "score": score,
+                "share_of_prior": float(np.mean((okT & (nbad == 0))[:n_sobol])) if n_sobol else None}
+
+    def _region(self, em):
+        n0 = 2 ** int(self.th["candidates_log2"]) if self.p else 1
+        C = _sobol(self.p, n0, _seed(self.seed, "candidates", len(self.waves)))
+        st = self._evaluate(em, C)
+        cl = self._classify(st, n0)
+        rng = np.random.default_rng([self.seed, len(self.waves), 3])
+        for _ in range(int(self.th["refine_rounds"]) if self.p else 0):
+            if len(cl["region"]) >= int(self.th["region_min_candidates"]):
+                break
+            base = cl["region"] if len(cl["region"]) else np.argsort(cl["score"])[:16]
+            src = C[rng.choice(base, size=n0 // 2)] if len(base) else C
+            X = np.clip(src + rng.normal(0, float(self.th["refine_sd"]), src.shape), 0, 1)
+            st = self._merge(st, self._evaluate(em, X))
+            C = st["C"]
+            cl = self._classify(st, n0)
+        st.update(cl)
+        return st
+
+    # ---------------------------------------------------------------- the run
+    def run(self, waves=None) -> dict:
+        raise NotImplementedError("alpha: the self-tests come first")
+        nw = int(waves if waves is not None else self.th["waves"])
+        state = None
+        valid = {}
+        for w in range(nw):
+            urows, srows = self._design(w, state)
+            self.log(f"joint calibration wave {w + 1}/{nw}: {len(urows)} unit runs, {len(srows)} shared runs")
+            urows = self._run("unit", urows)
+            srows = self._run("shared", srows)
+            self.data.add("unit", urows)
+            self.data.add("shared", srows)
+            valid = self._validate(urows, srows)
+            self.em = self._fit(self.data.unit, self.data.shared)
+            state = self._region(self.em)
+            self.waves.append(self._wave_summary(w, urows, srows, valid, state))
+            self.log(f"  region: {len(state['region'])} of {len(state['C'])} candidates; unmatched "
+                     f"{len(state['unmatchable'])}; conflicting {len(state['conflicting'])}")
+        self.state = state
+        return self.report(valid)
+
+    def _wave_summary(self, w, urows, srows, valid, st):
+        return {"wave": w + 1, "unit_runs": len(urows), "shared_runs": len(srows), "validation": valid,
+                "candidates": int(len(st["C"])), "accepted": int(len(st["region"])),
+                "share_of_prior": st["share_of_prior"], "relaxed": st["relaxed"],
+                "unmatched": list(st["unmatchable"]), "conflicting": list(st["conflicting"]),
+                "ranges": self._ranges(st)}
+
+    def _ranges(self, st):
+        R = st["C"][st["region"]] if len(st["region"]) else np.zeros((0, self.p))
+        out = {}
+        for j, p in enumerate(self.P.shared):
+            out[p.name] = [float(p.natural(R[:, j].min())), float(p.natural(R[:, j].max()))] if len(R) else None
+        return out
+
+    def _verify(self, best_c, zbest):
+        """Run the engine at the best point for every unit (and the shared targets): simulated implausibility."""
+        st = self.state
+        t = st["C"][best_c]
+        urows = [{"unit": u, "s": float(self.zg[zbest[u]]), "t": t.copy(), "seed": _seed(self.seed, "verify", u)}
+                 for u in self.P.units]
+        srows = [{"t": t.copy(), "seed": _seed(self.seed, "verify", "shared")}] if self.sobs else []
+        urows = self._run("unit", urows)
+        srows = self._run("shared", srows)
+        byu = {r["unit"]: r["obs"] for r in urows}
+        out = {"units": {}, "targets": {}}
+        for u in self.P.units:
+            worst = 0.0
+            rows = []
+            for tg in self.P.unit_targets(u):
+                noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                y = float(tr(byu[u][tg.observable], tg.scale))
+                i = abs(y - tg.y) / math.sqrt(noise + tg.var)
+                worst = max(worst, i)
+                rows.append({"target": tg.id, "simulated": byu[u][tg.observable], "implausibility": round(i, 4)})
+            out["units"][u] = {"implausibility": round(worst, 4), "ok": worst <= self.cut, "targets": rows}
+        for tg in self.P.targets:
+            if tg.kind == "group":
+                ws = sum(tg.weights.values())
+                pbar = sum(w / ws * byu[u][tg.observable] for u, w in tg.weights.items())
+                i = abs(float(tr(pbar, tg.scale)) - tg.y) / math.sqrt(tg.var)
+                out["targets"][tg.id] = {"simulated": pbar, "implausibility": round(i, 4), "ok": i <= self.cut}
+            elif tg.kind == "shared":
+                v = srows[0]["obs"][tg.observable]
+                noise = self.em["shared"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                i = abs(float(tr(v, tg.scale)) - tg.y) / math.sqrt(noise + tg.var)
+                out["targets"][tg.id] = {"simulated": v, "implausibility": round(i, 4), "ok": i <= self.cut}
+        return out
+
+    def report(self, valid) -> dict:
+        P, st = self.P, self.state
+        C, R = st["C"], st["region"]
+        blocks = []
+        inadequate = {ob: v for ob, v in valid.items() if v["status"] != "passed"}
+        if inadequate:
+            blocks.append({"code": "emulator_inadequate", "detail": {ob: v["status"] for ob, v in inadequate.items()}})
+        if not len(R):
+            blocks.append({"code": "empty_region", "detail": "no candidate satisfies the shared and group targets"})
+        unmatched = list(st["unmatchable"])
+        if len(unmatched) + len(st["conflicting"]) > int(self.bth["unmatched_units_max"]):
+            blocks.append({"code": "unmatched_units", "detail": {"unmatched": unmatched,
+                                                                 "conflicting": list(st["conflicting"])}})
+        if st["relaxed"]:
+            blocks.append({"code": "conflicting_units", "detail": f"the region is relaxed: {st['relaxed']} unit(s) "
+                                                                  "unmatched at every accepted value"})
+        src = R if len(R) else np.argsort(st["score"])[:1]
+        best_c = int(src[np.argmin(st["score"][src])])
+        zbest = {u: int(st["units"][u]["g"][best_c]) for u in P.units}
+        best_theta = P.theta_natural(C[best_c])[0] if self.p else {}
+        units = {}
+        for u in P.units:
+            r = st["units"][u]
+            okR = r["ok"][R] if len(R) else np.zeros((0, len(self.zg)), bool)
+            zset = self.zg[okR.any(0)] if len(okR) else np.array([])
+            gb = int(r["g"][best_c])
+            miss = r["m"].argmin()
+            d = None
+            if u in unmatched:
+                gm = int(r["g"][miss])
+                d = ("target_above_reach" if r["sign"][miss] < 0 else "target_below_reach") \
+                    if gm in (0, len(self.zg) - 1) else "no_value_fits_every_target"
+            at_b = [nm for nm, gi in (("lo", 0), ("hi", len(self.zg) - 1)) if len(okR) and okR[:, gi].any()]
+            units[u] = {"matched": u not in unmatched and u not in st["conflicting"],
+                        "status": "unmatched" if u in unmatched else "conflicting" if u in st["conflicting"]
+                        else "matched",
+                        "best_implausibility": float(r["m"].min()),
+                        "implausibility_at_best": float(r["m"][best_c]),
+                        "z_best": float(P.z_natural(self.zg[gb])),
+                        "z_interval": [float(P.z_natural(zset.min())), float(P.z_natural(zset.max()))]
+                        if len(zset) else None,
+                        "region_touches_bound": at_b, "direction": d}
+        ranges = self._ranges(st)
+        contraction = {p.name: (None if ranges[p.name] is None else
+                                round(1 - (ranges[p.name][1] - ranges[p.name][0]) / (p.hi - p.lo), 4))
+                       for p in P.shared}
+        ver = None
+        if self.vth.get("run") and P.units or self.sobs:
+            ver = self._verify(best_c, zbest)
+            bad = [u for u, v in ver["units"].items() if not v["ok"] and units[u]["matched"]]
+            badt = [k for k, v in ver["targets"].items() if not v["ok"]]
+            for u in bad:
+                units[u]["status"] = "verification_failed"
+                units[u]["matched"] = False
+            if bad or badt:
+                blocks.append({"code": "verification_failed", "detail": {"units": bad, "targets": badt}})
+        tsum = {}
+        for t in P.targets:
+            if t.kind in ("shared", "group"):
+                v = st["targets"][t.id]
+                tsum[t.id] = dict(t.describe(), implausibility_at_best=float(v["I"][best_c]),
+                                  modelled_at_best=float(inv(v["mean"][best_c], t.scale)),
+                                  non_implausible_share=float(np.mean(v["I"] <= self.cut)))
+        smp = self.sample(int(self.th["draws_kept"])) if len(R) else None
+        return {"method": "history_matching", "producer": PRODUCER,
+                "status": "blocked" if blocks else "matched", "blocked": bool(blocks), "blocks": blocks,
+                "cutoff": self.cut,
+                "shared": {p.name: p.describe() for p in P.shared},
+                "unit_parameter": P.unit_param,
+                "region": {"candidates": int(len(C)), "accepted": int(len(R)), "share_of_prior": st["share_of_prior"],
+                           "relaxed": st["relaxed"], "ranges": ranges,
+                           "prior_ranges": {p.name: [p.lo, p.hi] for p in P.shared}, "contraction": contraction},
+                "best": {"theta": best_theta, "z": {u: units[u]["z_best"] for u in P.units},
+                         "score": float(st["score"][best_c])},
+                "units": units, "unmatched": unmatched, "conflicting": list(st["conflicting"]),
+                "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
+                "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
+                "verification": ver, "waves": self.waves,
+                "emulators": {"unit": {ob: e.hyper for ob, e in self.em["unit"].items()},
+                              "shared": {ob: {"kernel": str(e.gp.kernel_)} for ob, e in self.em["shared"].items()}},
+                "thresholds": {"history_matching": self.th, "emulator": self.eth, "blocking": self.bth},
+                "sample": smp}
+
+    def sample(self, n: int, seed: int | None = None) -> dict:
+        """n rows over the region: shared values drawn from the accepted candidates by prior weight, each unit's
+        parameter uniform over its non-implausible grid values at that candidate (jittered within a grid step).
+        Names: the shared names, then z:<unit>. The id hashes the names and the rows."""
+        st, P = self.state, self.P
+        R = st["region"]
+        rng = np.random.default_rng([self.seed if seed is None else int(seed), 17])
+        w = P.prior_weight(st["C"][R]) if self.p else np.ones(len(R))
+        pick = rng.choice(R, size=int(n), p=w / w.sum())
+        names = P.names + [f"z:{u}" for u in P.units]
+        rows = []
+        step = 1.0 / max(len(self.zg) - 1, 1)
+        for c in pick:
+            row = [float(p.natural(st["C"][c][j])) for j, p in enumerate(P.shared)]
+            for u in P.units:
+                okc = np.flatnonzero(st["units"][u]["ok"][c])
+                gi = rng.choice(okc) if len(okc) else int(st["units"][u]["g"][c])
+                s = float(np.clip(self.zg[gi] + rng.uniform(-0.5, 0.5) * step, 0, 1)) if len(okc) else self.zg[gi]
+                if len(okc):       # stay inside the non-implausible bracket around the chosen grid value
+                    lo = self.zg[gi - 1] if gi > 0 and gi - 1 in okc else self.zg[gi]
+                    hi = self.zg[gi + 1] if gi + 1 < len(self.zg) and gi + 1 in okc else self.zg[gi]
+                    s = float(np.clip(s, lo, hi))
+                row.append(float(P.z_natural(s)))
+            rows.append(row)
+        rows = np.asarray(rows, float).reshape(len(rows), len(names))
+        h = hashlib.sha256(json.dumps(names).encode())
+        h.update(np.ascontiguousarray(rows).tobytes())
+        return {"sample_id": h.hexdigest(), "names": names, "rows": rows.tolist(), "method": "history_matching_region",
+                "weighting": "prior density over the non-implausible region; unit parameter uniform within its "
+                             "non-implausible values"}
+
+
+def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, **override) -> dict:
+    return HistoryMatch(problem, simulate, seed, log, **override).run(waves)
+
+
+# --------------------------------------------------------------------------- self-test
+def _expit(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _toy(n_units=12, sd=0.1, extra=None, conflict=False, with_group=False, md=0.05):
+    """A two-window toy: logit f0 = z + a_u + 0.3 b (before an intervention), logit f1 = f0 - 3 e s_u (after; s_u
+    marks units with the intervention). e is identified by units with both windows; b is confounded with z."""
+    truth = {"e": 0.6, "b": 0.5}
+    units = [f"u{i}" for i in range(n_units)]
+    a = {u: -1.0 + 2.0 * i / max(n_units - 1, 1) for i, u in enumerate(units)}
+    s = {u: float(i % 2) for i, u in enumerate(units)}
+    zt = {u: 0.4 - 0.1 * (i % 3) for i, u in enumerate(units)}
+
+    def f(u, z, th, ob, noise=0.0):
+        l0 = z + a[u] + 0.3 * th["b"]
+        return _expit(l0 if ob == "w0" else l0 - 3.0 * th["e"] * s[u])
+
+    tg = []
+    for u in units:
+        tg.append(Target(f"{u}:w1", "unit", "w1", f(u, zt[u], truth, "w1"), "logit", sd_obs=sd, sd_md=md, unit=u,
+                         source="toy"))
+        if s[u]:
+            tg.append(Target(f"{u}:w0", "unit", "w0", f(u, zt[u], truth, "w0"), "logit", sd_obs=sd, sd_md=md, unit=u,
+                             source="toy"))
+    if conflict:      # two treated units whose windows imply e = 0.15 and e = 1.05 with tight errors
+        for u, e in (("u1", 0.15), ("u3", 1.05)):
+            for t in tg:
+                if t.unit == u:
+                    t.value = f(u, zt[u], {"e": e, "b": 0.5}, t.observable)
+                    t.sd_obs, t.sd_md = 0.03, 0.0
+    if with_group:
+        w = {u: 1.0 + i for i, u in enumerate(units)}
+        ws = sum(w.values())
+        val = sum(w[u] / ws * f(u, zt[u], truth, "w0") for u in units)
+        tg.append(Target("grp:w0", "group", "w0", val, "logit", sd_obs=sd, sd_md=md, weights=w, source="toy"))
+    if extra:
+        tg += extra(f, units)
+    P = Problem([Param("e", 0.0, 1.2, "triangular", 0.5, "toy source"), Param("b", 0.0, 1.0, "uniform", None, "toy")],
+                {"name": "z", "lo": -2.0, "hi": 2.0}, units, tg, features={u: [a[u]] for u in units},
+                feature_names=["a"])
+    calls = {"n": 0}
+
+    def sim(pts):
+        calls["n"] += len(pts)
+        out = []
+        for p in pts:
+            r = np.random.default_rng(p["seed"])
+            out.append({ob: _expit(math.log(f(p["unit"], p["z"], p["theta"], ob) /
+                                            (1 - f(p["unit"], p["z"], p["theta"], ob))) + r.normal(0, 0.02))
+                        for ob in ("w0", "w1")})
+        return out
+    return P, sim, truth, zt, calls
+
+
+def _self_test() -> int:
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        if not c:
+            fails.append(m)
+
+    def safe(fn, msg):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            ok(False, f"{msg}: raised {type(e).__name__}: {e}")
+
+    q = lambda *a, **k: None  # noqa: E731
+    fast = dict(candidates_log2=10, points_per_unit=10)
+
+    def hm1():
+        P, sim, truth, zt, calls = _toy()
+        r = calibrate(P, sim, seed=3, waves=2, log=q, **fast)
+        rg = r["region"]["ranges"]
+        ok(r["status"] == "matched" and r["n_matched"] == len(P.units) and not r["unmatched"],
+           f"HM1a every unit matched on the toy, nothing blocked ({r['status']}, {r['blocks']})")
+        ok(rg["e"][0] <= truth["e"] <= rg["e"][1] and r["region"]["contraction"]["e"] > 0.4,
+           f"HM1b the identified shared parameter's region contains the truth and contracts ({rg['e']}, "
+           f"{r['region']['contraction']['e']})")
+        ok(r["region"]["contraction"]["b"] < 0.2,
+           f"HM1c a parameter the data do not inform keeps (nearly) its prior range ({rg['b']})")
+        ok(all(r["units"][u]["z_interval"][0] - 0.2 <= zt[u] <= r["units"][u]["z_interval"][1] + 0.2
+               for u in P.units), "HM1d each unit's true parameter is inside (or within a grid step of) its interval")
+        v = r["validation"] if "validation" in r else r["waves"][-1]["validation"]
+        ok(all(x["status"] == "passed" for x in v.values()), f"HM1e the held-out emulator check passes ({v})")
+        ok(r["verification"] and all(x["ok"] for x in r["verification"]["units"].values()),
+           "HM1f verification: the engine at the best point matches every unit")
+        smp = r["sample"]
+        R = np.asarray(smp["rows"])
+        j = smp["names"].index("e")
+        ok(R.shape == (1000, 2 + len(P.units)) and rg["e"][0] - 1e-9 <= R[:, j].min() and R[:, j].max() <= rg["e"][1]
+           + 1e-9, "HM8a the region sample has one row per draw, shared values inside the region")
+        zs = R[:, smp["names"].index("z:u0")]
+        zi = r["units"]["u0"]["z_interval"]
+        ok(zi[0] - 0.11 <= zs.min() and zs.max() <= zi[1] + 0.11, "HM8b unit values inside their intervals")
+        r2 = calibrate(P, sim, seed=3, waves=2, log=q, **fast)
+        ok(r2["sample"]["sample_id"] == smp["sample_id"], "HM8c same seed, same inputs: the same sample id")
+    safe(hm1, "HM1")
+
+    def hm2():
+        def extra(f, units):
+            return [Target("u2:hi", "unit", "w1", 0.995, "logit", sd_obs=0.1, sd_md=0.05, unit="u2", source="toy")]
+        P, sim, truth, zt, _ = _toy(extra=extra)
+        r = calibrate(P, sim, seed=4, waves=1, log=q, **fast)
+        u = r["units"]["u2"]
+        ok("u2" in r["unmatched"] and u["status"] == "unmatched" and u["direction"] == "target_above_reach",
+           f"HM2a a target above what the model reaches: the unit is unmatched and says so ({u})")
+        ok(r["blocked"] and any(b["code"] == "unmatched_units" for b in r["blocks"]),
+           "HM2b an unmatched unit blocks (never pinned at a bound silently)")
+        ok(r["region"]["accepted"] > 0 and r["n_matched"] == len(P.units) - 1,
+           f"HM2c the region is still computed from the other units ({r['region']['accepted']}, {r['n_matched']}, "
+           f"{[(k, v['status']) for k, v in r['units'].items() if v['status'] != 'matched']})")
+    safe(hm2, "HM2")
+
+    def hm3():
+        P, sim, *_ = _toy(conflict=True)
+        r = calibrate(P, sim, seed=5, waves=1, log=q, **fast)
+        ok(r["blocked"] and r["region"]["relaxed"] >= 1 and set(r["conflicting"]) & {"u1", "u3"},
+           f"HM3 units matchable alone but not together: the region is relaxed and they are named "
+           f"({r['conflicting']}, relaxed {r['region']['relaxed']})")
+    safe(hm3, "HM3")
+
+    def hm4():
+        P = Problem([Param("a", 0.0, 1.0, "uniform", None, "toy"), Param("b", 0.0, 1.0, "uniform", None, "toy")], None,
+                    [], [Target("B1", "shared", "s1", 2 * 0.55 + 0.35, "identity", sd_obs=0.05, source="toy"),
+                         Target("B2", "shared", "s2", 0.55 - 0.35, "identity", sd_obs=0.05, source="toy")])
+
+        def sim(pts):
+            return [{"s1": 2 * p["theta"]["a"] + p["theta"]["b"], "s2": p["theta"]["a"] - p["theta"]["b"]}
+                    for p in pts]
+        r = calibrate(P, sim, seed=6, waves=2, log=q, candidates_log2=11, shared_points=20)
+        rg = r["region"]["ranges"]
+        ok(r["status"] == "matched" and rg["a"][0] <= 0.55 <= rg["a"][1] and rg["b"][0] <= 0.35 <= rg["b"][1]
+           and r["region"]["contraction"]["a"] > 0.5,
+           f"HM4 canary with no units: shared targets only; the region contains the truth and contracts ({rg})")
+    safe(hm4, "HM4")
+
+    def hm5():
+        P, sim, truth, *_ = _toy(with_group=True)
+        r = calibrate(P, sim, seed=7, waves=2, log=q, **fast)
+        g = r["targets"].get("grp:w0")
+        ok(g is not None and g["implausibility_at_best"] <= 3 and r["status"] == "matched"
+           and r["region"]["ranges"]["e"][0] <= truth["e"] <= r["region"]["ranges"]["e"][1],
+           f"HM5 a group target (a weighted aggregate over units) is matched and reported ({g and g['implausibility_at_best']})")
+    safe(hm5, "HM5")
+
+    def hm6():
+        P, sim, *_ = _toy()
+        P.targets[0].sd_obs = P.targets[0].sd_md = P.targets[0].sd_bias = 0.0
+        try:
+            HistoryMatch(P, sim, log=q)
+            ok(False, "HM6a a target with no declared error is refused")
+        except CalibrationInputError as e:
+            ok("ground truth" in str(e), "HM6a a target with no declared error is refused (no source is ground truth)")
+        Pa, sa, *_ = _toy(sd=0.08)
+        Pb, sb, *_ = _toy(sd=0.4)
+        ra = calibrate(Pa, sa, seed=8, waves=1, log=q, **fast)
+        rb = calibrate(Pb, sb, seed=8, waves=1, log=q, **fast)
+        wa = ra["region"]["ranges"]["e"][1] - ra["region"]["ranges"]["e"][0]
+        wb = rb["region"]["ranges"]["e"][1] - rb["region"]["ranges"]["e"][0]
+        ok(wb > wa, f"HM6b a larger sampling error gives a wider region ({wa:.3f} < {wb:.3f})")
+    safe(hm6, "HM6")
+
+    def hm7():
+        rng = np.random.default_rng(0)
+        good = validation(rng.normal(0, 1, 200))
+        bad = validation(rng.normal(0, 4, 200))
+        few = validation(rng.normal(0, 1, 3))
+        ok(good["status"] == "passed" and bad["status"] == "failed" and few["status"] == "not_run",
+           "HM7a held-out check: calibrated errors pass, overconfident ones fail, too few is not a pass")
+        P, sim, *_ = _toy()
+        real = UnitEmulator.predict
+
+        def overconfident(self, u, S, T, noise=True):      # an emulator that states a hundredth of its variance
+            m, v = real(self, u, S, T, noise)
+            return m, v / 100.0
+        UnitEmulator.predict = overconfident
+        try:
+            r = calibrate(P, sim, seed=9, waves=1, log=q, **fast)
+        finally:
+            UnitEmulator.predict = real
+        ok(r["blocked"] and any(b["code"] == "emulator_inadequate" for b in r["blocks"]),
+           f"HM7b an emulator whose stated uncertainty is too small fails closed ({[b['code'] for b in r['blocks']]})")
+    safe(hm7, "HM7")
+
+    def hm9():
+        bad_cases = [
+            ("non-finite target", lambda P: setattr(P.targets[0], "value", float("nan"))),
+            ("group weight on an unknown unit", lambda P: P.targets.append(
+                Target("g", "group", "w0", 0.3, "logit", sd_obs=0.1, weights={"nope": 1.0}, source="t"))),
+            ("empty shared range", lambda P: setattr(P.shared[0], "hi", P.shared[0].lo)),
+            ("shared range without a source", lambda P: setattr(P.shared[1], "source", "")),
+            ("a unit with no target", lambda P: (P.units.append("orphan"), P.features.update(orphan=[0.0]))),
+        ]
+        for why, mut in bad_cases:
+            P, sim, *_ = _toy()
+            mut(P)
+            try:
+                HistoryMatch(P, sim, log=q)
+                ok(False, f"HM9 refused: {why}")
+            except CalibrationInputError:
+                ok(True, f"HM9 refused: {why}")
+        P, sim, *_ = _toy()
+
+        def nan_sim(pts):
+            out = sim(pts)
+            out[0]["w1"] = float("nan")
+            return out
+        try:
+            calibrate(P, nan_sim, seed=1, waves=1, log=q, **fast)
+            ok(False, "HM9 a non-finite simulated value fails closed")
+        except CalibrationInputError:
+            ok(True, "HM9 a non-finite simulated value fails closed")
+        ok(abs(sd_from_ci(0.2, 0.4, "logit") - (math.log(0.4 / 0.6) - math.log(0.2 / 0.8)) / (2 * 1.959964)) < 1e-6
+           and abs(sd_from_n(0.3, 400, "identity") - math.sqrt(0.21 / 400)) < 1e-12,
+           "HM10 sampling sd from an interval and from a sample size")
+    safe(hm9, "HM9")
+
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(_self_test())
+    print(__doc__)
