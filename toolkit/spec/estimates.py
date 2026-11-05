@@ -123,6 +123,13 @@ BIAS_SUPPORT = {"under_ascertainment": (0.0, 1.0)}
 SUPPORTED_BIAS = tuple(BIAS_SUPPORT)        # the mechanisms the estimates path applies to a count series
 
 
+def _with_source(prior, source):
+    """The prior with its enclosing declaration's source (Codex r2-9: provenance kept)."""
+    if not isinstance(prior, dict):
+        return prior
+    return dict(prior, source=prior.get("source") or str(source or ""))
+
+
 def source_params(sources) -> list:
     """[(param, prior, where)] of every observation parameter, in declaration order (duplicates kept, so a collision
     can be refused): bias mechanisms and a declared dispersion."""
@@ -132,10 +139,12 @@ def source_params(sources) -> list:
             continue
         for b in s.get("bias") or [] if isinstance(s.get("bias"), list) else []:
             if isinstance(b, dict) and b.get("param"):
-                out.append((b["param"], b.get("prior"), f"observations.{s.get('id')}.bias.{b.get('mechanism')}"))
+                out.append((b["param"], _with_source(b.get("prior"), b.get("source")),
+                            f"observations.{s.get('id')}.bias.{b.get('mechanism')}"))
         disp = (s.get("noise") or {}).get("dispersion")
         if isinstance(disp, dict) and disp.get("param"):
-            out.append((disp["param"], disp.get("prior"), f"observations.{s.get('id')}.noise.dispersion"))
+            out.append((disp["param"], _with_source(disp.get("prior"), disp.get("source")),
+                        f"observations.{s.get('id')}.noise.dispersion"))
     return out
 
 
@@ -179,10 +188,19 @@ def validate_pending(s) -> list[str]:
     from toolkit.analysis import observation as ob
     srcs = (r.get("observations") or {}).get("sources")
     bad += [f"{code}: observations: {m}" for code, m in ob.check_sources(srcs)]
-    ids = {x.get("id") for x in srcs or [] if isinstance(x, dict)}
+    id_list = [x.get("id") for x in srcs or [] if isinstance(x, dict)]
+    ids = set(id_list)
+    if len(ids) != len(id_list):
+        bad.append("observations.sources: duplicate source ids (each source has its own id)")
+    if "engine_parameters" in r:
+        bad.append("engine_parameters: not applied by the estimates path; declare quantities as data or priors")
     for x in srcs or []:
         if not isinstance(x, dict):
             continue
+        mechs = [b.get("mechanism") for b in (x.get("bias") if isinstance(x.get("bias"), list) else [])
+                 if isinstance(b, dict)]
+        bad += [f"observations.{x.get('id')}.bias: mechanism {m} appears more than once (its composition is not "
+                "defined)" for m in sorted({m for m in mechs if mechs.count(m) > 1})]
         disp = (x.get("noise") or {}).get("dispersion")
         if (x.get("noise") or {}).get("model") == "negbin" and not (
                 (_isnum(disp) and disp > 0) or (isinstance(disp, dict) and disp.get("param")
@@ -245,6 +263,11 @@ def validate_pending(s) -> list[str]:
             bad.append(f"calibration.targets.{k}: required")
     if t.get("source") and t["source"] not in ids:
         bad.append(f"observation_source_undeclared: calibration.targets.source {t['source']!r} is not a declared source")
+    tsrc = next((x for x in srcs or [] if isinstance(x, dict) and x.get("id") == t.get("source")), None)
+    if tsrc is not None and ((tsrc.get("latent") or {}).get("quantity") != "incidence"
+                             or tsrc.get("measures") != "case_notifications"):
+        bad.append(f"observations.{tsrc.get('id')}: the estimates path fits a count series: the target's source must "
+                   "measure case_notifications of latent quantity incidence")
     if not bad:
         try:
             rows = _read_csv(s.resolve(t["csv"]))
@@ -355,6 +378,23 @@ def validate(s, eng) -> list[str]:
             bad.append(f"parameter_name_collision: {where}: {n} is also an engine "
                        f"{'parameter' if n in pnames else 'unit attribute'} of {card.name}; observation parameters "
                        "need their own names")
+    # Codex r2-4: no silent defaults, whatever the derivation opt-in: every unit attribute is bound to data, moved by
+    # the calibration, or its card default accepted by name with a reason
+    pri_names = set(((s.raw.get("calibration") or {}).get("priors") or {}))
+    acc = du.get("defaults_accepted") or {}
+    for a in card.unit_attributes:
+        if a in bound or a in pri_names:
+            if a in acc:
+                bad.append(f"decision_units.defaults_accepted.{a}: the attribute is also bound or calibrated")
+            continue
+        if not (isinstance(acc, dict) and str(acc.get(a) or "").strip()):
+            bad.append(f"engine_attribute_unbound: engine {card.name}: {a}: bind it, give it a calibration prior, or "
+                       "accept the card default by name in decision_units.defaults_accepted with a reason")
+    # Codex r2-2: the engine configuration is exactly what dynamics declares (no other key, e.g. a results file)
+    ecfg = (s.raw.get("engine") or {}).get("config") if isinstance(s.raw.get("engine"), dict) else None
+    extra = sorted(set(ecfg or {}) - {"generation_interval", "dt", "transmissibility"})
+    if extra:
+        bad.append(f"engine.config: keys {extra} are not declared by dynamics (e.g. results_path): remove them")
     bad += dynamics_problems(s.raw, eng)
     return bad
 

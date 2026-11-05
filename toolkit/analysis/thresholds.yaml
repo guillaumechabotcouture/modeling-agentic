@@ -43,7 +43,10 @@ estimates:
   # An output that moves by more than this share of its median across an undetermined parameter's own posterior range
   # (marginal slope in the canonical draws x the parameter's central interval) is reported as set by that
   # parameter's declared range, not by the data.
-  dependence_max: 0.1
+  dependence_max: 0.1          # a diagnostic since Codex r2-1 (the class reads flat_share_max)
+  # An output whose spread along the likelihood's flat directions (per prior sd) is at least this share of its
+  # posterior sd is set by the declared ranges: along those directions only the priors bound it (Codex r2-1).
+  flat_share_max: 0.5
   # A prior_range test end whose best fit is worse than the full posterior's by more than this log-likelihood is
   # rejected by the data (1.92: the 95% likelihood-ratio cut for one parameter), and cannot change the decision.
   end_loglik_drop_max: 1.92
