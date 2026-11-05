@@ -736,7 +736,8 @@ def _validate(s: Spec) -> list[str]:
         elif "column" in m:
             need.add(m["column"])
             if "empty" in m and ("split" not in m or not isinstance(m["empty"], str) or not m["empty"].strip()
-                                 or isinstance(_num(m["empty"]), float)):
+                                 or any(isinstance(_num(x), float) for x in [m["empty"]]
+                                        + (m["empty"].split(m["split"]) if isinstance(m["empty"], str) else []))):
                 # Codex r1 P1-4 / P2-6: a non-blank, non-numeric string, so no reader can take the token for data
                 bad.append(f"decision_units.engine_attributes.{attr}: `empty` (the token of an empty list) needs "
                            "`split` and a non-blank, non-numeric string (e.g. none)")

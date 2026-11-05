@@ -271,6 +271,11 @@ def smc_history(a: dict, d0: float, months, later=()) -> dict | None:
         years.append(int(float(y)))
     if len(set(years)) != len(years):
         raise ValueError(f"smc_hist_years: a year is given twice ({years})")
+    raw = a.get("smc_months")
+    if years and raw is not None and not isinstance(raw, (list, tuple)):
+        # Codex r2 P1: a falsy or non-list value must not fall back to the default months silently
+        raise ValueError(f"smc_months {raw!r}: with past SMC (smc_hist_years) the SMC months must be a list of "
+                         "distinct whole months 1-12 (or absent, for the default from the seasonality)")
     if years:     # Codex r1 P1-3: the months past SMC uses are whole, distinct calendar months (order kept)
         bad_m = [m for m in months if not _is_num(m) or not np.isfinite(float(m)) or float(m) != int(float(m))
                  or not 1 <= int(float(m)) <= 12]
