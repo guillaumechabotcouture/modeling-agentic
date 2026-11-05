@@ -115,7 +115,7 @@ def _self_test() -> int:
             fails.append(m)
     q = lambda *a, **k: None  # noqa: E731
     P, sim, truth, s_true = _units_problem()
-    r = HM.calibrate(P, sim, seed=1, waves=2, log=q, candidates_log2=10, points_per_unit=10, shared_points=24)
+    r = HM.calibrate(P, sim, seed=1, waves=2, log=q, candidates_log2=10, points_per_unit=16, shared_points=24)
     rg = r["region"]["ranges"]
     ok(r["status"] == "matched" and r["n_matched"] == 10, f"AC1a renewal engine: every population matched ({r['blocks']})")
     ok(all(rg[k][0] <= v <= rg[k][1] for k, v in truth.items()) and r["region"]["contraction"]["effect:vc"] > 0.3,

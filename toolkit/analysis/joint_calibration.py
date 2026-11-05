@@ -581,8 +581,10 @@ def main(argv=None) -> int:
     rep = run(spec, rd, kw, log=lambda *x, **k: print(*x, flush=True), units=units, **ov)
     out = os.path.abspath(a.out or os.path.join(rd, OUT_REL))
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "joint_calibration.yaml"), "w") as f:
-        yaml.safe_dump(HM_plain(artifact(rep)), f, sort_keys=False)
+    from toolkit.analysis.artifacts import _safe_io      # no link followed inside the run dir (write_audit WA3)
+    root = rd if os.path.commonpath([rd, out]) == rd else out
+    _safe_io().write_nofollow(root, os.path.relpath(os.path.join(out, "joint_calibration.yaml"), root),
+                              yaml.safe_dump(HM_plain(artifact(rep)), sort_keys=False).encode(), atomic=True)
     print(summary(rep), flush=True)
     return 0 if not rep["blocked"] else 3
 
