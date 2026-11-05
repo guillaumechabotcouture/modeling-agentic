@@ -142,14 +142,18 @@ How it works in practice:
   the disease area: id, statement, tag, disease area, run, evidence, the change made).
 - When a second disease area shows the same lesson, a core PR generalises it. The PR cites
   both postmortem entries and passes the acceptance criteria in §4.
-- The eval suite counts: a synthetic measles or dengue question is a different disease area
-  from the Nigeria malaria run. This is what makes Track B the fast route to promotion.
-
-Two cases for the owner to confirm (open items in §7):
+Owner decisions (2026-11-05, at review of this note):
 - **Infrastructure and integrity defects** (a launcher that drops jobs, a gate that can be
-  bypassed, data leaving its storage) are not disease knowledge. This note proposes that they
-  are fixed in core at the first occurrence, tagged `core`, with the two-area test still
-  required before merge.
+  bypassed, data leaving its storage) are fixed in core the first time they appear, tagged
+  `core`. The fix must still pass on two disease areas (AC2) before it merges.
+- **A synthetic eval question counts as a disease area for the acceptance tests** (AC2),
+  because it exercises a different engine and question type. **For promoting a domain lesson
+  into core, it counts only when the lesson is about method or structure** (for example a
+  calibration that clamps, or an interval that leaves out a source), **not about real-world
+  data** (a source's quirks, a programme's records). A lesson about real-world data needs a
+  second real-data disease area before it is promoted.
+
+Also:
 - **Core rules made before this note** stay as they are. Each one whose evidence comes from
   one disease area is listed in the first postmortem round and checked on an eval canary;
   none is removed by this note.
@@ -344,8 +348,6 @@ them; the parameter that changed twice and the chemoprevention effect are `engin
 
 | Item | Owner | Target date |
 |---|---|---|
-| Confirm the proposed reading of the promotion rule for infrastructure and integrity defects (§2) | owner | at review of this PR |
-| Confirm that a synthetic eval question counts as a disease area for the two-area test (§2) | owner | at review of this PR |
 | Age-structured compartmental engine (started) | engine agent | PR into `v2` by 2026-11-08 |
 | Renewal engine (started) | engine agent | PR into `v2` by 2026-11-08 |
 | Malaria v0.11 (in progress) | engine agent | PR into `v2` by 2026-11-07 |
