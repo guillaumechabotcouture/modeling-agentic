@@ -660,6 +660,10 @@ def frame_problems(s: Spec) -> list[str]:
     m = cal.get("method")
     if m in (None, "none") or not isinstance(cal, dict):
         return []
+    if (cal.get("targets") or {}).get("kind") == "observations":
+        # each observation row names the engine groups it measures and a declared source with its sampling frame
+        # (toolkit/analysis/observed_targets.py checks both): the band is per row, never a whole-unit output
+        return []
     if m == "emulator_inversion":
         compared, fr, where = cal.get("metric"), cal.get("target_frame"), "calibration.target_frame"
     else:
