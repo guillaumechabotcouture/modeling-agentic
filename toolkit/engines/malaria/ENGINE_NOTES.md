@@ -1,12 +1,22 @@
-# Malaria engine v0.9: benchmark notes
+# Malaria engine v0.10: benchmark notes
 
-Engine `malaria-starsim` v0.9 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.10 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.10 numbers are v0.9's.** v0.10 adds past SMC and a net type per past net campaign as unit attributes (section below); they act
+only when a unit sets them, and the pack and the evidence set none. So the results, fit, equilibration and guess-sensitivity files keep the numbers
+v0.9 computed, and their identity fields were re-stamped by
+`benchmarks/restamp_proof.py` after it found v0.9 (d24d28d) and v0.10 (2460326) outputs identical in 23 of 23 cases: the
+14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and 4 pinned scenarios,
+including `empty_history_v010`, which sets the new attributes at their empty values. The proof ran locally (Python
+3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v010-3`). Each file's `restamped:` record says
+`confirmation: {validate_once: pending}` until a `validate_once.sh` run reports. The v0.9 paragraphs below describe
+the v0.9 recompute, whose numbers these are.
 
 **v0.9 numbers are recomputed.** v0.9 changes net attrition to the smooth-compact survival curve (section below),
 so every evidence file was recomputed by `bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12`. The run
@@ -53,6 +63,64 @@ with a delivery period, routine nets and SMC, boundary dates and heterogeneous b
 Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
+
+## v0.10 scope: past SMC and a net type per past net campaign (owner approval 2026-11-04)
+
+**Why.** Up to v0.9 a unit had no attribute for past SMC, so a calibration to a survey taken after SMC began (for
+example a 2021 survey) treated SMC-treated units as never having had SMC: their fitted transmission can come out too
+low. Past net campaigns all used one net type (`hist_net`), so a unit that moved from pyrethroid to PBO or dual-AI
+nets could not be described.
+
+**New unit attributes.** Each is optional, with a default declared in `attribute_binding.yaml`.
+
+| Attribute | Format | Default | Meaning |
+|---|---|---|---|
+| `smc_hist_years` | list of whole calendar years, e.g. `[2019, 2020, 2021]`; units-table column: `{column, split: " ", empty: "none"}` with cells `2019 2020 2021` or `none` | `[]` | SMC rounds in each of those years in the unit's SMC months (`smc_months`, or the default from the seasonality) |
+| `smc_hist_rounds` | one whole number for every past year, or a list with one per entry of `smc_hist_years` | the number of SMC months | a year with n rounds gets the first n of the unit's SMC months |
+| `hist_net_by_year` | mapping `{decimal year: pyr \| pbo \| dual}`, or the string `"2017.5:pyr 2020.5:pbo"`; a units-table column holds the string, or `none` | none | each named past campaign gives that net type; campaigns not named, and routine campaigns, keep `hist_net` |
+
+**Mechanism.** No new mechanism. Past SMC rounds run through `model.SMCDelivery`, the intervention of the package's
+SMC (and of routine SMC), with the same efficacy `smc_pe`, the same access groups `smc_hi_frac` and the round dates
+of `model.smc_targets` (month starts). They run in every arm, the comparator included, and are never charged
+(`count=False`). A per-campaign net type sets the code that `ITNCampaign` gives to that campaign's nets; nothing else
+about the campaign changes. Both come from `delivery_plan`, so `schedule()` lists past SMC rounds as `history`
+events (label `past SMC round`) and names each past campaign's own net type (`past net campaign (dual)`).
+
+**Fail closed.** The engine refuses (ValueError, before any sim is built):
+- `smc_hist_years` that is not a list (a string or a bare number), or holds a fractional year, NaN, a boolean, a
+  string, or a repeated year;
+- a past SMC round at or after the delivery start or the first package or routine SMC round (past SMC precedes
+  both; without a delivery period the package's SMC can start before the window, in its first calendar year), or
+  one that the sim would run on a daily step at or after the delivery start (checked on the sim's own steps);
+- with past SMC, SMC months that are not distinct whole months 1–12;
+- `smc_hist_rounds` that is not a whole number from 1 to the number of SMC months, or a list of another length;
+- `hist_net_by_year` with a net type other than pyr, pbo or dual, a year that is not one of `itn_hist_years`
+  (within 1e-6 y), a year given twice, a token that is not `year:type`, or a value that is neither a mapping nor a
+  string.
+
+**Burn-in sharing.** Past SMC acts before the fork, so for a unit with `smc_hist_years` the parameters `smc_pe` and
+`smc_hi_frac` join its burn-in key; a past dual-AI campaign named in `hist_net_by_year` puts `cfp_kill` and
+`cfp_half` in the key, as `hist_net: dual` already did. Without these attributes the key is v0.9's.
+
+**Spec binding (disease-agnostic).** A bound column may not be blank (`attribute_column_empty`), so an empty list
+needs an explicit token. `toolkit/spec/schema.py` gains an optional `empty` field for split columns:
+`{column: c, split: " ", empty: "none"}` reads a cell equal to `none` as `[]`. `empty` needs `split` and a non-blank,
+non-numeric string, so no reader can take the token for data (self-tests SP8b–g).
+
+**Back-compatibility.** With the attributes absent, empty (`[]`, `{}`, `""`, `"none"`), `smc_hist_rounds` given
+without past years, or `hist_net_by_year` naming every campaign at `hist_net`, the sim has the v0.9 interventions and
+gives byte-identical outcomes, cost drivers and meta (self-test H3). `benchmarks/restamp_proof.py` compares v0.9 and
+v0.10 on the pack, the evidence cases, the pinned scenarios, and a new scenario `empty_history_v010` that sets the
+new attributes at their empty values.
+
+**Tests (written first).** H0 card and binding; H1 past SMC rounds in the schedule at their dates, uncharged, on the
+steps the sim runs, and the rounds-per-year override; H2 the trajectory is identical before the first past round and
+under-5 incidence is lower in the past SMC months (sum of the monthly rates over June–September 2015,
+0.081 vs 0.646 per child-year, 1,000 agents, horizon 2015–2017), never charged; H3 byte-identity with empty values; H4 malformed formats fail closed, in `schedule()`
+and in the sim path; H5 each past campaign gives its own net type and routine campaigns keep `hist_net`; H6 burn-in
+key; H7 (Codex review round 1) overlap with the package's SMC, the sim-step check, SMC months and year keys of
+mixed type. The v0.8–v0.10 sections run in a second process (`selftest_late.py --self-test`; L0 checks every
+section runs in one of the two), so each module stays well inside CI's per-test time limit.
 
 ## v0.9 scope: smooth-compact net survival (written before the v0.9 pack run)
 

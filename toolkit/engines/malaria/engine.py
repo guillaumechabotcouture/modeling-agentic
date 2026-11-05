@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Malaria engine behind the `Engine` contract (toolkit/engines/contract.py).
 
-    python3 -m toolkit.engines.malaria.engine --self-test
+    python3 -m toolkit.engines.malaria.engine --self-test     # M1-M21 and the v0.5-v0.7 sections
+    python3 toolkit/engines/malaria/selftest_late.py --self-test  # the v0.8-v0.10 sections (a second process)
     python3 -m toolkit.engines.malaria.engine --card [path]    # writes card.yaml (after the pack is run)
 
 Our own Starsim code (model.py, vector.py). Fitted engine-level parameters come from the
@@ -16,7 +17,11 @@ Unit attributes (UnitSpec.attributes):
   cm_ft           probability a clinical episode is effectively treated (current level)
   itn_use         survey-reported nightly net use, measured itn_use_at years after the campaign
   itn_use_at      optional (default 0); access at distribution = itn_use / (retention(t) x use_rate)
-  itn_hist_years  decimal years of past pyrethroid-net campaigns
+  itn_hist_years  decimal years of past net campaigns (net type hist_net, or per campaign hist_net_by_year)
+  hist_net        optional; net type of past and routine campaigns, pyr (default) | pbo | dual
+  hist_net_by_year optional (v0.10); {decimal year: pyr|pbo|dual} or "year:type year:type"; years from itn_hist_years
+  smc_hist_years  optional (v0.10); whole calendar years of past SMC (before the delivery period), every arm
+  smc_hist_rounds optional (v0.10); rounds per past SMC year: one number or one per year (the first n SMC months)
   campaign_year   decimal year of the package's net campaign (in the delivery period)
   itn_routine_interval  optional (v0.6); years between routine net campaigns after campaign_year, in every arm
   smc_routine     optional (v0.7); 0 | 1: routine SMC every season after the delivery period, in every arm
@@ -67,6 +72,15 @@ S(t) = exp(k - k / (1 - (t/L)^2)) for t < L and 0 after, k = 20 (new fixed param
 median retention net_retention_half (unchanged name, value and range). A net of age a days is lost each day with
 probability 1 - S(a+1)/S(a) (model.net_loss_prob), and access_for_use divides by the same S(t). Not byte-identical
 to v0.8, so the benchmark evidence is recomputed (validate_once.sh; ENGINE_NOTES.md, v0.9). Self-tests N0-N7.
+
+v0.10: past SMC and a net type per past net campaign, as unit attributes. `smc_hist_years` (whole calendar years,
+default []) runs SMC rounds in the unit's SMC months in each of those years, in every arm including the comparator,
+never charged, through the same SMC intervention as the package's (model.SMCDelivery); `smc_hist_rounds` (one number,
+or one per year) keeps the first n SMC months of a year. Every past round precedes the delivery period (fail closed).
+`hist_net_by_year` gives a past campaign its own net type; campaigns it does not name, and routine campaigns, keep
+hist_net. Past SMC puts smc_pe and smc_hi_frac, and a past dual-AI campaign cfp_kill and cfp_half, in the burn-in
+key (they act before the fork). With the attributes absent or empty, a run is byte-identical to v0.9 (self-test H3;
+benchmarks/restamp_proof.py). Self-tests H0-H7.
 """
 from __future__ import annotations
 
@@ -95,7 +109,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.9"
+VERSION = "0.10"
 BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC8196080)"
 
 # name, value, kind, units, lo, hi, source, verified
@@ -157,6 +171,8 @@ POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", "smc_p
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
+# v0.10: SMC parameters act before the fork when a unit has past SMC (smc_hist_years), so they join its burn-in key
+SMC_PARAMS = frozenset({"smc_pe", "smc_hi_frac"})
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
 # v0.8: the monthly series run_series offers (toolkit/engines/hooks.py), each one of the model's daily records
 # (model.DAILY) with the same definition as the window metric of the same name
@@ -234,6 +250,112 @@ def smc_schedule_problems(pkg_rounds, routine_rounds, months, d0, d1, w1) -> lis
     return bad
 
 
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, (bool, np.bool_))
+
+
+def smc_history(a: dict, d0: float, months, later=()) -> dict | None:
+    """v0.10: a unit's past SMC from smc_hist_years (whole calendar years) and smc_hist_rounds (optional: one number
+    for every past year, or one per year; default every SMC month). A year's n rounds are at the month starts of the
+    first n of the unit's SMC `months` in that year (model.smc_targets, as the package's SMC). Every round precedes
+    the delivery start d0 and the first of the package's and routine SMC rounds `later` (Codex r1 P1-1). None when
+    there is no past year (the v0.9 sim). Fails closed on any other form."""
+    ys, rr = a.get("smc_hist_years"), a.get("smc_hist_rounds")
+    if ys is None:
+        ys = []
+    if not isinstance(ys, (list, tuple)):
+        raise ValueError(f"smc_hist_years must be a list of whole calendar years (got {ys!r})")
+    years = []
+    for y in ys:
+        if not _is_num(y) or not np.isfinite(float(y)) or float(y) != int(float(y)):
+            raise ValueError(f"smc_hist_years: {y!r} is not a whole calendar year (the list is {list(ys)!r})")
+        years.append(int(float(y)))
+    if len(set(years)) != len(years):
+        raise ValueError(f"smc_hist_years: a year is given twice ({years})")
+    raw = a.get("smc_months")
+    if years and raw is not None and not isinstance(raw, (list, tuple)):
+        # Codex r2 P1: a falsy or non-list value must not fall back to the default months silently
+        raise ValueError(f"smc_months {raw!r}: with past SMC (smc_hist_years) the SMC months must be a list of "
+                         "distinct whole months 1-12 (or absent, for the default from the seasonality)")
+    if years:     # Codex r1 P1-3: the months past SMC uses are whole, distinct calendar months (order kept)
+        bad_m = [m for m in months if not _is_num(m) or not np.isfinite(float(m)) or float(m) != int(float(m))
+                 or not 1 <= int(float(m)) <= 12]
+        if bad_m or len({int(float(m)) for m in months}) != len(list(months)) or not list(months):
+            raise ValueError(f"smc_months {list(months)!r}: with past SMC (smc_hist_years) the SMC months must be "
+                             "distinct whole months 1-12")
+    months = [int(float(m)) for m in months]
+
+    def n_rounds(x):
+        if not _is_num(x) or not np.isfinite(float(x)) or float(x) != int(float(x)) or not 1 <= int(x) <= len(months):
+            raise ValueError(f"smc_hist_rounds: {x!r} must be a whole number of rounds from 1 to the unit's "
+                             f"{len(months)} SMC months {months}")
+        return int(x)
+    if rr is None:
+        ns = [len(months)] * len(years)
+    elif isinstance(rr, (list, tuple)):
+        if len(rr) != len(years):
+            raise ValueError(f"smc_hist_rounds: {len(rr)} values for {len(years)} past SMC years (give one number, or "
+                             "one per entry of smc_hist_years)")
+        ns = [n_rounds(x) for x in rr]
+    elif _is_num(rr):
+        ns = [n_rounds(rr)] * len(years)
+    else:
+        raise ValueError(f"smc_hist_rounds must be a number or a list of numbers (got {rr!r})")
+    if not years:
+        return None
+    pairs = sorted(zip(years, ns))
+    rounds = [t for y, n in pairs for t in M.smc_targets([y], months[:n])]
+    first = min([float(d0)] + [float(t) for t in later])
+    late = [round(t, 3) for t in rounds if t >= first]
+    if late:
+        raise ValueError(f"smc_hist_years: past SMC round(s) at {late[:4]} are at or after {first:g}, the "
+                         f"delivery start {d0:g} or the first package or routine SMC round; past SMC precedes both")
+    return {"years": [y for y, _ in pairs], "rounds_per_year": [n for _, n in pairs], "months": months,
+            "rounds": rounds}
+
+
+def hist_net_types(a: dict, hist_years: list) -> list | None:
+    """v0.10: the net type of each past campaign (one per entry of itn_hist_years) from hist_net_by_year, a mapping
+    {decimal year: pyr | pbo | dual} or the string "year:type year:type ..."; a campaign not named takes hist_net.
+    None when the attribute is absent, empty or "none" (every past campaign gives hist_net: the v0.9 sim). Each year
+    must be one of itn_hist_years (within 1e-6 y) and named once. Fails closed on any other form."""
+    m = a.get("hist_net_by_year")
+    if m is None or (isinstance(m, dict) and not m) or (isinstance(m, str) and m.strip().lower() in ("", "none")):
+        return None
+    if isinstance(m, str):
+        pairs = []
+        for tok in m.split():
+            y, sep, t = tok.partition(":")
+            if not sep or not y or not t:
+                raise ValueError(f"hist_net_by_year: {tok!r} is not year:type (the string is {m!r})")
+            pairs.append((y, t))
+    elif isinstance(m, dict):
+        pairs = list(m.items())
+    else:
+        raise ValueError(f"hist_net_by_year must be a mapping {{year: net type}} or 'year:type ...' (got {m!r})")
+    default = a.get("hist_net", "pyr")
+    out = [None] * len(hist_years)
+    seen = []
+    for y, t in pairs:
+        try:
+            yf = float("nan") if isinstance(y, bool) else float(y)
+        except (TypeError, ValueError):
+            yf = float("nan")
+        if not np.isfinite(yf):
+            raise ValueError(f"hist_net_by_year: {y!r} is not a decimal year")
+        if t not in ("pyr", "pbo", "dual"):
+            raise ValueError(f"hist_net_by_year: {y!r}: net type {t!r} is not pyr, pbo or dual")
+        if any(abs(yf - z) <= 1e-6 for z in seen):
+            raise ValueError(f"hist_net_by_year: year {yf:g} is given twice")
+        seen.append(yf)
+        hit = [i for i, h in enumerate(hist_years) if abs(float(h) - yf) <= 1e-6]
+        if not hit:
+            raise ValueError(f"hist_net_by_year: {yf:g} is not a past campaign year (itn_hist_years {list(hist_years)})")
+        for i in hit:
+            out[i] = t
+    return [t if t is not None else default for t in out]
+
+
 class MalariaEngine:
     def __init__(self, fitted_path: str = FITTED, results_path: str = RESULTS):
         self.fitted = (yaml.safe_load(open(fitted_path)) or {}).get("parameters", {}) if os.path.exists(fitted_path) else {}
@@ -274,6 +396,8 @@ class MalariaEngine:
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "routine SMC in every arm after the delivery period, uncharged (v0.7)",
+                "past SMC before the delivery period and a net type per past net campaign, in every arm, uncharged "
+                "(v0.10)",
                 "expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table",
                 "microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, "
                 "15 and under, all ages; Pryce 2018 characteristics of included studies)"],
@@ -290,7 +414,13 @@ class MalariaEngine:
                 "itn_routine_interval": "years between routine net campaigns after campaign_year: every arm, net type "
                                         "hist_net, never charged (default: none)",
                 "smc_routine": "0 | 1: routine SMC every season from the delivery period's end to the window's end in "
-                               "the unit's SMC months: every arm, never charged; needs objective.delivery (default 0)"},
+                               "the unit's SMC months: every arm, never charged; needs objective.delivery (default 0)",
+                "smc_hist_years": "whole calendar years of past SMC before the delivery period, rounds in the unit's "
+                                  "SMC months: every arm, never charged (default [])",
+                "smc_hist_rounds": "optional rounds per past SMC year: one number, or one per smc_hist_years entry; "
+                                   "the first n SMC months (default: every SMC month)",
+                "hist_net_by_year": "optional net type per past campaign, {year: pyr | pbo | dual} or 'year:type ...'; "
+                                    "years from itn_hist_years; others hist_net (default none)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
@@ -423,6 +553,7 @@ class MalariaEngine:
                 raise ValueError(f"outside the delivery period [{d0:g}, {d1:g}): {', '.join(out[:4])}")
         plan["hist_years"] = [float(y) for y in a.get("itn_hist_years", [])]
         plan["hist_net"] = a.get("hist_net", "pyr")
+        plan["hist_nets"] = hist_net_types(a, plan["hist_years"])   # v0.10: None, or one net type per past campaign
         plan["routine_years"] = cls._routine_years(a, horizon)   # validated here, before any sim is built
         rs = cls._smc_routine(a, horizon)            # v0.7: and routine SMC with the package's own rounds
         if rs is not None:
@@ -431,11 +562,16 @@ class MalariaEngine:
             if bad:
                 raise ValueError("; ".join(bad))
         plan["smc_routine"] = rs
+        # v0.10: past SMC in the unit's SMC months, before the delivery period (None without smc_hist_years)
+        later = [t for c, t in timed if c == "SMC round"] + list((rs or {}).get("rounds", []))
+        plan["smc_hist"] = smc_history(a, float(d0), a.get("smc_months") or default_smc_months(season), later)
         # one intervention (itn_hist) runs past and routine campaigns, in this order (as _base_sim builds it)
-        ev += [("itn_hist", "net", f"past net campaign ({plan['hist_net']})", "history", t) for t in plan["hist_years"]]
+        hn = plan["hist_nets"] or [plan["hist_net"]] * len(plan["hist_years"])
+        ev += [("itn_hist", "net", f"past net campaign ({n})", "history", t) for t, n in zip(plan["hist_years"], hn)]
         ev += [("itn_hist", "net", f"routine net campaign ({plan['hist_net']})", "routine", t)
                for t in plan["routine_years"]]
         ev += [("smc_routine", "smc", "routine SMC round", "routine", t) for t in (rs or {}).get("rounds", [])]
+        ev += [("smc_hist", "smc", "past SMC round", "history", t) for t in (plan["smc_hist"] or {}).get("rounds", [])]
         plan["deliveries"] = ev
         # where cost drivers count (model.delivery_contains): the delivery period, or the window when none is given
         w0, w1 = (float(x) for x in horizon.window)
@@ -516,7 +652,15 @@ class MalariaEngine:
     @staticmethod
     def _burnin_key(P: dict, a: dict) -> str:
         import json
-        skip = POST_FORK | (frozenset() if a.get("hist_net", "pyr") == "dual" else DUAL_NET)
+        # v0.10: dual-AI nets in any past campaign (hist_net_by_year) and past SMC act before the fork, so their
+        # parameters join the key (delivery_plan validated both attributes before this)
+        hn = hist_net_types(a, [float(y) for y in a.get("itn_hist_years", [])]) or []
+        dual = a.get("hist_net", "pyr") == "dual" or "dual" in hn
+        skip = POST_FORK | (frozenset() if dual else DUAL_NET)
+        if a.get("smc_hist_years"):
+            skip = skip - SMC_PARAMS
+        if isinstance(a.get("hist_net_by_year"), dict):   # Codex r1 P2-5: keys of mixed type cannot be sorted
+            a = dict(a, hist_net_by_year=sorted([float(k), str(v)] for k, v in a["hist_net_by_year"].items()))
         return json.dumps({"P": {k: v for k, v in P.items() if k not in skip}, "unit": a}, sort_keys=True,
                           default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x))   # arrays in full (review P3)
 
@@ -551,7 +695,9 @@ class MalariaEngine:
                                 stop=dp["cm"]["stop"], name="cm")]
         hist = dp["hist_years"] + dp["routine_years"]
         if hist:
-            itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist"))
+            # v0.10: a net type per past campaign when hist_net_by_year is given (routine campaigns keep hist_net)
+            nts = None if dp["hist_nets"] is None else dp["hist_nets"] + [dp["hist_net"]] * len(dp["routine_years"])
+            itv.append(M.ITNCampaign(years=hist, use=use, net_type=dp["hist_net"], name="itn_hist", net_types=nts))
         itv += [M.ITNCampaign(years=[], use=use, net_type="pyr", count=True, name="itn_new"),
                 M.SMCDelivery(years=[], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"], name="smc"),
                 M.IRSRound(years=[], coverage=P["irs_coverage"], name="irs")]
@@ -559,6 +705,17 @@ class MalariaEngine:
         if rs is not None:     # v0.7: built only when set, last, so a unit without it gets the v0.6 sim exactly
             itv.append(M.SMCDelivery(years=rs["years"], months=rs["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
                                      count=False, after=rs["after"], before=rs["before"], name="smc_routine"))
+        sh = dp["smc_hist"]
+        if sh is not None:     # v0.10: built only when set, last, so a unit without it gets the v0.9 sim exactly
+            # Codex r1 P1-2: every past round runs on a step before the delivery start (the steps the sim uses)
+            yv = self._yearvec(P, horizon)
+            d0 = float(delivery_period(horizon)[0])
+            late = sorted(round(float(yv[i]), 6) for i in M.event_steps(yv, sh["rounds"]) if float(yv[i]) >= d0)
+            if late:
+                raise ValueError(f"smc_hist_years: past SMC round(s) run on step(s) {late[:4]}, at or after the "
+                                 f"delivery start {d0:g}")
+            itv.append(M.SMCDelivery(years=sh["years"], months=sh["months"], pe=P["smc_pe"], hi_frac=P["smc_hi_frac"],
+                                     count=False, times=sh["rounds"], name="smc_hist"))
         if cfg is not None:
             self._configure({i.name: i for i in itv}, None, P, cfg)
         sim = ss.Sim(people=_people(n0), start=float(horizon.start) - B, stop=float(horizon.stop),
@@ -581,6 +738,8 @@ class MalariaEngine:
         smc.pe, smc.hi_frac = P["smc_pe"], P["smc_hi_frac"]
         if "smc_routine" in itv:   # v0.7: routine rounds act after the fork, with the member's own SMC parameters
             itv["smc_routine"].pe, itv["smc_routine"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
+        if "smc_hist" in itv:      # v0.10: the burn-in key holds the SMC parameters, so this is the shared value
+            itv["smc_hist"].pe, itv["smc_hist"].hi_frac = P["smc_pe"], P["smc_hi_frac"]
         irs.years = list(cfg["irs"]["years"]) if cfg["irs"] else []
         if cfg["irs"]:
             irs.month = int(cfg["irs"]["month"])
@@ -822,7 +981,16 @@ def to_jsonable(o: Outcomes) -> dict:
     return {"per_capita": o.per_capita, "windows": o.windows, "cost_drivers": o.cost_drivers, "meta": o.meta}
 
 
+def _self_test_unit() -> UnitSpec:
+    """The unit every self-test section starts from (here and in selftest_late.py)."""
+    return UnitSpec("t", {"m0": 8.0, "season": [1.0] * 12, "resistance": 0.5, "species": {"gambiae": 0.7, "arabiensis": 0.3},
+                          "cm_ft": 0.3, "itn_use": 0.6, "itn_hist_years": [2016.3], "campaign_year": 2018.1})
+
+
 def _self_test() -> int:
+    """Cases M1-M21 and the v0.5-v0.7 sections. The v0.8-v0.10 sections run in a second process,
+    `python3 toolkit/engines/malaria/selftest_late.py --self-test`, so each module stays well inside CI's per-test
+    time limit (scripts/self_tests.py discovers and runs both)."""
     fails = []
 
     def ok(cond, msg):
@@ -832,8 +1000,7 @@ def _self_test() -> int:
 
     e = MalariaEngine()
     e_par = {"n_agents": 600, "burnin_years": 0}      # mechanism tests: no burn-in (v0.5 cases below)
-    unit = UnitSpec("t", {"m0": 8.0, "season": [1.0] * 12, "resistance": 0.5, "species": {"gambiae": 0.7, "arabiensis": 0.3},
-                          "cm_ft": 0.3, "itn_use": 0.6, "itn_hist_years": [2016.3], "campaign_year": 2018.1})
+    unit = _self_test_unit()
     h = Horizon(2015.0, 2019.0, (2018.0, 2019.0), {"pre": [2017.0, 2018.0], "post": [2018.3, 2019.0]})
 
     class Small(MalariaEngine):
@@ -953,8 +1120,6 @@ def _self_test() -> int:
     _self_test_v05(ok, e, unit)
     _self_test_v06(ok, e, unit)
     _self_test_v07(ok, e, unit)
-    _self_test_v08(ok, e, unit)
-    _self_test_v09(ok, e, unit)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1693,7 +1858,7 @@ def _self_test_v09(ok, e, unit) -> None:
     def n0():
         specs = {p.name: p for p in e.parameters()}
         k, med = specs.get("net_survival_k"), specs["net_retention_half"]
-        ok(VERSION == "0.9" and k is not None and k.kind == "fixed" and k.value == 20.0 and k.lo is None
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 9) and k is not None and k.kind == "fixed" and k.value == 20.0 and k.lo is None
            and "Supplementary Note 1.4" in k.source and med.value == 1.64 * 365 and med.lo == 1.33 * 365
            and med.hi == 2.37 * 365 and "median" in med.source and "exponential" not in med.source,
            "N0 engine v0.9: k = 20 is a fixed, sourced parameter; net_retention_half stays the median (1.64 y, card "
@@ -1836,6 +2001,237 @@ def _self_test_v09(ok, e, unit) -> None:
            f"N7 net age in the loss hazard is 0 on a campaign's step and 1 the next day, for first nets and for "
            f"replacements of nets still held ({len(both)} people, campaign steps {s1}, {s2})")
     case("N7", n7)
+
+
+def _self_test_v010(ok, e, unit) -> None:
+    """v0.10: past SMC (smc_hist_years, optional smc_hist_rounds) and a net type per past net campaign
+    (hist_net_by_year). Past SMC runs through the same SMC intervention as the package's, uncharged, before the
+    delivery period, in every arm. With the attributes absent or empty a run is byte-identical to v0.9 (H3;
+    benchmarks/restamp_proof.py compares the v0.9 and v0.10 code)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    from toolkit.engines import hooks as HK
+    from toolkit.engines.horizon import DeliveryHorizon
+    from toolkit.engines.malaria import model as MM
+    base = {"n_agents": 800, "burnin_years": 2}
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    months = default_smc_months(np.asarray(season))          # (6, 7, 8, 9) for this season
+    wins = {"y14": [2014.0, 2015.0], "y15": [2015.0, 2016.0], "d": [2016.0, 2017.0]}
+    attrs = dict(unit.attributes, season=season, itn_hist_years=[2014.3, 2015.2], campaign_year=2016.1, irs_month=4)
+    hd = DeliveryHorizon(2014.0, 2018.0, (2016.0, 2018.0), dict(wins), delivery=(2016.0, 2017.0))
+    # the runs below use a shorter horizon (CI time): 2015 for past SMC and one delivery year, one burn-in year
+    hs = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"y15": [2015.0, 2016.0], "d": [2016.0, 2017.0]},
+                         delivery=(2016.0, 2017.0))
+    small = {"n_agents": 300, "burnin_years": 1}
+    none, smc = Package("none", {}), Package("smc", {"smc": 1})
+    full = Package("full", {"net": "pyr", "smc": 1, "irs": 1, "cm": 1})
+    strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                       {k: v for k, v in o.meta.items() if k != "seconds"})
+
+    def refused(at, needle, label, pkg=none):
+        try:
+            e.schedule(base, UnitSpec("t", dict(attrs, **at)), pkg, hd)
+            ok(False, label)
+        except ValueError as ex:
+            ok(needle in str(ex), f"{label} ({ex})")
+
+    def h0():
+        ua = e.describe().unit_attributes
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 10)
+           and {"smc_hist_years", "smc_hist_rounds", "hist_net_by_year"} <= set(ua),
+           "H0 engine v0.10 declares smc_hist_years, smc_hist_rounds and hist_net_by_year on its card")
+        b = yaml.safe_load(open(os.path.join(HERE, "attribute_binding.yaml")))["attribute_binding"]
+        ok(all(isinstance(b.get(k), dict) and "default" in b[k] and str(b[k].get("meaning") or "").strip()
+               for k in ("smc_hist_years", "smc_hist_rounds", "hist_net_by_year"))
+           and str(b["smc_hist_years"]["default"]) == "[]" and str(b["hist_net_by_year"]["default"]) == "none",
+           "H0b attribute_binding.yaml gives each new attribute a default and its meaning (no past SMC; every past "
+           "campaign's net type is hist_net)")
+    case("H0", h0)
+
+    def h1():
+        uh = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015]))
+        want = sorted(y + (m - 1) / 12 for y in (2014, 2015) for m in months)
+        for pkg in (none, full):
+            ev = e.schedule(base, uh, pkg, hd)
+            past = [x for x in ev if x["component"] == "smc" and x["kind"] == "history"]
+            ok(len(past) == len(want) and all(abs(x["t0"] - t) < 1.0 / 365 for x, t in zip(past, want))
+               and all(x["charged"] is False and x["label"] == "past SMC round" for x in past),
+               f"H1 ({pkg.id}) the schedule lists the past SMC rounds at their dates, as history, uncharged: "
+               f"{[round(x['t0'], 3) for x in past]}")
+            sim, _ = e.build_sim(base, uh, pkg, hd, 3)
+            sim.init()
+            itv, yv = sim.interventions, np.asarray(sim.t.yearvec)
+            ran = sorted(round(float(yv[i]), 9) for i in MM._event_tis(sim, itv["smc_hist"].targets()))
+            ok(ran == sorted(round(x["t0"], 9) for x in past) and isinstance(itv["smc_hist"], MM.SMCDelivery)
+               and itv["smc_hist"].count is False,
+               f"H1b ({pkg.id}) the sim runs past SMC through the SMC intervention, uncounted, on the listed steps")
+        HK.schedule(e, base, uh, full, hd)      # the hooks checker accepts history SMC before the delivery period
+        ur = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015], smc_hist_rounds=[2, 3]))
+        near = lambda a, b: len(a) == len(b) and all(abs(x - y) < 1.0 / 365 for x, y in zip(a, b))  # noqa: E731
+        got = sorted(x["t0"] for x in e.schedule(base, ur, none, hd) if x["component"] == "smc")
+        w2 = sorted(y + (m - 1) / 12 for y, k in ((2014, 2), (2015, 3)) for m in months[:k])
+        ok(near(got, w2), f"H1c smc_hist_rounds gives each past year its first n SMC months: {[round(x, 3) for x in got]}")
+        us = UnitSpec("t", dict(attrs, smc_hist_years=[2015], smc_hist_rounds=2))
+        got = sorted(x["t0"] for x in e.schedule(base, us, none, hd) if x["component"] == "smc")
+        ok(near(got, sorted(2015 + (m - 1) / 12 for m in months[:2])),
+           f"H1d one number in smc_hist_rounds applies to every past year: {[round(x, 3) for x in got]}")
+    case("H1", h1)
+
+    def h2():
+        uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
+        u0 = UnitSpec("t", dict(attrs))
+        p = {"n_agents": 1000, "burnin_years": 1}
+        # one run per unit gives the series and the outcomes (run_series reads run_batch's member loop, S7)
+        (oh,), (sh,) = e._run_members([p], [uh], [none], hs, 5, series=["inc_u5"])
+        (o0,), (s0,) = e._run_members([p], [u0], [none], hs, 5, series=["inc_u5"])
+        t = np.asarray(sh["t"])
+        first = 2015 + (months[0] - 1) / 12
+        pre = t < first - 1e-9
+        ok(np.array_equal(np.asarray(sh["values"]["inc_u5"])[pre], np.asarray(s0["values"]["inc_u5"])[pre]),
+           "H2 the trajectory is identical before the first past SMC round")
+        on = (t >= first - 1e-9) & (t < 2015 + months[-1] / 12 - 1e-9)
+        a, b = float(np.sum(np.asarray(sh["values"]["inc_u5"])[on])), float(np.sum(np.asarray(s0["values"]["inc_u5"])[on]))
+        ok(a < 0.7 * b, f"H2b under-5 clinical incidence is lower in the past SMC months of 2015 ({a:.3f} vs {b:.3f} "
+                        "without past SMC)")
+        paid = ("nets_given", "smc_doses", "irs_sprayed")           # treated_all follows the health outcomes
+        ok(oh.windows["y15"]["inc_u5_smc"] < 0.7 * o0.windows["y15"]["inc_u5_smc"]
+           and all(oh.cost_drivers[k] == o0.cost_drivers[k] for k in paid) and oh.cost_drivers["smc_doses"] == 0,
+           f"H2c past SMC acts in 2015 ({oh.windows['y15']['inc_u5_smc']:.3f} vs {o0.windows['y15']['inc_u5_smc']:.3f}) "
+           f"and is never charged ({oh.cost_drivers})")
+    case("H2", h2)
+
+    def h3():
+        pk = [none, full]
+        ref = [strip(o) for o in e.run_batch([small] * 2, UnitSpec("t", attrs), pk, hs, 5)]
+        ref_names = None
+        for extra, nm in (({"smc_hist_years": []}, "smc_hist_years []"),
+                          ({"smc_hist_years": [], "smc_hist_rounds": 4}, "smc_hist_rounds without past years"),
+                          ({"hist_net_by_year": {}}, "hist_net_by_year {}"),
+                          ({"hist_net_by_year": ""}, "hist_net_by_year ''"),
+                          ({"hist_net_by_year": "none"}, "hist_net_by_year 'none'"),
+                          ({"hist_net_by_year": {2014.3: "pyr", 2015.2: "pyr"}}, "every campaign at hist_net")):
+            ux = UnitSpec("t", dict(attrs, **extra))
+            got = [strip(o) for o in e.run_batch([small] * 2, ux, pk, hs, 5)]
+            ok(got == ref, f"H3 ({nm}) byte-identical outcomes, cost drivers and meta to the attributes absent")
+            sim, _ = e.build_sim(small, ux, full, hs, 5)
+            sim.init()
+            names = list(sim.interventions.keys())
+            if ref_names is None:
+                s0, _ = e.build_sim(small, UnitSpec("t", attrs), full, hs, 5)
+                s0.init()
+                ref_names = list(s0.interventions.keys())
+            ok(names == ref_names, f"H3b ({nm}) the same interventions as v0.9: {names}")
+    case("H3", h3)
+
+    def h4():
+        for at, label in (({"smc_hist_years": "2014 2015"}, "a string, not a list"),
+                          ({"smc_hist_years": 2015}, "a number, not a list"),
+                          ({"smc_hist_years": [2014.5]}, "a fractional year"),
+                          ({"smc_hist_years": [2015, 2015]}, "a repeated year"),
+                          ({"smc_hist_years": [float("nan")]}, "NaN"),
+                          ({"smc_hist_years": [True]}, "a boolean"),
+                          ({"smc_hist_years": ["2015"]}, "a string year"),
+                          ({"smc_hist_years": [2016]}, "a year in the delivery period"),
+                          ({"smc_hist_years": [2015], "smc_hist_rounds": 0}, "0 rounds"),
+                          ({"smc_hist_years": [2015], "smc_hist_rounds": 5}, "more rounds than SMC months"),
+                          ({"smc_hist_years": [2015], "smc_hist_rounds": 2.5}, "fractional rounds"),
+                          ({"smc_hist_years": [2014, 2015], "smc_hist_rounds": [4]}, "a rounds list of another length"),
+                          ({"smc_hist_years": [2015], "smc_hist_rounds": "4"}, "rounds as a string")):
+            key = "smc_hist_rounds" if "smc_hist_rounds" in at else "smc_hist_years"
+            refused(at, key, f"H4 smc_hist_years / smc_hist_rounds: {label} fails closed")
+        for at, label in (({"hist_net_by_year": {2015.2: "olyset"}}, "an unknown net type"),
+                          ({"hist_net_by_year": {2015.25: "pbo"}}, "a year that is not a past campaign"),
+                          ({"hist_net_by_year": "2015.2-pbo"}, "a malformed string"),
+                          ({"hist_net_by_year": "2015.2:pbo 2015.2:dual"}, "a year given twice"),
+                          ({"hist_net_by_year": ["pbo"]}, "a list"),
+                          ({"hist_net_by_year": {"x": "pbo"}}, "a non-numeric year"),
+                          ({"hist_net_by_year": {2015.2: "none"}}, "net type none")):
+            refused(at, "hist_net_by_year", f"H4b hist_net_by_year: {label} fails closed")
+        try:
+            e.run(base, UnitSpec("t", dict(attrs, smc_hist_years=[2016.5])), none, hd, 1)
+            ok(False, "H4c the sim path refuses a malformed past SMC year too")
+        except ValueError as ex:
+            ok("smc_hist_years" in str(ex), f"H4c the sim path refuses a malformed past SMC year too ({ex})")
+    case("H4", h4)
+
+    def h5():
+        p = dict(base, n_agents=1000, burnin_years=0)
+        yrs = [2014.3, 2015.2]
+        for form, mp in (("mapping", {2015.2: "dual"}), ("string", "2015.2:dual"), ("string keys", {"2015.2": "dual"})):
+            ux = UnitSpec("t", dict(attrs, hist_net="pbo", hist_net_by_year=mp, itn_routine_interval=1.0))
+            ev = e.schedule(p, ux, none, hd)
+            lab = [(round(x["t0"], 2), x["label"]) for x in ev if x["component"] == "net"]
+            ok(lab[:2] == [(2014.3, "past net campaign (pbo)"), (2015.2, "past net campaign (dual)")]
+               and all(lb == "routine net campaign (pbo)" for _, lb in lab[2:]) and len(lab) > 2,
+               f"H5 ({form}) the schedule names each past campaign's own net type; routine campaigns keep hist_net: {lab}")
+            sim, _ = e.build_sim(p, ux, none, hd, 4)
+            sim.init()
+            yv = np.asarray(sim.t.yearvec)
+            s1, s2 = sorted(MM.event_steps(yv, yrs))
+            dz = sim.diseases.malaria
+            got = {}
+            for s in (s1, s2):
+                sim.run(until=yv[s])
+                uu = sim.people.auids
+                new = np.asarray(dz.net_t[uu]) == s
+                got[s] = sorted(set(np.asarray(dz.net_type[uu])[new].tolist()))
+            ok(got[s1] == [float(V.NET_CODE["pbo"])] and got[s2] == [float(V.NET_CODE["dual"])],
+               f"H5b ({form}) the 2014.3 campaign gives hist_net (pbo) nets and the 2015.2 campaign dual-AI nets: {got}")
+    case("H5", h5)
+
+    def h6():
+        uh = UnitSpec("t", dict(attrs, smc_hist_years=[2015]))
+        ps = [dict(small, smc_pe=0.6), dict(small, smc_pe=0.9)]
+        b = e.run_batch(ps, uh, none, hs, 3)
+        solo = [e.run(q, uh, none, hs, 3) for q in ps]
+        ok([o.meta["burnin_members"] for o in b] == [1, 1] and [strip(o) for o in b] == [strip(o) for o in solo],
+           "H6 with past SMC, parameter sets that differ in smc_pe do not share a burn-in (it acts before the fork); "
+           "each member equals its own run")
+        b0 = e.run_batch(ps, UnitSpec("t", attrs), none, hs, 3)
+        ok([o.meta["burnin_members"] for o in b0] == [2, 2], "H6b without past SMC they still share one (v0.9)")
+        ud = UnitSpec("t", dict(attrs, hist_net_by_year={2015.2: "dual"}))
+        pc = [dict(small, cfp_kill=0.2), dict(small, cfp_kill=0.6)]
+        bd = e.run_batch(pc, ud, none, hs, 3)
+        ok([o.meta["burnin_members"] for o in bd] == [1, 1]
+           and [strip(o) for o in bd] == [strip(e.run(q, ud, none, hs, 3)) for q in pc],
+           "H6c a past dual-AI campaign from hist_net_by_year puts cfp_kill in the burn-in key, as hist_net: dual does")
+    case("H6", h6)
+
+    def h7():
+        # Codex r1 P1-1: without a delivery period the package's SMC may start in the window's first calendar year,
+        # before the window; a past round must not coincide with (or follow) a package or routine SMC round
+        hn = Horizon(2023.0, 2026.0, (2024.5, 2026.0), {})
+        un = UnitSpec("t", dict(attrs, campaign_year=2024.5, smc_months=[5, 6, 7, 8], smc_hist_years=[2024],
+                                smc_hist_rounds=2))
+        for fn, nm in ((lambda: e.schedule(base, un, smc, hn), "schedule"), (lambda: e.run(base, un, smc, hn, 1), "run")):
+            try:
+                fn()
+                ok(False, f"H7 ({nm}) a past SMC round on a package SMC round is refused")
+            except ValueError as ex:
+                ok("smc_hist_years" in str(ex), f"H7 ({nm}) a past SMC round on a package SMC round is refused ({ex})")
+        # Codex r1 P1-2: a round dated before the delivery start that the sim runs on a step at or after it
+        hb = DeliveryHorizon(2023.0, 2025.0, (2023.167, 2025.0), {}, delivery=(2023.167, 2024.0))
+        ub = UnitSpec("t", dict(attrs, campaign_year=2023.5, smc_months=[3], smc_hist_years=[2023]))
+        try:
+            e.run({"n_agents": 200, "burnin_years": 0}, ub, none, hb, 1)
+            ok(False, "H7b a past round executed at or after the delivery start is refused in the sim path")
+        except ValueError as ex:
+            ok("smc_hist_years" in str(ex), f"H7b a past round executed at or after the delivery start is refused in "
+                                            f"the sim path ({ex})")
+        # Codex r1 P1-3: SMC months the past rounds use must be whole, distinct months 1-12
+        for mo in ([7.9], [0], [13], [True], [7, 7], False, 0, "6 7", 7):     # Codex r2 P1: falsy and non-list values too
+            refused({"smc_months": mo, "smc_hist_years": [2015]}, "smc_months",
+                    f"H7c with past SMC, smc_months {mo} fails closed")
+        # Codex r1 P2-5: year keys of mixed type are accepted by the run as by the schedule
+        um = UnitSpec("t", dict(attrs, hist_net_by_year={2014.3: "pbo", "2015.2": "dual"}))
+        o = e.run({"n_agents": 200, "burnin_years": 0}, um, none, hs, 1)
+        ok(o.per_capita is not None, "H7d hist_net_by_year with float and string year keys runs (burn-in key)")
+    case("H7", h7)
+
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""

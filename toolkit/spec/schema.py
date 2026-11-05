@@ -24,7 +24,8 @@ docs/design/v2-spec-and-analysis.md §1):
       label: name                          # optional
       region: region_column                # optional: region-level effects and uncertainty
       engine_attributes:                   # engine unit attribute <- column(s) or a value
-        a: {column: col}                   # {column, split}, {columns: [..] or {k: col}}, {value, source}
+        a: {column: col}                   # {column, split[, empty]}, {columns: [..] or {k: col}}, {value, source}
+                                           # (empty: the cell token of an empty list, e.g. "none")
       populations:                         # population group <- unit column and engine age groups
         all: {column: pop, age_groups: [all]}
       defaults_accepted: {attr: "<reason>"}   # an engine card default taken by name (the card's attribute_binding.yaml);
@@ -322,7 +323,12 @@ class Spec:
                 out[attr] = m["value"]
             elif "column" in m:
                 v = row[m["column"]]
-                out[attr] = [float(x) for x in str(v).split(m["split"])] if "split" in m else _num(v)
+                if "split" not in m:
+                    out[attr] = _num(v)
+                elif "empty" in m and str(v).strip() == str(m["empty"]).strip():
+                    out[attr] = []          # the declared token of an empty list (a blank cell is refused)
+                else:
+                    out[attr] = [float(x) for x in str(v).split(m["split"])]
             elif isinstance(m["columns"], dict):
                 out[attr] = {k: float(row[c]) for k, c in m["columns"].items()}
             else:
@@ -729,6 +735,12 @@ def _validate(s: Spec) -> list[str]:
             bad.append(f"decision_units.engine_attributes.{attr}: must be a mapping")
         elif "column" in m:
             need.add(m["column"])
+            if "empty" in m and ("split" not in m or not isinstance(m["empty"], str) or not m["empty"].strip()
+                                 or any(isinstance(_num(x), float) for x in [m["empty"]]
+                                        + (m["empty"].split(m["split"]) if isinstance(m["empty"], str) else []))):
+                # Codex r1 P1-4 / P2-6: a non-blank, non-numeric string, so no reader can take the token for data
+                bad.append(f"decision_units.engine_attributes.{attr}: `empty` (the token of an empty list) needs "
+                           "`split` and a non-blank, non-numeric string (e.g. none)")
         elif "columns" in m:
             need |= set(m["columns"].values() if isinstance(m["columns"], dict) else m["columns"])
         elif "value" not in m:
@@ -1213,6 +1225,28 @@ def _self_test() -> int:
             "SP7 an envelope below its fixed costs is refused")
         bad(lambda r: r["uncertainty"].update(excluded=[{"kind": "costs", "reason": "toy"}]), "neither declared",
             "SP8 lesson 6: an uncertainty source neither declared nor excluded with a reason is refused")
+        # a list column whose empty list is written as a declared token (a blank cell is refused as
+        # attribute_column_empty, so an empty list needs an explicit marker)
+        ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}
+        sx = Spec({"decision_units": {"engine_attributes": ea}}, d)
+        try:
+            got = [sx.unit_attributes({"yrs": v})["yrs"] for v in ("none", "2019 2020", " none ")]
+            ok(got == [[], [2019.0, 2020.0], []], f"SP8b a split column's declared empty token gives []: {got}")
+        except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+            ok(False, f"SP8b a split column's declared empty token gives [] ({type(e).__name__}: {e})")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "empty": "none"}),
+            "empty", "SP8c `empty` without `split` is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": " "}),
+            "empty", "SP8d a blank `empty` token is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": None}),
+            "empty", "SP8e a null `empty` token is refused (Codex r1 P1-4)")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": -1}),
+            "empty", "SP8f a non-string `empty` token is refused")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ", "empty": "-1"}),
+            "empty", "SP8g a numeric `empty` token is refused (a reader could plot it as data; Codex r1 P2-6)")
+        bad(lambda r: r["decision_units"]["engine_attributes"].update(x={"column": "cov", "split": " ",
+                                                                         "empty": "none 2020"}),
+            "empty", "SP8h an `empty` token with a numeric piece after the split is refused (Codex r2 P2)")
         bad(lambda r: r["uncertainty"]["excluded"][0].update(reason=""), "neither declared",
             "SP9 an exclusion without a reason is refused")
         bad(lambda r: r["constraints"].update(group_rules=[{"id": "g", "components": ["a"], "by": "nocol"}]),

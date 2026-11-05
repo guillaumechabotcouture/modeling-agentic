@@ -413,10 +413,27 @@ def irs_targets(years, month) -> list:
 
 
 class ITNCampaign(ss.Intervention):
-    """Mass campaign(s) at given decimal years reaching achieved use `use`."""
-    def __init__(self, years=(), use=0.55, net_type='pyr', count=False, name=None):
+    """Mass campaign(s) at given decimal years reaching achieved use `use`.
+    v0.10: `net_types` (optional, one net type per entry of `years`) gives each campaign its own net type; a step
+    reached by several campaigns takes the type of the first of them in `years` (as the schedule lists it). None:
+    every campaign gives `net_type`."""
+    def __init__(self, years=(), use=0.55, net_type='pyr', count=False, name=None, net_types=None):
         super().__init__(name=name)
         self.years, self.use, self.code, self.count = list(years), use, V.NET_CODE[net_type], count
+        if net_types is not None and len(net_types) != len(self.years):
+            raise ValueError(f"ITNCampaign: {len(net_types)} net types for {len(self.years)} campaign years")
+        self.codes = None if net_types is None else [V.NET_CODE[t] for t in net_types]
+
+    def _code(self):
+        if self.codes is None:
+            return self.code
+        if not hasattr(self, '_codes'):
+            yv = self.sim.t.yearvec
+            self._codes = {}
+            for y, c in zip(self.years, self.codes):
+                for ti in event_steps(yv, [y]):
+                    self._codes.setdefault(ti, c)
+        return self._codes.get(self.ti, self.code)
 
     def step(self):
         if not hasattr(self, '_tis'):
@@ -427,7 +444,7 @@ class ITNCampaign(ss.Intervention):
             give = u[dz.prop_net[u] < self.use]
             dz.has_net[give] = True
             dz.net_t[give] = self.ti
-            dz.net_type[give] = self.code
+            dz.net_type[give] = self._code()
             if self.count and dz.in_delivery():
                 dz.acc_cost['nets_given'] += len(give) / len(u)
 
@@ -455,16 +472,21 @@ class SMCDelivery(ss.Intervention):
     """SMC monthly cycles for 3-59 months: clears infection, 28-day protection with
     efficacy `pe`; semi-correlated cycle coverage (high / low access groups).
     v0.7: `count` False never adds doses to the cost driver (routine SMC); `after` / `before` keep only the rounds
-    at decimal times after <= t < before (None: no bound)."""
+    at decimal times after <= t < before (None: no bound).
+    v0.10: `times` (optional) gives the rounds' decimal times directly (past SMC, whose rounds per year may differ);
+    None: the rounds are the month starts of `months` in `years`."""
     def __init__(self, years=(), months=(7, 8, 9, 10), pe=0.882, hi_frac=0.85, p_hi=0.95, p_lo=0.5, name=None,
-                 count=True, after=None, before=None):
+                 count=True, after=None, before=None, times=None):
         super().__init__(name=name)
         self.years, self.months, self.pe = list(years), list(months), pe
         self.hi_frac, self.p_hi, self.p_lo = hi_frac, p_hi, p_lo
         self.count, self.after, self.before = count, after, before
+        self.times = None if times is None else [float(t) for t in times]
 
     def targets(self):
         """The decimal times of the rounds."""
+        if self.times is not None:
+            return list(self.times)
         return smc_targets(self.years, self.months, self.after, self.before)
 
     def step(self):
