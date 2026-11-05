@@ -63,10 +63,17 @@ def gate_findings(run_dir: str) -> list[dict]:
     exp = man.get("expected") or {}
     kinds = {e.get("kind") for e in (man.get("artifacts") or {}).values()}
     roles = {e.get("role") for e in (man.get("deliverables") or {}).values()}
-    need_k = set(EXPECTED_KINDS) | set(exp.get("kinds") or [])
+    base_k, base_r = EXPECTED_KINDS, EXPECTED_ROLES
+    if man.get("deliverable_kind") == "estimates":      # no allocation units (toolkit/analysis/estimates.py)
+        from toolkit.analysis.estimates import EXPECTED_KINDS as base_k, EXPECTED_ROLES as base_r
+        cur_kind = _deliverable_kind(run_dir)
+        if cur_kind != "estimates":
+            out.append(_f("analysis_contract_stale", f"the manifest records an estimates run, the spec's deliverable "
+                                                     f"kind is {cur_kind!r}"))
+    need_k = set(base_k) | set(exp.get("kinds") or [])
     for k in sorted(need_k - kinds):
         out.append(_f("analysis_contract_incomplete", f"the completed run has no {k} artifact", k))
-    for r in sorted(set(EXPECTED_ROLES) - roles):
+    for r in sorted(set(base_r) - roles):
         out.append(_f("analysis_contract_incomplete", f"the completed run has no {r} deliverable", r))
     listed = set(man.get("deliverables") or {})
     for tid, rel in sorted((exp.get("decision_tests") or {}).items()):
@@ -142,6 +149,13 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
     return out
+
+
+def _deliverable_kind(run_dir):
+    try:
+        return ((yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("deliverable") or {}).get("kind")
+    except (OSError, yaml.YAMLError, AttributeError):
+        return None
 
 
 def _calibration(rel, d) -> list[dict]:

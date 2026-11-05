@@ -70,24 +70,252 @@ def _isnum(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
 
 
-def gi_from_spec(raw, base=None):
-    raise NotImplementedError("estimates deliverable: tests first; the implementation is the next commit")
+def _read_csv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
-def engine_config(raw):
-    raise NotImplementedError("estimates deliverable: tests first; the implementation is the next commit")
+def gi_from_spec(raw: dict, base: str | None = None) -> dict:
+    """{dt, w} from dynamics.generation_interval: the declared values, checked against the cited csv when `base`
+    is given (ValueError on a mismatch: the values must be the file's, lag by lag from lag 1)."""
+    gi = (raw.get("dynamics") or {}).get("generation_interval") or {}
+    vals = gi.get("values")
+    if not isinstance(vals, list) or not vals or not all(_isnum(v) for v in vals):
+        raise ValueError("dynamics.generation_interval.values: the distribution's values, lag 1 first")
+    if gi.get("step") not in STEPS:
+        raise ValueError(f"dynamics.generation_interval.step: one of {STEPS}")
+    if base is not None:
+        for k in ("csv", "lag", "probability"):
+            if not str(gi.get(k) or "").strip():
+                raise ValueError(f"dynamics.generation_interval.{k}: required (the cited file and its columns)")
+        p = gi["csv"] if os.path.isabs(gi["csv"]) else os.path.join(base, gi["csv"])
+        rows = _read_csv(p)
+        try:
+            pairs = sorted((int(float(r[gi["lag"]])), float(r[gi["probability"]])) for r in rows)
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"dynamics.generation_interval: {gi['csv']} unreadable as lag/probability: {e}") from None
+        lags = [a for a, _ in pairs]
+        if lags != list(range(1, len(lags) + 1)):
+            raise ValueError(f"dynamics.generation_interval: {gi['csv']} lags must be 1..L without gaps ({lags})")
+        if len(pairs) != len(vals) or any(abs(b - float(v)) > 1e-12 for (_, b), v in zip(pairs, vals)):
+            raise ValueError(f"dynamics.generation_interval.values {vals} differ from {gi['csv']} "
+                             f"({[b for _, b in pairs]})")
+    return {"dt": gi["step"], "w": [float(v) for v in vals]}
 
 
-def validate_pending(s):
-    raise NotImplementedError("estimates deliverable: tests first; the implementation is the next commit")
+def engine_config(raw: dict) -> dict:
+    """The engine configuration an estimates spec implies (for engines configured from `dynamics`)."""
+    d = raw.get("dynamics") or {}
+    gi = gi_from_spec(raw)
+    return {"generation_interval": gi, "dt": gi["dt"], "transmissibility": d.get("transmissibility", "constant")}
 
 
-def validate(s, eng):
-    raise NotImplementedError("estimates deliverable: tests first; the implementation is the next commit")
+def _source_params(sources) -> dict:
+    """{param: prior} of every observation parameter: bias mechanisms, frame gaps and a declared dispersion."""
+    out = {}
+    for s in sources or []:
+        for b in s.get("bias") or [] if isinstance(s.get("bias"), list) else []:
+            if isinstance(b, dict) and b.get("param"):
+                out[b["param"]] = b.get("prior")
+        for e in ((s.get("frame") or {}).get("excluded") or []):
+            if isinstance(e, dict) and e.get("param"):
+                out[e["param"]] = e.get("relative_value_prior")
+        disp = (s.get("noise") or {}).get("dispersion")
+        if isinstance(disp, dict) and disp.get("param"):
+            out[disp["param"]] = disp.get("prior")
+    return out
 
 
-def needs(raw):
-    raise NotImplementedError("estimates deliverable: tests first; the implementation is the next commit")
+def validate_pending(s) -> list[str]:
+    """Engine-independent checks (sign-off with engine: auto)."""
+    r = s.raw
+    bad = [f"missing section {k}" for k in REQUIRED if k not in r]
+    if bad:
+        return bad
+    bad += [f"{k}: not part of an estimates spec (no allocation): remove it" for k in NOT_APPLICABLE if k in r]
+    from toolkit.spec.schema import SCHEMA_VERSION
+    if r["schema_version"] != SCHEMA_VERSION:
+        return [f"schema_version {r['schema_version']!r} is not {SCHEMA_VERSION}"]
+    for k in ("question", "decision_maker"):
+        if not str(r.get(k) or "").strip():
+            bad.append(f"{k}: empty")
+    if not (_isnum(r["decision_date"]) or (isinstance(r["decision_date"], str) and r["decision_date"][:4].isdigit())):
+        bad.append("decision_date: give a year or an ISO date")
+    h = r["horizon"]
+    if not (isinstance(h, dict) and _isnum(h.get("start")) and _isnum(h.get("stop")) and h["start"] < h["stop"]):
+        return bad + ["horizon: start < stop (numbers)"]
+    try:
+        units = s.units()
+    except (OSError, KeyError, TypeError) as e:
+        return bad + [f"decision_units: units table unreadable: {e}"]
+    if len(units) != 1:
+        bad.append(f"decision_units: an estimates spec describes one population (one row); the table has {len(units)}")
+    try:
+        gi_from_spec(r, s.base)
+    except (OSError, ValueError) as e:
+        bad.append(str(e))
+    tr = (r.get("dynamics") or {}).get("transmissibility", "constant")
+    if tr != "constant" and not (isinstance(tr, dict) and isinstance(tr.get("knots"), list) and tr["knots"]
+                                 and all(_isnum(x) and h["start"] < x < h["stop"] for x in tr["knots"])):
+        bad.append("dynamics.transmissibility: constant | {knots: [t, ...]} with each knot inside the horizon")
+    # observation sources
+    from toolkit.analysis import observation as ob
+    srcs = (r.get("observations") or {}).get("sources")
+    bad += [f"{code}: observations: {m}" for code, m in ob.check_sources(srcs)]
+    ids = {x.get("id") for x in srcs or [] if isinstance(x, dict)}
+    for x in srcs or []:
+        if not isinstance(x, dict):
+            continue
+        disp = (x.get("noise") or {}).get("dispersion")
+        if (x.get("noise") or {}).get("model") == "negbin" and not (
+                (_isnum(disp) and disp > 0) or (isinstance(disp, dict) and disp.get("param")
+                                                and ob._prior_ok(disp.get("prior")) and str(disp.get("source") or ""))):
+            bad.append(f"observations.{x.get('id')}.noise.dispersion: a number > 0 or {{param, prior, source}}")
+        dl = x.get("delay")
+        if dl is not None:
+            pmf = dl.get("pmf") if isinstance(dl, dict) else None
+            if not (isinstance(pmf, list) and pmf and all(_isnum(v) and v >= 0 for v in pmf)
+                    and abs(sum(pmf) - 1) < 1e-9 and str(dl.get("source") or "").strip()):
+                bad.append(f"observations.{x.get('id')}.delay: {{pmf: [p_0, ...] summing to 1, source}}")
+    # calibration
+    cal = r["calibration"]
+    if not isinstance(cal, dict) or cal.get("method") != "posterior":
+        return bad + ["calibration.method: posterior (an estimates spec calibrates by its declared priors)"]
+    from toolkit.analysis.calibration import Prior
+    pri = cal.get("priors") or {}
+    if not isinstance(pri, dict) or not pri:
+        bad.append("calibration.priors: every quantity the calibration moves, with its prior and source")
+    for n, d in (pri or {}).items():
+        try:
+            Prior.from_decl(n, d)
+        except ValueError as e:
+            bad.append(f"calibration.priors.{n}: {e}")
+        if not str((d or {}).get("source") or "").strip():
+            bad.append(f"calibration.priors.{n}: a source is required")
+    for n, d in _source_params(srcs).items():
+        if n in pri:
+            bad.append(f"calibration.priors.{n}: declared again; observation parameters take their prior from the "
+                       "source")
+        try:
+            Prior.from_decl(n, d)
+        except ValueError as e:
+            bad.append(f"observations: {n}: {e}")
+    t = cal.get("targets") or {}
+    for k in ("csv", "source", "step", "observed"):
+        if not str(t.get(k) or "").strip():
+            bad.append(f"calibration.targets.{k}: required")
+    if t.get("source") and t["source"] not in ids:
+        bad.append(f"observation_source_undeclared: calibration.targets.source {t['source']!r} is not a declared source")
+    if not bad:
+        try:
+            rows = _read_csv(s.resolve(t["csv"]))
+            steps = [int(float(x[t["step"]])) for x in rows]
+            ys = [float(x[t["observed"]]) for x in rows]
+            if not rows or min(steps) < 1 or len(set(steps)) != len(steps):
+                bad.append("calibration.targets: steps must be distinct integers >= 1 (1 = the first step of the horizon)")
+            if any(y < 0 or y != round(y) for y in ys):
+                bad.append("calibration.targets: observed counts must be non-negative integers")
+        except (OSError, KeyError, ValueError) as e:
+            bad.append(f"calibration.targets: {t.get('csv')} unreadable: {e}")
+    # uncertainty
+    u = r["uncertainty"]
+    srcs_k = [x.get("kind") for x in (u.get("sources") or []) if isinstance(x, dict)]
+    exc = [x for x in (u.get("excluded") or []) if isinstance(x, dict)]
+    for k in UQ_KINDS:
+        if k not in srcs_k and not any(e.get("kind") == k and str(e.get("reason") or "").strip() for e in exc):
+            bad.append(f"uncertainty: kind {k} must be a source or excluded with a reason")
+    bad += [f"uncertainty.sources: kind {k!r} not in {UQ_KINDS} for an estimates spec" for k in srcs_k
+            if k not in UQ_KINDS]
+    lv = u.get("level", 0.95)
+    if not (_isnum(lv) and 0 < lv < 1):
+        bad.append("uncertainty.level: in (0, 1)")
+    # deliverable
+    d = r["deliverable"]
+    wins = d.get("windows")
+    if not isinstance(wins, dict) or not wins:
+        bad.append("deliverable.windows: {name: [t0, t1]}")
+        wins = {}
+    for n, w in wins.items():
+        if not (isinstance(w, list) and len(w) == 2 and all(_isnum(x) for x in w) and w[0] < w[1]
+                and h["start"] <= w[0] and w[1] <= h["stop"]):
+            bad.append(f"deliverable.windows.{n}: [t0, t1] inside the horizon")
+    outs = d.get("outputs")
+    names = []
+    if not isinstance(outs, list) or not outs:
+        bad.append("deliverable.outputs: at least one {name, metric, window, scale}")
+        outs = []
+    import re
+    for o in outs:
+        if not isinstance(o, dict) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", str(o.get("name") or "")):
+            bad.append(f"deliverable.outputs: {o!r} needs a name (letters, digits, _)")
+            continue
+        names.append(o["name"])
+        if o.get("window") not in wins:
+            bad.append(f"deliverable.outputs.{o['name']}: window {o.get('window')!r} is not in deliverable.windows")
+        if o.get("scale") not in SCALES:
+            bad.append(f"deliverable.outputs.{o['name']}: scale in {SCALES}")
+        if not str(o.get("metric") or "").strip():
+            bad.append(f"deliverable.outputs.{o['name']}: metric (an engine window metric)")
+    if len(set(names)) != len(names):
+        bad.append("deliverable.outputs: names must be unique")
+    dec = d.get("decision")
+    if dec is not None:
+        st = statements(dec)
+        if not (isinstance(dec, dict) and dec.get("kind") == "threshold" and dec.get("output") in names
+                and _isnum(dec.get("threshold")) and dec.get("direction") in DIRECTIONS
+                and _isnum(dec.get("probability")) and 0.5 < dec["probability"] < 1
+                and all(str(st.get(k) or "").strip() for k in ("yes", "no", "undetermined"))):
+            bad.append("deliverable.decision: {kind: threshold, output: <an output name>, threshold, direction: above | "
+                       "below, probability in (0.5, 1), statements: {yes, no, undetermined}}")
+        elif any(ch.isdigit() for k in ("yes", "no", "undetermined") for ch in str(st.get(k))):
+            bad.append("deliverable.decision.statements: descriptive text with no numbers (the harness renders them)")
+    return bad
+
+
+def validate(s, eng) -> list[str]:
+    """Every check, with the engine: priors name engine parameters or unbound unit attributes, outputs name engine
+    window metrics, and the engine offers run_batch and the incidence series the targets are compared with."""
+    bad = validate_pending(s)
+    card = eng.describe()
+    pnames = {p.name: p for p in eng.parameters()}
+    du = s.raw.get("decision_units") or {}
+    bound = set((du.get("engine_attributes") or {}))
+    for attr in bound:
+        if attr not in card.unit_attributes:
+            bad.append(f"decision_units.engine_attributes: {attr} is not declared by engine {card.name}")
+    for n in ((s.raw.get("calibration") or {}).get("priors") or {}):
+        if n in pnames:
+            if pnames[n].kind not in ("calibrated", "scenario", "fitted"):
+                bad.append(f"calibration.priors.{n}: engine parameter of kind {pnames[n].kind} (a prior goes on a "
+                           "calibrated, fitted or scenario parameter)")
+        elif n in card.unit_attributes:
+            if n in bound:
+                bad.append(f"calibration.priors.{n}: unit attribute bound to data in decision_units.engine_attributes "
+                           "(a quantity is data or calibrated, not both)")
+        else:
+            bad.append(f"calibration.priors.{n}: neither an engine parameter nor a unit attribute of {card.name}")
+    miss = [p for p, v in pnames.items() if v.kind == "calibrated"
+            and p not in ((s.raw.get("calibration") or {}).get("priors") or {})]
+    if miss:
+        bad.append(f"calibration.priors: the engine's calibrated parameters {miss} need a prior (no silent defaults)")
+    wm = set((card.outputs or {}).get("windows") or [])
+    for o in (s.raw.get("deliverable") or {}).get("outputs") or []:
+        if isinstance(o, dict) and o.get("metric") not in wm:
+            bad.append(f"deliverable.outputs.{o.get('name')}: metric {o.get('metric')!r} is not an engine window metric "
+                       f"{sorted(wm)}")
+    if not callable(getattr(eng, "run_batch", None)):
+        bad.append(f"engine {card.name}: an estimates spec needs run_batch() (the posterior evaluates many points)")
+    return bad
+
+
+def needs(raw: dict) -> dict:
+    """What an engine must offer (the eligibility filter): the outputs' window metrics, the unit attributes the spec
+    binds or calibrates."""
+    wins = [o.get("metric") for o in (raw.get("deliverable") or {}).get("outputs") or [] if isinstance(o, dict)]
+    du = raw.get("decision_units") or {}
+    attrs = list(du.get("engine_attributes") or {})
+    return {"components": {}, "outputs": [], "cost_drivers": [], "windows": [w for w in dict.fromkeys(wins) if w],
+            "unit_attributes": attrs, "age_groups": []}
 
 
 # --------------------------------------------------------------------------- self-test
