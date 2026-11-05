@@ -4560,6 +4560,47 @@ def _run_self_test() -> int:
         if not cond:
             failures.append(label)
 
+    # --- SE1-SE4 (v2 eval runs 2026-11-05): every schema error in a file at once ---
+    with tempfile.TemporaryDirectory() as d:
+        pth = os.path.join(d, "critique_domain.yaml")
+        rb = {"id": "D-001", "severity": "MEDIUM", "category": "HYPOTHESES", "target_stage": "WRITE",
+              "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f", "resolved": True}
+        with open(pth, "w") as fh:
+            yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                            "structural_mismatch": {"detected": False}, "carried_forward": ["D-001"],
+                            "blockers": [rb, dict(rb, id="D-002", category="NOPE")]}, fh)
+        try:
+            validate_critique(pth, "critique-domain", 2)
+            errs = []
+        except SchemaError as e:
+            errs = list(getattr(e, "errors", [str(e)]))
+        joined = " | ".join(errs)
+        ok(all(w in joined for w in ("D-001 missing 'resolved_in_round'", "D-001 missing 'resolved_evidence'",
+                                     "D-002 category", "D-002 missing 'resolved_in_round'",
+                                     "carried_forward entry must be a mapping")),
+           f"SE1 a refused critique lists every schema error, not the first: {errs}")
+        ok(errs and errs[0].endswith("resolved blocker D-001 missing 'resolved_in_round'"),
+           f"SE2 the error message is the first error, as before: {errs[:1]}")
+        rb2 = dict(rb, resolved_in_round=2, resolved_evidence="manuscript.md Methods")
+        with open(pth, "w") as fh:
+            yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                            "structural_mismatch": {"detected": False},
+                            "carried_forward": [{"id": "D-001", "prior_round": 1, "still_present": False,
+                                                 "notes": "n"}], "blockers": [rb2]}, fh)
+        ok(validate_critique(pth, "critique-domain", 2)["blockers"][0]["id"] == "D-001",
+           "SE3 the repaired file passes")
+        with open(pth, "w") as fh:
+            yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                            "structural_mismatch": "no", "blockers": "none"}, fh)
+        try:
+            validate_critique(pth, "critique-domain", 2)
+            errs = []
+        except SchemaError as e:
+            errs = list(getattr(e, "errors", [str(e)]))
+        ok(len(errs) >= 3 and any("structural_mismatch" in e for e in errs)
+           and any("blockers must be a list" in e for e in errs) and any("carried_forward" in e for e in errs),
+           f"SE4 a malformed file fails closed with each problem named, without crashing: {errs}")
+
     # --- Phase 39 α: presentation polish waits for the first draft ---
     with tempfile.TemporaryDirectory() as d:
         pres = {"kind": "critique_blocker", "id": "P-003", "category": "PRESENTATION", "target_stage": "ANALYZE",

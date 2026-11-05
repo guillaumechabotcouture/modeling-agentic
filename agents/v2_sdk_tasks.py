@@ -503,6 +503,14 @@ def _self_test() -> int:
                                         stages="S")
         ok(all(c in cp for c in V.VALID_CATEGORY) and "- X" in cp,
            "S11 the critique prompt lists the gate's categories and carries a repair's errors")
+        # S17 (two v2 eval runs, 2026-11-05): critics resolved blockers without resolved_in_round or
+        # resolved_evidence and wrote carried_forward as bare ids. The prompt states both requirements
+        # with the round filled in, and the repair says its list is every error in the file.
+        cp2 = PROMPTS["critique"].format(reviewer="critique-domain", round=2, prev_round=1, file="f", prefix="D",
+                                         out=OUT, feedback="", severities="H", categories="C", stages="S")
+        ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
+                                  "never a bare id")),
+           "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT)
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 

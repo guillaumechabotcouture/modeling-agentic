@@ -1910,6 +1910,64 @@ def _self_test() -> int:
            and T.calls.count("critique:critique-redteam:1") == 1,
            f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
 
+        # T74-T75 (two v2 eval runs, 2026-11-05, both completed_gate_error with no verdict): in round 2
+        # the critics marked blockers resolved without resolved_in_round or resolved_evidence and wrote
+        # carried_forward as a list of ids. The gate named one error per file, the critic fixed exactly
+        # that one, the next surfaced, and the two repairs ran out. The gate now names every error in
+        # a file at once, so one repair carries all of them.
+        import yaml
+        r2 = os.path.join(td, "resolved_shape")
+        os.makedirs(r2)
+        resolved_b = {"id": "D-001", "severity": "MEDIUM", "category": "HYPOTHESES", "target_stage": "WRITE",
+                      "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f (done)",
+                      "resolved": True, "done_when": [{"file": "manuscript.md", "contains": "draft"}]}
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001", "D-002"],
+                        "blockers": [resolved_b, dict(resolved_b, id="D-002")]},
+                       open(os.path.join(r2, "critique_domain.yaml"), "w"), sort_keys=False)
+        g = v2_gate(r2, 2, 3, False, [], history=False, strict_done_when=True)
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        want = ("D-001 missing 'resolved_in_round'", "D-001 missing 'resolved_evidence'",
+                "D-002 missing 'resolved_in_round'", "D-002 missing 'resolved_evidence'",
+                "carried_forward entry must be a mapping")
+        ok(g.get("action") is None and all(any(w in e for e in dom) for w in want),
+           f"T74 the gate names every schema error in a critic's file at once, not the first ({dom})")
+
+        class Literal(StubTasks):
+            """A critic that, like the real ones, fixes exactly the errors it is told and nothing else."""
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                p = os.path.join(run_dir, "critique_domain.yaml")
+                if reviewer != "critique-domain" or round_n < 2:
+                    return super().critique(run_dir, reviewer, round_n, feedback)
+                if not feedback:
+                    res = super().critique(run_dir, reviewer, round_n)
+                    doc = yaml.safe_load(open(p))
+                    for b in doc["blockers"]:
+                        b.pop("resolved_in_round", None)
+                        b.pop("resolved_evidence", None)
+                    doc["carried_forward"] = [c["id"] for c in doc["carried_forward"]]
+                    yaml.safe_dump(doc, open(p, "w"))
+                    return res
+                self.calls.append(f"repair:{len(feedback)}")
+                doc = yaml.safe_load(open(p))
+                for e in feedback:
+                    for b in doc["blockers"]:
+                        for key in ("resolved_in_round", "resolved_evidence"):
+                            if f"blocker {b['id']} missing '{key}'" in e:
+                                b[key] = round_n if key == "resolved_in_round" else "done_when passes"
+                    if "carried_forward entry must be a mapping" in e:
+                        doc["carried_forward"] = [{"id": i, "prior_round": round_n - 1, "still_present": False,
+                                                   "notes": "fixed"} for i in doc["carried_forward"]]
+                yaml.safe_dump(doc, open(p, "w"))
+                return self._r(f"critique:{reviewer}:{round_n}")
+        d, T, st = new_run("resolved_repair", {"critics": {1: {"critique-domain": [blocker]}},
+                                               "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
+        T = Literal(T.s)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s in ("completed", "completed_scope_declared") and "repair:3" in T.calls,
+           f"T75 a round-2 critic that resolved a blocker in the wrong shape is repaired in one pass and the "
+           f"gate decides ({s}, {[c for c in T.calls if 'repair' in c]})")
+
         # T38-T41: from the first blind real run (v2blind1). Fixtures: its three critique YAMLs,
         # final_gate.json and claims ledger (tests/fixtures/v2blind1; no question text, no evals content).
         import yaml
