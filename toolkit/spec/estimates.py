@@ -679,6 +679,12 @@ def _self_test() -> int:
         ok(len(cs) == 64 and info["sampled"] and info["total"] == 2 ** 25,
            f"ES28 (Codex fix-r1 P2-3/4) 25 priors: 64 corners sampled without building all 2^25, and the sampling "
            f"is disclosed ({len(cs)}, {info})")
+        try:
+            cs, info = probe_corners([[0.0, 1.0]] * 70, 64)
+            ok(len(set(cs)) == 64 and info["total"] == 2 ** 70,
+               "ES28c (Codex fix-r2 P2-2) 70 priors: 64 distinct corners, no overflow")
+        except OverflowError as e:
+            ok(False, f"ES28c (Codex fix-r2 P2-2) 70 priors: 64 distinct corners, no overflow ({e})")
         cs, info = probe_corners([[0.0, 1.0], [2.0, 3.0]], 64)
         ok(sorted(cs) == [(0.0, 2.0), (0.0, 3.0), (1.0, 2.0), (1.0, 3.0)] and not info["sampled"],
            f"ES28b up to the cap every corner is probed: {cs}")
