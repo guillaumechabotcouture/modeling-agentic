@@ -1072,6 +1072,9 @@ def _self_test_pipeline(ok, _outcome) -> None:
             open(os.path.join(rp, "run_state.json"), "w").write("{}")
             rc = drive("--v1", "--skip-preflight", "--resume", rp)
             ok(rc == 1 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
+            rc = drive("--resume", rp)
+            ok(rc == 1 and not calls, f"PV11c (Codex r2) ... nor on the default: a run with no recorded pipeline needs "
+                                      f"an explicit flag ({rc}, {calls})")
             json.dump({"question": "Q?", "pipeline": "V2!"}, open(os.path.join(rp, "metadata.json"), "w"))
             rc = drive("--resume", rp)
             ok(rc == 1 and not calls, f"PV11b a malformed recorded pipeline is refused ({rc}, {calls})")

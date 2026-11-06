@@ -284,13 +284,24 @@ def _self_test() -> int:
             ok(True, f"PI29 refused: {why}")
     ok(from_command("python3 main.py Q --v2\ncp -r runs $JOB_OUT/") == "v2", "PI30 a later line does not hide main.py's flag")
     ok(from_command("python3 main.py A --v2 && python3 main.py B --v2") == "v2", "PI31 several calls that agree")
+    # PI36-38 (Codex r2): comments, redirections and continued lines.
+    try:
+        got = from_command("python3 main.py Q # --v1")
+        ok(False, f"PI36 a flag inside a shell comment does not count (got {got})")
+    except PipelineError:
+        ok(True, "PI36 a flag inside a shell comment does not count: refused")
+    ok(from_command("python3 main.py Q >log --v1") == "v1" and from_command("python3 main.py Q 2>&1 --v2 > out.log") == "v2",
+       "PI37 a redirection is not a command boundary")
+    ok(from_command("python3 main.py Q \\\n  --v1") == "v1", "PI38 a continued line belongs to the command")
     with tempfile.TemporaryDirectory() as td:
         rs = os.path.join(td, "v2run")
         os.makedirs(rs)
         open(os.path.join(rs, "run_state.json"), "w").write("{}")
-        ok(resume_conflict({}, "v1", rs) and not resume_conflict({}, "v2", rs),
-           "PI32 a run with no recorded pipeline but a run_state.json is v2's")
-        ok(not resume_conflict({}, "v1", td), "PI33 an old run with neither (a v1 run) resumes with --v1")
+        ok(resume_conflict({}, "v1", rs, explicit_flag=True) and not resume_conflict({}, "v2", rs, explicit_flag=True),
+           "PI32 a run with no recorded pipeline but a run_state.json resumes only as v2")
+        ok(not resume_conflict({}, "v1", td, explicit_flag=True), "PI33 an old run with neither resumes with an explicit --v1")
+        ok(resume_conflict({}, "v2", rs, explicit_flag=False) and resume_conflict({}, "v1", td, explicit_flag=False),
+           "PI33b (Codex r2) a run that records no pipeline is never resumed on the default: the flag must be explicit")
         ok(resume_conflict({"pipeline": "V2!"}, "v2", rs) and resume_conflict({"pipeline": 2}, "v1", td),
            "PI34 a malformed recorded pipeline is refused")
         json.dump({"question": "Q"}, open(os.path.join(rs, "metadata.json"), "w"))

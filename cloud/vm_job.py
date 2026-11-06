@@ -758,7 +758,7 @@ def _self_test_pipeline(ok) -> None:
         sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
         try:
             import eval_suite
-            run_dir = os.path.join(dest, "runs", "2026-11-05_000000_q")
+            run_dir = os.path.join(dest, "out", "runs", "2026-11-05_000000_q")   # where polls save $JOB_OUT/runs
             os.makedirs(run_dir)
             got = eval_suite.launch_record_for(run_dir)
             ok(got is not None and got.get("launch_id") == rec["launch_id"] and got.get("pipeline") == "v2"
@@ -774,12 +774,12 @@ def _self_test_pipeline(ok) -> None:
         open(os.path.join(dest, ".manifest.json"), "w").write("{}")
         rec2 = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
         try:
-            got2 = eval_suite.launch_record_for(os.path.join(dest, "runs", "2026-11-05_000000_q"))
+            got2 = eval_suite.launch_record_for(os.path.join(dest, "out", "runs", "2026-11-05_000000_q"))
         except NameError:
             got2 = None
-        ok(rec2["launch_id"] != rec["launch_id"] and not os.path.exists(os.path.join(dest, "runs"))
+        ok(rec2["launch_id"] != rec["launch_id"] and not os.path.exists(os.path.join(dest, "out", "runs"))
            and not os.path.exists(os.path.join(dest, ".manifest.json"))
-           and any(n.startswith("runs.before_") for n in os.listdir(dest)),
+           and any(n.startswith("out.before_") for n in os.listdir(dest)),
            f"VP7 the earlier attempt's runs/ is set aside and the poll index reset ({os.listdir(dest)}, {got2})")
         # VP8 (Codex r1 P1): the commit comes from the archive that ships.
         arch = io.BytesIO()
@@ -790,6 +790,8 @@ def _self_test_pipeline(ok) -> None:
                 t.addfile(ti, io.BytesIO(b))
         ok(g["_launch_commit"](arch.getvalue(), "/nonexistent-tree", None) == "0123456",
            "VP8 the launch record's commit is the archive's, not the checkout's HEAD at submit time")
+        ok(g["_launch_commit"](_tarball(None, os.path.dirname(HERE)), None, os.path.dirname(HERE)) == "unknown",
+           "VP8b (Codex r2) a --dir archive (no stamp) records commit unknown, not the live checkout's HEAD")
         # VP9 (Codex r1 P2): a --dir archive (./-prefixed names) still records its input hashes.
         d2 = os.path.join(td, "srcdir")
         os.makedirs(os.path.join(d2, "data", "evals", "q"))
