@@ -415,7 +415,13 @@ def probe_corners(ends, cap: int = MAX_PROBE_CORNERS) -> tuple:
     import random
     d = len(ends)
     total = 2 ** d
-    idx = list(range(total)) if total <= cap else random.Random(0).sample(range(total), cap)
+    if total <= cap:
+        idx = list(range(total))
+    else:                       # distinct random indices of d bits each (no range of 2^d: it overflows at d >= 63)
+        rng, seen = random.Random(0), set()
+        while len(seen) < cap:
+            seen.add(rng.getrandbits(d))
+        idx = sorted(seen)
     corners = [tuple(ends[j][(i >> j) & 1] for j in range(d)) for i in idx]
     return corners, {"total": total, "probed": len(corners), "sampled": total > cap}
 

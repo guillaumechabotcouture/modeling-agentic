@@ -239,6 +239,7 @@ class EstimatesProblem:
         n = len(next(iter(X.values())))
         V = self._vals(X)
         outs = self.run(V, n)
+        refusal_guard(self, "the posterior predictive check")      # before predictions are built (fix-r2 P2-3)
         mu = self.expected(outs, V)
         model = self.sources[self.target["source"]].noise["model"]
         if model == "negbin":
@@ -485,7 +486,9 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     if np.any(~np.isfinite(s["ll_rows"])):
         raise C.CalibrationRefused("posterior_ess", "a canonical draw has no finite likelihood")
     cls = C.classify(P, s)
+    refusal_guard(E, "the identifiability classes")
     xh, conv, msg = C._map_point(P, s["best"])
+    refusal_guard(E, "the posterior mode")
     smp = {"sample_id": s["sample_id"], "names": s["names"], "rows": np.asarray(s["rows"], float)}
     nd = int(n_draws or u.get("draws", 1000))
     dr = C.draws(smp, nd, seed)
