@@ -144,6 +144,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         if spec["analysis"].get("workers"):
             jkw.setdefault("max_workers", int(spec["analysis"]["workers"]))
         jc = JC.run(spec, run_dir, jkw, log)
+        # drawn here so a blocked run has them; listed in the joint artifact. A complete run's figure step redraws
+        # them from the artifact into figures/ with provenance sidecars and lists them in analysis/figures.yaml
+        jc["figures"] = JC.render_figures(jc, run_dir)
         arts["joint_calibration"] = S.write("joint_calibration", plain(JC.artifact(jc)), JC.PRODUCER,
                                             [spec_path] + data_in + JC.inputs(spec) + eng_files)
         holder["calibration"] = arts["joint_calibration"]
@@ -705,6 +708,13 @@ def _self_test_joint(ok, q):
            and jp.get("draws") == 6,
            "JR6 (Codex r1 P1-2) the point uses the joint calibration's unit values and the draws its full rows (shared "
            "values and unit values together), not a re-inversion of one target")
+        figs_ = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
+        names_ = {f["figure"] for f in figs_["figures"]}
+        ok({"calibration_unit_fit", "calibration_waves"} <= names_
+           and all(f["tier"] == "data_model" for f in figs_["figures"] if f["figure"].startswith("calibration_"))
+           and os.path.exists(os.path.join(d, "figures", "joint_calibration", "calibration_unit_fit.png")),
+           f"JR7 the calibration figures are drawn at the calibration step and listed in the figure manifest (data and "
+           f"model tier): {sorted(n for n in names_ if n.startswith('calibration_'))}")
         ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
            f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
     with tempfile.TemporaryDirectory() as d:

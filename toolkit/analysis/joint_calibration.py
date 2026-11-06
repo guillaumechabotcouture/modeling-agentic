@@ -282,7 +282,7 @@ def build(spec, units=None) -> tuple:
     dr = PRI.drawn(spec)
     fr = {p.name: p for p in spec.engine().parameters() if p.kind == "fitted"}
     shared = [HM.Param(n, dr[n].lo, dr[n].hi, dr[n].dist, dr[n].value, dr[n].source) if n in dr else
-              HM.Param(n, fr[n].lo, fr[n].hi, "uniform", None, f"engine card fitted range ({fr[n].source})")
+              HM.Param(n, fr[n].lo, fr[n].hi, "uniform", fr[n].value, f"engine card fitted range ({fr[n].source})")
               for n in j["shared"]]
     _ = fitted_ranges
     rows = {str(r[spec.uid]): r for r in spec.units()}
@@ -458,6 +458,18 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, **override) -> di
     return rep
 
 
+def render_figures(rep, run_dir, labels=None, dest_rel="figures/joint_calibration") -> dict:
+    """The calibration figures (toolkit/calibration/figures.py), drawn at the calibration step so a blocked run has
+    them too; the figure step redraws them from analysis/joint_calibration.yaml for the manifest of a complete run."""
+    from toolkit.calibration import figures as CF
+    try:
+        return CF.render(rep.get("figure_data"), os.path.join(run_dir, dest_rel), run_dir, labels,
+                         sources=[os.path.join("analysis", "joint_calibration.yaml")])
+    except Exception as e:  # noqa: BLE001 -- a figure failure is recorded, never hides the calibration's verdict
+        return {"figures": [], "not_produced": [{"figure": n, "reason": f"{type(e).__name__}: {e}", "tier": CF.TIER}
+                                                for n in CF.NAMES]}
+
+
 def region_sample(rep) -> dict:
     """The canonical sample the uncertainty draws read: every region row, shared values and each unit's value
     together (Codex r1 P1-2: a unit's value comes from the joint fit of all its targets, never from re-inverting one
@@ -500,7 +512,7 @@ def block_reason(rep) -> str:
 
 def artifact(rep) -> dict:
     """The analysis/joint_calibration.yaml payload: the report without the bulky sample rows (their id is kept)."""
-    out = {k: v for k, v in rep.items() if k != "sample"}
+    out = {k: v for k, v in rep.items() if k not in ("sample", "runs")}     # the runs: in their own file
     if rep.get("sample"):
         s = region_sample(rep)
         out["sample"] = {"sample_id": s["sample_id"], "names": s["names"], "rows": s["rows"].tolist(),
@@ -581,10 +593,15 @@ def main(argv=None) -> int:
     rep = run(spec, rd, kw, log=lambda *x, **k: print(*x, flush=True), units=units, **ov)
     out = os.path.abspath(a.out or os.path.join(rd, OUT_REL))
     os.makedirs(out, exist_ok=True)
+    froot = rd if os.path.commonpath([rd, out]) == rd else out
+    rep["figures"] = render_figures(rep, froot, dest_rel=os.path.relpath(os.path.join(out, "figures"), froot))
+    print("figures:", [f["path"] for f in rep["figures"]["figures"]], rep["figures"]["not_produced"], flush=True)
     from toolkit.analysis.artifacts import _safe_io      # no link followed inside the run dir (write_audit WA3)
     root = rd if os.path.commonpath([rd, out]) == rd else out
     _safe_io().write_nofollow(root, os.path.relpath(os.path.join(out, "joint_calibration.yaml"), root),
                               yaml.safe_dump(HM_plain(artifact(rep)), sort_keys=False).encode(), atomic=True)
+    _safe_io().write_nofollow(root, os.path.relpath(os.path.join(out, "runs.json"), root),
+                              json.dumps(HM_plain(rep.get("runs") or {})).encode(), atomic=True)
     print(summary(rep), flush=True)
     return 0 if not rep["blocked"] else 3
 

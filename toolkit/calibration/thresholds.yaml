@@ -40,6 +40,12 @@ emulator:
   min_holdout: 10            # fewer held-out points than this: the check is recorded as not run, and the step refuses
   min_points_per_unit: 4     # a unit with fewer simulations than this cannot be emulated
   ridge: 1.0e-6              # ridge on the regression mean (per point)
+figures:
+  # the calibration figures (toolkit/calibration/figures.py): display settings, not decision thresholds
+  points_max: 4000        # candidates drawn in the pair panels
+  depth_bins: 12          # optical-depth cells per axis
+  band_rows: 200          # region rows used for each target's model band
+  top_pairs: 6            # pairs in the top-pairs figure
 verification:
   # After the last wave the engine itself is run once per unit at the best point. A unit whose simulated value is
   # implausible there (observation, discrepancy and run-noise variance only) is flagged, as is a unit no point in the

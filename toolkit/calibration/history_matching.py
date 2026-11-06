@@ -934,6 +934,95 @@ class HistoryMatch:
             out[p.name] = [float(p.natural(R[:, j].min())), float(p.natural(R[:, j].max()))] if len(R) else None
         return out
 
+    def figure_data(self, smp, units, ver) -> dict:
+        """What the calibration figures draw (toolkit/calibration/figures.py), on natural scales: a subset of the
+        shared-value candidates with their worst implausibility and whether they are in the region; the co-variation
+        of each pair inside the region (|Spearman|); the optical depth of each pair (the share of candidates in each
+        cell of the pair's prior box that are non-implausible, whatever the other parameters); each target's observed
+        interval against the band the region gives it; the region's prior share per wave."""
+        st, P = self.state, self.P
+        fth = thresholds().get("figures") or {}
+        C, R = st["C"], st["region"]
+        n0 = st.get("n_sobol") or len(C)
+        rng = np.random.default_rng([self.seed, 23])
+        keep_u = [u for u in P.units if u not in st["unmatchable"]]
+        worst = np.zeros(len(C))
+        for u in keep_u:
+            worst = np.maximum(worst, st["units"][u]["m"])
+        for v in st["targets"].values():
+            worst = np.maximum(worst, v["I"])
+        acc = np.zeros(len(C), bool)
+        acc[R] = True
+        nmax = int(fth.get("points_max", 4000))
+        idx = np.arange(len(C)) if len(C) <= nmax else np.sort(rng.choice(len(C), nmax, replace=False))
+        nat = lambda U: np.column_stack([p.natural(U[:, j]) for j, p in enumerate(P.shared)]) \
+            if self.p else np.zeros((len(U), 0))  # noqa: E731
+        out = {"names": P.names, "prior": {p.name: dict(p.describe(), point=p.mode) for p in P.shared},
+               "cutoff": self.cut,
+               "points": {"values": nat(C[idx]).tolist(), "implausibility": worst[idx].tolist(),
+                          "accepted": acc[idx].tolist()},
+               "waves": [{"wave": w["wave"], "share_of_prior": w["share_of_prior"], "accepted": w["accepted"],
+                          "candidates": w["candidates"], "ranges": w["ranges"]} for w in self.waves]}
+        A = nat(C[R]) if len(R) else np.zeros((0, self.p))
+        pairs = []
+        bins = int(fth.get("depth_bins", 12))
+        Cs = C[:n0]
+        accs = acc[:n0]
+        for i in range(self.p):
+            for j in range(i):
+                rho = None
+                if len(A) >= 5 and np.std(A[:, i]) > 0 and np.std(A[:, j]) > 0:
+                    from scipy.stats import spearmanr
+                    rho = float(spearmanr(A[:, i], A[:, j]).correlation)
+                bi = np.minimum((Cs[:, i] * bins).astype(int), bins - 1)
+                bj = np.minimum((Cs[:, j] * bins).astype(int), bins - 1)
+                tot = np.zeros((bins, bins))
+                hit = np.zeros((bins, bins))
+                np.add.at(tot, (bi, bj), 1)
+                np.add.at(hit, (bi, bj), accs.astype(float))
+                depth = np.where(tot > 0, hit / np.maximum(tot, 1), np.nan)
+                pairs.append({"x": P.names[j], "y": P.names[i], "abs_spearman": None if rho is None else abs(rho),
+                              "spearman": rho, "depth": depth.tolist(), "bins": bins})
+        out["pairs"] = pairs
+        rows = []
+        if smp and P.units:
+            S = np.asarray(smp["rows"], float)
+            k = min(len(S), int(fth.get("band_rows", 200)))
+            S = S[rng.choice(len(S), k, replace=False)]
+            Tn = S[:, :self.p]
+            Tc = np.column_stack([(Tn[:, j] - p.lo) / (p.hi - p.lo) for j, p in enumerate(P.shared)]) \
+                if self.p else np.zeros((k, 0))
+            lo_, hi_ = P.unit_param["lo"], P.unit_param["hi"]
+            for n, u in enumerate(P.units):
+                zc = (S[:, self.p + n] - lo_) / (hi_ - lo_)
+                for tg in P.unit_targets(u):
+                    m, v = self.em["unit"][tg.observable].predict(u, zc, Tc, noise=False)
+                    q = np.percentile(inv(m, tg.scale), [2.5, 50, 97.5])
+                    sdo = math.sqrt(tg.sd_obs ** 2 + tg.sd_bias ** 2)
+                    sim = None
+                    if ver and u in ver["units"]:
+                        sim = next((x["simulated"] for x in ver["units"][u]["targets"] if x["target"] == tg.id), None)
+                    rows.append({"target": tg.id, "kind": "unit", "unit": u, "observable": tg.observable,
+                                 "observed": tg.value, "obs_lo": float(inv(tg.y - 1.96 * sdo, tg.scale)),
+                                 "obs_hi": float(inv(tg.y + 1.96 * sdo, tg.scale)), "model_lo": float(q[0]),
+                                 "model_mid": float(q[1]), "model_hi": float(q[2]), "verified": sim,
+                                 "status": units[u]["status"]})
+        for tg in P.targets:
+            if tg.kind in ("group", "shared"):
+                v = st["targets"][tg.id]
+                vals = inv(v["mean"][R], tg.scale) if len(R) else np.array([np.nan])
+                q = np.nanpercentile(vals, [2.5, 50, 97.5])
+                sdo = math.sqrt(tg.sd_obs ** 2 + tg.sd_bias ** 2)
+                sim = (ver or {}).get("targets", {}).get(tg.id, {}).get("simulated")
+                rows.append({"target": tg.id, "kind": tg.kind, "unit": None, "observable": tg.observable,
+                             "observed": tg.value, "obs_lo": float(inv(tg.y - 1.96 * sdo, tg.scale)),
+                             "obs_hi": float(inv(tg.y + 1.96 * sdo, tg.scale)), "model_lo": float(q[0]),
+                             "model_mid": float(q[1]), "model_hi": float(q[2]), "verified": sim,
+                             "status": "matched" if (ver or {}).get("targets", {}).get(tg.id, {}).get("ok", True)
+                             else "verification_failed"})
+        out["fit"] = rows
+        return out
+
     def compatible(self, theta: dict) -> bool:
         """Is this joint shared value non-implausible for every target and unit (on the final emulators)?"""
         x = np.array([[(float(theta[p.name]) - p.lo) / (p.hi - p.lo) for p in self.P.shared]]).reshape(1, self.p)
@@ -1095,7 +1184,12 @@ class HistoryMatch:
                                   modelled_at_best=float(inv(v["mean"][best_c], t.scale)),
                                   non_implausible_share=float(np.mean(v["I"] <= self.cut)))
         smp = self.sample(int(self.th["draws_kept"])) if len(R) else None
-        return {"method": "history_matching", "producer": PRODUCER,
+        figd = self.figure_data(smp, units, ver)
+        runs = {"unit": [{"unit": r["unit"], "z": float(P.z_natural(r["s"])), "theta": P.theta_natural(r["t"])[0]
+                          if self.p else {}, "seed": r["seed"], "obs": r["obs"]} for r in self.data.unit],
+                "shared": [{"theta": P.theta_natural(r["t"])[0], "seed": r["seed"], "obs": r["obs"]}
+                           for r in self.data.shared]}
+        return {"method": "history_matching", "producer": PRODUCER, "figure_data": figd, "runs": runs,
                 "status": "blocked" if blocks else "matched", "blocked": bool(blocks), "blocks": blocks,
                 "cutoff": self.cut,
                 "shared": {p.name: p.describe() for p in P.shared},

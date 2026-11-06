@@ -36,7 +36,8 @@ PRODUCER = "toolkit/analysis/figures.py"
 # kind gets a not-produced entry, fail closed).
 TIERS = {
     "data_model": ("data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage",
-                   "sensitivity"),
+                   "sensitivity", "calibration_region", "calibration_top_pairs", "calibration_optical_depth",
+                   "calibration_unit_fit", "calibration_waves"),
     "simulation": ("timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"),
 }
 DECISION_SETS = {
@@ -2025,6 +2026,25 @@ FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attribu
          "burden_map": fig_burden, "calibration_fit": fig_calibration, "frontier": fig_frontier,
          "dollars": fig_dollars, "cost_per_outcome": fig_cost_per_outcome, "sensitivity": fig_sensitivity,
          "timeline": fig_timeline, "trajectories": fig_trajectories}
+
+
+def _joint_figure(name):
+    """A joint calibration figure (toolkit/calibration/figures.py) from analysis/joint_calibration.yaml."""
+    def f(R, t):
+        from toolkit.calibration import figures as CF
+        if (R.spec.get("calibration") or {}).get("joint") is None:
+            raise Missing("the spec has no joint calibration (calibration.joint)")
+        fd = R.art("joint_calibration").get("figure_data")
+        try:
+            fig, title, cap, rows = CF.draw(name, fd, t, getattr(R.labels, "overlay", None))
+        except CF.NoData as e:
+            raise Missing(str(e))
+        return fig, title, cap, rows, "the joint calibration's compatible region and fit (" + name + ")"
+    return f
+
+
+FUNCS.update({n: _joint_figure(n) for n in ("calibration_region", "calibration_top_pairs", "calibration_optical_depth",
+                                            "calibration_unit_fit", "calibration_waves")})
 
 
 # --------------------------------------------------------------------------- rendering
