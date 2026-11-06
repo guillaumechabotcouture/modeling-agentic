@@ -627,11 +627,65 @@ def _self_test() -> int:
     _self_test_sched(ok)
     _self_test_batch(ok)
     _self_test_run(ok)
+    _self_test_pipeline(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_pipeline(ok) -> None:
+    """VP (2026-11-05): a main.py job must state its pipeline (the default changed once, silently),
+    the run learns its launcher, and the job leaves a launch record in the grader's format
+    (assignments.json + result.json, as cloud/run_cluster.py writes them), so a vm_job eval run
+    is graded with its input hashes checked instead of --unverified-inputs."""
+    import inspect
+    import tempfile
+    g = globals()
+    jp = g.get("job_pipeline")
+    ok(jp is not None, "VP1 vm_job reads the pipeline of a main.py command")
+    if jp is None:
+        return
+    for cmd in (["python3", "main.py", "Q?", "--max-rounds", "3"], "python3 main.py 'Q?' && cp -r runs $JOB_OUT/"):
+        try:
+            jp(cmd)
+            ok(False, f"VP1 a main.py command relying on the default pipeline is refused: {cmd}")
+        except SystemExit as e:
+            ok("--v1 or --v2" in str(e), f"VP1 a main.py command relying on the default pipeline is refused: {e}")
+    ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None,
+       "VP2 an explicit main.py command gives its pipeline; other commands have none")
+    src = inspect.getsource(_run_locked)
+    ok("job_pipeline(" in src and src.index("job_pipeline(") < src.index("_create("),
+       "VP3 run refuses an undeclared pipeline before it creates a cluster")
+    ok("job_pipeline(" in inspect.getsource(cmd_start), "VP3b start refuses it too")
+    env = g["job_env"]({"ANTHROPIC_API_KEY": "k"}, "dev", "j1")
+    ok(env == {"ANTHROPIC_API_KEY": "k", "MA_LAUNCHER": "vm_job:dev/j1"} and g["job_env"](None, "dev", "j1")
+       == {"MA_LAUNCHER": "vm_job:dev/j1"}, f"VP4 the job's environment names its launcher for metadata.json ({env})")
+    with tempfile.TemporaryDirectory() as td:
+        dest = os.path.join(td, "dev", "j1")
+        code = io.BytesIO()
+        with tarfile.open(fileobj=code, mode="w:gz") as t:
+            for n, b in (("data/evals/q/a.csv", b"1,2\n"), ("main.py", b"x")):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        rec = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+        try:
+            import eval_suite
+            run_dir = os.path.join(dest, "runs", "2026-11-05_000000_q")
+            os.makedirs(run_dir)
+            got = eval_suite.launch_record_for(run_dir)
+            ok(got is not None and got.get("launch_id") == rec["launch_id"] and got.get("pipeline") == "v2"
+               and got.get("commit") == "abc1234" and "collected_launch_id" not in got
+               and got.get("eval_inputs_sha256", {}).get("data/evals/q/a.csv"),
+               f"VP5 the grader finds the vm_job launch record with its input hashes ({got})")
+        except ImportError as e:
+            ok(False, f"VP5 the grader is importable: {e}")
+        g["write_launch_record"](os.path.join(td, "dev", "j2"), "j2", code.getvalue(), None, "abc1234", "dev")
+        a = json.load(open(os.path.join(td, "dev", "assignments.json")))
+        ok(set(a) == {"j1", "j2"} and a["j2"]["pipeline"] == "none", f"VP6 records of two jobs share the file ({a})")
 
 
 def _self_test_sched(ok) -> None:
