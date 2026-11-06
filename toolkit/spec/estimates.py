@@ -577,6 +577,27 @@ def _self_test() -> int:
             "ES23 (Codex r2-7) a target source whose latent quantity is not incidence is refused")
         mut(lambda r: r["engine"]["config"].update(results_path="/tmp/forged.yaml"), "results_path",
             "ES24 (Codex r2-2) an engine configuration key that dynamics does not declare (results_path) is refused")
+
+        def c1_priors(r):        # the priors of run 2026-11-06_012422 (cschema-dengue c1), which failed at ANALYZE
+            r["decision_units"].pop("defaults_accepted", None)
+            r["calibration"]["priors"].update(
+                r0={"dist": "uniform", "range": [1.3, 5.0], "source": "c1"},
+                s0={"dist": "uniform", "range": [0.0, 1.0], "source": "c1"},
+                seed={"dist": "loguniform", "range": [6.7e-07, 0.001], "source": "c1"})
+        mut(c1_priors, "prior_support_infeasible",
+            "ES25 (c1 run) a prior box with points the engine refuses (seed above s0 near s0 = 0) is refused before "
+            "sign-off, naming the engine's reason")
+
+        def c1_fixed(r):
+            c1_priors(r)
+            r["calibration"]["priors"]["s0"]["range"] = [0.05, 1.0]
+        raw = copy.deepcopy(yaml.safe_load(open(sp)))
+        c1_fixed(raw)
+        keep = open(sp).read()
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        e = schema.validate(schema.load(sp))
+        open(sp, "w").write(keep)
+        ok(e == [], f"ES25b the same priors with s0 from 0.05 (above the seed's upper end) validate: {e[:2]}")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))

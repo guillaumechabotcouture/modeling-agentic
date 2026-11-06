@@ -957,6 +957,34 @@ def _self_test_codex_r2(ok) -> None:
     ok(f3 == [], f"AE22c a complete test passes: {f3 or err}")
 
 
+def _self_test_c1(ok, rows) -> None:
+    """Run 2026-11-06_012422 (c1) stopped at ANALYZE with 'the engine refused 12 draws': the refusals were parameter
+    sets the sampler explored (seed above s0 near s0 = 0), counted together with the draws. Refusals are recorded with
+    the engine's reason and where they happened, and the message says so."""
+    import tempfile
+    import yaml
+    from toolkit.spec import estimates as ES, schema
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        sp = ES.toy_dir(d, rows=rows)
+        s = schema.load(sp)
+        E = EstimatesProblem(s, s.engine())
+        V = {"r0": np.array([1.8, 1.8]), "seed": np.array([1e-3, 1e-3]), "reporting": np.array([0.1, 0.1]),
+             "k": np.array([50.0, 50.0])}
+        E.unit_names = E.unit_names | {"s0"}          # s0 moved by the calibration, as in the c1 spec
+        V["s0"] = np.array([0.0, 0.5])
+        ll, _ = E.loglik(V)
+        rec = getattr(E, "refusals", None)
+        ok(not np.isfinite(ll[0]) and np.isfinite(ll[1]) and rec and "seed" in rec[0]["reason"]
+           and rec[0]["values"].get("s0") == 0.0,
+           f"AE23 (c1) a refused parameter set is recorded with the engine's reason and its values: {rec}")
+        msg = engine_failure_message(E, stage="the posterior sample") if callable(
+            globals().get("engine_failure_message")) else ""
+        ok("parameter set" in msg and "seed" in msg and "draws" not in msg,
+           f"AE23b (c1) the refusal message names parameter sets and the reason, not 'draws': {msg!r}")
+    del yaml
+
+
 def _self_test() -> int:
     import tempfile
     import yaml
@@ -1021,6 +1049,7 @@ def _self_test() -> int:
         ok("validated against" in txt, "AE17b (Codex r1-12) results.md carries the engine's validation label")
     _self_test_codex_r1(ok, rows)
     _self_test_codex_r2(ok)
+    _self_test_c1(ok, rows)
         # the reporting fraction and s0 trade off: with s0 unknown, reporting is not determined
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)
