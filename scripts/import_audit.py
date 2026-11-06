@@ -64,6 +64,8 @@ REVIEWED = {
     "scripts/stall_rule.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/validate_critique_yaml.py": {"spec_from_file_location": (8, _REPO_FILE)},
     "toolkit/alloc/optimize.py": {"spec_from_file_location": (1, _REPO_FILE)},
+    "toolkit/engines/compartmental/selftest_age.py": {
+        "__import__": (1, "the literal module toolkit.engines.horizon, in its own self-test")},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {
         "import_module": (1, "a module under toolkit.engines.malaria.benchmarks named by the shipped proof file")},
     "toolkit/spec/schema.py": {"import_module": (1, "its self-test's literal (module, class) pairs of shipped engines")},
