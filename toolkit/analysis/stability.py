@@ -117,7 +117,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                       "package_concordance_pct": 100.0 * np.mean([plan[i] == pf[i] for i in hid]),
                       "benefit_gap_pct": 100.0 * (b_full - b_fold) / b_full if b_full > 0 else 0.0,
                       "total_benefit_loss_pct": 100.0 * (tot_full - tot_fold) / tot_full if tot_full > 0 else 0.0,
-                      "z_shift_mean": float(np.mean([zh[i] - z0[i] for i in hid]))})
+                      "z_shift_mean": (float(np.mean([zh[i] - z0[i] for i in hid]))
+                                       if all(zh[i] is not None and z0[i] is not None for i in hid) else None)})
     big = [f for f in folds if f["n_units"] >= MIN_FOLD_UNITS and f["rank_corr"] is not None
            and not math.isnan(f["rank_corr"])]
     met = {"total_benefit_loss_pct_mean": _mean([f["total_benefit_loss_pct"] for f in folds]),

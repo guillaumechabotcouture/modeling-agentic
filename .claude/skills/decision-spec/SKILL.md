@@ -112,6 +112,61 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
 
+## Closed-population epidemic questions (the compartmental engine)
+
+For a question about an epidemic in a closed population (vaccine doses by age group, a catch-up campaign
+by birth cohort, an outbreak's final size), the engine is
+`toolkit.engines.compartmental.engine:CompartmentalEngine`. Name it with its configuration in the spec
+(`engine: {ref, config}`); it is eligible only with a configuration. Read its `card.yaml`,
+`ENGINE_NOTES.md` and `literature.yaml`.
+- **Structure.** `structure: age_groups_contact_matrix` binds `contact` (a G x G matrix from the data, or
+  a published matrix with its source). `birth_cohorts` mixes homogeneously. `groups` are the question's
+  own group labels.
+- **Run mode.** `mode: to_extinction` with `final_size: true` gives an outcome that is the epidemic's
+  final size. `time_unit: year` reads the horizon in decimal years and turns on the figure hooks.
+  `windowed` counts infections inside the window.
+- **Generation interval.** `generation_interval: {seir: {latent_days, infectious_days}}`. The final size
+  does not depend on it; timing does.
+- **Immunity.** `initialiser: given` takes the susceptible share per group. Make it a calibrated
+  parameter with `per_group_parameters: [s0]`. `cohort_history` takes dose coverage by birth year, and
+  `coverage_scale` is a per-unit latent multiplier on a reported coverage series. When you calibrate it, start
+  its prior from the card's sourced range (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the
+  source. First check the card's `applicability` assumptions against the question (coverage level, declared
+  seroconversion, pathogen, setting), and recompute the ends where they differ. A narrower or wider range
+  needs its own source. The results list the card's limitation for it: it is a
+  simplification standing in for everything that separates reported from effective coverage. Repeat that in the
+  report's limitations.
+- **Outcomes.** An outcome per infection (`outcomes: [o]`) is a unit attribute `ratio:<o>`, or calibrated
+  per group with `per_group_parameters: [ratio:<o>]`.
+- **Interventions.**
+  - `kind: campaign` (targets, reach) or `kind: doses` (whole blocks to one group: `block_size`,
+    `max_blocks`).
+  - Protection is all-or-nothing, `efficacy:<component>`, declared in `engine_parameters` with its
+    source.
+  - `day` acts during the epidemic; the default, 0, acts before it.
+- **Joint dose blocks within one unit.** Use one alloc component per (group, level), with `group:` the
+  group so that a package takes at most one level per group. Map each to `{<engine component>: level}`
+  and give it a fixed cost item. Use `packages: {generate: true, within_envelope: true}`: packages no
+  plan can afford are dropped. Use `deliverable.by_group` (columns `{group, quantity, value}`,
+  `quantity: {<group>: <cost_outputs name>}`) for one row per group.
+- **Calibration to surveys and counts by group.** Use `calibration: {method: posterior, parameters,
+  [attribute, range, scale], priors, sources, targets: {kind: observations, ...}}`. The format is in
+  `toolkit/analysis/observed_targets.py`.
+  - Each target row names its unit, the groups it covers, its source, and its latent quantity:
+    `immunity`, `susceptible`, `attack_rate` or `outcome:<o>`.
+  - Each source declares a frame, bias mechanisms (or `{none: reason}`) and a noise model: binomial or
+    beta-binomial for shares, Poisson or negative binomial for counts.
+  - Values the question gives (an efficacy, a seroconversion share, a reach) go in `engine_parameters`, each with
+    `value`, `source`, `reason` and `basis: setting_data` (every field is required).
+    Omit `units`, or copy the card's units string exactly. Give no `range` when the question
+    says the value is known. With a `posterior` calibration, a drawn prior on a parameter it does not
+    calibrate is refused, because the fit does not condition on it. Either calibrate the parameter (if the
+    card marks it calibrated) or hold it at its value.
+  - A per-unit attribute needs `scale` (`linear`, or `log` where the attribute is exp(z)); its `range` and prior
+    are on that scale.
+  - A parameter the data do not inform, such as a declared R0 range, may be calibrated with that range
+    as its prior. It is then classed prior-dominated and gets its prior_range test.
+
 ## When the question asks for quantities, not an allocation
 
 Some questions ask for estimates with intervals (a reproduction number, an attack rate) and a yes/no statement,

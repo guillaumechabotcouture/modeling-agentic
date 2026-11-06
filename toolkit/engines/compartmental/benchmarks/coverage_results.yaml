@@ -1,15 +1,14 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: compartmental-starsim
-  version: '0.1'
-  code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+  version: '0.2'
+  code_sha256: 339ef0a7ce81e9b9514a8a914e0fcb017eb4c69925c596cd5b491a283b8891e2
   params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
   config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
 engine_config_sha256: 6430f390a3fc3746f15649cdcfe6c65ea257d47a896b6ffa069d5ecdaae006c8
 benchmarks:
 - id: SB1
-  metric: 'identified renewal fit: known initial susceptibility and seeding, unforced,
-    complete epidemic'
+  metric: 'identified renewal fit: known initial susceptibility and seeding, unforced, complete epidemic'
   role: held_out
   target: null
   band:
@@ -60,8 +59,7 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: 0fc6623da01ed2e207ee74e96bdba4e1c77d637e5f0c07132e67352b298ecb05
 - id: SB2a
-  metric: 'confounded: series truncated before depletion, seeding unknown; prior range
-    of reporting carried'
+  metric: 'confounded: series truncated before depletion, seeding unknown; prior range of reporting carried'
   role: held_out
   target: null
   band:
@@ -111,8 +109,7 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: 2e33fbb08d9ef0c30715c66a96d0afd666d468b062c3d47e0a8c95677ed3ba8c
 - id: SB2a_neg
-  metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces
-    the v1 failure)'
+  metric: 'negative control for SB2a: reporting fixed at its prior median (reproduces the v1 failure)'
   role: held_out
   target: null
   band:
@@ -156,8 +153,8 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: 2334ae7dac6d88325d2bc0fe224a2b87284afa9c13ccbac06e0ab09f7a4e3168
 - id: SB2b
-  metric: 'confounded: unknown initial susceptible share (declared prior) and unknown
-    forcing amplitude, complete series'
+  metric: 'confounded: unknown initial susceptible share (declared prior) and unknown forcing amplitude, complete
+    series'
   role: held_out
   target: null
   band:
@@ -194,8 +191,7 @@ benchmarks:
       identified: 3
   per_replicate_sha256: 202866441c4c23f39e77c8598a1ff38c8ba3fb3c1311b97b162bb3c0c87acbfa
   errors:
-  - 'CalibrationRefused: posterior_ess: effective sample size 513 below the floor
-    1000 after 12 adaptive stages'
+  - 'CalibrationRefused: posterior_ess: effective sample size 513 below the floor 1000 after 12 adaptive stages'
   interval_width_median:
     attack_rate: 0.12387741627254967
   sampler:
@@ -271,8 +267,8 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: 59fb7ed6823e371beb4cddf970b1dca39737d8e575e3ac3205260bc0be3073b7
 - id: SB3a
-  metric: cohort immunity from two overlapping sources (admin coverage with numerator
-    inflation and denominator error; serosurvey with assay error, waning, frame gap)
+  metric: cohort immunity from two overlapping sources (admin coverage with numerator inflation and denominator
+    error; serosurvey with assay error, waning, frame gap)
   role: held_out
   target: null
   band:
@@ -458,8 +454,7 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: 4b50cd881edc590fe0fabfdc9c7cf617af9ac062b71d109d38f2b26d10cca3a1
 - id: SB3c
-  metric: 'administrative coverage only: every bias parameter prior-dominated, prior
-    ranges carried'
+  metric: 'administrative coverage only: every bias parameter prior-dominated, prior ranges carried'
   role: held_out
   target: null
   band:
@@ -529,8 +524,7 @@ benchmarks:
     note: stored replicate aggregates re-scored; no new run
   computation_sha256: ac97cb8967c478839125a4ae7f3ecb71bdc7531469ffe14473724b296ac1f0b3
 - id: SB5
-  metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted
-    by a fixed plan'
+  metric: 'group-attack-rate calibration of q: coverage of hospitalisations averted by a fixed plan'
   role: held_out
   target: null
   band:
@@ -724,3 +718,30 @@ summary:
 engine_version: '0.1'
 fit_rule: null
 wall_s: 21626.0
+restamped:
+  by: compat_proof.py
+  proof: compat_proof.yaml
+  proof_cases: 27
+  old_identity:
+    name: compartmental-starsim
+    version: '0.1'
+    code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
+    params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+    config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
+  old_ref: origin/v2
+  old_commit: b24d147819aee932049c404bd33d97784a0fbfcf
+  rows_not_rebound:
+  - SB1
+  - SB2a
+  - SB2a_neg
+  - SB2b
+  - SB2c
+  - SB3a
+  - SB3b_admin_truth
+  - SB3b_sero_truth
+  - SB3c
+  - SB5
+  note: coverage values computed by the old code, carried by a byte-identity proof of the engine on every configuration
+    the packs use; not recomputed. Rows in rows_not_rebound were computed by calibrator code other than the proof's
+    old side (before this change), so they keep that code's digest and stay unusable for rescore and merge until
+    re-run

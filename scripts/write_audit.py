@@ -322,6 +322,8 @@ REVIEWED: dict = {
     "toolkit/analysis/run.py": {"open-write": (5, _FIX + " (_resign, _direct_toy)"), "os-remove": (1, _FIX),
                                 "shutil": (1, _FIX)},
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
+    "toolkit/engines/compartmental/benchmarks/compat_proof.py": {
+        "open-write": (2, _REPO + " (the proof record and the re-stamped coverage results in the engine's benchmarks/)")},
     "toolkit/engines/compartmental/benchmarks/runtime_spike.py": {"open-write": (1, _REPO)},
     "toolkit/engines/compartmental/engine.py": {"open-write": (1, _REPO + " (write_card)")},
     "toolkit/engines/renewal/engine.py": {"open-write": (1, _REPO + " (write_card)")},

@@ -39,7 +39,43 @@ ALLOCATION_CSV = f"{OUT_DIR}/allocation.csv"
 def _empirical_config(spec: dict) -> dict:
     """The package-rate engine is configured by the spec: its components and the outcome."""
     comps = list(((spec.get("options") or {}).get("components") or {}).keys())
+    if len(comps) > EMPIRICAL_MAX_COMPONENTS:
+        # the engine enumerates every combination of its components (2^n rate ratios): a joint dose-block space with
+        # dozens of level components would exhaust memory while the harness only asks whether it fits (flu run 1)
+        raise ValueError(f"the package-rate engine takes at most {EMPIRICAL_MAX_COMPONENTS} components (one rate ratio "
+                         f"per combination); this spec has {len(comps)}")
     return {"components": comps, "outcome": (spec.get("objective") or {}).get("outcome") or "cases"}
+
+
+EMPIRICAL_MAX_COMPONENTS = 16
+
+
+COMPARTMENTAL = "toolkit.engines.compartmental.engine:CompartmentalEngine"
+
+
+def _signed_config(ref: str):
+    """A configured engine whose configuration is part of the signed spec (`engine: {ref, config}`): its card is the
+    card of that configuration. A spec that names another engine (or `auto`) gives it none, so it is not eligible
+    (its structure, run mode and groups cannot be guessed)."""
+    def cfg(spec: dict) -> dict:
+        e = spec.get("engine")
+        if isinstance(e, dict) and e.get("ref") == ref:
+            return dict(e.get("config") or {})
+        # measles run 6: a rethink re-drafted the spec as `engine: auto`. The schema then reads the engine from the
+        # run's engine_choice.json, so the choice's configuration is the one this engine runs with
+        auto = e == "auto" or (isinstance(e, dict) and e.get("auto") is True)
+        rd = spec.get("_run_dir")
+        if auto and rd and os.path.exists(os.path.join(rd, ENGINE_CHOICE)):
+            try:
+                with open(os.path.join(rd, ENGINE_CHOICE)) as f:
+                    ch = (json.load(f) or {}).get("engine") or {}
+            except (OSError, ValueError):
+                ch = {}
+            if isinstance(ch, dict) and ch.get("ref") == ref and isinstance(ch.get("config"), dict):
+                return dict(ch["config"])
+        raise ValueError(f"{ref} is configured by the signed spec: write engine: {{ref: {ref}, config: {{...}}}} (its card "
+                         "and the decision-spec skill list the fields); engine: auto cannot configure it")
+    return cfg
 
 
 def _renewal_config(spec: dict) -> dict:
@@ -57,6 +93,7 @@ ENGINES = [
     ("toolkit.engines.contract:ToyEngine", None, None),
     ("toolkit.engines.malaria.engine:MalariaEngine", "toolkit/engines/malaria/card.yaml", None),
     ("toolkit.engines.empirical.engine:PackageRateEngine", None, _empirical_config),
+    (COMPARTMENTAL, None, _signed_config(COMPARTMENTAL)),
     ("toolkit.engines.renewal.engine:RenewalEngine", None, _renewal_config),
 ]
 # Contract thresholds on the analysis output (B owns these once it lands).
@@ -470,7 +507,12 @@ class _ToolkitApi:
             self.candidates = rows
             if any(r.get("eligible") for r in rows):
                 return bad
-            return bad + ["no candidate engine passes the full checks before sign-off"] + [
+            # engines configured by the signed spec cannot be chosen by `auto`: say so first, so a short feedback window
+            # (the machine log truncates) still carries it (flu run 7 spent its last try on `auto`)
+            conf = [r["ref"] for r in rows if "configured by the signed spec" in " ".join(r.get("why_not") or [])]
+            hint = ([f"engine: auto cannot configure {', '.join(conf)}: name it as engine: {{ref, config}}"]
+                    if conf else [])
+            return bad + ["no candidate engine passes the full checks before sign-off"] + hint + [
                 f"[{r['ref']}] {w}" for r in rows for w in (r.get("why_not") or []) if w not in bad]
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
@@ -484,7 +526,7 @@ class _ToolkitApi:
             signed = (yaml.safe_load(open(s.path)) or {}).get("engine", signed) if s.path else signed
         except (OSError, yaml.YAMLError):
             pass
-        rows = self._card_rows(dict(s.raw, engine=signed), engines)
+        rows = self._card_rows(dict(s.raw, engine=signed, _run_dir=s.base), engines)
         for r in rows:
             if r.get("eligible"):
                 probs = schema.validate(schema.with_engine(s, r["ref"], r.get("config")))
@@ -772,6 +814,35 @@ def _self_test() -> int:
                 sys.modules[k] = mod
     ok(no_auto is sys.modules[__name__] and isinstance(with_auto, _ToolkitApi),
        "B22 B's API is used only once its schema takes `engine: auto` from engine_choice.json")
+    # B25: the compartmental engine is registered with the configuration its signed spec gives
+    cfg = {"groups": ["a", "b"], "structure": "age_groups_contact_matrix", "outcomes": ["hosp"],
+           "components": {"da": {"kind": "doses", "group": "a", "block_size": 10, "max_blocks": 2}}}
+    sp = {"engine": {"ref": COMPARTMENTAL, "config": cfg}, "objective": {"outcome": "hosp"},
+          "options": {"engine_map": {"x1": {"da": 1}, "x2": {"da": 2}}},
+          "decision_units": {"engine_attributes": {"N": {}, "contact": {}, "s0": {}, "ratio:hosp": {}},
+                             "populations": {"all": {"age_groups": ["a", "b"]}}}}
+    rows = {r["ref"]: r for r in eligible_engines(sp)}
+    ok(COMPARTMENTAL in rows and rows[COMPARTMENTAL]["eligible"] and rows[COMPARTMENTAL]["config"] == cfg,
+       f"B25 the compartmental engine is eligible for a spec that names it with its configuration: "
+       f"{rows.get(COMPARTMENTAL, {}).get('why_not')}")
+    sp2 = dict(sp, engine={"ref": "toolkit.engines.contract:ToyEngine"})
+    r2 = {r["ref"]: r for r in eligible_engines(sp2)}
+    ok(not r2[COMPARTMENTAL]["eligible"] and "configured by the signed spec" in str(r2[COMPARTMENTAL]["why_not"]),
+       "B26 without its configuration in the signed spec the compartmental engine is not eligible")
+    many = dict(sp2, options={"components": {f"c{i}": {} for i in range(40)}, "engine_map": {}})
+    r3 = {r["ref"]: r for r in eligible_engines(many)}
+    emp = next(v for k, v in r3.items() if "PackageRateEngine" in k)
+    ok(not emp["eligible"] and "at most" in str(emp["why_not"]),
+       "B27 a spec with 40 components makes the package-rate engine ineligible at once (it would enumerate 2^40 "
+       "combinations)")
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as d:
+        json.dump(engine_choice_record(COMPARTMENTAL, "test", [], config=cfg), open(os.path.join(d, ENGINE_CHOICE), "w"))
+        r4 = {r["ref"]: r for r in eligible_engines(dict(sp, engine="auto", _run_dir=d))}
+        r5 = {r["ref"]: r for r in eligible_engines(dict(sp, engine="auto"))}
+        ok(r4[COMPARTMENTAL]["eligible"] and r4[COMPARTMENTAL]["config"] == cfg and not r5[COMPARTMENTAL]["eligible"],
+           "B28 an `engine: auto` spec (a rethink) keeps the compartmental configuration of the run's engine choice; "
+           "with no choice in the run it is not eligible")
     # an estimates spec (no allocation units): the renewal engine is the one eligible registered engine, configured
     # from the spec's dynamics; for an allocation spec it is not eligible
     import tempfile as _tf
