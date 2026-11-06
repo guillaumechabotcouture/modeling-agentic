@@ -1545,8 +1545,14 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
         return st
     st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
                   derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed)
-    _write_json(run_dir, "metadata.json", {"question": question, "started": _now(), "pipeline": "v2",
-                                           "max_rounds": max_rounds, "signoff": signoff})
+    try:   # keep what main.py recorded first (run_dir, pipeline, commit, launcher: scripts/lib/pipeline_id.py)
+        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
+    except (OSError, ValueError):
+        meta = {}
+    meta = meta if isinstance(meta, dict) else {}
+    meta.update({"question": question, "started": meta.get("started") or _now(), "pipeline": "v2",
+                 "max_rounds": max_rounds, "signoff": signoff})
+    _write_json(run_dir, "metadata.json", meta)
     save_state(run_dir, st)
     return st
 

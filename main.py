@@ -93,6 +93,8 @@ from agents.run_finish import (  # noqa: E402,F401  Phase 48 γ: moved, re-expor
 )
 
 REPO_ROOT = enforcement.REPO_ROOT
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts", "lib"))
+import pipeline_id  # noqa: E402  which pipeline runs (v2 by default) and the identity every run records
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -344,8 +346,8 @@ async def run(question: str, max_rounds: int, max_sessions: int,
               run_dir: str | None = None, run_path: str | None = None,
               allow_cloud: bool = False, cross_model: bool = False,
               methods_critic: bool = False, max_budget_usd: float | None = None,
-              signoff: str = "owner", signoff_hours: float = 24.0) -> str:
-    """Run the modeling pipeline as a single lead agent session.
+              signoff: str = "owner", signoff_hours: float = 24.0, identity: dict | None = None) -> str:
+    """Run the modeling pipeline as a single lead agent session (pipeline v1, `--v1`).
 
     Returns the terminal status written to metadata.json.
     """
@@ -372,6 +374,7 @@ async def run(question: str, max_rounds: int, max_sessions: int,
     heartbeat.start()
     trace_path = os.path.join(run_path, "trace.jsonl")
     metadata_path = os.path.join(run_path, "metadata.json")
+    pipeline_id.stamp(run_path, identity or pipeline_id.identity("v1", REPO_ROOT))   # before anything reads it
     with open(metadata_path) as f:
         prior_meta = json.load(f)
     # A resumed run keeps its critic set: the validator's requirements follow it.
@@ -2882,8 +2885,8 @@ def _run_self_test() -> int:
 
 def eval_refusal(args, here: str) -> str | None:
     """Why this invocation may not run here (Phase 50 α eval isolation), or None. Checks the
-    question the run will use: the argument, the resumed run's metadata.json, and for a --v2
-    resume also run_state.json (main_v2 takes its question from there, not the argument)."""
+    question the run will use: the argument, the resumed run's metadata.json, and for a v2
+    resume (the default) also run_state.json (main_v2 takes its question from there, not the argument)."""
     lib = os.path.join(here, "scripts", "lib")
     if lib not in sys.path:
         sys.path.insert(0, lib)
@@ -2893,7 +2896,11 @@ def eval_refusal(args, here: str) -> str | None:
         resume_dir = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
     question, meta = question_for(args.question, resume_dir)
     candidates = [question]
-    if getattr(args, "v2", False) and resume_dir:
+    try:
+        v2 = pipeline_id.select(getattr(args, "v1", False), getattr(args, "v2", False)) == "v2"
+    except pipeline_id.PipelineError:
+        v2 = True           # refused later; check every question the run could use
+    if v2 and resume_dir:
         try:
             from agents import stage_machine
             st = stage_machine.load_state(resume_dir)
@@ -2944,16 +2951,18 @@ def run_v2_and_store(run, run_path: str, store=None):
             print(f"[ERROR] RUN RESULTS NOT STORED: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
 
 
-def main_v2(args) -> int:
+def main_v2(args, ident: dict | None = None) -> int:
     """v2 C: the stage machine drives the run; bounded agent tasks (agents/v2_sdk_tasks.py)
     do the judgement. Resumes from run_state.json with --resume. The lead session, its
-    prompt and its flow hooks are not used."""
+    prompt and its flow hooks are not used. `ident` (pipeline_id.identity) goes into
+    metadata.json before the machine starts."""
     from agents import stage_machine, v2_sdk_tasks
+    ident = ident or pipeline_id.identity("v2", REPO_ROOT)
     if args.resume:
         run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
         st = stage_machine.load_state(run_path)
         if st is None:
-            print(f"Error: {run_path} has no run_state.json (not a v2 run)")
+            print(f"Error: {run_path} has no run_state.json (not a v2 run; pass --v1 to resume a v1 run)")
             return 1
         question = st.question
     else:
@@ -2962,6 +2971,7 @@ def main_v2(args) -> int:
             return 1
         question = args.question
         run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
+    pipeline_id.stamp(run_path, ident)
     print(f"Run (v2): {run_path}", flush=True)
     tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
     status = run_v2_and_store(lambda: stage_machine.run_v2(
@@ -3010,9 +3020,14 @@ def main() -> int:
                              "PATH, framework imports) and exit")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the live preflight before a run (not recommended)")
+    parser.add_argument("--v1", action="store_true",
+                        help="Run the v1 lead-session pipeline. Only on explicit request: v2 (the stage "
+                             "machine, agents/stage_machine.py) is the default since 2026-11-05.")
     parser.add_argument("--v2", action="store_true",
-                        help="v2 C: run the code-owned stage machine (agents/stage_machine.py) instead of "
-                             "the lead session. Off by default; today's pipeline is unchanged without it.")
+                        help="Run the v2 stage machine (the default; accepted so existing commands work).")
+    parser.add_argument("--launcher", default=None,
+                        help="Name of the launcher that started this run, recorded in metadata.json "
+                             "(default: $MA_LAUNCHER, else 'direct').")
     parser.add_argument("--dev-unsandboxed-derivations", action="store_true",
                         help="v2 development only: run the spec's data derivations without a sandbox where there is "
                              "none (macOS). The record says sandbox none and the run cannot be accepted "
@@ -3021,6 +3036,10 @@ def main() -> int:
 
     if args.self_test:
         return _run_self_test()
+    try:
+        pipeline = pipeline_id.select(args.v1, args.v2)
+    except pipeline_id.PipelineError as e:
+        parser.error(str(e))
     # Phase 50 α: an eval-suite question runs only on a cloud worker (its work directory is
     # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
     # route. Checked on the question the run will actually use, including --resume, and
@@ -3029,9 +3048,18 @@ def main() -> int:
     if why:
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
-    if args.v2:
+    ident = pipeline_id.identity(pipeline, REPO_ROOT, args.launcher)
+    print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
+    if args.resume:   # a run continues under the pipeline it was recorded with
+        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(
+            args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume), "metadata.json")),
+            pipeline)
+        if why:
+            print(f"Error: {why}", file=sys.stderr)
+            return 1
+    if pipeline == "v2":
         try:
-            return main_v2(args)
+            return main_v2(args, ident)
         except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
             return 130
     if args.preflight_only or not args.skip_preflight:
@@ -3077,7 +3105,7 @@ def main() -> int:
                    run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
                    cross_model=args.cross_model, methods_critic=args.methods_critic,
                    max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours)
+                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
     else:
         if not args.question:
             print("Error: question is required (or use --resume)")
@@ -3085,7 +3113,7 @@ def main() -> int:
         coro = run(args.question, args.max_rounds, args.max_sessions,
                    allow_cloud=args.cloud, cross_model=args.cross_model,
                    methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours)
+                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
     try:
         status = asyncio.run(coro)
     except KeyboardInterrupt:

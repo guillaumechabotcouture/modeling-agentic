@@ -1,4 +1,4 @@
-"""E7 Nigeria question on architecture v2 (main.py --v2), scoped to the 13 Global Fund-supported states
+"""E7 Nigeria question on architecture v2 (pipeline="v2": the launcher passes --v2), scoped to the 13 Global Fund-supported states
 (owner decision 2026-11-01). NOT launched: the owner sets the budget and launches.
 
 Inputs never enter the public repo (DHS terms). Before a launch:
@@ -28,11 +28,13 @@ CONFIG = RunConfig(
     labels=("N1",),
     storage_prefix="runs/v2_nigeria_gf13",
     out_dir=os.path.expanduser("~/modeling-agentic-keep/nigeria_gf13_v2/run"),
-    flags=("--v2", "--max-budget-usd", "100", "--signoff", "owner", "--signoff-hours", "24"),
+    pipeline="v2",
+    flags=("--max-budget-usd", "100", "--signoff", "owner", "--signoff-hours", "24"),
     max_rounds=4,
     compute_start=1, compute_max=8,
     compute_env={"MA_COMPUTE_RESOURCE": "compute", "MA_COMPUTE_TARGET_WORKERS": "8",
                  "MA_COMPUTE_MAX_CORE_HOURS": "200", "MA_COMPUTE_CALL_CORE_HOURS": "100"},
-    required_files=RunConfig.__dataclass_fields__["required_files"].default + ("main.py", "agents/stage_machine.py")
+    required_files=RunConfig.__dataclass_fields__["required_files"].default + ("main.py", "agents/stage_machine.py",
+                                                                                "scripts/lib/pipeline_id.py")
     + INPUTS + ("data/nigeria_gf13/manifest.json",),
 )

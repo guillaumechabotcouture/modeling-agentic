@@ -290,7 +290,8 @@ def add_verdict_banner(run_path: str, gate: dict | None) -> bool:
 
 # methods_critic / cross_model decide which critiques the validator requires
 # (Codex review of PR #15: flipping methods_critic dropped a requirement).
-_PROTECTED_META = ("question", "started", "run_dir", "methods_critic", "cross_model")
+_PROTECTED_META = ("question", "started", "run_dir", "methods_critic", "cross_model",
+                   "pipeline", "commit", "launcher")   # run identity (scripts/lib/pipeline_id.py)
 
 
 def _restore_protected_meta(metadata_path: str, original_meta: dict) -> bool:

@@ -14,11 +14,14 @@ disease-agnostic: every question-specific fact is in the rubric and the truth fi
     python3 scripts/eval_suite.py grade --root <dir> [--out suite_scores.json]
         <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>);
         the answer key is the one whose input hashes match the run's
-    python3 scripts/eval_suite.py run [--tag T] [--reps N] [--execute] [q ...]
+    python3 scripts/eval_suite.py run [--tag T] [--reps N] [--pipeline v2|v1] [--execute] [q ...]
         preflight (inputs current, nothing hidden in the launch tarball), then print the
-        launch commands; --execute runs them (each launch costs up to the US$35 cap)
-    python3 scripts/eval_suite.py report <suite_scores.json> [<other suite_scores.json>]
-        a table; with two files, B against A per question
+        launch commands, each stating its pipeline (EVAL_PIPELINE, default v2); --execute runs
+        them (each launch costs up to the US$35 cap)
+    python3 scripts/eval_suite.py report <suite_scores.json> [<other suite_scores.json>] [--allow-mixed-pipelines]
+        a table; with two files, B against A per question. Every score names the pipeline and
+        commit its run recorded ("unknown" for runs from before 2026-11-05); two files whose
+        pipelines differ, or are unknown, are not compared without --allow-mixed-pipelines
     python3 scripts/eval_suite.py --self-test [--with-private]
         engine tests; --with-private also runs the bundle's question-specific tests
   maintainer, on the laptop that holds the key (macOS keychain):
@@ -68,6 +71,7 @@ sys.path.insert(0, os.path.join(HERE, "lib"))
 sys.path.insert(0, HERE)
 import eval_paths  # noqa: E402
 import eval_private  # noqa: E402
+import pipeline_id  # noqa: E402
 
 DEFAULT_TEXT_FILES = ("report.md", "results.md", "decision_rule.md", "scope_declaration.yaml")
 MAX_TEXT_BYTES = 2_000_000
@@ -430,6 +434,7 @@ def extract_process(run_dir) -> dict:
            "has_report": os.path.isfile(os.path.join(run_dir, "report.md"))}
     meta = meta if isinstance(meta, dict) else {}
     out["status"] = meta.get("status")
+    out["pipeline"], out["commit"] = pipeline_id.label(meta)    # "unknown" when not recorded: never assumed
     fg = meta.get("final_gate") if isinstance(meta.get("final_gate"), dict) else {}
     out["action"] = out["action"] or fg.get("action")
     out["rounds"] = fg.get("current_round")
@@ -785,6 +790,7 @@ def score(answer, rubric, truth, texts, records, input_names, taxonomy=None) -> 
         "failures": classified, "primary_layer": primary,
         "gate_action": proc.get("action"), "status": proc.get("status"), "rounds": proc.get("rounds"),
         "cost_usd": proc.get("cost_usd"), "wall_hours": proc.get("wall_hours"),
+        "pipeline": proc.get("pipeline") or pipeline_id.UNKNOWN, "commit": proc.get("commit") or pipeline_id.UNKNOWN,
     }
 
 
@@ -822,6 +828,22 @@ def input_hash_problem(q, truth, launch) -> tuple[str, str] | None:
     return None
 
 
+def identity_problem(proc, launch) -> tuple[str, str] | None:
+    """(failure code, detail) when the run's recorded pipeline or commit is not what its launch
+    record says was launched. A launch record that names neither (launches from before
+    2026-11-05) checks nothing: the score then reads "unknown" for what it cannot show."""
+    lp, lc = (launch or {}).get("pipeline"), (launch or {}).get("commit")
+    rp, rc = (proc or {}).get("pipeline", pipeline_id.UNKNOWN), (proc or {}).get("commit", pipeline_id.UNKNOWN)
+    if lp:
+        if rp == pipeline_id.UNKNOWN:
+            return "pipeline_unrecorded", f"launched as pipeline {lp}, but the run records no pipeline"
+        if rp != lp:
+            return "pipeline_mismatch", f"launched as pipeline {lp}, but the run records pipeline {rp}"
+    if lp and lc and not pipeline_id.same_commit(lc, rc):
+        return "commit_mismatch", f"launched at commit {lc}, but the run records commit {rc}"
+    return None
+
+
 def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=None, verify_inputs=True) -> dict:
     """Score one run. The answer key is `truth` when given (with the current rubric),
     else the key in the hidden tree whose input hashes match the run's (select_truth)."""
@@ -844,6 +866,7 @@ def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=No
         prob = ("inputs_mismatch", how[len(INPUTS_CONTRADICT):])
     elif verify_inputs:
         prob = input_hash_problem(q, truth, launch)
+    prob = prob or identity_problem(answer.get("process"), launch)   # a run that is not what was launched
     if prob:   # refuse: a score against the wrong answer key means nothing
         out.update(quality=0.0, quality_gated=0.0, refused=prob[1], primary_layer="INFRA")
         out["failures"].insert(0, {"code": prob[0], "check": None, "layer": "INFRA", "detail": prob[1]})
@@ -872,10 +895,12 @@ def collected_runs(root, q) -> list[tuple]:
     return res
 
 
-def _zero_row(label, why):
+def _zero_row(label, why, launch=None):
     return {"label": label, "run_dir": None, "quality": 0.0, "quality_gated": 0.0, "gate_action": None,
             "status": None, "rounds": None, "cost_usd": None, "wall_hours": None, "primary_layer": "INFRA",
-            "failures": ["run_record_missing"], "detail": why}
+            "failures": ["run_record_missing"], "detail": why,
+            "pipeline": (launch or {}).get("pipeline") or pipeline_id.UNKNOWN,
+            "commit": (launch or {}).get("commit") or pipeline_id.UNKNOWN}
 
 
 def grade_root(root, private_dir=None, data_dir=DATA) -> dict:
@@ -884,14 +909,14 @@ def grade_root(root, private_dir=None, data_dir=DATA) -> dict:
         res = []
         for label, rec, rd, why in collected_runs(root, q):
             if rd is None:   # an expected replicate with no current run scores zero
-                res.append(_zero_row(label, why))
+                res.append(_zero_row(label, why, rec))
                 continue
             s = grade_run(q, rd, private_dir, data_dir, launch=rec)
             with open(os.path.join(rd, "scores.json"), "w") as f:
                 json.dump(s, f, indent=1)
             res.append({"label": label} | {k: s[k] for k in ("run_dir", "quality", "quality_gated", "gate_action",
                                                                "status", "rounds", "cost_usd", "wall_hours",
-                                                               "primary_layer")}
+                                                               "primary_layer", "pipeline", "commit")}
                        | {"failures": sorted({f["code"] for f in s["failures"]})})
         if not res:   # fail closed: a question never launched (no assignments.json) scores zero
             res.append(_zero_row(None, "no launch record (assignments.json)"))
@@ -915,6 +940,32 @@ def _f(x, fmt="{:.2f}"):
     return "-" if x is None else fmt.format(x)
 
 
+def _ident(row) -> tuple[str, str]:
+    """(pipeline, commit) of a score row; "unknown" for rows from before 2026-11-05."""
+    return pipeline_id.label(row)
+
+
+def suite_identity(suite: dict) -> tuple[set, set]:
+    """Every pipeline and every commit the suite's rows name."""
+    rows = [r for runs in suite.get("questions", {}).values() for r in runs]
+    return {_ident(r)[0] for r in rows} or {pipeline_id.UNKNOWN}, {_ident(r)[1] for r in rows} or {pipeline_id.UNKNOWN}
+
+
+def compare_refusal(a: dict, b: dict) -> str | None:
+    """Why two score files are not comparable as one pipeline against itself, or None: both must
+    name exactly one pipeline, the same one, and not "unknown" (fail closed)."""
+    pa, pb = suite_identity(a)[0], suite_identity(b)[0]
+    if len(pa) != 1 or len(pb) != 1 or pa != pb or pipeline_id.UNKNOWN in pa:
+        return (f"A is pipeline {','.join(sorted(pa))}, B is pipeline {','.join(sorted(pb))}: not compared "
+                "(pass --allow-mixed-pipelines to compare different pipelines on purpose)")
+    return None
+
+
+def _ident_line(name: str, suite: dict) -> str:
+    p, c = suite_identity(suite)
+    return f"{name}pipeline {', '.join(sorted(p))}; commit {', '.join(sorted(c))}"
+
+
 def summarise(suite: dict) -> dict:
     rows = {}
     for q, runs in suite["questions"].items():
@@ -924,28 +975,39 @@ def summarise(suite: dict) -> dict:
                    "rounds": _mean(r["rounds"] for r in runs), "cost_usd": _mean(r["cost_usd"] for r in runs),
                    "wall_hours": _mean(r["wall_hours"] for r in runs),
                    "gate": ",".join(sorted({r["gate_action"] or "-" for r in runs})),
-                   "failures": sorted({f for r in runs for f in r["failures"]})}
+                   "failures": sorted({f for r in runs for f in r["failures"]}),
+                   "pipeline": ",".join(sorted({_ident(r)[0] for r in runs})) or pipeline_id.UNKNOWN,
+                   "commit": ",".join(sorted({_ident(r)[1] for r in runs})) or pipeline_id.UNKNOWN}
     tot = {k: _mean(v[k] for v in rows.values()) for k in ("quality", "quality_gated", "rounds", "wall_hours")}
     tot["cost_usd"] = sum(r["cost_usd"] or 0 for runs in suite["questions"].values() for r in runs)   # every run
     return {"rows": rows, "total": tot}
 
 
-def report(a: dict, b: dict | None = None) -> str:
+def report(a: dict, b: dict | None = None, allow_mixed_pipelines: bool = False) -> str:
+    """A table of one score file, or B against A. Raises ValueError for two files that are not the
+    same known pipeline (compare_refusal) unless `allow_mixed_pipelines`."""
     sa = summarise(a)
     lines = []
     if b is None:
-        lines += ["| question | n | quality | gated | gate | rounds | US$ | hours | failures |",
-                  "|---|---|---|---|---|---|---|---|---|"]
+        lines += [_ident_line("", a), "",
+                  "| question | n | quality | gated | gate | rounds | US$ | hours | pipeline | commit | failures |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
         for q, r in sa["rows"].items():
             lines.append(f"| {q} | {r['n']} | {_f(r['quality'])} | {_f(r['quality_gated'])} | {r['gate']} | "
                          f"{_f(r['rounds'], '{:.1f}')} | {_f(r['cost_usd'], '{:.0f}')} | {_f(r['wall_hours'])} | "
-                         f"{', '.join(r['failures'][:4])} |")
+                         f"{r['pipeline']} | {r['commit']} | {', '.join(r['failures'][:4])} |")
         t = sa["total"]
         lines.append(f"| **suite** | | {_f(t['quality'])} | {_f(t['quality_gated'])} | | {_f(t['rounds'], '{:.1f}')} | "
-                     f"{_f(t['cost_usd'], '{:.0f}')} (total) | {_f(t['wall_hours'])} | |")
+                     f"{_f(t['cost_usd'], '{:.0f}')} (total) | {_f(t['wall_hours'])} | | | |")
         return "\n".join(lines)
+    why = compare_refusal(a, b)
+    if why and not allow_mixed_pipelines:
+        raise ValueError(why)
     sb = summarise(b)
-    lines += ["| question | quality A | quality B | Δ | within replicate spread | rounds A→B | US$ A→B | hours A→B |",
+    lines += [_ident_line("A: ", a), _ident_line("B: ", b)]
+    if why:
+        lines.append(f"WARNING: different pipelines compared on request (--allow-mixed-pipelines): {why.split(':')[0]}")
+    lines += ["", "| question | quality A | quality B | Δ | within replicate spread | rounds A→B | US$ A→B | hours A→B |",
               "|---|---|---|---|---|---|---|---|"]
     better = worse = 0
     for q in sa["rows"]:
@@ -992,8 +1054,10 @@ def leak_problems(repo=REPO) -> list[str]:
     return probs
 
 
-def launch_commands(questions, tag, reps, tree=None) -> list[str]:
-    env = f"EVAL_TAG={tag} EVAL_REPS={reps}" + (f" EVAL_TREE={tree}" if tree else "")
+def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]:
+    if pipeline not in pipeline_id.PIPELINES:
+        raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}")
+    env = f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}" + (f" EVAL_TREE={tree}" if tree else "")
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
@@ -1129,6 +1193,8 @@ def main(argv=None) -> int:
     r.add_argument("--reps", type=int, default=1)
     r.add_argument("--tree", default=None)
     r.add_argument("--execute", action="store_true")
+    r.add_argument("--pipeline", choices=pipeline_id.PIPELINES, default="v2",
+                   help="the pipeline every launch runs (EVAL_PIPELINE; default v2)")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
     r.add_argument("--private-dir", help=hidden_help)
     r.add_argument("questions", nargs="*")
@@ -1144,6 +1210,8 @@ def main(argv=None) -> int:
     rp = sub.add_parser("report")
     rp.add_argument("a")
     rp.add_argument("b", nargs="?")
+    rp.add_argument("--allow-mixed-pipelines", action="store_true",
+                    help="compare two score files from different (or unknown) pipelines on purpose")
     fe = sub.add_parser("fetch", help="maintainer: decrypt the bundle into a directory to edit it")
     fe.add_argument("dest")
     pu = sub.add_parser("publish", help="maintainer: encrypt and upload a hidden tree as the next bundle version")
@@ -1256,9 +1324,10 @@ def _run_command(ap, args, private) -> int:
         if probs:
             print("refusing to launch:\n  " + "\n  ".join(probs))
             return 1
-        cmds = launch_commands(qs, args.tag, args.reps, tree if args.tree else None)
-        print(f"preflight OK ({len(qs)} questions, {args.reps} replicate(s), model spend cap US$35 each, "
-              f"at most US${35 * len(qs) * args.reps})")
+        cmds = launch_commands(qs, args.tag, args.reps, tree if args.tree else None, args.pipeline)
+        print(f"preflight OK ({len(qs)} questions, {args.reps} replicate(s), pipeline {args.pipeline}, model spend "
+              f"cap US$35 each, at most US${35 * len(qs) * args.reps}); the launcher checks the pipeline against "
+              f"the shipped main.py before it creates anything")
         for c in cmds:
             print(c)
         print(f"then: EVAL_TAG={args.tag} python3 cloud/run_cluster.py cloud/configs/eval_<q>.py collect; "
@@ -1290,7 +1359,8 @@ def _run_command(ap, args, private) -> int:
         with open(out, "w") as f:
             json.dump(s, f, indent=1)
         key = "quality_gated" if args.gated else "quality"
-        print(f"{args.question}: {key} {s[key]:.3f} (gated {s['quality_gated']:.3f}); gate {s['gate_action']}; "
+        print(f"{args.question}: {key} {s[key]:.3f} (gated {s['quality_gated']:.3f}); pipeline {s.get('pipeline')} "
+              f"@ {s.get('commit')}; gate {s['gate_action']}; "
               f"rounds {s['rounds']}; US$ {s['cost_usd']}; primary layer {s['primary_layer']}; "
               f"answer key {s.get('truth_key')} ({s.get('truth_selected_by')})")
         for c in s["checks"]:
@@ -1304,7 +1374,11 @@ def _run_command(ap, args, private) -> int:
         if args.b:
             with open(args.b) as f:
                 b = json.load(f)
-        print(report(a, b))
+        try:
+            print(report(a, b, allow_mixed_pipelines=args.allow_mixed_pipelines))
+        except ValueError as e:
+            print(f"REFUSED: {e}")
+            return 2
         return 0
     ap.print_help()
     return 2
@@ -1458,7 +1532,8 @@ def _self_test(with_private=False, private_dir=None) -> int:
         # report and comparison
         sa = {"questions": {"toy": [{"run_dir": "r", "quality": 0.5, "quality_gated": 0.4, "gate_action": "ACCEPT",
                                      "status": "completed", "rounds": 3, "cost_usd": 30, "wall_hours": 0.9,
-                                     "primary_layer": "MODEL", "failures": ["mechanism_not_reported"]}]}}
+                                     "primary_layer": "MODEL", "failures": ["mechanism_not_reported"],
+                                     "pipeline": "v2", "commit": "abc1234"}]}}
         sbb = {"questions": {"toy": [dict(sa["questions"]["toy"][0], quality=0.8, rounds=2, cost_usd=22)]}}
         txt = report(sa, sbb)
         ok("+0.30" in txt and "3.0→2.0" in txt and "30→22" in txt, f"S11 comparison table: {txt}")

@@ -125,6 +125,28 @@ def run_stored(tarball):
     return None
 
 
+def run_identity(tarball):
+    """The run's pipeline, commit and launcher from its metadata.json in the tarball; "unknown"
+    for anything missing (scripts/lib/pipeline_id.py label; inlined: this file runs on the VMs)."""
+    import io, json, tarfile
+    out = {"pipeline": "unknown", "commit": "unknown", "launcher": "unknown"}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as t:
+            for m in t.getmembers():
+                if m.name.endswith("/metadata.json") and m.name.count("/") == 2:   # runs/<run>/metadata.json
+                    meta = json.load(t.extractfile(m))
+                    meta = meta if isinstance(meta, dict) else {}
+                    if meta.get("pipeline") in ("v1", "v2"):
+                        out["pipeline"] = meta["pipeline"]
+                    for k in ("commit", "launcher"):
+                        if isinstance(meta.get(k), str) and meta[k].strip():
+                            out[k] = meta[k].strip()
+                    break
+    except (tarfile.TarError, ValueError, OSError):
+        pass
+    return out
+
+
 def record_blob(prefix, launch_id, label):
     """Result records live under the launch that wrote them, so a record an
     earlier launch left under the same prefix never counts for this one."""
@@ -170,6 +192,7 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     tarball = res.pop("tarball")
     open(f"{d}/result.tar.gz", "wb").write(tarball)
     res["run_stored"] = run_stored(tarball)
+    res["run_identity"] = run_identity(tarball)
     res["launch_id"] = launch_id
     json.dump(res, open(f"{d}/result.json", "w"))
     if res["run_stored"] and res.get("transcripts_stored"):

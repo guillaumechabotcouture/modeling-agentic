@@ -10,6 +10,10 @@ Environment:
     EVAL_TREE  a committed checkout to ship instead of ~/modeling-agentic-launch
                (a branch is allowed then; without it the tree must be origin/main)
     EVAL_REPS  replicates per question (default 1; labels R1..Rn on one cluster)
+    EVAL_PIPELINE  "v2" (default) or "v1": the pipeline main.py runs, passed to it explicitly and
+               checked against the shipped code before launch (cloud/run_cluster.py
+               pipeline_preflight). Until 2026-11-05 this file passed no pipeline flag, so every
+               eval launch ran main.py's default, which was v1.
 
 The question text is read from evals/<q>/question.txt in this checkout (never shipped);
 the shipped tree must hold the question's inputs (data/evals/<q>/), or launch refuses.
@@ -29,6 +33,7 @@ def eval_config(question: str) -> RunConfig:
     tag = os.environ.get("EVAL_TAG", "main")
     reps = int(os.environ.get("EVAL_REPS", "1"))
     tree = os.environ.get("EVAL_TREE", "")
+    pipeline = os.environ.get("EVAL_PIPELINE", "v2")
     inputs = sorted(os.path.relpath(p, REPO) for p in glob.glob(os.path.join(REPO, "data", "evals", question, "*")))
     if not inputs:
         raise ValueError(f"no inputs in data/evals/{question}/: run scripts/eval_suite.py generate")
@@ -40,6 +45,7 @@ def eval_config(question: str) -> RunConfig:
         labels=tuple(f"R{i + 1}" for i in range(reps)),
         storage_prefix=f"runs/evals/{tag}/{question}",
         out_dir=os.path.expanduser(f"~/modeling-agentic-keep/evals/{tag}/{question}"),
+        pipeline=pipeline,
         flags=("--max-budget-usd", str(BUDGET_USD), "--signoff", "lead"),
         max_rounds=MAX_ROUNDS,
         compute_start=1, compute_max=4,

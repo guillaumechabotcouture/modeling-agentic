@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import io
 import json
 import os
 import re
@@ -52,6 +53,7 @@ sys.path.insert(0, HERE)
 import worker_side as ws  # noqa: E402 — uploaded to the VMs under this name
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts", "lib"))
 import eval_paths  # noqa: E402 — Phase 50 α: what a launch tarball must never hold
+import pipeline_id  # noqa: E402 — which pipeline main.py runs; the identity each run records
 sys.modules.setdefault("run_cluster", sys.modules[__name__])   # configs import RunConfig from here
 
 WORKSPACE = ws.WORKSPACE
@@ -66,7 +68,8 @@ class RunConfig:
     question_file: str
     tree: str = os.path.expanduser("~/modeling-agentic-launch")
     labels: tuple = ("R1",)
-    flags: tuple = ()                          # extra main.py flags
+    flags: tuple = ()                          # extra main.py flags (never --v1/--v2: set `pipeline`)
+    pipeline: str = ""                         # "v1" or "v2", required to launch; passed to main.py explicitly
     max_rounds: int = 8
     max_sessions: int = 5
     cross_model: bool = False                  # pass the OpenAI key for the cross-model critic
@@ -112,6 +115,10 @@ class RunConfig:
             raise ValueError(f"set {bad} through max_rounds / max_sessions, not flags")
         if not self.labels or len(set(self.labels)) != len(self.labels):
             raise ValueError("labels must be non-empty and distinct")
+        if self.pipeline and self.pipeline not in pipeline_id.PIPELINES:
+            raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}, not {self.pipeline!r}")
+        if {"--v1", "--v2"} & set(self.flags):
+            raise ValueError("set the pipeline with pipeline='v1' or 'v2', not flags: the launcher passes it to main.py")
         for f in ("scale_down_after", "adapt_interval", "overflow_hold") + (("target_duration",) if self.target_duration else ()):
             seconds(getattr(self, f))   # fail at load, not on the keeper VM
         if seconds(self.adapt_interval) <= 0:
@@ -279,11 +286,54 @@ def refuse_hidden(blob: bytes, tree: str) -> None:
                          f"({len(hidden)}, e.g. {hidden[:3]}); check .gitattributes: refusing")
 
 
+def main_flags(cfg) -> list:
+    """main.py's arguments from the config: the declared pipeline, stated explicitly (never the
+    default: it changed once, 2026-11-05), the launcher's name for metadata.json, then the flags."""
+    return [f"--{cfg.pipeline}", "--launcher", f"run_cluster:{cfg.name}", *cfg.flags]
+
+
+def pipeline_preflight(cfg, code: bytes, python: str = sys.executable) -> str:
+    """The pipeline the shipped main.py runs with this config's arguments, asked of the shipped
+    code itself (its scripts/lib/pipeline_id.py, standard library only, run isolated). Refuses a
+    config that declares no pipeline, a tree that cannot state one (from before 2026-11-05, when
+    main.py defaulted to v1 and nothing recorded it), and any disagreement with the declaration."""
+    import tempfile
+    if cfg.pipeline not in pipeline_id.PIPELINES:
+        raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v1' or 'v2'): refusing")
+    want = "scripts/lib/pipeline_id.py"
+    try:
+        with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
+            m = next((m for m in t.getmembers() if m.isfile() and m.name.lstrip("./") == want), None)
+            src = t.extractfile(m).read() if m else None
+    except (tarfile.TarError, OSError) as e:
+        raise SystemExit(f"{cfg.name}: the code tarball cannot be read ({e}): refusing") from e
+    if src is None:
+        raise SystemExit(f"{cfg.name}: the code to launch has no {want}, so it cannot state which pipeline main.py "
+                         "runs (a tree from before 2026-11-05 runs v1 by default): refusing")
+    with tempfile.TemporaryDirectory(prefix="pipeline-preflight-") as td:
+        f = os.path.join(td, "pipeline_id.py")
+        open(f, "wb").write(src)
+        r = subprocess.run([python, "-I", f, "which", "--", *main_flags(cfg)], capture_output=True, text=True,
+                           timeout=60, cwd=td)
+    got = r.stdout.strip()
+    if r.returncode or got != cfg.pipeline:
+        raise SystemExit(f"{cfg.name}: the config declares pipeline {cfg.pipeline}, but the shipped main.py would run "
+                         f"{got or 'nothing'} ({(r.stderr or '').strip()[:200]}): refusing")
+    return got
+
+
+def launch_record(cfg, worker, commit, launch_id, cluster_id, code, pipeline) -> dict:
+    """One label's entry in assignments.json (the grader reads it: scripts/eval_suite.py)."""
+    return {"worker": worker, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id,
+            "cluster_id": cluster_id, "pipeline": pipeline, "launcher": f"run_cluster:{cfg.name}",
+            "eval_inputs_sha256": eval_paths.archive_sha256(code)}   # Phase 50 α: the inputs shipped
+
+
 # ---- commands ---------------------------------------------------------------------------
 
 def _submit(cfg, client, label, worker, code, question, keys, launch_id):
     from distributed import fire_and_forget
-    fut = client.submit(ws.run_to_disk, label, code, question, list(cfg.flags), keys["ANTHROPIC_API_KEY"],
+    fut = client.submit(ws.run_to_disk, label, code, question, main_flags(cfg), keys["ANTHROPIC_API_KEY"],
                         keys.get("OPENAI_API_KEY") if cfg.cross_model else None, list(cfg.labels),
                         cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
                         workers=[worker], allow_other_workers=False, pure=False,
@@ -297,8 +347,10 @@ def launch(cfg):
         raise SystemExit(f"{cfg.name} is already running: use status / relaunch")
     os.makedirs(cfg.out_dir, exist_ok=True)
     question = open(cfg.question_file).read().strip()
-    keys = read_keys()
     code, commit = code_tarball(cfg)
+    pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
+    print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
+    keys = read_keys()
     compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = coiled.Cluster(
@@ -322,10 +374,8 @@ def launch(cfg):
     assign = {}
     for label, w in zip(cfg.labels, workers):
         _submit(cfg, client, label, w, code, question, keys, launch_id)
-        assign[label] = {"worker": w, "commit": commit, "submitted": time.strftime("%F %T"), "launch_id": launch_id,
-                         "cluster_id": cluster.cluster_id,
-                         "eval_inputs_sha256": eval_paths.archive_sha256(code)}   # Phase 50 α: the inputs shipped
-        print(f"fired {label} -> {w} @ {commit}", flush=True)
+        assign[label] = launch_record(cfg, w, commit, launch_id, cluster.cluster_id, code, pipeline)
+        print(f"fired {label} -> {w} @ {commit} (pipeline {pipeline})", flush=True)
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
     clusters = {"run": {"name": cfg.name, "id": cluster.cluster_id}, "launch_id": launch_id,
                 "launched_utc": time.strftime("%FT%TZ", time.gmtime())}
@@ -512,8 +562,32 @@ def status(cfg):
                   f"stored={r.get('run_stored')}")
 
 
-def collect_from_storage(cfg, store, label, launch_id):
-    """One label from storage: this launch's result record, then the run directory it names."""
+def _run_identity_on_disk(dest: str) -> dict:
+    """The collected run's own identity (its metadata.json), "unknown" for anything missing."""
+    import glob
+    for mp in sorted(glob.glob(os.path.join(dest, "runs", "*", "metadata.json"))):
+        try:
+            meta = json.load(open(mp))
+        except (OSError, ValueError):
+            meta = {}
+        p, c = pipeline_id.label(meta)
+        return {"pipeline": p, "commit": c, "launcher": (meta.get("launcher") if isinstance(meta, dict) else None)
+                or pipeline_id.UNKNOWN}
+    return {"pipeline": pipeline_id.UNKNOWN, "commit": pipeline_id.UNKNOWN, "launcher": pipeline_id.UNKNOWN}
+
+
+def _identity_note(label, assigned: dict | None, run_ident: dict) -> None:
+    a = assigned or {}
+    if a.get("pipeline") and run_ident["pipeline"] != a["pipeline"]:
+        print(f"WARNING {label}: launched as pipeline {a['pipeline']}, the run records {run_ident['pipeline']}")
+    if a.get("commit") and not pipeline_id.same_commit(a["commit"], run_ident["commit"]):
+        print(f"WARNING {label}: launched at {a['commit']}, the run records commit {run_ident['commit']}")
+
+
+def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = None):
+    """One label from storage: this launch's result record, then the run directory it names.
+    result.json records the launch's pipeline and commit (`assigned`, from assignments.json)
+    and the run's own (`run_identity`, from its metadata.json)."""
     dest = os.path.join(cfg.out_dir, label)
     rj = os.path.join(cfg.out_dir, f"{label}.result.json")
     store.download(ws.record_blob(cfg.storage_prefix, launch_id, label), rj, cfg.storage_account)
@@ -526,6 +600,10 @@ def collect_from_storage(cfg, store, label, launch_id):
     with tarfile.open(tgz, mode="r:gz") as t:
         t.extractall(os.path.join(dest, "runs"), filter="data")
     meta["launch_id"] = launch_id
+    meta["run_identity"] = _run_identity_on_disk(dest)
+    for k in ("pipeline", "commit", "launcher"):
+        meta[k] = (assigned or {}).get(k) or pipeline_id.UNKNOWN
+    _identity_note(label, assigned, meta["run_identity"])
     json.dump(meta, open(os.path.join(dest, "result.json"), "w"), indent=1)
     return meta
 
@@ -596,7 +674,7 @@ def collect(cfg):
         if cur is False:   # an earlier launch's copy: keep it, out of the way
             os.rename(dest, f"{dest}.before_{assign[label]['launch_id']}_{int(time.time())}")
         try:
-            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"])
+            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"], assign[label])
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
@@ -617,7 +695,10 @@ def collect(cfg):
         os.makedirs(dest, exist_ok=True)
         with tarfile.open(tgz, mode="r:gz") as t:
             t.extractall(dest, filter="data")
-        json.dump({**meta, **assign[label]}, open(os.path.join(dest, "result.json"), "w"), indent=1)
+        ident = _run_identity_on_disk(dest)
+        _identity_note(label, assign[label], ident)
+        json.dump({**meta, **assign[label], "run_identity": ident}, open(os.path.join(dest, "result.json"), "w"),
+                  indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
         print(f"{label}: collected from the VM -> {dest}")
     if running and not pending:
@@ -825,13 +906,14 @@ def relaunch(cfg, label):
     if why:
         raise SystemExit(f"{label}: {why}; not relaunching")
     code, commit = code_tarball(cfg)
+    pipeline = pipeline_preflight(cfg, code)
     client.upload_file(os.path.join(HERE, "worker_side.py"))
     _submit(cfg, client, label, assign[label]["worker"], code, open(cfg.question_file).read().strip(), read_keys(),
             launch_id)
-    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True,
-                         eval_inputs_sha256=eval_paths.archive_sha256(code))
+    assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
+                         launcher=f"run_cluster:{cfg.name}", eval_inputs_sha256=eval_paths.archive_sha256(code))
     json.dump(assign, open(cfg.state_file, "w"), indent=1)
-    print(f"re-fired {label} -> {assign[label]['worker']} @ {commit}")
+    print(f"re-fired {label} -> {assign[label]['worker']} @ {commit} (pipeline {pipeline})")
 
 
 def parse_sign_args(rest: list, labels) -> dict:
@@ -1246,11 +1328,13 @@ def _self_test_52(ok) -> None:
     with tempfile.TemporaryDirectory() as d:
         q = os.path.join(d, "q.txt")
         open(q, "w").write("question")
-        lcfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0)
+        lcfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
+                         pipeline="v2")
         with mock.patch.dict(sys.modules, {"coiled": fake_coiled}), \
                 mock.patch.object(sys.modules[__name__], "is_running", return_value=False), \
                 mock.patch.object(sys.modules[__name__], "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
                 mock.patch.object(sys.modules[__name__], "code_tarball", return_value=(b"", "c0")), \
+                mock.patch.object(sys.modules[__name__], "pipeline_preflight", return_value="v2"), \
                 mock.patch.object(sys.modules[__name__], "_compute", return_value=comp), \
                 mock.patch.object(sys.modules[__name__], "_submit", side_effect=lambda cfg, c, *a: used.append(c)), \
                 mock.patch.object(eval_paths, "archive_sha256", return_value="0"), \
@@ -1700,6 +1784,13 @@ def _self_test_pipeline(ok, tb) -> None:
         ok(on_disk.get("run_identity", {}).get("pipeline") == "v2" and on_disk.get("pipeline") == "v2"
            and on_disk.get("commit") == "abc1234" and m.get("launch_id") == "L1",
            f"RP11 the collected result.json records the launch's and the run's pipeline and commit ({on_disk})")
+    import inspect
+    for fn in (launch, relaunch):
+        src = inspect.getsource(fn)
+        ok("pipeline_preflight(cfg, code)" in src and src.index("pipeline_preflight(") < src.index("_submit(")
+           and ("coiled.Cluster(" not in src or src.index("pipeline_preflight(") < src.index("coiled.Cluster(")),
+           f"RP12 {fn.__name__} checks the pipeline before it creates or submits anything")
+    ok("main_flags(cfg)" in inspect.getsource(_submit), "RP13 every submission passes main_flags (the pipeline)")
 
 
 def _self_test() -> int:
