@@ -635,24 +635,42 @@ def attribute_notes(cal: dict, binding: dict) -> list[dict]:
         return []
     run = (cal.get("priors") or {}).get(a) if isinstance(cal.get("priors"), dict) else None
     return [{"attribute": a, "limitation": rule["limitation"].strip(), "card_prior": rule.get("prior"),
-             "run_prior": run if isinstance(run, dict) else None}]
+             "run_prior": run if isinstance(run, dict) else None, "scale": str(cal.get("scale") or "linear")}]
 
 
-def attribute_notes_markdown(notes: list[dict]) -> list[str]:
-    """Lines of a results section, one entry per note; [] when there is none."""
-    if not notes:
-        return []
-
-    def rng(p):
-        if not isinstance(p, dict):
-            return "none declared"
+def _prior_text(p, scale: str = "linear", attr: str = "") -> str:
+    """A declared prior in words: its distribution, its range or shape parameters, the scale it is declared on, and
+    its source."""
+    if not isinstance(p, dict):
+        return "none declared"
+    src = str(p.get("source") or "no source").strip()
+    if p.get("range") is not None or "lo" in p:
         r = p.get("range") or [p.get("lo"), p.get("hi")]
-        return f"{p.get('dist', '?')} on [{r[0]}, {r[1]}] ({str(p.get('source') or 'no source').strip()})"
+        body = f"{p.get('dist', '?')} on [{r[0]}, {r[1]}]"
+        if p.get("mode") is not None:
+            body += f", mode {p['mode']}"
+    else:
+        shape = {k: v for k, v in p.items() if k not in ("dist", "source", "verified", "note", "basis", "units")}
+        body = f"{p.get('dist', '?')} with " + ", ".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v}"
+                                                         for k, v in shape.items())
+    if scale and scale != "linear":
+        body += f" on the {scale} scale (the attribute is exp of the drawn value)" if scale == "log" else \
+            f" on the {scale} scale"
+    return f"{body} ({src})"
+
+
+def attribute_notes_markdown(notes: list[dict], problems=None) -> list[str]:
+    """Lines of a results section, one entry per note; [] when there is none. `problems`: errors reading the engine
+    card's binding, stated in the section rather than dropped (fail closed)."""
+    if not notes and not problems:
+        return []
     L = ["## Simplifications in the calibrated inputs", ""]
     for n in notes:
         L += [f"- **{n['attribute']}**: {n['limitation']}",
-              f"  - Engine card prior: {rng(n['card_prior'])}.",
-              f"  - This run's prior: {rng(n['run_prior'])}."]
+              f"  - Engine card prior: {_prior_text(n['card_prior'])}.",
+              f"  - This run's prior: {_prior_text(n['run_prior'], n.get('scale', 'linear'))}."]
+    for p in problems or []:
+        L.append(f"- The engine card's attribute binding could not be read, so its limitations are not listed: {p}")
     return L + [""]
 
 
@@ -1839,6 +1857,17 @@ def _self_test_derived(ok) -> None:
         md = "\n".join(attribute_notes_markdown(notes))
         ok(len(notes) == 1 and "a stand-in for X" in md and "0.5" in md and "S" in md and "0.6" in md and "planner" in md,
            f"AB3 a calibrated attribute with a card limitation is listed with the card prior and the run's prior: {md}")
+        n_log = attribute_notes({"method": "posterior", "attribute": "a", "scale": "log",
+                                 "priors": {"a": {"dist": "uniform", "range": [-0.693, 0.0953], "source": "p"}}}, b)
+        n_beta = attribute_notes({"method": "posterior", "attribute": "a",
+                                  "priors": {"a": {"dist": "beta", "a": 2.0, "b": 5.0, "source": "p"}}}, b)
+        md_log, md_beta = "\n".join(attribute_notes_markdown(n_log)), "\n".join(attribute_notes_markdown(n_beta))
+        ok("log scale" in md_log and "exp" in md_log and "a=2" in md_beta and "None" not in md_beta,
+           f"AB3b (Codex r3 P2-3) the run's prior is shown on its declared scale, and a beta prior by its shape "
+           f"parameters: {md_log} | {md_beta}")
+        md_bad = "\n".join(attribute_notes_markdown([], problems=["engine_attribute_unbound: x: unreadable"]))
+        ok("could not be read" in md_bad and "unreadable" in md_bad,
+           f"AB5 (Codex r3 P2-2) an unreadable card binding is stated in the results, not dropped: {md_bad}")
         ok(attribute_notes({"method": "none", "attribute": "a"}, b) == []
            and attribute_notes({"method": "posterior", "attribute": "c"}, b) == []
            and attribute_notes_markdown([]) == [],

@@ -131,7 +131,9 @@ by birth cohort, an outbreak's final size), the engine is
   parameter with `per_group_parameters: [s0]`. `cohort_history` takes dose coverage by birth year, and
   `coverage_scale` is a per-unit latent multiplier on a reported coverage series. When you calibrate it, start
   its prior from the card's sourced range (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the
-  source. A narrower or wider range needs its own source. The results list the card's limitation for it: it is a
+  source. First check the card's `applicability` assumptions against the question (coverage level, declared
+  seroconversion, pathogen, setting), and recompute the ends where they differ. A narrower or wider range
+  needs its own source. The results list the card's limitation for it: it is a
   simplification standing in for everything that separates reported from effective coverage. Repeat that in the
   report's limitations.
 - **Outcomes.** An outcome per infection (`outcomes: [o]`) is a unit attribute `ratio:<o>`, or calibrated

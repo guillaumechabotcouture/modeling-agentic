@@ -129,11 +129,11 @@ def _fmt(x, d=3):
 
 def attribute_simplifications(A) -> list[str]:
     """The engine card's limitation (and its sourced prior beside the run's) for the unit attribute the calibration
-    moves (toolkit/spec/schema.py attribute_notes); [] when the card gives none. A card that cannot be read leaves
-    the section out: the spec check (schema.attribute_problems) already reports an unreadable binding."""
+    moves (toolkit/spec/schema.py attribute_notes); [] when the card gives none. A card binding that cannot be read
+    is stated in the section, not dropped (Codex r3 P2-2)."""
     from toolkit.spec import schema
-    b, _ = schema.load_binding(A.eng)
-    return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b))
+    b, bad = schema.load_binding(A.eng)
+    return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b), problems=bad)
 
 
 def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:

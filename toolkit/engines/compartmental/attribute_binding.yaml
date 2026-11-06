@@ -58,10 +58,17 @@ attribute_binding:
         Zimmerman L (2011) J Infect Dis 204 Suppl 1:S133-S148, doi:10.1093/infdis/jir102: median field
         effectiveness of one measles dose 77% (IQR 62-91%) at 9-11 months and 92% (IQR 86-96%) at 12 months or later.
       basis: >-
-        Lower end: a 30-point gap on reported coverage near 90% gives a ratio of about 0.67. Card-only survey coverage
-        understates true coverage, so this ratio is a low estimate. Multiplied by the lower quartile of field
-        effectiveness relative to a declared seroconversion of 85% (0.62 / 0.85, about 0.73), it gives about 0.5.
-        Upper end: reported coverage taken as correct, times the upper quartile of field effectiveness relative to the
-        declared value (0.91 / 0.85, about 1.07), gives 1.1. A question or a better local comparison overrides it.
+        A judgement-based construction from the sources, not a published interval. It assumes reported coverage near
+        90% and a declared first-dose seroconversion near 85% (a measles-like setting). Lower end: a 30-point gap on
+        reported coverage near 90% gives a ratio of about 0.67. Card-only survey coverage may understate true
+        coverage (children without a card are counted unvaccinated), so this ratio may be low. Multiplied by the lower
+        quartile of field effectiveness relative to the declared seroconversion (0.62 / 0.85, about 0.73), it gives
+        about 0.5. Upper end: reported coverage taken as correct, times the upper quartile of field effectiveness
+        relative to the declared value (0.91 / 0.85, about 1.07), gives 1.1.
+      applicability: >-
+        Before copying the range, check its assumptions against the question: the reported coverage level, the
+        declared seroconversion, the pathogen and the setting's income group (Dolan and MacNeil: gaps of 27-34 points
+        in low-income and 8-15 in upper-middle-income countries). Recompute both ends when they differ, and cite a
+        local survey-versus-administrative comparison when one exists. A question that states the gap overrides it.
       verified: "read 2026-11-06: Dolan and MacNeil from the PMC author manuscript (results text); Lim, Murray and
         Uzicanin from their abstracts (Europe PMC)"
