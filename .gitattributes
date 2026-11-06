@@ -5,3 +5,6 @@
 # (scripts/lib/eval_paths.py). A question's input data live in data/evals/<q>/ and ship.
 /evals/** export-ignore
 /docs/design/eval-suite.md export-ignore
+# The launch tarball carries its commit (scripts/lib/pipeline_id.py code_commit): git archive
+# fills in the placeholder, so a run on a worker with no .git still records what code it ran.
+/scripts/lib/code_commit.txt export-subst

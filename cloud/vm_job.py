@@ -42,7 +42,18 @@ poll copies new or changed files (and the log) to <out>/<name>/<job_id>/, so a V
 stops for any other reason loses at most one poll interval of outputs.
 
 The job's command runs in the shipped tree (`--tree`: git archive of HEAD; `--dir`: a
-plain directory), with secrets (`--anthropic-key`) in its environment only. `--setup-sdk`
+plain directory), with secrets (`--anthropic-key`) in its environment only.
+
+A command that runs main.py must state its pipeline (`--v2` or `--v1`; refused otherwise, before
+anything is created: main.py's default changed once, 2026-11-05). The job's environment names
+its launcher (MA_LAUNCHER=vm_job:<name>/<job_id>, recorded in the run's metadata.json), and
+`start`/`run` write a launch record in the eval grader's format (launch_id, pipeline, commit as
+stamped in the archive, eval_inputs_sha256): <out>/<name>/<job_id>/assignments.json and
+<out>/<name>/<job_id>/out/result.json, plus <out>/<name>/assignments.json listing every job. A
+main.py job that copies its run to $JOB_OUT/runs/ is then graded with
+`scripts/eval_suite.py grade <q> <out>/<name>/<job_id>/out/runs/<run>` with its input hashes
+checked. A relaunch of a job id sets the earlier out/ aside. A wrapper script that calls main.py
+is not seen: name the pipeline inside it. A shell comment in a main.py command is refused. `--setup-sdk`
 installs the pinned claude-agent-sdk from the tree's requirements.txt first (the useful part
 of keep/coiled_run/dev_vm.py, which this replaces).
 
@@ -91,6 +102,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import run_cluster as rc  # noqa: E402
 import worker_side as ws  # noqa: E402
+import eval_paths  # noqa: E402  (scripts/lib, on the path through run_cluster)
+import pipeline_id  # noqa: E402
 
 OUT = os.path.expanduser("~/modeling-agentic-keep/vm_jobs")
 CHUNK = 8 * 2**20
@@ -145,6 +158,80 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
     json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
     st["fetched"] = got
     return st
+
+
+def job_pipeline(cmd) -> str | None:
+    """The pipeline a main.py command states, None for a command that runs no main.py; refuses a
+    main.py command that relies on main.py's default. A one-element command is a shell string
+    (as `start` runs it)."""
+    if isinstance(cmd, (list, tuple)) and len(cmd) == 1:
+        cmd = cmd[0]
+    try:
+        return pipeline_id.from_command(cmd)
+    except pipeline_id.PipelineError as e:
+        raise SystemExit(f"{e} (add --v2 or --v1 to main.py's arguments): refusing") from None
+
+
+def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
+    """The job's extra environment: its secrets, and its launcher's name for main.py's metadata.json."""
+    return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
+
+
+def _write_json(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    json.dump(obj, open(tmp, "w"), indent=1)
+    os.replace(tmp, path)
+
+
+def write_launch_record(dest: str, job_id: str, code: bytes | None, pipeline: str | None, commit: str,
+                        name: str) -> dict:
+    """The job's launch record. Polls save $JOB_OUT under <dest>/out/, so a run lands at
+    <dest>/out/runs/<run> and the grader's label dir (scripts/eval_suite.py launch_record_for) is
+    <dest>/out: the record goes to <dest>/assignments.json["out"] and <dest>/out/result.json, the
+    format cloud/run_cluster.py writes. <out>/<name>/assignments.json lists every job of <name>.
+    An earlier attempt of this job id never passes for this one (Codex r1, r2): its out/ is set
+    aside and the poll index reset."""
+    import secrets
+    rec = {"launch_id": f"{job_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}", "job_id": job_id,
+           "commit": commit, "pipeline": pipeline or "none", "launcher": f"vm_job:{name}/{job_id}",
+           "submitted": time.strftime("%F %T"), "eval_inputs_sha256": eval_paths.archive_sha256(code) if code else {}}
+    os.makedirs(dest, exist_ok=True)
+    out = os.path.join(dest, "out")
+    if os.path.exists(out):
+        os.rename(out, os.path.join(dest, f"out.before_{rec['launch_id']}"))
+    if os.path.exists(os.path.join(dest, ".manifest.json")):
+        os.remove(os.path.join(dest, ".manifest.json"))
+    os.makedirs(out)
+    _write_json(os.path.join(dest, "assignments.json"), {"out": rec})
+    _write_json(os.path.join(out, "result.json"), {"launch_id": rec["launch_id"], "job_id": job_id,
+                                                   "pipeline": rec["pipeline"], "commit": commit})
+    every = os.path.join(os.path.dirname(dest), "assignments.json")
+    try:
+        allj = json.load(open(every))
+    except (OSError, ValueError):
+        allj = {}
+    allj = allj if isinstance(allj, dict) else {}
+    allj[job_id] = rec
+    _write_json(every, allj)
+    return rec
+
+
+def _launch_commit(code: bytes | None, tree: str | None, src_dir: str | None) -> str:
+    """The commit of the code that ships: git archive's stamp inside the archive (so a checkout
+    that moves on while the VM starts does not change it), else the tree or directory's."""
+    stamped = rc.archive_commit(code) if code else None
+    if stamped or not tree:
+        return stamped or pipeline_id.UNKNOWN       # a --dir archive is no commit: unknown, never the live HEAD
+    return _code_commit(tree, None)
+
+
+def _code_commit(tree: str | None, src_dir: str | None) -> str:
+    if tree:
+        try:
+            return subprocess.check_output(["git", "-C", tree, "rev-parse", "--short=7", "HEAD"], text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return pipeline_id.UNKNOWN
+    return pipeline_id.code_commit(src_dir) if src_dir else pipeline_id.UNKNOWN
 
 
 def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
@@ -280,8 +367,11 @@ def cmd_start(a, cluster=None):
     cmd = a.command
     if not cmd:
         raise SystemExit("no command given (put it after --)")
+    pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
-    secrets = {"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None
+    base = getattr(a, "base_name", a.name)
+    secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
+                      base, a.job_id)
     c, w = _client(a.name, cluster)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
@@ -296,14 +386,18 @@ def cmd_start(a, cluster=None):
     fire_and_forget(fut)
     dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
+    lrec = write_launch_record(dest, a.job_id, code, pipeline, _launch_commit(code, a.tree, a.dir), base)
     json.dump({"name": getattr(a, "base_name", a.name), "cluster": a.name,
                "cluster_id": getattr(cluster, "cluster_id", None) if cluster is not None else None,
                "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
                "max_hours": a.max_hours, "cluster_compute": a.cluster_compute, "store": store,
-               "shutdown_when_stored": a.shutdown_when_stored}, open(os.path.join(dest, "job.json"), "w"), indent=1)
+               "shutdown_when_stored": a.shutdown_when_stored, "pipeline": lrec["pipeline"],
+               "commit": lrec["commit"], "launch_id": lrec["launch_id"]},
+              open(os.path.join(dest, "job.json"), "w"), indent=1)
     tail = (f"; outputs go to {store['prefix']}/ and the cluster stops itself once they are verified there"
             if a.shutdown_when_stored else "")
-    print(f"started {a.job_id} on {a.name} ({w}); outputs -> {dest}{tail}")
+    print(f"started {a.job_id} on {a.name} ({w}); pipeline {lrec['pipeline']} @ {lrec['commit']}; "
+          f"outputs -> {dest}{tail}")
 
 
 def _print(st, dest):
@@ -471,6 +565,7 @@ def cmd_run(a):
 
 def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
+    job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
@@ -627,11 +722,94 @@ def _self_test() -> int:
     _self_test_sched(ok)
     _self_test_batch(ok)
     _self_test_run(ok)
+    _self_test_pipeline(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_pipeline(ok) -> None:
+    """VP (2026-11-05): a main.py job must state its pipeline (the default changed once, silently),
+    the run learns its launcher, and the job leaves a launch record in the grader's format
+    (assignments.json + result.json, as cloud/run_cluster.py writes them), so a vm_job eval run
+    is graded with its input hashes checked instead of --unverified-inputs."""
+    import inspect
+    import tempfile
+    g = globals()
+    jp = g.get("job_pipeline")
+    ok(jp is not None, "VP1 vm_job reads the pipeline of a main.py command")
+    if jp is None:
+        return
+    for cmd in (["python3", "main.py", "Q?", "--max-rounds", "3"], "python3 main.py 'Q?' && cp -r runs $JOB_OUT/"):
+        try:
+            jp(cmd)
+            ok(False, f"VP1 a main.py command relying on the default pipeline is refused: {cmd}")
+        except SystemExit as e:
+            ok("--v1 or --v2" in str(e), f"VP1 a main.py command relying on the default pipeline is refused: {e}")
+    ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
+       and jp(["python3 main.py 'Q?' --v1"]) == "v1",
+       "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
+    src = inspect.getsource(_run_locked)
+    ok("job_pipeline(" in src and src.index("job_pipeline(") < src.index("_create("),
+       "VP3 run refuses an undeclared pipeline before it creates a cluster")
+    ok("job_pipeline(" in inspect.getsource(cmd_start), "VP3b start refuses it too")
+    env = g["job_env"]({"ANTHROPIC_API_KEY": "k"}, "dev", "j1")
+    ok(env == {"ANTHROPIC_API_KEY": "k", "MA_LAUNCHER": "vm_job:dev/j1"} and g["job_env"](None, "dev", "j1")
+       == {"MA_LAUNCHER": "vm_job:dev/j1"}, f"VP4 the job's environment names its launcher for metadata.json ({env})")
+    with tempfile.TemporaryDirectory() as td:
+        dest = os.path.join(td, "dev", "j1")
+        code = io.BytesIO()
+        with tarfile.open(fileobj=code, mode="w:gz") as t:
+            for n, b in (("data/evals/q/a.csv", b"1,2\n"), ("main.py", b"x")):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        rec = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+        try:
+            import eval_suite
+            run_dir = os.path.join(dest, "out", "runs", "2026-11-05_000000_q")   # where polls save $JOB_OUT/runs
+            os.makedirs(run_dir)
+            got = eval_suite.launch_record_for(run_dir)
+            ok(got is not None and got.get("launch_id") == rec["launch_id"] and got.get("pipeline") == "v2"
+               and got.get("commit") == "abc1234" and "collected_launch_id" not in got
+               and got.get("eval_inputs_sha256", {}).get("data/evals/q/a.csv"),
+               f"VP5 the grader finds the vm_job launch record with its input hashes ({got})")
+        except ImportError as e:
+            ok(False, f"VP5 the grader is importable: {e}")
+        g["write_launch_record"](os.path.join(td, "dev", "j2"), "j2", code.getvalue(), None, "abc1234", "dev")
+        a = json.load(open(os.path.join(td, "dev", "assignments.json")))
+        ok(set(a) == {"j1", "j2"} and a["j2"]["pipeline"] == "none", f"VP6 records of two jobs share the file ({a})")
+        # VP7 (Codex r1 P1): a relaunch of the same job id never adopts the earlier attempt's run.
+        open(os.path.join(dest, ".manifest.json"), "w").write("{}")
+        rec2 = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        try:
+            got2 = eval_suite.launch_record_for(os.path.join(dest, "out", "runs", "2026-11-05_000000_q"))
+        except NameError:
+            got2 = None
+        ok(rec2["launch_id"] != rec["launch_id"] and not os.path.exists(os.path.join(dest, "out", "runs"))
+           and not os.path.exists(os.path.join(dest, ".manifest.json"))
+           and any(n.startswith("out.before_") for n in os.listdir(dest)),
+           f"VP7 the earlier attempt's runs/ is set aside and the poll index reset ({os.listdir(dest)}, {got2})")
+        # VP8 (Codex r1 P1): the commit comes from the archive that ships.
+        arch = io.BytesIO()
+        with tarfile.open(fileobj=arch, mode="w:gz") as t:
+            for n, b in (("scripts/lib/code_commit.txt", b"0123456789abcdef0123456789abcdef01234567\n"),):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        ok(g["_launch_commit"](arch.getvalue(), "/nonexistent-tree", None) == "0123456",
+           "VP8 the launch record's commit is the archive's, not the checkout's HEAD at submit time")
+        ok(g["_launch_commit"](_tarball(None, os.path.dirname(HERE)), None, os.path.dirname(HERE)) == "unknown",
+           "VP8b (Codex r2) a --dir archive (no stamp) records commit unknown, not the live checkout's HEAD")
+        # VP9 (Codex r1 P2): a --dir archive (./-prefixed names) still records its input hashes.
+        d2 = os.path.join(td, "srcdir")
+        os.makedirs(os.path.join(d2, "data", "evals", "q"))
+        open(os.path.join(d2, "data", "evals", "q", "a.csv"), "w").write("1,2\n")
+        r3 = g["write_launch_record"](os.path.join(td, "dev", "j3"), "j3", _tarball(None, d2), "v2", "x", "dev")
+        ok(r3["eval_inputs_sha256"].get("data/evals/q/a.csv"), f"VP9 --dir archives record input hashes ({r3['eval_inputs_sha256']})")
 
 
 def _self_test_sched(ok) -> None:
