@@ -34,3 +34,34 @@ attribute_binding:
   coverage_scale:
     default: 1.0
     meaning: "the declared coverage:<dose> series is the latent true coverage (no reporting bias)"
+    # Owner decision on PR #146 (2026-11-06): one per-unit factor for now; a per-cohort hierarchical latent-coverage
+    # model is the follow-up (F6).
+    limitation: >-
+      One factor per unit multiplies the reported coverage of every dose and birth cohort. It is a simplification
+      standing in for everything that separates reported from effective coverage: numerator and denominator errors in
+      the reported series, doses given outside the schedule, and field effectiveness that differs from the declared
+      seroconversion. It cannot represent a gap that differs between cohorts or doses. A serosurvey age pattern that
+      one factor cannot fit is a sign of such a gap.
+    prior:
+      dist: uniform
+      range: [0.5, 1.1]
+      units: effective coverage per unit of reported coverage
+      source: >-
+        Dolan SB, MacNeil A (2017) Vaccine 35:3441-3445, doi:10.1016/j.vaccine.2017.05.026: in 71 national DHS/MICS
+        surveys (card-verified coverage, cohorts 2009-2013) against administrative (JRF) coverage, the median
+        administrative-minus-survey difference ranged from 26 (BCG) to 30 points (MCV1); 27-34 in low-income and
+        8-15 in upper-middle-income countries. Lim SS et al. (2008) Lancet 372:2031-2046,
+        doi:10.1016/S0140-6736(08)61869-3: in 51 countries with GAVI immunisation services support, surveys found
+        7.4 million (5.7-9.2 million) additional DTP3-immunised children against 13.9 million officially reported.
+        Murray CJL et al. (2003) Lancet 362:1022-1027, doi:10.1016/S0140-6736(03)14411-X: officially reported DTP3
+        coverage exceeds DHS coverage in 45 countries, more so where reported coverage is high. Uzicanin A,
+        Zimmerman L (2011) J Infect Dis 204 Suppl 1:S133-S148, doi:10.1093/infdis/jir102: median field
+        effectiveness of one measles dose 77% (IQR 62-91%) at 9-11 months and 92% (IQR 86-96%) at 12 months or later.
+      basis: >-
+        Lower end: a 30-point gap on reported coverage near 90% gives a ratio of about 0.67. Card-only survey coverage
+        understates true coverage, so this ratio is a low estimate. Multiplied by the lower quartile of field
+        effectiveness relative to a declared seroconversion of 85% (0.62 / 0.85, about 0.73), it gives about 0.5.
+        Upper end: reported coverage taken as correct, times the upper quartile of field effectiveness relative to the
+        declared value (0.91 / 0.85, about 1.07), gives 1.1. A question or a better local comparison overrides it.
+      verified: "read 2026-11-06: Dolan and MacNeil from the PMC author manuscript (results text); Lim, Murray and
+        Uzicanin from their abstracts (Europe PMC)"

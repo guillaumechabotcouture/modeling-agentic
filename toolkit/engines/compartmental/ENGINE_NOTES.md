@@ -29,7 +29,11 @@ The age-structured model is the discrete-time renewal form of a multigroup SEIR:
 - Pre-existing immunity by age enters in one of two ways. With the `given` initialiser it is the initial
   susceptible share per group: a unit attribute `s0`, or (`per_group_parameters: [s0]`) calibrated parameters
   `s0:<group>`. With the `cohort_history` initialiser, susceptibility comes from dose coverage by birth year;
-  `coverage_scale` is a per-unit latent multiplier on a reported coverage series.
+  `coverage_scale` is a per-unit latent multiplier on a reported coverage series. It is a simplification
+  standing in for everything that separates reported from effective coverage, and it cannot represent a gap that
+  differs between cohorts. Its sourced prior (uniform on [0.5, 1.1]) and its limitation text are in
+  `attribute_binding.yaml`; the results list both when a run calibrates it. A per-cohort hierarchical
+  latent-coverage model is the planned follow-up (F6).
 - Vaccination by age group uses whole dose blocks per group (`kind: doses`, `block_size`, `max_blocks`) or
   campaigns (`kind: campaign`, targeted groups, reach). Protection is all-or-nothing with `efficacy:<component>`.
   Doses given to immune people are wasted unless `targets_susceptible` is set.

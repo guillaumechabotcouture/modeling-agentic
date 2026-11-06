@@ -129,7 +129,11 @@ by birth cohort, an outbreak's final size), the engine is
   does not depend on it; timing does.
 - **Immunity.** `initialiser: given` takes the susceptible share per group. Make it a calibrated
   parameter with `per_group_parameters: [s0]`. `cohort_history` takes dose coverage by birth year, and
-  `coverage_scale` is a per-unit latent multiplier on a reported coverage series.
+  `coverage_scale` is a per-unit latent multiplier on a reported coverage series. When you calibrate it, start
+  its prior from the card's sourced range (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the
+  source. A narrower or wider range needs its own source. The results list the card's limitation for it: it is a
+  simplification standing in for everything that separates reported from effective coverage. Repeat that in the
+  report's limitations.
 - **Outcomes.** An outcome per infection (`outcomes: [o]`) is a unit attribute `ratio:<o>`, or calibrated
   per group with `per_group_parameters: [ratio:<o>]`.
 - **Interventions.**

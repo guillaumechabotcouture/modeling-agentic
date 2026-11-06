@@ -127,6 +127,15 @@ def _fmt(x, d=3):
     return str(x)
 
 
+def attribute_simplifications(A) -> list[str]:
+    """The engine card's limitation (and its sourced prior beside the run's) for the unit attribute the calibration
+    moves (toolkit/spec/schema.py attribute_notes); [] when the card gives none. A card that cannot be read leaves
+    the section out: the spec check (schema.attribute_problems) already reports an unreadable binding."""
+    from toolkit.spec import schema
+    b, _ = schema.load_binding(A.eng)
+    return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b))
+
+
 def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
     o = A.primary
     s = A.spec
@@ -194,6 +203,7 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
         for p, v in (cal["identifiability"].get("parameters") or {}).items():
             L.append(f"| {p} | {_fmt(v['estimate'])} | {_fmt(v['se'])} | {v['status']} |")
         L.append("")
+    L += attribute_simplifications(A)
     if emu_acc and not emu_acc.get("direct"):
         L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in emu_acc.items())}.", ""]
     L += ["## Allocation stability", ""]

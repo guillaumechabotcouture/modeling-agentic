@@ -40,6 +40,12 @@ Core changes (they need acceptance on two diseases):
 - A floor on the cost-per-outcome figure's height.
 - Observation targets carry their frame per row.
 - The decision-spec skill gains the vocabulary (no thresholds).
+- An engine card's `attribute_binding.yaml` may give a defaulted attribute a sourced `prior` and a
+  `limitation`. Both are checked when the card is read. `results.md` lists them, beside the run's own prior, for
+  the attribute a calibration moves (AB1–AB4). The compartmental card gives `coverage_scale` the range [0.5, 1.1],
+  sourced from survey-versus-administrative coverage comparisons and measles vaccine field effectiveness. Its
+  limitation says it stands in for everything that separates reported from effective coverage. This follows the
+  owner's decision on Codex P1-3; per-cohort latent coverage is the F6 follow-up.
 - `toolkit/analysis/contract.py`: a spec that names its engine ignores the harness's `engine_choice.json`, so
   the gate no longer flags that file as stale for it (K12b). Flu run 8 and measles runs 6–7 carried a spurious
   HIGH `analysis_contract_stale` at every gate.

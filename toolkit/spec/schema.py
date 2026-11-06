@@ -111,6 +111,7 @@ import csv
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -584,10 +585,75 @@ def _read_binding(path: str | None) -> tuple[dict, list[str]]:
     out, bad = {}, []
     for k, v in b.items():
         if v == "required" or (isinstance(v, dict) and "default" in v and str(v.get("meaning") or "").strip()):
-            out[str(k)] = v
+            why = _binding_extras(v) if isinstance(v, dict) else []
+            if why:
+                bad += [f"engine_attribute_unbound: {path}: {k}: {w}" for w in why]
+            else:
+                out[str(k)] = v
         else:
             bad.append(f"engine_attribute_unbound: {path}: {k} must be `required` or {{default, meaning}}")
     return out, bad
+
+
+BINDING_PRIOR_DISTS = ("uniform", "loguniform", "triangular")
+
+
+def _binding_extras(v: dict) -> list[str]:
+    """The optional card keys of a defaulted attribute: `prior` {dist, range: [lo, hi], source, ...}, the sourced range a
+    spec that calibrates the attribute starts from; `limitation`, what the attribute simplifies, which the results
+    state whenever a run calibrates it."""
+    bad = []
+    if "limitation" in v and not (isinstance(v["limitation"], str) and v["limitation"].strip()):
+        bad.append("limitation must be a non-empty text")
+    if "prior" in v:
+        p = v["prior"]
+        if not isinstance(p, dict):
+            return bad + ["prior must be {dist, range: [lo, hi], source}"]
+        if p.get("dist") not in BINDING_PRIOR_DISTS:
+            bad.append(f"prior dist {p.get('dist')!r} is not one of {list(BINDING_PRIOR_DISTS)}")
+        r = p.get("range")
+        try:
+            lo, hi = (float(x) for x in r)
+            if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+                raise ValueError
+        except (TypeError, ValueError):
+            bad.append(f"prior range {r!r} must be [lo, hi] with lo < hi")
+        if not str(p.get("source") or "").strip():
+            bad.append("prior needs a source")
+    return bad
+
+
+def attribute_notes(cal: dict, binding: dict) -> list[dict]:
+    """[{attribute, limitation, card_prior, run_prior}] for the unit attribute a calibration moves, when its card gives
+    a limitation."""
+    cal = cal if isinstance(cal, dict) else {}
+    a = cal.get("attribute")
+    if cal.get("method") in (None, "none") or not isinstance(a, str) or not a:
+        return []
+    rule = binding_rule(binding, a)
+    if not isinstance(rule, dict) or not str(rule.get("limitation") or "").strip():
+        return []
+    run = (cal.get("priors") or {}).get(a) if isinstance(cal.get("priors"), dict) else None
+    return [{"attribute": a, "limitation": rule["limitation"].strip(), "card_prior": rule.get("prior"),
+             "run_prior": run if isinstance(run, dict) else None}]
+
+
+def attribute_notes_markdown(notes: list[dict]) -> list[str]:
+    """Lines of a results section, one entry per note; [] when there is none."""
+    if not notes:
+        return []
+
+    def rng(p):
+        if not isinstance(p, dict):
+            return "none declared"
+        r = p.get("range") or [p.get("lo"), p.get("hi")]
+        return f"{p.get('dist', '?')} on [{r[0]}, {r[1]}] ({str(p.get('source') or 'no source').strip()})"
+    L = ["## Simplifications in the calibrated inputs", ""]
+    for n in notes:
+        L += [f"- **{n['attribute']}**: {n['limitation']}",
+              f"  - Engine card prior: {rng(n['card_prior'])}.",
+              f"  - This run's prior: {rng(n['run_prior'])}."]
+    return L + [""]
 
 
 def load_binding(engine) -> tuple[dict, list[str]]:
@@ -1740,6 +1806,43 @@ def _self_test_derived(ok) -> None:
         e = validate(load(p), derived=True)
         ok(has(e, "units_not_derived") or has(e, "data_ref_not_derived"),
            f"DI1b a spec citing data/derived/ with no declaration is refused: {e[:3]}")
+    # card prior and limitation of a calibrated unit attribute (owner decision on #146: a single latent multiplier
+    # keeps a sourced card range, and the results say what it simplifies)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            from toolkit.engines.compartmental.engine import CompartmentalEngine
+            b, bad = load_binding(CompartmentalEngine)
+            cs = b.get("coverage_scale") or {}
+            pr = cs.get("prior") or {}
+            ok(bad == [] and len(pr.get("range") or []) == 2 and pr["range"][0] < 1.0 <= pr["range"][1]
+               and str(pr.get("source") or "").strip() and str(cs.get("limitation") or "").strip(),
+               f"AB1 the compartmental card gives coverage_scale a sourced prior range around its default and a "
+               f"limitation ({bad}, {pr})")
+        except ImportError as e:
+            print(f"SKIP AB1: {e}")
+        bp = os.path.join(d, "b.yaml")
+        for case, v, want in (("no source", {"default": 1.0, "meaning": "m", "prior": {"dist": "uniform",
+                                                                                        "range": [0.5, 1.1]}}, "source"),
+                              ("lo >= hi", {"default": 1.0, "meaning": "m", "prior": {"dist": "uniform", "range": [1.1, 0.5],
+                                                                                       "source": "s"}}, "range"),
+                              ("unknown dist", {"default": 1.0, "meaning": "m", "prior": {"dist": "normal", "range": [0, 1],
+                                                                                           "source": "s"}}, "dist"),
+                              ("blank limitation", {"default": 1.0, "meaning": "m", "limitation": " "}, "limitation")):
+            yaml.safe_dump({"attribute_binding": {"a": v}}, open(bp, "w"))
+            got, bad = _read_binding(bp)
+            ok("a" not in got and any(want in x for x in bad), f"AB2 a card prior or limitation with {case} is refused: "
+                                                               f"{bad}")
+        b = {"a": {"default": 1.0, "meaning": "m", "limitation": "a stand-in for X",
+                   "prior": {"dist": "uniform", "range": [0.5, 1.1], "source": "S"}}, "c": "required"}
+        notes = attribute_notes({"method": "posterior", "attribute": "a",
+                                 "priors": {"a": {"dist": "uniform", "range": [0.6, 1.2], "source": "planner"}}}, b)
+        md = "\n".join(attribute_notes_markdown(notes))
+        ok(len(notes) == 1 and "a stand-in for X" in md and "0.5" in md and "S" in md and "0.6" in md and "planner" in md,
+           f"AB3 a calibrated attribute with a card limitation is listed with the card prior and the run's prior: {md}")
+        ok(attribute_notes({"method": "none", "attribute": "a"}, b) == []
+           and attribute_notes({"method": "posterior", "attribute": "c"}, b) == []
+           and attribute_notes_markdown([]) == [],
+           "AB4 nothing is listed when the attribute is not calibrated or its card gives no limitation")
     # DI12: contract.py and the engines' code are unchanged (the fingerprints still match the benchmark stamps).
     from toolkit.engines.contract import code_fingerprint
     for mod, cls, res in (("toolkit.engines.malaria.engine", "MalariaEngine", "toolkit/engines/malaria/benchmarks/results.yaml"),
