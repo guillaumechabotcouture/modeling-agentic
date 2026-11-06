@@ -150,7 +150,8 @@ by birth cohort, an outbreak's final size), the engine is
     `immunity`, `susceptible`, `attack_rate` or `outcome:<o>`.
   - Each source declares a frame, bias mechanisms (or `{none: reason}`) and a noise model: binomial or
     beta-binomial for shares, Poisson or negative binomial for counts.
-  - Values the question gives (an efficacy, a seroconversion share, a reach) go in `engine_parameters` with
+  - Values the question gives (an efficacy, a seroconversion share, a reach) go in `engine_parameters`, each with
+    `value`, `source`, `reason` and `basis: setting_data` (every field is required),
     their source. Omit `units`, or copy the card's units string exactly. Give no `range` when the question
     says the value is known. With a `posterior` calibration, a drawn prior on a parameter it does not
     calibrate is refused, because the fit does not condition on it. Either calibrate the parameter (if the
