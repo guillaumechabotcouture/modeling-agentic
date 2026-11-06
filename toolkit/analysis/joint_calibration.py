@@ -598,6 +598,7 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
     ident = engine_identity(spec.engine())
     P_, _ = build(spec, meta.get("units"))
     need = set(P_.observables("unit"))
+    shared_now = set(P_.names)
     unit_runs, kept = runs.get("unit") or [], []
     order = [(c, i) for c in sorted(rows) for i in sorted(k for k in rows[c] if isinstance(k, int))]
     pos = 0
@@ -617,8 +618,13 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
         if not r or not r.get("ok"):
             continue
         pv = ((r.get("result") or {}).get("provenance") or {})
+        # Codex r4 P1: the job is rebuilt from the current shared names and the current held values only; a run
+        # whose shared values name anything else was simulated under other held values and cannot match
+        th = run_.get("theta") or {}
+        if set(th) != shared_now:
+            continue
         try:
-            sha = Bt.job_sha(sim.job(run_, k, windows=wins))
+            sha = Bt.job_sha(sim.job(dict(run_, theta={k: th[k] for k in shared_now}), k, windows=wins))
         except (KeyError, TypeError, ValueError):
             continue                                    # Codex r3 P2-4: a job that cannot be rebuilt is dropped
         if not (isinstance(pv.get("job_sha"), str) and pv["job_sha"] and pv["job_sha"] == sha
@@ -1072,6 +1078,25 @@ def _self_test() -> int:
             except HM.CalibrationInputError:
                 ok(True, "JA9d a second setting that changes what the runs simulate is refused")
     safe(ja9, "JA9")
+
+    def ja10():          # Codex r4 P1: an earlier shared parameter now held cannot carry its old values in
+        import yaml
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as o1:
+            p = _toy_joint(d, group=False)
+            raw = yaml.safe_load(open(p))
+            raw["uncertainty"]["priors"]["k"] = {"dist": "uniform", "range": [0.6, 1.0], "source": "toy range"}
+            raw["calibration"]["joint"]["shared"] = ["base", "k"]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
+            _write_out(rep, d, o1)
+            raw["calibration"]["joint"]["shared"] = ["base"]
+            raw["calibration"]["joint"]["independent"].append({"parameter": "k", "reason": "toy: held"})
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec2 = schema.load(p)
+            P2, meta2 = build(spec2)
+            pr, info = load_prior(spec2, o1, meta2, log=q)
+            ok(info["reused"] == 0, f"JA10 runs simulated with a now-held parameter varied are not reused ({info})")
+    safe(ja10, "JA10")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

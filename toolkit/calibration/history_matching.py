@@ -607,6 +607,9 @@ class HistoryMatch:
                 if t is None or miss:
                     continue
                 keep = {ob: float(obs[ob]) for ob in need}
+                for ob in need:              # Codex r4 P3: earlier values at a scale's edge are counted too
+                    if at_edge(obs[ob], P.scales[ob]):
+                        self.boundary[ob] = self.boundary.get(ob, 0) + 1
                 keep.update({ob: float(obs[ob]) for ob in self.record if isinstance(obs.get(ob), (int, float))
                              and not isinstance(obs.get(ob), bool)})          # Codex r3 P2-8: records kept
                 row = {"t": t, "seed": r.get("seed"), "obs": keep, "prior": True}
