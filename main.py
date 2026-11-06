@@ -3065,12 +3065,13 @@ def main() -> int:
     if why:
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
+    if args.preflight_only:      # the preflight and nothing else, whatever the pipeline (Codex r1)
+        return _preflight_and_report(args)
     ident = pipeline_id.identity(pipeline, REPO_ROOT, args.launcher)
     print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
     if args.resume:   # a run continues under the pipeline it was recorded with
-        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(
-            args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume), "metadata.json")),
-            pipeline)
+        _rp = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp)
         if why:
             print(f"Error: {why}", file=sys.stderr)
             return 1
@@ -3079,27 +3080,37 @@ def main() -> int:
             return main_v2(args, ident)
         except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
             return 130
-    if args.preflight_only or not args.skip_preflight:
-        pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
-        print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
-              f"{sorted((pf.get('model_usage') or {}).keys())} | sdk={pf['sdk_version']}"
-              f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
-        for p in pf["problems"]:
-            print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
-        if pf.get("write_probe"):
-            print("  write probe log (last lines):\n    " + pf["write_probe"].replace("\n", "\n    "), flush=True)
-        if args.cross_model:
-            cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
-                                env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
-            cm_ok = cm.returncode == 0 and "logged in" in (cm.stdout + cm.stderr).lower()
-            print(f"  cross-model: codex {'OK' if cm_ok else 'NOT AVAILABLE'}"
-                  f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
-            pf["ok"] = pf["ok"] and cm_ok
-        if args.preflight_only or not pf["ok"]:
-            return 0 if pf["ok"] else 3
+    if not args.skip_preflight:
+        rc = _preflight_and_report(args)
+        if rc:
+            return rc
     if args.max_sessions < 1 or args.max_rounds < 1:
         parser.error("--max-sessions and --max-rounds must be >= 1")
+    return _run_v1(args, ident)
 
+
+def _preflight_and_report(args) -> int:
+    """The live preflight (v1's lead session): 0 when it passed, 3 otherwise."""
+    pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
+    print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
+          f"{sorted((pf.get('model_usage') or {}).keys())} | sdk={pf['sdk_version']}"
+          f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
+    for p in pf["problems"]:
+        print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
+    if pf.get("write_probe"):
+        print("  write probe log (last lines):\n    " + pf["write_probe"].replace("\n", "\n    "), flush=True)
+    if args.cross_model:
+        cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
+                            env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
+        cm_ok = cm.returncode == 0 and "logged in" in (cm.stdout + cm.stderr).lower()
+        print(f"  cross-model: codex {'OK' if cm_ok else 'NOT AVAILABLE'}"
+              f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
+        pf["ok"] = pf["ok"] and cm_ok
+    return 0 if pf["ok"] else 3
+
+
+def _run_v1(args, ident: dict) -> int:
+    """The v1 lead-session pipeline (`--v1`)."""
     if args.resume:
         run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
         if not os.path.isdir(run_path):

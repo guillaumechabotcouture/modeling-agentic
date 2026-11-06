@@ -829,17 +829,24 @@ def input_hash_problem(q, truth, launch) -> tuple[str, str] | None:
 
 
 def identity_problem(proc, launch) -> tuple[str, str] | None:
-    """(failure code, detail) when the run's recorded pipeline or commit is not what its launch
-    record says was launched. A launch record that names neither (launches from before
-    2026-11-05) checks nothing: the score then reads "unknown" for what it cannot show."""
-    lp, lc = (launch or {}).get("pipeline"), (launch or {}).get("commit")
+    """(failure code, detail) when the run's recorded identity is not what its launch record says
+    was launched. A launch record that names a pipeline (launches from 2026-11-05 on) must also
+    name a commit, and the run must record both and match. A legacy record (commit only) still
+    refuses a run that records another commit; a legacy run that records nothing is not refused,
+    and its score reads "unknown"."""
+    launch = launch or {}
+    lp, lc = launch.get("pipeline"), launch.get("commit")
     rp, rc = (proc or {}).get("pipeline", pipeline_id.UNKNOWN), (proc or {}).get("commit", pipeline_id.UNKNOWN)
     if lp:
+        if not lc:
+            return "launch_identity_incomplete", f"the launch record names pipeline {lp} but no commit"
         if rp == pipeline_id.UNKNOWN:
             return "pipeline_unrecorded", f"launched as pipeline {lp}, but the run records no pipeline"
         if rp != lp:
             return "pipeline_mismatch", f"launched as pipeline {lp}, but the run records pipeline {rp}"
-    if lp and lc and not pipeline_id.same_commit(lc, rc):
+        if rc == pipeline_id.UNKNOWN:
+            return "commit_unrecorded", f"launched at commit {lc}, but the run records no commit"
+    if lc and rc != pipeline_id.UNKNOWN and not pipeline_id.same_commit(lc, rc):
         return "commit_mismatch", f"launched at commit {lc}, but the run records commit {rc}"
     return None
 
@@ -1541,7 +1548,7 @@ def _self_test(with_private=False, private_dir=None) -> int:
         for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
                          ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
                          ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
-                         ("S18", _test_s18_incomplete_bundle), ("S19", _test_s19_pipeline)):
+                         ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -1570,7 +1577,7 @@ def _self_test(with_private=False, private_dir=None) -> int:
     return 0
 
 
-def _test_s19_pipeline(ok, td):
+def _self_test_s19_pipeline(ok, td):
     """2026-11-05: eval scores from the standard launcher were v1 scores, and nothing in a score
     said so. Every score names its pipeline and commit ("unknown" for old runs, never assumed), a
     run whose recorded pipeline is not the launch's is refused, and `report` does not compare

@@ -70,36 +70,69 @@ def explicit(flags) -> str | None:
     return None
 
 
-def main_py_args(cmd) -> list | None:
-    """The arguments after `main.py` in a command (an argv list or a shell string), or None
-    when the command does not run main.py. A wrapper script that calls main.py cannot be seen."""
-    toks = shlex.split(cmd) if isinstance(cmd, str) else [str(t) for t in cmd or ()]
-    for i, t in enumerate(toks):
-        if t in (";", "&&", "||", "|"):
+_OPS = {";", "&&", "||", "|", "&", "\n", "(", ")", "<", ">", ">>", "<<", ";;", "|&", "&>", ">&", "<&"}
+
+
+def _split_commands(cmd) -> list[list[str]]:
+    """A command as its simple commands (argv lists). An argv list is one command. A shell string
+    is split on shell operators, attached or not, and on newlines (shlex in punctuation mode)."""
+    if not isinstance(cmd, str):
+        return [[str(t) for t in cmd or ()]]
+    lex = shlex.shlex(cmd.replace("\r", "\n"), posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace = " \t"                 # a newline is a command boundary, not a space
+    lex.whitespace_split = True
+    lex.commenters = ""
+    out, cur = [], []
+    for t in lex:
+        if t in _OPS or (t and set(t) <= set(";&|()<>\n")):
+            if cur:
+                out.append(cur)
+            cur = []
             continue
-        if os.path.basename(t.rstrip(";&|")) == "main.py":
-            rest = []
-            for u in toks[i + 1:]:
-                if u in (";", "&&", "||", "|") or u.endswith((";", "&&")):
-                    if u not in (";", "&&", "||", "|"):
-                        rest.append(u.rstrip(";&"))
-                    break
-                rest.append(u)
-            return rest
-    return None
+        cur.append(t)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def main_py_calls(cmd) -> list[list[str]]:
+    """The arguments of every main.py call in a command (empty when it runs none). A wrapper
+    script that calls main.py cannot be seen."""
+    calls = []
+    for argv in _split_commands(cmd):
+        for i, t in enumerate(argv):
+            if os.path.basename(t) == "main.py":
+                calls.append(argv[i + 1:])
+                break
+    return calls
+
+
+def main_py_args(cmd) -> list | None:
+    """The arguments of the first main.py call in a command, or None when it runs none."""
+    calls = main_py_calls(cmd)
+    return calls[0] if calls else None
 
 
 def from_command(cmd) -> str | None:
-    """A job command's main.py pipeline when it states one explicitly; None when it runs no
-    main.py. Raises PipelineError when it runs main.py relying on the default (launchers must
-    name the pipeline: the default changed once and silently, 2026-11-05)."""
-    args = main_py_args(cmd)
-    if args is None:
+    """A job command's main.py pipeline when every main.py call in it states the same one
+    explicitly; None when it runs no main.py. Raises PipelineError when a call relies on the
+    default (the default changed once and silently, 2026-11-05), when calls disagree, or when
+    a shell string makes main.py's arguments depend on an expansion (`$(...)`, backquotes)."""
+    if isinstance(cmd, str) and "main.py" in cmd and ("`" in cmd or "$(" in cmd):
+        raise PipelineError("the command builds main.py's arguments with a command substitution: "
+                            "state the pipeline as a literal --v1 or --v2")
+    calls = main_py_calls(cmd)
+    if not calls:
         return None
-    p = explicit(args)
-    if p is None:
-        raise PipelineError("the command runs main.py without --v1 or --v2: state the pipeline explicitly")
-    return p
+    got = set()
+    for args in calls:
+        p = explicit(args)
+        if p is None:
+            raise PipelineError("the command runs main.py without --v1 or --v2: state the pipeline explicitly")
+        got.add(p)
+    if len(got) != 1:
+        raise PipelineError(f"the command runs main.py under several pipelines ({sorted(got)}): run one")
+    return got.pop()
 
 
 def code_commit(repo: str) -> str:
@@ -145,23 +178,39 @@ def stamp(run_path: str, ident: dict, now: str | None = None) -> dict:
     except (OSError, ValueError):
         meta = {}
     meta = meta if isinstance(meta, dict) else {}
+    before = label(meta)[0]
     meta.update({k: ident[k] for k in ("pipeline", "commit", "launcher")})
     inv = meta.get("invocations") if isinstance(meta.get("invocations"), list) else []
     meta["invocations"] = inv + [{**{k: ident[k] for k in ("pipeline", "commit", "launcher")},
+                                  "pipeline_before": before,
                                   "at": now or datetime.now().isoformat(timespec="seconds")}]
-    os.makedirs(run_path, exist_ok=True)
-    tmp = mp + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(meta, f, indent=2)
-    os.replace(tmp, mp)
+    if not os.path.isdir(run_path):
+        raise PipelineError(f"{run_path}: no run directory to stamp")
+    if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from safe_io import publish      # a run dir may hold agent-planted links: no link is followed
+    publish(mp, json.dumps(meta, indent=2), run_path)
     return meta
 
 
-def resume_conflict(meta: dict, pipeline: str) -> str | None:
-    """Why a run recorded under one pipeline may not be resumed under another, or None."""
-    rec = (meta or {}).get("pipeline") if isinstance(meta, dict) else None
-    if rec in PIPELINES and rec != pipeline:
-        return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
+def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None) -> str | None:
+    """Why a run may not be resumed under `pipeline`, or None. A recorded pipeline must match; a
+    malformed one is refused. With none recorded (runs from before 2026-11-05) the run's files
+    decide: run_state.json is the v2 machine's, so such a run is v2's; a run without it is v1's."""
+    meta = meta if isinstance(meta, dict) else {}
+    if "pipeline" in meta:
+        rec = meta.get("pipeline")
+        if rec not in PIPELINES:
+            return f"this run records pipeline {rec!r}, which is not v1 or v2: refusing to resume it"
+        if rec != pipeline:
+            return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
+        return None
+    if run_path is None:
+        return None
+    by_files = "v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1"
+    if by_files != pipeline:
+        return (f"this run records no pipeline, and its files are pipeline {by_files}'s "
+                f"({'has' if by_files == 'v2' else 'no'} run_state.json); resume it with --{by_files}")
     return None
 
 

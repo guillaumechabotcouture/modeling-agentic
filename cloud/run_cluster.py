@@ -261,7 +261,22 @@ def code_tarball(cfg) -> tuple[bytes, str]:
     refuse_hidden_tree(cfg.tree)
     blob = subprocess.check_output(["git", "-C", cfg.tree, "archive", "--format=tar.gz", "HEAD"])
     refuse_hidden(blob, cfg.tree)
-    return blob, head[:7]
+    return blob, archive_commit(blob) or head[:7]   # the commit that ships (stamped by git archive)
+
+
+def _archive_member(code: bytes, name: str) -> bytes | None:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
+            m = next((m for m in t.getmembers() if m.isfile() and m.name.removeprefix("./") == name), None)
+            return t.extractfile(m).read() if m else None
+    except (tarfile.TarError, OSError):
+        return None
+
+
+def archive_commit(code: bytes) -> str | None:
+    """The 7-character commit git archive stamped into scripts/lib/code_commit.txt, or None."""
+    raw = (_archive_member(code, "scripts/lib/" + pipeline_id.COMMIT_FILE) or b"").decode("ascii", "replace").strip()
+    return raw[:7] if len(raw) >= 7 and all(c in "0123456789abcdef" for c in raw) else None
 
 
 def refuse_hidden_tree(tree: str, tracked: set[str] | None = None) -> None:
@@ -301,15 +316,14 @@ def pipeline_preflight(cfg, code: bytes, python: str = sys.executable) -> str:
     if cfg.pipeline not in pipeline_id.PIPELINES:
         raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v1' or 'v2'): refusing")
     want = "scripts/lib/pipeline_id.py"
-    try:
-        with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
-            m = next((m for m in t.getmembers() if m.isfile() and m.name.lstrip("./") == want), None)
-            src = t.extractfile(m).read() if m else None
-    except (tarfile.TarError, OSError) as e:
-        raise SystemExit(f"{cfg.name}: the code tarball cannot be read ({e}): refusing") from e
+    src = _archive_member(code, want)
     if src is None:
         raise SystemExit(f"{cfg.name}: the code to launch has no {want}, so it cannot state which pipeline main.py "
                          "runs (a tree from before 2026-11-05 runs v1 by default): refusing")
+    main_src = (_archive_member(code, "main.py") or b"").decode("utf-8", "replace")
+    if not all(k in main_src for k in ("pipeline_id.select(", '"--v1"', '"--v2"', '"--launcher"')):
+        raise SystemExit(f"{cfg.name}: the shipped main.py does not take --v1/--v2/--launcher or does not choose its "
+                         "pipeline through pipeline_id.select (a mixed or older tree): refusing")
     with tempfile.TemporaryDirectory(prefix="pipeline-preflight-") as td:
         f = os.path.join(td, "pipeline_id.py")
         open(f, "wb").write(src)

@@ -179,10 +179,18 @@ def write_launch_record(dest: str, job_id: str, code: bytes | None, pipeline: st
                         name: str) -> dict:
     """The job's launch record, in the format cloud/run_cluster.py writes and scripts/eval_suite.py
     grades: <dest>/../assignments.json[job_id] and <dest>/result.json, sharing one launch_id."""
-    rec = {"launch_id": f"{job_id}-{time.strftime('%Y%m%d-%H%M%S')}", "job_id": job_id, "commit": commit,
+    import secrets
+    rec = {"launch_id": f"{job_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}", "job_id": job_id,
+           "commit": commit,
            "pipeline": pipeline or "none", "launcher": f"vm_job:{name}/{job_id}", "submitted": time.strftime("%F %T"),
            "eval_inputs_sha256": eval_paths.archive_sha256(code) if code else {}}
     os.makedirs(dest, exist_ok=True)
+    # An earlier attempt of this job id must not pass for this launch's run (Codex r1): set its runs/
+    # aside and reset the poll index, so only this attempt's outputs appear under runs/.
+    if os.path.exists(os.path.join(dest, "runs")):
+        os.rename(os.path.join(dest, "runs"), os.path.join(dest, f"runs.before_{rec['launch_id']}"))
+    if os.path.exists(os.path.join(dest, ".manifest.json")):
+        os.remove(os.path.join(dest, ".manifest.json"))
     ap = os.path.join(os.path.dirname(dest), "assignments.json")
     try:
         a = json.load(open(ap))
@@ -197,6 +205,12 @@ def write_launch_record(dest: str, job_id: str, code: bytes | None, pipeline: st
         json.dump(obj, open(tmp, "w"), indent=1)
         os.replace(tmp, path)
     return rec
+
+
+def _launch_commit(code: bytes | None, tree: str | None, src_dir: str | None) -> str:
+    """The commit of the code that ships: git archive's stamp inside the archive (so a checkout
+    that moves on while the VM starts does not change it), else the tree or directory's."""
+    return (rc.archive_commit(code) if code else None) or _code_commit(tree, src_dir)
 
 
 def _code_commit(tree: str | None, src_dir: str | None) -> str:
@@ -360,7 +374,7 @@ def cmd_start(a, cluster=None):
     fire_and_forget(fut)
     dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
-    lrec = write_launch_record(dest, a.job_id, code, pipeline, _code_commit(a.tree, a.dir), base)
+    lrec = write_launch_record(dest, a.job_id, code, pipeline, _launch_commit(code, a.tree, a.dir), base)
     json.dump({"name": getattr(a, "base_name", a.name), "cluster": a.name,
                "cluster_id": getattr(cluster, "cluster_id", None) if cluster is not None else None,
                "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
