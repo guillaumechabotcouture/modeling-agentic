@@ -61,6 +61,18 @@ def _signed_config(ref: str):
         e = spec.get("engine")
         if isinstance(e, dict) and e.get("ref") == ref:
             return dict(e.get("config") or {})
+        # measles run 6: a rethink re-drafted the spec as `engine: auto`. The schema then reads the engine from the
+        # run's engine_choice.json, so the choice's configuration is the one this engine runs with
+        auto = e == "auto" or (isinstance(e, dict) and e.get("auto") is True)
+        rd = spec.get("_run_dir")
+        if auto and rd and os.path.exists(os.path.join(rd, ENGINE_CHOICE)):
+            try:
+                with open(os.path.join(rd, ENGINE_CHOICE)) as f:
+                    ch = (json.load(f) or {}).get("engine") or {}
+            except (OSError, ValueError):
+                ch = {}
+            if isinstance(ch, dict) and ch.get("ref") == ref and isinstance(ch.get("config"), dict):
+                return dict(ch["config"])
         raise ValueError(f"{ref} is configured by the signed spec (engine: {{ref, config}}); this spec does not name it")
     return cfg
 
@@ -508,7 +520,7 @@ class _ToolkitApi:
             signed = (yaml.safe_load(open(s.path)) or {}).get("engine", signed) if s.path else signed
         except (OSError, yaml.YAMLError):
             pass
-        rows = self._card_rows(dict(s.raw, engine=signed), engines)
+        rows = self._card_rows(dict(s.raw, engine=signed, _run_dir=s.base), engines)
         for r in rows:
             if r.get("eligible"):
                 probs = schema.validate(schema.with_engine(s, r["ref"], r.get("config")))
@@ -817,6 +829,14 @@ def _self_test() -> int:
     ok(not emp["eligible"] and "at most" in str(emp["why_not"]),
        "B27 a spec with 40 components makes the package-rate engine ineligible at once (it would enumerate 2^40 "
        "combinations)")
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as d:
+        json.dump(engine_choice_record(COMPARTMENTAL, "test", [], config=cfg), open(os.path.join(d, ENGINE_CHOICE), "w"))
+        r4 = {r["ref"]: r for r in eligible_engines(dict(sp, engine="auto", _run_dir=d))}
+        r5 = {r["ref"]: r for r in eligible_engines(dict(sp, engine="auto"))}
+        ok(r4[COMPARTMENTAL]["eligible"] and r4[COMPARTMENTAL]["config"] == cfg and not r5[COMPARTMENTAL]["eligible"],
+           "B28 an `engine: auto` spec (a rethink) keeps the compartmental configuration of the run's engine choice; "
+           "with no choice in the run it is not eligible")
     # an estimates spec (no allocation units): the renewal engine is the one eligible registered engine, configured
     # from the spec's dynamics; for an allocation spec it is not eligible
     import tempfile as _tf

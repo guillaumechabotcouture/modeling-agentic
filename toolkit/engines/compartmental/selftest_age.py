@@ -294,6 +294,14 @@ def _self_test() -> int:
        f"A39 the generation grid stores the seeds and a running total only ({len(st39['inc'])} rows over "
        f"{st39['n_steps']} generations), with the same final size")
 
+    # A40: finished sims are emptied (Starsim 3.3 keeps dropped Sim objects alive; each held the run's history)
+    import gc
+    for _ in range(3):
+        efs.run(near, _unit(), Package("0", {}), short, 1)
+    gc.collect()
+    held = [o for o in gc.get_objects() if type(o).__name__ in ("Sim", "GroupEpidemic") and vars(o)]
+    ok(not held, f"A40 no finished sim keeps its contents after a run ({len(held)} non-empty)")
+
     # A24 a contract check of each new configuration
     ok(check_engine(eyh, _unit(), pk, hy) == [] and check_engine(e_mid, u1, Package("v", {"vax": 1}), hd) == [],
        "A24 the year-unit and mid-epidemic configurations pass the contract test")

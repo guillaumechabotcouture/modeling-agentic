@@ -89,6 +89,7 @@ NAME, VERSION = "compartmental-starsim", "0.2"
 TIME_UNITS = ("day", "year")
 YEAR_DAYS = 365.0                 # time_unit year: one model year is 365 days (the forcing period's default)
 PER_GROUP = ("s0", "ratio")       # per_group_parameters: s0 and ratio:<outcome>
+MAX_SEGMENT = 8192                # steps per Starsim sim in a to_extinction run (memory bound per segment)
 
 STRUCTURES = ("single_group", "age_groups_contact_matrix", "birth_cohorts")
 MODES = ("to_extinction", "windowed")
@@ -471,6 +472,32 @@ def _component_class():
             mod.doses[self.cname] = self.doses
 
     return AllOrNothingComponent
+
+
+def _release(sim) -> None:
+    """Empty a finished Starsim sim. Starsim 3.3 keeps every Sim object alive after it is dropped (measured: a
+    plain ss.Sim of 20,000 daily steps run 30 times grew the process by ~1 GB; 30 runs with the finished sims
+    emptied stayed flat), and here each sim also holds the run's context and its incidence history. A
+    calibration of 10^4 evaluations therefore exhausted a 32 GB VM (flu run 4). The module state was exported
+    before, so emptying the sim, its modules and its other members changes no output."""
+    kids = []
+    for k in ("diseases", "interventions", "people", "loop", "dists", "results", "t", "networks", "demographics",
+              "connectors", "analyzers", "pars"):
+        v = getattr(sim, k, None)
+        if v is None:
+            continue
+        kids.append(v)
+        if isinstance(v, dict):
+            kids += [x for x in v.values() if hasattr(x, "__dict__")]
+    for v in kids:
+        try:
+            vars(v).clear()
+        except TypeError:
+            pass
+    try:
+        vars(sim).clear()
+    except TypeError:
+        pass
 
 
 # ------------------------------------------------------------------------------------ engine
@@ -937,17 +964,22 @@ class CompartmentalEngine:
                 bad = [int(b) for b in np.nonzero(state["active"])[0]]
                 raise RuntimeError(f"step cap {self.step_cap} reached with the epidemic still running "
                                    f"(converged: false; batch members {bad[:10]})")
-            n = min(2 * steps, self.step_cap - done)
+            # v0.2: segments double up to MAX_SEGMENT steps, so one Starsim sim never holds a near-critical run's whole
+            # length (a 5 x 10^5-step segment held ~1.4 GB and its timeline; the run's steps and outputs are unchanged)
+            n = min(2 * steps, MAX_SEGMENT, self.step_cap - done)
             sim = self._sim(ctx, state, n - 1, done + 1, seed)
             state, done, steps = self._run_until_done(sim, n - 1), done + n, n
         return state, sim
 
     def _run_until_done(self, sim, steps) -> dict:
         """Run one segment; in to_extinction mode stop early once every member has converged. Returns the
-        module state (the sim holds its own copy of the module, so it is read from the sim)."""
+        module state (the sim holds its own copy of the module, so it is read from the sim). The finished sim is
+        then emptied (_release)."""
         if self.mode != "to_extinction":
             sim.run()
-            return sim.diseases.groupepidemic.export()
+            st = sim.diseases.groupepidemic.export()
+            _release(sim)
+            return st
         sim.init()
         mod = sim.diseases.groupepidemic
         chunk = 32
@@ -955,7 +987,9 @@ class CompartmentalEngine:
         while True:
             sim.run(until=min(t, steps))
             if not mod.active.any() or t >= steps or sim.complete:
-                return mod.export()
+                st = mod.export()
+                _release(sim)
+                return st
             t += chunk
 
     def run(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
