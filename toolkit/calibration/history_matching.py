@@ -746,6 +746,7 @@ class HistoryMatch:
                 continue
             k = int(round(hs * len(wave)))
             errs = {}
+            covers_all = False
             if k >= mh:
                 ids = set(rng.choice(len(wave), size=k, replace=False).tolist())
                 held = [wave[i] for i in sorted(ids)]
@@ -758,10 +759,11 @@ class HistoryMatch:
                     e = self._errors(kind, [alld[i] for i in f], [r for r in alld if _key(r) not in fk])
                     for ob, v in e.items():
                         errs.setdefault(ob, []).extend(v)
+                covers_all = True
                 how = (f"5-fold cross-validation over {len(alld)} runs, repeated inputs in one fold (this wave's "
                        f"holdout would be {k} < {mh})")
             for ob, e in errs.items():
-                out[ob] = dict(validation(e, self.eth), how=how)
+                out[ob] = dict(validation(e, self.eth), how=how, covers_all=bool(covers_all))
         return out
 
     # ---------------------------------------------------------------- implausibility
@@ -980,7 +982,7 @@ class HistoryMatch:
             pu, ps = list(self.data.unit), list(self.data.shared)
             valid = self._validate(pu, ps)
             for ob, v in valid.items():
-                self.valid_hist.setdefault(ob, []).append(v["status"])
+                self._note_check(ob, v)
             off = 1000 + self.prior_n          # Codex r3 P2-7: a continuation's own seeds, apart from earlier ones
             if self.sobs and not ps:            # Codex r3 P2-5: no earlier shared runs: the shared design first
                 _, srows = self._design(0, None, label=off - 1, units=False)
@@ -989,7 +991,7 @@ class HistoryMatch:
                 ps = list(self.data.shared)
                 valid.update(self._validate([], srows))
                 for ob in self.sobs:
-                    self.valid_hist.setdefault(ob, []).append(valid[ob]["status"])
+                    self._note_check(ob, valid[ob])
             self.em = self._fit(pu, ps)
             state = self._region(self.em)
             self.waves.append(dict(self._wave_summary(-1, pu, ps, valid, state), prior_runs=len(pu),
@@ -1006,7 +1008,7 @@ class HistoryMatch:
             self.data.add("shared", srows)
             valid = self._validate(urows, srows)
             for ob, v in valid.items():
-                self.valid_hist.setdefault(ob, []).append(v["status"])
+                self._note_check(ob, v)
             self.em = self._fit(self.data.unit, self.data.shared)
             state = self._region(self.em)
             self.waves.append(self._wave_summary(w, urows, srows, valid, state))
@@ -1014,6 +1016,14 @@ class HistoryMatch:
                      f"{len(state['unmatchable'])}; conflicting {len(state['conflicting'])}")
         self.state = state
         return self.report(valid)
+
+    def _note_check(self, ob, v):
+        h = self.valid_hist.setdefault(ob, [])
+        h.append(v["status"])
+        if not hasattr(self, "valid_cleared"):
+            self.valid_cleared = {}
+        if v["status"] == "passed" and v.get("covers_all"):
+            self.valid_cleared[ob] = len(h) - 1          # every earlier check is superseded by this one
 
     def _wave_summary(self, w, urows, srows, valid, st):
         return {"wave": w + 1, "unit_runs": len(urows), "shared_runs": len(srows), "validation": valid,
@@ -1229,7 +1239,10 @@ class HistoryMatch:
         # Codex r2 P1-2: a wave whose check failed (or could not run) blocks even when a later wave passes: the later
         # check holds out only the later wave's points, so it cannot clear what the failed emulator excluded
         hist = getattr(self, "valid_hist", {}) or {ob: [v["status"]] for ob, v in valid.items()}
-        inadequate = {ob: s for ob, s in hist.items() if any(x != "passed" for x in s)}
+        # a failed check stays until a later check covers every run so far (cross-validation over all of them) and
+        # passes: a check of the new wave's points alone cannot clear what the failed emulator excluded
+        cleared = getattr(self, "valid_cleared", {})
+        inadequate = {ob: s for ob, s in hist.items() if any(x != "passed" for x in s[cleared.get(ob, -1) + 1:])}
         if inadequate:
             blocks.append({"code": "emulator_inadequate", "detail": {ob: f"wave checks {s}" for ob, s in inadequate.items()}})
         if not len(R):
@@ -1837,6 +1850,18 @@ def _self_test() -> int:
         except CalibrationInputError:
             ok(True, "HM19c a boolean observation in an earlier run is refused")
     safe(hm19, "HM19")
+
+    def hm20():          # a later check that covers every run (cross-validation over all) and passes clears a failure
+        h = HistoryMatch(*_toy()[:2], 1, q, **fast)
+        h.valid_hist = {}
+        h._note_check("w0", {"status": "failed"})
+        h._note_check("w0", {"status": "passed", "covers_all": False})
+        a = {ob: s for ob, s in h.valid_hist.items() if any(x != "passed" for x in s[h.valid_cleared.get(ob, -1) + 1:])}
+        h._note_check("w0", {"status": "passed", "covers_all": True})
+        b = {ob: s for ob, s in h.valid_hist.items() if any(x != "passed" for x in s[h.valid_cleared.get(ob, -1) + 1:])}
+        ok("w0" in a and "w0" not in b, "HM20 a failure stays after a new-wave pass, and clears after a pass of a check "
+                                        "covering every run")
+    safe(hm20, "HM20")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
