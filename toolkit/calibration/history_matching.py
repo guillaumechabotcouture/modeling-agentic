@@ -104,6 +104,18 @@ def in_domain(x, scale) -> bool:
     return (0 < x < 1) if scale == "logit" else (x > 0) if scale == "log" else True
 
 
+def at_edge(x, scale) -> bool:
+    """A simulated proportion of exactly 0 or 1 (logit), or exactly 0 (log): kept at the clip and counted."""
+    if isinstance(x, bool) or not isinstance(x, (int, float, np.floating)):
+        return False
+    return (scale == "logit" and float(x) in (0.0, 1.0)) or (scale == "log" and float(x) == 0.0)
+
+
+def sim_ok(x, scale) -> bool:
+    """One rule for fresh and earlier simulated values (Codex r3 P2-9)."""
+    return in_domain(x, scale) or at_edge(x, scale)
+
+
 def sd_from_ci(lo, hi, scale, level=0.95) -> float:
     """The sampling sd on the target's scale from a symmetric-on-that-scale interval at `level`."""
     from scipy.stats import norm
@@ -589,14 +601,15 @@ class HistoryMatch:
                 w = f"earlier {kind} run {n}"
                 t = cube_t(r.get("theta") or {}, w)
                 obs = r.get("obs") or {}
-                miss = [ob for ob in need if not in_domain(obs.get(ob), P.scales[ob]) and
-                        not (P.scales[ob] == "logit" and obs.get(ob) in (0, 1))]
+                miss = [ob for ob in need if not sim_ok(obs.get(ob), P.scales[ob])]
                 if miss:
                     bad.append(f"{w}: observables {miss} missing or outside their domain")
                 if t is None or miss:
                     continue
-                row = {"t": t, "seed": r.get("seed"), "obs": {ob: float(obs[ob]) for ob in need},
-                       "prior": True}
+                keep = {ob: float(obs[ob]) for ob in need}
+                keep.update({ob: float(obs[ob]) for ob in self.record if isinstance(obs.get(ob), (int, float))
+                             and not isinstance(obs.get(ob), bool)})          # Codex r3 P2-8: records kept
+                row = {"t": t, "seed": r.get("seed"), "obs": keep, "prior": True}
                 if kind == "unit":
                     z = r.get("z")
                     if r.get("unit") not in uset or not isinstance(z, (int, float)) or not lo - 1e-9 <= z <= hi + 1e-9:
@@ -630,32 +643,33 @@ class HistoryMatch:
             for ob in need:
                 v = (o or {}).get(ob)
                 sc = self.P.scales[ob]
-                edge = (isinstance(v, (int, float)) and not isinstance(v, bool) and
-                        ((sc == "logit" and v in (0, 1)) or (sc == "log" and v == 0)))
-                if edge:      # a finite engine can simulate exactly 0 or 1: transformed at the clip, and counted
+                if at_edge(v, sc):      # a finite engine can simulate exactly 0 or 1: transformed at the clip, counted
                     self.boundary[ob] = self.boundary.get(ob, 0) + 1
                 elif not in_domain(v, sc):
                     bad.append(f"simulate: point {r.get('unit', 'shared')} seed {r['seed']}: observable {ob} is "
                                f"missing, not finite or outside the {sc} scale's domain ({v!r})")
             r["obs"] = {ob: float(o[ob]) for ob in list(need) + self.record if ob in (o or {})
                         and isinstance(o[ob], (int, float)) and not isinstance(o[ob], bool)}
+            if isinstance((o or {}).get("_ref"), str):
+                r["ref"] = o["_ref"]            # where the simulator stored this run (for later reuse)
         if bad:
             raise CalibrationInputError(bad)
         return rows
 
-    def _design(self, wave, state):
+    def _design(self, wave, state, label=None, units=True):
         n_u = int(self.th["points_per_unit"])
         n_s = int(self.th["shared_points"]) if self.sobs else 0
         urows, srows = [], []
-        rng = np.random.default_rng([self.seed, wave, 1])
+        lab = wave if label is None else label          # the seeds' wave label
+        rng = np.random.default_rng([self.seed, lab, 1])
         if wave == 0 or state is None:
-            for k, u in enumerate(self.P.units):
+            for k, u in enumerate(self.P.units if units else []):
                 X = _sobol(1 + self.p, n_u, _seed(self.seed, "unit", u))
                 for i, x in enumerate(X):
                     urows.append({"unit": u, "s": float(x[0]), "t": x[1:].copy(),
-                                  "seed": _seed(self.seed, wave, u, i)})
-            for i, x in enumerate(_sobol(self.p, n_s, _seed(self.seed, "shared"))):
-                srows.append({"t": x.copy(), "seed": _seed(self.seed, wave, "shared", i)})
+                                  "seed": _seed(self.seed, lab, u, i)})
+            for i, x in enumerate(_sobol(self.p, n_s, _seed(self.seed, "shared", lab))):
+                srows.append({"t": x.copy(), "seed": _seed(self.seed, lab, "shared", i)})
             return urows, srows
         C, acc = state["C"], state["region"]
         w = self.P.prior_weight(C[acc]) if len(acc) else None
@@ -669,19 +683,19 @@ class HistoryMatch:
                 for i, c in enumerate(pick):
                     zs = self.zg[rng.choice(np.flatnonzero(ok[c]))]
                     zs = float(np.clip(zs + rng.uniform(-0.5, 0.5) / max(self.G - 1, 1), 0, 1))
-                    urows.append({"unit": u, "s": zs, "t": C[c].copy(), "seed": _seed(self.seed, wave, u, i)})
+                    urows.append({"unit": u, "s": zs, "t": C[c].copy(), "seed": _seed(self.seed, lab, u, i)})
             else:      # no value in the region matches it: simulate at its own best values, to confirm or refute
                 m = state["units"][u]["m"]
                 top = np.argsort(m)[:max(3 * n_u, 1)]
                 pick = rng.choice(top, size=n_u, replace=len(top) < n_u)
                 for i, c in enumerate(pick):
                     urows.append({"unit": u, "s": float(self.zg[state["units"][u]["g"][c]]), "t": C[c].copy(),
-                                  "seed": _seed(self.seed, wave, u, i)})
+                                  "seed": _seed(self.seed, lab, u, i)})
         if n_s:
             src = acc if len(acc) else np.arange(len(C))
             ww = self.P.prior_weight(C[src])
             for i, c in enumerate(rng.choice(src, size=n_s, p=ww / ww.sum(), replace=len(src) < n_s)):
-                srows.append({"t": C[c].copy(), "seed": _seed(self.seed, wave, "shared", i)})
+                srows.append({"t": C[c].copy(), "seed": _seed(self.seed, lab, "shared", i)})
         return urows, srows
 
     # ---------------------------------------------------------------- emulation
@@ -964,13 +978,22 @@ class HistoryMatch:
             valid = self._validate(pu, ps)
             for ob, v in valid.items():
                 self.valid_hist.setdefault(ob, []).append(v["status"])
+            off = 1000 + self.prior_n          # Codex r3 P2-7: a continuation's own seeds, apart from earlier ones
+            if self.sobs and not ps:            # Codex r3 P2-5: no earlier shared runs: the shared design first
+                _, srows = self._design(0, None, label=off - 1, units=False)
+                srows = self._run("shared", srows)
+                self.data.add("shared", srows)
+                ps = list(self.data.shared)
+                valid.update(self._validate([], srows))
+                for ob in self.sobs:
+                    self.valid_hist.setdefault(ob, []).append(valid[ob]["status"])
             self.em = self._fit(pu, ps)
             state = self._region(self.em)
             self.waves.append(dict(self._wave_summary(-1, pu, ps, valid, state), prior_runs=len(pu),
                                    prior_shared_runs=len(ps)))
             self.log(f"joint calibration: {len(pu)} earlier unit runs and {len(ps)} shared runs as data; region "
                      f"{len(state['region'])} of {len(state['C'])}")
-            off = 100           # new waves: their own seeds and designs from the region
+            off = 1000 + self.prior_n       # new waves: designs from the region, seeds apart from earlier ones
         for w in range(nw):
             urows, srows = self._design(w + off, state)
             self.log(f"joint calibration wave {w + 1}/{nw}: {len(urows)} unit runs, {len(srows)} shared runs")
@@ -1291,8 +1314,9 @@ class HistoryMatch:
                            "contraction95": round(1 - (b - a) / (pb - pa), 4) if pb > pa else None}
                 self._i95 = getattr(self, "_i95", {})
                 self._i95[p.name] = inter95
-        runs = {"unit": [{"unit": r["unit"], "z": float(P.z_natural(r["s"])), "theta": P.theta_natural(r["t"])[0]
-                          if self.p else {}, "seed": r["seed"], "obs": r["obs"]} for r in self.data.unit],
+        runs = {"unit": [dict({"unit": r["unit"], "z": float(P.z_natural(r["s"])), "theta": P.theta_natural(r["t"])[0]
+                               if self.p else {}, "seed": r["seed"], "obs": r["obs"]},
+                              **({"ref": r["ref"]} if r.get("ref") else {})) for r in self.data.unit],
                 "shared": [{"theta": P.theta_natural(r["t"])[0], "seed": r["seed"], "obs": r["obs"]}
                            for r in self.data.shared]}
         return {"method": "history_matching", "producer": PRODUCER, "figure_data": figd, "runs": runs,
@@ -1779,6 +1803,37 @@ def _self_test() -> int:
            "HM18 a recorded observable is kept with every run and the verification")
     safe(hm17, "HM17")
     safe(hm18, "HM18")
+
+    def hm19():          # Codex r3 P2-5/P2-7/P2-8/P2-9: continuation details
+        P = Problem([Param("a", 0.0, 1.0, "uniform", None, "toy")], {"name": "z", "lo": -2.0, "hi": 2.0}, ["u"],
+                    [Target("u:t", "unit", "x", 0.4, "identity", sd_obs=0.2, unit="u", source="t"),
+                     Target("B", "shared", "s", 0.5, "identity", sd_obs=0.05, source="t")])
+
+        def sim(pts):
+            return [({"x": p["z"] * 0.1 + p["theta"]["a"] * 0.2, "rec": 1.0} if p["kind"] == "unit" else
+                     {"s": p["theta"]["a"] + 0.001 * (p["seed"] % 3)}) for p in pts]
+        r1 = calibrate(P, sim, seed=5, waves=1, log=q, record=["rec"], candidates_log2=8, points_per_unit=6,
+                       shared_points=12)
+        only_units = {"unit": r1["runs"]["unit"], "shared": []}
+        try:
+            r2 = calibrate(P, sim, seed=5, waves=1, log=q, prior=only_units, record=["rec"], candidates_log2=8,
+                           points_per_unit=6, shared_points=12)
+            seeds1 = {x["seed"] for x in r1["runs"]["unit"] + r1["runs"]["shared"]}
+            new = [x for x in r2["runs"]["unit"] + r2["runs"]["shared"] if x.get("seed") is not None]
+            fresh = [x for x in new if x not in only_units["unit"]]
+            ok(r2["region"]["accepted"] > 0 and not ({x["seed"] for x in fresh} & seeds1),
+               "HM19a earlier unit runs without shared runs: the shared design is simulated first, and new runs "
+               "never reuse an earlier seed")
+            ok(all("rec" in x["obs"] for x in r2["runs"]["unit"]), "HM19b earlier runs keep their recorded values")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"HM19 continuation with shared targets: {type(e).__name__}: {e}")
+        bad = {"unit": [dict(r1["runs"]["unit"][0], obs={"x": True})], "shared": []}
+        try:
+            HistoryMatch(P, sim, 5, q, prior=bad, candidates_log2=8, points_per_unit=6)
+            ok(False, "HM19c a boolean observation in an earlier run is refused")
+        except CalibrationInputError:
+            ok(True, "HM19c a boolean observation in an earlier run is refused")
+    safe(hm19, "HM19")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

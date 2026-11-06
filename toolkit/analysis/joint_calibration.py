@@ -523,18 +523,65 @@ class Simulator:
                                                 f"provenance (e.g. {b['problems'][:2]})"])
             for k, n in enumerate(uix):
                 r = b["results"].get(jobs[k]["id"])
+                ref = f"call{self.calls}:{k}"
                 if r is None:
                     raise HM.CalibrationInputError([f"joint calibration batch: job {jobs[k]['id']} (unit "
                                                     f"{pts[n]['unit']}) did not complete"])
                 out[n] = {f"{w}.{m}": v for w, d in (r.get("windows") or {}).items() for m, v in d.items()}
+                out[n]["_ref"] = ref
 
 
 # --------------------------------------------------------------------------- the step
+def remap_windows(obs: dict, from_windows: dict, to_windows: dict) -> dict:
+    """Observations keyed by an earlier run's window names, renamed to the current names of the same window
+    endpoints (Codex r3 P1-2); a window the current problem does not have is dropped."""
+    to = {tuple(float(x) for x in v): k for k, v in to_windows.items()}
+    name = {k: to.get(tuple(float(x) for x in v)) for k, v in from_windows.items()}
+    out = {}
+    for key, v in obs.items():
+        w, _, m = key.partition(".")
+        if w in name and name[w] is not None:
+            out[f"{name[w]}.{m}"] = v
+        elif w not in from_windows:          # not a window observable (a benchmark): kept as it is
+            out[key] = v
+    return out
+
+
+def sim_signature(spec) -> dict:
+    """What a unit or benchmark run simulates, apart from its own point (Codex r3 P1-3): the engine and its code,
+    the horizon, the units' engine attributes, the comparator, the per-unit attribute and its scale, the held
+    parameter values. Two specs with different signatures cannot share runs."""
+    import hashlib
+    from toolkit.engines.contract import engine_identity
+    j = declared(spec) or {}
+    raw = spec.raw
+    sh = set(j.get("shared") or [])
+    units = {str(u[spec.uid]): spec.unit_attributes(u) for u in spec.units()}
+    blob = json.dumps(units, sort_keys=True, default=_jdefault).encode()
+    return {"engine": engine_identity(spec.engine()), "engine_ref": raw["engine"], "horizon": raw["horizon"],
+            "objective": {k: raw["objective"].get(k) for k in ("horizon", "delivery")},
+            "comparator": spec.engine_package(spec.packages()[spec.comparator]),
+            "attribute": raw["calibration"].get("attribute"), "scale": raw["calibration"].get("scale", "log"),
+            "held": {k: v for k, v in sorted(theta0(spec).items()) if k not in sh}, "shared": sorted(sh),
+            "units": hashlib.sha256(blob).hexdigest()}
+
+
+def check_same_simulator(a, b) -> None:
+    sa, sb = sim_signature(a), sim_signature(b)
+    diff = sorted(k for k in sa if sa[k] != sb.get(k))
+    if diff:
+        raise HM.CalibrationInputError([f"the second setting changes what the runs simulate ({diff}); its runs cannot "
+                                        "be reused"])
+
+
 def load_prior(spec, prior_dir, meta, log=print) -> tuple:
-    """Earlier runs of a diagnostic directory (the CLI's --out: runs.json, joint_calibration.yaml and the batch rows
-    under jc_rows/call*/results.jsonl), kept only where each run's batch job, rebuilt from the current spec with the
-    earlier windows, has the job_sha and engine identity its stored row's provenance records (fail closed: a run
-    that cannot be matched is dropped and counted). Earlier shared runs carry no batch provenance and are not reused."""
+    """Earlier unit runs from a diagnostic output directory (the CLI's --out: runs.json, joint_calibration.yaml and
+    jc_rows/call*/results.jsonl). A run is kept only when the batch job rebuilt from the current spec (with the
+    earlier windows) has a non-empty job_sha equal to its stored row's and the same engine identity; its
+    observations are then read from that authenticated row, renamed by window endpoints to the current names, and
+    never from runs.json (Codex r3 P1-1, P1-2). A run that carries its row reference is matched to that row; an
+    older run without one by its position in the calls. Earlier shared runs carry no batch provenance and are not
+    reused. Every run dropped is counted."""
     import glob
     import yaml
     from toolkit.analysis import batch as Bt
@@ -544,27 +591,44 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
     wins = (rep.get("adapter") or {}).get("windows")
     if not wins:
         raise HM.CalibrationInputError([f"{prior_dir}: the earlier report records no windows"])
-    calls = sorted(glob.glob(os.path.join(prior_dir, "jc_rows", "call*", "results.jsonl")),
-                   key=lambda p: int(os.path.basename(os.path.dirname(p))[4:]))
+    files = {int(os.path.basename(os.path.dirname(p))[4:]): p
+             for p in glob.glob(os.path.join(prior_dir, "jc_rows", "call*", "results.jsonl"))}
+    rows = {c: {r.get("i"): r for r in (json.loads(x) for x in open(f) if x.strip())} for c, f in files.items()}
     sim = Simulator(spec, prior_dir, meta)
     ident = engine_identity(spec.engine())
-    unit_runs, n, kept = runs.get("unit") or [], 0, []
-    for path in calls:          # the runs are the calls' jobs in order; each is kept only if its own row matches
-        if n >= len(unit_runs):
-            break
-        rows = sorted((json.loads(x) for x in open(path) if x.strip()), key=lambda r: r.get("i", 0))
-        for k, r in enumerate(rows):
-            if n >= len(unit_runs):
-                break
-            run_ = unit_runs[n]
-            n += 1
-            pv = ((r.get("result") or {}).get("provenance") or {})
+    P_, _ = build(spec, meta.get("units"))
+    need = set(P_.observables("unit"))
+    unit_runs, kept = runs.get("unit") or [], []
+    order = [(c, i) for c in sorted(rows) for i in sorted(k for k in rows[c] if isinstance(k, int))]
+    pos = 0
+    for run_ in unit_runs:
+        if run_.get("ref"):
+            c, _, k = str(run_["ref"]).partition(":")
             try:
-                sha = Bt.job_sha(sim.job(run_, k, windows=wins))
-            except (KeyError, TypeError, ValueError):
-                sha = None
-            if r.get("ok") and r.get("i") == k and pv.get("job_sha") == sha and pv.get("engine") == ident:
-                kept.append(run_)
+                c, k = int(c[4:]), int(k)
+            except ValueError:
+                continue
+        elif pos < len(order):
+            c, k = order[pos]
+            pos += 1
+        else:
+            continue
+        r = rows.get(c, {}).get(k)
+        if not r or not r.get("ok"):
+            continue
+        pv = ((r.get("result") or {}).get("provenance") or {})
+        try:
+            sha = Bt.job_sha(sim.job(run_, k, windows=wins))
+        except (KeyError, TypeError, ValueError):
+            continue                                    # Codex r3 P2-4: a job that cannot be rebuilt is dropped
+        if not (isinstance(pv.get("job_sha"), str) and pv["job_sha"] and pv["job_sha"] == sha
+                and pv.get("engine") == ident):
+            continue
+        res = (r.get("result") or {}).get("result") or {}
+        raw_obs = {f"{w}.{m}": v for w, d in (res.get("windows") or {}).items() for m, v in d.items()}
+        obs = remap_windows(raw_obs, wins, meta["windows"])
+        if need <= set(obs):                     # every observable the current problem emulates, from this row
+            kept.append(dict(run_, obs=obs))
     dropped = len(unit_runs) - len(kept)
     log(f"earlier runs: {len(kept)} unit runs reused (provenance matched), {dropped} not matched, "
         f"{len(runs.get('shared') or [])} shared runs not reused (no batch provenance)")
@@ -705,18 +769,23 @@ def main(argv=None) -> int:
     rc = 0 if not rep["blocked"] else 3
     if a.then_spec:     # a second setting on the same runs, in this process: every run of the first is its data
         spec2 = schema.load(os.path.join(rd, a.then_spec))
+        check_same_simulator(spec, spec2)
         P2, meta2 = build(spec2, units)
+        _, meta1 = build(spec, units)
+        first = {"unit": [dict(x, obs=remap_windows(x["obs"], meta1["windows"], meta2["windows"]))
+                          for x in rep["runs"]["unit"]], "shared": rep["runs"]["shared"]}
         j2 = declared(spec2)
         sim2 = Simulator(spec2, rd, meta2, kw, say)
         sim2.calls = 1000            # its batch files apart from the first setting's
-        rep2 = HM.calibrate(P2, sim2, seed=int(j2.get("seed", 0)), waves=a.then_waves, log=say, prior=rep["runs"],
+        rep2 = HM.calibrate(P2, sim2, seed=int(j2.get("seed", 0)), waves=a.then_waves, log=say, prior=first,
                             record=meta2["record"], **{k: j2[k] for k in ("points_per_unit", "shared_points") if k in j2})
         rep2["adapter"] = {"windows": meta2["windows"], "dropped_targets": meta2["dropped"], "units": len(meta2["units"]),
                            "shared": list(j2["shared"]), "simulator_calls": sim2.calls - 1000,
                            "theta_held": {k: v for k, v in sim2.th0.items() if k not in j2["shared"]}}
         rep2["prior_runs"] = {"reused": len(rep["runs"]["unit"]), "shared_reused": len(rep["runs"]["shared"]),
                               "from": "the first setting, same process"}
-        _write_out(rep2, rd, a.then_out)
+        _write_out(rep2, rd, a.then_out or os.path.join(rd, OUT_REL + "_second"))
+        rc = max(rc, 0 if not rep2["blocked"] else 3)        # Codex r3 P2-10
     return rc
 
 
@@ -732,6 +801,11 @@ def _write_out(rep, rd, out_arg):
                               yaml.safe_dump(HM_plain(artifact(rep)), sort_keys=False).encode(), atomic=True)
     _safe_io().write_nofollow(froot, os.path.relpath(os.path.join(out, "runs.json"), froot),
                               json.dumps(HM_plain(rep.get("runs") or {})).encode(), atomic=True)
+    import glob       # the batch rows the runs reference (Codex r3 P2-6): this directory is a valid --prior source
+    for f in glob.glob(os.path.join(rd, OUT_REL, "call*", "results.jsonl")):
+        rel = os.path.join("jc_rows", os.path.basename(os.path.dirname(f)), "results.jsonl")
+        _safe_io().write_nofollow(froot, os.path.relpath(os.path.join(out, rel), froot), open(f, "rb").read(),
+                                  atomic=True)
     print(summary(rep), flush=True)
 
 
@@ -960,6 +1034,44 @@ def _self_test() -> int:
                 ok(rep2["prior_runs"]["reused"] == info2["reused"] and rep2["waves"][0].get("prior_runs"),
                    "JA8d a calibration from earlier runs alone (no new wave)")
     safe(ja8, "JA8")
+
+    def ja9():           # Codex r3 P1-1/P1-2/P1-3, P2-4/P2-6/P2-10
+        import yaml
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as o1:
+            p = _toy_joint(d, group=False)
+            spec = schema.load(p)
+            rep = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            _write_out(rep, d, o1)
+            P, meta = build(spec)
+            pr, info = load_prior(spec, o1, meta, log=q)
+            ok(info["reused"] == len(rep["runs"]["unit"]),
+               f"JA9a the CLI's own output directory is a valid earlier-runs source ({info})")
+            runs = json.load(open(os.path.join(o1, "runs.json")))
+            true_v = runs["unit"][2]["obs"]["jc0.prev"]
+            runs["unit"][2]["obs"]["jc0.prev"] = 0.999
+            runs["unit"][4]["seed"] = None
+            json.dump(runs, open(os.path.join(o1, "runs.json"), "w"))
+            pr2, info2 = load_prior(spec, o1, meta, log=q)
+            vals = [r["obs"]["jc0.prev"] for r in pr2["unit"]]
+            ok(0.999 not in vals and true_v in vals and info2["unmatched"] >= 1,
+               "JA9b observations come from the authenticated batch rows, never from runs.json; a run whose job "
+               "cannot be rebuilt is dropped")
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["targets"][0]["window"] = [0.5, 2.5]       # the same name, another window
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec2 = schema.load(p)
+            P2, meta2 = build(spec2)
+            pr3, info3 = load_prior(spec2, o1, meta2, log=q)
+            ok(info3["reused"] == 0, f"JA9c earlier values of another window are never read as this window's ({info3})")
+            raw["calibration"]["joint"]["targets"][0]["window"] = [1, 2]
+            raw["calibration"]["scale"] = "log" if raw["calibration"].get("scale") == "linear" else "linear"
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            try:
+                check_same_simulator(spec, schema.load(p))
+                ok(False, "JA9d a second setting that changes what the runs simulate is refused")
+            except HM.CalibrationInputError:
+                ok(True, "JA9d a second setting that changes what the runs simulate is refused")
+    safe(ja9, "JA9")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

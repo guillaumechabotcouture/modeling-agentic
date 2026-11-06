@@ -342,20 +342,24 @@ def fig_residuals(fd, t, labels=None):
         ax.axhline(0, color=t["ink2"], lw=0.8)
         ax.scatter(x[~bad], res[~bad], s=9, color=t["cat"][0], lw=0)
         ax.scatter(x[bad], res[bad], s=14, color=t["cat"][1], lw=0)
-        if len(x) >= 3:
-            b = np.polyfit(x, res, 1)
-            xx = np.linspace(x.min(), x.max(), 2)
+        fin = np.isfinite(x) & np.isfinite(res)
+        if fin.sum() >= 3 and np.std(x[fin]) > 0:        # Codex r3 P2-12: a slope only where it is defined
+            b = np.polyfit(x[fin], res[fin], 1)
+            xx = np.linspace(x[fin].min(), x[fin].max(), 2)
             ax.plot(xx, b[1] + b[0] * xx, color=t["ink2"], lw=1, ls="--")
-            ax.set_title(f"{_lab(labels, k)}: slope {b[0]:.2f} (0 = no compression)", fontsize=8, color=t["ink"])
+            ax.set_title(f"{_lab(labels, k)}: trend {b[0]:.2f}", fontsize=8, color=t["ink"])
+        else:
+            ax.set_title(_lab(labels, k), fontsize=8, color=t["ink"])
         ax.set_xlabel("observed", fontsize=8)
         ax.set_ylabel("observed minus modelled", fontsize=8)
         FS.set_axis_format(ax, "x")
         FS.set_axis_format(ax, "y")
         out += [{"target": r["target"], "observed": float(a), "modelled": float(c), "residual": float(a - c),
                  "status": r["status"]} for r, a, c in zip(g, x, m)]
-    title = "Residuals against observed values: a rising trend means the model compresses the range"
+    title = "Residuals against observed values"
     cap = ("Per target: observed minus modelled (the engine at the best point where verified, else the region's median) "
-           "against the observed value; dashed: least-squares line. Orange: not matched.")
+           "against the observed value; dashed: least-squares trend. Observation error alone gives a positive trend, "
+           "so read it beside the matched share. Orange: not matched.")
     return fig, title, cap, out
 
 
@@ -438,8 +442,9 @@ def fig_bound_share(fd, t, labels=None):
     na, nb = int(np.sum(tr["at_top"])), int(np.sum(tr["touches_top"]))
     top = tr["unit_param"]["hi"]
     return fig, f"Units at the top of the transmission range ({top:g}): {na} best values, {nb} intervals", (
-        "Per group: the share of units whose best value of their own parameter is the range's top, and whose compatible "
-        "interval reaches it. Many units there mean the declared range, not the data, ends the region."), rows
+        "Per group: the share of units whose best value of their own parameter is the range's top, and whose interval "
+        "compatible with its own targets reaches it (group targets not applied). Many units there mean the declared "
+        "range, not the data, ends the region."), rows
 
 
 def fig_waves(fd, t, labels=None):
@@ -494,6 +499,10 @@ def render(fd, dest: str, root: str, labels=None, theme: str = "light", sources=
         except NoData as e:
             notp.append({"figure": name, "reason": str(e), "tier": TIER})
             continue
+        except Exception as e:  # noqa: BLE001 -- Codex r3 P2-12: one figure's failure is its own, recorded
+            notp.append({"figure": name, "reason": f"{type(e).__name__}: {e}", "tier": TIER})
+            plt.close("all")
+            continue
         FS.title(fig, title, t)
         from toolkit.analysis.figures import _fig_bytes     # the figures' one in-memory renderer (write_audit)
         png = _fig_bytes(fig, "png", dpi=FS.DPI)
@@ -538,6 +547,10 @@ def _self_test() -> int:
         res2 = render(fd2, os.path.join(d, "f2"), d)
         ok(len(res2["not_produced"]) >= 3 and all(x["reason"] for x in res2["not_produced"]),
            "CF4 with an empty region a figure is listed as not produced, with why (fail closed)")
+        fd3 = dict(fd, fit=[dict(r, observed=0.2) for r in fd["fit"]])
+        res3 = render(fd3, os.path.join(d, "f3"), d)
+        ok("calibration_residuals" in {f["figure"] for f in res3["figures"]},
+           "CF5 residuals with constant observed values draw without a trend, never fail the figure set")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
