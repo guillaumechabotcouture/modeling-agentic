@@ -396,7 +396,76 @@ def validate(s, eng) -> list[str]:
     if extra:
         bad.append(f"engine.config: keys {extra} are not declared by dynamics (e.g. results_path): remove them")
     bad += dynamics_problems(s.raw, eng)
+    if not bad:
+        bad += prior_support_problems(s, eng)
     return bad
+
+
+MAX_PROBE_CORNERS = 64
+
+
+def support_ends(prior) -> list:
+    """A prior's physical support ends (a beta prior: 0 and 1, not its central interval)."""
+    return [0.0, 1.0] if prior.dist == "beta" else [float(prior.lo), float(prior.hi)]
+
+
+def probe_corners(ends, cap: int = MAX_PROBE_CORNERS) -> tuple:
+    """(corners, info): every corner of the box when there are at most `cap`, else `cap` corners drawn by index
+    (seeded) and decoded bit by bit, so 2^n tuples are never built. info: {total, probed, sampled}."""
+    import random
+    d = len(ends)
+    total = 2 ** d
+    if total <= cap:
+        idx = list(range(total))
+    else:                       # distinct random indices of d bits each (no range of 2^d: it overflows at d >= 63)
+        rng, seen = random.Random(0), set()
+        while len(seen) < cap:
+            seen.add(rng.getrandbits(d))
+        idx = sorted(seen)
+    corners = [tuple(ends[j][(i >> j) & 1] for j in range(d)) for i in idx]
+    return corners, {"total": total, "probed": len(corners), "sampled": total > cap}
+
+
+def prior_support_problems(s, eng) -> list[str]:
+    """The engine accepts the corners of the box the calibration priors span, at each prior's physical support ends
+    (c1 run: s0 on [0, 1] with seed up to 1e-3 holds points where seed > s0, which the engine refuses, and the
+    posterior would have been truncated). Each corner is one engine run with the unit's bound attributes; a refusal
+    is reported with the engine's reason and the bound attributes it involves, before sign-off. This catches
+    constraints an engine imposes along the box's edges (such as seed <= s0, which is affine); it does not certify an
+    arbitrary interior domain, and above MAX_PROBE_CORNERS corners it samples them. The analysis keeps its runtime
+    refusal guards either way. Observation parameters do not reach the engine and are not probed."""
+    from toolkit.analysis.calibration import Prior
+    from toolkit.engines.contract import Horizon, Package, UnitSpec
+    card = eng.describe()
+    pnames = {p.name for p in eng.parameters()}
+    pri = (s.raw.get("calibration") or {}).get("priors") or {}
+    names = [n for n in pri if n in pnames or n in card.unit_attributes]
+    if not names:
+        return []
+    corners, info = probe_corners([support_ends(Prior.from_decl(n, pri[n])) for n in names])
+    h = s.raw["horizon"]
+    wins = {k: tuple(float(x) for x in v) for k, v in ((s.raw.get("deliverable") or {}).get("windows") or {}).items()}
+    hz = Horizon(float(h["start"]), float(h["stop"]), (float(h["start"]), float(h["stop"])), wins)
+    base = s.unit_attributes(s.units()[0])
+    bound = {k: v for k, v in base.items() if k not in names}
+    fmt = lambda d: ", ".join(f"{k}={v:.3g}" if isinstance(v, (int, float)) else f"{k}={v}"  # noqa: E731
+                              for k, v in d.items())
+    out = []
+    for c in corners:
+        vals = dict(zip(names, c))
+        params = {k: float(v) for k, v in vals.items() if k in pnames}
+        unit = UnitSpec("probe", dict(base, **{k: float(v) for k, v in vals.items() if k not in pnames}))
+        try:
+            eng.run_batch([params], [unit], [Package("none", {})], hz, 1)
+        except (ValueError, RuntimeError) as e:
+            where = (f"; with the attributes bound to data or accepted defaults {fmt(bound)}: correct the binding or "
+                     "the prior ranges") if bound else "; narrow the prior ranges to values the engine accepts"
+            out.append(f"prior_support_infeasible: calibration.priors: the engine refuses the corner {fmt(vals)} of "
+                       f"the declared prior box ({e}){where}"
+                       + (f" ({info['probed']} of {info['total']} corners probed)" if info["sampled"] else ""))
+            if len(out) >= 3:
+                break
+    return out
 
 
 def dynamics_problems(raw: dict, eng) -> list[str]:
@@ -577,6 +646,54 @@ def _self_test() -> int:
             "ES23 (Codex r2-7) a target source whose latent quantity is not incidence is refused")
         mut(lambda r: r["engine"]["config"].update(results_path="/tmp/forged.yaml"), "results_path",
             "ES24 (Codex r2-2) an engine configuration key that dynamics does not declare (results_path) is refused")
+
+        def c1_priors(r):        # the priors of run 2026-11-06_012422 (c1), which failed at ANALYZE
+            r["decision_units"].pop("defaults_accepted", None)
+            r["calibration"]["priors"].update(
+                r0={"dist": "uniform", "range": [1.3, 5.0], "source": "c1"},
+                s0={"dist": "uniform", "range": [0.0, 1.0], "source": "c1"},
+                seed={"dist": "loguniform", "range": [6.7e-07, 0.001], "source": "c1"})
+        mut(c1_priors, "prior_support_infeasible",
+            "ES25 (c1 run) a prior box with points the engine refuses (seed above s0 near s0 = 0) is refused before "
+            "sign-off, naming the engine's reason")
+
+        def c1_fixed(r):
+            c1_priors(r)
+            r["calibration"]["priors"]["s0"]["range"] = [0.05, 1.0]
+        raw = copy.deepcopy(yaml.safe_load(open(sp)))
+        c1_fixed(raw)
+        keep = open(sp).read()
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        e = schema.validate(schema.load(sp))
+        open(sp, "w").write(keep)
+        ok(e == [], f"ES25b the same priors with s0 from 0.05 (above the seed's upper end) validate: {e[:2]}")
+        # ---- Codex review of the fix, round 1
+        def beta_s0(r):
+            r["decision_units"].pop("defaults_accepted", None)
+            r["calibration"]["priors"].update(s0={"dist": "beta", "a": 1.0, "b": 1.0, "source": "x"},
+                                              seed={"dist": "loguniform", "range": [1e-4, 5e-3], "source": "x"})
+        mut(beta_s0, "prior_support_infeasible",
+            "ES26 (Codex fix-r1 P1-2) a beta prior is probed at its support ends (0, 1), not its central 98%")
+
+        def bound_s0(r):
+            r["decision_units"].pop("defaults_accepted", None)
+            r["decision_units"]["engine_attributes"]["s0"] = {"value": 1e-4, "source": "x"}
+            r["calibration"]["priors"]["seed"] = {"dist": "loguniform", "range": [1e-5, 1e-3], "source": "x"}
+        mut(bound_s0, "bound to data", "ES27 (Codex fix-r1 P3-6) a refusal that involves a data-bound attribute "
+                                       "names it and its value")
+        cs, info = probe_corners([[0.0, 1.0]] * 25, 64)
+        ok(len(cs) == 64 and info["sampled"] and info["total"] == 2 ** 25,
+           f"ES28 (Codex fix-r1 P2-3/4) 25 priors: 64 corners sampled without building all 2^25, and the sampling "
+           f"is disclosed ({len(cs)}, {info})")
+        try:
+            cs, info = probe_corners([[0.0, 1.0]] * 70, 64)
+            ok(len(set(cs)) == 64 and info["total"] == 2 ** 70,
+               "ES28c (Codex fix-r2 P2-2) 70 priors: 64 distinct corners, no overflow")
+        except OverflowError as e:
+            ok(False, f"ES28c (Codex fix-r2 P2-2) 70 priors: 64 distinct corners, no overflow ({e})")
+        cs, info = probe_corners([[0.0, 1.0], [2.0, 3.0]], 64)
+        ok(sorted(cs) == [(0.0, 2.0), (0.0, 3.0), (1.0, 2.0), (1.0, 3.0)] and not info["sampled"],
+           f"ES28b up to the cap every corner is probed: {cs}")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))
