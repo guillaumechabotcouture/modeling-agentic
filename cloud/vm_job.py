@@ -47,11 +47,13 @@ plain directory), with secrets (`--anthropic-key`) in its environment only.
 A command that runs main.py must state its pipeline (`--v2` or `--v1`; refused otherwise, before
 anything is created: main.py's default changed once, 2026-11-05). The job's environment names
 its launcher (MA_LAUNCHER=vm_job:<name>/<job_id>, recorded in the run's metadata.json), and
-`start`/`run` write a launch record in the eval grader's format: <out>/<name>/assignments.json
-(keyed by job id: launch_id, pipeline, commit, eval_inputs_sha256) and <out>/<name>/<job_id>/result.json
-(launch_id). A main.py job that copies its run to $JOB_OUT/runs/ is then graded with
-`scripts/eval_suite.py grade <q> <out>/<name>/<job_id>/runs/<run>` with its input hashes checked.
-A wrapper script that calls main.py is not seen: name the pipeline inside it. `--setup-sdk`
+`start`/`run` write a launch record in the eval grader's format (launch_id, pipeline, commit as
+stamped in the archive, eval_inputs_sha256): <out>/<name>/<job_id>/assignments.json and
+<out>/<name>/<job_id>/out/result.json, plus <out>/<name>/assignments.json listing every job. A
+main.py job that copies its run to $JOB_OUT/runs/ is then graded with
+`scripts/eval_suite.py grade <q> <out>/<name>/<job_id>/out/runs/<run>` with its input hashes
+checked. A relaunch of a job id sets the earlier out/ aside. A wrapper script that calls main.py
+is not seen: name the pipeline inside it. A shell comment in a main.py command is refused. `--setup-sdk`
 installs the pinned claude-agent-sdk from the tree's requirements.txt first (the useful part
 of keep/coiled_run/dev_vm.py, which this replaces).
 
@@ -175,42 +177,52 @@ def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
     return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
 
 
+def _write_json(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    json.dump(obj, open(tmp, "w"), indent=1)
+    os.replace(tmp, path)
+
+
 def write_launch_record(dest: str, job_id: str, code: bytes | None, pipeline: str | None, commit: str,
                         name: str) -> dict:
-    """The job's launch record, in the format cloud/run_cluster.py writes and scripts/eval_suite.py
-    grades: <dest>/../assignments.json[job_id] and <dest>/result.json, sharing one launch_id."""
+    """The job's launch record. Polls save $JOB_OUT under <dest>/out/, so a run lands at
+    <dest>/out/runs/<run> and the grader's label dir (scripts/eval_suite.py launch_record_for) is
+    <dest>/out: the record goes to <dest>/assignments.json["out"] and <dest>/out/result.json, the
+    format cloud/run_cluster.py writes. <out>/<name>/assignments.json lists every job of <name>.
+    An earlier attempt of this job id never passes for this one (Codex r1, r2): its out/ is set
+    aside and the poll index reset."""
     import secrets
     rec = {"launch_id": f"{job_id}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}", "job_id": job_id,
-           "commit": commit,
-           "pipeline": pipeline or "none", "launcher": f"vm_job:{name}/{job_id}", "submitted": time.strftime("%F %T"),
-           "eval_inputs_sha256": eval_paths.archive_sha256(code) if code else {}}
+           "commit": commit, "pipeline": pipeline or "none", "launcher": f"vm_job:{name}/{job_id}",
+           "submitted": time.strftime("%F %T"), "eval_inputs_sha256": eval_paths.archive_sha256(code) if code else {}}
     os.makedirs(dest, exist_ok=True)
-    # An earlier attempt of this job id must not pass for this launch's run (Codex r1): set its runs/
-    # aside and reset the poll index, so only this attempt's outputs appear under runs/.
-    if os.path.exists(os.path.join(dest, "runs")):
-        os.rename(os.path.join(dest, "runs"), os.path.join(dest, f"runs.before_{rec['launch_id']}"))
+    out = os.path.join(dest, "out")
+    if os.path.exists(out):
+        os.rename(out, os.path.join(dest, f"out.before_{rec['launch_id']}"))
     if os.path.exists(os.path.join(dest, ".manifest.json")):
         os.remove(os.path.join(dest, ".manifest.json"))
-    ap = os.path.join(os.path.dirname(dest), "assignments.json")
+    os.makedirs(out)
+    _write_json(os.path.join(dest, "assignments.json"), {"out": rec})
+    _write_json(os.path.join(out, "result.json"), {"launch_id": rec["launch_id"], "job_id": job_id,
+                                                   "pipeline": rec["pipeline"], "commit": commit})
+    every = os.path.join(os.path.dirname(dest), "assignments.json")
     try:
-        a = json.load(open(ap))
+        allj = json.load(open(every))
     except (OSError, ValueError):
-        a = {}
-    a = a if isinstance(a, dict) else {}
-    a[job_id] = rec
-    for path, obj in ((ap, a), (os.path.join(dest, "result.json"),
-                                {"launch_id": rec["launch_id"], "job_id": job_id, "pipeline": rec["pipeline"],
-                                 "commit": commit})):
-        tmp = path + ".tmp"
-        json.dump(obj, open(tmp, "w"), indent=1)
-        os.replace(tmp, path)
+        allj = {}
+    allj = allj if isinstance(allj, dict) else {}
+    allj[job_id] = rec
+    _write_json(every, allj)
     return rec
 
 
 def _launch_commit(code: bytes | None, tree: str | None, src_dir: str | None) -> str:
     """The commit of the code that ships: git archive's stamp inside the archive (so a checkout
     that moves on while the VM starts does not change it), else the tree or directory's."""
-    return (rc.archive_commit(code) if code else None) or _code_commit(tree, src_dir)
+    stamped = rc.archive_commit(code) if code else None
+    if stamped or not tree:
+        return stamped or pipeline_id.UNKNOWN       # a --dir archive is no commit: unknown, never the live HEAD
+    return _code_commit(tree, None)
 
 
 def _code_commit(tree: str | None, src_dir: str | None) -> str:

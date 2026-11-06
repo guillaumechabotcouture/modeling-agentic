@@ -80,7 +80,7 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> \
 
 - A command that runs `main.py` must name its pipeline (`--v2` or `--v1`);
   `vm_job.py` refuses it otherwise, before anything is created. The job
-  writes a launch record (`<out>/<name>/assignments.json`) that the eval
+  writes a launch record (`<out>/<name>/<job_id>/assignments.json`) that the eval
   grader reads.
 - `--store` is required: success means every output is verified in
   storage. Otherwise it exits non-zero with the reason (state, exit code,

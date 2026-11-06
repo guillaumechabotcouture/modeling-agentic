@@ -3074,7 +3074,8 @@ def main() -> int:
     print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
     if args.resume:   # a run continues under the pipeline it was recorded with
         _rp = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
-        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp)
+        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp,
+                                          explicit_flag=bool(args.v1 or args.v2))
         if why:
             print(f"Error: {why}", file=sys.stderr)
             return 1

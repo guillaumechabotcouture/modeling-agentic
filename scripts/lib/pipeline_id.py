@@ -75,20 +75,33 @@ _OPS = {";", "&&", "||", "|", "&", "\n", "(", ")", "<", ">", ">>", "<<", ";;", "
 
 def _split_commands(cmd) -> list[list[str]]:
     """A command as its simple commands (argv lists). An argv list is one command. A shell string
-    is split on shell operators, attached or not, and on newlines (shlex in punctuation mode)."""
+    is split on control operators (attached or not) and newlines; a continued line (backslash,
+    newline) joins; a redirection and its target are dropped, not a boundary. A shell comment
+    raises PipelineError: what follows `#` is not an argument, so a flag there must not count."""
     if not isinstance(cmd, str):
         return [[str(t) for t in cmd or ()]]
-    lex = shlex.shlex(cmd.replace("\r", "\n"), posix=True, punctuation_chars=";&|()<>\n")
+    text = cmd.replace("\r", "\n").replace("\\\n", " ")
+    lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t"                 # a newline is a command boundary, not a space
     lex.whitespace_split = True
     lex.commenters = ""
-    out, cur = [], []
+    out, cur, skip = [], [], False
     for t in lex:
-        if t in _OPS or (t and set(t) <= set(";&|()<>\n")):
+        if skip:                            # a redirection's target
+            skip = False
+            continue
+        punct = bool(t) and set(t) <= set(";&|()<>\n")
+        if punct and ("<" in t or ">" in t):
+            skip = True                     # >, >>, <, >&, &>: the next word is its target
+            continue
+        if t in _OPS or punct:
             if cur:
                 out.append(cur)
             cur = []
             continue
+        if t.startswith("#"):
+            raise PipelineError("the command holds a shell comment: write main.py's flags before any `#`, "
+                                "or drop the comment")
         cur.append(t)
     if cur:
         out.append(cur)
@@ -193,10 +206,11 @@ def stamp(run_path: str, ident: dict, now: str | None = None) -> dict:
     return meta
 
 
-def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None) -> str | None:
+def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, explicit_flag: bool = True) -> str | None:
     """Why a run may not be resumed under `pipeline`, or None. A recorded pipeline must match; a
-    malformed one is refused. With none recorded (runs from before 2026-11-05) the run's files
-    decide: run_state.json is the v2 machine's, so such a run is v2's; a run without it is v1's."""
+    malformed one is refused. A run that records none (from before 2026-11-05) is never resumed on
+    the default: the operator names the pipeline (`explicit_flag`), and the run's files must agree
+    (run_state.json is the v2 machine's). Its invocation then records pipeline_before: unknown."""
     meta = meta if isinstance(meta, dict) else {}
     if "pipeline" in meta:
         rec = meta.get("pipeline")
@@ -205,12 +219,14 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None) -> s
         if rec != pipeline:
             return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
         return None
+    if not explicit_flag:
+        return "this run records no pipeline: resume it with an explicit --v1 or --v2"
     if run_path is None:
         return None
     by_files = "v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1"
     if by_files != pipeline:
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s "
-                f"({'has' if by_files == 'v2' else 'no'} run_state.json); resume it with --{by_files}")
+                f"({'has' if by_files == 'v2' else 'no'} run_state.json): it cannot be resumed with --{pipeline}")
     return None
 
 
