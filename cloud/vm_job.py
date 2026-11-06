@@ -42,7 +42,16 @@ poll copies new or changed files (and the log) to <out>/<name>/<job_id>/, so a V
 stops for any other reason loses at most one poll interval of outputs.
 
 The job's command runs in the shipped tree (`--tree`: git archive of HEAD; `--dir`: a
-plain directory), with secrets (`--anthropic-key`) in its environment only. `--setup-sdk`
+plain directory), with secrets (`--anthropic-key`) in its environment only.
+
+A command that runs main.py must state its pipeline (`--v2` or `--v1`; refused otherwise, before
+anything is created: main.py's default changed once, 2026-11-05). The job's environment names
+its launcher (MA_LAUNCHER=vm_job:<name>/<job_id>, recorded in the run's metadata.json), and
+`start`/`run` write a launch record in the eval grader's format: <out>/<name>/assignments.json
+(keyed by job id: launch_id, pipeline, commit, eval_inputs_sha256) and <out>/<name>/<job_id>/result.json
+(launch_id). A main.py job that copies its run to $JOB_OUT/runs/ is then graded with
+`scripts/eval_suite.py grade <q> <out>/<name>/<job_id>/runs/<run>` with its input hashes checked.
+A wrapper script that calls main.py is not seen: name the pipeline inside it. `--setup-sdk`
 installs the pinned claude-agent-sdk from the tree's requirements.txt first (the useful part
 of keep/coiled_run/dev_vm.py, which this replaces).
 
@@ -91,6 +100,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import run_cluster as rc  # noqa: E402
 import worker_side as ws  # noqa: E402
+import eval_paths  # noqa: E402  (scripts/lib, on the path through run_cluster)
+import pipeline_id  # noqa: E402
 
 OUT = os.path.expanduser("~/modeling-agentic-keep/vm_jobs")
 CHUNK = 8 * 2**20
@@ -145,6 +156,56 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
     json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
     st["fetched"] = got
     return st
+
+
+def job_pipeline(cmd) -> str | None:
+    """The pipeline a main.py command states, None for a command that runs no main.py; refuses a
+    main.py command that relies on main.py's default. A one-element command is a shell string
+    (as `start` runs it)."""
+    if isinstance(cmd, (list, tuple)) and len(cmd) == 1:
+        cmd = cmd[0]
+    try:
+        return pipeline_id.from_command(cmd)
+    except pipeline_id.PipelineError as e:
+        raise SystemExit(f"{e} (add --v2 or --v1 to main.py's arguments): refusing") from None
+
+
+def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
+    """The job's extra environment: its secrets, and its launcher's name for main.py's metadata.json."""
+    return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
+
+
+def write_launch_record(dest: str, job_id: str, code: bytes | None, pipeline: str | None, commit: str,
+                        name: str) -> dict:
+    """The job's launch record, in the format cloud/run_cluster.py writes and scripts/eval_suite.py
+    grades: <dest>/../assignments.json[job_id] and <dest>/result.json, sharing one launch_id."""
+    rec = {"launch_id": f"{job_id}-{time.strftime('%Y%m%d-%H%M%S')}", "job_id": job_id, "commit": commit,
+           "pipeline": pipeline or "none", "launcher": f"vm_job:{name}/{job_id}", "submitted": time.strftime("%F %T"),
+           "eval_inputs_sha256": eval_paths.archive_sha256(code) if code else {}}
+    os.makedirs(dest, exist_ok=True)
+    ap = os.path.join(os.path.dirname(dest), "assignments.json")
+    try:
+        a = json.load(open(ap))
+    except (OSError, ValueError):
+        a = {}
+    a = a if isinstance(a, dict) else {}
+    a[job_id] = rec
+    for path, obj in ((ap, a), (os.path.join(dest, "result.json"),
+                                {"launch_id": rec["launch_id"], "job_id": job_id, "pipeline": rec["pipeline"],
+                                 "commit": commit})):
+        tmp = path + ".tmp"
+        json.dump(obj, open(tmp, "w"), indent=1)
+        os.replace(tmp, path)
+    return rec
+
+
+def _code_commit(tree: str | None, src_dir: str | None) -> str:
+    if tree:
+        try:
+            return subprocess.check_output(["git", "-C", tree, "rev-parse", "--short=7", "HEAD"], text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return pipeline_id.UNKNOWN
+    return pipeline_id.code_commit(src_dir) if src_dir else pipeline_id.UNKNOWN
 
 
 def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
@@ -280,8 +341,11 @@ def cmd_start(a, cluster=None):
     cmd = a.command
     if not cmd:
         raise SystemExit("no command given (put it after --)")
+    pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
-    secrets = {"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None
+    base = getattr(a, "base_name", a.name)
+    secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
+                      base, a.job_id)
     c, w = _client(a.name, cluster)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
@@ -296,14 +360,18 @@ def cmd_start(a, cluster=None):
     fire_and_forget(fut)
     dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
+    lrec = write_launch_record(dest, a.job_id, code, pipeline, _code_commit(a.tree, a.dir), base)
     json.dump({"name": getattr(a, "base_name", a.name), "cluster": a.name,
                "cluster_id": getattr(cluster, "cluster_id", None) if cluster is not None else None,
                "worker": w, "job_id": a.job_id, "cmd": cmd, "submitted": time.strftime("%F %T"),
                "max_hours": a.max_hours, "cluster_compute": a.cluster_compute, "store": store,
-               "shutdown_when_stored": a.shutdown_when_stored}, open(os.path.join(dest, "job.json"), "w"), indent=1)
+               "shutdown_when_stored": a.shutdown_when_stored, "pipeline": lrec["pipeline"],
+               "commit": lrec["commit"], "launch_id": lrec["launch_id"]},
+              open(os.path.join(dest, "job.json"), "w"), indent=1)
     tail = (f"; outputs go to {store['prefix']}/ and the cluster stops itself once they are verified there"
             if a.shutdown_when_stored else "")
-    print(f"started {a.job_id} on {a.name} ({w}); outputs -> {dest}{tail}")
+    print(f"started {a.job_id} on {a.name} ({w}); pipeline {lrec['pipeline']} @ {lrec['commit']}; "
+          f"outputs -> {dest}{tail}")
 
 
 def _print(st, dest):
@@ -471,6 +539,7 @@ def cmd_run(a):
 
 def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
+    job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
@@ -653,8 +722,9 @@ def _self_test_pipeline(ok) -> None:
             ok(False, f"VP1 a main.py command relying on the default pipeline is refused: {cmd}")
         except SystemExit as e:
             ok("--v1 or --v2" in str(e), f"VP1 a main.py command relying on the default pipeline is refused: {e}")
-    ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None,
-       "VP2 an explicit main.py command gives its pipeline; other commands have none")
+    ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
+       and jp(["python3 main.py 'Q?' --v1"]) == "v1",
+       "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
     src = inspect.getsource(_run_locked)
     ok("job_pipeline(" in src and src.index("job_pipeline(") < src.index("_create("),
        "VP3 run refuses an undeclared pipeline before it creates a cluster")
