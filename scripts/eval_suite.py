@@ -1466,7 +1466,7 @@ def _self_test(with_private=False, private_dir=None) -> int:
         for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
                          ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
                          ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
-                         ("S18", _test_s18_incomplete_bundle)):
+                         ("S18", _test_s18_incomplete_bundle), ("S19", _test_s19_pipeline)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -1493,6 +1493,67 @@ def _self_test(with_private=False, private_dir=None) -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _test_s19_pipeline(ok, td):
+    """2026-11-05: eval scores from the standard launcher were v1 scores, and nothing in a score
+    said so. Every score names its pipeline and commit ("unknown" for old runs, never assumed), a
+    run whose recorded pipeline is not the launch's is refused, and `report` does not compare
+    score files from different (or unknown) pipelines without --allow-mixed-pipelines."""
+    rubric, truth = _toy()
+    old, new = os.path.join(td, "old"), os.path.join(td, "new")
+    build_fixture(old, rubric, truth, "perfect")
+    build_fixture(new, rubric, truth, "perfect")
+    mp = os.path.join(new, "metadata.json")
+    json.dump(dict(json.load(open(mp)), pipeline="v2", commit="abc1234def", launcher="run_cluster:ev-x"), open(mp, "w"))
+    po, pn = extract_process(old), extract_process(new)
+    ok(po.get("pipeline") == "unknown" and po.get("commit") == "unknown", f"S19a an old run reads unknown: {po}")
+    ok(pn.get("pipeline") == "v2" and pn.get("commit") == "abc1234def", f"S19b a new run's identity is read: {pn}")
+    s = score(extract_answer(new, rubric, truth), rubric, truth, "alpha beta", "", [], None)
+    ok(s.get("pipeline") == "v2" and s.get("commit") == "abc1234def", f"S19c a score names pipeline and commit: {s.get('pipeline')}")
+    ip = globals().get("identity_problem")
+    ok(ip is not None, "S19d the grader checks the run's identity against its launch record")
+    if ip:
+        ok(ip(pn, {"pipeline": "v2", "commit": "abc1234"}) is None, "S19d a run matching its launch passes")
+        ok(ip(pn, {"pipeline": "v1", "commit": "abc1234"})[0] == "pipeline_mismatch",
+           "S19e a run whose pipeline is not the launch's is refused")
+        ok(ip(pn, {"pipeline": "v2", "commit": "fff0000"})[0] == "commit_mismatch",
+           "S19f a run whose commit is not the launch's is refused")
+        ok(ip(po, {"pipeline": "v2", "commit": "abc1234"})[0] == "pipeline_unrecorded",
+           "S19g a launch that names a pipeline with a run that records none is refused (fail closed)")
+        ok(ip(po, None) is None and ip(po, {"launch_id": "L"}) is None,
+           "S19h with no launch identity (old launches) nothing is refused; the score reads unknown")
+        import inspect
+        ok("identity_problem(" in inspect.getsource(grade_run), "S19i grade_run applies the identity check")
+    row = lambda q, p, c: {"run_dir": "r", "quality": q, "quality_gated": q, "gate_action": "ACCEPT",  # noqa: E731
+                           "status": "completed", "rounds": 2, "cost_usd": 20, "wall_hours": 1.0,
+                           "primary_layer": None, "failures": [], "pipeline": p, "commit": c}
+    a = {"questions": {"toy": [row(0.5, "v1", "aaa1111")]}}
+    b = {"questions": {"toy": [row(0.8, "v2", "bbb2222")]}}
+    b2 = {"questions": {"toy": [row(0.8, "v2", "ccc3333")]}}
+    a2 = {"questions": {"toy": [row(0.6, "v2", "aaa1111")]}}
+    unk = {"questions": {"toy": [{k: v for k, v in row(0.5, "v2", "x").items() if k not in ("pipeline", "commit")}]}}
+    single = report(b)
+    ok("v2" in single and "bbb2222" in single, f"S19j the single table names pipeline and commit: {single}")
+    for why, x, y in (("v1 against v2", a, b), ("unknown against v2", unk, b), ("unknown against unknown", unk, unk)):
+        try:
+            report(x, y)
+            ok(False, f"S19k report refuses to compare {why}")
+        except ValueError:
+            ok(True, f"S19k report refuses to compare {why}")
+    try:
+        txt = report(a2, b2)
+        ok("v2" in txt and "aaa1111" in txt and "ccc3333" in txt, f"S19l same pipeline compares, commits shown: {txt}")
+    except ValueError as e:
+        ok(False, f"S19l same pipeline compares: {e}")
+    try:
+        txt = report(a, b, allow_mixed_pipelines=True)
+        ok("v1" in txt and "v2" in txt, "S19m --allow-mixed-pipelines compares and still names both")
+    except (ValueError, TypeError) as e:
+        ok(False, f"S19m --allow-mixed-pipelines compares: {e}")
+    ok(_zero_row("R1", "x").get("pipeline") == "unknown", "S19n a missing run's row reads pipeline unknown")
+    cmds = launch_commands(["toy"], "t", 1, None, pipeline="v2")
+    ok(all("EVAL_PIPELINE=v2" in c for c in cmds), f"S19o the printed launch commands state the pipeline: {cmds}")
 
 
 def _test_s12_repo_tree(ok, td):

@@ -978,6 +978,97 @@ def _self_test_owner_cli(ok, td: str, trace, reg) -> None:
         print(f"{state} SO13b {name}: the tool hook cannot see indirect execution; closed by {OWNER_SIGNING_PR}")
 
 
+def _self_test_pipeline(ok, _outcome) -> None:
+    """PV (2026-11-05): an eval re-run meant to test a v2 fix ran v1, because main.py defaulted to
+    v1 and the eval config passed no pipeline flag, and no record said which pipeline ran."""
+    import tempfile
+    g = globals()
+    calls: list = []
+    saved = {k: g.get(k) for k in ("main_v2", "run", "create_run_dir", "store_run_results", "run_preflight")}
+    saved_argv = sys.argv
+
+    def fake_v2(args, ident=None):
+        calls.append(("v2", ident))
+        return 0
+
+    async def fake_run(*a, **kw):
+        calls.append(("v1", kw.get("identity")))
+        return "completed"
+
+    def drive(*argv):
+        calls.clear()
+        sys.argv = ["main.py", *argv]
+        try:
+            return main()
+        except SystemExit as e:
+            return ("exit", e.code)
+
+    async def no_preflight(*a, **kw):   # never a live preflight from a self-test
+        calls.append(("preflight", None))
+        return {"ok": False, "problems": ["self-test"], "sdk_version": "-"}
+
+    try:
+        g["main_v2"], g["run"], g["run_preflight"] = fake_v2, fake_run, no_preflight
+        rc = drive("--signoff", "lead", "--max-budget-usd", "35", "Q?")   # the eval config's flags that day
+        ok(rc == 0 and [c[0] for c in calls] == ["v2"], f"PV1 no pipeline flag runs v2 ({rc}, {calls})")
+        ok(calls and calls[0][1] and calls[0][1].get("pipeline") == "v2"
+           and calls[0][1].get("launcher") == "direct" and calls[0][1].get("commit"),
+           f"PV2 the v2 run gets its identity: pipeline, commit, launcher ({calls})")
+        rc = drive("--v2", "--launcher", "run_cluster:x", "Q?")
+        ok(rc == 0 and calls[:1] and calls[0][0] == "v2" and calls[0][1]["launcher"] == "run_cluster:x",
+           f"PV3 --v2 is a no-op alias; --launcher is recorded ({calls})")
+        rc = drive("--v1", "--skip-preflight", "Q?")
+        ok(rc == 0 and [c[0] for c in calls] == ["v1"] and calls[0][1]["pipeline"] == "v1",
+           f"PV4 --v1 runs the lead pipeline with its identity ({rc}, {calls})")
+        rc = drive("--v1", "--v2", "Q?")
+        ok(rc == ("exit", 2) and not calls, f"PV5 --v1 with --v2 is refused before anything runs ({rc})")
+        with tempfile.TemporaryDirectory() as td:
+            rp = os.path.join(td, "r1")
+            os.makedirs(rp)
+            json.dump({"question": "Q?", "pipeline": "v1"}, open(os.path.join(rp, "metadata.json"), "w"))
+            rc = drive("--resume", rp)
+            ok(rc == 1 and not calls, f"PV6 a run recorded as v1 is not resumed under the v2 default ({rc}, {calls})")
+            rc = drive("--v1", "--skip-preflight", "--resume", rp)
+            ok(rc == 0 and [c[0] for c in calls] == ["v1"], f"PV7 ... it resumes with --v1 ({rc})")
+            # PV8: a real main_v2 (machine stubbed at run_v2) stamps metadata.json, and the machine's
+            # init_run keeps the stamp instead of replacing metadata.json.
+            g["main_v2"] = saved["main_v2"]
+            from agents import stage_machine as _sm, v2_sdk_tasks as _vt
+            sm_saved, vt_saved = _sm.run_v2, _vt.SdkTasks
+            made = os.path.join(td, "runs_v2")
+
+            def fake_create(question):
+                os.makedirs(made)
+                json.dump({"question": question, "run_dir": "runs_v2"}, open(os.path.join(made, "metadata.json"), "w"))
+                return made
+
+            def fake_run_v2(question, run_dir, tasks, **kw):
+                _sm.init_run(run_dir, question)
+                return "completed"
+            g["create_run_dir"], g["store_run_results"] = fake_create, (lambda p: None)
+            _sm.run_v2, _vt.SdkTasks = fake_run_v2, (lambda *a, **k: None)
+            try:
+                rc = drive("--launcher", "vm_job:n/j", "Q2?")
+            finally:
+                _sm.run_v2, _vt.SdkTasks = sm_saved, vt_saved
+            m = json.load(open(os.path.join(made, "metadata.json"))) if os.path.exists(made) else {}
+            ok(rc == 0 and m.get("pipeline") == "v2" and m.get("launcher") == "vm_job:n/j" and m.get("commit")
+               and m.get("run_dir") == "runs_v2" and m.get("invocations"),
+               f"PV8 a v2 run's metadata.json records pipeline, commit and launcher ({rc}, {m})")
+        # PV9: the lead pipeline's end-of-run restore puts the identity back if a run tool changed it.
+        with tempfile.TemporaryDirectory() as td:
+            mp = os.path.join(td, "metadata.json")
+            json.dump({"question": "Q", "pipeline": "v2", "commit": "deadbeef"}, open(mp, "w"))
+            _restore_protected_meta(mp, {"question": "Q", "pipeline": "v1", "commit": "abc1234", "launcher": "direct"})
+            m = json.load(open(mp))
+            ok(m.get("pipeline") == "v1" and m.get("commit") == "abc1234",
+               f"PV9 pipeline and commit are protected run metadata ({m})")
+    finally:
+        for k, v in saved.items():
+            g[k] = v
+        sys.argv = saved_argv
+
+
 def _run_self_test() -> int:
     import tempfile
     import agents as agents_pkg
@@ -1246,6 +1337,8 @@ def _run_self_test() -> int:
             _sm.save_state(rv, _sm.RunState(question=_evq))
             ok(eval_refusal(_NS(question="benign", resume=rv, v2=True), REPO_ROOT) is not None,
                "EV3 a --v2 resume is checked on run_state.json's question, whatever the argument says")
+            ok(eval_refusal(_NS(question="benign", resume=rv, v2=False, v1=False), REPO_ROOT) is not None,
+               "EV4 v2 is the default: a resume with no pipeline flag is checked on run_state.json too")
         finally:
             if _prev_iso is not None:
                 os.environ["MA_EVAL_ISOLATED"] = _prev_iso
@@ -2389,6 +2482,7 @@ def _run_self_test() -> int:
        f"ST6 store_run_results with a non-object metadata.json neither raises nor keeps the bad value ({_got})")
     shutil.rmtree(_sr6, ignore_errors=True)
     shutil.rmtree(_cr, ignore_errors=True)
+    _self_test_pipeline(ok, _outcome)
 
     # WU (Phase 29): every run ends with a report.
     ok(writeup_reserve(450.0) == 36.0 and writeup_reserve(8.0) == 4.0 and writeup_reserve(None) == 0.0,

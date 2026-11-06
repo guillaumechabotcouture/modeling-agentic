@@ -1625,6 +1625,83 @@ def _self_test_sign(ok) -> None:
             ws.WORK = old_work
 
 
+def _self_test_pipeline(ok, tb) -> None:
+    """RP (2026-11-05): the eval launcher ran v1 for a v2 test. cloud/configs/_eval.py passed no
+    pipeline flag, main.py defaulted to v1, and neither the launch record nor the run said which ran."""
+    import tempfile
+    lib = os.path.join(os.path.dirname(HERE), "scripts", "lib")
+    real = open(os.path.join(lib, "pipeline_id.py"), "rb").read()
+    g = globals()
+    for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
+        if not f.endswith(".py") or f.startswith("_"):
+            continue
+        try:
+            c = load_config(os.path.join(HERE, "configs", f))
+        except Exception as e:  # noqa: BLE001 -- RC16 reports the load itself
+            ok(False, f"RP1 configs/{f} declares its pipeline: {e}")
+            continue
+        ok(getattr(c, "pipeline", "") in ("v1", "v2"), f"RP1 configs/{f} declares its pipeline ({getattr(c, 'pipeline', None)})")
+        if f.startswith("eval_"):
+            ok(getattr(c, "pipeline", None) == "v2", f"RP2 configs/{f} runs v2 ({getattr(c, 'pipeline', None)})")
+        mf = g.get("main_flags")
+        ok(mf is not None and f"--{getattr(c, 'pipeline', None)}" in mf(c) and not {"--v1", "--v2"} & set(c.flags),
+           f"RP3 configs/{f}: the launcher passes the declared pipeline to main.py, flags never do")
+    for bad in (dict(pipeline="v3"), dict(pipeline="v2", flags=("--v1",)), dict(pipeline="v1", flags=("--v2",))):
+        try:
+            RunConfig(name="t", question_file="/dev/null", **bad)
+            ok(False, f"RP4 a config with {bad} is refused")
+        except (ValueError, TypeError):
+            ok(True, f"RP4 a config with {bad} is refused")
+    pf = g.get("pipeline_preflight")
+    ok(pf is not None, "RP5 the launcher has a pipeline preflight")
+    if pf is None:
+        return
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(name="ev-x", question_file="/dev/null", out_dir=d, pipeline="v2",
+                        flags=("--max-budget-usd", "35", "--signoff", "lead"))
+        code = tb({"main.py": b"x", "scripts/lib/pipeline_id.py": real})
+        ok(pf(cfg, code) == "v2", "RP5 the shipped pipeline_id agrees with the declared v2")
+        ok(pf(RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1"), code) == "v1",
+           "RP6 an explicit v1 config passes the preflight")
+        for why, c2, code2 in (
+                ("a tree with no pipeline_id.py (from before 2026-11-05: defaults to v1)", cfg, tb({"main.py": b"x"})),
+                ("a config that declares no pipeline", RunConfig(name="t2", question_file="/dev/null", out_dir=d), code),
+                ("shipped code that would run another pipeline", cfg,
+                 tb({"main.py": b"x", "scripts/lib/pipeline_id.py":
+                     b"import sys\nprint('v1')\n"}))):
+            try:
+                pf(c2, code2)
+                ok(False, f"RP7 the preflight refuses {why}")
+            except SystemExit as e:
+                ok(True, f"RP7 the preflight refuses {why}: {str(e)[:90]}")
+        rec = g["launch_record"](cfg, worker="w1", commit="abc1234", launch_id="L1", cluster_id=9, code=code,
+                                 pipeline="v2")
+        ok(rec.get("pipeline") == "v2" and rec.get("commit") == "abc1234" and rec.get("launch_id") == "L1"
+           and rec.get("launcher") == "run_cluster:ev-x" and isinstance(rec.get("eval_inputs_sha256"), dict),
+           f"RP8 the launch record (assignments.json) carries pipeline, commit and launcher ({rec})")
+        ok(ws.run_identity(tb({"runs/r/metadata.json": json.dumps(
+            {"pipeline": "v2", "commit": "abc1234def", "launcher": "run_cluster:ev-x"}).encode()}))
+           == {"pipeline": "v2", "commit": "abc1234def", "launcher": "run_cluster:ev-x"},
+           "RP9 the worker reads the run's identity from its metadata.json")
+        ok(ws.run_identity(tb({"runs/r/metadata.json": b"{}"}))["pipeline"] == "unknown"
+           and ws.run_identity(b"junk")["commit"] == "unknown", "RP10 a run with no identity reads unknown")
+
+        class Store:
+            def __init__(self, files):
+                self.files = files
+
+            def download(self, blob, path, account):
+                open(path, "wb").write(self.files[blob])
+        run = tb({"r/metadata.json": json.dumps({"pipeline": "v2", "commit": "abc1234def"}).encode()})
+        res = json.dumps({"exit_code": 0, "duration_s": 5, "run_stored": "outputs/x/r.tar.gz"}).encode()
+        m = collect_from_storage(cfg, Store({ws.record_blob(cfg.storage_prefix, "L1", "R1"): res,
+                                             "outputs/x/r.tar.gz": run}), "R1", "L1", rec)
+        on_disk = json.load(open(os.path.join(d, "R1", "result.json")))
+        ok(on_disk.get("run_identity", {}).get("pipeline") == "v2" and on_disk.get("pipeline") == "v2"
+           and on_disk.get("commit") == "abc1234" and m.get("launch_id") == "L1",
+           f"RP11 the collected result.json records the launch's and the run's pipeline and commit ({on_disk})")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -1795,6 +1872,7 @@ def _self_test() -> int:
     _self_test_52(ok)
     _self_test_attach(ok)
     _self_test_sign(ok)
+    _self_test_pipeline(ok, tb)
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
