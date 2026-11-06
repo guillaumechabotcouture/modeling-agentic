@@ -164,6 +164,12 @@ class Param:
         up = np.where(x < c, 2 * (x - a) / ((b - a) * max(c - a, 1e-300)), 2 * (b - x) / ((b - a) * max(b - c, 1e-300)))
         return np.maximum(up, 0.0)
 
+    def quantiles(self, qs) -> list:
+        """Quantiles of the prior (numerical inverse of its cdf on a fine grid)."""
+        g = np.linspace(self.lo, self.hi, 4001)
+        c = np.concatenate([[0.0], np.cumsum(0.5 * (self.pdf(g[1:]) + self.pdf(g[:-1])) * np.diff(g))])
+        return [float(np.interp(q * c[-1], c, g)) for q in qs]
+
     def describe(self) -> dict:
         return {"range": [self.lo, self.hi], "dist": self.dist, "mode": self.mode, "source": self.source}
 
@@ -1185,6 +1191,18 @@ class HistoryMatch:
                                   non_implausible_share=float(np.mean(v["I"] <= self.cut)))
         smp = self.sample(int(self.th["draws_kept"])) if len(R) else None
         figd = self.figure_data(smp, units, ver)
+        # the extreme accepted values (ranges) can span the whole prior while the region's mass moves: compare the
+        # region sample's central 95% interval with the prior's (contraction95 = 1 - width ratio)
+        if smp:
+            Sx = np.asarray(smp["rows"], float)
+            for j, p in enumerate(P.shared):
+                a, b = np.percentile(Sx[:, j], [2.5, 97.5])
+                pa, pb = p.quantiles([0.025, 0.975])
+                inter95 = {"region": [float(a), float(b)], "prior": [pa, pb],
+                           "median": float(np.median(Sx[:, j])), "point": p.mode,
+                           "contraction95": round(1 - (b - a) / (pb - pa), 4) if pb > pa else None}
+                self._i95 = getattr(self, "_i95", {})
+                self._i95[p.name] = inter95
         runs = {"unit": [{"unit": r["unit"], "z": float(P.z_natural(r["s"])), "theta": P.theta_natural(r["t"])[0]
                           if self.p else {}, "seed": r["seed"], "obs": r["obs"]} for r in self.data.unit],
                 "shared": [{"theta": P.theta_natural(r["t"])[0], "seed": r["seed"], "obs": r["obs"]}
@@ -1196,7 +1214,8 @@ class HistoryMatch:
                 "unit_parameter": P.unit_param,
                 "region": {"candidates": int(len(C)), "accepted": int(len(R)), "share_of_prior": st["share_of_prior"],
                            "relaxed": st["relaxed"], "ranges": ranges,
-                           "prior_ranges": {p.name: [p.lo, p.hi] for p in P.shared}, "contraction": contraction},
+                           "prior_ranges": {p.name: [p.lo, p.hi] for p in P.shared}, "contraction": contraction,
+                           "interval95": dict(getattr(self, "_i95", {}))},
                 "best": {"theta": best_theta, "z": {u: units[u]["z_best"] for u in P.units},
                          "score": float(st["score"][best_c])},
                 "units": units, "unmatched": unmatched, "conflicting": conflicting,

@@ -264,7 +264,8 @@ def fig_unit_fit(fd, t, labels=None):
         raise NoData("no target fit rows (no region sample)")
     groups = {}
     for r in rows:      # one panel per kind of target and observable (unit targets of a survey; its groups; shared)
-        groups.setdefault(f"{r['kind']} targets, {r['observable']}", []).append(r)
+        key = "shared targets" if r["kind"] == "shared" else f"{r['kind']} targets, {r['observable']}"
+        groups.setdefault(key, []).append(r)
     keys = list(groups)
     hmax = max(len(v) for v in groups.values())
     h = min(max(2.6, 0.045 * hmax + 1.4), 22)

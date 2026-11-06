@@ -525,8 +525,10 @@ def summary(rep) -> str:
          f"{rep['region']['accepted']} of {rep['region']['candidates']} candidates (share of prior "
          f"{rep['region']['share_of_prior']})"]
     for n, r in rep["region"]["ranges"].items():
+        i95 = (rep["region"].get("interval95") or {}).get(n) or {}
         L.append(f"  {n}: region {r} vs prior {rep['region']['prior_ranges'][n]} (contraction "
-                 f"{rep['region']['contraction'][n]})")
+                 f"{rep['region']['contraction'][n]}); 95% region {i95.get('region')} vs prior {i95.get('prior')} "
+                 f"(contraction95 {i95.get('contraction95')})")
     if rep["unmatched"] or rep["conflicting"]:
         L.append(f"  unmatched {len(rep['unmatched'])}, conflicting {len(rep['conflicting'])}")
     for b in rep["blocks"]:
