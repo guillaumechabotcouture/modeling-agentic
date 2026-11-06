@@ -547,7 +547,7 @@ published_ranges:
       - 1.0
       spread: 'not identified by a case series alone (RW4 scale invariance): with a case series only, the attack
         rate scales with s0 while reff_end does not; declare it from a serosurvey or the question, or carry its
-        full range'
+        plausible range, with its lower end above the seed''s upper end (the engine refuses seed > s0)'
       source: the question or a serosurvey
       verified: unverified
     dispersion:

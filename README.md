@@ -2,8 +2,10 @@
 
 A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). It has two pipelines:
 
-- **v1 (the default)**: a lead agent and eleven specialist agents, described in most of this README.
-- **v2 (`main.py --v2`)**: code runs the pipeline as a state machine, every number comes from tested harness code (an owner-signed decision spec, a disease engine and the analysis engine), and LLMs do bounded tasks. See [v2: the stage machine](#v2-the-stage-machine).
+- **v2 (the default since 2026-11-05; `main.py --v2` still works)**: code runs the pipeline as a state machine, every number comes from tested harness code (an owner-signed decision spec, a disease engine and the analysis engine), and LLMs do bounded tasks. See [v2: the stage machine](#v2-the-stage-machine).
+- **v1 (`main.py --v1`, only on explicit request)**: a lead agent and eleven specialist agents, described in most of this README.
+
+Every run records the pipeline it ran, the code commit and its launcher in `metadata.json` (`pipeline`, `commit`, `launcher`); launchers and the eval grader read and check them (see [Pipeline identity](#pipeline-identity)).
 
 v1 stays supported until the owner retires it. In v1, you give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
 
@@ -81,7 +83,7 @@ Stages 4–7 loop up to `--max-rounds` times. STAGE 7 is not a judgment call —
 
 ## v2: the stage machine
 
-`python3 main.py --v2 "<question>"` runs `agents/stage_machine.py` instead of the lead session. Code owns the state, every transition and every number; the state is saved to `run_state.json` after each transition, so `main.py --v2 --resume <run_dir>` continues where a run stopped.
+`python3 main.py "<question>"` (or with `--v2`) runs `agents/stage_machine.py` instead of the lead session. Code owns the state, every transition and every number; the state is saved to `run_state.json` after each transition, so `main.py --resume <run_dir>` continues where a run stopped.
 
 ```
 SPEC → SIGN → EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE
@@ -150,6 +152,16 @@ The modeler ships these alongside the model code:
 
 **IDM Coiled (current).** `cloud/run_cluster.py <config.py> launch` starts a whole run (v1 or v2) on Coiled from a config in `cloud/configs/`. Each run gets its own agent VM, keeps running when the launching laptop disconnects, and uploads its directory to the project storage account when it ends; `status`, `collect`, `health`, `sign` and `shutdown` manage it (see the script's docstring). `cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> -- <command>` runs a detached job on its own VM in one command: it brings the cluster up, submits the job at once, polls until it ends, and stops the cluster whatever the outcome (non-zero exit with the reason unless the job is done with its outputs verified in storage; `--keep-on-failure` keeps the cluster after a failure for debugging). `up`/`start`/`wait`/`down` remain for interactive use. Inside a run, `scripts/compute.py map` fans batches of model evaluations (calibration grids, uncertainty draws, v2 engine batches) out over the run's Dask workers, or runs them locally. See the `cloud-compute` skill.
 
+### Pipeline identity
+
+On 2026-11-05 an eval re-run meant to test a v2 change ran v1: `main.py` then defaulted to v1, the eval config passed no pipeline flag, and nothing recorded which pipeline ran. Now:
+
+- `scripts/lib/pipeline_id.py` decides the pipeline (v2 unless `--v1`) and writes `pipeline`, `commit` and `launcher` into every run's `metadata.json` before the run starts. The commit of a launch tarball comes from `scripts/lib/code_commit.txt`, which `git archive` fills in (`.gitattributes` export-subst).
+- `cloud/run_cluster.py`: each config declares `pipeline=` (`v1` or `v2`); the launcher passes it to `main.py` explicitly and, before anything is created, asks the shipped code which pipeline those arguments run and refuses any disagreement or a tree that cannot answer. `assignments.json` and each collected `result.json` record the launch's pipeline and commit and the run's own.
+- `cloud/vm_job.py` refuses a `main.py` command without `--v1` or `--v2`, and writes a launch record in the grader's format.
+- `scripts/eval_suite.py` prints pipeline and commit with every score, refuses a run whose recorded identity is not its launch's, and `report` refuses to compare score files from different or unknown pipelines unless `--allow-mixed-pipelines` is given. Runs from before the change read `unknown`.
+- `scripts/smoke_check.py <run_dir> --pipeline v2 --commit <sha> --expect <marker>` fails a smoke run that lacks the markers its PR's changed code should produce.
+
 **Azure Batch (legacy, v1).** `scripts/propagate_uncertainty.py --cloud` can submit each uncertainty draw as an Azure Batch task through `scripts/cloud_batch.py`. Credentials live in `.env` (`AZ_*`) and are passed to agents only when `main.py --cloud` is set. Pools created by a run are deleted in a `finally` block. Install the extras with `pip install -r requirements-cloud.txt`.
 
 ## Skills ecosystem
@@ -180,9 +192,9 @@ The modeler ships these alongside the model code:
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY=your-key
 
-python main.py "Build a model of malaria incidence in Nigeria including ITNs, IRS, SMC, and case management, to inform Global Fund GC7 resource allocation (~$320M)."
+python main.py --v2 "Build a model of malaria incidence in Nigeria including ITNs, IRS, SMC, and case management, to inform Global Fund GC7 resource allocation (~$320M)."
 # or any other disease area, e.g.
-python main.py "Which districts should receive measles follow-up campaigns next year given a fixed vaccine and operations budget?"
+python main.py --v2 "Which districts should receive measles follow-up campaigns next year given a fixed vaccine and operations budget?"
 ```
 
 ### CLI options
@@ -192,7 +204,9 @@ python main.py "Which districts should receive measles follow-up campaigns next 
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
 | `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts (v2: from `run_state.json`) |
-| `--v2` | off | Run the v2 stage machine instead of the lead session |
+| `--v1` | off | Run the v1 lead session instead of the v2 stage machine (only on explicit request) |
+| `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands). `--v1 --v2` is refused |
+| `--launcher NAME` | `$MA_LAUNCHER` or `direct` | Name of the launcher, recorded in `metadata.json` (the cloud launchers set it) |
 | `--signoff owner\|lead\|none` | owner | Who signs the decision brief (v1) or the decision spec (v2) before compute; `lead` for unattended test runs |
 | `--signoff-hours H` | 24 | How long a v1 owner sign-off wait lasts before the run pauses (resumable) |
 | `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run |
@@ -289,7 +303,7 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 
 ```
 modeling-agentic/
-├── main.py                    CLI entry point + retry/resume loop (v1), --v2 dispatch
+├── main.py                    CLI entry point: v2 dispatch (default), retry/resume loop (v1, --v1)
 ├── agents/
 │   ├── __init__.py            Agent registry (v1)
 │   ├── lead_prompt.py, hooks.py, run_*.py   Lead prompt, hooks, session/budget/preflight/finish (v1)

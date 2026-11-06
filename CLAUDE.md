@@ -17,11 +17,12 @@ program allocate its malaria budget across districts?", "Where should
 measles campaigns run next year?", or "Which TB case-finding package
 should each district get?". Two pipelines share the rigor gates:
 
-- **v1 (default, `python3 main.py "<question>"`)**: a **lead** agent
-  chains the stages PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE →
-  WRITE, spawning specialist sub-agents and running mechanical rigor
-  checks between rounds.
-- **v2 (`python3 main.py --v2 "<question>"`)**: code owns the flow.
+- **v1 (`python3 main.py --v1 "<question>"`, only on explicit request)**:
+  a **lead** agent chains the stages PLAN → DATA → MODEL → ANALYZE →
+  CRITIQUE → GATE → WRITE, spawning specialist sub-agents and running
+  mechanical rigor checks between rounds.
+- **v2 (default since 2026-11-05, `python3 main.py "<question>"`; `--v2`
+  is accepted as a no-op alias)**: code owns the flow.
   `agents/stage_machine.py` steps through the states SPEC → SIGN →
   EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE →
   FIX_LOOP / OWNER_DECISION → WRITE → PRESENTATION → FINAL (the full
@@ -149,11 +150,21 @@ the live attachment picture.
 β: declarations of findings that bear on the primary decision) are resumable
 with `--resume` once signed; `completed_scope_declined` means the owner
 declined such a declaration and no rounds were left to fix it.
-A v2 run (`main.py --v2`) prints `paused:<reason>` when its state machine
+A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
-(scope declarations), and exits 2; `main.py --v2 --resume <run_dir>`
+(scope declarations), and exits 2; `main.py --resume <run_dir>`
 continues from `run_state.json`.
+
+Every run records which pipeline ran: `metadata.json` holds `pipeline`
+(`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per
+start or resume), written by `scripts/lib/pipeline_id.py` before the run
+starts. A run recorded under one pipeline is not resumed under the other.
+Launchers state the pipeline explicitly and never rely on the default:
+`cloud/run_cluster.py` configs set `pipeline=` and the launch refuses a
+config whose declaration the shipped code does not confirm;
+`cloud/vm_job.py` refuses a `main.py` command without `--v1` or `--v2`.
+Readers treat a missing field as `unknown`, never as a pipeline.
 
 Cloud and third-party credentials (`AZ_*`, `AZURE_*`, `OPENAI_*`,
 `AWS_*`, `GOOGLE_*`) are blanked in the agent environment unless
@@ -226,24 +237,38 @@ Install with `pip install -r requirements.txt` (pinned; it includes
 skill scripts import; add `-r requirements-cloud.txt` for Coiled, run
 storage and the legacy Azure Batch path).
 
-Live verification (kicks off a real run, ~5 hours, ~$25). Prefer
+Live verification (a real run, on the cloud: `cloud/run_cluster.py
+<config> launch`, or `cloud/vm_job.py run` for one job). Prefer
 alternating the disease area between retros so gates are not tuned to
-one domain:
+one domain. The pipeline is v2 unless `--v1` is passed; state it anyway
+in any command you write down:
 
 ```bash
-source .venv/bin/activate
-nohup python3 main.py "<research question>" \
-  --max-rounds 8 --max-sessions 5 --signoff owner \
-  > run_phaseN.log 2>&1 &
+python3 main.py --v2 "<research question>" --max-rounds 4 --signoff owner
 ```
 
-The run produces `runs/<timestamp>_<question>/` with all artifacts and
-`final_gate.json` (the post-run validator decision). Add `--v2` to run
-the stage machine instead of the lead session.
+A v2 run produces `runs/<timestamp>_<question>/` with `run_state.json`,
+the gate records and the report. It pauses at SIGN until the owner signs
+the decision spec (`python3 agents/stage_machine.py sign <run_dir> --by
+owner`); use `--signoff lead` for unattended test runs. A v1 run
+(`--v1 --max-sessions 5`) waits for the decision brief instead
+(`python3 scripts/decision_brief.py show|sign <run_dir>`).
 
-After the plan, the run waits for the owner to sign the decision brief
-(`python3 scripts/decision_brief.py show|sign <run_dir>`); use
-`--signoff lead` for unattended test runs.
+**A smoke must show that the changed code ran.** A run that finishes is
+not evidence: on 2026-11-05 a re-run meant to test a v2 fix ran v1 and
+finished. Each PR that changes run behaviour names, in its description,
+the markers only its changed code produces (a field it records, a file
+only it writes, a stage the machine reaches), and the smoke is checked
+against them:
+
+```bash
+python3 scripts/smoke_check.py <collected run dir> --pipeline v2 --commit <launched sha> \
+  --expect 'run_state.json:history' --expect '<file only the new code writes>'
+```
+
+The command exits 1 and lists each missing marker. Marker forms: `PATH`,
+`PATH:KEY`, `PATH:KEY=VALUE`, `PATH:KEY^=PREFIX`, `PATH~REGEX`
+(`python3 scripts/smoke_check.py --help`).
 
 ## Pointers to deeper docs
 

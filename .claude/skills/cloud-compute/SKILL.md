@@ -78,6 +78,10 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> \
     [--workers N --cluster-compute] -- <command ...>
 ```
 
+- A command that runs `main.py` must name its pipeline (`--v2` or `--v1`);
+  `vm_job.py` refuses it otherwise, before anything is created. The job
+  writes a launch record (`<out>/<name>/<job_id>/assignments.json`) that the eval
+  grader reads.
 - `--store` is required: success means every output is verified in
   storage. Otherwise it exits non-zero with the reason (state, exit code,
   storage check). The cluster is stopped whatever ends the command,

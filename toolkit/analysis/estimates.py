@@ -118,6 +118,7 @@ class EstimatesProblem:
             raise ValueError(f"calibration.targets: step {int(self.target['steps'].max())} is beyond the horizon's "
                              f"{n_steps} engine steps")
         self.failed = 0
+        self.refusals = []          # [{reason, values}] of the first parameter sets the engine refused
         self.problem = C.Problem(names, {n: pri[n] for n in names}, self.loglik, chunk=4096)
 
     # ---- engine evaluation
@@ -154,9 +155,13 @@ class EstimatesProblem:
         is split until each refused member stands alone."""
         try:
             return self.eng.run_batch(params, units, [Package("none", {})] * len(params), self.horizon, 1)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as e:
             if len(params) == 1:
                 self.failed += 1
+                if len(self.refusals) < 20:          # the first refusals, with the engine's reason and the values
+                    vals = dict(params[0])
+                    vals.update({k: v for k, v in units[0].attributes.items() if k in self.unit_names})
+                    self.refusals.append({"reason": f"{type(e).__name__}: {e}", "values": vals})
                 return [None]
             h = len(params) // 2
             return self._run(params[:h], units[:h]) + self._run(params[h:], units[h:])
@@ -234,6 +239,7 @@ class EstimatesProblem:
         n = len(next(iter(X.values())))
         V = self._vals(X)
         outs = self.run(V, n)
+        refusal_guard(self, "the posterior predictive check")      # before predictions are built (fix-r2 P2-3)
         mu = self.expected(outs, V)
         model = self.sources[self.target["source"]].noise["model"]
         if model == "negbin":
@@ -397,6 +403,39 @@ def max_loglik(P: C.Problem, starts) -> tuple:
     return -best, verified
 
 
+def refusal_guard(E, stage: str) -> None:
+    """Fail closed after an evaluation stage at which the engine refused a parameter set inside the declared priors
+    (Codex fix-r1 P1-1: every stage, not only the sample and the draws)."""
+    if E.failed:
+        raise C.CalibrationRefused("posterior_engine_failure", engine_failure_message(E, stage))
+
+
+def sample_checked(E, P, seed: int, stage: str) -> dict:
+    """The canonical sample, failing closed on refusals; when refusals made the sampler itself fail (ESS, R-hat), the
+    engine's reason leads the message (Codex fix-r1 P2-5)."""
+    try:
+        out = _sample(P, seed)
+    except C.CalibrationRefused as e:
+        if E.failed:
+            raise C.CalibrationRefused("posterior_engine_failure",
+                                       engine_failure_message(E, stage) + f" (the sampler then stopped: {e})") from e
+        raise
+    refusal_guard(E, stage)
+    return out
+
+
+def engine_failure_message(E, stage: str) -> str:
+    """Why the calibration stops: how many parameter sets inside the declared priors the engine refused, at which
+    stage, and the first one's values and the engine's reason."""
+    ex = E.refusals[0] if E.refusals else {}
+    vals = ", ".join(f"{k}={v:.3g}" for k, v in sorted((ex.get("values") or {}).items())
+                     if isinstance(v, (int, float)))
+    return (f"the engine refused {E.failed} parameter set(s) inside the declared priors during {stage} "
+            f"(e.g. {vals or 'no values recorded'}: {ex.get('reason', 'no reason recorded')}); the posterior would be "
+            "truncated to what the engine accepts. Narrow the priors to values the engine accepts (the spec validator "
+            "probes the prior box)")
+
+
 def _decision(dec, v: np.ndarray) -> dict:
     thr, prob = float(dec["threshold"]), float(dec["probability"])
     p = float(np.mean(v > thr)) if dec["direction"] == "above" else float(np.mean(v < thr))
@@ -443,18 +482,24 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     validation = benchmark_acceptance(eng)          # fail closed before any fit (Codex r1-12)
     E = EstimatesProblem(spec, eng)
     P = E.problem
-    s = _sample(P, seed)
+    s = sample_checked(E, P, seed, "the posterior sample")
     if np.any(~np.isfinite(s["ll_rows"])):
         raise C.CalibrationRefused("posterior_ess", "a canonical draw has no finite likelihood")
     cls = C.classify(P, s)
+    refusal_guard(E, "the identifiability classes")
     xh, conv, msg = C._map_point(P, s["best"])
+    refusal_guard(E, "the posterior mode")
     smp = {"sample_id": s["sample_id"], "names": s["names"], "rows": np.asarray(s["rows"], float)}
     nd = int(n_draws or u.get("draws", 1000))
     dr = C.draws(smp, nd, seed)
     X = {n: np.array([d["values"][n] for d in dr]) for n in smp["names"]}
+    # c1 run: a parameter set the engine refuses inside the declared priors would truncate the posterior, so the
+    # calibration fails closed (as calibration.posterior does); the message says where and why. The spec validator
+    # probes the prior box for this before sign-off (toolkit/spec/estimates.py prior_support_problems).
+    refusal_guard(E, "the posterior sample")
     ll, aux = E.loglik(X)                     # the engine re-run at each draw's applied values
     if E.failed or not np.all(np.isfinite(ll)):
-        raise C.CalibrationRefused("posterior_engine_failure", f"the engine refused {E.failed} draws")
+        raise C.CalibrationRefused("posterior_engine_failure", engine_failure_message(E, "the uncertainty draws"))
     vals = {o["name"]: aux[o["name"]] for o in E.outputs}
     dec = raw["deliverable"].get("decision")
     decision = _decision(dec, vals[dec["output"]]) if dec else None
@@ -464,21 +509,24 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     rows_ = smp["rows"]
     starts = [s["best"], np.asarray(xh, float)] + [rows_[i] for i in np.linspace(0, len(rows_) - 1, 4).astype(int)]
     ll_max, ll_verified = max_loglik(P, starts)
+    refusal_guard(E, "the likelihood maximisation")
     tests = []
 
     def end_fit(name, v, kind):
         """The posterior with `name` held at v: outputs, decision, and the optimised likelihood drop against the full
         fit (an end the data reject cannot change the decision; an unverified optimisation is recorded)."""
-        try:
+        stage = f"the fit at {name} = {v:g}"
+        try:           # a refusal at any stage of an end fit makes the end refused, never a result (c1, fix-r1 P1-1)
             Ef = EstimatesProblem(spec, eng, fixed={name: v})
-            sf = _sample(Ef.problem, seed)
+            sf = sample_checked(Ef, Ef.problem, seed, stage)
+            rf = np.asarray(sf["rows"])
+            dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": rf}, min(nd, 1000), seed)
+            Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
+            _, auxf = Ef.loglik(Xf)
+            mf, vf = max_loglik(Ef.problem, [sf["best"]] + [rf[i] for i in np.linspace(0, len(rf) - 1, 4).astype(int)])
+            refusal_guard(Ef, stage)
         except C.CalibrationRefused as e:
             return {"value": float(v), "kind": kind, "refused": str(e)}
-        rf = np.asarray(sf["rows"])
-        dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": rf}, min(nd, 1000), seed)
-        Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
-        _, auxf = Ef.loglik(Xf)
-        mf, vf = max_loglik(Ef.problem, [sf["best"]] + [rf[i] for i in np.linspace(0, len(rf) - 1, 4).astype(int)])
         drop = float(ll_max - mf)
         end = {"value": float(v), "kind": kind, "median": {o["name"]: float(np.median(auxf[o["name"]]))
                                                            for o in E.outputs},
@@ -523,10 +571,12 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     rng = np.random.default_rng([seed, 17])
     Xp = P.x_of_z(rng.standard_normal((PRIOR_DRAWS, len(P.names))))
     _, auxp = E.loglik(_rows_dict(P.names, Xp))
+    refusal_guard(E, "the outputs under the priors alone")
     undetermined = [t["parameter"] for t in C.prior_range_tests(cls, P)]
     on_ridges = sorted({q for r in cls.get("ridges") or [] for q in r.get("params") or []})
     cmin = float(C.thresholds()["contraction_prior_dominated"])
     flat = flat_dependence(P, s["best"], [o["name"] for o in E.outputs])
+    refusal_guard(E, "the flat-direction diagnostic")
     determined = {}
     for o in E.outputs:
         n = o["name"]
@@ -547,6 +597,7 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
                          "dependence": {p: dependence(P.priors[p].natural(X[p]), vq, lvl) for p in undetermined}}
     # posterior predictive check of the target series
     yrep, mu, outs = E.predictive({n: v[:PPC_DRAWS] for n, v in X.items()}, rng)
+    refusal_guard(E, "the posterior predictive check")
     lo, hi = np.quantile(yrep, (1 - lvl) / 2, axis=0), np.quantile(yrep, 1 - (1 - lvl) / 2, axis=0)
     y = E.target["y"]
     ppc = {"steps": E.target["steps"].tolist(), "observed": y.tolist(), "median": np.median(yrep, axis=0).tolist(),
@@ -957,6 +1008,54 @@ def _self_test_codex_r2(ok) -> None:
     ok(f3 == [], f"AE22c a complete test passes: {f3 or err}")
 
 
+def _self_test_c1(ok, rows) -> None:
+    """Run 2026-11-06_012422 (c1) stopped at ANALYZE with 'the engine refused 12 draws': the refusals were parameter
+    sets the sampler explored (seed above s0 near s0 = 0), counted together with the draws. Refusals are recorded with
+    the engine's reason and where they happened, and the message says so."""
+    import tempfile
+    import yaml
+    from toolkit.spec import estimates as ES, schema
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(d)
+        sp = ES.toy_dir(d, rows=rows)
+        s = schema.load(sp)
+        E = EstimatesProblem(s, s.engine())
+        V = {"r0": np.array([1.8, 1.8]), "seed": np.array([1e-3, 1e-3]), "reporting": np.array([0.1, 0.1]),
+             "k": np.array([50.0, 50.0])}
+        E.unit_names = E.unit_names | {"s0"}          # s0 moved by the calibration, as in the c1 spec
+        V["s0"] = np.array([0.0, 0.5])
+        ll, _ = E.loglik(V)
+        rec = getattr(E, "refusals", None)
+        ok(not np.isfinite(ll[0]) and np.isfinite(ll[1]) and rec and "seed" in rec[0]["reason"]
+           and rec[0]["values"].get("s0") == 0.0,
+           f"AE23 (c1) a refused parameter set is recorded with the engine's reason and its values: {rec}")
+        msg = engine_failure_message(E, stage="the posterior sample") if callable(
+            globals().get("engine_failure_message")) else ""
+        ok("parameter set" in msg and "seed" in msg and "draws" not in msg,
+           f"AE23b (c1) the refusal message names parameter sets and the reason, not 'draws': {msg!r}")
+        # Codex fix-r1 P1-1 / P2-5: a refusal at any later stage is caught, and a sampler failure caused by
+        # refusals reports the engine's reason
+        G = globals().get("refusal_guard")
+        raised = None
+        try:
+            G(E, "an optimisation") if G else None
+        except C.CalibrationRefused as ex:
+            raised = str(ex)
+        ok(raised is not None and "an optimisation" in raised and "seed" in raised,
+           f"AE24 (Codex fix-r1 P1-1) refusal_guard raises with the stage and the reason once the engine refused: "
+           f"{raised!r}")
+        P0 = C.Problem(["x"], {"x": C.Prior("x", "uniform", 0.0, 1.0)}, lambda X: (np.full(len(X["x"]), -np.inf), {}))
+        S = globals().get("sample_checked")
+        raised = None
+        try:
+            S(E, P0, 1, "the posterior sample") if S else None
+        except C.CalibrationRefused as ex:
+            raised = str(ex)
+        ok(raised is not None and "parameter set" in raised and "seed" in raised,
+           f"AE25 (Codex fix-r1 P2-5) a sampler failure with engine refusals reports the engine's reason: {raised!r}")
+    del yaml
+
+
 def _self_test() -> int:
     import tempfile
     import yaml
@@ -1021,6 +1120,7 @@ def _self_test() -> int:
         ok("validated against" in txt, "AE17b (Codex r1-12) results.md carries the engine's validation label")
     _self_test_codex_r1(ok, rows)
     _self_test_codex_r2(ok)
+    _self_test_c1(ok, rows)
         # the reporting fraction and s0 trade off: with s0 unknown, reporting is not determined
     with tempfile.TemporaryDirectory() as d:
         d = os.path.realpath(d)
