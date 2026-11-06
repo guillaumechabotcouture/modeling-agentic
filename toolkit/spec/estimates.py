@@ -396,7 +396,51 @@ def validate(s, eng) -> list[str]:
     if extra:
         bad.append(f"engine.config: keys {extra} are not declared by dynamics (e.g. results_path): remove them")
     bad += dynamics_problems(s.raw, eng)
+    if not bad:
+        bad += prior_support_problems(s, eng)
     return bad
+
+
+MAX_PROBE_CORNERS = 64
+
+
+def prior_support_problems(s, eng) -> list[str]:
+    """The engine accepts every corner of the box the calibration priors span (c1 run: s0 on [0, 1] with seed up to
+    1e-3 holds points where seed > s0, which the engine refuses, and the posterior would have been truncated). Each
+    corner is one engine run with the unit's bound attributes; a refusal is reported with the engine's reason, before
+    sign-off. Observation parameters do not reach the engine and are not probed."""
+    import itertools
+    from toolkit.analysis.calibration import Prior
+    from toolkit.engines.contract import Horizon, Package, UnitSpec
+    card = eng.describe()
+    pnames = {p.name for p in eng.parameters()}
+    pri = (s.raw.get("calibration") or {}).get("priors") or {}
+    names = [n for n in pri if n in pnames or n in card.unit_attributes]
+    if not names:
+        return []
+    ends = [Prior.from_decl(n, pri[n]).interval() for n in names]
+    corners = list(itertools.product(*ends))
+    if len(corners) > MAX_PROBE_CORNERS:
+        import random
+        corners = random.Random(0).sample(corners, MAX_PROBE_CORNERS)
+    h = s.raw["horizon"]
+    wins = {k: tuple(float(x) for x in v) for k, v in ((s.raw.get("deliverable") or {}).get("windows") or {}).items()}
+    hz = Horizon(float(h["start"]), float(h["stop"]), (float(h["start"]), float(h["stop"])), wins)
+    base = s.unit_attributes(s.units()[0])
+    out = []
+    for c in corners:
+        vals = dict(zip(names, c))
+        params = {k: float(v) for k, v in vals.items() if k in pnames}
+        unit = UnitSpec("probe", dict(base, **{k: float(v) for k, v in vals.items() if k not in pnames}))
+        try:
+            eng.run_batch([params], [unit], [Package("none", {})], hz, 1)
+        except (ValueError, RuntimeError) as e:
+            out.append(f"prior_support_infeasible: calibration.priors: the engine refuses the corner "
+                       f"{', '.join(f'{k}={v:.3g}' for k, v in vals.items())} of the declared prior box ({e}); narrow "
+                       "the ranges to values the engine accepts")
+            if len(out) >= 3:
+                break
+    return out
 
 
 def dynamics_problems(raw: dict, eng) -> list[str]:

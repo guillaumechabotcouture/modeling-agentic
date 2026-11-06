@@ -118,6 +118,7 @@ class EstimatesProblem:
             raise ValueError(f"calibration.targets: step {int(self.target['steps'].max())} is beyond the horizon's "
                              f"{n_steps} engine steps")
         self.failed = 0
+        self.refusals = []          # [{reason, values}] of the first parameter sets the engine refused
         self.problem = C.Problem(names, {n: pri[n] for n in names}, self.loglik, chunk=4096)
 
     # ---- engine evaluation
@@ -154,9 +155,13 @@ class EstimatesProblem:
         is split until each refused member stands alone."""
         try:
             return self.eng.run_batch(params, units, [Package("none", {})] * len(params), self.horizon, 1)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as e:
             if len(params) == 1:
                 self.failed += 1
+                if len(self.refusals) < 20:          # the first refusals, with the engine's reason and the values
+                    vals = dict(params[0])
+                    vals.update({k: v for k, v in units[0].attributes.items() if k in self.unit_names})
+                    self.refusals.append({"reason": f"{type(e).__name__}: {e}", "values": vals})
                 return [None]
             h = len(params) // 2
             return self._run(params[:h], units[:h]) + self._run(params[h:], units[h:])
@@ -397,6 +402,18 @@ def max_loglik(P: C.Problem, starts) -> tuple:
     return -best, verified
 
 
+def engine_failure_message(E, stage: str) -> str:
+    """Why the calibration stops: how many parameter sets inside the declared priors the engine refused, at which
+    stage, and the first one's values and the engine's reason."""
+    ex = E.refusals[0] if E.refusals else {}
+    vals = ", ".join(f"{k}={v:.3g}" for k, v in sorted((ex.get("values") or {}).items())
+                     if isinstance(v, (int, float)))
+    return (f"the engine refused {E.failed} parameter set(s) inside the declared priors during {stage} "
+            f"(e.g. {vals or 'no values recorded'}: {ex.get('reason', 'no reason recorded')}); the posterior would be "
+            "truncated to what the engine accepts. Narrow the priors to values the engine accepts (the spec validator "
+            "probes the prior box)")
+
+
 def _decision(dec, v: np.ndarray) -> dict:
     thr, prob = float(dec["threshold"]), float(dec["probability"])
     p = float(np.mean(v > thr)) if dec["direction"] == "above" else float(np.mean(v < thr))
@@ -452,9 +469,14 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     nd = int(n_draws or u.get("draws", 1000))
     dr = C.draws(smp, nd, seed)
     X = {n: np.array([d["values"][n] for d in dr]) for n in smp["names"]}
+    # c1 run: a parameter set the engine refuses inside the declared priors would truncate the posterior, so the
+    # calibration fails closed (as calibration.posterior does); the message says where and why. The spec validator
+    # probes the prior box for this before sign-off (toolkit/spec/estimates.py prior_support_problems).
+    if E.failed:
+        raise C.CalibrationRefused("posterior_engine_failure", engine_failure_message(E, "the posterior sample"))
     ll, aux = E.loglik(X)                     # the engine re-run at each draw's applied values
     if E.failed or not np.all(np.isfinite(ll)):
-        raise C.CalibrationRefused("posterior_engine_failure", f"the engine refused {E.failed} draws")
+        raise C.CalibrationRefused("posterior_engine_failure", engine_failure_message(E, "the uncertainty draws"))
     vals = {o["name"]: aux[o["name"]] for o in E.outputs}
     dec = raw["deliverable"].get("decision")
     decision = _decision(dec, vals[dec["output"]]) if dec else None
@@ -474,6 +496,8 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
             sf = _sample(Ef.problem, seed)
         except C.CalibrationRefused as e:
             return {"value": float(v), "kind": kind, "refused": str(e)}
+        if Ef.failed:          # a truncated end fit is not a result (c1)
+            return {"value": float(v), "kind": kind, "refused": engine_failure_message(Ef, f"the fit at {name} = {v:g}")}
         rf = np.asarray(sf["rows"])
         dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": rf}, min(nd, 1000), seed)
         Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
