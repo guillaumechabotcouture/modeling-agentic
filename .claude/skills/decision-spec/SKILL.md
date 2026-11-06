@@ -136,8 +136,9 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   horizon) and its count column.
 - **Names.** Each observation parameter (a bias parameter, a dispersion) has its own name. It must not be the name of a
   calibration prior, an engine parameter or an engine unit attribute. Frame exclusions are not supported for a count
-  series. A reporting fraction's prior lies within [0, 1]. The engine must accept every corner of the prior box (the validator
-  runs it there): for example, keep the susceptible share's lower end above the seed's upper end.
+  series. A reporting fraction's prior lies within [0, 1]. The engine must accept the corners of the prior box, taken
+  at each prior's support ends. The validator runs the engine there; above 64 corners it samples them, and the
+  analysis still stops on any refusal. For example, keep the susceptible share's lower end above the seed's upper end.
 - **Uncertainty.** List `calibration` and `observation` as sources. Exclusions and declared decision tests are
   refused: the posterior carries every declared prior, and the automatic tests are run.
 - **Outputs.** `deliverable.windows` names the windows. Each output in `deliverable.outputs` is an engine window

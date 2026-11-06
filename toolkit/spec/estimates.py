@@ -404,12 +404,30 @@ def validate(s, eng) -> list[str]:
 MAX_PROBE_CORNERS = 64
 
 
+def support_ends(prior) -> list:
+    """A prior's physical support ends (a beta prior: 0 and 1, not its central interval)."""
+    return [0.0, 1.0] if prior.dist == "beta" else [float(prior.lo), float(prior.hi)]
+
+
+def probe_corners(ends, cap: int = MAX_PROBE_CORNERS) -> tuple:
+    """(corners, info): every corner of the box when there are at most `cap`, else `cap` corners drawn by index
+    (seeded) and decoded bit by bit, so 2^n tuples are never built. info: {total, probed, sampled}."""
+    import random
+    d = len(ends)
+    total = 2 ** d
+    idx = list(range(total)) if total <= cap else random.Random(0).sample(range(total), cap)
+    corners = [tuple(ends[j][(i >> j) & 1] for j in range(d)) for i in idx]
+    return corners, {"total": total, "probed": len(corners), "sampled": total > cap}
+
+
 def prior_support_problems(s, eng) -> list[str]:
-    """The engine accepts every corner of the box the calibration priors span (c1 run: s0 on [0, 1] with seed up to
-    1e-3 holds points where seed > s0, which the engine refuses, and the posterior would have been truncated). Each
-    corner is one engine run with the unit's bound attributes; a refusal is reported with the engine's reason, before
-    sign-off. Observation parameters do not reach the engine and are not probed."""
-    import itertools
+    """The engine accepts the corners of the box the calibration priors span, at each prior's physical support ends
+    (c1 run: s0 on [0, 1] with seed up to 1e-3 holds points where seed > s0, which the engine refuses, and the
+    posterior would have been truncated). Each corner is one engine run with the unit's bound attributes; a refusal
+    is reported with the engine's reason and the bound attributes it involves, before sign-off. This catches
+    constraints an engine imposes along the box's edges (such as seed <= s0, which is affine); it does not certify an
+    arbitrary interior domain, and above MAX_PROBE_CORNERS corners it samples them. The analysis keeps its runtime
+    refusal guards either way. Observation parameters do not reach the engine and are not probed."""
     from toolkit.analysis.calibration import Prior
     from toolkit.engines.contract import Horizon, Package, UnitSpec
     card = eng.describe()
@@ -418,15 +436,14 @@ def prior_support_problems(s, eng) -> list[str]:
     names = [n for n in pri if n in pnames or n in card.unit_attributes]
     if not names:
         return []
-    ends = [Prior.from_decl(n, pri[n]).interval() for n in names]
-    corners = list(itertools.product(*ends))
-    if len(corners) > MAX_PROBE_CORNERS:
-        import random
-        corners = random.Random(0).sample(corners, MAX_PROBE_CORNERS)
+    corners, info = probe_corners([support_ends(Prior.from_decl(n, pri[n])) for n in names])
     h = s.raw["horizon"]
     wins = {k: tuple(float(x) for x in v) for k, v in ((s.raw.get("deliverable") or {}).get("windows") or {}).items()}
     hz = Horizon(float(h["start"]), float(h["stop"]), (float(h["start"]), float(h["stop"])), wins)
     base = s.unit_attributes(s.units()[0])
+    bound = {k: v for k, v in base.items() if k not in names}
+    fmt = lambda d: ", ".join(f"{k}={v:.3g}" if isinstance(v, (int, float)) else f"{k}={v}"  # noqa: E731
+                              for k, v in d.items())
     out = []
     for c in corners:
         vals = dict(zip(names, c))
@@ -435,9 +452,11 @@ def prior_support_problems(s, eng) -> list[str]:
         try:
             eng.run_batch([params], [unit], [Package("none", {})], hz, 1)
         except (ValueError, RuntimeError) as e:
-            out.append(f"prior_support_infeasible: calibration.priors: the engine refuses the corner "
-                       f"{', '.join(f'{k}={v:.3g}' for k, v in vals.items())} of the declared prior box ({e}); narrow "
-                       "the ranges to values the engine accepts")
+            where = (f"; with the attributes bound to data or accepted defaults {fmt(bound)}: correct the binding or "
+                     "the prior ranges") if bound else "; narrow the prior ranges to values the engine accepts"
+            out.append(f"prior_support_infeasible: calibration.priors: the engine refuses the corner {fmt(vals)} of "
+                       f"the declared prior box ({e}){where}"
+                       + (f" ({info['probed']} of {info['total']} corners probed)" if info["sampled"] else ""))
             if len(out) >= 3:
                 break
     return out
