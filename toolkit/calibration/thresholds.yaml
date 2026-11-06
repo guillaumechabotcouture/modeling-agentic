@@ -46,6 +46,7 @@ figures:
   depth_bins: 12          # optical-depth cells per axis
   band_rows: 200          # region rows used for each target's model band
   top_pairs: 6            # pairs in the top-pairs figure
+  transmission_rows: 120  # region rows drawn in the transmission figure
 verification:
   # After the last wave the engine itself is run once per unit at the best point. A unit whose simulated value is
   # implausible there (observation, discrepancy and run-noise variance only) is flagged, as is a unit no point in the

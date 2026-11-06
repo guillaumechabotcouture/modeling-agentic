@@ -33,7 +33,7 @@ if ROOT not in sys.path:
 from toolkit.analysis import figure_style as FS  # noqa: E402
 
 NAMES = ("calibration_region", "calibration_top_pairs", "calibration_optical_depth", "calibration_unit_fit",
-         "calibration_waves")
+         "calibration_residuals", "calibration_transmission", "calibration_bound_share", "calibration_waves")
 TIER = "data_model"
 
 
@@ -115,9 +115,16 @@ def fig_region(fd, t, labels=None):
                 g = np.linspace(xlo, xhi, 120)
                 pd = _prior_pdf(fd["prior"][xn], g)
                 ax.fill_between(g, 0, pd / max(pd.max(), 1e-300), color=t["band"], lw=0)
-                h, e = np.histogram(x, bins=20, range=(xlo, xhi), density=True)
-                ax.step(e[:-1], h / max(h.max(), 1e-300), where="post", color=t["cat"][0], lw=1.2)
-                ax.set_yticks([])
+                ds = (fd.get("design_share") or {}).get(xn)
+                if ds:
+                    e = np.asarray(ds["edges"], float)
+                    sh = np.array([np.nan if v is None else v for v in ds["share"]], float)
+                    ax.stairs(sh, e, color=t["cat"][0], lw=1.3)
+                ax.set_ylim(0, 1.05)
+                ax.set_yticks([0, 1])
+                ax.tick_params(axis="y", labelsize=5.5)
+                if i == 0:
+                    ax.set_ylabel("share compatible", fontsize=6.5, color=t["ink2"])
                 rows.append({"panel": f"{xn}", "region_min": float(x.min()), "region_max": float(x.max()),
                              "prior_lo": xlo, "prior_hi": xhi})
             else:
@@ -129,8 +136,8 @@ def fig_region(fd, t, labels=None):
                 ax.set_ylim(ylo, yhi)
                 pr = _pair(fd, xn, yn)
                 r = pr and pr["abs_spearman"]
-                ax.text(0.03, 0.97, "|ρ| n/a" if r is None else f"|ρ| {r:.2f}", transform=ax.transAxes, ha="left",
-                        va="top", fontsize=6.5, color=t["ink"])
+                ax.set_title("|ρ| n/a" if r is None else f"|ρ| {r:.2f}", fontsize=6.5, color=t["ink"], pad=2,
+                             loc="left")
                 rows.append({"panel": f"{yn} vs {xn}", "abs_spearman": r})
             ax.set_xlim(xlo, xhi)
             if i == p - 1:
@@ -152,9 +159,9 @@ def fig_region(fd, t, labels=None):
         cb.ax.tick_params(labelsize=6, colors=t["ink2"])
     acc = int(A.sum())
     title = "Compatible region of the shared parameters"
-    cap = (f"{acc} of {len(A)} candidates shown are compatible. Diagonal: the region's density (line) against the prior (shaded), each on its own prior range. Below: every "
-           "candidate (grey) and the compatible ones coloured by their worst implausibility; |ρ| is the region's "
-           "Spearman co-variation. Parameters ordered by their strongest |ρ|.")
+    cap = (f"{acc} of {len(A)} candidates shown are compatible. Diagonal: the share of the design's candidates in each "
+           "bin that are compatible (line; 1 = all) over the prior's shape (shaded), not a density. Below: every candidate "
+           "(grey) and the compatible ones by worst implausibility; |ρ|: Spearman inside the region.")
     return fig, title, cap, rows
 
 
@@ -304,6 +311,137 @@ def fig_unit_fit(fd, t, labels=None):
     return fig, title, cap, out
 
 
+def _palette(t, groups):
+    """Up to seven groups in the categorical slots by size, the rest as one muted group."""
+    from collections import Counter
+    top = [g for g, _ in Counter(groups).most_common(7)]
+    col = {g: t["cat"][k] for k, g in enumerate(top)}
+    return (lambda g: col.get(g, t["muted"])), top
+
+
+def fig_residuals(fd, t, labels=None):
+    import matplotlib.pyplot as plt
+    rows = [r for r in fd.get("fit") or [] if r["kind"] != "shared"]
+    if not rows:
+        raise NoData("no unit or group target fit rows")
+    groups = {}
+    for r in rows:
+        groups.setdefault(f"{r['kind']} targets, {r['observable']}", []).append(r)
+    keys = list(groups)
+    fig, axs = plt.subplots(1, len(keys), figsize=(4.6 * len(keys) + 0.6, 4.2), squeeze=False)
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.14, top=0.8, wspace=0.3)
+    out = []
+    for n, k in enumerate(keys):
+        ax = axs[0][n]
+        FS.style(ax, t, grid="y")
+        g = groups[k]
+        x = np.array([r["observed"] for r in g])
+        m = np.array([r["verified"] if r.get("verified") is not None else r["model_mid"] for r in g], float)
+        res = x - m
+        bad = np.array([r["status"] != "matched" for r in g])
+        ax.axhline(0, color=t["ink2"], lw=0.8)
+        ax.scatter(x[~bad], res[~bad], s=9, color=t["cat"][0], lw=0)
+        ax.scatter(x[bad], res[bad], s=14, color=t["cat"][1], lw=0)
+        if len(x) >= 3:
+            b = np.polyfit(x, res, 1)
+            xx = np.linspace(x.min(), x.max(), 2)
+            ax.plot(xx, b[1] + b[0] * xx, color=t["ink2"], lw=1, ls="--")
+            ax.set_title(f"{_lab(labels, k)}: slope {b[0]:.2f} (0 = no compression)", fontsize=8, color=t["ink"])
+        ax.set_xlabel("observed", fontsize=8)
+        ax.set_ylabel("observed minus modelled", fontsize=8)
+        FS.set_axis_format(ax, "x")
+        FS.set_axis_format(ax, "y")
+        out += [{"target": r["target"], "observed": float(a), "modelled": float(c), "residual": float(a - c),
+                 "status": r["status"]} for r, a, c in zip(g, x, m)]
+    title = "Residuals against observed values: a rising trend means the model compresses the range"
+    cap = ("Per target: observed minus modelled (the engine at the best point where verified, else the region's median) "
+           "against the observed value; dashed: least-squares line. Orange: not matched.")
+    return fig, title, cap, out
+
+
+def fig_transmission(fd, t, labels=None, k=4):
+    import matplotlib.pyplot as plt
+    tr = fd.get("transmission")
+    if not tr or not tr["n_shared"]:
+        raise NoData("no shared parameters or no region sample")
+    S = np.asarray(tr["rows"], float)
+    p, U = tr["n_shared"], len(tr["units"])
+    Z = S[:, p:p + U]
+    from scipy.stats import spearmanr
+    score = []
+    for j in range(p):
+        rs = [abs(spearmanr(S[:, j], Z[:, u]).correlation) for u in range(U) if np.std(Z[:, u]) > 0]
+        rs = [x for x in rs if np.isfinite(x)]
+        score.append(float(np.median(rs)) if rs else 0.0)
+    order = np.argsort(score)[::-1][:k]
+    color, top = _palette(t, tr["groups"])
+    fig, axs = plt.subplots(1, len(order), figsize=(3.7 * len(order) + 0.8, 3.9), squeeze=False)
+    fig.subplots_adjust(left=0.07, right=0.84, bottom=0.15, top=0.8, wspace=0.28)
+    names = fd["names"]
+    up = tr["unit_param"]
+    cols = [color(g) for g in tr["groups"]]
+    rows = []
+    for n, j in enumerate(order):
+        ax = axs[0][n]
+        FS.style(ax, t, grid="y")
+        xs = np.repeat(S[:, j], U)
+        ys = Z.reshape(-1)
+        cs = np.tile(np.array(cols, dtype=object), len(S))
+        ax.scatter(xs, ys, s=1.2, c=list(cs), lw=0, alpha=0.35, rasterized=True)
+        for b in (up["lo"], up["hi"]):
+            ax.axhline(b, color=t["ink2"], lw=0.8, ls="--")
+        ax.set_xlabel(_lab(labels, names[j]), fontsize=8)
+        if n == 0:
+            ax.set_ylabel(f"each unit's {up.get('name', 'parameter')} ({up.get('scale', '')} scale)", fontsize=8)
+        ax.set_title(f"median |ρ| across units {score[j]:.2f}", fontsize=8, color=t["ink"])
+        FS.set_axis_format(ax, "x")
+        FS.set_axis_format(ax, "y")
+        rows.append({"shared": names[j], "median_abs_spearman_with_units": score[j]})
+    handles = [plt.Line2D([], [], marker="o", ls="none", color=color(g), label=g) for g in top]
+    if len(set(tr["groups"])) > len(top):
+        handles.append(plt.Line2D([], [], marker="o", ls="none", color=t["muted"], label="other"))
+    if [g for g in top if g]:
+        fig.legend(handles=handles, loc="center right", fontsize=7, frameon=False)
+    title = "Each unit's transmission against the shared parameters, across the region"
+    cap = ("Region rows: every unit's value of its own parameter against a shared value, coloured by group; dashed: "
+           "the declared range. The parameters shown trade off most with the units' values (median |ρ| across units).")
+    return fig, title, cap, rows
+
+
+def fig_bound_share(fd, t, labels=None):
+    import matplotlib.pyplot as plt
+    tr = fd.get("transmission")
+    if not tr:
+        raise NoData("no per-unit values")
+    gs = sorted(set(tr["groups"]))
+    at = {g: [] for g in gs}
+    tt = {g: [] for g in gs}
+    for g, a, b in zip(tr["groups"], tr["at_top"], tr["touches_top"]):
+        at[g].append(a)
+        tt[g].append(b)
+    fig, ax = plt.subplots(figsize=(6.4, 0.32 * len(gs) + 1.6))
+    fig.subplots_adjust(left=0.24, right=0.96, bottom=0.12 if len(gs) > 6 else 0.22, top=0.84)
+    FS.style(ax, t, grid="x")
+    y = np.arange(len(gs))
+    a = np.array([np.mean(at[g]) for g in gs])
+    b = np.array([np.mean(tt[g]) for g in gs])
+    ax.barh(y + 0.18, b, height=0.34, color=t["cat"][0], label="compatible interval reaches the top")
+    ax.barh(y - 0.18, a, height=0.34, color=t["cat"][1], label="best value at the top")
+    ax.set_yticks(y)
+    ax.set_yticklabels([g or "(none)" for g in gs], fontsize=7)
+    ax.set_xlim(0, 1)
+    FS.set_axis_format(ax, "x")
+    ax.set_xlabel("share of the group's units", fontsize=8)
+    ax.legend(fontsize=7, loc="lower right")
+    rows = [{"group": g, "units": len(at[g]), "best_at_top": float(np.mean(at[g])),
+             "interval_reaches_top": float(np.mean(tt[g]))} for g in gs]
+    na, nb = int(np.sum(tr["at_top"])), int(np.sum(tr["touches_top"]))
+    top = tr["unit_param"]["hi"]
+    return fig, f"Units at the top of the transmission range ({top:g}): {na} best values, {nb} intervals", (
+        "Per group: the share of units whose best value of their own parameter is the range's top, and whose compatible "
+        "interval reaches it. Many units there mean the declared range, not the data, ends the region."), rows
+
+
 def fig_waves(fd, t, labels=None):
     import matplotlib.pyplot as plt
     w = [x for x in fd.get("waves") or [] if x.get("share_of_prior") is not None]
@@ -329,7 +467,8 @@ def fig_waves(fd, t, labels=None):
 
 FUNCS = {"calibration_region": fig_region, "calibration_top_pairs": fig_top_pairs,
          "calibration_optical_depth": fig_optical_depth, "calibration_unit_fit": fig_unit_fit,
-         "calibration_waves": fig_waves}
+         "calibration_residuals": fig_residuals, "calibration_transmission": fig_transmission,
+         "calibration_bound_share": fig_bound_share, "calibration_waves": fig_waves}
 
 
 def draw(name, fd, t, labels=None):
@@ -356,11 +495,11 @@ def render(fd, dest: str, root: str, labels=None, theme: str = "light", sources=
             notp.append({"figure": name, "reason": str(e), "tier": TIER})
             continue
         FS.title(fig, title, t)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=FS.DPI)
+        from toolkit.analysis.figures import _fig_bytes     # the figures' one in-memory renderer (write_audit)
+        png = _fig_bytes(fig, "png", dpi=FS.DPI)
         plt.close(fig)
         rel = os.path.relpath(os.path.join(dest, f"{name}.png"), root)
-        write_nofollow(root, rel, buf.getvalue(), atomic=True)
+        write_nofollow(root, rel, png, atomic=True)
         s = io.StringIO()
         if rows:
             w = csv.DictWriter(s, fieldnames=list(rows[0]), extrasaction="ignore")

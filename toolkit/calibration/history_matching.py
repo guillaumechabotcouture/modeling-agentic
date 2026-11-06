@@ -213,13 +213,14 @@ class Problem:
     """shared: [Param]; unit_param: {name, lo, hi} or None; units: [ids]; features: {unit: [floats]} (each unit the
     same length; may be empty); targets: [Target]; scales: {observable: scale}."""
 
-    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None):
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None):
         self.shared = list(shared)
         self.unit_param = dict(unit_param) if unit_param else None
         self.units = [str(u) for u in units]
         self.targets = list(targets)
         self.features = {str(k): [float(x) for x in v] for k, v in (features or {}).items()}
         self.feature_names = list(feature_names or [])
+        self.groups = {str(k): str(v) for k, v in (groups or {}).items()}      # a label per unit, figures only
         self.scales = {}
         for t in self.targets:
             self.scales.setdefault(t.observable, t.scale)
@@ -536,7 +537,11 @@ class HistoryMatch:
     natural scales) and returns one {observable: value} per point (natural scale); any missing or non-finite value
     fails closed."""
 
-    def __init__(self, problem: Problem, simulate, seed: int = 0, log=print, **override):
+    def __init__(self, problem: Problem, simulate, seed: int = 0, log=print, prior=None, record=(), **override):
+        """`prior`: earlier runs ({"unit": [{unit, z, theta, seed, obs}], "shared": [{theta, seed, obs}]}, natural
+        scales, as a report's "runs") used as data before the first new wave; each must lie inside the declared
+        ranges and carry every observable (fail closed). `record`: observables kept with every run and the
+        verification but never emulated or judged (for example a diagnostic the report states beside the fit)."""
         bad = problem.problems()
         if bad:
             raise CalibrationInputError(bad)
@@ -553,12 +558,56 @@ class HistoryMatch:
         self.data = Data()
         self.waves = []
         self.boundary = {}
+        self.record = [str(x) for x in record or ()]
+        self.prior_n = 0
         self.uobs = problem.observables("unit")
         self.sobs = problem.observables("shared")
         mp = int(self.eth["min_points_per_unit"])
         if problem.units and int(self.th["points_per_unit"]) < mp:     # Codex r1 P2-15
             raise CalibrationInputError([f"points_per_unit {self.th['points_per_unit']} is below the emulator's "
                                          f"min_points_per_unit {mp} (toolkit/calibration/thresholds.yaml)"])
+        if prior:
+            self._load_prior(prior)
+
+    def _load_prior(self, prior):
+        P, bad = self.P, []
+        lo, hi = (P.unit_param["lo"], P.unit_param["hi"]) if P.unit_param else (0.0, 1.0)
+        uset = set(P.units)
+
+        def cube_t(th, w):
+            try:
+                t = np.array([(float(th[p.name]) - p.lo) / (p.hi - p.lo) for p in P.shared], float)
+            except (KeyError, TypeError, ValueError):
+                bad.append(f"{w}: shared values {sorted(th or {})} do not name every shared parameter")
+                return None
+            if not (np.all(np.isfinite(t)) and np.all(t >= -1e-12) and np.all(t <= 1 + 1e-12)):
+                bad.append(f"{w}: a shared value lies outside its declared range")
+                return None
+            return np.clip(t, 0, 1)
+        for kind, need in (("unit", self.uobs), ("shared", self.sobs)):
+            for n, r in enumerate(prior.get(kind) or []):
+                w = f"earlier {kind} run {n}"
+                t = cube_t(r.get("theta") or {}, w)
+                obs = r.get("obs") or {}
+                miss = [ob for ob in need if not in_domain(obs.get(ob), P.scales[ob]) and
+                        not (P.scales[ob] == "logit" and obs.get(ob) in (0, 1))]
+                if miss:
+                    bad.append(f"{w}: observables {miss} missing or outside their domain")
+                if t is None or miss:
+                    continue
+                row = {"t": t, "seed": r.get("seed"), "obs": {ob: float(obs[ob]) for ob in need},
+                       "prior": True}
+                if kind == "unit":
+                    z = r.get("z")
+                    if r.get("unit") not in uset or not isinstance(z, (int, float)) or not lo - 1e-9 <= z <= hi + 1e-9:
+                        bad.append(f"{w}: unit {r.get('unit')!r} not calibrated or its value {z!r} outside "
+                                   f"[{lo}, {hi}]")
+                        continue
+                    row.update(unit=r["unit"], s=float(np.clip((z - lo) / (hi - lo), 0, 1)))
+                self.data.add(kind, [row])
+        if bad:
+            raise CalibrationInputError(bad)
+        self.prior_n = len(self.data.unit) + len(self.data.shared)
 
     # ---------------------------------------------------------------- simulation
     def _run(self, kind, rows):
@@ -588,7 +637,8 @@ class HistoryMatch:
                 elif not in_domain(v, sc):
                     bad.append(f"simulate: point {r.get('unit', 'shared')} seed {r['seed']}: observable {ob} is "
                                f"missing, not finite or outside the {sc} scale's domain ({v!r})")
-            r["obs"] = {ob: float(o[ob]) for ob in need if ob in (o or {})}
+            r["obs"] = {ob: float(o[ob]) for ob in list(need) + self.record if ob in (o or {})
+                        and isinstance(o[ob], (int, float)) and not isinstance(o[ob], bool)}
         if bad:
             raise CalibrationInputError(bad)
         return rows
@@ -908,8 +958,21 @@ class HistoryMatch:
         state = None
         valid = {}
         self.valid_hist = {}
+        off = 0
+        if self.prior_n:      # the earlier runs are wave 0: checked (cross-validation over them), fitted, a region
+            pu, ps = list(self.data.unit), list(self.data.shared)
+            valid = self._validate(pu, ps)
+            for ob, v in valid.items():
+                self.valid_hist.setdefault(ob, []).append(v["status"])
+            self.em = self._fit(pu, ps)
+            state = self._region(self.em)
+            self.waves.append(dict(self._wave_summary(-1, pu, ps, valid, state), prior_runs=len(pu),
+                                   prior_shared_runs=len(ps)))
+            self.log(f"joint calibration: {len(pu)} earlier unit runs and {len(ps)} shared runs as data; region "
+                     f"{len(state['region'])} of {len(state['C'])}")
+            off = 100           # new waves: their own seeds and designs from the region
         for w in range(nw):
-            urows, srows = self._design(w, state)
+            urows, srows = self._design(w + off, state)
             self.log(f"joint calibration wave {w + 1}/{nw}: {len(urows)} unit runs, {len(srows)} shared runs")
             urows = self._run("unit", urows)
             srows = self._run("shared", srows)
@@ -1027,6 +1090,30 @@ class HistoryMatch:
                              "status": "matched" if (ver or {}).get("targets", {}).get(tg.id, {}).get("ok", True)
                              else "verification_failed"})
         out["fit"] = rows
+        # per-unit transmission against the shared values (figures): region rows, each unit's best value, the bound
+        if smp and P.units:
+            S = np.asarray(smp["rows"], float)
+            k = min(len(S), int(fth.get("transmission_rows", 120)))
+            S = S[np.random.default_rng([self.seed, 29]).choice(len(S), k, replace=False)]
+            lo_, hi_ = P.unit_param["lo"], P.unit_param["hi"]
+            step = (hi_ - lo_) / max(len(self.zg) - 1, 1)
+            zb = {u: units[u]["z_best"] for u in P.units}
+            out["transmission"] = {
+                "rows": S.tolist(), "n_shared": self.p, "units": P.units, "groups": [P.groups.get(u, "") for u in P.units],
+                "unit_param": dict(P.unit_param), "z_best": [zb[u] for u in P.units],
+                "at_top": [zb[u] >= hi_ - 0.5 * step for u in P.units],
+                "at_bottom": [zb[u] <= lo_ + 0.5 * step for u in P.units],
+                "touches_top": ["hi" in (units[u]["region_touches_bound"] or []) for u in P.units],
+                "status": [units[u]["status"] for u in P.units]}
+        cand_all = nat(C[:n0]) if self.p else np.zeros((0, 0))
+        out["design_share"] = {}
+        for j, p in enumerate(P.shared):        # the compatible share of the design's candidates, by bin
+            e = np.linspace(p.lo, p.hi, 21)
+            b = np.clip(np.digitize(cand_all[:, j], e) - 1, 0, 19)
+            tot = np.bincount(b, minlength=20)
+            hit = np.bincount(b, weights=acc[:n0].astype(float), minlength=20)
+            out["design_share"][p.name] = {"edges": e.tolist(),
+                                           "share": [float(h / t) if t else None for h, t in zip(hit, tot)]}
         return out
 
     def compatible(self, theta: dict) -> bool:
@@ -1089,7 +1176,8 @@ class HistoryMatch:
             byu[u] = best[2]["obs"]
             out["units"][u] = {"implausibility": round(best[0], 4), "ok": best[0] <= self.cut, "targets": best[1],
                                "z": float(self.P.z_natural(best[2]["s"])),
-                               "runs": sum(1 for x in urows if x["unit"] == u)}
+                               "runs": sum(1 for x in urows if x["unit"] == u),
+                               "recorded": {k: best[2]["obs"][k] for k in self.record if k in best[2]["obs"]}}
         for tg in self.P.targets:
             if tg.kind == "group":
                 ws = sum(tg.weights.values())
@@ -1298,8 +1386,9 @@ class HistoryMatch:
         return {u: self._witness_g(u, c) for u in own}
 
 
-def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, **override) -> dict:
-    return HistoryMatch(problem, simulate, seed, log, **override).run(waves)
+def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, prior=None, record=(),
+              **override) -> dict:
+    return HistoryMatch(problem, simulate, seed, log, prior=prior, record=record, **override).run(waves)
 
 
 # --------------------------------------------------------------------------- self-test
@@ -1648,6 +1737,48 @@ def _self_test() -> int:
         ok(r["simulated_at_boundary"].get("w1", 0) >= 1, f"HM16 a simulated proportion at 0 is kept and counted "
                                                          f"({r.get('simulated_at_boundary')})")
     safe(hm16, "HM16")
+
+    def hm17():          # 2026-11-06: earlier runs are data (a wider range, another error setting), not discarded
+        P, sim, truth, *_ = _toy()
+        r1 = calibrate(P, sim, seed=3, waves=1, log=q, **fast)
+        calls = {"n": 0}
+
+        def counted(pts):
+            calls["n"] += len(pts)
+            return sim(pts)
+        P2, *_ = _toy()
+        P2.unit_param = dict(P2.unit_param, hi=3.0)          # a raised ceiling: the earlier runs lie inside it
+        h = HistoryMatch(P2, counted, 3, q, prior=r1["runs"], **fast)
+        r2 = h.run(1)
+        ok(len(h.data.unit) == len(r1["runs"]["unit"]) + len(P.units) * fast["points_per_unit"]
+           and calls["n"] == len(P.units) * fast["points_per_unit"] + sum(v["runs"] for v in
+                                                                         r2["verification"]["units"].values())
+           and r2["waves"][0].get("prior_runs") == len(r1["runs"]["unit"]) and r2["status"] == "matched",
+           f"HM17a earlier runs are reused as data, only the new wave and the verification simulate ({calls['n']})")
+        h0 = HistoryMatch(P2, counted, 3, q, prior=r1["runs"], **fast)
+        r0 = h0.run(0)
+        ok(r0["region"]["accepted"] > 0 and len(r0["waves"]) == 1, "HM17b zero new waves: the earlier runs alone")
+        bad = {"unit": [dict(r1["runs"]["unit"][0], z=9.0)] + r1["runs"]["unit"][1:], "shared": []}
+        try:
+            HistoryMatch(P2, sim, 3, q, prior=bad, **fast)
+            ok(False, "HM17c an earlier run outside the declared range is refused")
+        except CalibrationInputError:
+            ok(True, "HM17c an earlier run outside the declared range is refused")
+
+    def hm18():          # recorded observables: kept with every run and the verification, never a target
+        P, sim, *_ = _toy()
+
+        def rec(pts):
+            out = sim(pts)
+            for o in out:
+                o["extra"] = 7.0
+            return out
+        r = calibrate(P, rec, seed=3, waves=1, log=q, record=["extra"], **fast)
+        ok(all(x["obs"].get("extra") == 7.0 for x in r["runs"]["unit"])
+           and all(v.get("recorded", {}).get("extra") == 7.0 for v in r["verification"]["units"].values()),
+           "HM18 a recorded observable is kept with every run and the verification")
+    safe(hm17, "HM17")
+    safe(hm18, "HM18")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

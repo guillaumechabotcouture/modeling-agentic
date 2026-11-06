@@ -275,8 +275,6 @@ _FIX = "self-test fixture code in a helper the skip rule does not name"
 REVIEWED: dict = {
     "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
     "agents/run_preflight.py": {"shutil": (1, "removes the preflight's own temporary work dir")},
-    "toolkit/analysis/joint_calibration.py": {"open-write": (2, "the benchmark child process's input and output "
-                                                                "files, in the parent's own tempfile.TemporaryDirectory")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
     "scripts/compute.py": {

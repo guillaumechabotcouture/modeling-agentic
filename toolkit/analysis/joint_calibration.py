@@ -103,7 +103,7 @@ def spec_problems(spec) -> list[str]:
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
-                           "shared_points", "targets", "independent"})
+                           "shared_points", "targets", "independent", "record"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
     sh = j.get("shared")
@@ -160,6 +160,10 @@ def spec_problems(spec) -> list[str]:
         wins = card.outputs.get("windows", [])
     else:
         eng, wins = None, None
+    for n, r in enumerate(j.get("record") or []):
+        if not (isinstance(r, dict) and _window(r.get("window")) and (wins is None or r.get("metric") in wins)):
+            bad.append(f"{w}.record[{n}]: {{window: [a, b], metric: <engine window metric>}} (kept with every run, "
+                       "never a target)")
     tg = j.get("targets")
     if not (isinstance(tg, list) and tg):
         return bad + [f"{w}.targets: a non-empty list"]
@@ -256,8 +260,8 @@ def _unit_sd(t, row, scale, value):
 def _windows(j) -> dict:
     """{window key: [a, b]}, one key per distinct window of the unit and group targets (jc0, jc1, ...)."""
     out = {}
-    for t in j["targets"]:
-        if t["kind"] in ("unit", "group"):
+    for t in list(j["targets"]) + [dict(r, kind="record") for r in j.get("record") or []]:
+        if t["kind"] in ("unit", "group", "record"):
             w = [float(x) for x in t["window"]]
             if w not in out.values():
                 out[f"jc{len(out)}"] = w
@@ -343,12 +347,52 @@ def build(spec, units=None) -> tuple:
     F = {i: [_feature(rows[i], f) for f in feats] for i in ids} if feats else {}
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
           "scale": cal.get("scale", "log")}
+    reg = spec.raw["decision_units"].get("region")
     P = HM.Problem(shared, up, ids, targets, features=F,
-                   feature_names=[f if isinstance(f, str) else f["column"] for f in feats])
-    return P, {"windows": wins, "dropped": dropped, "units": ids}
+                   feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
+                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None)
+    rec = [_observable(r, wins) for r in j.get("record") or []]
+    return P, {"windows": wins, "dropped": dropped, "units": ids, "record": rec}
 
 
 # --------------------------------------------------------------------------- simulation
+class _Deferred(Exception):
+    """A benchmark runner needs engine jobs that are not in the cache yet (recorded; run them as a batch)."""
+
+
+def _jdefault(x):
+    return x.tolist() if hasattr(x, "tolist") else repr(x)
+
+
+def _jkey(j) -> str:
+    return json.dumps(list(j), sort_keys=True, default=_jdefault)
+
+
+def _runner_cls():
+    from toolkit.engines import benchmark as BM
+
+    class CachedRunner(BM.Runner):
+        """The benchmark runner with its engine calls answered from a cache; a miss records the jobs and stops this
+        evaluation (_Deferred), so the jobs of every point are batched together."""
+
+        def __init__(self, pack, engine, cache, pending, base_params=None):
+            super().__init__(pack, engine, workers=1, base_params=base_params)
+            self._jc_cache, self._jc_pending = cache, pending
+
+        def _map(self, jobs, chunk: int = 300):
+            keys = [_jkey(j) for j in jobs]
+            miss = [j for j, k in zip(jobs, keys) if k not in self._jc_cache]
+            if miss:
+                self._jc_pending.extend(miss)
+                raise _Deferred()
+            return [self._jc_cache[k] for k in keys]
+    return CachedRunner
+
+
+def _CachedRunner(*a, **k):
+    return _runner_cls()(*a, **k)
+
+
 class Simulator:
     """HistoryMatch's simulate(): unit points through the analysis batch (comparator package), shared points through
     the benchmark runner. Every call writes its own results file under analysis/joint_calibration/."""
@@ -371,34 +415,89 @@ class Simulator:
             self.horizon["delivery"] = [float(x) for x in spec.raw["objective"]["delivery"]]
         self.bench = None
 
+    def job(self, p, k, windows=None, call=None) -> dict:
+        """The batch job of unit point p at position k of a call (the batch's job_sha covers every field but id)."""
+        a = self.spec.unit_attributes(self.rows[p["unit"]])
+        a[self.spec.raw["calibration"]["attribute"]] = self.cv(self.spec, p["z"])
+        return {"id": f"jc{self.calls if call is None else call}|{k}", "point": k, "package": self.comp,
+                "components": self.comp_engine, "unit": a, "params": self._theta(p["theta"]),
+                "seed": int(p["seed"]) % (2 ** 31), "engine": self.spec.raw["engine"], "horizon": self.horizon,
+                "windows": self.meta["windows"] if windows is None else windows}
+
     def _theta(self, th):
         from toolkit.spec import engine_parameters as PV
         return PV.params(self.spec, dict({k: v for k, v in self.th0.items()}, **th))
 
     def _shared(self, pts, six, out):
-        """Benchmark targets at each point's shared values: the pack's settings re-calibrated there, then each
-        benchmark evaluated by the benchmark runner, in a child process of its own (its process pool is never forked
-        from this process, whose other thread drives the unit batch)."""
-        import subprocess
-        import tempfile
+        """Benchmark targets at each point's shared values, through the compute backend (scripts/compute.py: a
+        Coiled cluster when the job has one). Each point's runner re-calibrates the pack's settings there and
+        evaluates every benchmark; its engine jobs are collected across all points and run as one batch per phase
+        (settings first, then the arms they calibrate), the runner replaying from the results."""
         from toolkit.analysis.batch import fitted_ranges
-        fitted = {k: v[2] for k, v in fitted_ranges(self.eng).items()}
+        from toolkit.engines import benchmark as BM
+        pack, fit, why = _benchmarks(self.eng)
+        if pack is None:
+            raise HM.CalibrationInputError([f"benchmark targets: the engine has no pack ({why})"])
         want = [t["id"] for t in self.spec.raw["calibration"][FIELD]["targets"] if t["kind"] == "benchmark"]
-        with tempfile.TemporaryDirectory(prefix="jc-bench-") as d:
+        held = [t for t in want if t not in fit]
+        if held:                    # a held-out benchmark never enters a fit (also refused at validation)
+            raise HM.CalibrationInputError([f"benchmark targets {held} are held out by the engine's pack"])
+        byid = {b["id"]: b for b in pack["benchmarks"]}
+        fitted = {k: v[2] for k, v in fitted_ranges(self.eng).items()}
+        settings = sorted({pack["arms"][a]["setting"] for t in want for a in BM._arms_of(byid[t]["estimand"])})
+        cache = {}
+        for phase in range(int(self.kw.get("bench_phases", 8))):
+            pending, done = [], {}
             for n in six:
-                job = {"engine": self.spec.raw["engine"], "targets": want, "fitted": fitted,
-                       "base_params": {k: v for k, v in self._theta(pts[n]["theta"]).items() if k not in fitted},
-                       "workers": int(self.kw.get("bench_workers", self.kw.get("max_workers", 2)))}
-                fi, fo = os.path.join(d, f"in{n}.json"), os.path.join(d, f"out{n}.json")
-                with open(fi, "w") as f:
-                    json.dump(job, f)
-                p = subprocess.run([sys.executable, "-W", "ignore", os.path.abspath(__file__), "--bench-eval", fi, fo],
-                                   cwd=ROOT, capture_output=True, text=True)
-                if p.returncode or not os.path.exists(fo):
-                    raise HM.CalibrationInputError([f"benchmark evaluation failed at shared point {n}: "
-                                                    f"{(p.stderr or p.stdout)[-800:]}"])
-                with open(fo) as f:
-                    out[n] = {f"bench.{k}": float(v) for k, v in json.load(f).items()}
+                R = _CachedRunner(pack, self.eng, cache, pending,
+                                  base_params={k: v for k, v in self._theta(pts[n]["theta"]).items() if k not in fitted})
+                try:
+                    R.calibrate_settings(fitted, settings)
+                except _Deferred:
+                    continue
+                vals = {}
+                for t in want:
+                    try:
+                        vals[f"bench.{t}"] = float(R.evaluate(byid[t], fitted)["computed"])
+                    except _Deferred:
+                        pass
+                if len(vals) == len(want):
+                    done[n] = vals
+            if not pending:
+                for n in six:
+                    out[n] = done[n]
+                return
+            self._bench_batch(pending, cache, phase)
+        raise HM.CalibrationInputError(["benchmark targets: the runner still needed engine jobs after "
+                                        f"{self.kw.get('bench_phases', 8)} phases"])
+
+    def _bench_batch(self, pending, cache, phase):
+        """Run the collected benchmark engine jobs once each, grouped as the runner groups them (jobs of one setting,
+        horizon and seed share a starting state for an engine that offers it)."""
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        from toolkit.engines import benchmark as BM
+        uniq = {}
+        for j in pending:
+            uniq.setdefault(_jkey(j), j)
+        groups = {}
+        for k, j in uniq.items():
+            ref, config, params, unit, package, horizon, seed = j
+            g = json.dumps([ref, config, unit, horizon, seed], sort_keys=True, default=_jdefault) \
+                if BM.shares_state(BM._engine_of(j)) else k
+            groups.setdefault(g, []).append(j)
+        tasks = [[list(x) for x in g] for g in groups.values()]
+        outp = os.path.join(self.run_dir, OUT_REL, f"bench_call{self.calls}_phase{phase}.jsonl")
+        kw = {k: v for k, v in self.kw.items() if k in ("max_workers", "max_core_hours", "timeout_s")}
+        rows, summ = compute.run_map(self.run_dir, os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list",
+                                     tasks, outp, purpose="v2 joint calibration: benchmark settings", **kw)
+        bad = [n for n, r in enumerate(rows) if not r.get("ok")]
+        if bad:
+            raise HM.CalibrationInputError([f"benchmark batch: {len(bad)} of {len(rows)} tasks failed (e.g. "
+                                            f"{(rows[bad[0]].get('error') or '')[:300]})"])
+        for g, r in zip(tasks, rows):
+            for j, o in zip(g, r["result"]):
+                cache[_jkey(j)] = o
 
     def __call__(self, pts):
         from toolkit.analysis import batch as Bt
@@ -408,27 +507,15 @@ class Simulator:
         uix = [n for n, p in enumerate(pts) if p["kind"] == "unit"]
         six = [n for n, p in enumerate(pts) if p["kind"] == "shared"]
         attr = self.spec.raw["calibration"]["attribute"]
-        ex = ThreadPoolExecutor(1)       # benchmark settings run here while the unit batch runs on the compute backend
-        fut = ex.submit(self._shared, pts, six, out) if six else None
-        try:
-            self._units(pts, uix, out, attr, Bt)
-        finally:
-            if fut is not None:
-                fut.result()
-            ex.shutdown()
+        self._units(pts, uix, out, attr, Bt)           # both through the compute backend, one after the other
+        if six:
+            self._shared(pts, six, out)
+        _ = ThreadPoolExecutor
         return out
 
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
-            jobs = []
-            for k, n in enumerate(uix):
-                p = pts[n]
-                a = self.spec.unit_attributes(self.rows[p["unit"]])
-                a[attr] = self.cv(self.spec, p["z"])
-                jobs.append({"id": f"jc{self.calls}|{k}", "point": k, "package": self.comp,
-                             "components": self.comp_engine, "unit": a, "params": self._theta(p["theta"]),
-                             "seed": int(p["seed"]) % (2 ** 31), "engine": self.spec.raw["engine"],
-                             "horizon": self.horizon, "windows": self.meta["windows"]})
+            jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
             b = Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
                        **{k: v for k, v in self.kw.items() if k != "bench_workers"})
             if b["problems"]:
@@ -443,15 +530,59 @@ class Simulator:
 
 
 # --------------------------------------------------------------------------- the step
-def run(spec, run_dir, compute_kw=None, log=print, units=None, **override) -> dict:
+def load_prior(spec, prior_dir, meta, log=print) -> tuple:
+    """Earlier runs of a diagnostic directory (the CLI's --out: runs.json, joint_calibration.yaml and the batch rows
+    under jc_rows/call*/results.jsonl), kept only where each run's batch job, rebuilt from the current spec with the
+    earlier windows, has the job_sha and engine identity its stored row's provenance records (fail closed: a run
+    that cannot be matched is dropped and counted). Earlier shared runs carry no batch provenance and are not reused."""
+    import glob
+    import yaml
+    from toolkit.analysis import batch as Bt
+    from toolkit.engines.contract import engine_identity
+    runs = json.load(open(os.path.join(prior_dir, "runs.json")))
+    rep = yaml.safe_load(open(os.path.join(prior_dir, "joint_calibration.yaml")))
+    wins = (rep.get("adapter") or {}).get("windows")
+    if not wins:
+        raise HM.CalibrationInputError([f"{prior_dir}: the earlier report records no windows"])
+    calls = sorted(glob.glob(os.path.join(prior_dir, "jc_rows", "call*", "results.jsonl")),
+                   key=lambda p: int(os.path.basename(os.path.dirname(p))[4:]))
+    sim = Simulator(spec, prior_dir, meta)
+    ident = engine_identity(spec.engine())
+    unit_runs, n, kept = runs.get("unit") or [], 0, []
+    for path in calls:          # the runs are the calls' jobs in order; each is kept only if its own row matches
+        if n >= len(unit_runs):
+            break
+        rows = sorted((json.loads(x) for x in open(path) if x.strip()), key=lambda r: r.get("i", 0))
+        for k, r in enumerate(rows):
+            if n >= len(unit_runs):
+                break
+            run_ = unit_runs[n]
+            n += 1
+            pv = ((r.get("result") or {}).get("provenance") or {})
+            try:
+                sha = Bt.job_sha(sim.job(run_, k, windows=wins))
+            except (KeyError, TypeError, ValueError):
+                sha = None
+            if r.get("ok") and r.get("i") == k and pv.get("job_sha") == sha and pv.get("engine") == ident:
+                kept.append(run_)
+    dropped = len(unit_runs) - len(kept)
+    log(f"earlier runs: {len(kept)} unit runs reused (provenance matched), {dropped} not matched, "
+        f"{len(runs.get('shared') or [])} shared runs not reused (no batch provenance)")
+    return {"unit": kept, "shared": []}, {"reused": len(kept), "unmatched": dropped, "from": prior_dir}
+
+
+def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, waves=None, **override) -> dict:
     """The joint calibration of the spec: the history-matching report, plus the adapter's meta. Raises
     CalibrationInputError on a refused declaration; a blocked result is returned (report['blocked'])."""
     P, meta = build(spec, units)
     j = declared(spec)
     ov = {k: j[k] for k in ("points_per_unit", "shared_points") if k in j}
     ov.update(override)
+    prior, pinfo = load_prior(spec, prior_dir, meta, log) if prior_dir else (None, None)
     sim = Simulator(spec, run_dir, meta, compute_kw, log)
-    rep = HM.calibrate(P, sim, seed=int(j.get("seed", 0)), waves=j.get("waves"), log=log, **ov)
+    rep = HM.calibrate(P, sim, seed=int(j.get("seed", 0)), waves=j.get("waves") if waves is None else waves, log=log,
+                       prior=prior, record=meta["record"], **ov)
+    rep["prior_runs"] = pinfo
     rep["adapter"] = {"windows": meta["windows"], "dropped_targets": meta["dropped"], "units": len(meta["units"]),
                       "shared": list(j["shared"]), "simulator_calls": sim.calls,
                       "theta_held": {k: v for k, v in sim.th0.items() if k not in j["shared"]}}
@@ -536,33 +667,7 @@ def summary(rep) -> str:
     return "\n".join(L)
 
 
-def bench_eval(fi, fo) -> int:
-    """The child process of Simulator._shared: {benchmark id: computed value} at the given parameters."""
-    from toolkit.engines import benchmark as BM
-    from toolkit.spec.schema import load_engine
-    with open(fi) as f:
-        job = json.load(f)
-    eng = load_engine(job["engine"])
-    pack, fit, why = _benchmarks(eng)
-    if pack is None:
-        raise SystemExit(f"no benchmark pack: {why}")
-    bad = [t for t in job["targets"] if t not in fit]
-    if bad:                                   # held out: never evaluated for a fit (fail closed here too)
-        raise SystemExit(f"not fit targets of the pack: {bad}")
-    byid = {b["id"]: b for b in pack["benchmarks"]}
-    settings = sorted({pack["arms"][a]["setting"] for t in job["targets"] for a in BM._arms_of(byid[t]["estimand"])})
-    R = BM.Runner(pack, eng, workers=int(job["workers"]), base_params=job["base_params"])
-    R.calibrate_settings(job["fitted"], settings)
-    res = {t: float(R.evaluate(byid[t], job["fitted"])["computed"]) for t in job["targets"]}
-    with open(fo, "w") as f:
-        json.dump(res, f)
-    return 0
-
-
 def main(argv=None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["--bench-eval"]:
-        return bench_eval(argv[1], argv[2])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--spec", default="decision_spec.yaml")
@@ -571,6 +676,10 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--bench-workers", type=int, help="processes of the benchmark runner (default --workers)")
     ap.add_argument("--max-core-hours", type=float, help="compute.py allowance per batch call")
+    ap.add_argument("--prior", help="an earlier diagnostic output directory whose runs are reused (provenance checked)")
+    ap.add_argument("--then-spec", help="a second spec (another setting) calibrated next on every run of the first")
+    ap.add_argument("--then-out", help="its output directory")
+    ap.add_argument("--then-waves", type=int, default=0, help="new waves of the second setting (default 0)")
     ap.add_argument("--waves", type=int)
     ap.add_argument("--points-per-unit", type=int)
     ap.add_argument("--self-test", action="store_true")
@@ -590,22 +699,40 @@ def main(argv=None) -> int:
     ov = {}
     if a.points_per_unit:
         ov["points_per_unit"] = a.points_per_unit
-    if a.waves:
-        spec.raw["calibration"][FIELD]["waves"] = a.waves
-    rep = run(spec, rd, kw, log=lambda *x, **k: print(*x, flush=True), units=units, **ov)
-    out = os.path.abspath(a.out or os.path.join(rd, OUT_REL))
+    say = lambda *x, **k: print(*x, flush=True)  # noqa: E731
+    rep = run(spec, rd, kw, log=say, units=units, prior_dir=a.prior, waves=a.waves, **ov)
+    _write_out(rep, rd, a.out)
+    rc = 0 if not rep["blocked"] else 3
+    if a.then_spec:     # a second setting on the same runs, in this process: every run of the first is its data
+        spec2 = schema.load(os.path.join(rd, a.then_spec))
+        P2, meta2 = build(spec2, units)
+        j2 = declared(spec2)
+        sim2 = Simulator(spec2, rd, meta2, kw, say)
+        sim2.calls = 1000            # its batch files apart from the first setting's
+        rep2 = HM.calibrate(P2, sim2, seed=int(j2.get("seed", 0)), waves=a.then_waves, log=say, prior=rep["runs"],
+                            record=meta2["record"], **{k: j2[k] for k in ("points_per_unit", "shared_points") if k in j2})
+        rep2["adapter"] = {"windows": meta2["windows"], "dropped_targets": meta2["dropped"], "units": len(meta2["units"]),
+                           "shared": list(j2["shared"]), "simulator_calls": sim2.calls - 1000,
+                           "theta_held": {k: v for k, v in sim2.th0.items() if k not in j2["shared"]}}
+        rep2["prior_runs"] = {"reused": len(rep["runs"]["unit"]), "shared_reused": len(rep["runs"]["shared"]),
+                              "from": "the first setting, same process"}
+        _write_out(rep2, rd, a.then_out)
+    return rc
+
+
+def _write_out(rep, rd, out_arg):
+    import yaml
+    out = os.path.abspath(out_arg or os.path.join(rd, OUT_REL))
     os.makedirs(out, exist_ok=True)
     froot = rd if os.path.commonpath([rd, out]) == rd else out
     rep["figures"] = render_figures(rep, froot, dest_rel=os.path.relpath(os.path.join(out, "figures"), froot))
     print("figures:", [f["path"] for f in rep["figures"]["figures"]], rep["figures"]["not_produced"], flush=True)
     from toolkit.analysis.artifacts import _safe_io      # no link followed inside the run dir (write_audit WA3)
-    root = rd if os.path.commonpath([rd, out]) == rd else out
-    _safe_io().write_nofollow(root, os.path.relpath(os.path.join(out, "joint_calibration.yaml"), root),
+    _safe_io().write_nofollow(froot, os.path.relpath(os.path.join(out, "joint_calibration.yaml"), froot),
                               yaml.safe_dump(HM_plain(artifact(rep)), sort_keys=False).encode(), atomic=True)
-    _safe_io().write_nofollow(root, os.path.relpath(os.path.join(out, "runs.json"), root),
+    _safe_io().write_nofollow(froot, os.path.relpath(os.path.join(out, "runs.json"), froot),
                               json.dumps(HM_plain(rep.get("runs") or {})).encode(), atomic=True)
     print(summary(rep), flush=True)
-    return 0 if not rep["blocked"] else 3
 
 
 def HM_plain(x):
@@ -761,6 +888,78 @@ def _self_test() -> int:
             ok(not bad and [x.name for x in P.shared] == ["base", "eff_a"] and P.shared[1].lo == 0.3,
                f"JA6b an engine-fitted parameter can be calibrated jointly, over its card range ({bad})")
     safe(ja6, "JA6")
+
+    def ja7():           # 2026-11-06: benchmark targets run through the compute backend, equal to the runner's own
+        from toolkit.analysis import run as RUN
+        from toolkit.engines import benchmark as BM
+        pack = dict(RUN._toy_pack(), fit_joint={"targets": ["T2"]})
+        global _benchmarks
+        real = _benchmarks
+        _benchmarks = lambda eng: (pack, BM.fit_targets(pack), None)  # noqa: E731
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                import yaml
+                p = _toy_joint(d, group=False)
+                raw = yaml.safe_load(open(p))
+                raw["calibration"]["joint"]["targets"].append({"id": "T2", "kind": "benchmark"})
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                spec = schema.load(p)
+                P, meta = build(spec)
+                sim = Simulator(spec, d, meta, {"max_workers": 2})
+                pts = [{"kind": "shared", "theta": {"base": b}, "seed": 1} for b in (0.35, 0.6)]
+                got = sim(pts)
+                ref = []
+                for b in (0.35, 0.6):
+                    R = BM.Runner(pack, spec.engine(), 1, base_params=dict(theta0(spec), base=b))
+                    R.calibrate_settings({k: v for k, v in theta0(spec).items() if k in ("eff_a", "eff_b")})
+                    ref.append(R.evaluate(pack["benchmarks"][0], {k: v for k, v in theta0(spec).items()
+                                                                    if k in ("eff_a", "eff_b")})["computed"])
+                ok(all(abs(g["bench.T2"] - r) < 1e-9 for g, r in zip(got, ref))
+                   and any(f.startswith("bench_call") for f in os.listdir(os.path.join(d, OUT_REL))),
+                   f"JA7 benchmark targets run through the compute backend and equal the runner's own values "
+                   f"({[g['bench.T2'] for g in got]} vs {ref})")
+                pack["fit_joint"] = {"targets": []}
+                try:
+                    sim(pts)
+                    ok(False, "JA7b a benchmark the pack holds out is refused at simulation time too")
+                except HM.CalibrationInputError:
+                    ok(True, "JA7b a benchmark the pack holds out is refused at simulation time too")
+        finally:
+            _benchmarks = real
+    safe(ja7, "JA7")
+
+    def ja8():           # 2026-11-06: earlier runs reused only where their batch provenance matches
+        import shutil
+        import yaml
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as pd_:
+            p = _toy_joint(d, group=False)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["record"] = [{"window": [0, 3], "metric": "prev"}]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            rep = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            ok(all(any(k.endswith(".prev") and k != "jc0.prev" for k in r["obs"]) for r in rep["runs"]["unit"]),
+               "JA8a a recorded window metric is kept with every run")
+            shutil.copytree(os.path.join(d, OUT_REL), os.path.join(pd_, "jc_rows"))
+            json.dump(rep["runs"], open(os.path.join(pd_, "runs.json"), "w"))
+            yaml.safe_dump(HM_plain(artifact(rep)), open(os.path.join(pd_, "joint_calibration.yaml"), "w"))
+            P, meta = build(spec)
+            pr, info = load_prior(spec, pd_, meta, log=q)
+            ok(info["reused"] == len(rep["runs"]["unit"]) and info["unmatched"] == 0,
+               f"JA8b every earlier run whose batch row matches is reused ({info})")
+            runs = json.load(open(os.path.join(pd_, "runs.json")))
+            runs["unit"][3]["z"] = runs["unit"][3]["z"] + 0.01          # a run that no stored row computed
+            json.dump(runs, open(os.path.join(pd_, "runs.json"), "w"))
+            pr2, info2 = load_prior(spec, pd_, meta, log=q)
+            ok(info2["unmatched"] >= 1 and all(r["z"] != runs["unit"][3]["z"] for r in pr2["unit"]),
+               f"JA8c a run its stored row does not match is not reused ({info2['unmatched']} dropped)")
+            with tempfile.TemporaryDirectory() as d2:
+                p2 = _toy_joint(d2, group=False)
+                shutil.copy(p, p2)
+                rep2 = run(schema.load(p2), d2, {"max_workers": 2}, log=q, prior_dir=pd_, waves=0, **fast)
+                ok(rep2["prior_runs"]["reused"] == info2["reused"] and rep2["waves"][0].get("prior_runs"),
+                   "JA8d a calibration from earlier runs alone (no new wave)")
+    safe(ja8, "JA8")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

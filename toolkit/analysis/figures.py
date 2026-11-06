@@ -37,7 +37,8 @@ PRODUCER = "toolkit/analysis/figures.py"
 TIERS = {
     "data_model": ("data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage",
                    "sensitivity", "calibration_region", "calibration_top_pairs", "calibration_optical_depth",
-                   "calibration_unit_fit", "calibration_waves"),
+                   "calibration_unit_fit", "calibration_residuals", "calibration_transmission",
+                   "calibration_bound_share", "calibration_waves"),
     "simulation": ("timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"),
 }
 DECISION_SETS = {
@@ -2044,7 +2045,9 @@ def _joint_figure(name):
 
 
 FUNCS.update({n: _joint_figure(n) for n in ("calibration_region", "calibration_top_pairs", "calibration_optical_depth",
-                                            "calibration_unit_fit", "calibration_waves")})
+                                            "calibration_unit_fit", "calibration_residuals",
+                                            "calibration_transmission", "calibration_bound_share",
+                                            "calibration_waves")})
 
 
 # --------------------------------------------------------------------------- rendering
