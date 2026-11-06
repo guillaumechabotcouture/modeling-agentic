@@ -344,7 +344,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     harness's checks (`extra`), and optionally spec-compliance and registry findings."""
     import done_when
     import validate_critique_yaml as V
-    critiques, schema_errors = {}, []
+    critiques, schema_errors, refused = {}, [], {}
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -363,17 +363,31 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
         try:
             critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
         except V.SchemaError as e:
-            schema_errors.append(str(e))
+            # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
+            # blockers still have their done_when tests checked below, for the same reason.
+            schema_errors.extend(getattr(e, "errors", None) or [str(e)])
+            import yaml
+            try:
+                with open(path) as fh:
+                    raw = yaml.safe_load(fh)
+                if isinstance(raw, dict) and isinstance(raw.get("blockers"), list):
+                    refused[reviewer] = raw
+            except Exception:                                # unreadable: its schema errors stand
+                pass
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
         # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
         # here: one that does not parse is repaired like any schema error (the T37 path).
         import done_when as DW
-        for reviewer, doc in critiques.items():
+        for reviewer, doc in list(critiques.items()) + list(refused.items()):
             for b in doc.get("blockers") or []:
-                if b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
+                if not isinstance(b, dict) or b.get("resolved") is True \
+                        or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
                     continue
-                probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
+                try:
+                    probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
+                except Exception as e:                       # a test that cannot be checked is a problem
+                    probs = [f"done_when could not be checked ({type(e).__name__})"]
                 if probs:
                     schema_errors.append(f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: "
                                          f"{'; '.join(probs)[:300]}")
@@ -1909,6 +1923,91 @@ def _self_test() -> int:
         ok(s in ("completed", "completed_scope_declared") and "feedback:critique-domain:True" in T.calls
            and T.calls.count("critique:critique-redteam:1") == 1,
            f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
+
+        # T74-T75 (two v2 eval runs, 2026-11-05, both completed_gate_error with no verdict): in round 2
+        # the critics marked blockers resolved without resolved_in_round or resolved_evidence and wrote
+        # carried_forward as a list of ids. The gate named one error per file, the critic fixed exactly
+        # that one, the next surfaced, and the two repairs ran out. The gate now names every error in
+        # a file at once, so one repair carries all of them.
+        import yaml
+        r2 = os.path.join(td, "resolved_shape")
+        os.makedirs(r2)
+        resolved_b = {"id": "D-001", "severity": "MEDIUM", "category": "HYPOTHESES", "target_stage": "WRITE",
+                      "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f (done)",
+                      "resolved": True, "done_when": [{"file": "manuscript.md", "contains": "draft"}]}
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001", "D-002"],
+                        "blockers": [resolved_b, dict(resolved_b, id="D-002")]},
+                       open(os.path.join(r2, "critique_domain.yaml"), "w"), sort_keys=False)
+        g = v2_gate(r2, 2, 3, False, [], history=False, strict_done_when=True)
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        want = ("D-001 missing 'resolved_in_round'", "D-001 missing 'resolved_evidence'",
+                "D-002 missing 'resolved_in_round'", "D-002 missing 'resolved_evidence'",
+                "carried_forward entry must be a mapping")
+        ok(g.get("action") is None and all(any(w in e for e in dom) for w in want),
+           f"T74 the gate names every schema error in a critic's file at once, not the first ({dom})")
+
+        # T76: a refused file's open HIGH/MEDIUM blockers still have their done_when tests checked, so
+        # a prose test reaches the same repair as the file's schema errors.
+        r3 = os.path.join(td, "refused_done_when")
+        os.makedirs(r3)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001"],
+                        "blockers": [dict(resolved_b, resolved=False, done_when="the text says so")]},
+                       open(os.path.join(r3, "critique_domain.yaml"), "w"), sort_keys=False)
+        g = v2_gate(r3, 2, 3, False, [], history=False, strict_done_when=True)
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        ok(g.get("action") is None and any("carried_forward entry must be a mapping" in e for e in dom)
+           and any("blocker D-001 done_when" in e for e in dom),
+           f"T76 a refused file's schema errors and its open blockers' done_when problems reach one repair ({dom})")
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": ["D-001"],
+                        "blockers": [dict(resolved_b, resolved=False,
+                                          done_when=[{"file": "a.md", "contains": "a{4294967296}"}])]},
+                       open(os.path.join(r3, "critique_domain.yaml"), "w"), sort_keys=False)
+        try:
+            g = v2_gate(r3, 2, 3, False, [], history=False, strict_done_when=True)
+        except Exception as e:                                # noqa: BLE001 - the test is that it does not raise
+            g = {"crash": repr(e)}
+        dom = [e for e in g.get("schema_errors") or [] if e.startswith("critique_domain.yaml")]
+        ok(g.get("action") is None and any("carried_forward" in e for e in dom)
+           and any("D-001 done_when" in e for e in dom),
+           f"T76b a done_when the checker cannot evaluate is a schema error, not a crash ({g.get('crash') or dom})")
+
+        class Literal(StubTasks):
+            """A critic that, like the real ones, fixes exactly the errors it is told and nothing else."""
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                p = os.path.join(run_dir, "critique_domain.yaml")
+                if reviewer != "critique-domain" or round_n < 2:
+                    return super().critique(run_dir, reviewer, round_n, feedback)
+                if not feedback:
+                    res = super().critique(run_dir, reviewer, round_n)
+                    doc = yaml.safe_load(open(p))
+                    for b in doc["blockers"]:
+                        b.pop("resolved_in_round", None)
+                        b.pop("resolved_evidence", None)
+                    doc["carried_forward"] = [c["id"] for c in doc["carried_forward"]]
+                    yaml.safe_dump(doc, open(p, "w"))
+                    return res
+                self.calls.append(f"repair:{len(feedback)}")
+                doc = yaml.safe_load(open(p))
+                for e in feedback:
+                    for b in doc["blockers"]:
+                        for key in ("resolved_in_round", "resolved_evidence"):
+                            if f"blocker {b['id']} missing '{key}'" in e:
+                                b[key] = round_n if key == "resolved_in_round" else "done_when passes"
+                    if "carried_forward entry must be a mapping" in e:
+                        doc["carried_forward"] = [{"id": i, "prior_round": round_n - 1, "still_present": False,
+                                                   "notes": "fixed"} for i in doc["carried_forward"]]
+                yaml.safe_dump(doc, open(p, "w"))
+                return self._r(f"critique:{reviewer}:{round_n}")
+        d, T, st = new_run("resolved_repair", {"critics": {1: {"critique-domain": [blocker]}},
+                                               "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
+        T = Literal(T.s)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s in ("completed", "completed_scope_declared") and "repair:3" in T.calls,
+           f"T75 a round-2 critic that resolved a blocker in the wrong shape is repaired in one pass and the "
+           f"gate decides ({s}, {[c for c in T.calls if 'repair' in c]})")
 
         # T38-T41: from the first blind real run (v2blind1). Fixtures: its three critique YAMLs,
         # final_gate.json and claims ledger (tests/fixtures/v2blind1; no question text, no evals content).
