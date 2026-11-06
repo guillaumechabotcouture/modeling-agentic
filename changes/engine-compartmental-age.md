@@ -21,9 +21,10 @@ Validation:
 - Pack AS1–AS6, 10 new benchmarks: a 5-group SEIR with pre-existing immunity against the reference ODE,
   age-targeted dose blocks against the multigroup threshold, a component timed after extinction, birth cohorts
   against the rank-one final size at R0 12 and 18, and hooks consistency.
-- 61 of 61 assessable benchmarks are in band (re-run locally). FS7 and RN5 stay not_assessable.
+- 62 of 62 assessable benchmarks are in band (re-run locally). FS7 and RN5 stay not_assessable.
 - The coverage pack is carried by a 27-case byte-identity proof against ce79ccf and re-stamped, not recomputed.
-- Self-tests A1–A27.
+- Self-tests A1–A40. A39: final-size runs stream on the generation grid instead of keeping a per-step history.
+  A40: finished Starsim sims are emptied, because Starsim 3.3 keeps dropped Sim objects alive.
 
 `literature.yaml` holds sourced pathogen priors, all unverified.
 
@@ -39,3 +40,6 @@ Core changes (they need acceptance on two diseases):
 - A floor on the cost-per-outcome figure's height.
 - Observation targets carry their frame per row.
 - The decision-spec skill gains the vocabulary (no thresholds).
+- `toolkit/analysis/contract.py`: a spec that names its engine ignores the harness's `engine_choice.json`, so
+  the gate no longer flags that file as stale for it (K12b). Flu run 8 and measles runs 6–7 carried a spurious
+  HIGH `analysis_contract_stale` at every gate.

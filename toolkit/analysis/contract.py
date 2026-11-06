@@ -41,6 +41,17 @@ def _f(kind, claim, key=""):
             "scope_declarable": False, "source": "toolkit/analysis/contract.py"}
 
 
+def _names_engine(run_dir: str) -> bool:
+    """The signed spec names its engine (anything but auto), so the analysis ignores engine_choice.json, as
+    toolkit/spec/schema.py does, and records no choice hash. An unreadable spec or one without an engine is not
+    taken as naming one: the choice file is then compared (fail closed)."""
+    try:
+        eng = (yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("engine")
+    except (OSError, yaml.YAMLError, AttributeError):
+        return False
+    return eng is not None and not (eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True))
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -88,7 +99,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     if man.get("settings_sha256") != cur_set:
         out.append(_f("analysis_contract_stale", "analysis_settings.yaml changed (or appeared or vanished) after the "
                                                  "analysis ran: re-run the analysis"))
-    cur_ch = sha256(os.path.join(run_dir, ENGINE_CHOICE))
+    cur_ch = None if _names_engine(run_dir) else sha256(os.path.join(run_dir, ENGINE_CHOICE))
     if man.get("engine_choice_sha256") != cur_ch:
         out.append(_f("analysis_contract_stale", f"{ENGINE_CHOICE} changed (or appeared or vanished) after the analysis "
                                                  "ran: re-run the analysis"))
@@ -467,6 +478,17 @@ def _self_test() -> int:
                f"K12 a changed engine choice makes the manifest and every artifact stale ({len(st)} findings)")
         except Exception as e:  # noqa: BLE001
             ok(False, f"K12 engine choice hashed in the manifest and artifact headers: {type(e).__name__}: {e}")
+        # a spec that names its engine ignores engine_choice.json (toolkit/spec/schema.py): the harness still writes
+        # the file at ENGINE_CHOICE, and the analysis records no choice hash. That is not stale (flu run 8 and
+        # measles runs 6-7: a spurious HIGH analysis_contract_stale at every gate)
+        open(os.path.join(d, SPEC), "w").write("engine:\n  ref: x:Y\n")
+        complete_run(d)
+        json.dump({"engine": {"ref": "x:Y"}, "why": "harness record"}, open(cp, "w"))
+        ok(gate_findings(d) == [], f"K12b a spec that names its engine is not stale for the harness's engine_choice.json "
+                                   f"it ignores: {gate_findings(d)}")
+        open(os.path.join(d, SPEC), "w").write("engine: auto\n")
+        complete_run(d)
+        ok("analysis_contract_stale" in kinds(d), "K12c engine: auto with a choice the analysis did not record: stale")
     # figure sources are recorded relative to the run dir: a run whose outputs moved (VM /tmp paths) still checks,
     # and a source outside the run dir fails closed
     try:
