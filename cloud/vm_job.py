@@ -756,6 +756,32 @@ def _self_test_pipeline(ok) -> None:
         g["write_launch_record"](os.path.join(td, "dev", "j2"), "j2", code.getvalue(), None, "abc1234", "dev")
         a = json.load(open(os.path.join(td, "dev", "assignments.json")))
         ok(set(a) == {"j1", "j2"} and a["j2"]["pipeline"] == "none", f"VP6 records of two jobs share the file ({a})")
+        # VP7 (Codex r1 P1): a relaunch of the same job id never adopts the earlier attempt's run.
+        open(os.path.join(dest, ".manifest.json"), "w").write("{}")
+        rec2 = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        try:
+            got2 = eval_suite.launch_record_for(os.path.join(dest, "runs", "2026-11-05_000000_q"))
+        except NameError:
+            got2 = None
+        ok(rec2["launch_id"] != rec["launch_id"] and not os.path.exists(os.path.join(dest, "runs"))
+           and not os.path.exists(os.path.join(dest, ".manifest.json"))
+           and any(n.startswith("runs.before_") for n in os.listdir(dest)),
+           f"VP7 the earlier attempt's runs/ is set aside and the poll index reset ({os.listdir(dest)}, {got2})")
+        # VP8 (Codex r1 P1): the commit comes from the archive that ships.
+        arch = io.BytesIO()
+        with tarfile.open(fileobj=arch, mode="w:gz") as t:
+            for n, b in (("scripts/lib/code_commit.txt", b"0123456789abcdef0123456789abcdef01234567\n"),):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        ok(g["_launch_commit"](arch.getvalue(), "/nonexistent-tree", None) == "0123456",
+           "VP8 the launch record's commit is the archive's, not the checkout's HEAD at submit time")
+        # VP9 (Codex r1 P2): a --dir archive (./-prefixed names) still records its input hashes.
+        d2 = os.path.join(td, "srcdir")
+        os.makedirs(os.path.join(d2, "data", "evals", "q"))
+        open(os.path.join(d2, "data", "evals", "q", "a.csv"), "w").write("1,2\n")
+        r3 = g["write_launch_record"](os.path.join(td, "dev", "j3"), "j3", _tarball(None, d2), "v2", "x", "dev")
+        ok(r3["eval_inputs_sha256"].get("data/evals/q/a.csv"), f"VP9 --dir archives record input hashes ({r3['eval_inputs_sha256']})")
 
 
 def _self_test_sched(ok) -> None:

@@ -1715,6 +1715,7 @@ def _self_test_pipeline(ok, tb) -> None:
     import tempfile
     lib = os.path.join(os.path.dirname(HERE), "scripts", "lib")
     real = open(os.path.join(lib, "pipeline_id.py"), "rb").read()
+    real_main = open(os.path.join(os.path.dirname(HERE), "main.py"), "rb").read()
     g = globals()
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if not f.endswith(".py") or f.startswith("_"):
@@ -1743,15 +1744,18 @@ def _self_test_pipeline(ok, tb) -> None:
     with tempfile.TemporaryDirectory() as d:
         cfg = RunConfig(name="ev-x", question_file="/dev/null", out_dir=d, pipeline="v2",
                         flags=("--max-budget-usd", "35", "--signoff", "lead"))
-        code = tb({"main.py": b"x", "scripts/lib/pipeline_id.py": real})
+        code = tb({"main.py": real_main, "scripts/lib/pipeline_id.py": real})
         ok(pf(cfg, code) == "v2", "RP5 the shipped pipeline_id agrees with the declared v2")
         ok(pf(RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1"), code) == "v1",
            "RP6 an explicit v1 config passes the preflight")
         for why, c2, code2 in (
                 ("a tree with no pipeline_id.py (from before 2026-11-05: defaults to v1)", cfg, tb({"main.py": b"x"})),
                 ("a config that declares no pipeline", RunConfig(name="t2", question_file="/dev/null", out_dir=d), code),
+                ("a main.py that does not dispatch through pipeline_id (Codex r1 P2: old main.py, new helper)",
+                 RunConfig(name="t3", question_file="/dev/null", out_dir=d, pipeline="v1"),
+                 tb({"main.py": b"parser.add_argument('--v2')\n", "scripts/lib/pipeline_id.py": real})),
                 ("shipped code that would run another pipeline", cfg,
-                 tb({"main.py": b"x", "scripts/lib/pipeline_id.py":
+                 tb({"main.py": real_main, "scripts/lib/pipeline_id.py":
                      b"import sys\nprint('v1')\n"}))):
             try:
                 pf(c2, code2)
@@ -1791,6 +1795,10 @@ def _self_test_pipeline(ok, tb) -> None:
            and ("coiled.Cluster(" not in src or src.index("pipeline_preflight(") < src.index("coiled.Cluster(")),
            f"RP12 {fn.__name__} checks the pipeline before it creates or submits anything")
     ok("main_flags(cfg)" in inspect.getsource(_submit), "RP13 every submission passes main_flags (the pipeline)")
+    ac = g.get("archive_commit")
+    ok(ac is not None and ac(tb({"scripts/lib/code_commit.txt": b"0123456789abcdef0123456789abcdef01234567\n"}))
+       == "0123456"[:7] and ac(tb({"scripts/lib/code_commit.txt": b"$Format:%H$\n"})) is None and ac(tb({})) is None,
+       "RP14 the launch commit is read from the archive itself (the commit that ships, not HEAD later)")
 
 
 def _self_test() -> int:

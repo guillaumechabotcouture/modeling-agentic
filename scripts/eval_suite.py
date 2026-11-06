@@ -1600,6 +1600,14 @@ def _test_s19_pipeline(ok, td):
            "S19h with no launch identity (old launches) nothing is refused; the score reads unknown")
         import inspect
         ok("identity_problem(" in inspect.getsource(grade_run), "S19i grade_run applies the identity check")
+        # Codex r1 P1: the commit is checked on its own; a new launch record without a commit is incomplete.
+        ok((ip(pn, {"commit": "fff0000"}) or [None])[0] == "commit_mismatch",
+           "S19p a legacy launch record (commit, no pipeline) still refuses a run at another commit")
+        ok(ip(po, {"commit": "fff0000"}) is None, "S19q ... but not a legacy run that records no commit")
+        ok((ip(pn, {"pipeline": "v2"}) or [None])[0] == "launch_identity_incomplete",
+           "S19r a launch record naming a pipeline but no commit is refused")
+        ok((ip(dict(pn, commit="unknown"), {"pipeline": "v2", "commit": "abc1234"}) or [None])[0] == "commit_unrecorded",
+           "S19s a new launch whose run records no commit is refused")
     row = lambda q, p, c: {"run_dir": "r", "quality": q, "quality_gated": q, "gate_action": "ACCEPT",  # noqa: E731
                            "status": "completed", "rounds": 2, "cost_usd": 20, "wall_hours": 1.0,
                            "primary_layer": None, "failures": [], "pipeline": p, "commit": c}

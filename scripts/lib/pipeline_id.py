@@ -221,6 +221,32 @@ def _self_test() -> int:
         ok(False, "PI14 --v2 in a later command does not count for main.py")
     except PipelineError:
         ok(True, "PI14 --v2 in a later command does not count for main.py")
+    # PI29-PI31 (Codex r1 P1): shell boundaries the old parser lost, and several main.py calls.
+    for cmd, why in (("python3 main.py Q\necho --v1", "a newline ends main.py's arguments"),
+                     ("python3 main.py Q;echo --v1", "an attached ; ends them"),
+                     ("python3 main.py Q&&echo --v1", "an attached && ends them"),
+                     ("python3 main.py Q --v2; python3 main.py R", "a second main.py without a pipeline"),
+                     ("python3 main.py Q --v2 && python3 main.py R --v1", "two main.py calls that disagree"),
+                     ("python3 main.py $(echo --v2) Q", "a command substitution main.py's arguments depend on")):
+        try:
+            got = from_command(cmd)
+            ok(False, f"PI29 refused ({why}): got {got}")
+        except PipelineError:
+            ok(True, f"PI29 refused: {why}")
+    ok(from_command("python3 main.py Q --v2\ncp -r runs $JOB_OUT/") == "v2", "PI30 a later line does not hide main.py's flag")
+    ok(from_command("python3 main.py A --v2 && python3 main.py B --v2") == "v2", "PI31 several calls that agree")
+    with tempfile.TemporaryDirectory() as td:
+        rs = os.path.join(td, "v2run")
+        os.makedirs(rs)
+        open(os.path.join(rs, "run_state.json"), "w").write("{}")
+        ok(resume_conflict({}, "v1", rs) and not resume_conflict({}, "v2", rs),
+           "PI32 a run with no recorded pipeline but a run_state.json is v2's")
+        ok(not resume_conflict({}, "v1", td), "PI33 an old run with neither (a v1 run) resumes with --v1")
+        ok(resume_conflict({"pipeline": "V2!"}, "v2", rs) and resume_conflict({"pipeline": 2}, "v1", td),
+           "PI34 a malformed recorded pipeline is refused")
+        json.dump({"question": "Q"}, open(os.path.join(rs, "metadata.json"), "w"))
+        m = stamp(rs, {"pipeline": "v2", "commit": "abc1234", "launcher": "direct"}, now="t")
+        ok(m["invocations"][-1].get("pipeline_before") == UNKNOWN, "PI35 a stamp keeps what was recorded before (unknown)")
     with tempfile.TemporaryDirectory() as td:
         os.makedirs(os.path.join(td, "scripts", "lib"))
         cf = os.path.join(td, "scripts", "lib", COMMIT_FILE)

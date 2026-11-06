@@ -1058,6 +1058,23 @@ def _self_test_pipeline(ok, _outcome) -> None:
             ok(rc == 0 and m.get("pipeline") == "v2" and m.get("launcher") == "vm_job:n/j" and m.get("commit")
                and m.get("run_dir") == "runs_v2" and m.get("invocations"),
                f"PV8 a v2 run's metadata.json records pipeline, commit and launcher ({rc}, {m})")
+        # PV10 (Codex r1 P1): --preflight-only runs the preflight and nothing else, whatever the pipeline.
+        rc = drive("--preflight-only")
+        ok(rc == 3 and [c[0] for c in calls] == ["preflight"], f"PV10 --preflight-only never dispatches a run ({rc}, {calls})")
+        rc = drive("--preflight-only", "Q?")
+        ok(rc == 3 and [c[0] for c in calls] == ["preflight"], f"PV10b ... not even with a question ({rc}, {calls})")
+        # PV11 (Codex r1 P1): a run whose metadata.json lost its pipeline is judged by its files (run_state.json
+        # is v2's), and a malformed value is refused: a v2 run is never resumed with --v1.
+        with tempfile.TemporaryDirectory() as td:
+            rp = os.path.join(td, "r2")
+            os.makedirs(rp)
+            json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))
+            open(os.path.join(rp, "run_state.json"), "w").write("{}")
+            rc = drive("--v1", "--skip-preflight", "--resume", rp)
+            ok(rc == 1 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
+            json.dump({"question": "Q?", "pipeline": "V2!"}, open(os.path.join(rp, "metadata.json"), "w"))
+            rc = drive("--resume", rp)
+            ok(rc == 1 and not calls, f"PV11b a malformed recorded pipeline is refused ({rc}, {calls})")
         # PV9: the lead pipeline's end-of-run restore puts the identity back if a run tool changed it.
         with tempfile.TemporaryDirectory() as td:
             mp = os.path.join(td, "metadata.json")
