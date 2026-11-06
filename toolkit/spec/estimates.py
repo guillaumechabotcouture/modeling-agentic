@@ -622,7 +622,7 @@ def _self_test() -> int:
         mut(lambda r: r["engine"]["config"].update(results_path="/tmp/forged.yaml"), "results_path",
             "ES24 (Codex r2-2) an engine configuration key that dynamics does not declare (results_path) is refused")
 
-        def c1_priors(r):        # the priors of run 2026-11-06_012422 (cschema-dengue c1), which failed at ANALYZE
+        def c1_priors(r):        # the priors of run 2026-11-06_012422 (c1), which failed at ANALYZE
             r["decision_units"].pop("defaults_accepted", None)
             r["calibration"]["priors"].update(
                 r0={"dist": "uniform", "range": [1.3, 5.0], "source": "c1"},
@@ -642,6 +642,27 @@ def _self_test() -> int:
         e = schema.validate(schema.load(sp))
         open(sp, "w").write(keep)
         ok(e == [], f"ES25b the same priors with s0 from 0.05 (above the seed's upper end) validate: {e[:2]}")
+        # ---- Codex review of the fix, round 1
+        def beta_s0(r):
+            r["decision_units"].pop("defaults_accepted", None)
+            r["calibration"]["priors"].update(s0={"dist": "beta", "a": 1.0, "b": 1.0, "source": "x"},
+                                              seed={"dist": "loguniform", "range": [1e-4, 5e-3], "source": "x"})
+        mut(beta_s0, "prior_support_infeasible",
+            "ES26 (Codex fix-r1 P1-2) a beta prior is probed at its support ends (0, 1), not its central 98%")
+
+        def bound_s0(r):
+            r["decision_units"].pop("defaults_accepted", None)
+            r["decision_units"]["engine_attributes"]["s0"] = {"value": 1e-4, "source": "x"}
+            r["calibration"]["priors"]["seed"] = {"dist": "loguniform", "range": [1e-5, 1e-3], "source": "x"}
+        mut(bound_s0, "bound to data", "ES27 (Codex fix-r1 P3-6) a refusal that involves a data-bound attribute "
+                                       "names it and its value")
+        cs, info = probe_corners([[0.0, 1.0]] * 25, 64)
+        ok(len(cs) == 64 and info["sampled"] and info["total"] == 2 ** 25,
+           f"ES28 (Codex fix-r1 P2-3/4) 25 priors: 64 corners sampled without building all 2^25, and the sampling "
+           f"is disclosed ({len(cs)}, {info})")
+        cs, info = probe_corners([[0.0, 1.0], [2.0, 3.0]], 64)
+        ok(sorted(cs) == [(0.0, 2.0), (0.0, 3.0), (1.0, 2.0), (1.0, 3.0)] and not info["sampled"],
+           f"ES28b up to the cap every corner is probed: {cs}")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))

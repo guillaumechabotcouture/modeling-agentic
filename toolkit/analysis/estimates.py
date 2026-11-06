@@ -1006,6 +1006,26 @@ def _self_test_c1(ok, rows) -> None:
             globals().get("engine_failure_message")) else ""
         ok("parameter set" in msg and "seed" in msg and "draws" not in msg,
            f"AE23b (c1) the refusal message names parameter sets and the reason, not 'draws': {msg!r}")
+        # Codex fix-r1 P1-1 / P2-5: a refusal at any later stage is caught, and a sampler failure caused by
+        # refusals reports the engine's reason
+        G = globals().get("refusal_guard")
+        raised = None
+        try:
+            G(E, "an optimisation") if G else None
+        except C.CalibrationRefused as ex:
+            raised = str(ex)
+        ok(raised is not None and "an optimisation" in raised and "seed" in raised,
+           f"AE24 (Codex fix-r1 P1-1) refusal_guard raises with the stage and the reason once the engine refused: "
+           f"{raised!r}")
+        P0 = C.Problem(["x"], {"x": C.Prior("x", "uniform", 0.0, 1.0)}, lambda X: (np.full(len(X["x"]), -np.inf), {}))
+        S = globals().get("sample_checked")
+        raised = None
+        try:
+            S(E, P0, 1, "the posterior sample") if S else None
+        except C.CalibrationRefused as ex:
+            raised = str(ex)
+        ok(raised is not None and "parameter set" in raised and "seed" in raised,
+           f"AE25 (Codex fix-r1 P2-5) a sampler failure with engine refusals reports the engine's reason: {raised!r}")
     del yaml
 
 
