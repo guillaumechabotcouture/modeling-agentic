@@ -73,7 +73,8 @@ def _signed_config(ref: str):
                 ch = {}
             if isinstance(ch, dict) and ch.get("ref") == ref and isinstance(ch.get("config"), dict):
                 return dict(ch["config"])
-        raise ValueError(f"{ref} is configured by the signed spec (engine: {{ref, config}}); this spec does not name it")
+        raise ValueError(f"{ref} is configured by the signed spec: write engine: {{ref: {ref}, config: {{...}}}} (its card "
+                         "and the decision-spec skill list the fields); engine: auto cannot configure it")
     return cfg
 
 
@@ -506,7 +507,12 @@ class _ToolkitApi:
             self.candidates = rows
             if any(r.get("eligible") for r in rows):
                 return bad
-            return bad + ["no candidate engine passes the full checks before sign-off"] + [
+            # engines configured by the signed spec cannot be chosen by `auto`: say so first, so a short feedback window
+            # (the machine log truncates) still carries it (flu run 7 spent its last try on `auto`)
+            conf = [r["ref"] for r in rows if "configured by the signed spec" in " ".join(r.get("why_not") or [])]
+            hint = ([f"engine: auto cannot configure {', '.join(conf)}: name it as engine: {{ref, config}}"]
+                    if conf else [])
+            return bad + ["no candidate engine passes the full checks before sign-off"] + hint + [
                 f"[{r['ref']}] {w}" for r in rows for w in (r.get("why_not") or []) if w not in bad]
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
