@@ -626,7 +626,15 @@ class HistoryMatch:
                                    f"[{lo}, {hi}]")
                         continue
                     row.update(unit=r["unit"], s=float(np.clip((z - lo) / (hi - lo), 0, 1)))
+                if isinstance(r.get("failed_checks"), dict):
+                    row["failed_checks"] = r["failed_checks"]
                 self.data.add(kind, [row])
+        uc = prior.get("unresolved_checks") or {}
+        if not (isinstance(uc, dict) and all(isinstance(v, list) and all(isinstance(n, int) and n > 0 for n in v)
+                                             for v in uc.values())):
+            bad.append("unresolved_checks: {observable: [size of each unresolved failed check]}")
+        else:
+            self._carried = uc
         if bad:
             raise CalibrationInputError(bad)
         self.prior_n = len(self.data.unit) + len(self.data.shared)
@@ -747,7 +755,7 @@ class HistoryMatch:
                     m, v = em["shared"][ob].predict(np.atleast_2d(r["t"]))
                 x = float(standardised_errors(tr(r["obs"][ob], self.P.scales[ob]), m, v)[0])
                 e.append(x)
-                self._check_errs.setdefault(ob, {})[(kind,) + _key(r) + (r.get("seed"),)] = x
+                self._check_errs.setdefault(ob, {})[self._run_key(kind, r)] = x
             out[ob] = e
         return out
 
@@ -999,6 +1007,7 @@ class HistoryMatch:
         state = None
         valid = {}
         self._reset_checks()                 # Codex r5 P2-8: history and clearing reset together
+        self._restore_checks()               # Codex r6 P1-1: unresolved failed checks of the saved runs
         off = 0
         if self.prior_n:      # the earlier runs are wave 0: checked (cross-validation over them), fitted, a region
             pu, ps = list(self.data.unit), list(self.data.shared)
@@ -1054,10 +1063,39 @@ class HistoryMatch:
         if v["status"] != "passed":
             self._failed.setdefault(ob, []).append(set(errs))
         elif v.get("covers_all"):
-            sub = [validation([errs[k] for k in c if k in errs], self.eth) for c in self._failed.get(ob, [])]
+            # Codex r6 P1-2: every run of the failed check must be in this one; a partial cohort clears nothing
+            sub = [validation([errs[k] for k in c], self.eth) if c <= set(errs) else {"status": "incomplete"}
+                   for c in self._failed.get(ob, [])]
             if all(x["status"] == "passed" for x in sub):
                 self.valid_cleared[ob] = len(h) - 1      # every earlier check is superseded by this one
                 self._failed[ob] = []
+
+    @staticmethod
+    def _run_key(kind, r):
+        return (kind,) + _key(r) + (r.get("seed"),)
+
+    def _restore_checks(self):
+        """Codex r6 P1-1: the unresolved failed checks of saved runs (each run's failed_checks tags, and the size of
+        each check in unresolved_checks) are failed checks of this run too. A check whose runs are not all
+        reused keeps a member no later check can supply, so it never clears (fail closed)."""
+        carried = getattr(self, "_carried", None) or {}
+        for ob, sizes in carried.items():
+            cs = [set() for _ in sizes]
+            for kind in ("unit", "shared"):
+                for r in getattr(self.data, kind):
+                    for c in (r.get("failed_checks") or {}).get(ob, []):
+                        if isinstance(c, int) and 0 <= c < len(cs):
+                            cs[c].add(self._run_key(kind, r))
+            for c, n in enumerate(sizes):
+                if len(cs[c]) < int(n):
+                    cs[c].add(("missing", ob, c))
+            self._failed.setdefault(ob, []).extend(cs)
+            self.valid_hist.setdefault(ob, []).append("failed")
+
+    def _cohort_tags(self, kind, r) -> dict:
+        k = self._run_key(kind, r)
+        return {ob: [c for c, s in enumerate(cs) if k in s] for ob, cs in (getattr(self, "_failed", {}) or {}).items()
+                if any(k in s for s in cs)}
 
     def _inadequate(self) -> dict:
         hist = getattr(self, "valid_hist", {}) or {}
@@ -1370,9 +1408,15 @@ class HistoryMatch:
                 self._i95[p.name] = inter95
         runs = {"unit": [dict({"unit": r["unit"], "z": float(P.z_natural(r["s"])), "theta": P.theta_natural(r["t"])[0]
                                if self.p else {}, "seed": r["seed"], "obs": r["obs"]},
-                              **({"ref": r["ref"]} if r.get("ref") else {})) for r in self.data.unit],
-                "shared": [{"theta": P.theta_natural(r["t"])[0], "seed": r["seed"], "obs": r["obs"]}
+                              **({"ref": r["ref"]} if r.get("ref") else {}),
+                              **({"failed_checks": t} if (t := self._cohort_tags("unit", r)) else {}))
+                         for r in self.data.unit],
+                "shared": [dict({"theta": P.theta_natural(r["t"])[0], "seed": r["seed"], "obs": r["obs"]},
+                                **({"failed_checks": t} if (t := self._cohort_tags("shared", r)) else {}))
                            for r in self.data.shared]}
+        unres = {ob: [len(c) for c in cs] for ob, cs in (getattr(self, "_failed", {}) or {}).items() if cs}
+        if unres:       # Codex r6 P1-1: a continuation from these runs keeps the failed checks not yet cleared
+            runs["unresolved_checks"] = unres
         return {"method": "history_matching", "producer": PRODUCER, "figure_data": figd, "runs": runs,
                 "status": "blocked" if blocks else "matched", "blocked": bool(blocks), "blocks": blocks,
                 "cutoff": self.cut,
@@ -1875,7 +1919,10 @@ def _self_test() -> int:
                            points_per_unit=6, shared_points=12)
             seeds1 = {x["seed"] for x in r1["runs"]["unit"] + r1["runs"]["shared"]}
             new = [x for x in r2["runs"]["unit"] + r2["runs"]["shared"] if x.get("seed") is not None]
-            fresh = [x for x in new if x not in only_units["unit"]]
+            def bare(x):
+                return {k: v for k, v in x.items() if k != "failed_checks"}
+            old = [bare(x) for x in only_units["unit"]]
+            fresh = [x for x in new if bare(x) not in old]
             ok(r2["region"]["accepted"] > 0 and not ({x["seed"] for x in fresh} & seeds1),
                "HM19a earlier unit runs without shared runs: the shared design is simulated first, and new runs "
                "never reuse an earlier seed")
@@ -1938,6 +1985,46 @@ def _self_test() -> int:
         ok("u2" in r["unmatched"] and all(abs(r["best"]["theta"][k] - got[k]) < 1e-12 for k in got),
            "HM23 the best shared point is chosen from the matchable units only")
     safe(hm23, "HM23")
+
+    def hm24():          # Codex r6 P1-2: a covering check that lacks some of the failed runs cannot clear them
+        h = HistoryMatch(*_toy()[:2], 1, q, **fast)
+        h._reset_checks()
+        k1 = [("a", i) for i in range(32)]
+        h._check_errs = {"w0": dict(zip(k1, [0.5] * 30 + [5.0, 5.0]))}
+        h._note_check("w0", {"status": "failed"})
+        later = {k: 0.5 for k in k1[:30]}
+        later.update({("b", i): 0.5 for i in range(32)})
+        h._check_errs = {"w0": later}
+        h._note_check("w0", {"status": "passed", "covers_all": True})
+        ok("w0" in h._inadequate(), "HM24 a covering pass without every run of the failed check does not clear it")
+    safe(hm24, "HM24")
+
+    def hm25():          # Codex r6 P1-1: a continuation from saved runs keeps the unresolved failed checks
+        P, sim, *_ = _toy()
+        real = UnitEmulator.predict
+
+        def over(self, u, S, T, noise=True):
+            m, v = real(self, u, S, T, noise)
+            return m, v / 400.0
+        UnitEmulator.predict = over
+        try:
+            r1 = HistoryMatch(P, sim, 9, q, **fast).run(1)
+        finally:
+            UnitEmulator.predict = real
+        carried = r1["runs"].get("unresolved_checks") or {}
+        tagged = sum(1 for x in r1["runs"]["unit"] if x.get("failed_checks"))
+        h = HistoryMatch(P, sim, 9, q, prior=r1["runs"], **fast)
+        h._reset_checks()
+        h._restore_checks()
+        same = {ob: [len(c) for c in cs] for ob, cs in h._failed.items() if cs}
+        ok(r1["blocked"] and carried and tagged and same == carried,
+           f"HM25a the saved runs carry each unresolved failed check, restored whole ({carried} vs {same})")
+        first = next(j for j, y in enumerate(r1["runs"]["unit"]) if y.get("failed_checks"))
+        cut = dict(r1["runs"], unit=[x for i, x in enumerate(r1["runs"]["unit"]) if i != first])
+        r3 = HistoryMatch(P, sim, 9, q, prior=cut, **fast).run(0)
+        ok(any(b["code"] == "emulator_inadequate" for b in r3["blocks"]),
+           "HM25b a continuation missing a run of an unresolved failed check stays blocked")
+    safe(hm25, "HM25")
 
     def hm21():          # 2026-11-06: a top-up wave simulates only the units with too few earlier runs
         P, sim, *_ = _toy()

@@ -39,6 +39,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -293,14 +294,17 @@ def _sensitivity_problems(s, targets, w) -> list:
                 and isinstance(x.get("targets"), dict) and x["targets"]):
             bad.append(f"{ww}[{n}]: {{id, label, targets: {{target id: {{sd, bias_sd, discrepancy_sd}}}}}}")
             continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(x["id"])):     # Codex r6 P2: it names a directory
+            bad.append(f"{ww}[{n}].id: letters, digits, _ and - only")
         if x["id"] in seen:
             bad.append(f"{ww}[{n}]: repeated id {x['id']}")
         seen.add(x["id"])
         kinds = {t.get("id"): t for t in targets or [] if isinstance(t, dict)}
         for tid, ov in x["targets"].items():
             t0 = kinds.get(tid) or {}
-            if tid in ids and t0.get("kind") == "benchmark":
-                bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's error comes from its band; not overridable")
+            if tid in ids and t0.get("kind") == "benchmark" and isinstance(ov, dict) and set(ov) - {"discrepancy_sd"}:
+                bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's sampling error comes from its band; only "
+                           "discrepancy_sd can change")
                 continue
             if tid in ids and isinstance(ov, dict) and "sd" in ov and any(
                     k in t0 for k in ("sd_column", "ci_columns", "n_column", "ci")):
@@ -340,12 +344,37 @@ def unmatched_decision(spec, rep) -> dict:
                         "implausibility": v.get("implausibility_verified", v.get("best_implausibility")),
                         "direction": v.get("direction")})
     ok = (u.get("mode") == "flag" and codes <= unit_codes and not target_fail and not rep.get("conflicting")
-          and len(flagged) <= int(u.get("max_units", -1)))
+          and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed))
     return {"proceed": bool(ok) if rep.get("blocked") else True, "mode": u.get("mode", "block"),
             "flagged": flagged if ok or not rep.get("blocked") else [], "missed": flagged,
             "why_not": None if ok or not rep.get("blocked") else
             ("no flag option" if u.get("mode") != "flag" else f"blocks {sorted(codes)}; {len(flagged)} misses, max "
              f"{u.get('max_units')}; target failures {target_fail}; conflicting {rep.get('conflicting')}")}
+
+
+def _blocks_consistent(rep, missed) -> bool:
+    """Codex r6 P1-4: a blocked report may let unit misses proceed only when its blocks are complete and name
+    exactly the units whose status is not matched (fail closed on a partial or malformed report)."""
+    named = set()
+    blocks = rep.get("blocks")
+    if not (isinstance(blocks, list) and blocks):
+        return False
+    for b in blocks:
+        d = b.get("detail") if isinstance(b, dict) else None
+        if not isinstance(d, dict):
+            return False
+        if b["code"] == "unmatched_units":
+            if not (isinstance(d.get("unmatched"), list) and d.get("conflicting") == []):
+                return False
+            named |= {str(x) for x in d["unmatched"]}
+        elif b["code"] == "verification_failed":
+            if not (isinstance(d.get("units"), list) and d.get("targets") == []):
+                return False
+            named |= {str(x) for x in d["units"]}
+        else:
+            return False
+    units = rep.get("units") or {}
+    return bool(named) and named == {str(k) for k in missed} and named <= {str(k) for k in units}
 
 
 def _with_overrides(raw, overrides) -> dict:
@@ -361,43 +390,47 @@ def _with_overrides(raw, overrides) -> dict:
 
 def run_sensitivities(spec, rep, run_dir, compute_kw=None, log=print, units=None) -> list:
     """Each declared sensitivity: the spec with its target errors changed, calibrated on every run of the primary
-    setting (no new wave; the engine verification runs), reported beside the primary, never a block."""
-    import yaml
-    from toolkit.analysis.artifacts import _safe_io
-    from toolkit.spec import schema
+    setting (no new wave; the engine verification runs), reported beside the primary, never a block. A sensitivity
+    that fails at any step is reported with its error and the primary continues (Codex r5 P2-4, r6 P2)."""
     out = []
     j = declared(spec) or {}
     _, meta1 = build(spec, units)
     for n, x in enumerate(j.get("sensitivity") or []):
-        raw = _with_overrides(spec.raw, x["targets"])
-        rel = os.path.join(OUT_REL, f"sensitivity_{x['id']}", "decision_spec.yaml")
-        _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(raw, sort_keys=False).encode(), atomic=True)
-        s2 = schema.load(os.path.join(run_dir, rel))
-        s2.base = spec.base              # the copy resolves data paths as the spec does
         try:
-            check_same_simulator(spec, s2)
-        except HM.CalibrationInputError as e:
-            out.append({"id": x["id"], "label": x["label"], "targets": x["targets"], "error": str(e)[:500]})
-            continue
-        P2, meta2 = build(s2, units)
-        prior = {"unit": [dict(r, obs=remap_windows(r["obs"], meta1["windows"], meta2["windows"]))
-                          for r in rep["runs"]["unit"]], "shared": rep["runs"]["shared"]}
-        sim = Simulator(s2, run_dir, meta2, compute_kw, log)
-        sim.calls = 1000 * (n + 1)
-        try:            # Codex r5 P2-4: a sensitivity that fails is reported; it never stops the primary
-            r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
-                              record=meta2["record"], **{k: j[k] for k in ("points_per_unit", "shared_points") if k in j})
-        except Exception as e:  # noqa: BLE001
+            r2 = _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, meta1, j, n, x)
+        except Exception as e:  # noqa: BLE001  the primary is decided; this optional result is reported as failed
             out.append({"id": x["id"], "label": x["label"], "targets": x["targets"],
                         "error": f"{type(e).__name__}: {str(e)[:500]}"})
             log(f"sensitivity {x['id']}: failed ({type(e).__name__}); reported, the primary continues")
             continue
-        r2["prior_runs"] = {"reused": len(prior["unit"]), "shared_reused": len(prior["shared"]),
-                            "from": "the primary setting, same process"}
-        r2["adapter"] = {"windows": meta2["windows"], "units": len(meta2["units"]), "shared": list(j["shared"])}
         out.append({"id": x["id"], "label": x["label"], "targets": x["targets"], "report": r2})
         log(f"sensitivity {x['id']}: {r2['n_matched']} of {r2['n_units']} units matched (reported, not a block)")
     return out
+
+
+def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, meta1, j, n, x) -> dict:
+    import yaml
+    from toolkit.analysis.artifacts import _safe_io
+    from toolkit.spec import schema
+    raw = _with_overrides(spec.raw, x["targets"])
+    rel = os.path.join(OUT_REL, f"sensitivity_{x['id']}", "decision_spec.yaml")
+    _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(raw, sort_keys=False).encode(), atomic=True)
+    s2 = schema.load(os.path.join(run_dir, rel))
+    s2.base = spec.base              # the copy resolves data paths as the spec does
+    check_same_simulator(spec, s2)
+    P2, meta2 = build(s2, units)
+    prior = {"unit": [dict(r, obs=remap_windows(r["obs"], meta1["windows"], meta2["windows"]))
+                      for r in rep["runs"]["unit"]], "shared": rep["runs"]["shared"],
+             **({"unresolved_checks": rep["runs"]["unresolved_checks"]}
+                if rep["runs"].get("unresolved_checks") else {})}
+    sim = Simulator(s2, run_dir, meta2, compute_kw, log)
+    sim.calls = 1000 * (n + 1)
+    r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
+                      record=meta2["record"], **{k: j[k] for k in ("points_per_unit", "shared_points") if k in j})
+    r2["prior_runs"] = {"reused": len(prior["unit"]), "shared_reused": len(prior["shared"]),
+                        "from": "the primary setting, same process"}
+    r2["adapter"] = {"windows": meta2["windows"], "units": len(meta2["units"]), "shared": list(j["shared"])}
+    return r2
 
 
 # --------------------------------------------------------------------------- problem
@@ -803,7 +836,10 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
     dropped = len(unit_runs) - len(kept)
     log(f"earlier runs: {len(kept)} unit runs reused (provenance matched), {dropped} not matched, "
         f"{len(runs.get('shared') or [])} shared runs not reused (no batch provenance)")
-    return {"unit": kept, "shared": []}, {"reused": len(kept), "unmatched": dropped, "from": prior_dir}
+    out = {"unit": kept, "shared": []}
+    if runs.get("unresolved_checks"):     # Codex r6 P1-1: failed checks not yet cleared stay failed
+        out["unresolved_checks"] = runs["unresolved_checks"]
+    return out, {"reused": len(kept), "unmatched": dropped, "from": prior_dir}
 
 
 def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, waves=None, **override) -> dict:
@@ -960,7 +996,9 @@ def main(argv=None) -> int:
         P2, meta2 = build(spec2, units)
         _, meta1 = build(spec, units)
         first = {"unit": [dict(x, obs=remap_windows(x["obs"], meta1["windows"], meta2["windows"]))
-                          for x in rep["runs"]["unit"]], "shared": rep["runs"]["shared"]}
+                          for x in rep["runs"]["unit"]], "shared": rep["runs"]["shared"],
+                 **({"unresolved_checks": rep["runs"]["unresolved_checks"]}
+                    if rep["runs"].get("unresolved_checks") else {})}
         j2 = declared(spec2)
         sim2 = Simulator(spec2, rd, meta2, kw, say)
         sim2.calls = 1000            # its batch files apart from the first setting's
@@ -1299,8 +1337,8 @@ def _self_test() -> int:
             spec = schema.load(p)
             ok(spec_problems(spec) == [], "JA11b a well-formed flag option is accepted")
             rep = {"blocked": True, "unmatched": ["5"], "conflicting": [], "blocks": [
-                {"code": "unmatched_units", "detail": {}}, {"code": "verification_failed", "detail": {"units": ["7"],
-                                                                                                     "targets": []}}],
+                {"code": "unmatched_units", "detail": {"unmatched": ["5"], "conflicting": []}},
+                {"code": "verification_failed", "detail": {"units": ["7"], "targets": []}}],
                    "units": {"5": {"status": "unmatched", "direction": "target_above_reach", "best_implausibility": 9.0},
                              "7": {"status": "verification_failed", "implausibility_verified": 3.4},
                              "1": {"status": "matched"}}}
@@ -1314,6 +1352,13 @@ def _self_test() -> int:
             ok(not unmatched_decision(spec, rep3)["proceed"], "JA11d more misses than max_units still block")
             rep4 = dict(rep, blocks=rep["blocks"] + [{"code": "emulator_inadequate", "detail": {}}])
             ok(not unmatched_decision(spec, rep4)["proceed"], "JA11e a non-unit block (emulator) is never flagged through")
+            for blk, why in (([{"code": "verification_failed"}], "no detail"),
+                             ([{"code": "verification_failed", "detail": {"units": ["7"]}}], "no target list"),
+                             ([{"code": "verification_failed", "detail": {"units": [], "targets": []}}], "names none"),
+                             ([rep["blocks"][1]], "unit 5 missed but not named")):
+                rep5 = dict(rep, blocks=blk)
+                ok(not unmatched_decision(spec, rep5)["proceed"],
+                   f"JA11g an incomplete or inconsistent blocked report never proceeds ({why})")
             raw["calibration"]["joint"].pop("unmatched")
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             ok(not unmatched_decision(schema.load(p), rep)["proceed"], "JA11f without the option, misses block")
@@ -1373,6 +1418,10 @@ def _self_test() -> int:
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             ok(any("sd cannot override" in b for b in spec_problems(schema.load(p))),
                "JA13b an sd override on a target whose error comes from its data is refused")
+            raw["calibration"]["joint"]["sensitivity"] = [{"id": "x/../y", "label": "x",
+                                                           "targets": {"unit_t": {"bias_sd": 0.05}}}]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            ok(any(".id" in b for b in spec_problems(schema.load(p))), "JA13c a sensitivity id must be a plain name")
     safe(ja13, "JA13")
 
     if fails:

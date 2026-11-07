@@ -619,6 +619,7 @@ def _self_test() -> int:
     _self_test_priors(ok, q)
     _self_test_posterior(ok, q)
     _self_test_joint(ok, q)
+    _self_test_stability_flagged(ok)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -778,6 +779,54 @@ def _self_test_joint(ok, q):
                and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
                f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
     _ = p
+
+
+def _self_test_stability_flagged(ok):
+    """Codex r6 P1-3, P2: a flagged unit informs neither the held-out prediction nor the covariate scaling; a fold
+    without enough unflagged training units is reported not_run, and the metrics are computed without it."""
+    from toolkit.analysis import stability as SB
+
+    class _A:
+        method, theta0 = "emulator_inversion", {}
+
+        def __init__(self, ids, xs, flagged):
+            self.ids = list(ids)
+            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i]} for n, i in enumerate(ids)}
+            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}}}
+            self.flagged, self.seen = flagged, {}
+
+        def evaluate(self, theta, zh, hid):
+            self.seen.update({i: zh[i] for i in hid})
+            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, {i: [1.0, 2.0] for i in hid}
+
+        def solve(self, ben, cost):
+            return {"choice": {i: 0 for i in self.ids}}
+
+        def guard(self, *a):
+            pass
+    ids = [f"u{k}" for k in range(12)]
+    xs = {i: float(k) for k, i in enumerate(ids)}
+    z0 = {i: 0.1 * k for k, i in enumerate(ids)}
+    ben = {i: [1.0, 0.5] for i in ids}
+    cost = {i: [1.0, 2.0] for i in ids}
+    plan = {i: 0 for i in ids}
+    xs_out = dict(xs, u11=1000.0)
+    with_flag = _A(ids, xs_out, {"u11": {"reason": "toy"}})
+    SB.run(with_flag, dict(z0, u11=9.0), plan, ben, cost, plan)
+    keep = [i for i in ids if i != "u11"]
+    without = _A(keep, xs, {})
+    without.by_id = {i: with_flag.by_id[i] for i in keep}
+    SB.run(without, z0, plan, ben, cost, plan)
+    common = [i for i in without.seen if i in with_flag.seen]
+    ok(common and all(abs(with_flag.seen[i] - without.seen[i]) < 1e-9 for i in common),
+       "JR9a a flagged unit with an extreme covariate leaves every held-out prediction unchanged")
+    allf = _A(ids, xs, {i: {"reason": "toy"} for i in ids})
+    try:
+        r = SB.run(allf, z0, plan, ben, cost, plan)
+        ok(r["n_folds"] == 0 and len(r["folds_not_run"]) == 3 and r["value_verdict"] == "NOT_RUN",
+           f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")
 
 
 def _self_test_priors(ok, q):
