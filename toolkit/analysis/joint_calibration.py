@@ -394,10 +394,9 @@ def run_sensitivities(spec, rep, run_dir, compute_kw=None, log=print, units=None
     that fails at any step is reported with its error and the primary continues (Codex r5 P2-4, r6 P2)."""
     out = []
     j = declared(spec) or {}
-    _, meta1 = build(spec, units)
     for n, x in enumerate(j.get("sensitivity") or []):
         try:
-            r2 = _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, meta1, j, n, x)
+            r2 = _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, j, n, x)
         except Exception as e:  # noqa: BLE001  the primary is decided; this optional result is reported as failed
             out.append({"id": x["id"], "label": x["label"], "targets": x["targets"],
                         "error": f"{type(e).__name__}: {str(e)[:500]}"})
@@ -408,8 +407,9 @@ def run_sensitivities(spec, rep, run_dir, compute_kw=None, log=print, units=None
     return out
 
 
-def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, meta1, j, n, x) -> dict:
+def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, j, n, x) -> dict:
     import yaml
+    _, meta1 = build(spec, units)        # Codex r7 P2: inside the sensitivity's error handling
     from toolkit.analysis.artifacts import _safe_io
     from toolkit.spec import schema
     raw = _with_overrides(spec.raw, x["targets"])
@@ -419,10 +419,7 @@ def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, meta1, j, n, x)
     s2.base = spec.base              # the copy resolves data paths as the spec does
     check_same_simulator(spec, s2)
     P2, meta2 = build(s2, units)
-    prior = {"unit": [dict(r, obs=remap_windows(r["obs"], meta1["windows"], meta2["windows"]))
-                      for r in rep["runs"]["unit"]], "shared": rep["runs"]["shared"],
-             **({"unresolved_checks": rep["runs"]["unresolved_checks"]}
-                if rep["runs"].get("unresolved_checks") else {})}
+    prior = carry_runs(rep["runs"], meta1["windows"], meta2["windows"])
     sim = Simulator(s2, run_dir, meta2, compute_kw, log)
     sim.calls = 1000 * (n + 1)
     r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
@@ -745,6 +742,30 @@ def remap_windows(obs: dict, from_windows: dict, to_windows: dict) -> dict:
     return out
 
 
+def _remap_failures(d: dict, from_windows: dict, to_windows: dict) -> dict:
+    """Codex r7 P1: carried emulator failures keyed by observable, renamed as the observations are. A failure whose
+    window the current problem lacks keeps a name no current observable has, so it never clears (fail closed)."""
+    out = {}
+    for key, v in (d or {}).items():
+        r = remap_windows({key: v}, from_windows, to_windows)
+        out.update(r if r else {f"unmapped:{key}": v})
+    return out
+
+
+def carry_runs(runs: dict, from_windows: dict, to_windows: dict) -> dict:
+    """Saved runs as another problem's prior: observations and carried failures renamed by window endpoints."""
+    def one(r, rename_obs):
+        x = dict(r, obs=remap_windows(r["obs"], from_windows, to_windows)) if rename_obs else dict(r)
+        if r.get("failed_checks"):
+            x["failed_checks"] = _remap_failures(r["failed_checks"], from_windows, to_windows)
+        return x
+    out = {"unit": [one(r, True) for r in runs.get("unit") or []],
+           "shared": [one(r, False) for r in runs.get("shared") or []]}
+    if runs.get("unresolved_checks"):
+        out["unresolved_checks"] = _remap_failures(runs["unresolved_checks"], from_windows, to_windows)
+    return out
+
+
 def sim_signature(spec) -> dict:
     """What a unit or benchmark run simulates, apart from its own point (Codex r3 P1-3): the engine and its code,
     the horizon, the units' engine attributes, the comparator, the per-unit attribute and its scale, the held
@@ -832,13 +853,16 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
         raw_obs = {f"{w}.{m}": v for w, d in (res.get("windows") or {}).items() for m, v in d.items()}
         obs = remap_windows(raw_obs, wins, meta["windows"])
         if need <= set(obs):                     # every observable the current problem emulates, from this row
-            kept.append(dict(run_, obs=obs))
+            x = dict(run_, obs=obs)
+            if run_.get("failed_checks"):        # Codex r7 P1: carried failures renamed as the observations are
+                x["failed_checks"] = _remap_failures(run_["failed_checks"], wins, meta["windows"])
+            kept.append(x)
     dropped = len(unit_runs) - len(kept)
     log(f"earlier runs: {len(kept)} unit runs reused (provenance matched), {dropped} not matched, "
         f"{len(runs.get('shared') or [])} shared runs not reused (no batch provenance)")
     out = {"unit": kept, "shared": []}
     if runs.get("unresolved_checks"):     # Codex r6 P1-1: failed checks not yet cleared stay failed
-        out["unresolved_checks"] = runs["unresolved_checks"]
+        out["unresolved_checks"] = _remap_failures(runs["unresolved_checks"], wins, meta["windows"])
     return out, {"reused": len(kept), "unmatched": dropped, "from": prior_dir}
 
 
@@ -995,10 +1019,7 @@ def main(argv=None) -> int:
         check_same_simulator(spec, spec2)
         P2, meta2 = build(spec2, units)
         _, meta1 = build(spec, units)
-        first = {"unit": [dict(x, obs=remap_windows(x["obs"], meta1["windows"], meta2["windows"]))
-                          for x in rep["runs"]["unit"]], "shared": rep["runs"]["shared"],
-                 **({"unresolved_checks": rep["runs"]["unresolved_checks"]}
-                    if rep["runs"].get("unresolved_checks") else {})}
+        first = carry_runs(rep["runs"], meta1["windows"], meta2["windows"])
         j2 = declared(spec2)
         sim2 = Simulator(spec2, rd, meta2, kw, say)
         sim2.calls = 1000            # its batch files apart from the first setting's
@@ -1396,6 +1417,20 @@ def _self_test() -> int:
             ok(len(out) == 1 and "toy sensitivity failure" in out[0].get("error", "") and "report" not in out[0],
                "JA12d a sensitivity that fails is reported with its error; the primary is untouched")
             ok("sensitivity" in summary(dict(rep, sensitivity=out)), "JA12e the summary carries a failed sensitivity")
+            real_b = build
+
+            def build_fails(*a, **k):
+                raise OSError("toy rebuild failure")
+            globals()["build"] = build_fails
+            try:
+                out2 = run_sensitivities(spec, rep, d, {"max_workers": 2}, log=q)
+            except Exception as e:  # noqa: BLE001
+                out2 = [{"error": f"escaped: {e}"}]
+            finally:
+                globals()["build"] = real_b
+            ok(len(out2) == 1 and "toy rebuild failure" in out2[0].get("error", "")
+               and not out2[0]["error"].startswith("escaped"),
+               "JA12f a failure rebuilding the problem is reported for the sensitivity and never stops the primary")
     safe(ja12, "JA12")
 
     def ja13():          # Codex r5 P2-3, P2-5: refuse declarations the code would not apply as written
@@ -1423,6 +1458,30 @@ def _self_test() -> int:
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             ok(any(".id" in b for b in spec_problems(schema.load(p))), "JA13c a sensitivity id must be a plain name")
     safe(ja13, "JA13")
+
+    def ja14():          # Codex r7 P1: carried emulator failures follow their window when names change
+        w1 = {"jc0": [1.0, 2.0], "jc1": [3.0, 4.0]}
+        w2 = {"jc0": [3.0, 4.0], "jc1": [1.0, 2.0]}           # the targets reordered: the names swap
+        runs = {"unit": [{"unit": "a", "obs": {"jc0.prev": 0.1, "jc1.prev": 0.2},
+                          "failed_checks": {"jc0.prev": [0]}}],
+                "shared": [{"obs": {"bench.B": 1.0}, "failed_checks": {"jc0.prev": [0], "bench.B": [0]}}],
+                "unresolved_checks": {"jc0.prev": [32], "bench.B": [8]}}
+        c = carry_runs(runs, w1, w2)
+        ok(c["unit"][0]["obs"] == {"jc1.prev": 0.1, "jc0.prev": 0.2}
+           and c["unit"][0]["failed_checks"] == {"jc1.prev": [0]}
+           and c["shared"][0]["failed_checks"] == {"jc1.prev": [0], "bench.B": [0]}
+           and c["unresolved_checks"] == {"jc1.prev": [32], "bench.B": [8]},
+           f"JA14a a carried failure is renamed with its observations ({c['unresolved_checks']})")
+        c2 = carry_runs(runs, w1, {"jc0": [3.0, 4.0]})
+        ok("unmapped:jc0.prev" in c2["unresolved_checks"] and "jc0.prev" not in c2["unresolved_checks"],
+           "JA14b a carried failure whose window is gone keeps a name no observable has, so it never clears")
+        P, sim, *_ = HM._toy()
+        h = HM.HistoryMatch(P, sim, 1, q, prior={"unit": [], "shared": [], "unresolved_checks": {"unmapped:x": [4]}},
+                            points_per_unit=4, candidates_log2=8)
+        h._reset_checks()
+        h._restore_checks()
+        ok("unmapped:x" in h._inadequate(), "JA14c such a failure blocks the continuation")
+    safe(ja14, "JA14")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

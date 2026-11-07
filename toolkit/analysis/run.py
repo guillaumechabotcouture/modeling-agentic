@@ -823,7 +823,8 @@ def _self_test_stability_flagged(ok):
     allf = _A(ids, xs, {i: {"reason": "toy"} for i in ids})
     try:
         r = SB.run(allf, z0, plan, ben, cost, plan)
-        ok(r["n_folds"] == 0 and len(r["folds_not_run"]) == 3 and r["value_verdict"] == "NOT_RUN",
+        ok(r["n_folds"] == 0 and len(r["folds_not_run"]) == 3 and r["value_verdict"] == "NOT_RUN"
+           and r["verdict"] == "NOT_RUN",
            f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")

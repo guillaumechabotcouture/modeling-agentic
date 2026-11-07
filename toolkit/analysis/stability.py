@@ -145,6 +145,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                                      "cases_averted_gap_pct_worst_fold": met["benefit_gap_pct_worst_fold"],
                                      "rule_classification_concordance_pct_worst_fold":
                                          met["package_concordance_pct_worst_fold"]})
+    if not folds:       # Codex r7 P2: no fold ran; no verdict from all-None metrics
+        verdict = "NOT_RUN"
     th = thresholds()
     w = met["total_benefit_loss_pct_worst_fold"]
     vv = ("NOT_RUN" if w is None else "ROBUST" if w <= th["value_loss_pct_robust"] else
