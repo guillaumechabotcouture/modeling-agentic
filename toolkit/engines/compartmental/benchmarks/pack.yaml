@@ -58,6 +58,38 @@ configs:
                   initialiser: cohort_history, doses: [d1, d2], dose_dependence: nested, dt: day,
                   generation_interval: [0.5, 0.5], tol: 1.0e-12}
 
+  # v0.2 (age-structured questions): an SEIR generation interval, per-group calibrated s0, dose blocks per age group,
+  # a component acting during the epidemic, birth cohorts with pre-existing immunity, and the year time unit (hooks)
+  age5_seir: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+              initialiser: given, dt: day, transmission: q, tol: 1.0e-14, step_cap: 50000,
+              generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}, per_group_parameters: [s0]}
+  age5_attr: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+              initialiser: given, dt: day, transmission: q, tol: 1.0e-14, step_cap: 50000,
+              generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}}
+  age5_doses: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+               initialiser: given, dt: day, transmission: r0, tol: 1.0e-14, step_cap: 50000,
+               generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}},
+               components: {d1: {kind: doses, group: g1, block_size: 5.0e+4, max_blocks: 4},
+                            d2: {kind: doses, group: g2, block_size: 5.0e+4, max_blocks: 6},
+                            d3: {kind: doses, group: g3, block_size: 5.0e+4, max_blocks: 5},
+                            d4: {kind: doses, group: g4, block_size: 5.0e+4, max_blocks: 3},
+                            d5: {kind: doses, group: g5, block_size: 5.0e+4, max_blocks: 2}}}
+  win_seir: {groups: [all], structure: single_group, mode: windowed, initialiser: given, dt: day,
+             generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}}
+  late_campaign: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+                  generation_interval: {seir: {latent_days: 2.0, infectious_days: 3.0}}, tol: 1.0e-14, step_cap: 50000,
+                  components: {vax: {kind: campaign, targets: [all], reach: 0.6, day: 3000}}}
+  cohorts_homog: {groups: [old, c1, c2, c3, c4, c5], structure: birth_cohorts, mode: to_extinction, initialiser: given,
+                  dt: day, generation_interval: {seir: {latent_days: 10.0, infectious_days: 8.0}}, tol: 1.0e-14,
+                  step_cap: 50000}
+  age5_final: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+               initialiser: given, dt: day, transmission: q, tol: 1.0e-14, time_unit: year, final_size: true,
+               generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}}
+  age5_year: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+              initialiser: given, dt: day, transmission: q, tol: 1.0e-12, step_cap: 50000, time_unit: year,
+              generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}},
+              components: {d2: {kind: doses, group: g2, block_size: 5.0e+4, max_blocks: 6}}}
+
 settings:
   r0_1p5: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
   r0_2: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
@@ -106,6 +138,33 @@ settings:
                      always_immune: [b2000], contact_rate: 10.0, seed: 1.0e-9, intro: b2012,
                      "coverage:d1": [0.0, 0.9, 0.8, 0.7], "coverage:d2": [0.0, 0.6, 0.0, 0.5]}}
 
+  # v0.2
+  as_params: {config: age5_seir, params: {q: 0.6, "s0:g1": 1.0, "s0:g2": 0.9, "s0:g3": 0.7, "s0:g4": 0.8, "s0:g5": 1.0},
+              unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], seed: 1.0e-6, intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+  as_attr: {config: age5_attr, params: {q: 0.6},
+            unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2,
+                   contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+  as_doses: {config: age5_doses, params: {r0: 1.5, "efficacy:d1": 1.0, "efficacy:d2": 1.0, "efficacy:d3": 1.0,
+                                          "efficacy:d4": 1.0, "efficacy:d5": 1.0},
+             unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 1.0, 1.0, 1.0, 1.0], seed: 1.0e-9, intro: g2,
+                    contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+  as_growth: {config: win_seir, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-14}, params: {r0: 1.8},
+              horizon: {start: 0, stop: 200, window: [0, 200], windows: {growth: [60, 100], all: [0, 200]}}}
+  as_final_near: {config: age5_final, params: {q: 0.22},
+                  unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6,
+                         intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]},
+                  horizon: {start: 2026.0, stop: 2046.0, window: [2026.0, 2046.0], windows: {all: [2026.0, 2046.0]}}}
+  as_day_near: {config: age5_attr, params: {q: 0.22},
+                unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6,
+                       intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+  as_late: {config: late_campaign, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-8}, params: {r0: 2.0, "efficacy:vax": 0.9}}
+  as_cohorts_12: {config: cohorts_homog, params: {r0: 12.0},
+                  unit: {N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s0: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
+                         contact_rate: 10.0, seed: 1.0e-9, intro: c5}}
+  as_cohorts_18: {config: cohorts_homog, params: {r0: 18.0},
+                  unit: {N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s0: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
+                         contact_rate: 10.0, seed: 1.0e-9, intro: c5}}
+
 arms:
   fs1_1p5: {setting: r0_1p5, package: {}}
   fs1_2: {setting: r0_2, package: {}}
@@ -130,6 +189,18 @@ arms:
   rn2_week: {setting: rn_week, package: {}}
   rn3_forced: {setting: rn_forced, package: {}}
   ci_none: {setting: ci_cohort, package: {}}
+  as_p: {setting: as_params, package: {}}
+  as_a: {setting: as_attr, package: {}}
+  as_none: {setting: as_doses, package: {}}
+  as_herd: {setting: as_doses, package: {d1: 1, d2: 3, d3: 1, d4: 1}}
+  as_short: {setting: as_doses, package: {d1: 1, d2: 2, d3: 1, d4: 1}}
+  as_win: {setting: as_growth, package: {}}
+  as_late_none: {setting: as_late, package: {}}
+  as_fin_gen: {setting: as_final_near, package: {}}
+  as_fin_day: {setting: as_day_near, package: {}}
+  as_late_vax: {setting: as_late, package: {vax: 1}}
+  as_c12: {setting: as_cohorts_12, package: {}}
+  as_c18: {setting: as_cohorts_18, package: {}}
 
 benchmarks:
   # ---------------------------------------------------------------- to_extinction mode
@@ -334,6 +405,50 @@ benchmarks:
   - {id: OB1h, metric: "denominator error alone (0.9, 0.125 -> 0.8)", source: "hand-computed",
      estimand: {type: value, a: {probe: observation, args: {mechanism: denominator_error, value: 0.9, delta: 0.125}},
                 b: 0.8, tol: {abs: 1.0e-12}}}
+  # ---------------------------------------------------------------- v0.2: age-structured questions
+  - {id: AS1, metric: "5 age groups, SEIR generation interval, pre-existing immunity by age as calibrated s0:<group> parameters: per-group final size equals the reference ODE (the SEIR final size equals the SIR one)",
+     source: "the pack's ODE; Ma & Earn (2006) Bull Math Biol (final size independent of the latent period)",
+     estimand: {type: value, a: {arm: as_p, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 0.6, gamma: 0.25, N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s: [1.0, 0.9, 0.7, 0.8, 1.0],
+                    seed: [0.0, 3.3333333333333335e-6, 0.0, 0.0, 0.0], C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {abs: 1.0e-5}}}
+  - {id: AS1b, metric: "per-group s0 parameters and the s0 unit attribute give the same epidemic", source: "identity (v0.2)",
+     estimand: {type: identity, a: {arm: as_p, value: per_capita_vec.infections},
+                b: {arm: as_a, value: per_capita_vec.infections}, tol: {rel: 1.0e-12}}}
+  - {id: AS2, metric: "SEIR generation interval (latent 1.5 d, infectious 3 d), R0 = 1.8: the engine's growth rate r satisfies the SEIR relation R0 = (1 + r L)(1 + r D) to the discretisation",
+     source: "Wallinga & Lipsitch (2007) Proc R Soc B, eq. for SEIR with exponential periods",
+     estimand: {type: value, a: {oracle: seir_growth_r0, args: {r: {arm: as_win, value: windows.growth.growth_rate},
+                latent_days: 1.5, infectious_days: 3.0}}, b: 1.8, tol: {rel: 1.0e-2}}}
+  - {id: AS3a, metric: "age-targeted dose blocks (1, 3, 1, 1, 0 blocks of 50,000) bring the next-generation radius below 1 (R0 = 1.5, asymmetric 5x5)",
+     source: "multigroup herd-immunity threshold: rho(diag(s) K) < 1 (Diekmann, Heesterbeek & Metz 1990)",
+     estimand: {type: value, compare: le, a: {arm: as_herd, value: windows.all.reff_start}, b: 0.97, tol: {abs: 0.0}}}
+  - {id: AS3b, metric: "same: below the threshold no major outbreak (attack rate within the seed-size bound)", source: "threshold theorem",
+     estimand: {type: value, compare: le, a: {arm: as_herd, value: windows.all.attack_rate}, b: 1.0e-7, tol: {abs: 0.0}}}
+  - {id: AS3c, metric: "same matrix, one block fewer to the highest-contact group (1, 2, 1, 1, 0): above the threshold, a major outbreak", source: "threshold theorem",
+     estimand: {type: value, compare: le, a: 0.01, b: {arm: as_short, value: windows.all.attack_rate}, tol: {abs: 0.0}}}
+  - {id: AS4, metric: "a campaign acting after extinction (day 3000) leaves the final size unchanged", source: "identity (v0.2 component timing)",
+     estimand: {type: identity, a: {arm: as_late_vax, value: windows.all.attack_rate},
+                b: {arm: as_late_none, value: windows.all.attack_rate}, tol: {rel: 1.0e-12}}}
+  - {id: AS5a, metric: "birth cohorts with homogeneous mixing, an always-immune cohort and cohort susceptibilities 0.08-1, R0 = 12: per-cohort final size equals the rank-one relation",
+     source: "Ma & Earn (2006); Andreasen (2011)",
+     estimand: {type: value, a: {arm: as_c12, value: per_capita_vec.infections},
+                b: {oracle: final_size_rank_one, args: {q: 1.2, a: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                    b: [0.55, 0.09, 0.09, 0.09, 0.09, 0.09], N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
+                    seed: [0.0, 0.0, 0.0, 0.0, 0.0, 1.1111111111111112e-8]}}, tol: {rel: 1.0e-6}}}
+  - {id: AS5b, metric: "same at R0 = 18", source: "Ma & Earn (2006); Andreasen (2011)",
+     estimand: {type: value, a: {arm: as_c18, value: per_capita_vec.infections},
+                b: {oracle: final_size_rank_one, args: {q: 1.8, a: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                    b: [0.55, 0.09, 0.09, 0.09, 0.09, 0.09], N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
+                    seed: [0.0, 0.0, 0.0, 0.0, 0.0, 1.1111111111111112e-8]}}, tol: {rel: 1.0e-6}}}
+  - {id: AS7, metric: "final_size on the generation grid (one generation per step) equals the declared SEIR interval's final size, near criticality (Reff about 1.05)",
+     source: "exponential-survival identity: the final size does not depend on the generation interval (design note §1.1)",
+     estimand: {type: identity, a: {arm: as_fin_gen, value: per_capita_vec.infections},
+                b: {arm: as_fin_day, value: per_capita_vec.infections}, tol: {rel: 1.0e-7}}}
+  - {id: AS6, metric: "run_series() monthly incidence integrates to the run's attack rate, and its last susceptible share is the run's s_end (time_unit year, a dose package)",
+     source: "identity (figures-hooks/1)",
+     estimand: {type: value, a: {probe: series_consistency, args: {config: age5_year, params: {q: 0.6, "efficacy:d2": 0.7},
+                unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}, package: {d2: 2},
+                horizon: {start: 2026.0, stop: 2046.0, window: [2026.0, 2046.0], windows: {all: [2026.0, 2046.0]}}}},
+                b: 0.0, tol: {abs: 1.0e-12}}}
   # ---------------------------------------------------------------- held out, not yet transcribed (owner decision 2026-11-01)
   - {id: FS7, metric: "published age-specific final sizes from a contact-matrix model", role: held_out,
      source: "candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006) AJE",

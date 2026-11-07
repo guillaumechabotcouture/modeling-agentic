@@ -312,10 +312,22 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     buf = _io.StringIO(newline="")
     w = csv.writer(buf)
     hl_o = d["headline"]["outcome"]
-    w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"])
-    for i in A.ids:
-        w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
-                    A.by_id[i].get(reg, "") if reg else ""])
+    bg = d.get("by_group")
+    if bg:
+        # a joint package within a unit (e.g. dose blocks over groups): one row per (unit, engine group) with the
+        # plan's quantity in that group (a cost output) and the outcome averted in it
+        gc = bg["columns"]
+        w.writerow([gc["group"], gc["quantity"], gc["value"], cols["unit"], cols["package"]])
+        for i in A.ids:
+            yg = out0[i]["y_group"]
+            for g, qname in bg["quantity"].items():
+                w.writerow([g, round(float(out0[i]["cost"][plan[i]][qname]), 4),
+                            round(yg[A.comp][hl_o].get(g, 0.0) - yg[plan[i]][hl_o].get(g, 0.0), 4), i, plan[i]])
+    else:
+        w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"])
+        for i in A.ids:
+            w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
+                        A.by_id[i].get(reg, "") if reg else ""])
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(dp, buf.getvalue(), run_dir)
     S.deliverable(dp, PRODUCER, "allocation")

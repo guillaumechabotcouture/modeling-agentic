@@ -1536,7 +1536,7 @@ def fig_calibration(R, t):
         a1.set_ylabel("model expected", fontsize=8)
         pr = []
         for yv, r in enumerate(regs[::-1]):
-            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f["expected"]), 1e-9))
+            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f.get("variance", f["expected"])), 1e-9))
                  for f in fit if str(f.get("unit")) in R.by_id and R.region(str(f["unit"])) == r]
             pr += v
             a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], zorder=3)
@@ -1721,7 +1721,7 @@ def fig_cost_per_outcome(R, t):
     lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
     inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
     nrow = len(shown) + len(other)
-    fig = _fig(t, 7.6, 0.3 * (nrow + len(inc)) + 2.2)
+    fig = _fig(t, 7.6, 0.3 * max(nrow + len(inc), 4) + 2.2)    # a floor: one package and one component still lay out
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h

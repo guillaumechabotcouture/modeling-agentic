@@ -38,11 +38,28 @@ Configuration (constructor keywords; anything else is refused):
   doses, dose_dependence   cohort_history: dose names; independent | nested
   outcomes             extra per-capita outcomes, each from the unit attribute ratio:<outcome> (per group)
   tol, step_cap, segment, rt_trajectory, results_path
+v0.2 (age-structured questions; every field below defaults to the v0.1 behaviour):
+  time_unit            day (v0.1: the horizon is in days from the importation) | year (the horizon is in decimal
+                       years, day 0 is horizon.start; the figure hooks need it)
+  generation_interval  also {seir: {latent_days, infectious_days[, max_days]}}: the generation-interval
+                       distribution of an SEIR model with exponential latent and infectious periods, discretised
+                       on the dt grid (seir_generation_interval)
+  per_group_parameters [s0, ratio:<outcome>]: the initial susceptible share (given initialiser) and/or an
+                       outcome-per-infection ratio become calibrated engine parameters s0:<group> and
+                       ratio:<outcome>:<group> instead of unit attributes, so a calibration fits them jointly
+                       with transmission
+  components.<c>.day   days after horizon.start at which the component acts (default 0: before the epidemic,
+                       the v0.1 behaviour); a later day acts during the epidemic on the susceptibles left then
+  hooks                schedule() and run_series() (toolkit/engines/hooks.py, figures-hooks/1), time_unit year
+  final_size           to_extinction: outcomes count the whole epidemic (its final size), not only the decision
+                       window; near-critical epidemics last decades of model time but carry few infections
 
 Unit attributes: N (group sizes), s0 (given), contact (G x G) or contact_rate, birth_year,
 decision_year, coverage:<dose> (latent true coverage per cohort), always_immune, always_susceptible,
 seed (initial infections as a share of the unit's population), intro (group, or {group: share}),
-reach:<component>, ratio:<outcome>. Time is in days. Nothing here names a disease.
+reach:<component>, ratio:<outcome>; v0.2: coverage_scale (cohort_history: the latent true coverage is
+min(1, coverage_scale x coverage:<dose>), a per-unit latent quantity when coverage:<dose> is a reported series).
+Time is in days (time_unit day) or decimal years (time_unit year). Nothing here names a disease.
 
 `p_major` (probability of a major outbreak) is the one quantity computed from an equation rather
 than from the sim: the multitype branching-process extinction equations x_i = G_i(x). It is labelled
@@ -50,6 +67,7 @@ derived. Analytic final-size solvers are test oracles in benchmarks/oracles.py, 
 """
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import math
@@ -67,7 +85,11 @@ from toolkit.engines.contract import (EngineCard, Horizon, Outcomes, Package, Pa
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(HERE, "benchmarks", "pack.yaml")
 RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
-NAME, VERSION = "compartmental-starsim", "0.1"
+NAME, VERSION = "compartmental-starsim", "0.2"
+TIME_UNITS = ("day", "year")
+YEAR_DAYS = 365.0                 # time_unit year: one model year is 365 days (the forcing period's default)
+PER_GROUP = ("s0", "ratio")       # per_group_parameters: s0 and ratio:<outcome>
+MAX_SEGMENT = 8192                # steps per Starsim sim in a to_extinction run (memory bound per segment)
 
 STRUCTURES = ("single_group", "age_groups_contact_matrix", "birth_cohorts")
 MODES = ("to_extinction", "windowed")
@@ -79,7 +101,10 @@ IMPORTATION = ("deterministic", "branching")
 OFFSPRING = ("poisson", "geometric")
 DEPENDENCE = ("independent", "nested")
 KINDS = ("campaign", "doses")
-DECLARED = "declared per question (decision spec), with its source"
+DECLARED = ("declared per question (decision spec), with its source; pathogen-specific literature ranges are in "
+            "literature.yaml beside this engine (priors with their spread across settings, not truths)")
+PER_GROUP_SOURCE = ("calibrated per run: a latent quantity seen through the declared observation sources "
+                    "(per_group_parameters, v0.2)")
 PUBLISHED_LABEL = ("validated against analytic identities and simulation-based coverage; published benchmarks "
                    "FS7 and RN5 not yet assessed")
 
@@ -109,6 +134,72 @@ def check_generation_interval(gi, dt: str) -> np.ndarray:
     if abs(sum(w) - 1.0) > 1e-9:
         raise ValueError(f"generation interval sums to {sum(w)!r}, not 1")
     return np.asarray(w, float)
+
+
+def seir_generation_interval(latent_days, infectious_days, dt_days: float = 1.0, max_days=None,
+                             tail: float = 1e-9) -> list:
+    """The generation-interval distribution of an SEIR model with exponential latent (mean L) and infectious (mean
+    D) periods, g(t) = (exp(-t/L) - exp(-t/D)) / (L - D) (gamma(2, L) when L = D), discretised on the dt grid for a
+    renewal model whose infections are binned by step: lag s (s = 1..K) has weight integral (1 - |t/dt - s|) g(t)
+    over ((s-1) dt, (s+1) dt), the same-step mass folded into w_1 (the triangular form of the pack's win_refit;
+    the interval form G(s dt) - G((s-1) dt) shifts the mean by dt/2 and biases R0 from growth by 3-13%). Truncated
+    where the tail falls below `tail` (or at `max_days`), renormalised to sum 1. The renewal step with these weights
+    has the SEIR final size exactly (any weights do, §1.1) and, to the discretisation, its growth rate,
+    R0 = (1 + r L)(1 + r D) (pack AS2)."""
+    L, D = _num(latent_days, "latent_days"), _num(infectious_days, "infectious_days")
+    dt = _num(dt_days, "dt_days")
+    if L <= 0 or D <= 0 or dt <= 0:
+        raise ValueError("seir generation interval: latent_days, infectious_days and dt must be positive")
+
+    def g(t):
+        if abs(L - D) < 1e-12 * max(L, D):
+            return t / (L * L) * np.exp(-t / L)
+        return (np.exp(-t / L) - np.exp(-t / D)) / (L - D)
+
+    def tail_beyond(t):
+        if abs(L - D) < 1e-12 * max(L, D):
+            return math.exp(-t / L) * (1.0 + t / L)
+        return (L * math.exp(-t / L) - D * math.exp(-t / D)) / (L - D)
+    n = 400                                              # midpoint sub-steps per dt (weights to ~1e-6 relative)
+    u = (np.arange(n) + 0.5) / n                         # position within a step, in steps
+    cap = _num(max_days, "max_days") if max_days is not None else None
+    if cap is not None and abs(round(cap / dt) * dt - cap) > 1e-9 * max(1.0, cap):
+        raise ValueError(f"seir generation interval: max_days {cap} is not a whole number of {dt}-day steps")
+    if cap is not None and cap < dt:
+        raise ValueError(f"seir generation interval: max_days {cap} must be at least one step ({dt} days)")
+    if not (isinstance(tail, float) and 0 < tail < 1):
+        raise ValueError("seir generation interval: tail must be in (0, 1)")
+    w, k = [], 1
+    while True:
+        gk = g((k - 1 + u) * dt)                         # on the step ((k-1) dt, k dt), t / dt = k - 1 + u
+        up = float(np.sum(u * gk) * dt / n)              # hat k (rising, value u)
+        down = float(np.sum((1.0 - u) * gk) * dt / n)    # hat k-1 (falling, value 1 - u)
+        if k == 1:
+            w.append(up + down)                          # hat 0 (same step) folded into lag 1
+        else:
+            w[-1] += down
+            w.append(up)
+        if (cap is not None and k * dt >= cap) or (cap is None and tail_beyond(k * dt) < tail):
+            break
+        if k > 100000:
+            raise ValueError("seir generation interval: the tail did not fall below the tolerance within 100,000 steps")
+        k += 1
+    s = sum(w)
+    return [x / s for x in w]
+
+
+def resolve_generation_interval(gi, dt: str):
+    """The configured generation interval as weights on the dt grid: a list (or {dt, w}) as given, or
+    {seir: {latent_days, infectious_days[, max_days]}} discretised by seir_generation_interval."""
+    if isinstance(gi, dict) and "seir" in gi:
+        if set(gi) != {"seir"} or not isinstance(gi["seir"], dict):
+            raise ValueError("generation interval {seir: {latent_days, infectious_days[, max_days]}}: no other keys")
+        a = dict(gi["seir"])
+        bad = set(a) - {"latent_days", "infectious_days", "max_days"}
+        if bad or "latent_days" not in a or "infectious_days" not in a:
+            raise ValueError(f"generation interval seir: give latent_days and infectious_days (unknown: {sorted(bad)})")
+        return seir_generation_interval(a["latent_days"], a["infectious_days"], DT_DAYS[dt], a.get("max_days"))
+    return list(gi) if not isinstance(gi, dict) else gi
 
 
 def spectral_radius(M) -> np.ndarray:
@@ -247,10 +338,15 @@ def _module_class():
                 self.S = c["s_init"] * c["N"]
                 self.hist = np.zeros((len(c["w"]),) + self.S.shape)
                 self.inc = []
+                # v0.2 generation grid (final_size): no per-step history, only the running total per group, so memory
+                # does not grow with the number of generations (a near-critical batch ran to ~77 GB otherwise)
+                self.cum = np.zeros_like(self.S)
+                self.n_steps = 0
                 self.active = np.ones(self.S.shape[0], bool)
                 self.stopped = np.full(self.S.shape[0], -1)
                 self.s_first = None
                 self.doses = {cn: np.zeros(self.S.shape[0]) for cn in c["components"]}
+                self.removed = {}                              # v0.2: step -> susceptibles a later component protected
             else:
                 for k, v in self._carry.items():
                     setattr(self, k, v)
@@ -264,7 +360,8 @@ def _module_class():
                 ss.Result("n_active", label="Batch members still running"))
 
         def export(self) -> dict:
-            return {k: getattr(self, k) for k in ("S", "hist", "inc", "active", "stopped", "s_first", "doses")}
+            return {k: getattr(self, k) for k in ("S", "hist", "inc", "active", "stopped", "s_first", "doses",
+                                                  "removed", "cum", "n_steps")}
 
         @property
         def k(self) -> int:
@@ -281,6 +378,14 @@ def _module_class():
                 self.inc.append(seed.copy())
                 self._last = seed.sum(axis=1)
                 return
+            for cn, kc in c["late"]:                            # v0.2: a component acting during the epidemic
+                if k == kc:
+                    before = self.S.copy()
+                    s, d = apply_component(self.S / c["N"], c["N"], c["components"][cn], c["levels"][cn],
+                                           c["eff"][cn], c["reach"][cn], c["groups"], c["targets_susceptible"])
+                    self.S = s * c["N"]
+                    self.doses[cn] = d
+                    self.removed[k] = self.removed.get(k, 0.0) + (before - self.S)
             act = self.active
             new = np.zeros_like(self.S)
             if act.any():
@@ -291,8 +396,15 @@ def _module_class():
                 self.S[act] = self.S[act] - new[act]
             self.hist = np.roll(self.hist, 1, axis=0)
             self.hist[0] = new
-            self.inc.append(new)
+            if c.get("generations"):
+                self.cum += new
+            else:
+                self.inc.append(new)
+            self.n_steps = k
             self._last = new.sum(axis=1)
+            # a member may stop only after its own package's components acting during the epidemic have acted
+            # (Codex r1 P2-14: per member, from the components its package sets)
+            act = act & (k >= c["k_late_b"])
             if c["mode"] == "to_extinction" and act.any():
                 # Stop rule. A member whose whole infectious history is zero can never infect again. Otherwise,
                 # with v the incidence over one generation interval per group (an upper bound on the infection
@@ -362,18 +474,49 @@ def _component_class():
     return AllOrNothingComponent
 
 
+def _release(sim) -> None:
+    """Empty a finished Starsim sim. Starsim 3.3 keeps every Sim object alive after it is dropped (measured: a
+    plain ss.Sim of 20,000 daily steps run 30 times grew the process by ~1 GB; 30 runs with the finished sims
+    emptied stayed flat), and here each sim also holds the run's context and its incidence history. A
+    calibration of 10^4 evaluations therefore exhausted a 32 GB VM (flu run 4). The module state was exported
+    before, so emptying the sim, its modules and its other members changes no output."""
+    kids = []
+    for k in ("diseases", "interventions", "people", "loop", "dists", "results", "t", "networks", "demographics",
+              "connectors", "analyzers", "pars"):
+        v = getattr(sim, k, None)
+        if v is None:
+            continue
+        kids.append(v)
+        if isinstance(v, dict):
+            kids += [x for x in v.values() if hasattr(x, "__dict__")]
+    for v in kids:
+        try:
+            vars(v).clear()
+        except TypeError:
+            pass
+    try:
+        vars(sim).clear()
+    except TypeError:
+        pass
+
+
 # ------------------------------------------------------------------------------------ engine
 class CompartmentalEngine:
+    # run_batch() equals run() pair by pair (self-test K3, rel 1e-12), with one unit and one package per pair: the
+    # direct outcome model may evaluate a whole draw in batches (toolkit/analysis/model.py DirectModel)
+    batch_equals_run = True
+
     def __init__(self, groups=("all",), structure="single_group", mode="to_extinction", initialiser="given",
                  dt="day", generation_interval=(1.0,), transmission="r0", forcing="none", forcing_period=365.0,
                  forcing_ref_phase=0.0, importation="deterministic", offspring="poisson", components=None,
                  targets_susceptible=False, doses=(), dose_dependence="independent", outcomes=(), tol=1e-9,
-                 step_cap=20000, segment=256, rt_trajectory=True, results_path=None):
+                 step_cap=None, segment=256, rt_trajectory=True, results_path=None, time_unit="day",
+                 per_group_parameters=(), final_size=False):
         for val, allowed, what in ((structure, STRUCTURES, "structure"), (mode, MODES, "mode"),
                                    (initialiser, INITIALISERS, "initialiser"), (dt, tuple(DT_DAYS), "dt"),
                                    (transmission, TRANSMISSION, "transmission"), (forcing, FORCING, "forcing"),
                                    (importation, IMPORTATION, "importation"), (offspring, OFFSPRING, "offspring"),
-                                   (dose_dependence, DEPENDENCE, "dose_dependence")):
+                                   (dose_dependence, DEPENDENCE, "dose_dependence"), (time_unit, TIME_UNITS, "time_unit")):
             if val not in allowed:
                 raise ValueError(f"{what} {val!r} not in {allowed}")
         groups = [str(g) for g in groups]
@@ -388,8 +531,9 @@ class CompartmentalEngine:
             raise ValueError("cohort_history needs structure birth_cohorts (cohorts are indexed by birth year)")
         self.groups, self.structure, self.mode, self.initialiser = groups, structure, mode, initialiser
         self.dt, self.dt_days = dt, DT_DAYS[dt]
-        self.w = check_generation_interval(list(generation_interval) if not isinstance(generation_interval, dict)
-                                           else generation_interval, dt)
+        self.time_unit = time_unit
+        self.gi_decl = copy.deepcopy(generation_interval) if isinstance(generation_interval, dict) else None
+        self.w = check_generation_interval(resolve_generation_interval(generation_interval, dt), dt)
         self.transmission, self.forcing, self.importation, self.offspring = transmission, forcing, importation, offspring
         self.forcing_period = _num(forcing_period, "forcing_period")
         self.forcing_ref_phase = _num(forcing_ref_phase, "forcing_ref_phase")
@@ -405,7 +549,10 @@ class CompartmentalEngine:
                 r = _num(cfg.get("reach", 1.0), f"component {cname} reach")
                 if not 0 <= r <= 1:
                     raise ValueError(f"component {cname}: reach {r} outside [0, 1]")
+                day = self._day(cname, cfg)
                 cfg = {"kind": "campaign", "targets": list(cfg["targets"]), "reach": r}
+                if day:
+                    cfg["day"] = day
             else:
                 if cfg.get("group") not in groups:
                     raise ValueError(f"component {cname}: group {cfg.get('group')!r} not declared")
@@ -415,7 +562,10 @@ class CompartmentalEngine:
                 bs = _num(cfg.get("block_size"), f"component {cname} block_size")
                 if bs <= 0:
                     raise ValueError(f"component {cname}: block_size must be positive")
+                day = self._day(cname, cfg)
                 cfg = {"kind": "doses", "group": cfg["group"], "block_size": bs, "max_blocks": mb}
+                if day:
+                    cfg["day"] = day
             self.components[str(cname)] = cfg
         self.targets_susceptible = bool(targets_susceptible)
         self.doses = [str(d) for d in doses]
@@ -425,12 +575,43 @@ class CompartmentalEngine:
         self.outcomes = [str(o) for o in outcomes]
         if "infections" in self.outcomes:
             raise ValueError("infections is always an output; outcomes lists the others")
+        pg = [str(x) for x in (per_group_parameters or ())]
+        for x in pg:
+            base = x.split(":", 1)[0]
+            if base not in PER_GROUP or (base == "s0") != (x == "s0") or (base == "ratio" and x[6:] not in self.outcomes):
+                raise ValueError(f"per_group_parameters: {x!r} is not s0 or ratio:<a declared outcome>")
+        if "s0" in pg and initialiser != "given":
+            raise ValueError("per_group_parameters s0 needs the given initialiser")
+        if len(set(pg)) != len(pg):
+            raise ValueError("per_group_parameters: listed twice")
+        self.per_group = pg
+        self.final_size = bool(final_size)
+        if self.final_size and mode != "to_extinction":
+            raise ValueError("final_size needs mode to_extinction")
+        self.final_generations = (self.final_size and forcing == "none"
+                                  and not any(cfg.get("day") for cfg in self.components.values()))
         self.tol = _num(tol, "tol")
+        # v0.2: a final-size run counts generations (below), and a near-critical one needs many of them
+        step_cap = (1000000 if self.final_size else 20000) if step_cap is None else step_cap
         self.step_cap, self.segment = int(step_cap), int(segment)
         if self.tol <= 0 or self.step_cap < 1 or self.segment < 1:
             raise ValueError("tol, step_cap and segment must be positive")
         self.rt_trajectory = bool(rt_trajectory)
         self.results_path = results_path
+
+    def _day(self, cname, cfg) -> float:
+        """v0.2: the day after horizon.start at which a component acts (0: before the epidemic); a whole number of
+        dt steps."""
+        day = _num(cfg.get("day", 0.0), f"component {cname} day")
+        k = round(day / self.dt_days)
+        if day < 0 or abs(k * self.dt_days - day) > 1e-9:
+            raise ValueError(f"component {cname}: day {day} is not a non-negative whole number of {self.dt} steps")
+        return float(day)
+
+    def late_components(self) -> list:
+        """[(component, step)] of the components acting during the epidemic (day > 0), by step."""
+        return sorted(((c, int(round(cfg["day"] / self.dt_days))) for c, cfg in self.components.items()
+                       if cfg.get("day")), key=lambda x: (x[1], x[0]))
 
     # ---------------------------------------------------------------------------- contract
     def config(self) -> dict:
@@ -441,13 +622,18 @@ class CompartmentalEngine:
                 "offspring": self.offspring, "components": self.components,
                 "targets_susceptible": self.targets_susceptible, "doses": self.doses,
                 "dose_dependence": self.dose_dependence, "outcomes": self.outcomes, "tol": self.tol,
-                "step_cap": self.step_cap, "segment": self.segment}
+                "step_cap": self.step_cap, "segment": self.segment,
+                # v0.2 fields only when they differ from v0.1's behaviour (a v0.1 configuration's digest is unchanged)
+                **({"time_unit": self.time_unit} if self.time_unit != "day" else {}),
+                **({"per_group_parameters": list(self.per_group)} if self.per_group else {}),
+                **({"final_size": True} if self.final_size else {}),
+                **({"generation_interval_declared": self.gi_decl} if self.gi_decl and "seir" in self.gi_decl else {})}
 
     def parameters(self) -> list:
         out = []
         if self.transmission == "r0":
             out.append(ParamSpec("r0", 2.5, "calibrated", "basic reproduction number (all groups susceptible)",
-                                 0.05, 40.0, "calibrated per run, or " + DECLARED))
+                                 0.05, 40.0, "calibrated per run (with a declared prior), or " + DECLARED))
         else:
             out.append(ParamSpec("q", 0.2, "calibrated", "transmissibility per contact over the infectious period",
                                  0.0, 50.0, "calibrated per run, or " + DECLARED))
@@ -461,6 +647,14 @@ class CompartmentalEngine:
         for d in self.doses:
             out.append(ParamSpec(f"seroconversion:{d}", 1.0, "fixed", "share of the still susceptible protected",
                                  0.0, 1.0, DECLARED))
+        if "s0" in self.per_group:
+            out += [ParamSpec(f"s0:{g}", 1.0, "calibrated", "share of the group susceptible at horizon.start", 0.0, 1.0,
+                              PER_GROUP_SOURCE) for g in self.groups]
+        for x in self.per_group:
+            if x.startswith("ratio:"):
+                o = x[6:]
+                out += [ParamSpec(f"ratio:{o}:{g}", 0.0, "calibrated", f"{o} per infection in the group", 0.0, 1.0,
+                                  PER_GROUP_SOURCE) for g in self.groups]
         return out
 
     def _unit_attributes(self) -> dict:
@@ -472,17 +666,23 @@ class CompartmentalEngine:
         else:
             a["contact_rate"] = "mean daily contacts per person (homogeneous mixing, C_ij = c N_j / N; default 1)"
         if self.initialiser == "given":
-            a["s0"] = "initial susceptible share per group [0, 1] (a latent quantity, calibrated)"
+            if "s0" not in self.per_group:
+                a["s0"] = "initial susceptible share per group [0, 1] (a latent quantity, calibrated)"
         else:
             a.update({"birth_year": "birth year of each cohort group", "decision_year": "year of the decision",
-                      **{f"coverage:{d}": f"latent true coverage of dose {d} per cohort [0, 1]" for d in self.doses}})
+                      **{f"coverage:{d}": f"latent true coverage of dose {d} per cohort [0, 1]" for d in self.doses},
+                      "coverage_scale": "latent true coverage over the declared coverage:<dose> series, one number per "
+                                        "unit (default 1; the latent coverage is min(1, scale x declared)); a per-unit "
+                                        "latent quantity calibrated against an independent source when the declared "
+                                        "series is a reported one"})
         a["always_immune"] = "groups declared immune (from the spec, with a source)"
         a["always_susceptible"] = "groups declared susceptible (from the spec, with a source)"
         for c, cfg in self.components.items():
             if cfg["kind"] == "campaign":
                 a[f"reach:{c}"] = f"share of the targeted groups component {c} reaches (default {cfg['reach']})"
         for o in self.outcomes:
-            a[f"ratio:{o}"] = f"{o} per infection, one per group"
+            if f"ratio:{o}" not in self.per_group:
+                a[f"ratio:{o}"] = f"{o} per infection, one per group"
         return a
 
     def _window_metrics(self) -> list:
@@ -512,11 +712,15 @@ class CompartmentalEngine:
                 "given to immune people are wasted unless targets_susceptible is declared",
                 "p_major: multitype branching-process extinction equations (derived from an equation, not from the "
                 "sim)",
-                f"run mode {self.mode}"],
+                f"run mode {self.mode}"] + (
+                ["final_size: per-capita outcomes are the final size of the epidemic seeded at horizon.start (to "
+                 "extinction, whatever its duration); the decision window's end bounds only the figures"]
+                if self.final_size else []),
             components=comps or {"none": [0]},
             unit_attributes=self._unit_attributes(),
             outputs={"per_capita": ["infections"] + self.outcomes, "windows": self._window_metrics(),
-                     "cost_drivers": [f"doses:{c}" for c in self.components]},
+                     "cost_drivers": [f"doses:{c}" for c in self.components],
+                     **({"series": copy.deepcopy(self.SERIES)} if self.time_unit == "year" else {})},
             age_groups=list(self.groups),
             valid_ranges={"s0": [0.0, 1.0], "r0": [0.05, 40.0], "seed": [0.0, 0.01]},
             benchmarks=bench,
@@ -553,7 +757,8 @@ class CompartmentalEngine:
         else:
             q = P["q"]
         if self.initialiser == "given":
-            s = np.asarray([_num(x, "s0") for x in (a.get("s0") or [])], float)
+            src = [P[f"s0:{g}"] for g in self.groups] if "s0" in self.per_group else (a.get("s0") or [])
+            s = np.asarray([_num(x, "s0") for x in src], float)
             if len(s) != G:
                 raise ValueError(f"unit {unit.id}: s0 must give {G} values")
             cov = np.zeros((0, G))
@@ -570,6 +775,11 @@ class CompartmentalEngine:
             cov = np.asarray(cov, float).reshape(len(self.doses), G)
             if np.any(cov < 0) or np.any(cov > 1):
                 raise ValueError(f"unit {unit.id}: coverage outside [0, 1]")
+            if "coverage_scale" in a:
+                sc = _num(a["coverage_scale"], "coverage_scale")
+                if sc <= 0:
+                    raise ValueError(f"unit {unit.id}: coverage_scale {sc} must be positive")
+                cov = np.minimum(1.0, sc * cov)
             s = None
         for key in ("always_immune", "always_susceptible"):
             bad = [g for g in a.get(key) or [] if g not in self.groups]
@@ -604,10 +814,13 @@ class CompartmentalEngine:
             raise ValueError(f"unit {unit.id}: shares outside [0, 1]: {bad}")
         ratios = {}
         for o in self.outcomes:
-            v = a.get(f"ratio:{o}")
+            v = ([P[f"ratio:{o}:{g}"] for g in self.groups] if f"ratio:{o}" in self.per_group
+                 else a.get(f"ratio:{o}"))
             if not isinstance(v, (list, tuple)) or len(v) != G:
                 raise ValueError(f"unit {unit.id}: ratio:{o} must give {G} values")
             ratios[o] = np.asarray([_num(x, f"ratio:{o}") for x in v], float)
+            if np.any(ratios[o] < 0):
+                raise ValueError(f"unit {unit.id}: ratio:{o} must be >= 0")
         return {"N": N, "C": C, "q": float(q), "s": s, "cov": cov, "pi": pi, "seed": seed, "comp": comp,
                 "reach": reach, "ratios": ratios, "attrs": a,
                 "amp": float(P.get("forcing_amplitude", 0.0)), "phase": float(P.get("forcing_phase", 0.0)),
@@ -658,7 +871,10 @@ class CompartmentalEngine:
                "levels": {c: np.asarray([m["comp"].get(c, 0.0) for m in mem]) for c in self.components},
                "eff": {c: np.asarray([m["eff"][c] for m in mem]) for c in self.components},
                "reach": {c: np.asarray([m["reach"][c] for m in mem]) for c in self.components},
-               "members": mem}
+               "members": mem, "late": self.late_components()}
+        ctx["k_late_max"] = max([k for _, k in ctx["late"]], default=0)
+        ctx["k_late_b"] = np.asarray([max([k for cn, k in ctx["late"] if ctx["levels"][cn][b] > 0], default=0)
+                                      for b in range(B)], int)
         ctx["seed"] = (ctx["seed_share"] * N.sum(axis=1))[:, None] * ctx["pi"]
         ctx["reach_mask"] = reachable(ctx["C"], ctx["seed"] > 0)
         return ctx
@@ -670,6 +886,9 @@ class CompartmentalEngine:
         s = ctx["s_init"].copy()
         doses = {}
         for c in self.components:
+            if self.components[c].get("day"):        # v0.2: acts during the epidemic, not in the initial state
+                doses[c] = 0.0
+                continue
             s, d = apply_component(s, ctx["N"], self.components[c], ctx["levels"][c], ctx["eff"][c], ctx["reach"][c],
                                    self.groups, self.targets_susceptible)
             doses[c] = float(d[0])
@@ -684,7 +903,7 @@ class CompartmentalEngine:
         itv = []
         if state is None:
             Comp = _component_class()
-            itv = [Comp(c, ctx) for c in self.components]
+            itv = [Comp(c, ctx) for c in self.components if not self.components[c].get("day")]
         dt = ss.days(1) if self.dt == "day" else ss.weeks(1)
         sim = ss.Sim(n_agents=1, start=0, stop=int(steps), dt=dt, diseases=mod, interventions=itv,
                      rand_seed=int(seed), verbose=0)
@@ -696,7 +915,36 @@ class CompartmentalEngine:
         steps = self._first_steps(horizon)
         return self._sim(ctx, None, steps, 0, seed), ctx
 
+    def days(self, t, horizon: Horizon) -> float:
+        """A horizon time in the engine's days since the importation (time_unit year: (t - start) x 365)."""
+        return (float(t) - float(horizon.start)) * YEAR_DAYS if self.time_unit == "year" else float(t)
+
+    def year_of(self, day: float, horizon: Horizon) -> float:
+        return float(horizon.start) + float(day) / YEAR_DAYS
+
+    def _check_year_horizon(self, horizon: Horizon, packages) -> None:
+        """time_unit year: every component a package sets acts inside the delivery period, which lies in the
+        window (fail closed)."""
+        from toolkit.engines.horizon import delivery_period, delivery_problems
+        bad = delivery_problems(horizon)
+        if bad:
+            raise ValueError("; ".join(bad))
+        d0, d1 = delivery_period(horizon)
+        for pk in packages:
+            for c, v in pk.components.items():
+                if c in self.components and v:
+                    t = self.year_of(self.components[c].get("day", 0.0), horizon)
+                    if not d0 <= t < d1:
+                        raise ValueError(f"component {c} acts at {t:.4f}, outside the delivery period [{d0:g}, {d1:g})")
+
     def _first_steps(self, horizon: Horizon) -> int:
+        if self.mode == "windowed" and self.time_unit == "year":
+            span = (float(horizon.stop) - float(horizon.start)) * YEAR_DAYS
+            n = int(round(span / self.dt_days))
+            if n < 1 or abs(n * self.dt_days - span) > 1e-6:
+                raise ValueError(f"windowed horizon [{horizon.start}, {horizon.stop}) is not a whole number of "
+                                 f"{self.dt} steps")
+            return n
         if self.mode == "windowed":
             n = int(round(float(horizon.stop) / self.dt_days))
             if n < 1 or abs(n * self.dt_days - float(horizon.stop)) > 1e-9 * max(1.0, float(horizon.stop)):
@@ -716,17 +964,22 @@ class CompartmentalEngine:
                 bad = [int(b) for b in np.nonzero(state["active"])[0]]
                 raise RuntimeError(f"step cap {self.step_cap} reached with the epidemic still running "
                                    f"(converged: false; batch members {bad[:10]})")
-            n = min(2 * steps, self.step_cap - done)
+            # v0.2: segments double up to MAX_SEGMENT steps, so one Starsim sim never holds a near-critical run's whole
+            # length (a 5 x 10^5-step segment held ~1.4 GB and its timeline; the run's steps and outputs are unchanged)
+            n = min(2 * steps, MAX_SEGMENT, self.step_cap - done)
             sim = self._sim(ctx, state, n - 1, done + 1, seed)
             state, done, steps = self._run_until_done(sim, n - 1), done + n, n
         return state, sim
 
     def _run_until_done(self, sim, steps) -> dict:
         """Run one segment; in to_extinction mode stop early once every member has converged. Returns the
-        module state (the sim holds its own copy of the module, so it is read from the sim)."""
+        module state (the sim holds its own copy of the module, so it is read from the sim). The finished sim is
+        then emptied (_release)."""
         if self.mode != "to_extinction":
             sim.run()
-            return sim.diseases.groupepidemic.export()
+            st = sim.diseases.groupepidemic.export()
+            _release(sim)
+            return st
         sim.init()
         mod = sim.diseases.groupepidemic
         chunk = 32
@@ -734,7 +987,9 @@ class CompartmentalEngine:
         while True:
             sim.run(until=min(t, steps))
             if not mod.active.any() or t >= steps or sim.complete:
-                return mod.export()
+                st = mod.export()
+                _release(sim)
+                return st
             t += chunk
 
     def run(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
@@ -744,6 +999,18 @@ class CompartmentalEngine:
         """Evaluate many (parameter set, package) pairs in one sim (batch x groups). `unit` is one UnitSpec or
         one per pair; `packages` one Package or one per pair. Equal to run() pair by pair."""
         ctx = self._context(list(param_sets), unit, packages)
+        if self.time_unit == "year":
+            self._check_year_horizon(horizon, packages if isinstance(packages, (list, tuple)) else [packages])
+        late = [k for cn, k in ctx["late"] if np.any(ctx["levels"][cn] > 0)]     # components a package sets
+        if self.mode == "windowed" and late and max(late) >= self._first_steps(horizon):
+            raise ValueError(f"a component acts at step {max(late)}, after the windowed horizon ends")
+        if self.final_generations:
+            # v0.2 final_size without forcing or components acting during the epidemic: the outcome does not depend
+            # on the generation interval or the step length (the exponential-survival identity, FS8, AS7), so the
+            # epidemic runs one generation per step; a near-critical epidemic then converges in thousands of steps
+            # instead of hundreds of thousands. run_series() keeps the declared interval (the figures' timing).
+            ctx["w"] = np.ones(1)
+            ctx["generations"] = True
         state, sim = self._simulate(ctx, horizon, seed)
         return self._outcomes(ctx, state, horizon, seed)
 
@@ -756,21 +1023,75 @@ class CompartmentalEngine:
         x = extinction_probability(K, self.offspring)
         return np.sum(ctx["pi"] * (1.0 - x), axis=1)
 
+    def _p_major_safe(self, ctx, s_start) -> np.ndarray:
+        """p_major for every member. Under branching importation it scales the outcomes, so a member whose extinction
+        equations do not converge fails closed, as in v0.1. Under deterministic importation it is only a reported
+        diagnostic: such a member reports NaN (v0.2; the flu dry run's near-critical vaccinated arms), and the batch
+        and its outcomes are kept. Members that converge get exactly the v0.1 values."""
+        try:
+            return self._p_major(ctx, s_start)
+        except RuntimeError:
+            if self.importation == "branching":
+                raise
+        out = np.full(ctx["B"], np.nan)
+        for b in range(ctx["B"]):
+            sub = {"N": ctx["N"][b:b + 1], "C": ctx["C"][b:b + 1], "q": ctx["q"][b:b + 1], "pi": ctx["pi"][b:b + 1],
+                   "forcing": lambda t, _b=b: ctx["forcing"](t)[_b:_b + 1]}
+            try:
+                out[b] = float(self._p_major(sub, s_start[b:b + 1])[0])
+            except RuntimeError:
+                pass
+        return out
+
     def _outcomes(self, ctx, state, horizon, seed) -> list:
         B, G = ctx["B"], ctx["G"]
         N, C, q = ctx["N"], ctx["C"], ctx["q"]
         Ntot = N.sum(axis=1)
-        inc = np.stack(state["inc"])                              # (T + 1, B, G); step 0 holds the seeds
+        if ctx.get("generations"):
+            # the generation grid keeps the seeds and the running total only: two rows, (seeds, every later infection)
+            inc = np.stack([state["inc"][0], state["cum"]])
+        else:
+            inc = np.stack(state["inc"])                          # (T + 1, B, G); step 0 holds the seeds
         T1 = inc.shape[0]
         times = np.arange(T1) * self.dt_days
         s_start0 = state["s_first"]                               # after interventions, before seeding
-        S_after = (s_start0 * N)[None] - np.cumsum(inc, axis=0)   # S after each step
-        pm = self._p_major(ctx, s_start0) if self.forcing == "none" else None
+        S_after = self._s_after(state, ctx, inc)                  # S after each step
+        pm = self._p_major_safe(ctx, s_start0) if self.forcing == "none" else None
         scale = pm if self.importation == "branching" else np.ones(B)      # branching implies no forcing
         fref = ctx["forcing"](self.forcing_ref_phase)
         r0 = q * spectral_radius(C)
-        w0, w1 = float(horizon.window[0]), float(horizon.window[1])
-        sel_dec = (times >= w0) & (times < w1)
+        # Codex r1 P1-7: windows are compared in the horizon's own unit (decimal years for time_unit year: the step
+        # times as hooks.run_series computes them), so a boundary at an event time keeps its half-open membership
+        tcmp = float(horizon.start) + times / YEAR_DAYS if self.time_unit == "year" else times
+        conv = float
+        w0, w1 = conv(horizon.window[0]), conv(horizon.window[1])
+        w1_declared = w1
+        after = inc[tcmp >= w1].sum(axis=(0, 2)) / Ntot            # infections after the window's end
+        gens = False
+        if self.final_size:
+            # v0.2 final_size: outcomes are the epidemic's final size (to extinction), whatever its duration; the
+            # window must start at horizon.start (the importation), and its end bounds only the figures
+            # (meta after_window_share)
+            if w0 > float(tcmp[0]):
+                raise ValueError("final_size: the decision window must start at horizon.start (the importation)")
+            w1 = math.inf
+            gens = bool(ctx.get("generations"))
+            if gens:
+                after = np.zeros(B)                    # steps are generations: no calendar time to compare with
+                for wn, (a, z) in (horizon.windows or {}).items():
+                    if conv(a) > float(tcmp[0]) or conv(z) < w1_declared:
+                        raise ValueError(f"final_size counts generations, not days: window {wn} must cover the decision "
+                                         "window (declare forcing or a component day to time the epidemic)")
+        elif self.time_unit == "year" and self.mode == "to_extinction":
+            # the final size is counted in the decision window: infections after its end above the stop tolerance
+            # (tol x N, the run's own convergence criterion) fail closed rather than being dropped
+            after = inc[tcmp >= w1].sum(axis=(0, 2)) / Ntot
+            late = [int(b) for b in np.nonzero(after > self.tol)[0]]
+            if late:
+                raise RuntimeError(f"the epidemic outlasts the decision window (a share {float(np.max(after)):.3g} of the "
+                                   f"population is infected after window end day {w1:g}; batch members {late[:10]}): "
+                                   "lengthen the window")
+        sel_dec = (tcmp >= w0) & (tcmp < w1)
         out = []
         for b in range(B):
             Sb_before = lambda k: (s_start0[b] * N[b]) if k <= 0 else S_after[k - 1, b]  # noqa: E731
@@ -780,23 +1101,34 @@ class CompartmentalEngine:
                 per_capita[o] = {g: float(pc_inf[i] * ratio[i]) for i, g in enumerate(self.groups)}
             wins = {}
             for wn, (t0, t1) in (horizon.windows or {}).items():
-                t0, t1 = float(t0), float(t1)
-                sel = (times >= t0) & (times < t1)
+                t0, t1 = conv(t0), conv(t1)
+                if self.final_size and t1 >= w1_declared:
+                    t1 = math.inf
+                sel = (tcmp >= t0) & (tcmp < t1)
                 ks = np.nonzero(sel)[0]
-                k0 = int(ks[0]) if len(ks) else int(np.searchsorted(times, t0))
+                k0 = int(ks[0]) if len(ks) else int(np.searchsorted(tcmp, t0))
                 k_last = int(ks[-1]) if len(ks) else k0 - 1
                 S0 = Sb_before(k0)
                 S1 = S_after[min(k_last, T1 - 1), b] if k_last >= 0 else s_start0[b] * N[b]
                 tot = inc[sel, b].sum(axis=0)
-                f0, f1 = ctx["forcing"](t0)[b], ctx["forcing"](t1)[b]
+                # the forcing at the window's ends, in days; a final-size window ends at its last step (Codex r1 P1-5:
+                # never at infinity)
+                d0 = self.days(t0, horizon)
+                # Codex r2 P1-4: a final-size window ends at this member's own last step (its stop), never at a
+                # batch companion's, so batched and single runs give the same endpoint diagnostics
+                k_end = int(state["stopped"][b]) if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1
+                d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_end, 0), T1 - 1)])
+                if not math.isfinite(t1):
+                    S1 = S_after[min(k_end, T1 - 1), b]
+                f0, f1 = ctx["forcing"](d0)[b], ctx["forcing"](d1)[b]
                 rho0 = float(spectral_radius((S0 / N[b])[:, None] * C[b]))
                 rho1 = float(spectral_radius((S1 / N[b])[:, None] * C[b]))
                 series = inc[sel, b].sum(axis=1)
                 pos = series > 0
-                if pos.sum() >= 2:
+                if pos.sum() >= 2 and not gens:
                     gr = float(np.polyfit(times[sel][pos], np.log(series[pos]), 1)[0])
                     gdef = 1.0
-                else:
+                else:                  # Codex r2 P2-5: no calendar growth rate on the generation grid
                     gr, gdef = 0.0, 0.0
                 m = {"attack_rate": float(tot.sum() / Ntot[b] * scale[b]), "s_start": float(S0.sum() / Ntot[b]),
                      "s_end": float(S1.sum() / Ntot[b]), "r0": float(r0[b]), "reff_start": float(q[b] * f0 * rho0),
@@ -807,23 +1139,117 @@ class CompartmentalEngine:
                 m.update({f"attack_rate:{g}": float(tot[i] / N[b, i] * scale[b]) for i, g in enumerate(self.groups)})
                 if self.mode == "to_extinction":
                     m["converged"] = float(not state["active"][b])
-                    m["steps"] = float(state["stopped"][b] if state["stopped"][b] >= 0 else T1 - 1)
+                    m["steps"] = float(state["stopped"][b] if state["stopped"][b] >= 0 else
+                                       (state["n_steps"] if ctx.get("generations") else T1 - 1))
                 wins[wn] = m
             cost = {f"doses:{c}": float(state["doses"][c][b] / Ntot[b]) for c in self.components}
-            meta = {"seed": int(seed), "dt_days": self.dt_days, "steps": int(T1 - 1),
+            meta = {"seed": int(seed), "dt_days": self.dt_days,
+                    "steps": int(state["n_steps"]) if ctx.get("generations") else int(T1 - 1),
                     "age_shares": {g: float(N[b, i] / Ntot[b]) for i, g in enumerate(self.groups)},
                     "s_initialiser": [float(x) for x in ctx["s_init"][b]], "s_start": [float(x) for x in s_start0[b]],
-                    "incidence": [float(x) for x in inc[1:, b].sum(axis=1) / Ntot[b]],
+                    "incidence": ([] if ctx.get("generations") else
+                                  [float(x) for x in inc[1:, b].sum(axis=1) / Ntot[b]]),
                     "p_major_derived": True, "importation": self.importation,
                     "seed_clipped": bool(np.any(ctx["seed"][b] > s_start0[b] * N[b] + 1e-300))}
             if self.mode == "to_extinction":
                 meta["converged"] = bool(not state["active"][b])
+            if self.final_size:
+                meta["after_window_share"] = None if gens else float(after[b])
+                meta["time_axis"] = "generations" if gens else "days"
             if self.mode == "windowed" and self.rt_trajectory:
                 s_traj = S_after[:, b] / N[b]
                 f_t = np.asarray([ctx["forcing"](t)[b] for t in times])
                 meta["rt"] = [float(x) for x in q[b] * f_t * spectral_radius(s_traj[:, :, None] * C[b][None])]
             out.append(Outcomes(per_capita=per_capita, windows=wins, cost_drivers=cost, meta=meta))
         return out
+
+
+    # --------------------------------------------------------------- figure hooks (v0.2, figures-hooks/1)
+    @property
+    def hooks_contract(self):
+        """figures-hooks/1 when the horizon is in years (the hooks' grid is decimal years); none otherwise."""
+        from toolkit.engines.hooks import HOOKS_CONTRACT
+        return HOOKS_CONTRACT if self.time_unit == "year" else None
+
+    SERIES = {"incidence": {"label": "new infections", "units": "infections per person-year", "aggregate": "rate",
+                            "denominator": "person-year"},
+              "susceptible": {"label": "susceptible share", "units": "share of the unit's population",
+                              "aggregate": "mean", "denominator": "person"}}
+
+    def schedule(self, params, unit: UnitSpec, package: Package, horizon: Horizon) -> list:
+        """One decision event per component the package sets, at horizon.start + day / 365 (pure: the same
+        configuration the sim uses; no simulation). The engine has no history or routine deliveries in the sim:
+        past doses enter through the initialiser."""
+        if self.time_unit != "year":
+            raise ValueError("schedule(): time_unit year only (the hooks' times are decimal years)")
+        self._member(resolve_params(self, params), unit, package)       # the package and unit are checked as in run
+        ev = []
+        for c, v in sorted(package.components.items()):
+            if c not in self.components or not v:
+                continue
+            cfg = self.components[c]
+            label = "campaign" if cfg["kind"] == "campaign" else f"{int(v)} dose block(s) to {cfg['group']}"
+            ev.append({"component": c, "label": label, "kind": "decision",
+                       "t0": self.year_of(cfg.get("day", 0.0), horizon), "t1": None, "charged": True})
+        return ev
+
+    def run_series(self, params, unit, packages, horizon: Horizon, seed: int, metrics, step: str = "month") -> list:
+        """Monthly series on the contract's grid (hooks.monthly_grid) for each package, from one batch (the packages
+        share the unit and its history): incidence (infections per person-year over the step, seeds at day 0
+        included, scaled by p_major under branching importation) and susceptible (the step mean of the unit's
+        susceptible share after each sim step). After a to_extinction run stops, incidence is 0 and the susceptible
+        share stays at its final value. run() and run_batch() are unchanged by this method."""
+        from toolkit.engines.hooks import monthly_grid
+        if self.time_unit != "year":
+            raise ValueError("run_series(): time_unit year only")
+        if step != "month":
+            raise ValueError(f"run_series(): step {step!r} is not month")
+        bad = [m for m in metrics if m not in self.SERIES]
+        if bad:
+            raise ValueError(f"run_series(): unknown metrics {bad}")
+        pk = list(packages)
+        ctx = self._context([params] * len(pk), unit, pk)
+        self._check_year_horizon(horizon, pk)
+        state, _sim = self._simulate(ctx, horizon, seed)
+        inc = np.stack(state["inc"])
+        Ntot = ctx["N"].sum(axis=1)
+        S_after = self._s_after(state, ctx, inc)
+        scale = self._p_major(ctx, state["s_first"]) if self.importation == "branching" else np.ones(len(pk))
+        T1 = inc.shape[0]
+        ty = float(horizon.start) + np.arange(T1) * self.dt_days / YEAR_DAYS
+        grid = monthly_grid(horizon)
+        end = float(horizon.window[1])
+        tot = inc.sum(axis=2) * scale[None, :] / Ntot[None, :]          # (T1, B) per-capita infections per step
+        sus = S_after.sum(axis=2) / Ntot[None, :]
+        out = []
+        for b, p in enumerate(pk):
+            vals = {m: [] for m in metrics}
+            for k, a in enumerate(grid):
+                e = min(a + 1.0 / 12.0, end) if k == len(grid) - 1 else a + 1.0 / 12.0
+                sel = (ty >= a) & (ty < e)
+                if "incidence" in vals:
+                    vals["incidence"].append(float(tot[sel, b].sum() / (e - a)))
+                if "susceptible" in vals:
+                    # Codex r1 P1-6: the time mean of the piecewise-constant share over [a, e): the value after step j
+                    # holds over [ty_j, ty_j + dt), and after the last step it holds to the end
+                    lo = np.maximum(ty, a)
+                    hi = np.minimum(np.append(ty[1:], np.inf), e)
+                    w = np.maximum(hi - lo, 0.0)
+                    vals["susceptible"].append(float(np.dot(w, sus[:, b]) / (e - a)))
+            out.append({"package": p.id, "t": list(grid), "values": vals})
+        return out
+
+    def _s_after(self, state, ctx, inc) -> np.ndarray:
+        """Susceptible counts after each step: the initial state, less infections and (v0.2) the susceptibles a
+        component protected during the epidemic."""
+        base = (state["s_first"] * ctx["N"])[None]
+        if state.get("removed"):
+            rem = np.zeros_like(inc)
+            for k, v in state["removed"].items():
+                if k < inc.shape[0]:
+                    rem[k] += v
+            return base - np.cumsum(inc + rem, axis=0)
+        return base - np.cumsum(inc, axis=0)
 
 
 # ------------------------------------------------------------------------------------- card

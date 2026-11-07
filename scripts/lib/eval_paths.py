@@ -61,8 +61,9 @@ def archive_sha256(blob: bytes, prefix: str = "data/evals/") -> dict:
     out = {}
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as t:
         for m in t.getmembers():
-            if m.isfile() and m.name.startswith(prefix):
-                out[m.name] = hashlib.sha256(t.extractfile(m).read()).hexdigest()
+            name = m.name.removeprefix("./")          # a plain-directory tarball (vm_job --dir) names ./data/...
+            if m.isfile() and name.startswith(prefix):
+                out[name] = hashlib.sha256(t.extractfile(m).read()).hexdigest()
     return out
 
 

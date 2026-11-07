@@ -34,6 +34,8 @@ docs/design/v2-spec-and-analysis.md §1):
       populations: {total: pop}            # alloc population names -> unit columns
       components: {c1: {group: g}, ...}
       packages: {generate: true} | {name: [components]}
+                                       # {generate: true, within_envelope: true}: drop the generated packages no
+                                       # plan can afford (cost lower bound above the envelope in every unit)
       engine_map: {c1: {engine_component: value}}
       prices: {...}
       cost_items: [...]
@@ -60,6 +62,8 @@ docs/design/v2-spec-and-analysis.md §1):
     calibration:
       method: emulator_inversion | likelihood | posterior | none
       ...                                  # see CALIBRATION_FIELDS
+      targets: {kind: observations, ...}   # posterior on observations of group states and outcomes through
+                                       # declared sources (toolkit/analysis/observed_targets.py)
       target_frame: {band, source, mapping: {to, method, source}}   # the population band the target measures; a
                                            # mapping when it is not the compared output's (targets.frame for a panel)
     uncertainty:                           # spike lesson 6: sources declared up front
@@ -86,6 +90,9 @@ docs/design/v2-spec-and-analysis.md §1):
       allocation_file: allocation_optimized.csv
       columns: {unit: district, package: package, value: cases_averted}
       headline: {name: total_cases_averted, outcome: cases}
+      by_group: {columns: {group, quantity, value}, quantity: {<engine group>: <cost_outputs name>}}
+                                       # optional: one row per (unit, engine group) with the plan's quantity and
+                                       # the outcome averted there (a joint package within a unit)
 
 Every check names the section it failed. Nothing here names a disease, a place or an
 intervention; those live in engines and specs.
@@ -104,6 +111,7 @@ import csv
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -340,6 +348,9 @@ class Spec:
         """The toolkit/alloc spec: options plus the constraints (one place to read eligibility and caps)."""
         o, c = self.raw["options"], self.raw["constraints"]
         a = {k: copy.deepcopy(v) for k, v in o.items() if k in ("components", "packages", "prices", "cost_items")}
+        p = o.get("packages")
+        if isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True:
+            a["packages"] = {n: sorted(cs) for n, cs in self.packages().items()}    # the envelope-pruned list
         a["units"] = {"csv": self.resolve(self.raw["decision_units"]["csv"]), "id": self.uid,
                       "populations": dict(o.get("populations") or {})}
         for k in ("eligibility", "locks", "footprints"):
@@ -368,7 +379,49 @@ class Spec:
         return a
 
     def packages(self) -> dict:
-        return acosts.packages(self.raw["options"])
+        """Package name -> components. With `options.packages: {generate: true, within_envelope: true}`, a generated
+        package whose cost exceeds the envelope in every unit is dropped (no feasible plan can use it): the cost is
+        bounded below by its non-outcome cost items, which must be non-negative. Exact, and it keeps a joint package
+        space (dose blocks over groups) to the packages a plan can afford."""
+        pk = acosts.packages(self.raw["options"])
+        p = self.raw["options"].get("packages")
+        if not (isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True):
+            return pk
+        if getattr(self, "_pruned", None) is not None:
+            return self._pruned
+        o = self.raw["options"]
+        a = {"components": o.get("components") or {}, "prices": o.get("prices") or {},
+             "units": {"populations": dict(o.get("populations") or {})}}
+        items = [it for it in o.get("cost_items") or [] if it.get("basis") != "per_outcome"]
+        if any(not _isnum(it.get("value")) or it["value"] < 0 for it in items):
+            raise SpecError("options.packages.within_envelope: every cost item value must be a non-negative number")
+        budget = self.budget()
+        # Codex r1 P1-4: the bound holds in every scenario the analysis evaluates. Costs are taken at the lowest
+        # multiplier any uncertainty draw or sensitivity case applies to the item; budgets above the envelope (the
+        # frontier's upper fractions, envelope decision tests) are refused by those steps (prune_budget).
+        lo = {}
+        for rng_items in ((self.raw.get("uncertainty") or {}).get("sources") or []):
+            if isinstance(rng_items, dict) and rng_items.get("kind") == "costs":
+                for it_id, r in (rng_items.get("items") or {}).items():
+                    lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
+        for it_id, r in (((self.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items") or {}).items():
+            lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
+        comp_cost = {}
+        for u in self.units():
+            uid = str(u[self.uid])
+            comp_cost[uid] = {}
+            for it in items:
+                comp_cost[uid][it["component"]] = (comp_cost[uid].get(it["component"], 0.0)
+                                                   + acosts.item_cost(it, u, a) * min(1.0, lo.get(it["id"], 1.0)))
+        comp = self.raw["comparator"].get("package")
+        keep = {}
+        for name, cs in pk.items():
+            low = min(sum(comp_cost[uid].get(c, 0.0) for c in cs) for uid in comp_cost)
+            if name == comp or low <= budget * (1 + 1e-12) + 1e-9:
+                keep[name] = cs
+        self._pruned = keep
+        self.prune_budget = budget
+        return keep
 
     def engine_package(self, comps) -> dict:
         out = {}
@@ -532,10 +585,93 @@ def _read_binding(path: str | None) -> tuple[dict, list[str]]:
     out, bad = {}, []
     for k, v in b.items():
         if v == "required" or (isinstance(v, dict) and "default" in v and str(v.get("meaning") or "").strip()):
-            out[str(k)] = v
+            why = _binding_extras(v) if isinstance(v, dict) else []
+            if why:
+                bad += [f"engine_attribute_unbound: {path}: {k}: {w}" for w in why]
+            else:
+                out[str(k)] = v
         else:
             bad.append(f"engine_attribute_unbound: {path}: {k} must be `required` or {{default, meaning}}")
     return out, bad
+
+
+BINDING_PRIOR_DISTS = ("uniform", "loguniform", "triangular")
+
+
+def _binding_extras(v: dict) -> list[str]:
+    """The optional card keys of a defaulted attribute: `prior` {dist, range: [lo, hi], source, ...}, the sourced range a
+    spec that calibrates the attribute starts from; `limitation`, what the attribute simplifies, which the results
+    state whenever a run calibrates it."""
+    bad = []
+    if "limitation" in v and not (isinstance(v["limitation"], str) and v["limitation"].strip()):
+        bad.append("limitation must be a non-empty text")
+    if "prior" in v:
+        p = v["prior"]
+        if not isinstance(p, dict):
+            return bad + ["prior must be {dist, range: [lo, hi], source}"]
+        if p.get("dist") not in BINDING_PRIOR_DISTS:
+            bad.append(f"prior dist {p.get('dist')!r} is not one of {list(BINDING_PRIOR_DISTS)}")
+        r = p.get("range")
+        try:
+            lo, hi = (float(x) for x in r)
+            if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+                raise ValueError
+        except (TypeError, ValueError):
+            bad.append(f"prior range {r!r} must be [lo, hi] with lo < hi")
+        if not str(p.get("source") or "").strip():
+            bad.append("prior needs a source")
+    return bad
+
+
+def attribute_notes(cal: dict, binding: dict) -> list[dict]:
+    """[{attribute, limitation, card_prior, run_prior}] for the unit attribute a calibration moves, when its card gives
+    a limitation."""
+    cal = cal if isinstance(cal, dict) else {}
+    a = cal.get("attribute")
+    if cal.get("method") in (None, "none") or not isinstance(a, str) or not a:
+        return []
+    rule = binding_rule(binding, a)
+    if not isinstance(rule, dict) or not str(rule.get("limitation") or "").strip():
+        return []
+    run = (cal.get("priors") or {}).get(a) if isinstance(cal.get("priors"), dict) else None
+    return [{"attribute": a, "limitation": rule["limitation"].strip(), "card_prior": rule.get("prior"),
+             "run_prior": run if isinstance(run, dict) else None, "scale": str(cal.get("scale") or "linear")}]
+
+
+def _prior_text(p, scale: str = "linear", attr: str = "") -> str:
+    """A declared prior in words: its distribution, its range or shape parameters, the scale it is declared on, and
+    its source."""
+    if not isinstance(p, dict):
+        return "none declared"
+    src = str(p.get("source") or "no source").strip()
+    if p.get("range") is not None or "lo" in p:
+        r = p.get("range") or [p.get("lo"), p.get("hi")]
+        body = f"{p.get('dist', '?')} on [{r[0]}, {r[1]}]"
+        if p.get("mode") is not None:
+            body += f", mode {p['mode']}"
+    else:
+        shape = {k: v for k, v in p.items() if k not in ("dist", "source", "verified", "note", "basis", "units")}
+        body = f"{p.get('dist', '?')} with " + ", ".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v}"
+                                                         for k, v in shape.items())
+    if scale and scale != "linear":
+        body += f" on the {scale} scale (the attribute is exp of the drawn value)" if scale == "log" else \
+            f" on the {scale} scale"
+    return f"{body} ({src})"
+
+
+def attribute_notes_markdown(notes: list[dict], problems=None) -> list[str]:
+    """Lines of a results section, one entry per note; [] when there is none. `problems`: errors reading the engine
+    card's binding, stated in the section rather than dropped (fail closed)."""
+    if not notes and not problems:
+        return []
+    L = ["## Simplifications in the calibrated inputs", ""]
+    for n in notes:
+        L += [f"- **{n['attribute']}**: {n['limitation']}",
+              f"  - Engine card prior: {_prior_text(n['card_prior'])}.",
+              f"  - This run's prior: {_prior_text(n['run_prior'], n.get('scale', 'linear'))}."]
+    for p in problems or []:
+        L.append(f"- The engine card's attribute binding could not be read, so its limitations are not listed: {p}")
+    return L + [""]
 
 
 def load_binding(engine) -> tuple[dict, list[str]]:
@@ -621,6 +757,10 @@ def frame_problems(s: Spec) -> list[str]:
     cal = s.raw.get("calibration") or {}
     m = cal.get("method")
     if m in (None, "none") or not isinstance(cal, dict):
+        return []
+    if (cal.get("targets") or {}).get("kind") == "observations":
+        # each observation row names the engine groups it measures and a declared source with its sampling frame
+        # (toolkit/analysis/observed_targets.py checks both): the band is per row, never a whole-unit output
         return []
     if m == "emulator_inversion":
         compared, fr, where = cal.get("metric"), cal.get("target_frame"), "calibration.target_frame"
@@ -909,6 +1049,9 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
     m = cal.get("method") if isinstance(cal, dict) else None
     if m not in CALIBRATION_METHODS:
         return [f"calibration.method: one of {CALIBRATION_METHODS}"]
+    from toolkit.analysis import observed_targets as OT
+    if OT.applies(s):          # posterior on observations of group states and outcomes, through declared sources
+        return OT.problems(s, card, pnames)
     bad = [f"calibration.{k}: required for {m}" for k in CALIBRATION_FIELDS[m] if k not in cal]
     if bad or m == "none":
         return bad
@@ -1160,10 +1303,83 @@ def _validate_deliverable(s) -> list[str]:
     hl = d.get("headline") or {}
     if not hl.get("name") or hl.get("outcome") not in s.outcomes():
         bad.append("deliverable.headline: {name, outcome} with outcome in objective/outcomes_reported")
+    bg = d.get("by_group")
+    if bg is not None:
+        gc = (bg or {}).get("columns") if isinstance(bg, dict) else None
+        if not isinstance(gc, dict) or not all(isinstance(gc.get(k), str) and gc[k] for k in ("group", "quantity",
+                                                                                           "value")):
+            bad.append("deliverable.by_group.columns: {group, quantity, value} column names")
+        qm = (bg or {}).get("quantity") if isinstance(bg, dict) else None
+        outs = set((s.raw.get("analysis") or {}).get("cost_outputs") or {})
+        groups = set()
+        if not s.engine_pending:
+            try:
+                groups = set(s.engine().describe().age_groups or [])
+            except Exception:  # noqa: BLE001 -- reported by the engine checks
+                groups = set()
+        if not isinstance(qm, dict) or not qm:
+            bad.append("deliverable.by_group.quantity: {engine group: analysis.cost_outputs name}")
+        else:
+            bad += [f"deliverable.by_group.quantity: {g} is not an engine group" for g in qm
+                    if groups and g not in groups]
+            bad += [f"deliverable.by_group.quantity.{g}: {v!r} is not in analysis.cost_outputs" for g, v in qm.items()
+                    if v not in outs]
+        if (s.raw.get("analysis") or {}).get("evaluation") != "direct":
+            bad.append("deliverable.by_group: needs analysis.evaluation: direct (per-group outcomes)")
     return bad
 
 
 # --------------------------------------------------------------------------- self-test
+def _self_test_joint_packages(ok):
+    """SPJ: packages generated within the envelope (a joint dose-block space) and the by-group deliverable."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_spec(d)))
+        # three groups of mutually exclusive levels a1..a3, b1..b3, c1..c2 (cost = level); envelope 3
+        comps = {f"{g}{k}": {"group": g} for g, n in (("a", 3), ("b", 3), ("c", 2)) for k in range(1, n + 1)}
+        raw["options"]["components"] = comps
+        raw["options"]["engine_map"] = {c: {"a": 1} for c in comps}
+        raw["options"]["cost_items"] = [{"id": f"k_{c}", "component": c, "value": float(c[1:]), "price_year": "2024",
+                                         "price_rule": "as_published", "basis": "fixed", "includes": [c]}
+                                        for c in comps]
+        raw["options"]["packages"] = {"generate": True, "within_envelope": True}
+        raw["constraints"] = {"envelope_usd": 3.0}
+        s = Spec(raw, d, os.path.join(d, "decision_spec.yaml"))
+        pk = s.packages()
+        levels = lambda cs: sum(int(c[1:]) for c in cs)  # noqa: E731
+        full = acosts.packages(raw["options"])
+        ok(len(full) == 4 * 4 * 3 and all(levels(cs) <= 3 for cs in pk.values())
+           and len(pk) == sum(1 for cs in full.values() if levels(cs) <= 3) and "none" in pk,
+           f"SPJ1 within_envelope keeps exactly the generated packages a plan can afford ({len(pk)} of {len(full)})")
+        al = s.alloc_spec()
+        ok(set(acosts.packages(al)) == set(pk), "SPJ2 the alloc spec carries the same pruned package list")
+        raw2 = copy.deepcopy(raw)
+        raw2["options"]["cost_items"][0]["value"] = -1.0
+        try:
+            Spec(raw2, d).packages()
+            ok(False, "SPJ3 a negative cost item refuses pruning")
+        except SpecError as e:
+            ok("non-negative" in str(e), f"SPJ3 a negative cost item refuses pruning: {e}")
+        raw5 = copy.deepcopy(raw)                 # Codex r1 P1-4: a cost draw at half price keeps level-6 plans
+        raw5["uncertainty"]["sources"] = list(raw5["uncertainty"]["sources"]) + [
+            {"kind": "costs", "items": {f"k_{c}": [0.5, 1.5] for c in comps}}]
+        raw5["uncertainty"]["excluded"] = [e for e in raw5["uncertainty"]["excluded"] if e.get("kind") != "costs"]
+        s5 = Spec(raw5, d)
+        pk5 = s5.packages()
+        ok(any(levels(cs) == 6 for cs in pk5.values()) and not any(levels(cs) > 6 for cs in pk5.values())
+           and s5.prune_budget == 3.0,
+           f"SPJ6 pruning keeps every package affordable at the lowest cost multiplier ({len(pk5)} packages)")
+        raw3 = copy.deepcopy(raw)
+        raw3["options"]["packages"] = {"generate": True}
+        ok(len(Spec(raw3, d).packages()) == len(full), "SPJ4 without within_envelope every combination is kept")
+        r4 = yaml.safe_load(open(toy_spec(d)))
+        r4["deliverable"]["by_group"] = {"columns": {"group": "g"}, "quantity": {"zz": "nope"}}
+        errs = _validate_deliverable(Spec(r4, d))
+        ok(any("by_group.columns" in e for e in errs) and any("not an engine group" in e for e in errs)
+           and any("not in analysis.cost_outputs" in e for e in errs) and any("evaluation: direct" in e for e in errs),
+           f"SPJ5 a malformed by_group deliverable is refused: {errs}")
+
+
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
     """A valid toy spec and units table in directory d (used by the analysis self-tests too). `bench`: a benchmark
     results file for the toy engine (its interaction benchmark T2 drives decision test DT1)."""
@@ -1434,6 +1650,7 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     _self_test_engine_refs(ok)
+    _self_test_joint_packages(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1610,6 +1827,54 @@ def _self_test_derived(ok) -> None:
         e = validate(load(p), derived=True)
         ok(has(e, "units_not_derived") or has(e, "data_ref_not_derived"),
            f"DI1b a spec citing data/derived/ with no declaration is refused: {e[:3]}")
+    # card prior and limitation of a calibrated unit attribute (owner decision on #146: a single latent multiplier
+    # keeps a sourced card range, and the results say what it simplifies)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            from toolkit.engines.compartmental.engine import CompartmentalEngine
+            b, bad = load_binding(CompartmentalEngine)
+            cs = b.get("coverage_scale") or {}
+            pr = cs.get("prior") or {}
+            ok(bad == [] and len(pr.get("range") or []) == 2 and pr["range"][0] < 1.0 <= pr["range"][1]
+               and str(pr.get("source") or "").strip() and str(cs.get("limitation") or "").strip(),
+               f"AB1 the compartmental card gives coverage_scale a sourced prior range around its default and a "
+               f"limitation ({bad}, {pr})")
+        except ImportError as e:
+            print(f"SKIP AB1: {e}")
+        bp = os.path.join(d, "b.yaml")
+        for case, v, want in (("no source", {"default": 1.0, "meaning": "m", "prior": {"dist": "uniform",
+                                                                                        "range": [0.5, 1.1]}}, "source"),
+                              ("lo >= hi", {"default": 1.0, "meaning": "m", "prior": {"dist": "uniform", "range": [1.1, 0.5],
+                                                                                       "source": "s"}}, "range"),
+                              ("unknown dist", {"default": 1.0, "meaning": "m", "prior": {"dist": "normal", "range": [0, 1],
+                                                                                           "source": "s"}}, "dist"),
+                              ("blank limitation", {"default": 1.0, "meaning": "m", "limitation": " "}, "limitation")):
+            yaml.safe_dump({"attribute_binding": {"a": v}}, open(bp, "w"))
+            got, bad = _read_binding(bp)
+            ok("a" not in got and any(want in x for x in bad), f"AB2 a card prior or limitation with {case} is refused: "
+                                                               f"{bad}")
+        b = {"a": {"default": 1.0, "meaning": "m", "limitation": "a stand-in for X",
+                   "prior": {"dist": "uniform", "range": [0.5, 1.1], "source": "S"}}, "c": "required"}
+        notes = attribute_notes({"method": "posterior", "attribute": "a",
+                                 "priors": {"a": {"dist": "uniform", "range": [0.6, 1.2], "source": "planner"}}}, b)
+        md = "\n".join(attribute_notes_markdown(notes))
+        ok(len(notes) == 1 and "a stand-in for X" in md and "0.5" in md and "S" in md and "0.6" in md and "planner" in md,
+           f"AB3 a calibrated attribute with a card limitation is listed with the card prior and the run's prior: {md}")
+        n_log = attribute_notes({"method": "posterior", "attribute": "a", "scale": "log",
+                                 "priors": {"a": {"dist": "uniform", "range": [-0.693, 0.0953], "source": "p"}}}, b)
+        n_beta = attribute_notes({"method": "posterior", "attribute": "a",
+                                  "priors": {"a": {"dist": "beta", "a": 2.0, "b": 5.0, "source": "p"}}}, b)
+        md_log, md_beta = "\n".join(attribute_notes_markdown(n_log)), "\n".join(attribute_notes_markdown(n_beta))
+        ok("log scale" in md_log and "exp" in md_log and "a=2" in md_beta and "None" not in md_beta,
+           f"AB3b (Codex r3 P2-3) the run's prior is shown on its declared scale, and a beta prior by its shape "
+           f"parameters: {md_log} | {md_beta}")
+        md_bad = "\n".join(attribute_notes_markdown([], problems=["engine_attribute_unbound: x: unreadable"]))
+        ok("could not be read" in md_bad and "unreadable" in md_bad,
+           f"AB5 (Codex r3 P2-2) an unreadable card binding is stated in the results, not dropped: {md_bad}")
+        ok(attribute_notes({"method": "none", "attribute": "a"}, b) == []
+           and attribute_notes({"method": "posterior", "attribute": "c"}, b) == []
+           and attribute_notes_markdown([]) == [],
+           "AB4 nothing is listed when the attribute is not calibrated or its card gives no limitation")
     # DI12: contract.py and the engines' code are unchanged (the fingerprints still match the benchmark stamps).
     from toolkit.engines.contract import code_fingerprint
     for mod, cls, res in (("toolkit.engines.malaria.engine", "MalariaEngine", "toolkit/engines/malaria/benchmarks/results.yaml"),

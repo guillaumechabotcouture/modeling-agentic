@@ -81,6 +81,12 @@ structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers 
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires, resolved (true/false), and done_when (required for
 HIGH and MEDIUM). Use only those values: the gate refuses any other.
+A blocker with resolved: true also needs resolved_in_round: {round} and resolved_evidence: "<where
+the fix is, file and section>"; keep its done_when (the harness re-runs the test and reopens the
+finding if it fails). From round 2, carried_forward has one mapping per blocker of the previous
+round, never a bare id: {{id: <id>, prior_round: {prev_round}, still_present: <true if the blocker
+is still open>, notes: "<one line>"}}; still_present: true needs that blocker with resolved: false,
+still_present: false needs it with resolved: true.
 
 done_when is a structured test the harness runs, never prose: a list of checks, all must pass.
   - {{file: <path in the run>, exists: true}}
@@ -379,10 +385,12 @@ class SdkTasks:
         import validate_critique_yaml as V
         f = CRITIQUE_FILE[reviewer]
         model = enforcement.MODEL_FAST if reviewer == "critique-presentation" else enforcement.MODEL_DEEP
-        fb = ("\n\nThis is a repair: the gate refused your file. Fix exactly these errors and keep the review:\n- "
+        fb = ("\n\nThis is a repair: the gate refused your file. These are all of its errors; fix every one, "
+              "check the whole file against the schema above, and keep the review:\n- "
               + "\n- ".join(feedback)) if feedback else ""
         return self._session("critique", PROMPTS["critique"].format(
-            reviewer=reviewer, round=round_n, file=f, prefix=PREFIX[reviewer], out=OUT, feedback=fb,
+            reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
+            out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
                              f"Review round {round_n}.", (f,), model)
@@ -498,11 +506,19 @@ def _self_test() -> int:
         ok(_search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
            "S15 a Read of a link resolving into _truth is refused")
         import validate_critique_yaml as V
-        cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, file="f", prefix="D", out=OUT,
+        cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, prev_round=0, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),
                                         stages="S")
         ok(all(c in cp for c in V.VALID_CATEGORY) and "- X" in cp,
            "S11 the critique prompt lists the gate's categories and carries a repair's errors")
+        # S17 (two v2 eval runs, 2026-11-05): critics resolved blockers without resolved_in_round or
+        # resolved_evidence and wrote carried_forward as bare ids. The prompt states both requirements
+        # with the round filled in, and the repair says its list is every error in the file.
+        cp2 = PROMPTS["critique"].format(reviewer="critique-domain", round=2, prev_round=1, file="f", prefix="D",
+                                         out=OUT, feedback="", severities="H", categories="C", stages="S")
+        ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
+                                  "never a bare id")),
+           "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT)
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 

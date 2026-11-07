@@ -401,6 +401,34 @@ def probe_refit_r0(make_engine, config: str, r0: float, gamma: float, weeks: int
     return float(math.exp(best.x[0]))
 
 
+# ---------------------------------------------------------------- v0.2: age-structured questions
+def oracle_seir_growth_r0(r: float, latent_days: float, infectious_days: float) -> float:
+    """SEIR with exponential latent (L) and infectious (D) periods: R0 = (1 + r L)(1 + r D) for growth rate r
+    (Wallinga & Lipsitch 2007, the Laplace transform of the SEIR generation interval)."""
+    return (1.0 + float(r) * float(latent_days)) * (1.0 + float(r) * float(infectious_days))
+
+
+def probe_series_consistency(make_engine, config: str, unit: dict, params: dict, package: dict, horizon: dict) -> float:
+    """AS6: the largest of |sum of monthly incidence x step length - attack rate| and |last monthly susceptible
+    share - s_end| for the comparator and the package, through toolkit/engines/hooks.py (the contract checks)."""
+    from toolkit.engines import hooks as H
+    from toolkit.engines.contract import Package
+    eng = make_engine(config)
+    u, _p, h = _engine_args(unit, None, horizon)
+    pks = [Package("none", {}), Package("p", dict(package))]
+    ser = H.run_series(eng, params, u, pks, h, 1, ["incidence", "susceptible"])
+    outs = eng.run_batch([params, params], u, pks, h, 1)
+    grid = H.monthly_grid(h)
+    end = float(h.window[1])
+    worst = 0.0
+    for r, o in zip(ser, outs):
+        steps = [min(a + 1 / 12, end) - a for a in grid]
+        tot = sum(v * d for v, d in zip(r["values"]["incidence"], steps))
+        worst = max(worst, abs(tot - o.windows["all"]["attack_rate"]),
+                    abs(r["values"]["susceptible"][-1] - o.windows["all"]["s_end"]))
+    return float(worst)
+
+
 # ---------------------------------------------------------------- coverage-pack generators (coverage.yaml)
 # Independent of the engine and of the observation code under test: the renewal cases use the reference ODE,
 # the cohort case draws latent coverage and each source's frame and biases directly, and SB5 uses the

@@ -159,15 +159,17 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                 cz = A.calibrate(theta)
                 zs = {i: x[0] for i, x in cz.items()}
                 extra[v] = {"calibration_clamped_units": sum(bool(x[1]) for x in cz.values())}   # Codex r1 P1-3
-            elif A.method == "posterior" and (p in (A.lik or {}).get("params", []) or p.startswith("z:")):
+            elif A.method == "posterior" and (p in (A.lik or {}).get("params", []) or p.startswith("z:")
+                                              or p in (A.lik or {}).get("nuisance", [])):
                 from toolkit.analysis import calibration as C
                 if p.startswith("z:"):     # a unit attribute at each end of its range, the calibration redone
                     fit = C.fit_posterior_panel(A.spec, A.model, fixed_z={p[2:]: float(v)}, sample_it=False)
                     zs = dict(fit["z"], **{p[2:]: float(v)})
-                else:
+                else:                      # an engine parameter, or a source's bias parameter (never an engine input)
                     fit = C.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
                     zs = dict(fit["z"])
-                theta = dict(A.theta0, **fit["theta"])
+                zs = {i: zs.get(i, fit["fixed_z"].get(i)) for i in A.ids}
+                theta = dict({k: x for k, x in A.theta0.items() if k != p or k in fit["theta"]}, **fit["theta"])
             else:
                 zs = z0
             _, ben, cost = A.evaluate(theta, zs)
@@ -194,6 +196,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     elif t == "envelope":
         varied = "the envelope set to each tested value"
         fixed = sum(float(v) for v in (A.spec["constraints"].get("fixed_costs_usd") or {}).values())
+        A.spec.packages()
+        bound = getattr(A.spec, "prune_budget", None)
+        if bound is not None and any(float(v) - fixed > bound * (1 + 1e-12) for v in dt["values"]):
+            return _not_run(A, dt, "an envelope above the declared one, and the packages were generated within the "
+                                   "declared envelope (options.packages.within_envelope): drop within_envelope to "
+                                   "test larger envelopes")
         cases = [(v, ben0, cost0, float(v) - fixed, None) for v in dt["values"]]
         lowers = [False] * len(cases)
     else:
