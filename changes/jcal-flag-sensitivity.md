@@ -15,11 +15,15 @@ status_group: "In review (v2 calibration)"
 - **Sensitivities.** `calibration.joint.sensitivity: [{id, label, targets: {target id: {sd | bias_sd | discrepancy_sd}}}]` lists error settings that are reported beside the primary, never as a block.
   - Each is calibrated on every run of the primary setting, in the same process (no new wave; the engine verification runs).
   - The report names the primary setting's target errors (`primary`).
-- **Emulator-check rule (HM20, in PR #150).** This rule change was made after seeing the w6 result: the four benchmark emulators failed their wave-0 check on 32 points and passed a later cross-validation over all 64 runs. Before, any failed check blocked for good. Now a failed check clears only when a later check that covers every run so far, a cross-validation over all of them, passes.
-  - The rationale: that check is a stronger test than a single wave's holdout, because it includes the points the failed emulator was judged on.
-  - A later check of the new wave's points alone still cannot clear a failure (HM14).
+- **Emulator-check rule (HM20, first in PR #150; tightened here).** This rule change was made after seeing the w6 result: the four benchmark emulators failed their wave-0 check on 32 points and passed a later cross-validation over all 64 runs. Before, any failed check blocked for good.
+  - In #150, a failed check cleared when a later check covering every run so far passed. Review found that a pooled pass can dilute the same failures (two bad runs of 32 fail; the same two of 64 pass).
+  - Now a failed check clears only when a later check covering every run passes overall **and** on the failed check's own runs, judged out of fold (HM20, HM22). A check of the new wave's points alone still cannot clear a failure (HM14).
+  - Recomputed with w6's own folds, all five benchmark emulators pass both parts (share outside 3 sd: 0.000 to 0.031 on the wave-0 runs), so w6's setting A still clears. With other fold draws, two (B10, B12b) fail: these emulators are marginal.
+- **Best shared point (HM23).** Units that no value matches no longer steer the choice of the best shared point.
+- **Declarations the code would not apply are refused (JA13).** A reason entry must name exactly one unit or region. A sensitivity cannot override `sd` on a target whose error comes from its data (`sd_column`, `ci_columns`, `n_column`, `ci`) or on a benchmark.
+- **A failing sensitivity is reported with its error and never stops the primary (JA12d).** A stability fold with too few unflagged training units is recorded `not_run`. A top-up's minimum run count applies to the unit's total.
 - **Top-up waves (HM21).** A new wave can simulate only the units with fewer earlier runs than a count, for example units whose inputs changed.
-- **Tests, written first:** JA11 (flag option shape and decision), JA12 (sensitivity), JR8 (flagged units through ANALYZE: allocation file, point, uncertainty report), HM21.
+- **Tests, written first:** JA11 (flag option shape and decision), JA12 (sensitivity), JA13, HM20, HM22, HM23, JR8 (flagged units through ANALYZE: allocation file, point, uncertainty report), HM21.
 
 ## Status
 

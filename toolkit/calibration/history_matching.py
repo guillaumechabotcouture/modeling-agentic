@@ -686,11 +686,11 @@ class HistoryMatch:
         for r in self.data.unit:
             have[r["unit"]] = have.get(r["unit"], 0) + 1
         for u in self.P.units:
-            if self.top_up is not None:
-                n_u = max(self.top_up - have.get(u, 0), 0)
+            if self.top_up is not None:     # Codex r5 P2-6: the minimum applies to the unit's total, not the increment
+                target = max(self.top_up, int(self.eth["min_points_per_unit"]))
+                n_u = max(target - have.get(u, 0), 0)
                 if n_u == 0:
                     continue
-                n_u = max(n_u, int(self.eth["min_points_per_unit"]))
             ok = state["units"][u]["ok"]
             rows_ok = [c for c in acc if ok[c].any()] if len(acc) else []
             if rows_ok:
@@ -734,7 +734,8 @@ class HistoryMatch:
         return em
 
     def _errors(self, kind, held, rest):
-        """Standardised errors of `held` rows under emulators fitted on `rest` (one list per observable)."""
+        """Standardised errors of `held` rows under emulators fitted on `rest` (one list per observable); the errors
+        by run key are kept in self._check_errs for the cohort rule (_note_check)."""
         em = self._fit(rest, []) if kind == "unit" else self._fit([], rest)
         out = {}
         for ob in (self.uobs if kind == "unit" else self.sobs):
@@ -744,7 +745,9 @@ class HistoryMatch:
                     m, v = em["unit"][ob].predict(r["unit"], [r["s"]], np.atleast_2d(r["t"]))
                 else:
                     m, v = em["shared"][ob].predict(np.atleast_2d(r["t"]))
-                e.append(float(standardised_errors(tr(r["obs"][ob], self.P.scales[ob]), m, v)[0]))
+                x = float(standardised_errors(tr(r["obs"][ob], self.P.scales[ob]), m, v)[0])
+                e.append(x)
+                self._check_errs.setdefault(ob, {})[(kind,) + _key(r) + (r.get("seed"),)] = x
             out[ob] = e
         return out
 
@@ -755,6 +758,9 @@ class HistoryMatch:
         rng = np.random.default_rng([self.seed, len(self.waves), 2])
         hs, mh = float(self.eth["holdout_share"]), int(self.eth["min_holdout"])
         out = {}
+        if not hasattr(self, "_check_errs"):
+            self._reset_checks()
+        self._check_errs = {}
         for kind, wave, alld in (("unit", wave_u, self.data.unit), ("shared", wave_s, self.data.shared)):
             if not wave:
                 continue
@@ -956,7 +962,9 @@ class HistoryMatch:
             conflicting = sorted({u for u in matchable if not um[u][region].any()}, key=str)
             if not conflicting:      # different candidates miss different units: every unit missed somewhere
                 conflicting = sorted({u for u in matchable if (~um[u][region]).any()}, key=str)
-        score = sum(st["units"][u]["m"] ** 2 for u in self.P.units) if self.P.units else np.zeros(N)
+        # Codex r5 P1-2: units no value matches do not steer the choice of the best shared point
+        score = sum(st["units"][u]["m"] ** 2 for u in self.P.units if u not in unmatchable) \
+            if [u for u in self.P.units if u not in unmatchable] else np.zeros(N)
         score = score + sum(v["I"] ** 2 for v in st["targets"].values()) if st["targets"] else score
         acc = okT & (nbad == 0)
         share = None
@@ -990,7 +998,7 @@ class HistoryMatch:
         nw = int(waves if waves is not None else self.th["waves"])
         state = None
         valid = {}
-        self.valid_hist = {}
+        self._reset_checks()                 # Codex r5 P2-8: history and clearing reset together
         off = 0
         if self.prior_n:      # the earlier runs are wave 0: checked (cross-validation over them), fitted, a region
             pu, ps = list(self.data.unit), list(self.data.shared)
@@ -1031,13 +1039,30 @@ class HistoryMatch:
         self.state = state
         return self.report(valid)
 
+    def _reset_checks(self):
+        self.valid_hist, self.valid_cleared, self._failed, self._check_errs = {}, {}, {}, {}
+
     def _note_check(self, ob, v):
+        """Record one emulator check. A failed check keeps its runs (its cohort). A later check that covers every
+        run so far clears it only when it passes overall and, out of fold, on each failed cohort's runs (Codex r5
+        P1-1: a pooled pass alone could dilute the same failures)."""
+        if not hasattr(self, "valid_cleared"):
+            self._reset_checks()
         h = self.valid_hist.setdefault(ob, [])
         h.append(v["status"])
-        if not hasattr(self, "valid_cleared"):
-            self.valid_cleared = {}
-        if v["status"] == "passed" and v.get("covers_all"):
-            self.valid_cleared[ob] = len(h) - 1          # every earlier check is superseded by this one
+        errs = (getattr(self, "_check_errs", {}) or {}).get(ob, {})
+        if v["status"] != "passed":
+            self._failed.setdefault(ob, []).append(set(errs))
+        elif v.get("covers_all"):
+            sub = [validation([errs[k] for k in c if k in errs], self.eth) for c in self._failed.get(ob, [])]
+            if all(x["status"] == "passed" for x in sub):
+                self.valid_cleared[ob] = len(h) - 1      # every earlier check is superseded by this one
+                self._failed[ob] = []
+
+    def _inadequate(self) -> dict:
+        hist = getattr(self, "valid_hist", {}) or {}
+        cl = getattr(self, "valid_cleared", {}) or {}
+        return {ob: s for ob, s in hist.items() if any(x != "passed" for x in s[cl.get(ob, -1) + 1:])}
 
     def _wave_summary(self, w, urows, srows, valid, st):
         return {"wave": w + 1, "unit_runs": len(urows), "shared_runs": len(srows), "validation": valid,
@@ -1252,11 +1277,10 @@ class HistoryMatch:
         blocks = []
         # Codex r2 P1-2: a wave whose check failed (or could not run) blocks even when a later wave passes: the later
         # check holds out only the later wave's points, so it cannot clear what the failed emulator excluded
-        hist = getattr(self, "valid_hist", {}) or {ob: [v["status"]] for ob, v in valid.items()}
         # a failed check stays until a later check covers every run so far (cross-validation over all of them) and
-        # passes: a check of the new wave's points alone cannot clear what the failed emulator excluded
-        cleared = getattr(self, "valid_cleared", {})
-        inadequate = {ob: s for ob, s in hist.items() if any(x != "passed" for x in s[cleared.get(ob, -1) + 1:])}
+        # passes, overall and on the failed check's own runs (_note_check)
+        inadequate = self._inadequate() if getattr(self, "valid_hist", None) else \
+            {ob: [v["status"]] for ob, v in valid.items() if v["status"] != "passed"}
         if inadequate:
             blocks.append({"code": "emulator_inadequate", "detail": {ob: f"wave checks {s}" for ob, s in inadequate.items()}})
         if not len(R):
@@ -1866,17 +1890,54 @@ def _self_test() -> int:
             ok(True, "HM19c a boolean observation in an earlier run is refused")
     safe(hm19, "HM19")
 
-    def hm20():          # a later check that covers every run (cross-validation over all) and passes clears a failure
+    def hm20():          # a later check covering every run clears a failure only if the failed runs now pass too
         h = HistoryMatch(*_toy()[:2], 1, q, **fast)
-        h.valid_hist = {}
+        h._reset_checks()
+        rng = np.random.default_rng(1)
+        k1 = [("a", i) for i in range(32)]
+        h._check_errs = {"w0": dict(zip(k1, list(rng.normal(0, 4, 32))))}            # overconfident
         h._note_check("w0", {"status": "failed"})
+        h._check_errs = {"w0": {("b", i): float(x) for i, x in enumerate(rng.normal(0, 1, 32))}}
         h._note_check("w0", {"status": "passed", "covers_all": False})
-        a = {ob: s for ob, s in h.valid_hist.items() if any(x != "passed" for x in s[h.valid_cleared.get(ob, -1) + 1:])}
+        a = h._inadequate()
+        cov = {k: float(x) for k, x in zip(k1, rng.normal(0, 1, 32))}
+        cov.update({("b", i): float(x) for i, x in enumerate(rng.normal(0, 1, 32))})
+        h._check_errs = {"w0": cov}
         h._note_check("w0", {"status": "passed", "covers_all": True})
-        b = {ob: s for ob, s in h.valid_hist.items() if any(x != "passed" for x in s[h.valid_cleared.get(ob, -1) + 1:])}
+        b = h._inadequate()
         ok("w0" in a and "w0" not in b, "HM20 a failure stays after a new-wave pass, and clears after a pass of a check "
-                                        "covering every run")
+                                        "covering every run in which the failed runs pass too")
     safe(hm20, "HM20")
+
+    def hm22():          # Codex r5 P1-1: a covering pass cannot clear a failure by dilution
+        h = HistoryMatch(*_toy()[:2], 1, q, **fast)
+        h._reset_checks()
+        k1 = [("a", i) for i in range(32)]
+        e1 = [0.5] * 30 + [5.0, 5.0]                                        # 2 of 32 beyond 3: 6% fails
+        h._check_errs = {"w0": dict(zip(k1, e1))}
+        h._note_check("w0", {"status": "failed"})
+        pooled = dict(zip(k1, e1))                                          # 2 of 64: 3% passes overall
+        pooled.update({("b", i): 0.5 for i in range(32)})
+        h._check_errs = {"w0": pooled}
+        h._note_check("w0", {"status": "passed", "covers_all": True})
+        ok("w0" in h._inadequate(), "HM22 the same two failing runs diluted into a larger pass still block")
+    safe(hm22, "HM22")
+
+    def hm23():          # Codex r5 P1-2: an unmatched unit does not steer the shared best point
+        def extra(f, units):
+            return [Target("u2:hi", "unit", "w1", 0.995, "logit", sd_obs=0.1, sd_md=0.05, unit="u2", source="toy")]
+        P, sim, *_ = _toy(extra=extra)
+        h = HistoryMatch(P, sim, 4, q, **fast)
+        r = h.run(1)
+        st = h.state
+        R = st["region"]
+        sc = sum(st["units"][u]["m"] ** 2 for u in P.units if u != "u2") + \
+            (sum(v["I"] ** 2 for v in st["targets"].values()) if st["targets"] else 0)
+        want = int(R[np.argmin(np.asarray(sc)[R])])
+        got = P.theta_natural(st["C"][want])[0]
+        ok("u2" in r["unmatched"] and all(abs(r["best"]["theta"][k] - got[k]) < 1e-12 for k in got),
+           "HM23 the best shared point is chosen from the matchable units only")
+    safe(hm23, "HM23")
 
     def hm21():          # 2026-11-06: a top-up wave simulates only the units with too few earlier runs
         P, sim, *_ = _toy()

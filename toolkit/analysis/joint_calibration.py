@@ -266,9 +266,14 @@ def _unmatched_problems(u, w) -> list:
         mu = u.get("max_units")
         if not (isinstance(mu, int) and not isinstance(mu, bool) and mu >= 0):
             bad.append(f"{ww}.max_units: the most units that may proceed flagged (an integer >= 0)")
-    for n, r in enumerate(u.get("reasons") or []):
-        if not (isinstance(r, dict) and _text(r.get("reason")) and (_text(r.get("unit")) ^ _text(r.get("region")))
-                and set(r) <= {"unit", "region", "reason"}):
+    rs = u.get("reasons", [])
+    if not isinstance(rs, list):
+        bad.append(f"{ww}.reasons: a list of {{unit: <id>, reason}} or {{region: <name>, reason}}")
+        rs = []
+    for n, r in enumerate(rs):      # Codex r5 P2-5: exactly one selector, text, besides the reason
+        sel = [k for k in ("unit", "region") if isinstance(r, dict) and k in r]
+        if not (isinstance(r, dict) and _text(r.get("reason")) and len(sel) == 1 and _text(r.get(sel[0]))
+                and set(r) == {sel[0], "reason"}):
             bad.append(f"{ww}.reasons[{n}]: {{unit: <id>, reason}} or {{region: <name>, reason}}")
     return bad
 
@@ -291,7 +296,17 @@ def _sensitivity_problems(s, targets, w) -> list:
         if x["id"] in seen:
             bad.append(f"{ww}[{n}]: repeated id {x['id']}")
         seen.add(x["id"])
+        kinds = {t.get("id"): t for t in targets or [] if isinstance(t, dict)}
         for tid, ov in x["targets"].items():
+            t0 = kinds.get(tid) or {}
+            if tid in ids and t0.get("kind") == "benchmark":
+                bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's error comes from its band; not overridable")
+                continue
+            if tid in ids and isinstance(ov, dict) and "sd" in ov and any(
+                    k in t0 for k in ("sd_column", "ci_columns", "n_column", "ci")):
+                bad.append(f"{ww}[{n}].targets.{tid}: sd cannot override a target whose sampling error comes from "
+                           "its data (sd_column, ci_columns, n_column or ci); change bias_sd or discrepancy_sd")
+                continue
             if tid not in ids:
                 bad.append(f"{ww}[{n}].targets: {tid!r} is not a target id")
             elif not (isinstance(ov, dict) and ov and set(ov) <= set(SENS_KEYS)
@@ -359,14 +374,24 @@ def run_sensitivities(spec, rep, run_dir, compute_kw=None, log=print, units=None
         _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(raw, sort_keys=False).encode(), atomic=True)
         s2 = schema.load(os.path.join(run_dir, rel))
         s2.base = spec.base              # the copy resolves data paths as the spec does
-        check_same_simulator(spec, s2)
+        try:
+            check_same_simulator(spec, s2)
+        except HM.CalibrationInputError as e:
+            out.append({"id": x["id"], "label": x["label"], "targets": x["targets"], "error": str(e)[:500]})
+            continue
         P2, meta2 = build(s2, units)
         prior = {"unit": [dict(r, obs=remap_windows(r["obs"], meta1["windows"], meta2["windows"]))
                           for r in rep["runs"]["unit"]], "shared": rep["runs"]["shared"]}
         sim = Simulator(s2, run_dir, meta2, compute_kw, log)
         sim.calls = 1000 * (n + 1)
-        r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
-                          record=meta2["record"], **{k: j[k] for k in ("points_per_unit", "shared_points") if k in j})
+        try:            # Codex r5 P2-4: a sensitivity that fails is reported; it never stops the primary
+            r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
+                              record=meta2["record"], **{k: j[k] for k in ("points_per_unit", "shared_points") if k in j})
+        except Exception as e:  # noqa: BLE001
+            out.append({"id": x["id"], "label": x["label"], "targets": x["targets"],
+                        "error": f"{type(e).__name__}: {str(e)[:500]}"})
+            log(f"sensitivity {x['id']}: failed ({type(e).__name__}); reported, the primary continues")
+            continue
         r2["prior_runs"] = {"reused": len(prior["unit"]), "shared_reused": len(prior["shared"]),
                             "from": "the primary setting, same process"}
         r2["adapter"] = {"windows": meta2["windows"], "units": len(meta2["units"]), "shared": list(j["shared"])}
@@ -863,7 +888,8 @@ def artifact(rep) -> dict:
     out = {k: v for k, v in rep.items() if k not in ("sample", "runs", "sensitivity")}   # the runs: own file
     if rep.get("sensitivity"):
         out["sensitivity"] = [dict({k: v for k, v in s.items() if k != "report"},
-                                   report={k: v for k, v in s["report"].items() if k not in ("sample", "runs")})
+                                   **({"report": {k: v for k, v in s["report"].items() if k not in ("sample", "runs")}}
+                                      if "report" in s else {}))
                               for s in rep["sensitivity"]]
     if rep.get("sample"):
         s = region_sample(rep)
@@ -885,6 +911,10 @@ def summary(rep) -> str:
         L.append(f"  unmatched {len(rep['unmatched'])}, conflicting {len(rep['conflicting'])}")
     for b in rep["blocks"]:
         L.append(f"  block: {b['code']}")
+    for s in rep.get("sensitivity") or []:
+        r = s.get("report")
+        L.append(f"  sensitivity {s['id']} ({s['label']}): " + (f"failed, {s.get('error')}" if r is None else
+                 f"{r['n_matched']} of {r['n_units']} units matched (reported, not a block)"))
     return "\n".join(L)
 
 
@@ -1309,7 +1339,41 @@ def _self_test() -> int:
             raw["calibration"]["joint"]["sensitivity"][0]["targets"] = {"nope": {"sd": 0.1}}
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             ok(any("sensitivity" in b for b in spec_problems(schema.load(p))), "JA12c an unknown target id is refused")
+            real = HM.calibrate
+
+            def boom(*a, **k):
+                raise RuntimeError("toy sensitivity failure")
+            HM.calibrate = boom
+            try:
+                out = run_sensitivities(spec, rep, d, {"max_workers": 2}, log=q)
+            finally:
+                HM.calibrate = real
+            ok(len(out) == 1 and "toy sensitivity failure" in out[0].get("error", "") and "report" not in out[0],
+               "JA12d a sensitivity that fails is reported with its error; the primary is untouched")
+            ok("sensitivity" in summary(dict(rep, sensitivity=out)), "JA12e the summary carries a failed sensitivity")
     safe(ja12, "JA12")
+
+    def ja13():          # Codex r5 P2-3, P2-5: refuse declarations the code would not apply as written
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d, group=False)
+            raw = yaml.safe_load(open(p))
+            base = {"mode": "flag", "max_units": 2, "default_reason": "toy"}
+            for rs in ([{"unit": "5", "region": "r1", "reason": "both"}], [{"unit": "", "reason": "empty"}],
+                       {"unit": "5", "reason": "not a list"}):
+                raw["calibration"]["joint"]["unmatched"] = dict(base, reasons=rs)
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                ok(any("reasons" in b for b in spec_problems(schema.load(p))),
+                   f"JA13a a reason selector that is not exactly one unit or region is refused ({rs})")
+            raw["calibration"]["joint"].pop("unmatched")
+            t = next(t for t in raw["calibration"]["joint"]["targets"] if t["id"] == "unit_t")
+            t.pop("sd", None)
+            t["sd_column"] = "sd"
+            raw["calibration"]["joint"]["sensitivity"] = [{"id": "x", "label": "x", "targets": {"unit_t": {"sd": 0.05}}}]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            ok(any("sd cannot override" in b for b in spec_problems(schema.load(p))),
+               "JA13b an sd override on a target whose error comes from its data is refused")
+    safe(ja13, "JA13")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

@@ -80,6 +80,10 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             # they never inform the prediction of a held-out unit
             fl = np.array([i in (getattr(A, "flagged", None) or {}) for i in A.ids])
             tr = ~m & ~fl
+            if tr.sum() < Xs.shape[1]:     # Codex r5 P2-7: no regression without enough unflagged training units
+                folds.append({"group": gv, "status": "not_run", "n_held_out": len(hid),
+                              "reason": "too few unflagged units outside the fold to predict the held-out values"})
+                continue
             beta = np.linalg.solve(Xs[tr].T @ Xs[tr] + lam, Xs[tr].T @ y[tr])
             zh = dict(z0)
             for i, k in zip(A.ids, m):
