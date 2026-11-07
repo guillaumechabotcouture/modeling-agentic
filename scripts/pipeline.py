@@ -1706,7 +1706,8 @@ def cited_paths(spec: dict, run_dir: str) -> list[str]:
     jt = joint.get("targets") if isinstance(joint, dict) else None
     if isinstance(jt, list):
         jt = [dict(t, key={k: v for k, v in t["key"].items() if k != "csv"})
-              if isinstance(t, dict) and isinstance(t.get("key"), dict) else t for t in jt]
+              if isinstance(t, dict) and t.get("kind") == "group" and isinstance(t.get("key"), dict)
+              and isinstance(t["key"].get("csv"), str) else t for t in jt]
         spec = dict(spec, calibration=dict(cal, joint=dict(joint, targets=jt)))
     walk(spec)
     return sorted(set(found))

@@ -2177,6 +2177,13 @@ def _self_test() -> int:
             if want:
                 ok(any("data/missing.csv" in x for x in rc) and any("data/missing.csv" in x for x in dr),
                    f"T50d the joint target's own csv is still a cited file, and a missing one is refused ({rc}; {dr})")
+        for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
+                          ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
+            spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
+                {"id": "g", "kind": kind, "csv": "data/inputs/requirements.txt", "key": key}]}}}
+            yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+            ok(any("data/missing.csv" in x for x in record_cited_inputs(fk)),
+               f"T50e a {kind} target's key.csv that is not a group column name is still scanned for files")
         open(os.path.join(fr, "manuscript.md"), "w").write("`headline.point`\n")
         os.remove(os.path.join(fr, STATE_FILE))           # T45's machine left its state here
         m51 = Machine(fr, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False), backend=spike,
