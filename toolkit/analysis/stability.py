@@ -76,7 +76,11 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         theta = A.theta0
         if A.method == "emulator_inversion":
             lam = 1e-3 * np.eye(Xs.shape[1])
-            beta = np.linalg.solve(Xs[~m].T @ Xs[~m] + lam, Xs[~m].T @ y[~m])
+            # units flagged by the joint calibration (calibration.joint.unmatched: flag) carry no calibrated value:
+            # they never inform the prediction of a held-out unit
+            fl = np.array([i in (getattr(A, "flagged", None) or {}) for i in A.ids])
+            tr = ~m & ~fl
+            beta = np.linalg.solve(Xs[tr].T @ Xs[tr] + lam, Xs[tr].T @ y[tr])
             zh = dict(z0)
             for i, k in zip(A.ids, m):
                 if k:

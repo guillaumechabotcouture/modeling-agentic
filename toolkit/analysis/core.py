@@ -76,6 +76,7 @@ class Analysis:
         self.method = spec["calibration"].get("method", "none")
         self.lik = None
         self.joint = None
+        self.flagged = {}
         self.last_events = []
 
     def set_joint(self, rep):

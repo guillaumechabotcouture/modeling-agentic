@@ -151,8 +151,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                             [spec_path] + data_in + JC.inputs(spec) + eng_files)
         holder["calibration"] = arts["joint_calibration"]
         log(JC.summary(jc))
-        if jc["blocked"]:
+        if jc["blocked"] and not jc["unmatched_decision"]["proceed"]:
             raise AnalysisBlocked("calibration", JC.block_hits(jc), reason=JC.block_reason(jc))
+        if jc["unmatched_decision"]["flagged"]:      # owner option calibration.joint.unmatched: flag (never silent)
+            log(f"joint calibration: {len(jc['unmatched_decision']['flagged'])} units proceed flagged low-confidence")
     # ---- outcome model
     if spec["analysis"]["evaluation"] == "emulator":
         design, jobs = Bt.design(spec)
@@ -216,6 +218,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     A = Analysis(spec, model, log=log)
     if jc is not None:
         A.set_joint(jc)
+        A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
     # ---- calibration
     A.fit_calibration()
     cal0 = A.calibrate(A.theta0)
@@ -268,7 +271,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                               for n in (spec["analysis"].get("diagnostics") or {})},
                  per_unit={i: {"package": plan[i], "benefit": ben0[i][plan[i]], "cost": cost0[i][plan[i]],
                                "averted": {o: out0[i]["y"][A.comp][o] - out0[i]["y"][plan[i]][o] for o in A.outcomes},
-                               "z": z0[i]} for i in A.ids})
+                               "z": z0[i], **({"calibration_flag": A.flagged[i]["reason"],
+                                               "calibration_status": A.flagged[i]["status"]}
+                                              if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
@@ -325,10 +330,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                 w.writerow([g, round(float(out0[i]["cost"][plan[i]][qname]), 4),
                             round(yg[A.comp][hl_o].get(g, 0.0) - yg[plan[i]][hl_o].get(g, 0.0), 4), i, plan[i]])
     else:
-        w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"])
+        fl = getattr(A, "flagged", {}) or {}
+        w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"]
+                   + (["calibration_flag"] if fl else []))
         for i in A.ids:
             w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
-                        A.by_id[i].get(reg, "") if reg else ""])
+                        A.by_id[i].get(reg, "") if reg else ""] + ([fl[i]["reason"] if i in fl else ""] if fl else []))
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(dp, buf.getvalue(), run_dir)
     S.deliverable(dp, PRODUCER, "allocation")
@@ -696,6 +703,30 @@ def _self_test_joint(ok, q):
                and os.path.exists(os.path.join(d, "analysis", "joint_calibration.yaml")),
                "JR1 a unit the joint calibration cannot match stops the run at the calibration step, before the "
                "outcome batch (blocked.yaml names it; the joint calibration artifact is written)")
+    with tempfile.TemporaryDirectory() as d:     # owner decision 2026-11-06: flagged, never silently
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 1, "default_reason": "toy reason"}
+        # a narrow prior on the toy's (unidentified) base keeps the best point off the prior's edge, so the stability
+        # folds' predicted unit values stay inside the emulator's design (a toy property, not part of the flag)
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2})
+            rows = list(csv.DictReader(open(os.path.join(d, "allocation_optimized.csv"))))
+            rep_ = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+            jc_ = yaml.safe_load(open(os.path.join(d, "analysis", "joint_calibration.yaml")))["data"]
+            fl = {r["unit"]: r["calibration_flag"] for r in rows}
+            ok(fl.get("5") == "toy reason" and all(v == "" for k, v in fl.items() if k != "5")
+               and [x["unit"] for x in rep_.get("low_confidence_units") or []] == ["5"]
+               and [x["unit"] for x in jc_["unmatched_decision"]["flagged"]] == ["5"]
+               and R["point"]["per_unit"]["5"].get("calibration_flag") == "toy reason"
+               and "unmatched" in (rep_.get("low_confidence_note") or ""),
+               "JR8 with unmatched: flag, an unmatched unit proceeds into the batch and the allocation, flagged "
+               "low-confidence with its reason in the allocation file, the point, the uncertainty report and label")
+        except AnalysisBlocked as e:
+            ok(False, f"JR8 flag mode proceeds (blocked: {e})")
     with tempfile.TemporaryDirectory() as d:
         JC._toy_joint(d)
         signoff.sign(d, "lead", note="self-test")
