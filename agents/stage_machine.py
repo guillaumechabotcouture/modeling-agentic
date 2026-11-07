@@ -2162,6 +2162,21 @@ def _self_test() -> int:
         open(os.path.join(fs, "data", "inputs", "requirements.txt"), "a").write("tampered\n")
         ok(any("changed or removed" in x for x in record_cited_inputs(fs)),
            "T50b a staged input changed after it was copied is refused")
+        import pipeline as P_
+        fk = os.path.join(td, "t50k")         # a joint calibration group target's key names columns, not files
+        os.makedirs(fk)
+        stage_inputs(fk, "requirements.txt")
+        for csv, want in (("data/inputs/requirements.txt", False), ("data/missing.csv", True)):
+            spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
+                {"id": "g", "kind": "group", "csv": csv, "key": {"csv": "unit", "units": "state"}}]}}}
+            yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+            rc = record_cited_inputs(fk)
+            dr = [p["claim"] for p in P_.derivation_problems(fk, spec, required=True) if p["code"] == "data_ref_not_derived"]
+            ok(not any("cites unit" in x for x in rc) and not any("reads unit" in x for x in dr),
+               f"T50c a joint target's key.csv (a column) is not a cited file ({rc}; {dr})")
+            if want:
+                ok(any("data/missing.csv" in x for x in rc) and any("data/missing.csv" in x for x in dr),
+                   f"T50d the joint target's own csv is still a cited file, and a missing one is refused ({rc}; {dr})")
         open(os.path.join(fr, "manuscript.md"), "w").write("`headline.point`\n")
         os.remove(os.path.join(fr, STATE_FILE))           # T45's machine left its state here
         m51 = Machine(fr, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False), backend=spike,
