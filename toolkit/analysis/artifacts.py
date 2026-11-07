@@ -35,6 +35,7 @@ KINDS = {
     "batch": ("evaluation",),
     "emulator": ("accuracy",),
     "calibration": ("method", "units", "diagnostics", "identifiability"),
+    "joint_calibration": ("method", "status", "region", "units"),
     "point": ("plan", "averted", "cost_allocated", "mix", "solver"),
     "uncertainty": ("draws", "covers", "excludes", "label", "fixed_plan"),
     "stability": ("method", "folds", "metrics", "verdict", "value_verdict"),

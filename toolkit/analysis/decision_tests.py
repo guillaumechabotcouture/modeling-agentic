@@ -92,6 +92,13 @@ def prior_range_tests(A) -> list[dict]:
             "automatic": True, "finding": f"decision_test:{PRIOR_RANGE_PREFIX}{k}",
             "text": f"Does the plan change when {k} is at either end of its declared range?",
             "source": p.source} for k, p in A.pr.items()]
+    jr = (A.joint or {}).get("ranges") or {}
+    for t in out:      # a jointly calibrated parameter: each end of its compatible range, not of its prior
+        r = jr.get(t["parameter"])
+        if r:
+            t.update(values=[float(r[0]), float(r[1])], joint=True,
+                     text=f"Does the plan change when {t['parameter']} is at either end of its jointly calibrated "
+                          "range?")
     if A.method == "posterior":
         # v2d §3.2: a calibration parameter the data do not determine (prior-dominated or partly identified) gets the
         # same automatic test; the calibration is redone with the parameter held at each end of its declared range

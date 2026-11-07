@@ -26,12 +26,27 @@ def discount_factor(spec) -> float:
     return float((math.exp(-k * (t0 - b)) - math.exp(-k * (t1 - b))) / (k * (t1 - t0)))
 
 
-class AnalysisBlocked(RuntimeError):
-    """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan."""
+def clamped_units_max() -> int:
+    """toolkit/calibration/thresholds.yaml blocking.clamped_units_max. (Kept out of toolkit/analysis/calibration.py,
+    whose bytes the compartmental engine's coverage proof binds: compat_proof.py CALIBRATOR_FILES.)"""
+    from toolkit.calibration.history_matching import thresholds as _t
+    return int(_t()["blocking"]["clamped_units_max"])
 
-    def __init__(self, where: str, hits: list):
-        self.where, self.hits = where, list(hits)
-        super().__init__(f"{where}: {len(hits)} model corrections (extrapolation, clips, floors) bear on the plan "
+
+def clamped_hits(cal: dict) -> list:
+    """AnalysisBlocked hits for the units an emulator inversion clamped at a bound of calibration.range."""
+    return [{"unit": i, "package": "*", "kind": "calibration_clamped", "z": round(float(v["z"]), 4)}
+            for i, v in (cal.get("units") or {}).items() if v.get("clamped")]
+
+
+class AnalysisBlocked(RuntimeError):
+    """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan, or (at
+    the calibration step, `reason` given) units the calibration cannot match."""
+
+    def __init__(self, where: str, hits: list, reason: str | None = None):
+        self.where, self.hits, self.reason = where, list(hits), reason
+        super().__init__(f"{where}: {reason} (e.g. {hits[:2]})" if reason else
+                         f"{where}: {len(hits)} model corrections (extrapolation, clips, floors) bear on the plan "
                          f"(e.g. {hits[:2]})")
 
 
@@ -60,11 +75,26 @@ class Analysis:
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None
+        self.joint = None
         self.last_events = []
+
+    def set_joint(self, rep):
+        """The joint calibration (toolkit/analysis/joint_calibration.py): its shared parameters move to the best point
+        of the compatible region and each unit's attribute to its jointly fitted value there (verified on the engine);
+        the uncertainty draws read whole rows of the region sample (shared and unit values together) instead of the
+        priors. Steps that move another parameter (sensitivity, decision tests) keep these unit values, as the
+        posterior path keeps its fitted ones: re-inverting one target would drop the others (Codex r1 P1-2)."""
+        from toolkit.analysis import joint_calibration as JC
+        names = list(rep["shared"])
+        self.joint = {"shared": names, "sample": JC.region_sample(rep), "ranges": rep["region"]["ranges"],
+                      "best": dict(rep["best"]["theta"]), "z": {str(k): float(v) for k, v in rep["best"]["z"].items()}}
+        self.theta0 = dict(self.theta0, **{k: float(rep["best"]["theta"][k]) for k in names})
 
     # ------------------------------------------------------------ calibration
     def calibrate(self, theta, shifts=None, ids=None):
         """{unit: (z, clamped)} for emulator inversion; the fitted z for likelihood; None for none."""
+        if self.joint is not None:
+            return {i: (self.joint["z"][i], False) for i in (ids or self.ids)}
         if self.method == "emulator_inversion":
             return C.invert(self.spec, self.model, theta, shifts, ids)
         if self.method in ("likelihood", "posterior"):

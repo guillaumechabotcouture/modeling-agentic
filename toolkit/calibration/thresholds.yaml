@@ -1,0 +1,64 @@
+# Joint calibration thresholds (toolkit/calibration/history_matching.py). Proposals for the owner's review; the code
+# reads them from here and restates none. A spec may override `waves` and `points_per_unit` in calibration.joint.
+history_matching:
+  # A point is implausible when |E[model] - observed| exceeds this many standard deviations of the combined
+  # emulator, observation and discrepancy error. 3 is Pukelsheim's three-sigma rule for unimodal distributions, the
+  # usual first-wave cutoff (Vernon et al. 2010 Bayesian Anal 5:619; Andrianakis et al. 2015 PLoS Comput Biol
+  # 11:e1003968).
+  implausibility_cutoff: 3.0
+  # A unit with several targets (for example several survey years) is judged on its largest implausibility.
+  # Shared-parameter candidates: 2^candidates_log2 scrambled Sobol points over the prior box, refined around the
+  # accepted ones while fewer than region_min_candidates are accepted (at most refine_rounds times).
+  candidates_log2: 11
+  region_min_candidates: 64
+  refine_rounds: 2
+  refine_sd: 0.05            # perturbation sd of a refinement candidate, as a share of each prior range
+  z_grid: 41                 # points of the per-unit parameter grid over its declared range
+  # group targets: a component of group targets that share units moves its members by a common share of each
+  # member's non-implausible range, searched on group_t shares; the region sample first tries group_tries draws with
+  # each member at its own share, then group_tries common shares, keeping a draw only when every group target holds
+  group_t: 21
+  group_tries: 20
+  waves: 2                   # waves of simulation (wave 1 space-filling over the prior box; later waves in the region)
+  points_per_unit: 8         # simulations per unit per wave
+  shared_points: 16          # simulations per wave for targets that depend on the shared parameters only
+  draws_kept: 1000           # rows of the region sample handed to the uncertainty step
+  # Every target needs a declared error: a target whose total observation and discrepancy sd is zero would be
+  # treated as ground truth, which no source is. Below this sd (on the target's scale) the target is refused.
+  min_target_sd: 1.0e-6
+  # The emulator's run-to-run noise (the fitted nugget) is part of the emulator variance: a stochastic engine's single
+  # runs scatter around their mean, and the comparison is with one realised survey.
+  include_run_noise: true
+emulator:
+  # Each wave holds out this share of its simulations, fits the emulator on the rest and checks the held-out
+  # standardised errors (prediction - simulated) / predictive sd. More than outside_share_max beyond std_error_max
+  # means the emulator's stated uncertainty is too small, and the calibration fails closed (Bastos and O'Hagan 2009
+  # Technometrics 51:425: about 5% of individual standardised errors beyond 2 is expected; 3 is our looser check).
+  holdout_share: 0.1
+  std_error_max: 3.0
+  outside_share_max: 0.05
+  min_holdout: 10            # fewer held-out points than this: the check is recorded as not run, and the step refuses
+  min_points_per_unit: 4     # a unit with fewer simulations than this cannot be emulated
+  ridge: 1.0e-6              # ridge on the regression mean (per point)
+figures:
+  # the calibration figures (toolkit/calibration/figures.py): display settings, not decision thresholds
+  points_max: 4000        # candidates drawn in the pair panels
+  depth_bins: 12          # optical-depth cells per axis
+  band_rows: 200          # region rows used for each target's model band
+  top_pairs: 6            # pairs in the top-pairs figure
+  transmission_rows: 120  # region rows drawn in the transmission figure
+verification:
+  # After the last wave the engine itself is run once per unit at the best point. A unit whose simulated value is
+  # implausible there (observation, discrepancy and run-noise variance only) is flagged, as is a unit no point in the
+  # region matches.
+  run: true
+  # engine runs per unit at the best shared point: its best value of the unit parameter and values spread over the
+  # rest of its non-implausible interval there; the unit passes when the engine matches at one of them
+  z_points: 3
+blocking:
+  # Units that no point of the region matches block the analysis at the calibration step, before the outcome batch.
+  # The harness never pins them at a bound silently; how to treat them is the owner's decision.
+  unmatched_units_max: 0
+  # emulator_inversion: units whose target lies outside the reachable range at the point values (clamped at a bound
+  # of calibration.range) block at the calibration step, right after the emulator is fitted.
+  clamped_units_max: 0

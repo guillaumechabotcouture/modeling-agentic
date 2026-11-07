@@ -1110,6 +1110,9 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
             bad.append("calibration.targets.outcome: not an engine per-capita output")
     if m == "posterior":
         bad += _validate_posterior(cal, s.raw["analysis"].get("evaluation"), s.raw["decision_units"])
+    if cal.get("joint") is not None:       # joint calibration (toolkit/analysis/joint_calibration.py)
+        from toolkit.analysis import joint_calibration as JC
+        bad += JC.spec_problems(s)
     return bad
 
 

@@ -66,27 +66,48 @@ class Drawer:
             self.mvn = (np.array([A.lik["x"][n] for n in A.lik["names"]]), np.array(A.lik["cov"]))
         self.seed = int(seed)
         self.post_draws, self.records = None, []
+        self.jc_draws, self.jc_records = None, []
+        # joint calibration: its shared parameters are no longer free priors; with the calibration source they are
+        # drawn from the region sample, without it they stay at the region's best point
+        self.jc_names = set((A.joint or {}).get("shared") or [])
 
     def prepare(self, nd):
+        from toolkit.analysis import calibration as C
         if self.A.method == "posterior" and "calibration" in self.src:
-            from toolkit.analysis import calibration as C
             self.post_draws = C.draws(C.sample_of(self.A.lik), nd, self.seed)
+        if self.A.joint is not None and "calibration" in self.src:
+            self.jc_draws = C.draws(self.A.joint["sample"], nd, self.seed)
 
     def draw(self):
         A = self.A
         theta, sampled = dict(A.theta0), {}
         shifts, zs, noise, mult = None, None, None, None
         for k, p in A.pr.items():
-            theta[k] = p.sample(self.prng)
+            v = p.sample(self.prng)           # drawn even when replaced, so the other priors' stream is unchanged
+            if k in self.jc_names:
+                continue
+            theta[k] = v
             sampled[k] = theta[k]
+        if self.jc_draws is not None:
+            r = self.jc_draws[len(self.jc_records)]
+            for k in A.joint["shared"]:
+                theta[k] = float(r["values"][k])
+                sampled[k] = theta[k]
+            zs = {i: float(r["values"][f"z:{i}"]) for i in A.ids}
+            self.jc_records.append({"sample_id": r["sample_id"], "row": r["row"],
+                                    "values": dict({k: theta[k] for k in A.joint["shared"]},
+                                                   **{f"z:{i}": zs[i] for i in A.ids})})
         for kind in ORDER:
             if kind not in self.src:
                 continue
             if kind == "engine_parameters":
                 for k, v in A.fr.items():
-                    theta[k] = float(self.rng.uniform(v[0], v[1]))
+                    x = float(self.rng.uniform(v[0], v[1]))     # drawn either way: the stream is unchanged
+                    if k in self.jc_names and self.jc_draws is not None:
+                        continue                                # jointly calibrated: the region row's value
+                    theta[k] = x
                     sampled[k] = theta[k]
-            elif kind == "calibration" and A.method == "emulator_inversion":
+            elif kind == "calibration" and A.method == "emulator_inversion" and A.joint is None:
                 shifts = {r: float(self.rng.normal(0, self.sd)) for r in self.regions}
                 sampled.update({f"shift:{r}": v for r, v in shifts.items()})
             elif kind == "calibration" and A.method == "likelihood":
@@ -186,6 +207,17 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             meta = dict(scope["interval"])
             meta["prior_dominated"] = sorted(set(meta.get("prior_dominated") or []) | set(pd))
             scope = dict(scope, interval=meta, label=render_claims.interval_label(meta))
+    if D.jc_draws is not None:
+        # the joint calibration's draws: every applied value must be a row of its region sample (fail closed)
+        from toolkit.analysis import calibration as C
+        smp = A.joint["sample"]
+        found = C.check_provenance(smp, D.jc_records)
+        if found:
+            raise ValueError(f"uncertainty: {len(found)} draws are not rows of the joint calibration's region sample "
+                             f"(e.g. {found[0]})")
+        prov = dict(prov or {}, joint_calibration={"sample_id": smp["sample_id"], "draws": len(D.jc_records),
+                                                   "rows": [r["row"] for r in D.jc_records],
+                                                   "alarms": C.spread_alarm(smp, D.jc_records)})
     from toolkit.spec import priors as PRI
     plan_ = PRI.plan(A.spec)
     plan_["emulator_error"] = (getattr(A.model, "accuracy", {}) or {}).get("error_model") if "emulator" in D.src else None
