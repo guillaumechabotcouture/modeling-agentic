@@ -236,6 +236,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if prov is not None:
         data["draw_provenance"] = prov
+    flagged = sorted((getattr(A, "flagged", None) or {}).values(), key=lambda f: str(f["unit"]))
+    if flagged:        # calibration.joint.unmatched: flag: these units' values carry no calibrated match
+        data["low_confidence_units"] = flagged
     agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
@@ -253,6 +256,12 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
               "parameters_fixed": [{k: x.get(k) for k in ("name", "kind", "value", "reason")} for x in plan_["fixed"]
                                    if x["status"] == "fixed"],
               "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"]}
+    if flagged:
+        report["low_confidence_units"] = [{k: f.get(k) for k in ("unit", "region", "status", "reason", "implausibility")}
+                                          for f in flagged]
+        report["low_confidence_note"] = (f"{len(flagged)} units did not match the joint calibration and proceed "
+                                         "flagged (calibration.joint.unmatched: flag); their outcomes rest on an "
+                                         "unmatched calibration")
     return {"data": data, "report": report}
 
 

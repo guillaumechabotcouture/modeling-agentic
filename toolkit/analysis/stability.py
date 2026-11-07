@@ -64,8 +64,6 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         if not cov:
             raise ValueError("analysis.stability.covariates: emulator inversion needs covariates to predict held-out units")
         Xall = np.array([[float(A.by_id[i][c]) for c in cov] for i in A.ids])
-        mu, sdv = Xall.mean(0), Xall.std(0) + 1e-12
-        Xs = np.column_stack([np.ones(len(A.ids)), (Xall - mu) / sdv])
         y = np.array([z0[i] for i in A.ids])
     folds = []
     for gv in groups:
@@ -75,8 +73,18 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         hid = [i for i, k in zip(A.ids, m) if k]
         theta = A.theta0
         if A.method == "emulator_inversion":
-            lam = 1e-3 * np.eye(Xs.shape[1])
-            beta = np.linalg.solve(Xs[~m].T @ Xs[~m] + lam, Xs[~m].T @ y[~m])
+            # units flagged by the joint calibration (calibration.joint.unmatched: flag) carry no calibrated value:
+            # they never inform the prediction of a held-out unit, nor the covariate scaling (Codex r6 P1-3)
+            fl = np.array([i in (getattr(A, "flagged", None) or {}) for i in A.ids])
+            tr = ~m & ~fl
+            lam = 1e-3 * np.eye(Xall.shape[1] + 1)
+            if tr.sum() < Xall.shape[1] + 1:   # Codex r5 P2-7: no regression without enough unflagged training units
+                folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
+                              "reason": "too few unflagged units outside the fold to predict the held-out values"})
+                continue
+            mu, sdv = Xall[tr].mean(0), Xall[tr].std(0) + 1e-12
+            Xs = np.column_stack([np.ones(len(A.ids)), (Xall - mu) / sdv])
+            beta = np.linalg.solve(Xs[tr].T @ Xs[tr] + lam, Xs[tr].T @ y[tr])
             zh = dict(z0)
             for i, k in zip(A.ids, m):
                 if k:
@@ -119,6 +127,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                       "total_benefit_loss_pct": 100.0 * (tot_full - tot_fold) / tot_full if tot_full > 0 else 0.0,
                       "z_shift_mean": (float(np.mean([zh[i] - z0[i] for i in hid]))
                                        if all(zh[i] is not None and z0[i] is not None for i in hid) else None)})
+    skipped = [f for f in folds if f.get("status") == "not_run"]
+    folds = [f for f in folds if f.get("status") != "not_run"]        # Codex r6 P2: metrics over run folds only
     big = [f for f in folds if f["n_units"] >= MIN_FOLD_UNITS and f["rank_corr"] is not None
            and not math.isnan(f["rank_corr"])]
     met = {"total_benefit_loss_pct_mean": _mean([f["total_benefit_loss_pct"] for f in folds]),
@@ -135,12 +145,14 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                                      "cases_averted_gap_pct_worst_fold": met["benefit_gap_pct_worst_fold"],
                                      "rule_classification_concordance_pct_worst_fold":
                                          met["package_concordance_pct_worst_fold"]})
+    if not folds:       # Codex r7 P2: no fold ran; no verdict from all-None metrics
+        verdict = "NOT_RUN"
     th = thresholds()
     w = met["total_benefit_loss_pct_worst_fold"]
     vv = ("NOT_RUN" if w is None else "ROBUST" if w <= th["value_loss_pct_robust"] else
           "FRAGILE" if w <= th["value_loss_pct_fragile"] else "UNSTABLE")
     return {"method": f"leave-one-{g}-out", "holdout_group": g, "calibration_method": A.method,
-            "n_folds": len(folds), "folds": folds, "metrics": met, "verdict": verdict, "value_verdict": vv,
+            "n_folds": len(folds), "folds": folds, "folds_not_run": skipped, "metrics": met, "verdict": verdict, "value_verdict": vv,
             "value_thresholds_pct": th, "headline_metric": "total_benefit_loss_pct_worst_fold"}
 
 
