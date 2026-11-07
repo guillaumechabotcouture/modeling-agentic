@@ -12,7 +12,9 @@ engine (the renewal engine, toolkit/engines/renewal), with planted values: the c
        susceptible share against it), and the region says so (AC1d).
   AC2  the same with one population whose observed attack rate no susceptible share reaches: unmatched, with the
        direction, and blocked.
-  AC3  canary, no units: one population, shared R0 and seed only, shared targets (attack rate, peak week).
+  AC3  canary, no units: one population, shared R0 and seed only, shared targets (attack rate, cumulative
+       incidence before the intervention window).
+  AC4  the same canary with the peak week instead: a step-valued output the emulator check refuses.
 The production engine's acceptance is the real-data smoke (PR description), which these cases complement.
 Nothing here names a disease; the generation interval and ranges are synthetic.
 """
@@ -93,7 +95,10 @@ def _units_problem(unreachable=None):
     return P, sim, truth, s_true
 
 
-def _canary():
+def _canary(second="pre"):
+    """One population, shared R0 and seed. `second`: the second target, "pre" (cumulative incidence before the
+    intervention window: smooth in both parameters) or "peak" (the peak week: a step function on the weekly grid,
+    which a smooth emulator cannot follow within the stated error)."""
     eng = _engine()
     truth = {"r0": 1.8, "log10_seed": -4.5}
     sim = _sim_factory(eng, {})
@@ -102,7 +107,9 @@ def _canary():
                     HM.Param("log10_seed", -6.0, -3.0, "uniform", None, "synthetic range")], None, [],
                    [HM.Target("attack", "shared", "attack", o["attack"], "logit",
                               sd_obs=HM.sd_from_n(o["attack"], 500, "logit"), sd_md=0.03, source="synthetic survey"),
-                    HM.Target("peak", "shared", "peak", o["peak"], "log", sd_obs=0.04, source="synthetic series")])
+                    (HM.Target("pre", "shared", "pre", o["pre"], "log", sd_obs=0.05, source="synthetic series")
+                     if second == "pre" else
+                     HM.Target("peak", "shared", "peak", o["peak"], "log", sd_obs=0.04, source="synthetic series"))])
     return P, sim, truth
 
 
@@ -138,7 +145,15 @@ def _self_test() -> int:
     rgc = rc["region"]["ranges"]
     ok(rc["status"] == "matched" and all(rgc[k][0] <= v <= rgc[k][1] for k, v in tc.items())
        and rc["region"]["contraction"]["r0"] > 0.5,
-       f"AC3 canary with no units (shared targets only): planted values inside a contracted region ({rgc})")
+       f"AC3 canary with no units (shared targets only): planted values inside a contracted region ({rgc}; "
+       f"{rc['status']}, {rc['blocks']}, {[(w['wave'], {k: v['status'] for k, v in w['validation'].items()}) for w in rc['waves']]})")
+    # CI 2026-11-06: with the peak week as the second target the emulator check fails (the peak week is a step
+    # function of the parameters on the engine's weekly grid). That is the check working: it fails closed.
+    Pp, simp, _ = _canary("peak")
+    rp = HM.calibrate(Pp, simp, seed=2, waves=2, log=q, candidates_log2=11, shared_points=24)
+    ok(rp["blocked"] and any(b["code"] == "emulator_inadequate" for b in rp["blocks"]),
+       f"AC4 a step-valued target (the peak week on a weekly grid) fails the emulator check and blocks "
+       f"({[b['code'] for b in rp['blocks']]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

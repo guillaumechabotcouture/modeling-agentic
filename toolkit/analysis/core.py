@@ -26,6 +26,19 @@ def discount_factor(spec) -> float:
     return float((math.exp(-k * (t0 - b)) - math.exp(-k * (t1 - b))) / (k * (t1 - t0)))
 
 
+def clamped_units_max() -> int:
+    """toolkit/calibration/thresholds.yaml blocking.clamped_units_max. (Kept out of toolkit/analysis/calibration.py,
+    whose bytes the compartmental engine's coverage proof binds: compat_proof.py CALIBRATOR_FILES.)"""
+    from toolkit.calibration.history_matching import thresholds as _t
+    return int(_t()["blocking"]["clamped_units_max"])
+
+
+def clamped_hits(cal: dict) -> list:
+    """AnalysisBlocked hits for the units an emulator inversion clamped at a bound of calibration.range."""
+    return [{"unit": i, "package": "*", "kind": "calibration_clamped", "z": round(float(v["z"]), 4)}
+            for i, v in (cal.get("units") or {}).items() if v.get("clamped")]
+
+
 class AnalysisBlocked(RuntimeError):
     """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan, or (at
     the calibration step, `reason` given) units the calibration cannot match."""

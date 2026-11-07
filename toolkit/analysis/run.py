@@ -242,8 +242,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         # F5 (2026-11-05): units whose target lies outside what the model reaches at the point values are clamped at
         # a bound of calibration.range; they stop the run here, before the point plan and the uncertainty draws
         # (thresholds: toolkit/calibration/thresholds.yaml blocking.clamped_units_max)
-        hits = C.clamped_hits(cal)
-        if len(hits) > C.clamped_units_max():
+        from toolkit.analysis.core import clamped_hits, clamped_units_max
+        hits = clamped_hits(cal)
+        if len(hits) > clamped_units_max():
             raise AnalysisBlocked("calibration", hits, reason=f"{len(hits)} units' calibration targets lie outside "
                                   "what the model reaches inside calibration.range (clamped at a bound)")
     # ---- point and optimum
