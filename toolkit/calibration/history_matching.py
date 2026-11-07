@@ -549,7 +549,8 @@ class HistoryMatch:
     natural scales) and returns one {observable: value} per point (natural scale); any missing or non-finite value
     fails closed."""
 
-    def __init__(self, problem: Problem, simulate, seed: int = 0, log=print, prior=None, record=(), **override):
+    def __init__(self, problem: Problem, simulate, seed: int = 0, log=print, prior=None, record=(), top_up=None,
+                 **override):
         """`prior`: earlier runs ({"unit": [{unit, z, theta, seed, obs}], "shared": [{theta, seed, obs}]}, natural
         scales, as a report's "runs") used as data before the first new wave; each must lie inside the declared
         ranges and carry every observable (fail closed). `record`: observables kept with every run and the
@@ -572,6 +573,11 @@ class HistoryMatch:
         self.boundary = {}
         self.record = [str(x) for x in record or ()]
         self.prior_n = 0
+        # top_up: a new wave simulates only the units with fewer runs than this, up to it (for example the units
+        # whose inputs changed, so their earlier runs no longer match); None: every unit gets points_per_unit
+        if top_up is not None and not (isinstance(top_up, int) and not isinstance(top_up, bool) and top_up >= 1):
+            raise CalibrationInputError([f"top_up {top_up!r}: a positive integer"])
+        self.top_up = top_up
         self.uobs = problem.observables("unit")
         self.sobs = problem.observables("shared")
         mp = int(self.eth["min_points_per_unit"])
@@ -676,7 +682,15 @@ class HistoryMatch:
             return urows, srows
         C, acc = state["C"], state["region"]
         w = self.P.prior_weight(C[acc]) if len(acc) else None
+        have = {}
+        for r in self.data.unit:
+            have[r["unit"]] = have.get(r["unit"], 0) + 1
         for u in self.P.units:
+            if self.top_up is not None:
+                n_u = max(self.top_up - have.get(u, 0), 0)
+                if n_u == 0:
+                    continue
+                n_u = max(n_u, int(self.eth["min_points_per_unit"]))
             ok = state["units"][u]["ok"]
             rows_ok = [c for c in acc if ok[c].any()] if len(acc) else []
             if rows_ok:
@@ -1426,9 +1440,10 @@ class HistoryMatch:
         return {u: self._witness_g(u, c) for u in own}
 
 
-def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, prior=None, record=(),
+def calibrate(problem: Problem, simulate, seed: int = 0, waves=None, log=print, prior=None, record=(), top_up=None,
               **override) -> dict:
-    return HistoryMatch(problem, simulate, seed, log, prior=prior, record=record, **override).run(waves)
+    return HistoryMatch(problem, simulate, seed, log, prior=prior, record=record, top_up=top_up,
+                        **override).run(waves)
 
 
 # --------------------------------------------------------------------------- self-test
@@ -1862,6 +1877,22 @@ def _self_test() -> int:
         ok("w0" in a and "w0" not in b, "HM20 a failure stays after a new-wave pass, and clears after a pass of a check "
                                         "covering every run")
     safe(hm20, "HM20")
+
+    def hm21():          # 2026-11-06: a top-up wave simulates only the units with too few earlier runs
+        P, sim, *_ = _toy()
+        r1 = calibrate(P, sim, seed=3, waves=1, log=q, **fast)
+        keep = [x for x in r1["runs"]["unit"] if x["unit"] not in ("u0", "u1")]       # their inputs changed
+        seen = []
+
+        def counted(pts):
+            seen.extend(p.get("unit") for p in pts if p["kind"] == "unit")
+            return sim(pts)
+        h = HistoryMatch(P, counted, 3, q, prior={"unit": keep, "shared": []}, top_up=8, **fast)
+        r2 = h.run(1)
+        wave_units = set(seen[:len(seen) - sum(v["runs"] for v in r2["verification"]["units"].values())])
+        ok(wave_units == {"u0", "u1"} and r2["n_units"] == len(P.units),
+           f"HM21 a top-up wave simulates only the units below the run count ({sorted(wave_units)})")
+    safe(hm21, "HM21")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
