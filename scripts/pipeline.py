@@ -1700,6 +1700,15 @@ def cited_paths(spec: dict, run_dir: str) -> list[str]:
                     return             # a module reference such as pkg.mod:Class
                 if os.path.exists(os.path.join(run_dir, os.path.expanduser(v))):
                     found.append(v)
+    # a joint calibration group target's `key: {csv: <column>, units: <column>}` names columns, not a file
+    cal = spec.get("calibration") if isinstance(spec, dict) else None
+    joint = cal.get("joint") if isinstance(cal, dict) else None
+    jt = joint.get("targets") if isinstance(joint, dict) else None
+    if isinstance(jt, list):
+        jt = [dict(t, key={k: v for k, v in t["key"].items() if k != "csv"})
+              if isinstance(t, dict) and t.get("kind") == "group" and isinstance(t.get("key"), dict)
+              and isinstance(t["key"].get("csv"), str) else t for t in jt]
+        spec = dict(spec, calibration=dict(cal, joint=dict(joint, targets=jt)))
     walk(spec)
     return sorted(set(found))
 
