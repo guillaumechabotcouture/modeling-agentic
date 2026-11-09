@@ -155,8 +155,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S = Store(run_dir, spec.sha256, st == "signed", _engine_info(eng), spec.settings_sha256,
               spec.engine_choice_sha256)
     holder["S"] = S
-    from toolkit.engines.benchmark_sources import engine_fitted_problems
-    stale = engine_fitted_problems(eng)          # F6 S1-2: never an analysis on fitted values the pack no longer backs
+    from toolkit.engines.benchmark_sources import load_evidence
+    stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
     if stale:
         raise AnalysisBlocked("fitted_values", [], reason="; ".join(stale))
     card = eng.describe()
@@ -729,7 +729,7 @@ def _self_test() -> int:
             ok(False, "R23b stale fitted values block the analysis")
         except AnalysisBlocked as e:
             blk = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
-            ok(e.where == "fitted_values" and blk["reason"] == "refit required: T2, fit_rule",
+            ok(e.where == "fitted_values" and blk["reason"].startswith("refit required: T2, fit_rule"),
                f"R23b stale fitted values block the analysis before the joint calibration or batch: {blk['reason']}")
         finally:
             del ToyEngine.fitted_path
@@ -947,7 +947,7 @@ def _self_test_joint(ok, q):
             ok(False, "JR0 stale fitted values block a joint-calibration run")
         except AnalysisBlocked as e:
             b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
-            ok(e.where == "fitted_values" and b["reason"] == "refit required: T2, fit_rule",
+            ok(e.where == "fitted_values" and b["reason"].startswith("refit required: T2, fit_rule"),
                f"JR0 stale fitted values block a joint-calibration run with the blocked artifact: {b['reason']}")
         except Exception as e:  # noqa: BLE001
             ok(False, f"JR0 stale fitted values block a joint-calibration run (got {type(e).__name__}: {e})")

@@ -23,11 +23,18 @@ on a source estimand the engine's estimand does not match without a mapping note
 `requires` interval that differs from the referenced published interval.
 
 Exemptions, listed: the estimand types in EXEMPT_TYPES (oracle or rule checks, no trial interval), and entries with no
-`published` block in a pack whose engine is one of the self-test toys in TOY_ENGINE_REFS (their bands are test fixtures).
+`published` block in a pack whose engine is exactly one of the self-test toys in TOY_ENGINE_REFS (their bands are test
+fixtures; a subclass is not exempt).
+
+Threat model (S1-2b): stale or changed artifacts and declarations on disk, and code paths that read evidence without the
+loader. Deliberate in-process mutation by harness code is out of scope: the snapshot stores deep copies and returns
+detached copies, and consumers carry the values they captured instead of rereading them, but nothing is frozen.
 
 Stored evidence is bound to the declarations it was scored against: results rows carry `band_sha256`
 (band_digest), fitted.yaml carries `band_declarations` for its fit targets; `stale_ids`, `fitted_problems` and
-`engine_fitted_problems` report a stale row or "refit required". Disease-agnostic: nothing here names a disease.
+the one loader `load_evidence` returns an immutable snapshot (S1-2b) whose `problems` list a stale row ("rerun
+required") or fitted values without current provenance ("refit required"). Disease-agnostic: nothing here names a
+disease.
 """
 from __future__ import annotations
 
@@ -44,13 +51,18 @@ if not __package__:  # run as a file (the self-test runner): make the repository
 SOURCED_TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome")
 EXEMPT_TYPES = ("value", "identity", "coverage", "curve_rules")     # oracle and rule checks: no published interval
 TOY_ENGINE_REFS = ("toolkit.engines.contract:ToyEngine", "toolkit.engines.benchmark:SharedStateToy",
-                   "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")
+                   "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine",
+                   "toolkit.spec.priors:ToyPriorEngine", "toolkit.engines.hooks:ToyScheduleEngine")
 ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio", "cost_per_outcome")
 # engine estimand type -> source estimand types it stands for without a mapping note
 COMPATIBLE = {"odds_ratio": {"odds_ratio"}, "interaction_or": {"odds_ratio"}, "ratio": {"risk_ratio", "rate_ratio"},
               "cost_per_outcome": {"cost_per_outcome"}}
 SCALE_OF = {"ratio": "ratio", "odds_ratio": "ratio", "interaction_or": "ratio", "cost_per_outcome": "currency_per_outcome"}
 SCALES = tuple(sorted(set(SCALE_OF.values())))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# what the oracle and coverage checks exercise beyond their oracle and calibrator modules (Codex r2 on #158)
+OBSERVATION_FILES = (os.path.join(_REPO, "toolkit", "analysis", "observation.py"),
+                     os.path.join(_REPO, "toolkit", "analysis", "thresholds.yaml"))
 DIGEST_FIELDS = ("id", "target", "band", "published", "band_override", "estimand_type", "estimand_mapping", "requires")
 TOL = 1e-9
 
@@ -166,10 +178,12 @@ def check_benchmark(b, byid: dict | None = None, toy: bool = False) -> list[str]
     return bad
 
 
-def check_pack(pack) -> list[str]:
+def check_pack(pack, toy: bool | None = None) -> list[str]:
+    """Every source finding. `toy`: whether the pack's verified engine is an exact self-test toy (load_evidence passes
+    it from the engine's class); None derives it from the pack's own `engine` field (the standalone check)."""
     if not isinstance(pack, dict) or not isinstance(pack.get("benchmarks"), list):
         return ["pack has no benchmarks list"]
-    toy = pack.get("engine") in TOY_ENGINE_REFS
+    toy = pack.get("engine") in TOY_ENGINE_REFS if toy is None else toy
     byid = {b.get("id"): b for b in pack["benchmarks"] if isinstance(b, dict)}
     return [x for b in pack["benchmarks"] for x in check_benchmark(b, byid, toy)]
 
@@ -184,27 +198,53 @@ def _sha(x) -> str:
     return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def band_digest(b: dict, pack: dict) -> str | None:
-    """sha256 of a trial or cost benchmark's declaration as resolved in `pack`: its band and source fields, its whole
-    engine estimand (observable, arms), and the arms, settings, configurations, horizon, seeds and engine it runs with
-    (Codex r3). None for an exempt type."""
-    if _etype(b) not in SOURCED_TYPES:
-        return None
-    from toolkit.engines.benchmark import _arms_of, _config_name
-    arms = {a: (pack.get("arms") or {}).get(a) for a in _arms_of(b["estimand"]) if isinstance(a, str)}
+def band_digest(b: dict, pack: dict) -> str:
+    """sha256 of a benchmark's declaration as resolved in `pack`, for every estimand type (S1-2b): its band and source
+    fields, its whole engine estimand (type, observable, arms, sides), and the arms, settings, configurations,
+    horizon, seeds and engine it runs with. A change of any of them, or of the type, invalidates stored evidence."""
+    from toolkit.engines.benchmark import _arms_of, _config_name, _walk_values
+    arms = {a: (pack.get("arms") or {}).get(a) for a in _arms_of(b.get("estimand") or {}) if isinstance(a, str)}
     sets = {s: (pack.get("settings") or {}).get(s) for s in sorted({(v or {}).get("setting") for v in arms.values()}
                                                                     - {None})}
-    cfgs = {c: (pack.get("configs") or {}).get(c) for c in {_config_name(pack, st or {}) for st in sets.values()}
-            if c is not None}
-    return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": b.get("estimand"), "arms": arms,
+    names = {_config_name(pack, st or {}) for st in sets.values()} | {v for v in _walk_values(b) if isinstance(v, str)}
+    cfgs = {c: (pack.get("configs") or {})[c] for c in sorted(names - {None}) if c in (pack.get("configs") or {})}
+    e = b.get("estimand") or {}
+    code = {"oracles": _module_sha("oracle", pack.get("oracles"))}
+    if isinstance(e.get("calibrator"), dict):
+        code["calibrator"] = _module_sha("calibrator", str(e["calibrator"].get("fn", "")).split(":")[0])
+    from toolkit.engines.benchmark import COMPARE_TYPES
+    if e.get("type") in COMPARE_TYPES + ("coverage",):
+        code["observation"] = [_file_sha(f) for f in OBSERVATION_FILES]
+    return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": e, "arms": arms,
                  "settings": sets, "configs": cfgs, "default_config": pack.get("default_config"),
-                 "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine")})
+                 "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine"),
+                 "coverage_scoring": pack.get("coverage_scoring"), "code": code})
+
+
+def _file_sha(f: str) -> str:
+    try:
+        return hashlib.sha256(open(f, "rb").read()).hexdigest()
+    except OSError:
+        return f"missing:{os.path.basename(f)}"
+
+
+def _module_sha(kind: str, name) -> str | None:
+    """sha256 of an oracle or calibrator module's file, resolved through the import guard; a name it refuses or cannot
+    resolve is recorded as such (so the digest still changes with the name)."""
+    if not name:
+        return None
+    from toolkit import import_guard as G
+    try:
+        f = getattr(G.module(kind, name), "__file__", None)
+        return hashlib.sha256(open(f, "rb").read()).hexdigest() if f else f"unresolved:{name}"
+    except Exception:  # noqa: BLE001 -- recorded in the digest, never silently skipped
+        return f"unresolved:{name}"
 
 
 def band_declarations(pack: dict, ids=None) -> dict:
-    """{id: band_digest} of the pack's trial and cost benchmarks (only `ids` when given)."""
+    """{id: band_digest} of the pack's benchmarks (only `ids` when given)."""
     return {b["id"]: band_digest(b, pack) for b in pack.get("benchmarks") or []
-            if isinstance(b, dict) and band_digest(b, pack) is not None and (ids is None or b["id"] in ids)}
+            if isinstance(b, dict) and (ids is None or b["id"] in ids)}
 
 
 def fit_declarations(pack: dict) -> dict:
@@ -215,54 +255,188 @@ def fit_declarations(pack: dict) -> dict:
 
 
 def stale_ids(pack: dict, rows: list) -> list:
-    """Ids of stored trial or cost rows not scored against the pack's current declaration (or not in the pack)."""
+    """Ids of stored rows not scored against the pack's current declaration, or not in the pack. Every row must carry
+    the digest of its declaration (no legacy acceptance: a row without one is stale, oracle rows included)."""
+    from toolkit.engines.benchmark import calibrator_code_digest, declaration_digest
     cur = {b.get("id"): b for b in pack.get("benchmarks") or [] if isinstance(b, dict)}
     out = []
     for r in rows:
-        b = cur.get(r.get("id"))
-        if b is None or (band_digest(b, pack) is not None and r.get("band_sha256") != band_digest(b, pack)):
-            out.append(r.get("id"))
+        b = cur.get(r.get("id")) if isinstance(r, dict) else None
+        if b is None or r.get("band_sha256") != band_digest(b, pack):
+            out.append(r.get("id") if isinstance(r, dict) else r)
+        elif _etype(b) == "coverage":            # its own declaration and calibration-code digests too
+            try:
+                ok_ = (r.get("declaration_sha256") == declaration_digest(b, pack)
+                       and r.get("code_sha256") == calibrator_code_digest(pack, b["estimand"]))
+            except (KeyError, TypeError, ValueError):
+                ok_ = False
+            if not ok_:
+                out.append(b["id"])
     return out
 
 
 def fitted_problems(fitted: dict, pack: dict) -> list[str]:
     """["refit required: <ids>"] when fitted values were fitted against other declarations of the pack's fit targets
-    (or carry none); else []."""
+    or another fit rule (or carry none); else []."""
     want = fit_declarations(pack)
     have = (fitted or {}).get("band_declarations") or {}
     ids = sorted(k for k in set(want) | set(have) if have.get(k) != want.get(k))     # the target set and each digest
     return [f"refit required: {', '.join(ids)}"] if ids else []
 
 
-def engine_fitted_problems(engine) -> list[str]:
-    """fitted_problems for an engine's own fitted file (`fitted_path`) against its own pack; [] when it has none."""
+# ---- the one validated evidence snapshot (S1-2b): every consumer reads benchmark evidence through load_evidence
+class EvidenceError(ValueError):
+    """Benchmark evidence that cannot be used: the message lists every reason."""
+
+
+class Evidence:
+    """An immutable, validated snapshot of one engine's benchmark evidence: the pack's declarations, the fitted values
+    the engine actually uses with the digest of the file that backs them, and (when loaded) the stored result rows.
+    `problems` lists every reason the evidence cannot be used; `require()` raises them. Accessors return copies."""
+    __slots__ = ("_pack", "_rows", "_fitted", "_fitted_doc", "fitted_sha256", "decl_problems", "fit_problems", "toy",
+                 "engine_identity")
+
+    def __init__(self, pack, rows, fitted, fitted_sha256, decl_problems, fit_problems=(), toy=False,
+                 engine_identity=None, fitted_doc=None):
+        import copy
+        for k, v in (("_pack", copy.deepcopy(pack)), ("_rows", copy.deepcopy(rows)), ("_fitted", dict(fitted)),
+                     ("_fitted_doc", copy.deepcopy(fitted_doc)), ("fitted_sha256", fitted_sha256),
+                     ("decl_problems", tuple(decl_problems)), ("fit_problems", tuple(fit_problems)), ("toy", toy),
+                     ("engine_identity", engine_identity)):
+            object.__setattr__(self, k, v)
+
+    @property
+    def fitted_doc(self):
+        """A detached copy of the fitted document parsed from the bytes `fitted_sha256` hashes (None without one)."""
+        import copy
+        return copy.deepcopy(self._fitted_doc)
+
+    @property
+    def problems(self) -> tuple:
+        """The declarations' and rows' problems, then the fitted values' ('refit required')."""
+        return self.decl_problems + self.fit_problems
+
+    def __setattr__(self, k, v):
+        raise AttributeError("Evidence is immutable")
+
+    @property
+    def pack(self) -> dict:
+        import copy
+        return copy.deepcopy(self._pack)
+
+    @property
+    def rows(self) -> list:
+        import copy
+        return copy.deepcopy(self._rows)
+
+    @property
+    def fitted(self) -> dict:
+        """{name: (lo, hi, value)} of the fitted parameters in use, in engine order."""
+        return dict(self._fitted)
+
+    def require(self) -> "Evidence":
+        if self.problems:
+            raise EvidenceError("; ".join(self.problems))
+        return self
+
+
+def _fitted_in_use(engine, pack, toy: bool) -> tuple:
+    """(fitted values in use, digest of the file backing them, problems). The values are what the engine's
+    parameters() reports now (cached or defaults), checked against the current fitted file: a fitted parameter whose
+    value or range is not the file's, a missing or unreadable file, or a file fitted against other declarations is
+    'refit required'. An engine without fitted parameters needs no file; a self-test toy needs none unless it names one."""
     import yaml
+    eff = {p.name: (p.lo, p.hi, p.value) for p in engine.parameters() if getattr(p, "kind", None) == "fitted"}
     fp = getattr(engine, "fitted_path", None)
-    if not fp:
-        return []
-    if not os.path.isfile(fp):          # missing, or a dangling link: no fitted evidence for fitted parameters (Codex r3)
-        has_fitted = any(getattr(p, "kind", None) == "fitted" for p in engine.parameters())
-        return [f"refit required: fitted values file {fp} is missing (unusable evidence)"] if has_fitted else []
-    from toolkit.spec import engine_parameters as EP
-    try:
-        pack, why = EP.benchmark_pack(engine)
-    except ValueError as e:
-        pack, why = None, str(e)
+    if not eff or (toy and not fp):
+        return eff, None, [], None
+    if not fp or not os.path.isfile(fp):          # none configured, missing, or a dangling link
+        return eff, None, [f"refit required: no fitted values file backs the engine's fitted parameters ({fp})"], None
     if pack is None:
-        return [f"fitted values {fp} are unusable evidence: no readable benchmark pack to check them against ({why})"]
+        return eff, None, [f"refit required: fitted values {fp} have no readable benchmark pack to be checked "
+                           "against"], None
     try:
-        doc = yaml.safe_load(open(fp)) or {}
+        raw = open(fp, "rb").read()
+        doc = yaml.safe_load(raw) or {}
     except (OSError, yaml.YAMLError) as e:
-        return [f"fitted values {fp} are unusable evidence: unreadable ({e})"]
-    return fitted_problems(doc, pack)
+        return eff, None, [f"refit required: fitted values {fp} are unreadable ({e})"], None
+    probs = fitted_problems(doc, pack) + _fit_context_problems(doc, engine)
+    fparams = doc.get("parameters") or {}
+
+    def same(x, y):
+        return _num(x) and _num(y) and abs(float(x) - float(y)) <= 1e-12 * max(1.0, abs(float(y)))
+    diff = sorted(n for n, (lo, hi, v) in eff.items()
+                  if not (isinstance(fparams.get(n), dict) and same(fparams[n].get("value"), v)
+                          and all(k not in fparams[n] or same(fparams[n][k], x) for k, x in (("lo", lo), ("hi", hi)))))
+    if diff:
+        probs.append(f"refit required: the fitted values in use for {', '.join(diff)} are not {os.path.basename(fp)}'s "
+                     "(cached before the file changed, or engine defaults)")
+    return eff, hashlib.sha256(raw).hexdigest(), probs, doc
 
 
-def pack_evidence_problems(pack: dict, rows: list, engine=None) -> list[str]:
-    """Every reason stored benchmark rows cannot be trusted against `pack`: its bands do not match their sources, rows
-    scored against other band declarations ("rerun required"), or the engine's fitted values are stale."""
-    stale = stale_ids(pack, rows)
-    return (check_pack(pack) + ([f"rerun required: {', '.join(stale)}"] if stale else [])
-            + (engine_fitted_problems(engine) if engine is not None else []))
+def _fit_context_problems(doc: dict, engine) -> list[str]:
+    """The fitting context (which engine the fit ran on) must be the current engine: the runner's stamp, and the same
+    engine name, version, code and configured structure (and constructor configuration, when the engine has one).
+    The stamp's params_sha256 is the pre-fit parameter identity, not part of the context, and is not compared."""
+    from toolkit.engines import contract as C
+    from toolkit.engines.benchmark import PRODUCER, config_digest
+    if doc.get("producer") != PRODUCER:
+        return [f"refit required: the fitted values were not written by {PRODUCER} (no fitting context)"]
+    try:
+        cur = C.engine_identity(engine)
+    except Exception as e:  # noqa: BLE001 -- no identity: the fitting context cannot be verified
+        return [f"refit required: the engine's identity cannot be computed to check the fitting context ({e})"]
+    st = doc.get("engine_identity") or {}
+    off = [k for k in ("name", "version", "code_sha256", "config_sha256") if st.get(k) != cur.get(k)]
+    if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
+        off.append("engine_config_sha256")
+    return [f"refit required: the fit ran on another engine revision ({', '.join(off)} differ)"] if off else []
+
+
+def load_evidence(engine, pack: dict | None = None, rows: list | None = None, partial: bool = False) -> Evidence:
+    """The one loader of benchmark evidence. `pack`: the declarations the rows were scored against (default: the
+    engine's own pack; its absence is permitted only for an engine with no rows to check and no fitted values to back;
+    an unreadable pack is always a problem). `rows`: stored result rows to validate (None: fitted values only); they
+    must cover every benchmark of the pack unless `partial`. Problems: a pack that cannot be read, is not a non-empty
+    benchmark list or fails the source check; missing rows and rows scored against other declarations ('rerun
+    required'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
+    no pack."""
+    from toolkit.engines.contract import engine_identity
+    ref = f"{type(engine).__module__}:{type(engine).__name__}"
+    toy = ref in TOY_ENGINE_REFS
+    probs = []
+    if pack is not None and isinstance(pack, dict) and pack.get("engine") != ref:   # an explicit pack, bound to the class
+        probs.append(f"the pack is for engine {pack.get('engine')!r}, not the engine supplied ({ref})")
+        toy = False
+    if pack is None:
+        from toolkit.spec import engine_parameters as EP
+        try:
+            pack, why = EP.benchmark_pack(engine)
+        except ValueError as e:                     # unreadable or malformed: never permitted
+            pack, why = {}, None
+            probs.append(f"the engine's benchmark pack cannot be read: {e}")
+        if pack is None and rows is not None and not toy:
+            probs.append(f"no benchmark pack to check the stored rows against ({why})")
+    if pack is not None and not (isinstance(pack, dict) and isinstance(pack.get("benchmarks"), list)
+                                 and pack["benchmarks"]):
+        probs.append("the benchmark pack is not a mapping with a non-empty benchmarks list")
+        pack = pack if isinstance(pack, dict) else {}
+    if pack is not None:
+        probs += [x for x in check_pack(pack, toy=toy) if x != "pack has no benchmarks list"]
+    if rows is not None and pack is not None:       # an absent pack: refused above unless an exact toy's
+        if not (isinstance(rows, list) and all(isinstance(r, dict) and r.get("id") for r in rows)):
+            probs.append("the stored rows are not a list of mappings with ids")
+            rows = []
+        ids = [b.get("id") for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)]
+        stale = stale_ids(pack or {}, rows) + ([] if partial else [i for i in ids if i not in {r["id"] for r in rows}])
+        if stale:
+            probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
+    fitted, fsha, fprobs, fdoc = _fitted_in_use(engine, pack, toy)
+    try:
+        ident = engine_identity(engine)
+    except Exception:  # noqa: BLE001 -- an object without the contract's describe(): no identity to bind
+        ident = None
+    return Evidence(pack or {}, list(rows or []), fitted, fsha, probs, fprobs, toy, ident, fdoc)
 
 
 def main(argv=None) -> int:
@@ -370,18 +544,18 @@ def _self_test() -> int:
         EP.spec_benchmarks(wide, None, None)
         refused = False
     except ValueError as ex:
-        refused = "do not match their sources" in str(ex)
+        refused = "differs from its published" in str(ex)
     ok(refused, "BS21 the harness step (spec_benchmarks) refuses the pack before it touches the engine or spec")
     from toolkit.analysis import joint_calibration as JC
     orig = EP.benchmark_pack
     try:
         EP.benchmark_pack = lambda eng: (wide, None)
-        jw = JC._benchmarks(None)
+        jw = JC._benchmarks(BM.load_engine(toy["engine"]))
         EP.benchmark_pack = lambda eng: (toy, None)
-        jo = JC._benchmarks(None)
+        jo = JC._benchmarks(BM.load_engine(toy["engine"]))
     finally:
         EP.benchmark_pack = orig
-    ok(jw[0] is None and "do not match their sources" in str(jw[2]) and jo[0] is toy and jo[1] == {"T1"},
+    ok(jw[0] is None and "not usable" in str(jw[2]) and jo[0] == toy and jo[1] == {"T1"},
        "BS22 joint calibration reads a band as a 95% interval only when it matches its source")
 
     # ---- review round 1 (Codex, PR #154)
@@ -493,11 +667,13 @@ def _self_test() -> int:
     def r1_2b():
         from toolkit.analysis import batch as Bt
 
+        import types
+
         class Stale:
             fitted_path = None
 
             def parameters(self):
-                return []
+                return [types.SimpleNamespace(name="k", kind="fitted", lo=0.0, hi=1.0, value=0.5)]
         with tempfile.TemporaryDirectory() as d:
             fp = os.path.join(d, "fitted.yaml")
             yaml.safe_dump({"parameters": {}, "band_declarations": {"T1": "old"}}, open(fp, "w"))
@@ -506,7 +682,7 @@ def _self_test() -> int:
             orig = EP.benchmark_pack
             try:
                 EP.benchmark_pack = lambda e: (toy, "pack.yaml")
-                probs = engine_fitted_problems(s)
+                probs = list(load_evidence(s).problems)
                 try:
                     Bt.fitted_ranges(s)
                     raised = False
@@ -514,11 +690,11 @@ def _self_test() -> int:
                     raised = "refit required: T1" in str(ex)
             finally:
                 EP.benchmark_pack = orig
-        ok(probs == ["refit required: T1, fit_rule"] and raised,
+        ok(probs[0] == "refit required: T1, fit_rule" and raised,
            "BS44 an engine whose fitted values are stale: every analysis read of them (fitted_ranges) is refused")
         import inspect
         from toolkit.analysis import run as RUNm
-        ok("engine_fitted_problems" in inspect.getsource(RUNm._run),
+        ok("load_evidence" in inspect.getsource(RUNm._run),
            "BS45 the analysis entry blocks on stale fitted values before the joint calibration or the batch")
     case("BS44-45", r1_2b)
 
@@ -530,9 +706,11 @@ def _self_test() -> int:
     case("BS46", r2_6)
 
     def r2_5():
+        import types
+
         class NoPack:
             def parameters(self):
-                return []
+                return [types.SimpleNamespace(name="k", kind="fitted", lo=0.0, hi=1.0, value=0.5)]
         with tempfile.TemporaryDirectory() as d:
             e = NoPack()
             e.fitted_path = os.path.join(d, "fitted.yaml")
@@ -540,10 +718,10 @@ def _self_test() -> int:
             orig = EP.benchmark_pack
             try:
                 EP.benchmark_pack = lambda en: (None, "no pack")
-                probs = engine_fitted_problems(e)
+                probs = list(load_evidence(e).problems)
             finally:
                 EP.benchmark_pack = orig
-        ok(len(probs) == 1 and "unusable" in probs[0],
+        ok(len(probs) == 1 and "no readable benchmark pack" in probs[0],
            f"BS47 fitted values with no readable pack to check them against are unusable evidence: {probs}")
     case("BS47", r2_5)
 
@@ -603,11 +781,11 @@ def _self_test() -> int:
 
         class Fitted:
             def parameters(self):
-                return [types.SimpleNamespace(name="k", kind="fitted")]
+                return [types.SimpleNamespace(name="k", kind="fitted", lo=0.0, hi=1.0, value=0.5)]
 
         class Unfitted:
             def parameters(self):
-                return [types.SimpleNamespace(name="k", kind="fixed")]
+                return [types.SimpleNamespace(name="k", kind="fixed", lo=0.0, hi=1.0, value=0.5)]
         with tempfile.TemporaryDirectory() as d:
             gone = os.path.join(d, "fitted.yaml")
             link = os.path.join(d, "dangling.yaml")
@@ -616,11 +794,340 @@ def _self_test() -> int:
             for name, cls, fp in (("missing", Fitted, gone), ("dangling", Fitted, link), ("unfitted", Unfitted, gone)):
                 e = cls()
                 e.fitted_path = fp
-                res[name] = engine_fitted_problems(e)
+                res[name] = list(load_evidence(e).problems)
         ok(all("refit required" in str(res[k]) for k in ("missing", "dangling")) and res["unfitted"] == [],
            f"BS53 a configured fitted file that is missing or a dangling link is unusable evidence for an engine with "
            f"fitted parameters; an engine with none is exempt: {res}")
     case("BS53", r3_3)
+
+    # ---- S1-2b: one validated evidence snapshot (Codex round 4 reproductions first)
+    def r4_1():
+        rn = BM.Runner(toy, eng, 1)
+        b0 = toy["benchmarks"][0]
+        try:
+            rn.evaluate(dict(b0, band=[0.2, 0.5]), {})
+            ok(False, "BS54 Runner.evaluate refuses a declaration that is not its validated pack's")
+        except ValueError as ex:
+            ok("validated pack" in str(ex), f"BS54 Runner.evaluate refuses a declaration that is not its validated "
+                                            f"pack's: {ex}")
+        b_ = toy["benchmarks"][0]
+        b_["band"] = [0.2, 0.5]                    # the caller's dict changes after the runner was built
+        try:
+            r = rn.evaluate(rn.pack["benchmarks"][0], {})
+            ok(r["status"] in ("in_band", "out_of_band") and rn.pack["benchmarks"][0]["band"] == [0.3, 0.5],
+               "BS55 the runner scores its own copy of the validated pack, whatever the caller does with its dict")
+        finally:
+            b_["band"] = [0.3, 0.5]
+    case("BS54-55", r4_1)
+
+    def r4_2():
+        from toolkit.engines.contract import ToyEngine
+        b0 = toy["benchmarks"][0]
+        res = BM.stamp(BM.run_pack(toy, eng, BM.Runner(toy, eng, 1), {}), eng)
+        as_value = dict(toy, benchmarks=[dict(b0, estimand={"type": "value", "not_transcribed": "changed type"})])
+        with tempfile.TemporaryDirectory() as d:
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(res, open(rp, "w"))
+            yaml.safe_dump(as_value, open(os.path.join(d, "pack.yaml"), "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+        ok(stale_ids(as_value, res["benchmarks"]) == ["T1"] and rows == [] and "rerun required: T1" in str(why),
+           f"BS56 a change from a sourced to an exempt type makes the stored row stale (every type is digested): {why}")
+        legacy = {"id": "T1", "compare": "eq", "computed": 1.0}
+        ok(stale_ids(as_value, [legacy]) == ["T1"] and stale_ids(as_value, [{"id": "T1", "computed": 0.4}]) == ["T1"],
+           "BS57 a stored row without a digest, an oracle row included, is stale (rerun required)")
+    case("BS56-57", r4_2)
+
+    def r4_3():
+        import shutil
+        mdir = os.path.join(root, "malaria", "benchmarks")
+        calls = []
+        orig = BM.run_pack
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(os.path.join(mdir, "equilibration.yaml"), os.path.join(d, "equilibration.yaml"))
+            fpath = os.path.join(d, "elsewhere", "fitted.yaml")
+            os.makedirs(os.path.dirname(fpath))
+            yaml.safe_dump({"parameters": {}, "band_declarations": {"B10": "an older declaration"}}, open(fpath, "w"))
+            yaml.safe_dump(dict(pk, configs={"stale": {"fitted_path": fpath}}, default_config="stale"),
+                           open(os.path.join(d, "pack.yaml"), "w"))
+            try:
+                BM.run_pack = lambda *a, **k: calls.append(1) or {}
+                rc = BM.main([os.path.join(d, "pack.yaml"), "run", "--workers", "1", "--seeds", "1"])
+            finally:
+                BM.run_pack = orig
+        ok(rc == 2 and calls == [], f"BS58 the run CLI on a copied pack with no adjacent fit never runs on fitted values "
+                                    f"without current provenance (rc {rc}, run_pack calls {len(calls)})")
+    case("BS58", r4_3)
+
+    def r4_4():
+        from toolkit.analysis.batch import fitted_ranges
+        from toolkit.engines.malaria.engine import MalariaEngine
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "fitted.yaml")
+            doc = BM.stamp({"parameters": {"cfp_kill": {"value": 0.3, "lo": 0.2, "hi": 0.4},
+                                           "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
+                            "band_declarations": fit_declarations(pk)}, MalariaEngine())
+            yaml.safe_dump(doc, open(fp, "w"))
+            me = MalariaEngine(fitted_path=fp)
+            ok(fitted_ranges(me)["cfp_kill"][2] == 0.3, "BS59 fitted values with current provenance are used")
+            doc["parameters"]["cfp_kill"]["value"] = 0.9            # the file is replaced after the engine cached it
+            yaml.safe_dump(doc, open(fp, "w"))
+            try:
+                fitted_ranges(me)
+                ok(False, "BS60 cached fitted values that differ from their current file are refused")
+            except ValueError as ex:
+                ok("refit required" in str(ex), f"BS60 cached fitted values that differ from their current file are "
+                                                f"refused: {ex}")
+    case("BS59-60", r4_4)
+
+    def r4_5():
+        ev = load_evidence(eng, pack=toy)
+        cp = ev.pack
+        cp["benchmarks"][0]["band"] = [0.0, 9.0]
+        ok(ev.pack["benchmarks"][0]["band"] == [0.3, 0.5] and ev.problems == () and set(ev.fitted) == {"eff_a", "eff_b"},
+           "BS61 the evidence snapshot returns detached copies: a consumer's copy cannot change it")
+    case("BS61", r4_5)
+
+    # ---- S1-2b Codex round 1 (#158): behavioural bypass tests with self-contained stale fixtures
+    from toolkit.engines.contract import ToyEngine
+
+    class FittedToy(ToyEngine):          # a subclass of a listed toy: not exempt (P2-6)
+        pass
+
+    ftoy = dict(toy, engine=f"{FittedToy.__module__}:{FittedToy.__name__}")
+
+    def stale_toy(d):
+        fp = os.path.join(d, "fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T1": "an older declaration"}}, open(fp, "w"))
+        e = ToyEngine()                  # an exact toy that names a fitted file must back its values with it
+        e.fitted_path = fp
+        return e
+
+    def b1():
+        with tempfile.TemporaryDirectory() as d:
+            st = stale_toy(d)
+            try:
+                BM.run_pack(toy, st, BM.Runner(toy, st, 1), {})
+                ok(False, "BS62 run_pack refuses to score with fitted values without current provenance")
+            except ValueError as ex:
+                ok("refit required" in str(ex), f"BS62 run_pack refuses to score with stale fitted values: {ex}")
+            rf = BM.Runner(toy, st, 1, mode="fit")          # fitting is the one mode that sets fitted values
+            ok(rf.evaluate("T1", {"eff_a": 0.6})["computed"] is not None,
+               "BS63 fitting runs in its own explicit mode, with candidate fitted values")
+            e2 = FittedToy()
+            fp2 = os.path.join(d, "current.yaml")
+            yaml.safe_dump(BM.stamp({"parameters": {k: {"value": v[2], "lo": v[0], "hi": v[1]}
+                                                    for k, v in load_evidence(eng, pack=toy).fitted.items()},
+                                     "band_declarations": fit_declarations(ftoy)}, FittedToy()), open(fp2, "w"))
+            e2.fitted_path = fp2
+            rn = BM.Runner(ftoy, e2, 1)
+            try:
+                BM.run_pack(ftoy, e2, rn, {"eff_a": 0.65})
+                ok(False, "BS64 scoring refuses caller fitted values that are not the evidence's")
+            except ValueError as ex:
+                ok("evidence" in str(ex), f"BS64 scoring refuses caller fitted values that are not the evidence's: {ex}")
+        ok(any("refit required" in x for x in load_evidence(FittedToy(), pack=ftoy).problems),
+           "BS65 only exact registered toys are exempt: a subclass with fitted parameters and no file needs a refit")
+    case("BS62-65", b1)
+
+    def b2():
+        rn = BM.Runner(toy, eng, 1)
+        view = rn.pack
+        view["benchmarks"][0]["band"] = [0.2, 0.5]
+        try:
+            rn.evaluate(view["benchmarks"][0], {})
+            ok(False, "BS66 the runner's validated declarations cannot be changed through its pack")
+        except ValueError:
+            ok(rn.pack["benchmarks"][0]["band"] == [0.3, 0.5],
+               "BS66 the runner's validated declarations cannot be changed through its pack")
+    case("BS66", b2)
+
+    def b3():
+        cov = {"id": "C1", "estimand": {"type": "coverage", "calibrator": {"fn": "toolkit.engines.benchmark:x"}}}
+        p1 = dict(toy, benchmarks=[cov], coverage_scoring={"refusal_share_max": 0.02}, oracles="toolkit.engines.benchmark")
+        row = {"id": "C1", "band_sha256": band_digest(cov, p1)}
+        p2 = dict(p1, coverage_scoring={"refusal_share_max": 0.0})
+        b0 = toy["benchmarks"][0]
+        o1 = dict(toy, oracles="toolkit.engines.benchmark")
+        ok(stale_ids(p2, [row]) == ["C1"] and band_digest(b0, o1) != band_digest(b0, dict(o1, oracles="toolkit.engines.contract")),
+           "BS67 the digest covers pack-level coverage scoring and the oracle and calibrator modules' code")
+    case("BS67", b3)
+
+    def b4():
+        from toolkit.spec import engine_parameters as EPm
+        orig = EPm.benchmark_pack
+        try:
+            def broken(e):
+                raise EPm.PackError("unreadable")
+            EPm.benchmark_pack = broken
+            unreadable = load_evidence(eng).problems
+        finally:
+            EPm.benchmark_pack = orig
+        empty = load_evidence(eng, pack=dict(toy, benchmarks=[])).problems
+        missing = load_evidence(eng, pack=toy, rows=[]).problems
+        partial = load_evidence(eng, pack=toy, rows=[], partial=True).problems
+        ok(unreadable and empty and any("rerun required: T1" in x for x in missing) and partial == (),
+           f"BS68 an unreadable pack, an empty pack and missing rows are problems; partial rows are explicit: "
+           f"{unreadable} | {empty} | {missing} | {partial}")
+        with tempfile.TemporaryDirectory() as d:
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(BM.stamp({"note": "no rows"}, eng), open(rp, "w"))
+            yaml.safe_dump(toy, open(os.path.join(d, "pack.yaml"), "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+        ok(rows == [] and why, f"BS69 a results file without a benchmarks list is refused: {why}")
+    case("BS68-69", b4)
+
+    # ---- S1-2b Codex round 2 (#158)
+    def c1():
+        global OBSERVATION_FILES
+        from toolkit.engines.benchmark import calibrator_code_digest, declaration_digest
+        cov = {"id": "C1", "estimand": {"type": "coverage", "calibrator": {"fn": "toolkit.engines.benchmark:x"}}}
+        pc = dict(toy, benchmarks=[cov], oracles="toolkit.engines.benchmark")
+        good = {"id": "C1", "band_sha256": band_digest(cov, pc), "declaration_sha256": declaration_digest(cov, pc),
+                "code_sha256": calibrator_code_digest(pc, cov["estimand"])}
+        ok(stale_ids(pc, [good]) == [] and stale_ids(pc, [dict(good, declaration_sha256="x")]) == ["C1"]
+           and stale_ids(pc, [dict(good, code_sha256="x")]) == ["C1"],
+           "BS70 a coverage row is checked on its own declaration and calibration-code digests too")
+        val = {"id": "V1", "estimand": {"type": "value", "not_transcribed": "x"}}
+        pv = dict(toy, benchmarks=[val])
+        with tempfile.TemporaryDirectory() as d:
+            files = [os.path.join(d, "observation.py"), os.path.join(d, "thresholds.yaml")]
+            for f in files:
+                open(f, "w").write("a")
+            saved = OBSERVATION_FILES
+            try:
+                OBSERVATION_FILES = tuple(files)
+                d0 = band_digest(val, pv)
+                open(files[0], "w").write("b")
+                d1 = band_digest(val, pv)
+                open(files[1], "w").write("b")
+                d2 = band_digest(val, pv)
+            finally:
+                OBSERVATION_FILES = saved
+        ok(d0 != d1 != d2, "BS71 an oracle or coverage digest changes with the observation code and analysis thresholds")
+    case("BS70-71", c1)
+
+    def c2():
+        from toolkit.engines.compartmental.engine import CompartmentalEngine
+        ce = CompartmentalEngine()
+        unsourced = dict(toy, benchmarks=[{"id": "U", "target": 1.0, "band": [0.5, 2.0], "estimand": {"type": "ratio"}}])
+        probs = load_evidence(ce, pack=unsourced).problems
+        try:
+            BM.Runner(unsourced, ce, 1)
+            built = True
+        except ValueError:
+            built = False
+        ok(any("engine" in x and "CompartmentalEngine" in x for x in probs) and not built,
+           f"BS72 an explicit pack is bound to the engine's class; a toy pack cannot lend a real engine its exemption: "
+           f"{probs}")
+    case("BS72", c2)
+
+    def c3():
+        from toolkit.engines.malaria.benchmarks import render_notes as RN
+        with tempfile.TemporaryDirectory() as d:
+            res_p = os.path.join(d, "results.yaml")
+            tp = dict(toy, configs={"here": {"results_path": res_p}}, default_config="here")
+            yaml.safe_dump(tp, open(os.path.join(d, "pack.yaml"), "w"))
+            te = BM.load_engine(tp["engine"], tp["configs"]["here"])
+            yaml.safe_dump(BM.stamp(BM.run_pack(tp, te, BM.Runner(tp, te, 1), {}), te), open(res_p, "w"))
+            doc, fdoc = RN.validated_inputs(d)
+            clean = doc["benchmarks"][0]["id"] == "T1" and fdoc is None
+            bad = yaml.safe_load(open(res_p))
+            bad["engine_identity"] = dict(bad["engine_identity"], code_sha256="stale-engine-code")
+            yaml.safe_dump(bad, open(res_p, "w"))
+            try:
+                RN.validated_inputs(d)
+                refused = False
+            except SystemExit as ex:
+                refused = "engine identity" in str(ex)
+        ok(clean and refused, "BS73 render_notes renders only a results envelope validated against the engine "
+                              "identity and fitted values it captured, with the validated fitted document")
+    case("BS73", c3)
+
+    # ---- S1-2b final Codex round (#158)
+    from toolkit.engines.malaria.engine import MalariaEngine as _ME
+
+    def mal_fit(path, pack_, cfp=0.3):
+        doc = BM.stamp({"parameters": {"cfp_kill": {"value": cfp, "lo": 0.2, "hi": 0.4},
+                                       "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
+                        "band_declarations": fit_declarations(pack_)}, _ME())
+        yaml.safe_dump(doc, open(path, "w"))
+        return doc
+
+    def d1():
+        from toolkit.engines import contract as C
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "fitted.yaml")
+            mal_fit(fp, pk)
+            me = _ME(fitted_path=fp)
+            clean = load_evidence(me, pack=pk).problems
+            orig = C.code_fingerprint
+            try:
+                C.code_fingerprint = lambda e: "the engine file changed"
+                moved = load_evidence(me, pack=pk).problems
+            finally:
+                C.code_fingerprint = orig
+            raw = yaml.safe_load(open(fp))
+            raw.pop("producer")
+            yaml.safe_dump(raw, open(fp, "w"))
+            nop = load_evidence(_ME(fitted_path=fp), pack=pk).problems
+        ok(clean == () and any("refit required" in x and "engine" in x for x in moved)
+           and any("refit required" in x for x in nop),
+           f"BS74 a fit made under another engine revision (only the engine file changed), or without the runner's "
+           f"stamp, is refit required: {moved} | {nop}")
+    case("BS74", d1)
+
+    def d2():
+        import shutil
+        mdir = os.path.join(root, "malaria", "benchmarks")
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(os.path.join(mdir, "equilibration.yaml"), os.path.join(d, "equilibration.yaml"))
+            fp = os.path.join(d, "fit", "fitted.yaml")
+            os.makedirs(os.path.dirname(fp))
+            p2 = dict(pk, configs={"here": {"fitted_path": fp}}, default_config="here")
+            mal_fit(fp, p2)
+            yaml.safe_dump(p2, open(os.path.join(d, "pack.yaml"), "w"))
+            orig_le, orig_rp = BM.load_evidence, BM.run_pack
+
+            def le(*a, **k):                     # the fit file is replaced right after the snapshot is taken
+                ev = orig_le(*a, **k)
+                raw = yaml.safe_load(open(fp))
+                raw["parameters"]["cfp_kill"]["lo"] = 0.29
+                yaml.safe_dump(raw, open(fp, "w"))
+                return ev
+            try:
+                BM.load_evidence = le
+                BM.run_pack = lambda pack, engine, runner, fitted, fit_info=None: got.update(fit_info=fit_info) or {}
+                BM.main([os.path.join(d, "pack.yaml"), "run", "--workers", "1", "--seeds", "1"])
+            finally:
+                BM.load_evidence, BM.run_pack = orig_le, orig_rp
+        lo = (((got.get("fit_info") or {}).get("parameters") or {}).get("cfp_kill") or {}).get("lo")
+        ok(lo == 0.2, f"BS75 the run CLI passes the captured fitted document (ranges for reach_check), not a reread: "
+                      f"lo {lo}")
+    case("BS75", d2)
+
+    def d3():
+        from toolkit.engines.malaria.benchmarks import render_notes as RN
+        with tempfile.TemporaryDirectory() as d:
+            fp, rp = os.path.join(d, "fitted.yaml"), os.path.join(d, "results.yaml")
+            p2 = dict(pk, configs={"here": {"fitted_path": fp, "results_path": rp}}, default_config="here")
+            yaml.safe_dump(p2, open(os.path.join(d, "pack.yaml"), "w"))
+            mal_fit(fp, p2, cfp=0.3)
+            me = _ME(fitted_path=fp, results_path=rp)
+            rows = [{"id": b["id"], "status": "in_band", "computed": 1.0, "band_sha256": band_digest(b, p2)}
+                    for b in p2["benchmarks"]]
+            yaml.safe_dump(BM.stamp({"benchmarks": rows, "engine_version": "x"}, me), open(rp, "w"))
+            doc, fdoc = RN.validated_inputs(d)
+            clean = fdoc["parameters"]["cfp_kill"]["value"] == 0.3 and len(doc["benchmarks"]) == len(rows)
+            mal_fit(fp, p2, cfp=0.35)            # a valid fit replaces it; the old results envelope stays
+            try:
+                RN.validated_inputs(d)
+                refused = False
+            except SystemExit as ex:
+                refused = "engine identity" in str(ex)
+        ok(clean and refused, "BS76 render_notes rejects an old results envelope after a valid fit replaced the one "
+                              "it was computed with")
+    case("BS76", d3)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

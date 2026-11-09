@@ -95,6 +95,7 @@ value, with settings re-calibrated there, as a verification.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import itertools
 import math
@@ -116,8 +117,7 @@ TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rul
 COMPARE_TYPES = ("value", "identity")
 COMPARES = ("eq", "le", "differ")
 STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
-from toolkit.engines.benchmark_sources import (TOY_ENGINE_REFS, band_digest, fit_declarations,  # noqa: E402
-                                             fitted_problems, pack_evidence_problems, stale_ids)
+from toolkit.engines.benchmark_sources import band_digest, fit_declarations, load_evidence  # noqa: E402
 JOINT_RULES = {
     "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
                 "target's log value; infeasible targets dropped; argmin (n out of band, band-scaled squared log "
@@ -539,12 +539,29 @@ def _spread(per) -> dict:
 
 
 class Runner:
-    def __init__(self, pack: dict, engine, workers: int = 1, seeds=None, base_params: dict | None = None):
-        from toolkit.engines.benchmark_sources import check_pack as band_sources
-        bad = band_sources(pack)
-        if bad:                             # F6 S1-2: no runner scores a band that differs from its source
-            raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
-        self.pack, self.engine, self.workers = pack, engine, workers
+    def __init__(self, pack: dict | None, engine, workers: int = 1, seeds=None, base_params: dict | None = None,
+                 mode: str = "score", evidence=None):
+        """mode "score": the evidence must be clean, fitted values included, and every score uses its fitted values.
+        mode "fit": only the declarations must be clean; candidate fitted values are evaluated (fits, joint
+        calibration). `evidence` (S1-2b): a snapshot loaded for this engine; `pack` then names the benchmarks to run,
+        each equal to the snapshot's declaration."""
+        from toolkit.engines.contract import engine_identity
+        if mode not in ("score", "fit"):
+            raise ValueError(f"Runner mode {mode!r}: score or fit")
+        ev = evidence if evidence is not None else load_evidence(engine, pack=pack)
+        bad = list(ev.problems if mode == "score" else ev.decl_problems)
+        if ev.engine_identity != engine_identity(engine):
+            bad.append("the evidence was loaded for another engine identity")
+        dec = {b["id"]: b for b in ev.pack.get("benchmarks") or []}
+        if evidence is not None and pack is not None:
+            bad += [f"{b.get('id')}: not the evidence's declaration" for b in pack.get("benchmarks") or []
+                    if dec.get(b.get("id")) != b]
+        if bad:
+            raise ValueError("benchmark evidence: " + "; ".join(bad))
+        pack = ev.pack
+        self.mode, self.evidence, self._decl = mode, ev, dec
+        self._fitted = {k: v[2] for k, v in ev.fitted.items()}
+        self._p, self.engine, self.workers = pack, engine, workers
         # values under every setting's own parameters (a spec's engine parameter values, toolkit/spec/
         # engine_parameters.py): they replace engine defaults, never a setting's observed conditions
         self.base_params = dict(base_params or {})
@@ -589,11 +606,11 @@ class Runner:
         return shares_state(_engine_of(job))
 
     def _setting(self, name):
-        s = self.pack["settings"][name]
-        return dict(s["unit"]), dict(s.get("horizon") or self.pack["horizon"]), dict(s.get("params") or {})
+        s = self._p["settings"][name]
+        return dict(s["unit"]), dict(s.get("horizon") or self._p["horizon"]), dict(s.get("params") or {})
 
     def _config(self, setting_name):
-        return _config_of(self.pack, self.pack["settings"][setting_name])
+        return _config_of(self._p, self._p["settings"][setting_name])
 
     def make_engine(self, config_name=None):
         """The pack's engine with a named configuration (None: the runner's engine). Used by probes."""
@@ -601,16 +618,16 @@ class Runner:
             return self.engine
         self.exercised.add(config_name)
         if config_name not in self._engines:
-            self._engines[config_name] = load_engine(self.ref, (self.pack.get("configs") or {})[config_name])
+            self._engines[config_name] = load_engine(self.ref, (self._p.get("configs") or {})[config_name])
         return self._engines[config_name]
 
     def calibrate_settings(self, fitted: dict, names=None):
         """Settings with `calibrate`: pick the unit attribute value (log-linear interpolation on
         a grid) so the baseline arm reproduces the trial site's baseline value."""
-        todo = [n for n, s in self.pack["settings"].items() if s.get("calibrate") and (names is None or n in names)]
+        todo = [n for n, s in self._p["settings"].items() if s.get("calibrate") and (names is None or n in names)]
         jobs, idx = [], []
         for n in todo:
-            c = self.pack["settings"][n]["calibrate"]
+            c = self._p["settings"][n]["calibrate"]
             unit, hor, par = self._setting(n)
             for g in c["grid"]:
                 for sd in self.seeds[:2]:
@@ -620,7 +637,7 @@ class Runner:
         res = self._map(jobs)
         self.nsims += len(jobs)
         for n in todo:
-            c = self.pack["settings"][n]["calibrate"]
+            c = self._p["settings"][n]["calibrate"]
             ys = [np.mean([get(r, c["value_path"]) for (nn, gg), r in zip(idx, res) if nn == n and gg == g]) for g in c["grid"]]
             xs = np.log(np.asarray(c["grid"], float))
             ys = np.asarray(ys)
@@ -635,13 +652,13 @@ class Runner:
                       f"{c['grid']}: extend the grid (fit rule)", flush=True)
 
     def _arm_jobs(self, a, fitted):
-        cfg = self.pack["arms"][a]
+        cfg = self._p["arms"][a]
         unit, hor, par = self._setting(cfg["setting"])
         if cfg["setting"] in self.calibrated:
             c = self.calibrated[cfg["setting"]]
             unit[c["attribute"]] = c["value"]
         conf = self._config(cfg["setting"])
-        name = _config_name(self.pack, self.pack["settings"][cfg["setting"]])
+        name = _config_name(self._p, self._p["settings"][cfg["setting"]])
         if name is not None:
             self.exercised.add(name)
         return [(self.ref, conf, self._params(par, fitted), unit, cfg.get("package") or {}, hor, sd) for sd in self.seeds]
@@ -676,7 +693,33 @@ class Runner:
         key = tuple(sorted(fitted.items()))
         return {a: self.cache[(a, key)] for a in arms}
 
-    def evaluate(self, b: dict, fitted: dict) -> dict:
+    @property
+    def pack(self) -> dict:
+        """A detached copy of the validated pack (S1-2b)."""
+        return copy.deepcopy(self._p)
+
+    def fitted_for(self, fitted: dict | None) -> dict:
+        """The fitted values a score uses: the evidence's. Candidate values only in fit mode, or for an exact
+        self-test toy (whose fitted values are test inputs)."""
+        fitted = dict(fitted or {})
+        if self.mode == "fit" or self.evidence.toy:
+            return dict(self._fitted, **fitted)
+        off = sorted(k for k, v in fitted.items() if k not in self._fitted or abs(float(v) - self._fitted[k]) > 1e-12)
+        if off:
+            raise ValueError(f"scoring uses the evidence's fitted values; {off} differ (fit mode sets candidates)")
+        return dict(self._fitted)
+
+    def evaluate(self, b, fitted: dict) -> dict:
+        return self.evaluate_at(b, self.fitted_for(fitted))
+
+    def evaluate_at(self, b, fitted: dict) -> dict:
+        """One benchmark at the given fitted values: the diagnostic entry (reach_check, fits); a score goes through
+        evaluate(). The benchmark is always the validated pack's declaration of its id."""
+        cur = self._decl.get(b.get("id") if isinstance(b, dict) else b)
+        if cur is None or (isinstance(b, dict) and b != cur):     # S1-2b: only the validated pack's declarations
+            raise ValueError(f"evaluate: {b.get('id') if isinstance(b, dict) else b} is not the validated pack's "
+                             "declaration")
+        b = copy.deepcopy(cur)
         e = b["estimand"]
         if e["type"] in COMPARE_TYPES:
             return self._compare(b, fitted)
@@ -789,7 +832,7 @@ class Runner:
             raise ValueError(f"bad side {x!r}")
         if "arm" in x:
             return get(R[x["arm"]][i], x["value"])
-        om = _oracles(self.pack)
+        om = _oracles(self._p)
         args = {k: self._side(v, R, i) if self._is_side(v) else v for k, v in (x.get("args") or {}).items()}
         if "oracle" in x:
             return getattr(om, f"oracle_{x['oracle']}")(**args)
@@ -847,7 +890,7 @@ class Runner:
 
     def _coverage(self, b: dict) -> dict:
         e = b["estimand"]
-        om = _oracles(self.pack)
+        om = _oracles(self._p)
         gen = getattr(om, "generate_" + e["generator"]["fn"])
         try:
             cal = resolve_calibrator(e["calibrator"]["fn"])
@@ -860,7 +903,7 @@ class Runner:
         classes = e.get("classes") or {}
         ridge_names = list(e.get("ridge_names") or [])
         reps, seed = int(e["replicates"]), int(e.get("seed", 0))
-        job = (self.ref, self.pack.get("configs") or {}, self.pack["oracles"], e["generator"]["fn"],
+        job = (self.ref, self._p.get("configs") or {}, self._p["oracles"], e["generator"]["fn"],
                e["generator"].get("args") or {}, e["calibrator"]["fn"], e["calibrator"].get("args") or {}, seed, qs,
                classes, ridge_names)
         jobs = [job + (r,) for r in range(reps)]
@@ -906,10 +949,10 @@ class Runner:
                                                       "max": float(max(vals))}
         if ridge_names:
             out["ridge_share"] = sum(int(p["ridge_ok"]) for p in per) / reps
-        out["declaration_sha256"] = declaration_digest(b, self.pack)
-        out["computation_sha256"] = computation_digest(b, self.pack)
-        out["code_sha256"] = calibrator_code_digest(self.pack, e)
-        out.update(score_coverage(out, e, self.pack))
+        out["declaration_sha256"] = declaration_digest(b, self._p)
+        out["computation_sha256"] = computation_digest(b, self._p)
+        out["code_sha256"] = calibrator_code_digest(self._p, e)
+        out.update(score_coverage(out, e, self._p))
         return out
 
     @staticmethod
@@ -953,7 +996,7 @@ def reach_check(pack: dict, runner: Runner, rows: list, fit_info: dict | None) -
     for r in todo:
         b = byid[r["id"]]
         runner.prefetch(_arms_of(b["estimand"]), corners)
-        vals = [runner.evaluate(b, c)["computed"] for c in corners]
+        vals = [runner.evaluate_at(b, c)["computed"] for c in corners]
         lo, hi = b["band"]
         r["reach_in_fitted_range"] = [round(min(vals), 4), round(max(vals), 4)]
         if all(v > hi for v in vals) or all(v < lo for v in vals):
@@ -1113,6 +1156,8 @@ def fit_joint(pack: dict, engine, runner: Runner) -> dict:
 
 # ------------------------------------------------------------------------------ pack run
 def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | None = None) -> dict:
+    """Score `pack`'s benchmarks with `runner`'s validated evidence and its fitted values (S1-2b)."""
+    fitted = runner.fitted_for(fitted)
     fit_ids = fit_targets(pack)
     infeasible = set(((fit_info or {}).get("feasibility") or {}).get("infeasible_in_box") or [])
     runner.calibrate_settings(fitted)
@@ -1125,8 +1170,7 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         r = runner.evaluate(b, fitted)
         row = {"id": b["id"], "metric": b["metric"], "role": "fit" if b["id"] in fit_ids else "held_out",
                "target": b.get("target"), "band": b.get("band"), "source": b.get("source", "")}
-        if band_digest(b, pack) is not None:
-            row["band_sha256"] = band_digest(b, pack)
+        row["band_sha256"] = band_digest(runner._decl[b["id"]], runner._p)
         if b.get("requires"):
             row["requires"] = b["requires"]
         if b["id"] in infeasible:
@@ -1183,31 +1227,39 @@ def stamp(out: dict, engine) -> dict:
 def verified_benchmarks(engine) -> tuple[list, str | None]:
     """(benchmark rows, None) when the engine's results file was written by this runner for this engine's current
     code; else ([], why). Decision tests read benchmark arm ratios only from here."""
+    doc, why = verified_results(engine)
+    return (doc["benchmarks"], None) if doc is not None else ([], why)
+
+
+def verified_results(engine) -> tuple[dict | None, str | None]:
+    """(the whole results document, None) when its envelope (producer, the engine identity, which binds the fitted
+    values in use, and configuration) and its rows pass the evidence snapshot; its rows are the snapshot's. Else
+    (None, why)."""
     from toolkit.engines.contract import engine_identity
     path = getattr(engine, "results_path", None)
     if not path or not os.path.exists(path):
-        return [], "the engine has no benchmark results file"
+        return None, "the engine has no benchmark results file"
     try:
         doc = yaml.safe_load(open(path)) or {}
     except (OSError, yaml.YAMLError) as e:
-        return [], f"benchmark results unreadable: {e}"
+        return None, f"benchmark results unreadable: {e}"
     if doc.get("producer") != PRODUCER:
-        return [], f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
+        return None, f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
     if doc.get("engine_identity") != engine_identity(engine):
-        return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
+        return None, f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
-        return [], f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
-    rows = list(doc.get("benchmarks") or [])
+        return None, f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
     pp = os.path.join(os.path.dirname(path), "pack.yaml")
-    ref = f"{type(engine).__module__}:{type(engine).__name__}"
-    if not os.path.exists(pp):
-        return (rows, None) if ref in TOY_ENGINE_REFS else ([], f"no pack.yaml beside {os.path.basename(path)}")
     try:
-        pack = yaml.safe_load(open(pp))
+        pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
     except (OSError, yaml.YAMLError) as e:
-        return [], f"{os.path.basename(pp)} beside the results is unreadable: {e}"
-    bad = pack_evidence_problems(pack if isinstance(pack, dict) else {}, rows, engine)
-    return ([], f"{os.path.basename(path)}: {'; '.join(bad)}") if bad else (rows, None)
+        return None, f"{os.path.basename(pp)} beside the results is unreadable: {e}"
+    if not isinstance(doc.get("benchmarks"), list):
+        return None, f"{os.path.basename(path)} has no benchmarks list"
+    ev = load_evidence(engine, pack=pack, rows=doc["benchmarks"])
+    if ev.problems:
+        return None, f"{os.path.basename(path)}: {'; '.join(ev.problems)}"
+    return dict(doc, benchmarks=ev.rows), None
 
 
 def refusal_share_max(e: dict, pack: dict) -> float:
@@ -1261,11 +1313,14 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
             raise ValueError(f"rescore: the stored results have another {k}")
     cur = {b["id"]: b for b in pack["benchmarks"]}
     old = {b["id"]: b for b in previous_pack["benchmarks"]}
+    ev = load_evidence(engine, pack=pack, partial=True,
+                       rows=[r for r in doc.get("benchmarks") or []
+                             if (cur.get(r["id"]) or {}).get("estimand", {}).get("type") != "coverage"])
+    if ev.problems:              # S1-2b: only coverage rows are re-scored; any other stale row needs a rerun
+        raise ValueError(f"rescore: {'; '.join(ev.problems)}")
     rows = []
     for r in doc.get("benchmarks") or []:
         b = cur.get(r["id"])
-        if b is not None and band_digest(b, pack) is not None and r.get("band_sha256") != band_digest(b, pack):
-            raise ValueError(f"rescore: rerun required: {r['id']} was scored against another band declaration")
         if b is None or b["estimand"]["type"] != "coverage":
             rows.append(r)
             continue
@@ -1287,6 +1342,7 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
                               "note": "stored replicate aggregates re-scored; no new run"}
         r["declaration_sha256"] = declaration_digest(b, pack)
         r["computation_sha256"] = computation_digest(b, pack)
+        r["band_sha256"] = band_digest(b, pack)
         r["in_band"] = r["status"] == "in_band"
         rows.append(r)
     out = {k: v for k, v in doc.items() if k not in ("producer", "engine_identity", "engine_config_sha256")}
@@ -1366,9 +1422,9 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
                 raise ValueError(f"merge: {b['id']} was computed for another declaration")
             if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
                 raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
-    stale = stale_ids(pack, [r for r in rows.values() if r["id"] in ids])
-    if stale:
-        raise ValueError(f"merge: rerun required: {', '.join(stale)} (scored against other band declarations)")
+    ev = load_evidence(engine, pack=pack, rows=[r for r in rows.values() if r["id"] in ids])
+    if ev.problems:
+        raise ValueError(f"merge: {'; '.join(ev.problems)}")
     miss = [i for i in ids if i not in rows]
     extra = sorted(set(rows) - set(ids))
     if miss or extra:
@@ -1434,7 +1490,12 @@ def main(argv=None) -> int:
             return 2
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
-    runner = Runner(pack, eng, a.workers, seeds)
+    ev = load_evidence(eng, pack=full_pack)          # S1-2b: the full pack's evidence, whatever --only runs
+    try:
+        runner = Runner(pack, eng, a.workers, seeds, mode="fit" if a.action == "fit" else "score", evidence=ev)
+    except ValueError as e:
+        print(e)
+        return 2
     t0 = time.time()
     if a.action == "fit":
         out = fit_joint(pack, eng, runner) if pack.get("fit_joint") else fit(pack, eng, runner)
@@ -1445,12 +1506,8 @@ def main(argv=None) -> int:
                                    "band_declarations": fit_declarations(pack)}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
-        fp = os.path.join(d, "fitted.yaml")
-        f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
-        if os.path.exists(fp) and fitted_problems(f, full_pack):     # F6 S1-2: never run on stale fitted values
-            print("; ".join(fitted_problems(f, full_pack)))
-            return 2
-        fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
+        f = ev.fitted_doc or {}                  # S1-2b: the captured fitted document (reach_check's ranges too)
+        fitted = {k: v[2] for k, v in ev.fitted.items()}
         out = run_pack(pack, eng, runner, fitted, f)
         out["engine_version"] = eng.describe().version
         out["fit_rule"] = (f.get("fit_rule") or {}).get("version")

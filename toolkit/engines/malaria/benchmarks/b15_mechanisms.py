@@ -21,7 +21,7 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
 from toolkit.engines.benchmark import Runner, load_engine  # noqa: E402
-from toolkit.engines.benchmark_sources import fitted_problems  # noqa: E402
+from toolkit.engines.benchmark_sources import load_evidence  # noqa: E402
 
 OFF = {"hh_net_corr": 0.0, "cov_corr": 0.0, "exp_corr": 0.0, "irs_divert": 0.0}
 # name -> (non-fitted parameter overrides, IRS product)
@@ -63,7 +63,7 @@ def field_scan(pack0, eng, fitted, workers):
             if s == "muleba" and "net_retention_half" in o and o["net_retention_half"] != 1e9:
                 o.pop("net_retention_half")         # Muleba's retention comes from its own trial data
             st["params"] = dict(st.get("params") or {}, **o)
-        r = Runner(pack, eng, workers, pack["seeds"])
+        r = Runner(pack, eng, workers, pack["seeds"], mode="fit")    # a mechanism scan
         r.calibrate_settings(fitted, ["cochrane_itn", "muleba"])
         row = {"config": name, "overrides": over}
         for bid in ("B7", "B8", "B9", "B15"):
@@ -83,12 +83,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=os.path.join(HERE, "b15_mechanisms.yaml"))
     a = ap.parse_args(argv)
     pack0 = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
-    fdoc = yaml.safe_load(open(os.path.join(HERE, "fitted.yaml")))
-    stale = fitted_problems(fdoc, pack0)         # F6 S1-2: never run on fitted values the pack's bands no longer back
-    if stale:
-        raise SystemExit("; ".join(stale))
-    fitted = {k: v["value"] for k, v in fdoc["parameters"].items()}
     eng = load_engine(pack0["engine"])
+    ev = load_evidence(eng, pack=pack0)          # S1-2b: never run on fitted values without current provenance
+    if ev.problems:
+        raise SystemExit("; ".join(ev.problems))
+    fitted = {k: v[2] for k, v in ev.fitted.items()}
     b15 = next(b for b in pack0["benchmarks"] if b["id"] == "B15")
     rows = []
     for name, over, product in CONFIGS:
@@ -96,7 +95,7 @@ def main(argv=None) -> int:
         s = pack["settings"]["muleba"]
         s["params"] = dict(s.get("params") or {}, **over)
         s["unit"]["irs_product"] = product
-        r = Runner(pack, eng, a.workers, pack["seeds"])
+        r = Runner(pack, eng, a.workers, pack["seeds"], mode="fit")    # a mechanism scan at the validated values
         r.calibrate_settings(fitted, ["muleba"])
         e = r.evaluate(b15, fitted)
         row = {"config": name, "overrides": over, "irs_product": product,
