@@ -149,15 +149,15 @@ class Drawer:
 
 
 def affordability(costs, budget: float, rule: dict | None = None, level: float = 0.95) -> dict:
-    """The fixed plan's cost in each draw against the allocatable budget (F6 S1-1). A cost above the budget by more
-    than rounding counts as over budget. With a rule (`uncertainty.affordability`), rule_met says whether the share of
+    """The fixed plan's cost in each draw against the allocatable budget (F6 S1-1). A cost above budget * (1 + 1e-9), the
+    solver's own tolerance, counts as over budget. With a rule (`uncertainty.affordability`), rule_met says whether the share of
     draws over budget is at most rule.max_share_over_budget; without one, rule_met is None (reported, not judged).
     No draws, or a non-finite cost, fails closed."""
     c = np.asarray(costs, float)
     if c.size == 0 or not np.all(np.isfinite(c)):
         raise ValueError("affordability: the fixed plan's cost needs one finite value per draw")
     b = float(budget)
-    over = int(np.sum(c > b + 1e-9 * max(1.0, abs(b))))
+    over = int(np.sum(c > b * (1 + 1e-9)))       # the solver's relative budget tolerance (toolkit/alloc BUDGET_RTOL)
     share = over / c.size
     met = None if not rule else bool(share <= float(rule["max_share_over_budget"]) + 1e-12)
     return {"budget_allocatable": b, "draws": int(c.size), "draws_over_budget": over, "share_over_budget": share,

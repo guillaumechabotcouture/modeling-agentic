@@ -20,6 +20,7 @@ All HIGH, none scope-declarable; each fails closed (an unreadable file is a find
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -64,12 +65,20 @@ def _affordability(run_dir: str, unc: dict) -> list[dict]:
                    "affordability")]
     if not rule:
         return []
-    af = unc.get("affordability") or {}
+    af = unc.get("affordability")
     F = lambda c: [_f("analysis_contract_affordability", f"analysis/uncertainty.yaml: {c}", "affordability")]  # noqa: E731
-    n, over = af.get("draws"), af.get("draws_over_budget")
-    if not isinstance(n, int) or n <= 0 or not isinstance(over, int) or not 0 <= over <= n:
+    if not isinstance(af, dict):
+        return F(f"the spec declares an affordability rule ({rule}) but the artifact has no affordability result")
+    n, over, share = af.get("draws"), af.get("draws_over_budget"), af.get("share_over_budget")
+
+    def count(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+    if not count(n) or n <= 0 or not count(over) or not 0 <= over <= n or n != unc.get("draws"):
         return F(f"the spec declares an affordability rule ({rule}) but the artifact has no usable result "
-                 f"(draws {n!r}, over budget {over!r})")
+                 f"(draws {n!r} of the artifact's {unc.get('draws')!r}, over budget {over!r})")
+    if not (isinstance(share, (int, float)) and not isinstance(share, bool) and math.isfinite(share)
+            and abs(share - over / n) <= 1e-12):
+        return F(f"the artifact's share over budget {share!r} does not equal {over} of {n} draws")
     if af.get("rule") != rule:
         return F(f"the artifact judged the rule {af.get('rule')!r}, the signed spec declares {rule!r}")
     met = over / n <= float(rule["max_share_over_budget"]) + 1e-12
