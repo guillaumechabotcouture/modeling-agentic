@@ -2285,15 +2285,47 @@ _FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg",
 # partial rows of the batch that step was running (Nigeria v2 full run, 2026-11-02).
 _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.json")
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
+# F6 S1-8: the fingerprint covers code content only. The launch commit stamp changes with every commit (git archive
+# fills it in, .gitattributes export-subst), so with it any launch commit invalidated every stored batch (F5, 2026-11-08).
+_FP_REPO_SKIP = ("scripts/lib/code_commit.txt",)
+# Records the harness writes in the run after its engine batches, which no model reads: the analysis outputs under
+# models/ (toolkit/analysis: run.py, stability.py, claims.py, estimates.py, decision_tests.py), the v1 script outputs
+# there, and the input-check records under data/ (agents/enforcement.py SCRIPT_OUTPUTS). With them a resume after
+# ANALYZE looked stale (F5). An explicit list, never a guess: any other file under models/ or data/ is still hashed.
+# RU13 checks it against toolkit/analysis.
+FP_HARNESS_OUTPUTS = ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml",
+                      "models/eligibility_probe.yaml", "models/model_comparison_formal.yaml",
+                      "data/input_checks.json", "data/geometry_signoff.json")
+FP_HARNESS_DIRS = {"models/decision_tests/": (".yaml",)}     # these file types, directly in the directory
+
+
+def _harness_output(rel: str) -> bool:
+    rel = rel.replace(os.sep, "/")
+    return rel in FP_HARNESS_OUTPUTS or any(rel.startswith(d) and "/" not in rel[len(d):] and rel.endswith(ext)
+                                            for d, ext in FP_HARNESS_DIRS.items())
+
+
+def fn_id(run_dir: str, fn_spec: str) -> str:
+    """A function's identity across trees: run-relative for a function in the run dir, `repo:<path>` for one in the
+    repo, else the spec as given. Each cloud launch extracts the code to a new temporary directory, so an absolute
+    path never matched twice."""
+    path, sep, name = fn_spec.partition("::")
+    real = os.path.realpath(path if os.path.isabs(path) else os.path.join(run_dir, path))
+    for base, tag in ((os.path.realpath(run_dir), ""), (os.path.realpath(REPO), "repo:")):
+        if real.startswith(base + os.sep):
+            return tag + os.path.relpath(real, base).replace(os.sep, "/") + sep + name
+    return fn_spec
 
 
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/ and toolkit/, except (outside data/) logs, figures, summaries, the ledger, the
+    scripts/ and toolkit/ (code content only: never the commit stamp, F6 S1-8), except the harness's own records
+    (FP_HARNESS_OUTPUTS, FP_HARNESS_DIRS) and (outside data/) logs, figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
-    size and mtime. Any change and earlier rows are not reused.
+    size and mtime. Any change and earlier rows are not reused. The spec is not in it: what a spec sets reaches a
+    job through its params, which are the row's own key (input_key).
 
     `confined` (the run console, which treats run artifacts as hostile; review round 3, P1-3): the run's files are
     read through no-follow directory and file fds (lib.safe_io), a link anywhere under models/ or data/ (the entries
@@ -2328,7 +2360,12 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
             names = set(fns)
             in_data = root == os.path.join(run_dir, "data")
             runner = dp == os.path.join(run_dir, "models")
+            in_run = root.startswith(run_dir + os.sep)
             for fn in fns:
+                p = os.path.join(dp, fn)      # S1-8: harness-written analysis outputs (explicit list); the stamp
+                if (_harness_output(os.path.relpath(p, run_dir)) if in_run else
+                        os.path.relpath(p, REPO).replace(os.sep, "/") in _FP_REPO_SKIP):
+                    continue
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
                 if not in_data and not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
                                                       or fn.endswith((PARTIAL_EXT, JOB_EXT))
@@ -2422,14 +2459,25 @@ def input_keys(inputs) -> list[str]:
 PARTIAL_EXT, JOB_EXT = ".partial.jsonl", ".job.json"
 
 
-def _reusable(out: str, fn_spec: str, fp: str) -> dict:
+def _out_files(out: str) -> tuple:
+    """A batch's own files: never part of its code fingerprint."""
+    return (out, out + ".tmp", out + ".summary.json", out + ".summary.json.tmp", out + PARTIAL_EXT, out + JOB_EXT,
+            out + ".log")
+
+
+def _same_fn(rec: dict, fn_spec: str, fid: str | None) -> bool:
+    """The recorded function is this one: the same spec, or (S1-8) the same identity from another tree."""
+    return rec.get("fn") == fn_spec or bool(fid and rec.get("fn_id") == fid)
+
+
+def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
     """key -> ok row from an earlier --out of the same function and code, and
     (Phase 42 α) from the rows an interrupted or killed run of it had written
     to `<out>.partial.jsonl` (its first line names the function and code)."""
     got = {}
     try:
         prev = json.load(open(out + ".summary.json"))
-        if prev.get("fn") == fn_spec and prev.get("code_fp") == fp:
+        if _same_fn(prev, fn_spec, fid) and prev.get("code_fp") == fp:
             got.update({r["key"]: r for r in (json.loads(l) for l in open(out) if l.strip())
                         if isinstance(r, dict) and r.get("ok") and r.get("key")})
     except (OSError, ValueError):
@@ -2437,7 +2485,7 @@ def _reusable(out: str, fn_spec: str, fp: str) -> dict:
     try:
         with open(out + PARTIAL_EXT) as f:
             head = json.loads(f.readline() or "{}").get("_partial") or {}
-            if head.get("fn") == fn_spec and head.get("code_fp") == fp:
+            if _same_fn(head, fn_spec, fid) and head.get("code_fp") == fp:
                 for line in f:
                     try:
                         r = json.loads(line)
@@ -2448,6 +2496,67 @@ def _reusable(out: str, fn_spec: str, fp: str) -> dict:
     except (OSError, ValueError, AttributeError):
         pass
     return got
+
+
+def _stored_heads(out: str) -> list[dict]:
+    """The function and code records of a stored batch: its summary, and the journal an interrupted run left."""
+    heads = []
+    try:
+        heads.append(json.load(open(out + ".summary.json")))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(out + PARTIAL_EXT) as f:
+            heads.append(json.loads(f.readline() or "{}").get("_partial"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [h for h in heads if isinstance(h, dict) and h.get("fn") and h.get("code_fp")]
+
+
+def _here_spec(rec: dict) -> str:
+    """A recorded function as a spec in this tree: from its identity (S1-8) when recorded, else as recorded."""
+    fid = rec.get("fn_id") or ""
+    if fid.startswith("repo:"):
+        path, _, name = fid[len("repo:"):].partition("::")
+        return os.path.join(REPO, path) + "::" + name
+    return fid or rec["fn"]
+
+
+def reuse_report(run_dir: str) -> dict:
+    """Would the code here reuse the stored rows under `run_dir`? For every stored batch (a `<out>.summary.json`, or
+    the `<out>.partial.jsonl` an interrupted batch left): the ok rows stored, the rows run_map would keep (same
+    function, same code fingerprint), and why not. Read-only and local: what a launcher runs from the tree it would
+    ship, before launching (`compute.py reuse-check`, `cloud/run_cluster.py <config> reuse-check`)."""
+    run_dir = os.path.realpath(run_dir)
+    outs = set()
+    for dp, dirs, fns in os.walk(run_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
+        for f in fns:
+            for ext in (".summary.json", PARTIAL_EXT):
+                if f.endswith(ext):
+                    outs.add(os.path.join(dp, f[:-len(ext)]))
+    batches = []
+    for out in sorted(outs):
+        heads = _stored_heads(out)
+        if not heads:
+            continue                     # not a compute batch: no function and code record
+        stored = {}
+        for h in heads:
+            stored.update(_reusable(out, h["fn"], h["code_fp"]))
+        spec = _here_spec(heads[0])
+        path = spec.partition("::")[0]
+        if not os.path.exists(path if os.path.isabs(path) else os.path.join(run_dir, path)):
+            n, why = 0, f"function file not found here: {spec}"
+        else:
+            fp = code_fingerprint(run_dir, spec, exclude=_out_files(out))
+            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec)))
+            why = "" if n >= len(stored) else (
+                "code fingerprint differs: code, data or a file under models/ changed"
+                if fp not in {h["code_fp"] for h in heads} else "recorded under another function")
+        batches.append({"out": os.path.relpath(out, run_dir), "fn": heads[0].get("fn_id") or heads[0]["fn"],
+                        "stored": len(stored), "reusable": n, "why": why})
+    return {"run_dir": run_dir, "stored": sum(b["stored"] for b in batches),
+            "reusable": sum(b["reusable"] for b in batches), "batches": batches}
 
 
 def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
@@ -2498,11 +2607,10 @@ def _out_lock(out: str, block: bool = False, suffix: str = ".lock", run_dir: str
 
 def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
     rel_out =os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))
-    fp = code_fingerprint(run_dir, fn_spec, exclude=(out, out + ".tmp", out + ".summary.json",
-                                                     out + ".summary.json.tmp", out + PARTIAL_EXT,
-                                                     out + JOB_EXT, out + ".log"))
+    fp = code_fingerprint(run_dir, fn_spec, exclude=_out_files(out))
+    fid = fn_id(run_dir, fn_spec)
     keys = input_keys(inputs)
-    old = {} if fresh else _reusable(out, fn_spec, fp)
+    old = {} if fresh else _reusable(out, fn_spec, fp, fid)
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
         # Phase 42 α: rows are appended to <out>.partial.jsonl as they finish, so
@@ -2511,7 +2619,7 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         # one only once complete (a kill during the copy loses nothing).
         from lib.safe_io import open_append_nofollow, write_nofollow
         base, name = _out_base(out, run_dir)
-        journal = json.dumps({"_partial": {"fn": fn_spec, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
+        journal = json.dumps({"_partial": {"fn": fn_spec, "fn_id": fid, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
             json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
         try:
             write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
@@ -2545,7 +2653,7 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     summary = {**summary, "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
-               "fn": fn_spec, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
+               "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
@@ -3246,6 +3354,8 @@ def _self_test_s18(ok) -> None:
             ok(fp() == fp1, "RU3 harness-written analysis outputs under models/ and the spec keep the fingerprint")
             w(rd, "models/decision_tests/DT1.yaml", "written: 2\n")
             ok(fp() == fp1, "RU3b a rewritten decision test keeps the fingerprint")
+            w(rd, "data/input_checks.json", "{}\n")
+            ok(fp() == fp1, "RU3c the harness's input-check record under data/ keeps the fingerprint")
             for rel in ("models/notes.yaml", "models/decision_tests/helper.py", "models/ext/claims_spec.yaml"):
                 w(rd, rel, "x = 1\n")
                 fpx = fp()
@@ -5015,8 +5125,10 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a model function over many parameter sets")
-    ap.add_argument("cmd", nargs="?", choices=["map", "status", "wait"])
-    ap.add_argument("run_dir", nargs="?", help="map: the run directory; status/wait: the batch's --out file")
+    ap.add_argument("cmd", nargs="?", choices=["map", "status", "wait", "reuse-check"])
+    ap.add_argument("run_dir", nargs="?", help="map, reuse-check: the run directory; status/wait: the batch's --out file")
+    ap.add_argument("--expect-all", action="store_true",
+                    help="reuse-check: exit 1 unless every stored row would be reused")
     ap.add_argument("--detach", action="store_true",
                     help="run the batch in its own session and return at once; follow it with "
                          "`compute.py wait <out>` (an agent tool timeout cannot kill it)")
@@ -5040,6 +5152,15 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    if a.cmd == "reuse-check":
+        if not a.run_dir:
+            ap.error("usage: compute.py reuse-check <run_dir> [--expect-all]")
+        r = reuse_report(a.run_dir)
+        for b in r["batches"]:
+            print(f"{b['out']}: {b['reusable']} of {b['stored']} stored rows reused"
+                  + (f" ({b['why']})" if b["why"] else ""), file=sys.stderr)
+        print(json.dumps(r))
+        return 1 if a.expect_all and r["reusable"] < r["stored"] else 0
     if a.cmd in ("status", "wait"):
         if not a.run_dir:
             ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")
