@@ -106,7 +106,8 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
     for f in FL.open_findings(ledger):
         fs.append({"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
                    "owner_state": f.owner_state, "resolution_type": f.resolution_type,
-                   "scope_declarable": f.scope_declarable, "claim": f.claim[:400], "done_when": f.done_when,
+                   "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
+                   "fix_requires": f.fix_requires, "done_when": f.done_when,
                    "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)})
     g = gate or {}
     return {"round": round_n, "max_rounds": max_rounds,
@@ -167,7 +168,7 @@ def default_plan(packet: dict) -> dict:
     for f in packet["findings"]:
         if f["blocking"] and f["resolution_type"] != "owner_decision":
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
-                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f['claim'][:300]}", "files": []})
+                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}", "files": []})
     return {"tasks": tasks, "deferred": [], "by": "harness default"}
 
 

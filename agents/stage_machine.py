@@ -253,7 +253,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     import pipeline as P
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
-        "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
+        "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*")
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
@@ -470,18 +470,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     return out
 
 
-def _remedy(f: dict) -> str | None:
-    """A finding's required remedy, in full (critics write `fix_requires`)."""
-    r = f.get("fix_requires") or f.get("remedy")
-    return " ".join(str(r).split()) if r else None
-
-
-def short_label(text: str, n: int = 120) -> str:
-    """F6 S1-7: a short label for a field that must be short. It never replaces the full text: the
-    claim is kept beside it, and a cut label says so with an ellipsis."""
-    t = " ".join(str(text or "").split())
-    first = t.split(". ")[0]
-    return first if len(first) <= n else first[:n - 1].rstrip() + "…"
+_remedy, short_label = FL.remedy, FL.short_label
+MAX_LANGUAGE_REPAIRS = 2
 
 
 def require_judged(d: dict, opened: list | None = None) -> dict:
@@ -989,7 +979,6 @@ class Machine:
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
         if self.st.v2_rules:
             out += report_claim_findings(self.run_dir)
-            out += report_acceptance_findings(self.run_dir, self.st.write_mode)
         if self.st.derived_inputs or os.path.exists(os.path.join(self.run_dir, "data", "derivations.yaml")):
             import pipeline as P
             try:
@@ -1315,9 +1304,8 @@ class Machine:
                 # The final status heads the report; a not-accepted one records any acceptance language.
                 fst = route_gate(d, pw)[1]
                 render_report(self.run_dir, self.backend, status=fst or "pending")
-                if fst not in ACCEPTED_STATUSES:
-                    hits = report_acceptance_findings(self.run_dir, "not_accepted")
-                    d["report_acceptance_language"] = [h["claim"] for h in hits]
+                if fst is not None and fst not in ACCEPTED_STATUSES:
+                    d["report_acceptance_language"] = self._repair_language(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -1333,6 +1321,11 @@ class Machine:
                         led[fid].blocking = True
                 FL.save(self.run_dir, led)
         nxt, status, mode = route_gate(d, pw)
+        if nxt == "FINAL" and ((d or {}).get("report_acceptance_language") or {}).get("remaining"):
+            # Not delivered with acceptance language in place (F6 S1-7): the report is withheld.
+            os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
+            return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
+                            "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
             n = self.st.tries.get("schema", 0) + 1
             self.st.tries["schema"] = n
@@ -1355,6 +1348,22 @@ class Machine:
         if nxt == "WRITE":
             self.st.write_mode = mode
         return self._go(nxt, why, status)
+
+    def _repair_language(self, status: str) -> dict:
+        """F6 S1-7: a report the final gate did not accept is not delivered with acceptance language. The
+        writer repairs it (at most MAX_LANGUAGE_REPAIRS times); each repair is re-rendered and re-checked."""
+        mode = "declared" if status == "completed_scope_declared" else "not_accepted"
+        found = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
+        rec = {"found": found, "repairs": 0, "remaining": found}
+        while rec["remaining"] and rec["repairs"] < MAX_LANGUAGE_REPAIRS:
+            rec["repairs"] += 1
+            res = self._task(f"GATE#{self._visit()}:language_repair{rec['repairs']}", "write", self.run_dir, mode,
+                             rec["remaining"], writeup=True)
+            if res is None or not res.ok or not self._has_draft():
+                break
+            render_report(self.run_dir, self.backend, status=status)
+            rec["remaining"] = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
+        return rec
 
     def h_FIX_LOOP(self):
         v = self._visit()
@@ -1601,16 +1610,24 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
               f"Could not be rendered from analysis/engine.yaml: {type(e).__name__}: {e}", ""]
     if sv:
         lines += [""] + sv[:-1]
-    try:
-        decl = (yaml.safe_load(open(os.path.join(run_dir, "scope_declaration.yaml"))) or {}).get("declarations") or []
-    except OSError:
-        decl = []
-    if decl:
-        lines += ["", "## Declared limits (rendered verbatim from scope_declaration.yaml)", ""]
+    decl, sd_find = [], []
+    if os.path.exists(os.path.join(run_dir, "scope_declaration.yaml")):
+        try:   # every shape the gate reads, each entry's full text (lib.scope_declarations)
+            from lib import scope_declarations as SD
+            _doc, decl, sd_find = SD.load(run_dir)
+        except Exception as e:  # noqa: BLE001 -- fail closed: the report says so
+            SD, sd_find = None, [{"claim": f"{type(e).__name__}: {e}"}]
+    if decl or sd_find:
+        lines += ["", "## Declared limits (rendered in full from scope_declaration.yaml)", ""]
+        lines += [f"- scope_declaration.yaml could not be read: {f.get('claim')}" for f in sd_find]
         for e in decl:
-            fix = e.get("fix_requires") or e.get("required_remedy") or e.get("remedy")
-            lines.append(f"- **{e.get('id')}** ({e.get('blocker_id')}): {e.get('why_unresolved', '')} "
-                         f"Impact: {e.get('impact_on_conclusions', '')}" + (f" Required remedy: {fix}" if fix else ""))
+            ids = [str(x) for k in SD.STRUCTURED_ID_FIELDS
+                   for x in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)]) if x]
+            text = " ".join(f"{f.replace('_', ' ').capitalize()}: {' '.join(str(e[f]).split())}"
+                            for f in SD.JUSTIFICATION_FIELDS if e.get(f))
+            fix = _remedy(e)
+            lines.append(f"- **{e.get('id') or 'unnamed'}** ({', '.join(ids) or 'no finding named'}): "
+                         f"{text or 'no text given.'}" + (f" Required remedy: {fix}" if fix else ""))
     try:
         dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
     except OSError:
@@ -1619,7 +1636,12 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
-    _put(run_dir, "report.md", _status_line(run_dir, status) + draft.rstrip() + "\n" + "\n".join(lines) + "\n")
+    head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    full = head + body + "\n".join(lines) + "\n"
+    _put(run_dir, "report.md", full)
+    # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
+    _write_json(run_dir, "report_render.json", {"report_sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
+                                                "writer_span": [len(head), len(head) + len(body)]})
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
 

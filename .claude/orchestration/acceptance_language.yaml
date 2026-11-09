@@ -1,11 +1,14 @@
 # Acceptance language (F6 S1-7). A report may use these terms only when the run's final gate accepted it.
 # scripts/writer_qa.py flags each use in a report whose run status is not in `accepted_statuses`; the v2
 # stage machine (agents/stage_machine.py) makes the same check a write-up finding for a declared-scope or
-# not-accepted write-up. A term preceded, within `negation_window` words, by a negation ("not accepted",
-# "was never validated") is not acceptance language. Disease-agnostic: no unit, disease or intervention names.
+# not-accepted write-up. A term preceded, within `negation_window` words, by a negation in the same clause ("not accepted",
+# "was never validated", "isn't validated") is not acceptance language. Disease-agnostic: no unit, disease or intervention names.
 accepted_statuses: [completed, completed_with_report_restored]
 negation_window: 3
-negations: [not, never, no, nor, without, "n't", cannot, neither, yet]
+# Every entry is quoted: YAML reads an unquoted no as false (writer_qa refuses a non-string entry).
+negations: ["not", "never", "no", "nor", "without", "cannot", "neither", "yet"]
+# A quotation shortly after one of these words is a critic's or reviewer's words, not the report's claim.
+attributions: ["critic", "reviewer", "critique", "review"]
 terms:
   - {id: accepted, pattern: '\baccepted\b'}
   - {id: validated, pattern: '\bvalidat(?:ed|ion\s+(?:shows|confirms))\b'}

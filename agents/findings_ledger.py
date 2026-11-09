@@ -74,12 +74,27 @@ class Finding:
     last_seen_round: int | None = None
     instances: int = 1
     claim: str = ""
+    fix_requires: str | None = None     # F6 S1-7: the required remedy, in full
     done_when: list | None = None
     decision_test: dict | None = None
     events: list = field(default_factory=list)
 
     def to_row(self) -> dict:
         return asdict(self)
+
+
+def remedy(f: dict) -> str | None:
+    """A finding's required remedy, in full (critics write `fix_requires`)."""
+    r = f.get("fix_requires") or f.get("required_remedy") or f.get("remedy")
+    return " ".join(str(r).split()) if r else None
+
+
+def short_label(text: str, n: int = 120) -> str:
+    """F6 S1-7: a short label for a field that must be short. It never replaces the full text, which is
+    kept beside it; a cut label ends with an ellipsis."""
+    t = " ".join(str(text or "").split())
+    first = t.split(". ")[0]
+    return first if len(first) <= n else first[:n - 1].rstrip() + "…"
 
 
 def owner_state_for(stage: str | None) -> tuple[str, bool]:
@@ -170,7 +185,7 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 id=str(b["id"]), kind="critique_blocker", severity=str(b.get("severity") or "HIGH").upper(),
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
-                last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""),
+                last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""), fix_requires=remedy(b),
                 done_when=b.get("done_when") if isinstance(b.get("done_when"), list) else None))
     return found, problems
 
@@ -213,7 +228,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 owner_state_known=known, target_stage=str(stage or ""),
                 scope_declarable=v.get("scope_declarable") is not False,
                 first_seen_round=v.get("first_seen_round", round_n), last_seen_round=round_n,
-                claim=str(v.get("claim") or v.get("evidence") or ""))
+                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v))
             if v.get("owner_signoff"):
                 rows[fid].resolution_type = "owner_decision"
     # Blocking gate entries whose kind no violation list carries (e.g. a required artifact).
@@ -324,7 +339,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             _event(new, round_n, new.status, new.source)
             continue
         # keep identity and history; refresh what the source now says
-        for k in ("severity", "claim", "owner_state", "owner_state_known", "target_stage", "instances",
+        for k in ("severity", "claim", "fix_requires", "owner_state", "owner_state_known", "target_stage", "instances",
                   "scope_declarable", "last_seen_round"):
             setattr(old, k, getattr(new, k))
         if not new.source.startswith("critique"):

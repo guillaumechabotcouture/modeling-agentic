@@ -436,33 +436,57 @@ def load_acceptance_language(path: str = ACCEPTANCE_MANIFEST) -> dict:
     if not isinstance(doc.get("terms"), list) or not doc["terms"] or not isinstance(doc.get("status_lines"), dict):
         raise ValueError(f"{os.path.basename(path)}: needs a non-empty `terms` list and `status_lines`")
     for t in doc["terms"]:
+        if not (isinstance(t, dict) and isinstance(t.get("id"), str) and isinstance(t.get("pattern"), str)):
+            raise ValueError(f"{os.path.basename(path)}: each term needs a string id and pattern")
         re.compile(t["pattern"])
+    for k in ("negations", "allowed", "attributions"):
+        v = doc.get(k) or []
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(f"{os.path.basename(path)}: `{k}` must be a list of quoted strings "
+                             "(YAML reads an unquoted no as false)")
     return doc
 
 
-def run_status(run_dir: str) -> Optional[str]:
-    """The run's terminal status if one is recorded (metadata.json, then run_state.json), else
-    `completed_scope_declared` when the final gate declared, else None (not yet decided)."""
-    for name in ("metadata.json", "run_state.json"):
-        try:
-            st = (json.load(open(os.path.join(run_dir, name))) or {}).get("status")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if st:
-            return str(st)
+ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+REPORT_RENDER = "report_render.json"
+
+
+def _record(run_dir: str, name: str) -> Optional[dict]:
     try:
-        action = (json.load(open(os.path.join(run_dir, "final_gate.json"))) or {}).get("action")
-    except (OSError, ValueError, AttributeError):
-        action = None
-    return {"ACCEPT": "completed", "DECLARE_SCOPE": "completed_scope_declared"}.get(action, action and "not_accepted")
+        doc = json.load(open(os.path.join(run_dir, name)))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else {}
 
 
-def strip_harness_blocks(text: str) -> str:
-    """The writer's text: drop the harness-rendered blocks (each opens with an `<!-- harness:` comment;
-    the rendered tail runs to the end), which quote findings and state the status themselves."""
-    i = text.find("<!-- harness: rendered")
-    text = text if i < 0 else text[:i]
-    return re.sub(r"^<!-- harness:[^\n]*-->\n(?:[^\n]+\n)*", "", text, flags=re.M)
+def run_status(run_dir: str) -> Optional[str]:
+    """The run's status from the harness's own records: the final gate's decision (final_gate.json) and
+    the v2 machine's state (run_state.json). metadata.json is not read: agents can edit it. Records that
+    disagree on acceptance are `records_conflict` (not accepted); a run still in progress is `pending`."""
+    g, rs = _record(run_dir, "final_gate.json"), _record(run_dir, "run_state.json")
+    action = (g or {}).get("action")
+    by_gate = {"ACCEPT": "completed", "DECLARE_SCOPE": "completed_scope_declared"}.get(action) or (
+        "not_accepted" if g is not None else None)
+    st = (rs or {}).get("status")
+    if st and by_gate and (st in ACCEPTED_STATUSES) != (by_gate == "completed"):
+        return "records_conflict"
+    if rs is not None:
+        return str(st) if st else "pending"
+    return by_gate
+
+
+def report_writer_text(run_dir: str, text: str) -> str:
+    """The part of report.md to check: the writer's span the harness recorded when it rendered the
+    report (report_render.json), only while the record's hash matches the report; else all of it."""
+    import hashlib
+    rec = _record(run_dir, REPORT_RENDER) or {}
+    try:
+        a, b = (int(x) for x in rec["writer_span"])
+        if rec["report_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest() and 0 <= a <= b <= len(text):
+            return text[a:b]
+    except (KeyError, TypeError, ValueError):
+        pass
+    return text
 
 
 def acceptance_language_hits(text: str, status: Optional[str], manifest: Optional[dict] = None) -> list[str]:
@@ -471,15 +495,21 @@ def acceptance_language_hits(text: str, status: Optional[str], manifest: Optiona
     m = manifest or load_acceptance_language()
     if status in (m.get("accepted_statuses") or []):
         return []
-    text = strip_harness_blocks(text)
+    for a, b in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
+        text = text.replace(a, b)
     for a in m.get("allowed") or []:
         text = re.sub(a, " ", text, flags=re.I)
-    negs = {str(n).lower() for n in m.get("negations") or []}
+    att = "|".join(re.escape(a) for a in m.get("attributions") or [])
+    if att:   # a quotation attributed to a critic or reviewer is their words, not the report's claim
+        text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
+    negs = {n.lower() for n in m.get("negations") or []}
     win = int(m.get("negation_window", 3))
     out = []
     for t in m["terms"]:
         for hit in re.finditer(t["pattern"], text, re.I):
-            before = re.findall(r"[A-Za-z']+", text[max(0, hit.start() - 80):hit.start()].lower())[-win:]
+            # a negation counts only in the term's own clause
+            clause = re.split(r"[.;:!?,()\n]|\bbut\b", text[max(0, hit.start() - 120):hit.start()], flags=re.I)[-1]
+            before = re.findall(r"[a-z']+", clause.lower())[-win:]
             if any(w in negs or w.endswith("n't") for w in before):
                 continue
             ctx = " ".join(text[max(0, hit.start() - 60):hit.end() + 60].split())
@@ -490,7 +520,7 @@ def acceptance_language_hits(text: str, status: Optional[str], manifest: Optiona
 def _check_acceptance_language(text: str, run_dir: str) -> list[QAIssue]:
     status = run_status(run_dir)
     try:
-        hits = acceptance_language_hits(text, status)
+        hits = acceptance_language_hits(report_writer_text(run_dir, text), status)
     except Exception as e:  # noqa: BLE001 -- fail closed: the check could not run
         return [QAIssue(kind="acceptance_language_unchecked", severity="MAJOR", section=None,
                         description=f"The acceptance-language manifest could not be read ({type(e).__name__}: {e}).")]

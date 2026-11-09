@@ -409,8 +409,12 @@ class SdkTasks:
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
                                                            settings=_settings_text(), out=OUT), "Make the fix.", owns)
 
-    def write(self, run_dir, mode):
-        return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT), "Write the draft.", OWNS["write"])
+    def write(self, run_dir, mode, feedback=None):
+        fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
+              "uses acceptance language. Rewrite these passages (say what was tested and what is declared), "
+              "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
+        return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
+                             OWNS["write"])
 
 
 def _self_test() -> int:
