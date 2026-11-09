@@ -98,6 +98,7 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
             f = f"data.tests[{j}]"
             cl += [_c(f"dt.{tid}.share", "percentage", arts["decision_tests"], f"{f}.share_pct", "%"),
                    _c(f"dt.{tid}.dollars", "currency", arts["decision_tests"], f"{f}.dollars_moved", "USD"),
+                   _c(f"dt.{tid}.reallocated", "currency", arts["decision_tests"], f"{f}.dollars_reallocated", "USD"),
                    _c(f"dt.{tid}.population", "scalar", arts["decision_tests"], f"{f}.population_changed", "people")]
             if d.get("regret_share") is not None:      # undefined when the re-optimised objective is not positive
                 cl.append(_c(f"dt.{tid}.regret_pct", "percentage", arts["decision_tests"], f"{f}.regret_pct", "%"))
@@ -305,7 +306,7 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
     for r in sens["rows"]:
         e2 = (r["low"], r["high"])
         rg = [e["regret_share"] for e in e2 if e.get("regret_share") is not None]
-        trig = [k for k in ("share", "regret", "dollars") if any(k in (e.get("triggered_by") or []) for e in e2)]
+        trig = [k for k in ("infeasible", "share", "regret", "dollars") if any(k in (e.get("triggered_by") or []) for e in e2)]
         L.append(f"| {r['name']} | {r['basis']} | {_fmt(r['low']['value'])} | {_fmt(r['high']['value'])} | "
                  f"{_fmt(r['swing_pct_of_point'])} | "
                  f"{max(r['low']['share_units_changed'], r['high']['share_units_changed']):.0%} | "
@@ -322,12 +323,15 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
         L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{t}.verdict]; "
               f"largest share of units changing package [CLAIM:dt.{t}.share] (the plan changes when more "
               f"than [CLAIM:dt.{t}.threshold] of units change package, or on regret or dollars moved). "
+              + ("At some tested value the point plan is not feasible under the test, so it cannot be kept. "
+                 if d.get("point_plan_feasible") is False else "")
               + (f"Keeping the point plan loses up to [CLAIM:dt.{t}.regret_pct] of the re-optimised objective; "
                  if d.get("regret_share") is not None else "")
-              + f"up to [CLAIM:dt.{t}.dollars] moves between components, and up to [CLAIM:dt.{t}.population] people "
-              "live in units whose package changes"
-              + (" (most changes in " + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]"
-                                                for k, g in enumerate(grp[:GROUPS_SHOWN])) + ")" if grp else "")
+              + f"up to [CLAIM:dt.{t}.dollars] moves between components and up to [CLAIM:dt.{t}.reallocated] between "
+              f"units, and up to [CLAIM:dt.{t}.population] people live in units whose package changes"
+              + (" (at the value with the most units changing, most changes in "
+                 + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]" for k, g in enumerate(grp[:GROUPS_SHOWN]))
+                 + ")" if grp else "")
               + ". " + (f"Changes the plan on: {', '.join(d['triggered_by'])}. " if d.get("triggered_by") else "")
               + f"Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"

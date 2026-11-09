@@ -367,8 +367,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          **{k: (None if x.get(f) is None else 100.0 * x[f]) for k, f in (
              ("regret_pct", "regret_share"), ("regret_threshold_pct", "regret_threshold"),
              ("dollars_moved_pct", "dollars_moved_share"), ("dollars_threshold_pct", "dollars_threshold"),
+             ("dollars_reallocated_pct", "dollars_reallocated_share"), ("dollars_share_pct", "dollars_share"),
              ("population_changed_pct", "population_changed_share"))},
-         **{k: x.get(k) for k in ("regret", "dollars_moved", "population_changed", "triggered_by",
+         **{k: x.get(k) for k in ("regret", "objective_gap", "point_plan_feasible", "dollars_moved",
+                                  "dollars_reallocated", "population_changed", "triggered_by",
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
@@ -854,11 +856,25 @@ def _self_test_moves(ok, d, R):
         spent = sum(cost0[i][plan[i]] for i in A.ids)
         ok(all(spent + sum(r["dollars_by_component"].values()) <= A.plan_budget * (1 + 1e-9) for r in rec["results"]),
            "MS10 with a reserve the re-solved plans' costs (point cost plus dollars by component) stay within it")
+        # Codex r1 P2-1: a smaller envelope makes the point plan unaffordable: a change, never NO_CHANGE
+        A.set_reserve(None)
+        env = {"id": "env_small", "type": "envelope", "values": [0.5 * float(A.budget)], "text": "a smaller envelope"}
+        rec = DT.run_one(A, env, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        r0 = rec["results"][0]
+        ok(r0["point_plan_feasible"] is False and r0["regret"] is None and "infeasible" in rec["triggered_by"]
+           and rec["decision_changes"] is True and r0["objective_gap"] < 0,
+           f"MS11 an envelope the point plan does not fit is a change ({rec.get('triggered_by')})")
+        ok(set(rec.get("worst_by_criterion") or {}) >= {"share", "regret", "dollars", "population"}
+           and all("value" in w for w in rec["worst_by_criterion"].values()),
+           "MS12 the result file names, for each criterion, its worst tested value with its own breakdown")
     except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
-        ok(False, f"MS8-MS10 the regret criterion on the toy ({type(e).__name__}: {e})")
+        ok(False, f"MS8-MS12 the criteria on the toy ({type(e).__name__}: {e})")
     finally:
         A.spec.raw["analysis"] = saved
         A.set_reserve(None)
+    es = next((f for f in figs if f["figure"] == "sensitivity"), None)
+    scols = set(next(csv.DictReader(open(os.path.join(d, es["table"]))), {})) if es else set()
+    ok("triggered_by" in scols, f"MS13 the sensitivity figure table names the criterion that changed the plan: {scols}")
 
 
 def _self_test_variants(ok, q):
