@@ -44,22 +44,51 @@ def component_totals(ccost: dict, plan: dict, ids) -> dict:
     return tot
 
 
-def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, components) -> dict:
+def infeasible_reasons(ids, plan, cost, feas, plan_budget) -> list[str]:
+    """Why the point plan cannot be kept under a test: its cost under the test's costs above the planning budget,
+    a package the test's feasibility rules out, a cap it exceeds, or a group rule it breaks. [] when it can."""
+    out = []
+    spent = sum(float(cost[i][plan[i]]) for i in ids)
+    if spent > float(plan_budget) * (1 + 1e-9):
+        out.append(f"costs {spent:,.0f} under the test, above the planning budget {float(plan_budget):,.0f}")
+    if feas:
+        bad = [i for i in ids if not feas["feasible"][i].get(plan[i], False)]
+        if bad:
+            out.append(f"{len(bad)} units' packages are not feasible under the test (e.g. {bad[:3]})")
+        for cap in feas.get("caps") or []:
+            used = sum(cap["weights"][i][plan[i]] for i in ids)
+            if used > cap["max"] + 1e-9:
+                out.append(f"cap {cap['name']}: {used:g} above {cap['max']:g}")
+        for L in feas.get("links") or []:
+            split = [g for g, m in L["groups"].items() if len({L["class"][u][plan[u]] for u in m}) > 1]
+            if split:
+                out.append(f"group rule {L['name']}: {len(split)} groups take more than one decision")
+    return out
+
+
+def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, components, plan_budget=None,
+            feas=None) -> dict:
     """What moves from the point plan `plan` to the plan `ch` re-solved under a test (benefits `ben`, costs `ccost`
-    split by component, re-optimised objective `objective`). `pop`: {unit: population}; `region`: {unit: group} or
-    None. Fails closed on a unit without a population or costs without a component split."""
+    split by component, re-optimised objective `objective`, solved within `plan_budget` (default `budget`) under
+    `feas`). `pop`: {unit: population}; `region`: {unit: group} or None. Fails closed on a unit without a population
+    or costs without a component split. A point plan the test makes infeasible changes the plan: it has no regret
+    (it cannot be kept), only the signed objective gap."""
     if ccost is None:
         raise ValueError("decision summary: the costs carry no split by component (toolkit/analysis/core.py "
                          "CostTable); dollars moved cannot be computed")
     miss = [i for i in ids if pop.get(i) is None]
     if miss:
         raise ValueError(f"decision summary: no population for units {miss[:5]}")
+    cost = {i: {k: sum(ccost[i][k].values()) for k in {plan[i], ch[i]}} for i in ids}     # the two plans only
+    why = infeasible_reasons(ids, plan, cost, feas, budget if plan_budget is None else plan_budget)
     changed = [i for i in ids if ch[i] != plan[i]]
     point = sum(ben[i][plan[i]] for i in ids)
-    regret = float(objective) - point
+    gap = float(objective) - point
+    regret = None if why else gap
     pt, re = component_totals(ccost, plan, ids), component_totals(ccost, ch, ids)
     delta = {c: re.get(c, 0.0) - pt.get(c, 0.0) for c in components}
     moved = max(sum(v for v in delta.values() if v > 0), -sum(v for v in delta.values() if v < 0))
+    realloc = 0.5 * sum(abs(cost[i][ch[i]] - cost[i][plan[i]]) for i in ids)     # between units, any component
     total_pop = sum(float(pop[i]) for i in ids)
     pc = sum(float(pop[i]) for i in changed)
     by = None
@@ -71,14 +100,18 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
             g[0] += ch[i] != plan[i]
         by = [{"group": g, "changed": v[0], "units": v[1]} for g, v in sorted(n.items(), key=lambda kv: (-kv[1][0],
                                                                                                          kv[0])) if v[0]]
+    share = lambda x: x / float(budget) if budget > 0 else None  # noqa: E731
     rec = {"units_changed": len(changed), "share_units_changed": len(changed) / len(ids),
-           "point_plan_objective_under_test": point, "reoptimised_objective": float(objective), "regret": regret,
-           "regret_share": regret / float(objective) if objective > 0 else None,
+           "point_plan_feasible": not why, "point_plan_infeasible": why,
+           "point_plan_objective_under_test": point, "reoptimised_objective": float(objective), "objective_gap": gap,
+           "regret": regret, "regret_share": regret / float(objective) if regret is not None and objective > 0 else None,
            "population_changed": pc, "population_changed_share": pc / total_pop if total_pop > 0 else None,
-           "dollars_by_component": delta, "dollars_moved": moved,
-           "dollars_moved_share": moved / float(budget) if budget > 0 else None, "units_changed_by_group": by}
-    vals = {"share": rec["share_units_changed"], "regret": rec["regret_share"], "dollars": rec["dollars_moved_share"]}
-    rec["triggered_by"] = [k for k in CRITERIA if vals[k] is not None and vals[k] > thr[k]]
+           "dollars_by_component": delta, "dollars_moved": moved, "dollars_moved_share": share(moved),
+           "dollars_reallocated": realloc, "dollars_reallocated_share": share(realloc),
+           "dollars_share": share(max(moved, realloc)), "units_changed_by_group": by}
+    vals = {"share": rec["share_units_changed"], "regret": rec["regret_share"], "dollars": rec["dollars_share"]}
+    rec["triggered_by"] = (["infeasible"] if why else []) + [k for k in CRITERIA if vals[k] is not None
+                                                             and vals[k] > thr[k]]
     rec["decision_changes"] = bool(rec["triggered_by"])
     return rec
 
@@ -104,15 +137,45 @@ def population(A) -> dict:
     return {i: float(A.by_id[i][col]) for i in A.ids}
 
 
+SUMMARY = ("units_changed", "share_units_changed", "point_plan_feasible", "point_plan_infeasible",
+           "point_plan_objective_under_test", "reoptimised_objective", "objective_gap", "regret", "regret_share",
+           "population_changed", "population_changed_share", "dollars_by_component", "dollars_moved",
+           "dollars_moved_share", "dollars_reallocated", "dollars_reallocated_share", "dollars_share",
+           "units_changed_by_group", "triggered_by", "decision_changes")
+
+
 def aggregate(rows: list) -> dict:
-    raise NotImplementedError
+    """A test's summary over its tested values (compare() rows with `value`): `worst_by_criterion` gives, for the
+    share, regret, dollars and population, the worst value with its own coherent summary (Codex r1 P2-3); the
+    top-level numbers are each criterion's worst, the breakdowns those of the value they come from."""
+    def worst(key):
+        c = [r for r in rows if r.get(key) is not None]
+        return max(c, key=lambda r: r[key]) if c else None
+    w = {"share": worst("share_units_changed"), "regret": worst("regret_share") or worst("regret") or rows[0],
+         "dollars": worst("dollars_share") or rows[0], "population": worst("population_changed")}
+    wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for k, r in w.items()}
+    trig = [k for k in ("infeasible",) + CRITERIA if any(k in (r.get("triggered_by") or []) for r in rows)]
+    return {"decision_changes": bool(trig), "triggered_by": trig,
+            "point_plan_feasible": all(r.get("point_plan_feasible", True) for r in rows),
+            "share_units_changed": w["share"]["share_units_changed"],
+            "units_changed_by_group": w["share"]["units_changed_by_group"],
+            **{k: w["regret"].get(k) for k in ("regret", "regret_share", "reoptimised_objective", "objective_gap")},
+            **{k: w["dollars"].get(k) for k in ("dollars_share", "dollars_moved", "dollars_moved_share",
+                                                 "dollars_reallocated", "dollars_reallocated_share",
+                                                 "dollars_by_component")},
+            "population_changed": w["population"]["population_changed"],
+            "population_changed_share": w["population"]["population_changed_share"], "worst_by_criterion": wb}
 
 
-def summarise(A, plan, ch, ben, cost, objective) -> dict:
-    """compare() for the analysis state: its population, region, allocatable budget, thresholds and components."""
+def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None) -> dict:
+    """compare() for the analysis state: its population, region, allocatable budget, thresholds and components; the
+    point plan is checked against `budget` (default: the budget plans are solved at) and `feas` (default A.feas)."""
     reg = {i: A.by_id[i].get(A.region) for i in A.ids} if A.region else None
+    if budget is None:
+        budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
     return compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
-                   A.budget, thresholds(A.spec["analysis"]), list(A.spec["options"]["components"]))
+                   A.budget, thresholds(A.spec["analysis"]), list(A.spec["options"]["components"]),
+                   plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None))
 
 
 # --------------------------------------------------------------------------- self-test

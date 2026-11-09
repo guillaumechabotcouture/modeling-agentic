@@ -359,8 +359,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          **{k: (None if x.get(f) is None else 100.0 * x[f]) for k, f in (
              ("regret_pct", "regret_share"), ("regret_threshold_pct", "regret_threshold"),
              ("dollars_moved_pct", "dollars_moved_share"), ("dollars_threshold_pct", "dollars_threshold"),
+             ("dollars_reallocated_pct", "dollars_reallocated_share"), ("dollars_share_pct", "dollars_share"),
              ("population_changed_pct", "population_changed_share"))},
-         **{k: x.get(k) for k in ("regret", "dollars_moved", "population_changed", "triggered_by",
+         **{k: x.get(k) for k in ("regret", "objective_gap", "point_plan_feasible", "dollars_moved",
+                                  "dollars_reallocated", "population_changed", "triggered_by",
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,

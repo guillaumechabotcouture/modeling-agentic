@@ -245,15 +245,13 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         ch = sol["choice"]
         A.guard(f"decision test {dt['id']} at {v}", [plan, ch], events=evs.get(v, []))
         # F6 S1-5: what moves beside the share (regret, population, dollars by component, units by group)
-        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"]),
+        # (the point plan judged under the test's costs, feasibility and planning budget: Codex r1 P2-1)
+        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas),
                         "objective": sol["objective"], "recommendation": A.mix_text(ch),
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
     worst = max(results, key=lambda r: r["share_units_changed"])
-    share = worst["share_units_changed"]
     th = MV.thresholds(A.spec["analysis"])
-    top = lambda k: max((r[k] for r in results if r[k] is not None), default=None)  # noqa: E731
-    big = max(results, key=lambda r: (r["regret"], r["dollars_moved"]))
-    trig = [k for k in MV.CRITERIA if any(k in r["triggered_by"] for r in results)]
+    agg = MV.aggregate(results)       # each criterion's worst value, with its own breakdown (Codex r1 P2-3)
     comps = set(dt.get("components") or [])
     in_draws = sorted(comps & set(uq_data.get("components_in_any_draw_plan") or [])) if comps else None
     in_plan = sum(bool(A.pk[plan[i]] & comps) for i in A.ids) if comps else None
@@ -281,13 +279,9 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            "test_id": dt["id"], "type": t, "question": dt.get("text", ""), "varied": varied,
            "criterion": (f"the package changes in more than {thr:.0%} of units, or keeping the point plan loses more "
                          f"than {th['regret']:.1%} of the re-optimised objective, or more than {th['dollars']:.0%} of "
-                         "the allocatable budget moves between components"),
-           "decision_changes": bool(trig), "triggered_by": trig, "share_units_changed": float(share),
-           "share_threshold": thr, "regret": top("regret"), "regret_share": top("regret_share"),
-           "regret_threshold": th["regret"], "population_changed": top("population_changed"),
-           "population_changed_share": top("population_changed_share"), "dollars_moved": top("dollars_moved"),
-           "dollars_moved_share": top("dollars_moved_share"), "dollars_threshold": th["dollars"],
-           "dollars_by_component": big["dollars_by_component"], "units_changed_by_group": big["units_changed_by_group"],
+                         "the allocatable budget moves between components or between units, or the point plan is "
+                         "not feasible under the test"),
+           **agg, "share_threshold": thr, "regret_threshold": th["regret"], "dollars_threshold": th["dollars"],
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
            "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER}
     if sv:

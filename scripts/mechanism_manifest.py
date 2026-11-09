@@ -353,23 +353,32 @@ def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
                       f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
-    # F6 S1-5: regret and dollars moved are further criteria, each checked against its own threshold; the verdict
-    # is the union of the criteria given, and `triggered_by`, when given, names exactly those that fire
+    # F6 S1-5: regret and dollars moved are further criteria, each checked against its own threshold; a point plan the
+    # test makes infeasible (point_plan_feasible: false) is a change. The verdict is the union of the criteria given,
+    # and `triggered_by`, when given, names exactly those that fire
     crit = {"share": (share, thr)}
     for name, vk, tk in (("regret", "regret_share", "regret_threshold"),
-                         ("dollars", "dollars_moved_share", "dollars_threshold")):
+                         ("dollars", "dollars_share", "dollars_threshold")):
         if res.get(vk) is not None or res.get(tk) is not None:
             v, t = _num(res.get(vk)), _num(res.get(tk))
+            if name == "regret" and res.get(vk) is None and t is not None and 0 <= t <= 1 and (
+                    res.get("point_plan_feasible") is False
+                    or (_num(res.get("reoptimised_objective")) is not None and _num(res["reoptimised_objective"]) <= 0
+                        and _num(res.get("regret")) is not None)):
+                continue        # undefined, and the file says why: an infeasible point plan, or a zero objective
             if v is None or t is None or not 0 <= t <= 1:
                 out.append(_f("mechanism_manifest_invalid", "HIGH",
                               f"`{rel}`: {vk} and {tk} must both be numbers ({tk} a fraction in [0, 1]) when either "
-                              f"is given (got {res.get(vk)!r}, {res.get(tk)!r})."))
+                              f"is given (got {res.get(vk)!r}, {res.get(tk)!r}), unless the point plan is infeasible or "
+                              "the re-optimised objective is not positive."))
                 continue
             crit[name] = (v, t)
     known = {k: v > t for k, (v, t) in crit.items() if v is not None and t is not None}
+    if "point_plan_feasible" in res:
+        known["infeasible"] = res["point_plan_feasible"] is not True
     if known and any(known.values()) != res["decision_changes"]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
-                      f"`{rel}`: criteria {', '.join(f'{k} {crit[k][0]} vs {crit[k][1]}' for k in known)} contradict "
+                      f"`{rel}`: criteria {', '.join(f'{k}: {f}' for k, f in known.items())} contradict "
                       f"decision_changes: {res['decision_changes']}."))
     tb = res.get("triggered_by")
     if tb is not None and (not isinstance(tb, list) or sorted(map(str, tb)) != sorted(k for k, f in known.items() if f)):
