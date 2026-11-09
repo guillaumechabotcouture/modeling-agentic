@@ -1,0 +1,13 @@
+---
+phase: "F6"
+commit: "S2-5 α–γ"
+status_group: "F6 Stage 2"
+---
+
+## Changelog
+
+**Absolute burden checked against external estimates (F6 S2-5, critique C7).** A spec may declare `validation.burden` (`csv`, `group`, `arm`, `daly_parts`): a reference file, under a contract checked by `toolkit/spec/schema.py` before sign-off, that lists external estimates of outcomes the engine reports. Each row gives the group (a value of the group column, or `*` for every unit), an optional age band (a `decision_units.populations` group), the outcome, count or rate per N people, the year, the value and its interval, the source, the kind (`estimated`, or `reported`, which is shown for information only and never judged) and a tolerance (a ratio band, by default and at most as wide as `toolkit/analysis/thresholds.yaml` `burden` allows, or interval overlap). The reference file cannot be the calibration targets file. The analysis (`toolkit/analysis/burden.py`) compares the continuation arm (the comparator, or the declared `arm`) with each reference, as the arm's annual mean over the decision window. It reports the ratio, the reference interval as ratios and the model interval: from the uncertainty draws for all-age references, or the point value with a statement for an age band. Results go in the new optional artifact `analysis/burden_validation.yaml`, with the share of the arm's DALYs that comes from deaths (when years of life lost per death are declared) and the plan's DALYs averted per death averted. The contract check (`toolkit/analysis/contract.py`) re-judges every row from its numbers. An estimated reference outside its tolerance is a declarable HIGH finding (`burden_outside_tolerance`). A declared check with no artifact, an unmatched reference, or a status or band that the numbers or the manifest do not support is a HIGH finding that cannot be declared. `results.md` gains a section, the claims ledger a claim per number, and the figure set a `burden_validation` diagnostic (model / reference on a log axis, with both intervals). Self-tests: `burden.py` BV1–BV16, `run.py` BE1–BE4. No reference values are in the repository; the Nigeria reference file is built separately.
+
+## Status
+
+- **S2-5:** continuation-arm burden compared with declared external estimates by group and age band; a group outside tolerance is a declarable gate finding.
