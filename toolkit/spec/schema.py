@@ -76,6 +76,9 @@ docs/design/v2-spec-and-analysis.md §1):
                source: "<citation>", verified: unverified}}
                                            # engine-card priors (the engine's priors.yaml) are drawn without being
                                            # listed (kind `priors`, toolkit/spec/priors.py); the label names them
+      affordability: {max_share_over_budget: 0.1}   # optional (F6 S1-1): the share of draws in which the point plan
+                                           # may cost more than the allocatable budget; above it, a gate finding.
+                                           # Without it the share is reported, not judged
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
@@ -1194,6 +1197,12 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     lvl = u.get("level", 0.95)
     if not (_isnum(lvl) and 0.5 <= lvl < 1):
         bad.append("uncertainty.level: in [0.5, 1)")
+    if "affordability" in u:      # F6 S1-1: the share of draws in which the fixed plan may exceed the budget
+        af = u["affordability"]
+        if not isinstance(af, dict) or set(af) != {"max_share_over_budget"}:
+            bad.append("uncertainty.affordability: a mapping with one key, max_share_over_budget")
+        elif not (_isnum(af["max_share_over_budget"]) and 0 <= af["max_share_over_budget"] < 1):
+            bad.append("uncertainty.affordability.max_share_over_budget: in [0, 1)")
     items = {it.get("id") for it in s.raw["options"].get("cost_items") or []}
     for src in u.get("sources") or []:
         if src.get("kind") == "costs":

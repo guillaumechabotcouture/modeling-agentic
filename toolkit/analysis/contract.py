@@ -52,6 +52,18 @@ def _names_engine(run_dir: str) -> bool:
     return eng is not None and not (eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True))
 
 
+def _affordability(unc: dict) -> list[dict]:
+    """F6 S1-1: the spec's affordability rule, checked on the fixed plan's cost across the uncertainty draws. A rule
+    that is not met is a finding; no rule declared is reported in the artifact and not judged here."""
+    af = unc.get("affordability") or {}
+    if af.get("rule_met") is not False:
+        return []
+    return [_f("analysis_contract_affordability",
+               f"analysis/uncertainty.yaml: the fixed plan exceeds the allocatable budget in {af.get('draws_over_budget')} "
+               f"of {af.get('draws')} uncertainty draws (share {af.get('share_over_budget'):.3f}); the spec allows at most "
+               f"{(af.get('rule') or {}).get('max_share_over_budget')}", "affordability")]
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -161,6 +173,8 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += estimates_test_findings(est_doc[0], est_doc[1], exp_ids if isinstance(exp_ids, list) else [])
     if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
+    if unc_doc is not None:
+        out += _affordability(unc_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)

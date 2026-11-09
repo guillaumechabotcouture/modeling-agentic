@@ -14,7 +14,11 @@ its two sources, so the stored spike batch reproduces):
   priors             (v2 priors, drawn whenever there is one) every prior parameter from its declared bounded
                      distribution (toolkit/spec/priors.py), on its own random stream, before calibration
 The point plan is evaluated in every draw (the headline interval) and the plan is
-re-optimised in every draw (package stability). The interval's label comes from the spec
+re-optimised in every draw (package stability). The point plan's cost is recorded in every draw
+too (F6 S1-1): costs move with treated cases and unit prices, so a plan within the budget at the
+point values can exceed it in a draw. `affordability` reports the share of draws over the
+allocatable budget and the cost quantiles, and checks the spec's `uncertainty.affordability`
+rule (max_share_over_budget) when one is declared. The interval's label comes from the spec
 (`Spec.uncertainty_scope`): what it covers and what it does not. Writes
 `uncertainty_report.yaml` in the schema of scripts/propagate_uncertainty.py (shared
 summariser), plus the scope and the draw plan: every source drawn or not, every engine
@@ -144,6 +148,22 @@ class Drawer:
         return theta, zs, noise, mult, sampled
 
 
+def affordability(costs, budget: float, rule: dict | None = None, level: float = 0.95) -> dict:
+    """The fixed plan's cost in each draw against the allocatable budget (F6 S1-1). A cost above the budget by more
+    than rounding counts as over budget. With a rule (`uncertainty.affordability`), rule_met says whether the share of
+    draws over budget is at most rule.max_share_over_budget; without one, rule_met is None (reported, not judged).
+    No draws, or a non-finite cost, fails closed."""
+    c = np.asarray(costs, float)
+    if c.size == 0 or not np.all(np.isfinite(c)):
+        raise ValueError("affordability: the fixed plan's cost needs one finite value per draw")
+    b = float(budget)
+    over = int(np.sum(c > b + 1e-9 * max(1.0, abs(b))))
+    share = over / c.size
+    met = None if not rule else bool(share <= float(rule["max_share_over_budget"]) + 1e-12)
+    return {"budget_allocatable": b, "draws": int(c.size), "draws_over_budget": over, "share_over_budget": share,
+            "fixed_plan_cost": q(c, level), "rule": dict(rule) if rule else None, "rule_met": met}
+
+
 def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     sp = A.spec["uncertainty"]
     nd = int(draws if draws is not None else sp.get("draws", 32))
@@ -151,6 +171,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     D = Drawer(A, seed if seed is not None else sp.get("seed", 42))
     D.prepare(nd)
     fixed = {o: [] for o in A.outcomes}
+    fixed_cost = []
     opt_vals, same = [], np.zeros(len(A.ids))
     comps_used, outs, samples = set(), [], {}
     corr_any = corr_plan = 0
@@ -169,6 +190,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             fixed[o].append(v)
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
+        fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
+        row["fixed_plan_cost"] = fixed_cost[-1]
         sol = A.solve(ben, cost)
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]])
         opt_vals.append(sol["objective"])
@@ -233,6 +256,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                     "per_draw": clamped_draws},
             "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
+            "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if prov is not None:
         data["draw_provenance"] = prov
@@ -255,7 +279,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                    for x in plan_["drawn"]],
               "parameters_fixed": [{k: x.get(k) for k in ("name", "kind", "value", "reason")} for x in plan_["fixed"]
                                    if x["status"] == "fixed"],
-              "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"]}
+              "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"],
+              "affordability": data["affordability"]}
     if flagged:
         report["low_confidence_units"] = [{k: f.get(k) for k in ("unit", "region", "status", "reason", "implausibility")}
                                           for f in flagged]

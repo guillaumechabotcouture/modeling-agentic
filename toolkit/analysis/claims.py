@@ -48,6 +48,12 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
           _c("units.no_package", "count", arts["point"], "data.mix.no_package", "units"),
           _c("uq.draws", "count", arts["uncertainty"], "data.draws", "draws"),
           _c("uq.units_stable_90", "count", arts["uncertainty"], "data.units_same_package_in_90pct_of_draws", "units")]
+    if (uq.get("affordability") or {}).get("draws"):     # F6 S1-1: the fixed plan's cost across the draws
+        cl += [_c("uq.draws_over_budget", "count", arts["uncertainty"], "data.affordability.draws_over_budget", "draws"),
+               _c("uq.fixed_plan_cost.median", "currency", arts["uncertainty"],
+                  "data.affordability.fixed_plan_cost.median", "USD"),
+               _c("uq.fixed_plan_cost.high", "currency", arts["uncertainty"],
+                  "data.affordability.fixed_plan_cost.ci_high", "USD")]
     for oc in A.outcomes[1:]:
         cl.append(_c(f"averted.{oc}.point", "scalar", arts["point"], f"data.averted.{oc}", oc))
         cl.append(_c(f"averted.{oc}.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{oc}.median", oc,
