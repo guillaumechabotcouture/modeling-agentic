@@ -81,6 +81,45 @@ def decision_rule(A, out, plan) -> list[dict]:
 
 
 
+def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> dict:
+    """F6 S1-1b: with `uncertainty.affordability.enforce`, the plan solved within a budget reserve. The uncertainty
+    step's draws are evaluated once (same Drawer, seed and number of draws), and toolkit/analysis/uncertainty.py
+    reserve_search visits budget fractions (a grid from the floor, then bisection) and keeps the best visited plan whose
+    cost exceeds the allocatable budget in at most max_share_over_budget of those draws (not a proven optimum). No
+    visited fraction meeting the rule: AnalysisBlocked (fail closed).
+    Returns {solution, reserve (the point artifact's record), pre (the evaluated draws, for UQ.run)}."""
+    rule = A.spec["uncertainty"]["affordability"]
+    pre = UQ.evaluate_draws(A, draws, seed)
+    fl = UQ.RESERVE_FLOOR if floor is None else float(floor)
+    rs = UQ.reserve_search([r["cost"] for r in pre["rows"]], lambda b: A.solve(ben0, cost0, budget=b), A.budget,
+                           float(rule["max_share_over_budget"]), floor=fl)
+    st = rs["steps"]
+    if not rs["feasible"]:
+        raise AnalysisBlocked("affordability", [dict(s, kind="reserve_step") for s in st], reason=(
+            f"no visited fraction meets the affordability rule (at most {rule['max_share_over_budget']} of "
+            f"{pre['draws']} draws over budget): {len(st)} plans solved, at the full budget and at {rs['grid']} "
+            f"fractions from the floor of {fl:g}; the floor candidate "
+            + ("was proved infeasible by the solver" if st[1].get("infeasible") else
+               f"is over budget in {st[1]['draws_over_budget']} draws")
+            + ". This is not a proof that no plan within a reserve meets the rule"))
+    u0, f = st[0], rs["fraction"]
+    obj_u, obj_a = float(sol0["objective"]), float(rs["solution"]["objective"])
+    sol = rs["solution"] if f < 1.0 else sol0
+    plan_cost = lambda s: float(sum(cost0[i][s["choice"][i]] for i in A.ids))  # noqa: E731
+    given = obj_u - obj_a if f < 1.0 else 0.0
+    reserve = {"rule": dict(rule), "outcome": A.primary, "fraction": f, "budget_allocatable": float(A.budget),
+               "budget_planned": f * float(A.budget), "reserve_usd": (1.0 - f) * float(A.budget),
+               "draws": pre["draws"], "seed": pre["seed"],
+               "unconstrained": {"objective": obj_u, "cost": plan_cost(sol0), "plan": dict(sol0["choice"]),
+                                 "draws_over_budget": u0["draws_over_budget"], "share_over_budget": u0["share_over_budget"]},
+               "affordable": {"objective": float(sol["objective"]), "cost": plan_cost(sol), "plan": dict(sol["choice"]),
+                              "draws_over_budget": rs["draws_over_budget"], "share_over_budget": rs["share_over_budget"]},
+               "value_given_up": given, "value_given_up_pct": 100.0 * given / obj_u if obj_u > 0 else None,
+               "search": {k: rs[k] for k in ("result", "floor_met", "grid", "tolerance", "floor", "max_solves", "solves",
+                                             "converged", "steps")}}
+    return {"solution": sol, "reserve": reserve, "pre": pre}
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
@@ -254,8 +293,16 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     events0 = list(A.last_events)
     sol = A.solve(ben0, cost0)
+    reserve = pre = None
+    if (spec["uncertainty"].get("affordability") or {}).get("enforce"):
+        # F6 S1-1b: the headline plan is the one solved within the reserve that meets the affordability rule
+        ap = affordable_plan(A, ben0, cost0, sol, draws=draws)
+        sol, reserve, pre = ap["solution"], ap["reserve"], ap["pre"]
+        A.set_reserve(reserve["fraction"])
+        log(f"affordability: plan within {reserve['fraction']:.4f} of the budget ({reserve['reserve_usd']:,.0f} held "
+            f"back), {reserve['value_given_up_pct'] or 0:.2f}% of the objective given up")
     plan = sol["choice"]
-    A.guard("point plan", [plan], events0)   # Codex P1-6; every later evaluation is guarded too (r2 P1-3)
+    A.guard("point plan", [plan] + ([reserve["unconstrained"]["plan"]] if reserve else []), events0)  # Codex P1-6
     on_plan = []
     point = A.summary(plan, out0, cost0)
     from toolkit.engines.contract import engine_identity
@@ -274,11 +321,13 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                "z": z0[i], **({"calibration_flag": A.flagged[i]["reason"],
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
+    if reserve is not None:
+        point["reserve"] = reserve
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
-    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws)
+    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
@@ -483,8 +532,12 @@ def _self_test() -> int:
                and u5["budget_allocatable"] == A5.budget,
                f"R5e with drawn cost multipliers each draw's cost equals an independent replay, and the rule is judged "
                f"on those draws ({u5.get('draws_over_budget')} of 8 over)")
+            _self_test_reserve(ok, A5, R, u5)
         finally:
             A5.spec.raw["uncertainty"] = saved
+            if hasattr(A5, "set_reserve"):
+                A5.set_reserve(None)
+            A5.plan_budget = None
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
@@ -644,6 +697,7 @@ def _self_test() -> int:
         finally:
             EmulatorModel.predict = orig
         _self_test_round2(ok, d, q)
+        _self_test_reserve_e2e(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -1003,6 +1057,144 @@ def _self_test_test_ranges(ok, q):
         ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
            and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
            f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
+
+
+def _self_test_reserve(ok, A, R, u_unc):
+    """F6 S1-1b on the emulator-path analysis, with a drawn cost multiplier (costs vary by draw): the unconstrained
+    plan fails the rule; the enforced plan, solved within a reserve, meets it on the same draws, and the contract
+    check finds nothing; the reserve and the value given up are reported; an unreachable rule blocks."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract, uncertainty as U
+    plan0 = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    _o, ben0, cost0 = A.evaluate(A.theta0, z0)
+    sol0 = A.solve(ben0, cost0)
+    fn = globals().get("affordable_plan")
+    ok(callable(fn) and sol0["choice"] == plan0, "R5g affordable_plan() exists; the point plan re-solves unchanged")
+    if not callable(fn):
+        return
+    rule = {"max_share_over_budget": 0.2, "enforce": True}
+    A.spec.raw["uncertainty"]["affordability"] = rule
+    ok(u_unc["rule_met"] is False, f"R5h the unconstrained plan fails the rule on these draws "
+                                   f"({u_unc['draws_over_budget']} of 8 over, at most 0.2)")
+    res = fn(A, ben0, cost0, sol0, draws=8, seed=3)
+    rv, plan1 = res["reserve"], res["solution"]["choice"]
+    if hasattr(A, "set_reserve"):
+        A.set_reserve(rv["fraction"])
+    A.plan_budget = rv["budget_planned"]
+    u1 = U.run(A, plan1, "total_dalys_averted", draws=8, seed=3, pre=res["pre"])["data"]
+    af1 = u1["affordability"]
+    with tempfile.TemporaryDirectory() as t:
+        open(os.path.join(t, contract.SPEC), "w").write(yaml.safe_dump({"uncertainty": {"affordability": rule}}))
+        f_aff = contract._affordability(t, {"draws": 8, "affordability": af1})
+        f_unc = contract._affordability(t, {"draws": 8, "affordability": dict(u_unc, rule=rule)})
+    ok(af1["rule_met"] is True and f_aff == [] and f_unc and af1["draws_over_budget"] == rv["affordable"]["draws_over_budget"]
+       and rv["unconstrained"]["draws_over_budget"] == u_unc["draws_over_budget"],
+       f"R5i the enforced plan meets the rule on the uncertainty step's own draws and the contract check finds nothing; "
+       f"the unconstrained plan is a finding ({af1['draws_over_budget']} of 8 over; {f_aff[:1]})")
+    ok(0.5 <= rv["fraction"] < 1.0 and abs(rv["reserve_usd"] - (1 - rv["fraction"]) * A.budget) < 1e-6
+       and abs(rv["value_given_up"] - (rv["unconstrained"]["objective"] - rv["affordable"]["objective"])) < 1e-9
+       and rv["value_given_up"] >= 0 and abs(rv["value_given_up_pct"] - 100 * rv["value_given_up"]
+                                             / rv["unconstrained"]["objective"]) < 1e-9
+       and rv["search"]["steps"][0]["fraction"] == 1.0 and rv["search"]["tolerance"] > 0
+       and (rv.get("affordable") or {}).get("plan") == plan1 and rv["search"].get("result") == "best_visited"
+       and u1.get("budget_planned") == rv["budget_planned"],
+       f"R5j the reserve (fraction {rv['fraction']:.4f}, {rv['reserve_usd']:,.0f} USD held back) and the value given "
+       f"up ({rv['value_given_up_pct']:.2f}%) are reported with the search steps")
+    A.spec.raw["uncertainty"]["affordability"] = {"max_share_over_budget": 0.0, "enforce": True}
+    A.spec.raw["uncertainty"]["sources"][-1] = {"kind": "costs", "items": {"ca": [1.9, 2.0]}}
+    try:
+        fn(A, ben0, cost0, sol0, draws=8, seed=3, floor=0.95)
+        ok(False, "R5k a rule no plan at or above the floor meets blocks the analysis")
+    except AnalysisBlocked as e:
+        ok(e.where == "affordability" and "no visited fraction" in (e.reason or "")
+           and "not a proof" in (e.reason or ""),
+           f"R5k a rule no visited plan meets blocks the analysis, and the reason claims only what was visited: "
+           f"{e.reason}")
+    A.spec.raw["uncertainty"]["affordability"] = rule
+    # Codex S1-1b P2: an undefined percentage (zero unconstrained objective) is not a claim; the ledger never gets null
+    arts = R["artifacts"]
+    ids = lambda rr: {c["id"] for c in CL.claim_spec(A, arts, dict(R["point"], reserve=rr), R["uncertainty"],  # noqa: E731
+                                                      R["stability"], R["decision_tests"], R["calibration"])}
+    ok("reserve.value_given_up_pct" in ids(rv)
+       and "reserve.value_given_up_pct" not in ids(dict(rv, value_given_up_pct=None))
+       and "reserve.value_given_up" in ids(dict(rv, value_given_up_pct=None)),
+       "R5l a zero unconstrained objective leaves the value given up in percent undefined: that claim is omitted")
+    # Codex S1-1b P2: the envelope test and the frontier keep the reserve; the unchanged envelope does not move the plan
+    if hasattr(A, "set_reserve"):
+        A.set_reserve(rv["fraction"])
+    _o0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    env = float(A.spec["constraints"]["envelope_usd"])
+    try:
+        t = DT.run_one(A, {"id": "env_same", "type": "envelope", "values": [env]}, z0, ben0, cost0, plan1, u1)
+        fr = FD.frontier(A, ben0, cost0, _o0)
+        p1 = next((x for x in fr["points"] if x["fraction"] == 1.0), {})
+        ok(t["share_units_changed"] == 0.0 and not t["decision_changes"]
+           and abs(p1.get("objective", -1) - rv["affordable"]["objective"]) <= 1e-9 * max(1.0, abs(p1.get("objective", 1))),
+           f"R5m with the reserve, the unchanged envelope shows NO_CHANGE ({t['share_units_changed']}) and the frontier "
+           f"at fraction 1 is the affordable plan ({p1.get('objective')} vs {rv['affordable']['objective']})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5m the envelope test and frontier keep the reserve: {type(e).__name__}: {e}")
+
+
+def _self_test_reserve_e2e(ok, d, q):
+    """F6 S1-1b end to end: a signed spec that enforces the rule; point.yaml, claims and api.headline carry the reserve,
+    and the contract checks pass."""
+    import yaml
+    from toolkit.analysis import api, contract
+
+    def mut(r):
+        r["uncertainty"]["sources"] = list(r["uncertainty"]["sources"]) + [{"kind": "costs", "items": {"ca": [0.5, 2.0]}}]
+        r["uncertainty"]["excluded"] = [x for x in r["uncertainty"].get("excluded") or [] if x.get("kind") != "costs"]
+        r["uncertainty"]["affordability"] = {"max_share_over_budget": 0.2, "enforce": True}
+    try:
+        _resign(d, mut)
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R33 an enforced affordability rule runs end to end: {type(e).__name__}: {e}")
+        return
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))["data"]
+    rv = pt.get("reserve") or {}
+    af = R["uncertainty"]["affordability"]
+    ok(rv.get("fraction") is not None and pt["plan"] == R["point"]["plan"] and af["rule_met"] is True
+       and (rv.get("affordable") or {}).get("plan") == pt["plan"]
+       and abs(pt["solver"]["objective"] - rv["affordable"]["objective"]) < 1e-9,
+       f"R33 the headline plan is the affordable plan, and it meets the rule: {af['draws_over_budget']} of 8 over")
+    cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+    hl = api.headline(d)
+    ok({"reserve.fraction", "reserve.usd", "reserve.value_given_up", "reserve.value_given_up_pct"} <= cs
+       and {"reserve_fraction", "reserve_usd", "value_given_up", "value_given_up_pct"} <= set(hl),
+       f"R34 claims and api.headline carry the reserve and the value given up: {sorted(k for k in hl if 'reserve' in k)}")
+    ok(contract.gate_findings(d) == [], f"R35 the contract checks pass on an enforced run: {contract.gate_findings(d)}")
+    # Codex S1-1b P2: with enforce, the contract requires the reserve record and checks it against the artifacts
+    unc = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    rule = {"max_share_over_budget": 0.2, "enforce": True}
+    rf = getattr(contract, "reserve_findings", None)
+    ok(callable(rf) and rf(rule, pt, unc) == [], "R37 reserve_findings() passes the enforced run's own artifacts")
+    if callable(rf):
+        u0 = next(iter(pt["plan"]))
+        alt = dict(pt["plan"], **{u0: "none" if pt["plan"][u0] != "none" else "a"})
+        for label, p_, u_ in (
+                ("no reserve record", {k: v for k, v in pt.items() if k != "reserve"}, unc),
+                ("published plan is not the reserve plan", dict(pt, plan=alt), unc),
+                ("planned budget is not fraction x budget", dict(pt, reserve=dict(rv, budget_planned=rv["budget_planned"] + 1)), unc),
+                ("dollars held back do not add up", dict(pt, reserve=dict(rv, reserve_usd=rv["reserve_usd"] + 1)), unc),
+                ("seed differs from the uncertainty step's", dict(pt, reserve=dict(rv, seed=rv["seed"] + 1)), unc),
+                ("draw count differs", dict(pt, reserve=dict(rv, draws=rv["draws"] + 1)), unc),
+                ("affordable count disagrees with the uncertainty step", pt,
+                 dict(unc, affordability=dict(unc["affordability"], draws_over_budget=unc["affordability"]["draws_over_budget"] + 1))),
+                ("draws planned at another budget", pt, dict(unc, budget_planned=unc.get("budget_planned", 0) + 1)),
+                ("the reserve plan breaks the rule", dict(pt, reserve=dict(rv, affordable=dict(rv["affordable"], share_over_budget=0.5,
+                                                                                          draws_over_budget=4))), unc)):
+            ok(bool(rf(rule, p_, u_)), f"R38 reserve contract, {label}: a finding")
+    # Codex S1-1b P2: a rebuild of an enforced run restores the reserved budget before it solves
+    try:
+        Ar, plan_r, *_ = FD.rebuild(d, log=q)
+        ok(plan_r == pt["plan"] and abs((Ar.plan_budget or 0) - rv["budget_planned"]) < 1e-9,
+           f"R36 rebuild() restores the reserve and reproduces the enforced plan (plan budget {Ar.plan_budget})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R36 rebuild() of an enforced run: {type(e).__name__}: {e}")
 
 
 def _resign(d, mutate):

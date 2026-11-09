@@ -111,6 +111,11 @@ def headline(run_dir: str) -> dict:
         out.update({"fixed_plan_share_over_budget": float(af["share_over_budget"]),
                     "fixed_plan_cost_median": float(af["fixed_plan_cost"]["median"]),
                     "fixed_plan_cost_hi": float(af["fixed_plan_cost"]["ci_high"])})
+    rv = p.get("reserve") or {}
+    if rv:                     # F6 S1-1b: the reserve that makes the plan meet the affordability rule
+        out.update({"reserve_fraction": float(rv["fraction"]), "reserve_usd": float(rv["reserve_usd"]),
+                    "value_given_up": float(rv["value_given_up"]),
+                    "value_given_up_pct": None if rv["value_given_up_pct"] is None else float(rv["value_given_up_pct"])})
     try:
         s = read(run_dir, "analysis/stability.yaml")["data"]
         if s["metrics"].get("total_benefit_loss_pct_worst_fold") is not None:

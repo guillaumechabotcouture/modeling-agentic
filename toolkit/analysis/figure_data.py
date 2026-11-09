@@ -70,7 +70,7 @@ def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
                             "within it (options.packages.within_envelope): a plan there could use a dropped package"})
             continue
         try:
-            sol = A.solve(ben0, cost0, budget=b)
+            sol = A.solve(ben0, cost0, budget=A.planned(b))      # F6 S1-1b: the same reserve fraction
         except RuntimeError as e:
             if str(e).strip() == "optimizer status infeasible":
                 infeasible.append({"fraction": f, "envelope_usd": f * env, "reason": "the solver proves no "
@@ -83,7 +83,9 @@ def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
                              "(extrapolation, clips, floors) bear on this plan", "examples": hits[:3]})
             continue
         s = A.summary(sol["choice"], out0, cost0)
-        rows.append({"fraction": f, "envelope_usd": f * env, "budget_allocatable": b, "objective": sol["objective"],
+        rows.append({"fraction": f, "envelope_usd": f * env, "budget_allocatable": b,
+                     **({"budget_planned": A.planned(b)} if getattr(A, "reserve_fraction", None) is not None else {}),
+                     "objective": sol["objective"],
                      "cost": s["cost_allocated"], "averted": s["averted"], "packages": s["packages"], "mix": s["mix"]})
     by = {r["fraction"]: r for r in rows}
     marg = None
@@ -416,8 +418,16 @@ def rebuild(run_dir: str, log=print):
     z0 = {i: v[0] for i, v in cal0.items()}
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     A.point_events = list(A.last_events)
-    sol = A.solve(ben0, cost0)
     point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
+    if ((spec["uncertainty"].get("affordability") or {}).get("enforce")):
+        # F6 S1-1b: an enforced run's plan was solved within its reserve; restore it before solving
+        rv = point.get("reserve")
+        f = rv.get("fraction") if isinstance(rv, dict) else None
+        if not (isinstance(f, (int, float)) and not isinstance(f, bool) and 0 < f <= 1
+                and abs(float(rv.get("budget_planned", -1)) - f * A.budget) <= 1e-9 * max(1.0, A.budget)):
+            raise RebuildRefused("the spec enforces the affordability rule but point.yaml has no consistent reserve")
+        A.set_reserve(f)
+    sol = A.solve(ben0, cost0)
     plan = {str(k): v for k, v in point["plan"].items()}
     diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
     if diff:

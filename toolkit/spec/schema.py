@@ -76,9 +76,14 @@ docs/design/v2-spec-and-analysis.md §1):
                source: "<citation>", verified: unverified}}
                                            # engine-card priors (the engine's priors.yaml) are drawn without being
                                            # listed (kind `priors`, toolkit/spec/priors.py); the label names them
-      affordability: {max_share_over_budget: 0.1}   # optional (F6 S1-1): the share of draws in which the point plan
-                                           # may cost more than the allocatable budget; above it, a gate finding.
-                                           # Without it the share is reported, not judged
+      affordability: {max_share_over_budget: 0.1, enforce: false}   # optional (F6 S1-1): the share of draws in
+                                           # which the point plan may cost more than the allocatable budget; above
+                                           # it, a gate finding. Without it the share is reported, not judged.
+                                           # enforce: true (S1-1b) plans within a reserve: the best visited
+                                           # budget fraction (a grid from 0.5, then bisection) whose plan meets the
+                                           # rule on the uncertainty draws, not a proven optimum; the same fraction
+                                           # applies to envelope tests and the frontier; no visited fraction
+                                           # meeting the rule blocks the analysis
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
@@ -1199,10 +1204,13 @@ def _validate_uncertainty(s, pnames) -> list[str]:
         bad.append("uncertainty.level: in [0.5, 1)")
     if "affordability" in u:      # F6 S1-1: the share of draws in which the fixed plan may exceed the budget
         af = u["affordability"]
-        if not isinstance(af, dict) or set(af) != {"max_share_over_budget"}:
-            bad.append("uncertainty.affordability: a mapping with one key, max_share_over_budget")
+        if not isinstance(af, dict) or "max_share_over_budget" not in af or not set(af) <= {"max_share_over_budget",
+                                                                                            "enforce"}:
+            bad.append("uncertainty.affordability: a mapping with max_share_over_budget and optionally enforce")
         elif not (_isnum(af["max_share_over_budget"]) and 0 <= af["max_share_over_budget"] < 1):
             bad.append("uncertainty.affordability.max_share_over_budget: in [0, 1)")
+        elif not isinstance(af.get("enforce", False), bool):
+            bad.append("uncertainty.affordability.enforce: true or false")
     items = {it.get("id") for it in s.raw["options"].get("cost_items") or []}
     for src in u.get("sources") or []:
         if src.get("kind") == "costs":
@@ -1508,6 +1516,15 @@ def _self_test() -> int:
         r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1}
         ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
            "SP8f a well-formed affordability rule validates")
+        # F6 S1-1b: `enforce` asks the analysis for a plan that meets the rule (a budget reserve)
+        bad(lambda r: r["uncertainty"].update(affordability={"enforce": True}), "uncertainty.affordability",
+            "SP8j enforce without max_share_over_budget is refused")
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share_over_budget": 0.1, "enforce": "yes"}),
+            "uncertainty.affordability.enforce", "SP8k a non-boolean enforce is refused")
+        for en in (True, False):
+            r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1, "enforce": en}
+            ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
+               f"SP8l an affordability rule with enforce: {en} validates")
         # a list column whose empty list is written as a declared token (a blank cell is refused as
         # attribute_column_empty, so an empty list needs an explicit marker)
         ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}
