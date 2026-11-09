@@ -682,6 +682,9 @@ def _self_test() -> int:
             gate_findings(d, 6, c2)
             ok(c[0]["owner_item"]["fingerprint"] != c2[0]["owner_item"]["fingerprint"],
                "SO28 a changed source analysis (same summary claim) is a new item")
+            c3 = [dict(sa, claim="UNSTABLE: " + "the package flips in this unit; " * 40)]   # F6 S1-7
+            gate_findings(d, 6, c3)
+            ok(c3[0]["owner_item"]["claim"] == c3[0]["claim"], "SO28b the owner is shown the finding's full claim")
             # SO29 (#4): owner items in accept blockers make a signable request, once each.
             it = c2[0]["owner_item"]
             p0 = record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": it}],

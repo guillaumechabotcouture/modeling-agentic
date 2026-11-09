@@ -456,6 +456,16 @@ def _self_test() -> int:
             ok(True, "L12 an unreadable ledger line fails closed")
         ok(decision_test_result(d, "../x.yaml")["valid"] is False and decision_test_result(d, "nope.yaml")["valid"] is False,
            "L13 a decision test outside the run or missing is invalid")
+        # L15 (F6 S1-7): a finding's claim is kept in full, from a critic and from the gate.
+        longc = "a claim that runs well past six hundred characters; " * 20
+        d15 = os.path.join(d, "l15")
+        os.makedirs(d15)
+        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-003", "severity": "MEDIUM", "claim": longc}]},
+                       open(os.path.join(d15, CRITIQUE_FILES["critique-domain"]), "w"))
+        led, _ = sync(d15, {"rigor_violations": [{"kind": "long_gate", "severity": "MEDIUM", "stage": "MODEL",
+                                                  "claim": longc}]}, 1)
+        ok(led["D-003"].claim == longc and led["long_gate"].claim == longc,
+           "L15 the ledger keeps each finding's full claim")
     # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         open(os.path.join(out, "v"), "w").write("untouched")

@@ -626,6 +626,30 @@ def _run_self_test() -> int:
     ok(set(VERDICTS) >= {"CLEAN", "REVISE", "MAJOR_REVISION"},
        "T-verdicts: VERDICTS must include the Phase 7 vocabulary")
 
+    # F6 S1-7: a report whose run was not accepted uses no acceptance language
+    # (the terms live in .claude/orchestration/acceptance_language.yaml).
+    over = ("# Report\n\nThe allocation was accepted. The model is validated against the trials, "
+            "and the analysis shows conclusively that the plan is best.\n")
+    honest = ("# Report\n\nRun status: declared scope, not accepted. The model was tested against the "
+              "trials; it is not validated against cases by state.\n")
+    for status, text, want in (("completed_scope_declared", over, 3), ("completed", over, 0),
+                               ("completed_scope_declared", honest, 0), (None, over, 3)):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "report.md"), "w").write(text)
+            if status:
+                json.dump({"status": status}, open(os.path.join(d, "metadata.json"), "w"))
+            r = writer_qa(d)
+            hits = [i for i in r.issues if i.kind == "acceptance_language"]
+            ok(len(hits) == want and all(i.severity == "MAJOR" for i in hits),
+               f"T-accept: status {status}: {want} acceptance-language issue(s) expected, got "
+               f"{[i.evidence for i in hits]}")
+    try:
+        terms = load_acceptance_language()["terms"]
+    except Exception as e:  # noqa: BLE001
+        terms = [str(e)]
+    ok(any(t.get("id") == "accepted" for t in terms if isinstance(t, dict)),
+       f"T-accept-manifest: the terms come from the manifest: {terms}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f_ in failures:

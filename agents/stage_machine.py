@@ -2338,6 +2338,58 @@ def _self_test() -> int:
         ok(rc not in (0, None) and st70 == "awaiting" and rc2 == 0 and _SO.status(d70) == "signed",
            f"T70 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
            f"(rc {rc}, {st70}; rc {rc2}, {_SO.status(d70)})")
+        # T80-T83 (F6 S1-7): declared findings keep their full text and remedy; not judged is not a pass;
+        # a declared-scope report says so and uses no acceptance language. The fixture mimics F5's three
+        # declarations whose claims were cut mid-sentence (D-003, R-001, R-002).
+        import yaml
+        f80 = os.path.join(td, "t80")
+        os.makedirs(f80)
+        longc = {i: (f"{i}: the effect used for this component is a fixed value with no cited source, and the "
+                     "chosen package in each unit depends on it; " * 4 + f"END-{i}.") for i in ("D-003", "R-001", "R-002")}
+        fix = {i: "Replace the fixed value with a sourced range and rerun the decision test; " * 3 + f"FIX-{i}."
+               for i in longc}
+        jd = [{"file": "manuscript.md", "exists": True}, {"judgement": "a sourced range is used"}]
+        for fn, ids in (("critique_domain.yaml", ["D-003"]), ("critique_redteam.yaml", ["R-001", "R-002"])):
+            yaml.safe_dump({"blockers": [{"id": i, "severity": "MEDIUM", "target_stage": "MODEL", "resolved": False,
+                                          "first_seen_round": 1, "claim": longc[i], "fix_requires": fix[i],
+                                          "done_when": jd} for i in ids]}, open(os.path.join(f80, fn), "w"))
+        yaml.safe_dump({"schema_version": 1}, open(os.path.join(f80, AB.SPEC_FILE), "w"))
+        open(os.path.join(f80, "manuscript.md"), "w").write("The plan is described here.\n")
+        try:
+            op80 = open_findings(f80, {"action": "ACCEPT", "rigor_violations": []})
+            g80 = apply_medium_rule({"action": "ACCEPT"}, op80, rounds_remaining=0, budget_ok=True)
+            write_declared(f80, op80, g80)
+            dec80 = yaml.safe_load(open(os.path.join(f80, DECLARED_FILE)))["declared"]
+            ok(g80["action"] == "DECLARE_SCOPE" and len(dec80) == 3
+               and all(e["claim"] == longc[e["id"]] and e.get("required_remedy") == fix[e["id"]]
+                       and 0 < len(e.get("label") or "") <= 160 for e in dec80),
+               f"T80 declared_findings.yaml keeps each full claim and required remedy, with a separate short label "
+               f"({[(e['id'], len(e['claim']), bool(e.get('required_remedy'))) for e in dec80]})")
+            render_report(f80, AB, status="completed_scope_declared")
+            rep80 = open(os.path.join(f80, "report.md")).read()
+            ok(all(longc[i] in rep80 and fix[i] in rep80 for i in longc)
+               and "Run status: declared scope, not accepted" in rep80.split("\n\n")[0],
+               "T81 the report repeats each declaration in full with its remedy, under a 'declared scope, not "
+               "accepted' status line")
+        except Exception as e:  # noqa: BLE001 -- the α tests fail, they do not crash the suite
+            ok(False, f"T80/T81 raised {type(e).__name__}: {e}")
+        try:
+            open(os.path.join(f80, "manuscript.md"), "w").write("The allocation was accepted and is validated.\n")
+            k82 = [(f["kind"], f["severity"]) for f in report_acceptance_findings(f80, "declared")]
+            ok(("report_acceptance_language", "MEDIUM") in k82 and not report_acceptance_findings(f80, "accepted"),
+               f"T82 acceptance language in a declared-scope write-up is a finding; in an accepted one it is not ({k82})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T82 raised {type(e).__name__}: {e}")
+        try:
+            nj = {"action": "ACCEPT", "rule_matched": 4,
+                  "done_when_status": {"D-009": {"passes": None, "result": "not_judged", "open": True,
+                                                 "severity": "MEDIUM", "detail": "not judged"}}}
+            r83 = require_judged(dict(nj))
+            ok(r83["action"] != "ACCEPT" and r83.get("check_summary", {}).get("not_judged") == 1
+               and "D-009" in json.dumps(r83),
+               f"T83 a required check that is not judged cannot yield ACCEPT ({r83.get('action')})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T83 raised {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

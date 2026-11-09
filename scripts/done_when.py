@@ -680,6 +680,32 @@ def _self_test() -> int:
         ok(st["M-001"]["mechanical"] and st["M-001"]["passes"] is False, f"DW17 status per test: {st}")
         ok(check_cli(d, ["R-005"]) == 0 and check_cli(d, ["M-001"]) == 1 and check_cli(d, ["Z-9"]) == 1,
            "DW18 the check command exits 0 only when every named test passes")
+        # DW24-DW26 (F6 S1-7): a test that is not judged is reported as not judged, never as a pass.
+        long_claim = "The case-management effect is a fixed value with no source; " * 8
+        cj = {"critique-domain": {"blockers": [
+            {"id": "D-003", "severity": "HIGH", "resolved": False, "claim": long_claim,
+             "done_when": [{"file": "alloc.csv", "exists": True}, {"judgement": "the effect is sourced"}]},
+            {"id": "D-004", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "alloc.csv", "exists": True}},
+            {"id": "D-005", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "never.csv", "exists": True}}]}}
+        dj = os.path.join(d, "s17")
+        os.makedirs(dj)
+        open(os.path.join(dj, "alloc.csv"), "w").write("unit,package\na,P1\n")
+        rj = run(dj, cj, 1)
+        sj = rj["status"]
+        ok(sj["D-003"].get("result") == "not_judged" and sj["D-004"].get("result") == "passed"
+           and sj["D-005"].get("result") == "failed" and not sj["D-003"]["detail"].startswith("pass"),
+           f"DW24 each test has a result: passed, failed or not_judged; a pending judgement never reads as a pass: {sj}")
+        try:
+            sm = summary(sj)
+        except NameError as e:
+            sm = {"error": str(e)}
+        ok(sm.get("passed") == 1 and sm.get("failed") == 1 and sm.get("not_judged") == 1
+           and sm.get("required_not_judged") == ["D-003"],
+           f"DW25 the summary counts passed, failed and not judged separately, and names the open ones: {sm}")
+        ok(load_registry(dj)["tests"]["D-003"]["claim"] == long_claim,
+           "DW26 the registry keeps the finding's full claim")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
