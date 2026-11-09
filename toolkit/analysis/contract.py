@@ -178,7 +178,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc, pt_doc, bv_doc = None, None, None, None, None
+    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc = None, None, None, None, None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -264,6 +264,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             pt_doc = doc.get("data") or {}
         if kind == "burden_validation":
             bv_doc = doc.get("data") or {}
+        if kind == "plan_variants":
+            pv_doc = doc.get("data") or {}
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -282,6 +284,8 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _affordability(run_dir, unc_doc or {})
     out += _reserve(run_dir, pt_doc, unc_doc or {})
+    if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
+        out += _plan_variants(run_dir, pt_doc, pv_doc)
     out += _burden(run_dir, bv_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
@@ -410,6 +414,15 @@ def _posterior_provenance(rel, cal: dict, unc: dict) -> list[dict]:
         return [_f(kind, f"{rel}: the canonical sample is unreadable ({e})", rel)]
     return [_f(kind, f"{rel}: {len(found)} draw values are not the canonical sample's rows (e.g. {found[0]})", rel)] \
         if found else []
+
+
+def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
+    from toolkit.analysis import variants as V
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_plan_variants", f"{SPEC} unreadable: {e}")]
+    return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
 def _decision_tests(run_dir, man) -> list[dict]:

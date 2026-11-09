@@ -17,6 +17,7 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/claims.py"
 SPEC_REL = os.path.join("models", "claims_spec.yaml")
+GROUPS_LISTED = 40      # results.md lists at most this many groups' choices for a group-rule variant
 GROUPS_SHOWN = 3        # results.md names the groups with the most units changing package in each decision test
 
 
@@ -144,10 +145,10 @@ def _spec_rows(A, claimable=False) -> list[dict]:
     return [r for r in PV.rows(A.spec, A.eng) if not claimable or _claimable(r["name"])]
 
 
-def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -> dict:
+def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, burden=None) -> dict:
     B, R = _scripts()
     spec = {"producer": PRODUCER, "produced_by": "harness",
-            "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden)}
+            "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden) + variant_claims(A, arts, pv)}
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().write_nofollow(run_dir, SPEC_REL.replace(os.sep, "/"),
                               yaml.safe_dump(spec, sort_keys=False, width=120).encode(), atomic=True)
@@ -157,7 +158,7 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, burden=Non
     if doc.get("unresolved"):
         raise RuntimeError(f"claims ledger: unresolved harness claims {doc['unresolved'][:3]}")
     claims = R.load_claims(os.path.join(run_dir, "models", "claims_ledger.yaml"))
-    text = results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden)
+    text = results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden) + variants_markdown(A, pv)
     rendered, unresolved = R.render_text(text, claims)
     if unresolved:
         raise RuntimeError(f"results.md: unresolved claims {unresolved}")
@@ -181,6 +182,62 @@ def attribute_simplifications(A) -> list[str]:
     from toolkit.spec import schema
     b, bad = schema.load_binding(A.eng)
     return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b), problems=bad)
+
+
+def variant_claims(A, arts, pv) -> list[dict]:
+    """F6 S1-6: each solved plan variant's value lost, dollars moved, unfunded units and units changing package."""
+    out = []
+    for j, v in enumerate((pv or {}).get("variants") or []):
+        if v.get("status") != "solved":
+            continue
+        f, c = f"data.variants[{j}]", f"variant.{v['id']}"
+        out += [_c(f"{c}.value_lost", "scalar", arts["plan_variants"], f"{f}.value_lost", A.primary),
+                _c(f"{c}.dollars", "currency", arts["plan_variants"], f"{f}.dollars_moved", "USD"),
+                _c(f"{c}.reallocated", "currency", arts["plan_variants"], f"{f}.dollars_reallocated", "USD"),
+                _c(f"{c}.no_package", "count", arts["plan_variants"], f"{f}.units_no_package", "units"),
+                _c(f"{c}.units_changed", "count", arts["plan_variants"], f"{f}.units_changed", "units")]
+        if v.get("value_lost_pct") is not None:      # undefined when the unconstrained objective is not positive
+            out.append(_c(f"{c}.value_lost_pct", "percentage", arts["plan_variants"], f"{f}.value_lost_pct", "%"))
+        if v.get("group_choices") is not None:
+            out.append(_c(f"{c}.groups_none", "count", arts["plan_variants"], f"{f}.groups_none", "groups"))
+    if pv:
+        out.append(_c("variant.unconstrained.no_package", "count", arts["plan_variants"],
+                      "data.unconstrained.units_no_package", "units"))
+    return out
+
+
+def variants_markdown(A, pv) -> str:
+    """results.md section for the plan variants: words from code, numbers from claims."""
+    if not pv:
+        return ""
+    hv = pv["headline"]
+    L = ["", "## Plan variants", "",
+         "Each variant is solved on the point outcomes and costs within the same budget as the headline plan, and "
+         "compared with the unconstrained plan (units with no package there: [CLAIM:variant.unconstrained.no_package]). "
+         + ("The headline plan is the unconstrained plan." if hv == "unconstrained" else
+            f"The headline plan is the variant {hv}, as the spec states (analysis.plan_variants.headline)."), "",
+         f"| Variant | Rule | Value lost ({A.primary}) | Value lost (% of the unconstrained plan) | Dollars moved between "
+         "components | Dollars reallocated between units | Units changing package | Units with no package |",
+         "|---|---|---|---|---|---|---|---|"]
+    for v in pv["variants"]:
+        c = f"variant.{v['id']}"
+        if v.get("status") != "solved":
+            L.append(f"| {v['id']} | {v['text']} | not solved: {v.get('reason', '')} | | | | | |")
+            continue
+        L.append(f"| {v['id']} | {v['text']} | [CLAIM:{c}.value_lost] | "
+                 + (f"[CLAIM:{c}.value_lost_pct]" if v.get("value_lost_pct") is not None else "n/a")
+                 + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.reallocated] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
+    for v in pv["variants"]:        # Codex S1-6 r1 P3: what a group rule allows, and what each group chose
+        if v.get("status") != "solved" or v.get("group_choices") is None:
+            continue
+        ch = v["group_choices"]
+        L += ["", f"{v['id']}: one decision per {v['by']} on {', '.join(v['components'])}; "
+              + ("every group must provide one of them (provide: true). " if v.get("provide") else
+                 "a group may share no provision (none); to require provision, set provide: true. ")
+              + f"Groups choosing none: [CLAIM:variant.{v['id']}.groups_none]. Choices: "
+              + "; ".join(f"{g}: {k}" for g, k in list(ch.items())[:GROUPS_LISTED])
+              + (" ..." if len(ch) > GROUPS_LISTED else "") + " (all in the plan_variants artifact)."]
+    return "\n".join(L) + "\n"
 
 
 def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -> str:

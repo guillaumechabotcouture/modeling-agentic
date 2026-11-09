@@ -41,6 +41,7 @@ KINDS = {
     "stability": ("method", "folds", "metrics", "verdict", "value_verdict"),
     "sensitivity": ("rows",),
     "decision_tests": ("tests",),
+    "plan_variants": ("headline", "unconstrained", "variants"),     # optional (F6 S1-6: analysis.plan_variants)
     "figure_data": ("frontier", "dollars", "by_package", "burden", "schedule"),
     "figures": ("figures",),
     "trajectories": ("status", "sample", "series"),
