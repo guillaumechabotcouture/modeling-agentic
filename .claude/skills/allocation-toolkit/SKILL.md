@@ -65,6 +65,10 @@ apart.
    output is a `per_outcome` item (`incremental: true` for the package minus
    the package without this component); pass
    `outcome=<fn(unit_row, package) -> {name: value}>` to `costs.cost_matrix`.
+   Setup, supervision or capacity that a unit pays once for receiving a
+   component is a `per_unit` item beside it. Each item lists what its price
+   `includes`; two items of one component may not list the same part unless
+   one states `not_double_counted: {<other id>: <reason>}`.
 4. **Benefit** comes from the model: `benefit[unit][package]`, one number per
    feasible pair, in the objective's units.
 5. **Optimize and benchmark in one call:**

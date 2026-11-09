@@ -146,6 +146,7 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join("models", "mechanism_manifest.yaml")
+REGRET_TOL = 1e-9   # F6 S1-5: as toolkit/analysis/moves.py (regret under a non-positive optimum, relative to max(1, |obj|))
 STATUSES = ("modelled", "fixed", "simplified")
 _CODE_EXT = (".py", ".r", ".jl", ".ipynb")
 
@@ -365,7 +366,11 @@ def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
                     res.get("point_plan_feasible") is False
                     or (_num(res.get("reoptimised_objective")) is not None and _num(res["reoptimised_objective"]) <= 0
                         and _num(res.get("regret")) is not None)):
-                continue        # undefined, and the file says why: an infeasible point plan, or a zero objective
+                # undefined, and the file says why: an infeasible point plan (no regret), or a non-positive objective,
+                # where any regret above the tolerance is a change (toolkit/analysis/moves.py fires, REGRET_TOL)
+                if _num(res.get("regret")) is not None and res.get("point_plan_feasible") is not False:
+                    crit[name] = (_num(res["regret"]), REGRET_TOL * max(1.0, abs(_num(res["reoptimised_objective"]))))
+                continue
             if v is None or t is None or not 0 <= t <= 1:
                 out.append(_f("mechanism_manifest_invalid", "HIGH",
                               f"`{rel}`: {vk} and {tk} must both be numbers ({tk} a fraction in [0, 1]) when either "

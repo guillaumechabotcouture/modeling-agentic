@@ -92,6 +92,7 @@ class Analysis:
         self.joint = None
         self.flagged = {}
         self.last_events = []
+        self.last_cost_floors = []
         # F6 S1-1b: with an enforced affordability rule, plans are solved within a reserve (fraction x budget); every
         # re-optimisation (draws, stability, sensitivity) then compares like with like. `budget` stays the allocatable
         # envelope that affordability is judged against.
@@ -155,7 +156,9 @@ class Analysis:
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]
         fn = lambda u, p: out[str(u[self.spec.uid])]["cost"][p]  # noqa: E731
-        cm = acosts.cost_matrix(self.alloc, units, outcome=fn)
+        floors = []
+        cm = acosts.cost_matrix(self.alloc, units, outcome=fn, floors=floors)
+        self.last_cost_floors = floors       # F6 S1-3: incremental per-outcome costs floored at zero here
         comp_of = {it["id"]: it["component"] for it in self.alloc["cost_items"]}
         by = {i: {k: {} for k in self.pk} for i in ids}
         for i in ids:
