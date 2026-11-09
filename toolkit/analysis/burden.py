@@ -123,13 +123,36 @@ def _same_file(a, b) -> bool:
     return bool(a and b and (a[0] == b[0] or a[1] == b[1] or a[2] == b[2]))
 
 
-def provenance(s) -> dict:
-    """The reference file's identity and the calibration inputs it was checked to be independent of."""
+def read_reference(base, rel) -> bytes:
+    """The reference file's bytes, read once through one fd under the run dir with no link followed at any component:
+    an absolute path, an empty, `.` or `..` component, or a link anywhere is refused (ValueError), never normalised.
+    Validation, the sign-off sheet, signing, status and the analysis all read the file through this one semantics
+    (Codex #165 r4)."""
+    from toolkit.analysis.artifacts import _safe_io
+    sio = _safe_io()
+    try:
+        return sio.read_nofollow(base, str(rel))[0]
+    except FileNotFoundError:
+        raise ValueError(f"{rel}: the reference file does not exist") from None
+    except (sio.LinkRefused, OSError) as e:
+        raise ValueError(f"{rel}: the reference file cannot be read as a plain path inside the run directory without "
+                         f"following a link ({e})") from None
+
+
+def provenance(s, data=None) -> dict:
+    """The reference file's identity and the calibration inputs it was checked to be independent of. `data`: the
+    bytes already read (the sheet, signing and the analysis each read the file once); its hash is of those bytes."""
+    import hashlib
     path = csv_path(s)
-    me = _identity(path)
+    try:
+        data = read_reference(s.base, config(s)["csv"]) if data is None else data
+    except ValueError:
+        data = None
+    st = _identity(path)
+    me = (st[0], st[1], hashlib.sha256(data).hexdigest()) if st and data is not None else None
     ins = [(c["path"], _identity(c["path"])) for c in calibration_inputs(s)]
     rel = lambda q: os.path.relpath(q, s.base) if os.path.isabs(q) else q  # noqa: E731
-    refs = load_references(s)[0]
+    refs = load_references(s, data)[0] if data is not None else []
     cids, cbad = calibration_source_ids(s)
     shared = [x["id"] for x in refs if x["source_id"] in cids or set(x["derived_from"]) & set(cids)]
     return {"csv": config(s)["csv"], "realpath": me[0] if me else None, "sha256": me[2] if me else None,
@@ -140,7 +163,7 @@ def provenance(s) -> dict:
             "independent": bool(me) and not any(_same_file(me, i) for _q, i in ins) and not shared and not cbad}
 
 
-def sheet_lines(raw, run_dir) -> list[str]:
+def sheet_lines(raw, run_dir, data=None) -> list[str]:
     """The sign-off sheet's section: each reference's declared sources beside the calibration's, which signing
     attests are independent (it cannot be inferred from the numbers)."""
     if section(raw) is None:
@@ -149,7 +172,8 @@ def sheet_lines(raw, run_dir) -> list[str]:
     try:
         from toolkit.spec import schema
         sp = schema.Spec(raw, run_dir)
-        pv, (refs, bad) = provenance(sp), load_references(sp)
+        data = read_reference(run_dir, config(sp)["csv"]) if data is None else data     # one read
+        pv, (refs, bad) = provenance(sp, data), load_references(sp, data)
     except Exception as e:  # noqa: BLE001 -- the sheet says so rather than omitting the section
         return out + [f"Unreadable: {type(e).__name__}: {e}", ""]
     out += [f"Signing attests that no reference below comes from, or is derived from, a source the calibration fits "
@@ -198,8 +222,9 @@ def calibration_source_ids(s) -> tuple[list[str], list[str]]:
     return sorted(ids), bad
 
 
-def load_references(s) -> tuple[list[dict], list[str]]:
-    """(references, problems) for the spec's validation.burden: its keys and the reference CSV contract."""
+def load_references(s, data=None) -> tuple[list[dict], list[str]]:
+    """(references, problems) for the spec's validation.burden: its keys and the reference CSV contract. `data`: the
+    reference file's bytes when the caller already read them (else `s.burden_bytes`, else one read_reference)."""
     v = s.raw.get("validation")
     if v is None:
         return [], []
@@ -232,10 +257,12 @@ def load_references(s) -> tuple[list[dict], list[str]]:
             bad.append(f"{P}.csv: the same file as the calibration input {os.path.basename(c['path'])} (by path, "
                        "inode or content); references validate, they are never fitted")
     try:
-        with open(path, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except OSError as e:
-        return [], bad + [f"{P}.csv: unreadable: {e}"]
+        data = data if data is not None else getattr(s, "burden_bytes", None)
+        data = read_reference(s.base, cfg["csv"]) if data is None else data
+        import io
+        rows = list(csv.DictReader(io.StringIO(data.decode("utf-8"), newline="")))
+    except (ValueError, UnicodeDecodeError, csv.Error) as e:
+        return [], bad + [f"{P}.csv: {e}"]
     if not rows or set(COLUMNS) - set(rows[0]):
         return [], bad + [f"{P}.csv: needs a row and the columns {', '.join(COLUMNS)}"]
     groups = {str(u.get(cfg["group"])) for u in units} if cfg["group"] and cfg["group"] in units[0] else set()
@@ -362,7 +389,8 @@ class Collector:
 
     def __init__(self, A):
         self.A, self.cfg = A, config(A.spec)
-        self.refs, bad = load_references(A.spec)
+        self.data = read_reference(A.spec.base, self.cfg["csv"])        # read once: values, provenance
+        self.refs, bad = load_references(A.spec, self.data)
         if bad:
             raise ValueError("validation.burden: " + "; ".join(bad))
         self.draws = {r["id"]: [] for r in self.refs if not r["age_band"]}
@@ -467,7 +495,7 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
     t0, t1 = A.spec["objective"]["horizon"]
     cnt = {s: sum(x["status"] == s for x in rows) for s in STATUSES}
     return {"arm": arm, "group_column": cfg["group"], "window": [t0, t1], "csv": cfg["csv"],
-            "provenance": provenance(A.spec),
+            "provenance": provenance(A.spec, col.data),
             "draws": max((len(v) for v in col.draws.values()), default=0), "references": rows,
             "summary": dict(cnt, n=len(rows)), "daly_parts": daly_parts(A, cfg, arm, out0, by_pop, point),
             "statement": f"the {arm} arm's annual mean over {t0:g}-{t1:g} against each reference's year"}

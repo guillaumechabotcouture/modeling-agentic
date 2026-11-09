@@ -58,15 +58,21 @@ def burden_reference(spec_doc) -> str | None:
     calibration is attested on what the file declares (Codex #165 r3)."""
     b = ((spec_doc.get("validation") or {}) if isinstance(spec_doc, dict) else {}).get("burden")
     c = b.get("csv") if isinstance(b, dict) else None
-    return os.path.normpath(c) if isinstance(c, str) and c else None
+    return c if isinstance(c, str) and c else None        # never normalised: one no-follow semantics (r4)
+
+
+def _burden_bytes(run_dir: str, rel: str) -> bytes | None:
+    """The reference file's bytes through toolkit/analysis/burden.py read_reference (the analysis's own semantics: no
+    traversal component, no link); None when absent; ValueError when it cannot be read that way."""
+    from toolkit.analysis import burden as BV
+    if not os.path.lexists(os.path.join(run_dir, rel)) and ".." not in str(rel).replace("\\", "/").split("/"):
+        return None
+    return BV.read_reference(run_dir, rel)
 
 
 def _burden_sha(run_dir: str, rel: str) -> str | None:
-    """sha256 of the reference file through a no-follow fd; None when absent; ValueError when unreadable or a link."""
-    try:
-        return _sha_nofollow(run_dir, rel)
-    except OSError as e:
-        raise ValueError(f"{rel}: {e}") from None
+    b = _burden_bytes(run_dir, rel)
+    return hashlib.sha256(b).hexdigest() if b is not None else None
 
 
 def burden_changed(run_dir: str, rec: dict) -> list[str]:
@@ -173,9 +179,10 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except (yaml.YAMLError, UnicodeDecodeError):
         doc0 = {}
     brel = burden_reference(doc0)      # F6 S2-5: the reference file is bound like the derivation record
-    bsha = _burden_sha(run_dir, brel) if brel else None
-    if brel and bsha is None:
+    bdata = _burden_bytes(run_dir, brel) if brel else None      # read once: hashed and validated from these bytes
+    if brel and bdata is None:
         raise ValueError(f"{brel} (the validation.burden reference file) does not exist")
+    bsha = hashlib.sha256(bdata).hexdigest() if bdata is not None else None
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
@@ -210,7 +217,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         if not isinstance(geo_expect, str):
             raise ValueError(f"{SHEET} records no geometry evidence (it predates the geometry check): the sheet is "
                              "regenerated before the owner signs; read the new one")
-    errs = schema.validate(schema.load(os.path.join(run_dir, SPEC), data=data), pending_ok=True)
+    sp = schema.load(os.path.join(run_dir, SPEC), data=data)
+    sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
+    errs = schema.validate(sp, pending_ok=True)
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -301,12 +310,14 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     if isinstance(spec_doc, dict):
         geometry.run(run_dir, spec_doc)
     section = geometry.sheet_section(run_dir)
-    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section)
     brel = burden_reference(spec_doc)
-    try:
-        bsha = (_burden_sha(run_dir, brel) or "none") if brel else "none"
+    try:                                # F6 S2-5 (Codex r4): one read, shown and hashed
+        bbytes = _burden_bytes(run_dir, brel) if brel else None
+        bsha = (hashlib.sha256(bbytes).hexdigest() if bbytes is not None else "none") if brel else "none"
     except ValueError:
-        bsha = "unreadable"
+        bbytes, bsha = None, "unreadable"
+    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
+                 burden_bytes=bbytes)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
@@ -317,7 +328,8 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
-          record_bytes: bytes | None = None, geometry_section: tuple | None = None) -> str:
+          record_bytes: bytes | None = None, geometry_section: tuple | None = None,
+          burden_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -380,7 +392,7 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     from toolkit.spec import engine_parameters as PV
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
-    out += BV.sheet_lines(raw, run_dir)                 # F6 S2-5: reference sources the owner attests are independent
+    out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
