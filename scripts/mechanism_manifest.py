@@ -829,7 +829,7 @@ def _self_test() -> int:
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7e regret above its threshold, no change")
         w(d, "models/suff.yaml", dict(mv, triggered_by=["dollars"]))
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7f triggered_by its numbers contradict")
-        w(d, "models/suff.yaml", dict(mv, dollars_moved_share=0.3))
+        w(d, "models/suff.yaml", dict(mv, dollars_share=0.3))
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)),
            "MM7g dollars moved without its threshold fails closed")
         w(d, "models/model.py", "def mix_effect(u):\n    return u\n")

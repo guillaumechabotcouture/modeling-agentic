@@ -104,6 +104,10 @@ def population(A) -> dict:
     return {i: float(A.by_id[i][col]) for i in A.ids}
 
 
+def aggregate(rows: list) -> dict:
+    raise NotImplementedError
+
+
 def summarise(A, plan, ch, ben, cost, objective) -> dict:
     """compare() for the analysis state: its population, region, allocatable budget, thresholds and components."""
     reg = {i: A.by_id[i].get(A.region) for i in A.ids} if A.region else None
@@ -186,12 +190,58 @@ def _self_test() -> int:
                                     "scripts"))
     import mechanism_manifest as MM
     res = {"decision_changes": True, "share_units_changed": 0.05, "share_threshold": 0.1, "regret_share": 0.02,
-           "regret_threshold": 0.01, "dollars_moved_share": 0.0, "dollars_threshold": 0.05, "triggered_by": ["regret"]}
+           "regret_threshold": 0.01, "dollars_share": 0.0, "dollars_threshold": 0.05, "triggered_by": ["regret"]}
     ok(MM._result_conflicts("t.yaml", res, "x", None) == [],
        "MV12 a result changed on regret, below the share threshold, is consistent")
     ok(MM._result_conflicts("t.yaml", dict(res, decision_changes=False), "x", None) != []
        and MM._result_conflicts("t.yaml", dict(res, triggered_by=["share"]), "x", None) != [],
        "MV13 a verdict or triggered_by that its criteria contradict is a conflict")
+    # Codex r1 P2-1: a point plan the test makes infeasible (costs up, same budget) is a change, never NO_CHANGE
+    ids100 = [f"v{k}" for k in range(100)]
+    one = {i: {"none": {}, "a": {"a": 1.02}} for i in ids100}
+    b100 = {i: {"none": 0.0, "a": 1.0} for i in ids100}
+    p100 = {i: "a" for i in ids100}
+    c100 = dict(p100, v98="none", v99="none")
+    m5, e9 = attempt(compare, ids100, p100, c100, b100, one, 98.0, {i: 1.0 for i in ids100}, None, 100.0,
+                     {"share": 0.1, "regret": 0.01, "dollars": 0.05}, ["a"])
+    m5 = m5 or {}
+    ok(e9 is None and m5.get("point_plan_feasible") is False and abs(m5.get("objective_gap", 0) + 2.0) < 1e-9
+       and m5.get("regret") is None and "infeasible" in (m5.get("triggered_by") or []) and m5.get("decision_changes")
+       and m5.get("point_plan_infeasible"),
+       f"MV14 an infeasible point plan is reported and changes the plan; the signed gap is kept apart from regret "
+       f"({e9!r}, {m5.get('point_plan_feasible')}, {m5.get('triggered_by')})")
+    ok(MM._result_conflicts("t.yaml", dict(res, decision_changes=False, triggered_by=[], regret_share=0.0,
+                                           point_plan_feasible=False), "x", None) != [],
+       "MV15 the loader refuses NO_CHANGE for an infeasible point plan")
+    # Codex r1 P2-2: a zero objective leaves the regret share undefined, which the loader accepts when stated
+    z = {i: {"none": 0.0, "a": 0.0, "b": 0.0} for i in ids}
+    m6, _ = attempt(compare, ids, plan, plan, z, cc, 0.0, pop, reg, 100.0, thr, ["a", "b"])
+    rows = [dict(m6 or {}, value=1.0)]
+    agg, e10 = attempt(aggregate, rows)
+    doc = dict(agg or {}, varied="v", criterion="c", share_threshold=thr["share"], regret_threshold=thr["regret"],
+               dollars_threshold=thr["dollars"])
+    ok(e10 is None and doc.get("regret_share") is None and doc.get("decision_changes") is False
+       and MM._result_conflicts("t.yaml", doc, "x", None) == []
+       and MM._result_conflicts("t.yaml", dict(doc, reoptimised_objective=None), "x", None) != [],
+       f"MV16 zero objective, emitter to loader: an undefined regret share is accepted when the objective and the "
+       f"regret say why, refused otherwise ({e10!r})")
+    # Codex r1 P2-3: each worst value by criterion carries its own tested value and the matching breakdown
+    r_a = dict(m or {}, value="A", share_units_changed=0.1, dollars_share=0.3, dollars_by_component={"a": 30.0})
+    r_b = dict(m or {}, value="B", share_units_changed=0.7, dollars_share=0.01, dollars_by_component={"a": 1.0})
+    ag, e11 = attempt(aggregate, [r_a, r_b])
+    w = (ag or {}).get("worst_by_criterion") or {}
+    ok(e11 is None and w.get("dollars", {}).get("value") == "A" and w["dollars"]["dollars_by_component"] == {"a": 30.0}
+       and w.get("share", {}).get("value") == "B" and ag["dollars_share"] == 0.3 and ag["share_units_changed"] == 0.7,
+       f"MV17 maxima from different tested values each carry their own value and breakdown ({e11!r}, {w.keys()})")
+    # coordinator: money moved between units inside one component is counted (dollars reallocated)
+    p2, c2 = {"u1": "a", "u2": "none", "u3": "none", "u4": "none"}, {"u1": "none", "u2": "a", "u3": "none", "u4": "none"}
+    m7, _ = attempt(compare, ids, p2, c2, ben, cc, 5.0, pop, reg, 100.0, {"share": 0.9, "regret": 0.9, "dollars": 0.05},
+                    ["a", "b"])
+    m7 = m7 or {}
+    ok(m7.get("dollars_moved") == 0.0 and m7.get("dollars_reallocated") == 10.0
+       and abs(m7.get("dollars_share", 0) - 0.1) < 1e-12 and m7.get("triggered_by") == ["dollars"],
+       f"MV18 dollars reallocated between units inside one component trigger the dollars criterion "
+       f"({m7.get('dollars_moved')}, {m7.get('dollars_reallocated')}, {m7.get('triggered_by')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
