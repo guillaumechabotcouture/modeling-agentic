@@ -398,6 +398,7 @@ def _self_test() -> int:
        f"TC17 local_index converts through the local currency (Turner method 3): {validate(loc)}")
     ok(any("prices.local entries" in e for e in validate({**loc, "prices": spec["prices"]})),
        "TC18 local_index without local rates and index fails")
+    _self_test_structure(ok, spec, units, po, treated)
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
@@ -405,6 +406,91 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_structure(ok, spec, units, po, treated) -> None:
+    """F6 S1-3: a fixed cost per unit receiving a component, what each price includes, and floored increments."""
+    pu = {**spec, "cost_items": spec["cost_items"] + [
+        {"id": "c2_setup", "component": "c2", "value": 500.0, "price_year": 2024, "price_rule": "as_published",
+         "basis": "per_unit", "years": 3, "includes": ["supervision", "setup"]}]}
+    ok(validate(pu) == [], f"TC25 a per_unit cost item is valid: {validate(pu)}")
+    try:
+        m = cost_matrix(pu, units)
+        ok(m["u0"]["c2"]["items"].get("c2_setup") == 1500.0 and m["u3"]["c1+c2"]["items"].get("c2_setup") == 1500.0
+           and "c2_setup" not in m["u0"]["c1"]["items"] and m["u0"]["none"]["total"] == 0.0,
+           f"TC26 per_unit charges value x years once per unit receiving the component, whatever its population: {m['u0']}")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC26 per_unit is costed: {e!r}")
+    ok(any("per_unit" in e and "population" in e for e in validate(
+        {**pu, "cost_items": pu["cost_items"][:-1] + [{**pu["cost_items"][-1], "population": "total"}]})),
+       "TC27 a per_unit item charged on a population is refused (it is charged once per unit)")
+    # The hand calculation: 3 units, pick one of none / t / p per unit. t costs $1,000 and averts 100 everywhere; p
+    # costs $2,000 and averts 150, 140, 130. Budget $3,000. Without a fixed part the optimum is t in all three
+    # (300 averted, $3,000; p + t is 250). With a per-unit fixed cost of $1,500 for t, t costs $2,500 a unit, so
+    # nothing pairs within $3,000 and the best single option is p in u0 (150 averted, $2,000).
+    try:
+        from toolkit.alloc import optimize as opt, packages as pkm
+    except ImportError:
+        import optimize as opt   # noqa: E402  (run as a script from toolkit/alloc)
+        import packages as pkm   # noqa: E402
+    hu = [{"id": f"h{i}", "pop": 1000, "elig": 1000} for i in range(3)]
+    hs = {"units": {"id": "id", "populations": {"total": "pop", "eligible": "elig"}},
+          "components": {"t": {}, "p": {"eligible": "eligible"}}, "packages": {"none": [], "t": ["t"], "p": ["p"]},
+          "prices": {"base_year": 2024, "index": {"2024": 1.0}},
+          "cost_items": [{"id": "t_drug", "component": "t", "value": 1.0, "price_year": 2024, "price_rule": "index",
+                          "basis": "per_person", "includes": ["treatment"]},
+                         {"id": "p_all_in", "component": "p", "value": 2.0, "price_year": 2024, "price_rule": "index",
+                          "basis": "per_eligible", "includes": ["drug", "delivery"]}]}
+    hb = {f"h{i}": {"none": 0.0, "t": 100.0, "p": 150.0 - 10 * i} for i in range(3)}
+
+    def plan(s):
+        cm = cost_matrix(s, hu)
+        r = opt.solve(hb, {u: {p: v["total"] for p, v in ps.items()} for u, ps in cm.items()},
+                      pkm.feasibility(s, hu), 3000.0, method="ilp")
+        return r["choice"], r["objective"]
+    c0, o0 = plan(hs)
+    ok(c0 == {"h0": "t", "h1": "t", "h2": "t"} and abs(o0 - 300.0) < 1e-9, f"TC28 without a fixed part: t everywhere, 300 ({c0}, {o0})")
+    try:
+        c1, o1 = plan({**hs, "cost_items": hs["cost_items"] + [
+            {"id": "t_capacity", "component": "t", "value": 1500.0, "price_year": 2024, "price_rule": "index",
+             "basis": "per_unit", "includes": ["supervision", "capacity"]}]})
+        ok(c1 == {"h0": "p", "h1": "none", "h2": "none"} and abs(o1 - 150.0) < 1e-9,
+           f"TC29 a $1,500 fixed part per unit for t moves the plan to p in h0 alone, 150, as computed by hand ({c1}, {o1})")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC29 a per-unit fixed part changes the plan as computed by hand: {e!r}")
+    # what each price includes: a per-outcome item and a per-unit item that both list a programme are refused
+    ov = {**po, "cost_items": po["cost_items"][:-1] + [
+        {**po["cost_items"][-1], "includes": ["treatment", "programme"]},
+        {"id": "c2_programme", "component": "c2", "value": 900.0, "price_year": 2024, "price_rule": "index",
+         "basis": "per_unit", "includes": ["programme", "supervision"]}]}
+    ev = validate(ov)
+    ok(any("c2_per_case and c2_programme both include programme" in e and "not_double_counted" in e for e in ev),
+       f"TC30 a per-outcome and a per-unit item listing the same part are refused, and the remedy is named: {ev}")
+    why = {**ov, "cost_items": ov["cost_items"][:-1] + [
+        {**ov["cost_items"][-1], "not_double_counted": {"c2_per_case": "the per-case price covers only staff time "
+                                                        "per case; this item is the fixed programme overhead"}}]}
+    ok(validate(why) == [], f"TC31 ... unless the spec states why they do not double count: {validate(why)}")
+    for bad, label in (({"c2_per_case": "short"}, "a reason under 10 characters"),
+                       ({"c1_delivered": "covers a different component entirely"}, "a reason naming an item it "
+                                                                                    "does not overlap")):
+        b2 = {**ov, "cost_items": ov["cost_items"][:-1] + [{**ov["cost_items"][-1], "not_double_counted": bad}]}
+        ok(any("not_double_counted" in e for e in validate(b2)), f"TC32 {label} is refused")
+    # floored increments: c2 adds 30 treated cases alone, but with c1 the package has fewer cases than c1 alone
+    # (prevention removes them), so the increment is floored at zero in every unit's c1+c2 package
+    neg = lambda u, p: {"treated": 100.0 + (30.0 if "c2" in packages(po)[p] else 0.0)  # noqa: E731
+                        - (50.0 if packages(po)[p] == {"c1", "c2"} else 0.0)}
+    try:
+        fl: list = []
+        mf = cost_matrix(po, units, outcome=neg, floors=fl)
+        rep = floor_report(fl)
+        ok(mf["u0"]["c1+c2"]["items"]["c2_per_case"] == 0.0 and rep.get("n_unit_packages") == len(units)
+           and rep.get("by_item") == {"c2_per_case": len(units)} and "not a cost" in rep.get("statement", ""),
+           f"TC33 floored per-outcome increments are counted as units x packages, with a statement: {rep}")
+        fl2: list = []
+        cost_matrix(po, units, outcome=treated, floors=fl2)
+        ok(floor_report(fl2).get("n_unit_packages") == 0, "TC34 no floor applied: a count of zero")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC33 floored increments are reported: {e!r}")
 
 
 def main(argv=None) -> int:

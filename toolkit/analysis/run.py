@@ -543,6 +543,7 @@ def _self_test() -> int:
             if hasattr(A5, "set_reserve"):
                 A5.set_reserve(None)
             A5.plan_budget = None
+        _self_test_cost_structure(ok, A5, R)
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
@@ -1103,6 +1104,61 @@ def _self_test_test_ranges(ok, q):
         ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
            and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
            f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
+
+
+def _self_test_cost_structure(ok, A, R):
+    """F6 S1-3 on the emulator-path analysis: a per-unit fixed cost item for component a enters every cost path (the
+    point costs, drawn cost multipliers, the uncertainty draws, the figures' dollars); the point records floored
+    per-outcome increments, and the results state them."""
+    import copy
+    from toolkit.analysis import figure_data as FD, uncertainty as U
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    out0, _b, cost0 = A.evaluate(A.theta0, z0)
+    d0 = FD.dollars(A, plan, out0)["by_component"]["a"]
+    item = {"id": "ca_setup", "component": "a", "value": 100.0, "price_year": "2024", "price_rule": "as_published",
+            "basis": "per_unit", "includes": ["setup", "supervision"]}
+    saved = (copy.deepcopy(A.alloc), copy.deepcopy(A.spec.raw["options"]), copy.deepcopy(A.spec.raw["uncertainty"]))
+    try:
+        A.alloc["cost_items"].append(dict(item))
+        A.spec.raw["options"]["cost_items"].append(dict(item))
+        _o, _b, c1 = A.evaluate(A.theta0, z0)
+        _o, _b, c2 = A.evaluate(A.theta0, z0, cost_mult={"ca_setup": 2.0})
+        ok(all(abs(c1[i][k] - cost0[i][k] - (100.0 if "a" in A.pk[k] else 0.0)) < 1e-9
+               and abs(c2[i][k] - cost0[i][k] - (200.0 if "a" in A.pk[k] else 0.0)) < 1e-9 for i in A.ids for k in A.pk),
+           "R5n a per-unit fixed cost is charged once per unit whose package has the component, and its cost "
+           "multiplier scales it (point and draws)")
+        n_a = sum("a" in A.pk[plan[i]] for i in A.ids)
+        ok(abs(FD.dollars(A, plan, out0)["by_component"]["a"] - d0 - 100.0 * n_a) < 1e-6,
+           f"R5o the figures' dollars by component carry the fixed part ({n_a} units with a)")
+        A.spec.raw["uncertainty"]["sources"] = list(saved[2]["sources"]) + [{"kind": "costs",
+                                                                            "items": {"ca_setup": [0.5, 2.0]}}]
+        A.spec.raw["uncertainty"]["excluded"] = [x for x in saved[2].get("excluded") or [] if x.get("kind") != "costs"]
+        af = U.run(A, plan, "total_dalys_averted", draws=6, seed=5)["data"]["affordability"]
+        D = U.Drawer(A, 5)
+        D.prepare(6)
+        want = []
+        for _ in range(6):
+            th, zs, noise, mult, _s = D.draw()
+            _o, _b, cd = A.evaluate(th, zs, noise=noise, cost_mult=mult)
+            want.append(sum(cd[i][plan[i]] for i in A.ids))
+        ok(af.get("per_draw_cost") == want and len({round(c, 6) for c in want}) > 1,
+           "R5p the uncertainty draws cost the plan with the drawn multiplier on the fixed part")
+    finally:
+        A.alloc, A.spec.raw["options"], A.spec.raw["uncertainty"] = saved
+    fl = R["point"].get("cost_floors") or {}
+    ok(fl.get("n_unit_packages") == 0 and fl.get("items") == [] and "statement" in fl,
+       f"R5q the point records floored per-outcome increments (none in this toy): {fl}")
+    fake = dict(R["point"], cost_floors={"items": ["x"], "n_unit_packages": 3, "by_item": {"x": 3},
+                                         "statement": "S1-3 floor statement"})
+    txt = CL.results_template(A, fake, R["uncertainty"], R["stability"], R["sensitivity"], R["decision_tests"],
+                              R["calibration"], R["emulator_accuracy"])
+    ids = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                              "calibration", "engine")}, fake, R["uncertainty"],
+                                          R["stability"], R["decision_tests"], R["calibration"])}
+    ok("[CLAIM:cost.floored_unit_packages]" in txt and "S1-3 floor statement" in txt
+       and "cost.floored_unit_packages" in ids,
+       "R5r the results state the floored increments, with the count as a claim")
 
 
 def _self_test_reserve(ok, A, R, u_unc):
