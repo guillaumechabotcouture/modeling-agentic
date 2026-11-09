@@ -437,7 +437,7 @@ def _self_test() -> int:
             yaml.safe_dump(pk_, open(os.path.join(d, "pack.yaml"), "w"))
             from toolkit.engines.contract import ToyEngine
             res = BM.stamp(BM.run_pack(pk_, eng, BM.Runner(pk_, eng, 1), {}), eng)
-            ok(all(r.get("band_sha256") == band_digest(b) for r, b in zip(res["benchmarks"], pk_["benchmarks"])),
+            ok(all(r.get("band_sha256") == band_digest(b, pk_) for r, b in zip(res["benchmarks"], pk_["benchmarks"])),
                "BS36 results rows carry the digest of their band declaration")
             rp = os.path.join(d, "results.yaml")
             yaml.safe_dump(res, open(rp, "w"))
@@ -531,7 +531,7 @@ def _self_test() -> int:
         from toolkit.engines.malaria.engine import MalariaEngine
         me = MalariaEngine()
         doc = {"producer": BM.PRODUCER, "engine_identity": {"code_sha256": code_fingerprint(me)},
-               "benchmarks": [{"id": b["id"], "status": "in_band", "band_sha256": band_digest(b)} for b in pk["benchmarks"]]}
+               "benchmarks": [{"id": b["id"], "status": "in_band", "band_sha256": band_digest(b, pk)} for b in pk["benchmarks"]]}
         doc["benchmarks"][[b["id"] for b in pk["benchmarks"]].index("B10")]["band_sha256"] = "an older declaration"
         try:
             ES.benchmark_acceptance(me, doc=doc)
@@ -539,6 +539,66 @@ def _self_test() -> int:
         except ValueError as ex:
             ok("rerun required: B10" in str(ex), f"BS48 estimates acceptance refuses a stale status: {ex}")
     case("BS48", r2_4)
+
+    # ---- review round 3 (Codex, PR #154)
+    def r3_1():
+        fd = {"band_declarations": band_declarations(toy, ["T1"])}
+        b0 = toy["benchmarks"][0]
+        obs = dict(toy, benchmarks=[dict(b0, estimand=dict(b0["estimand"], value="windows.w.prev"))])
+        sett = dict(toy, settings={"s": {"unit": {"x": 0.5}}})
+        row = {"id": "T1", "band_sha256": band_digest(b0, toy)}
+        ok(stale_ids(obs, [row]) == ["T1"] and fitted_problems(fd, obs) == ["refit required: T1"],
+           "BS49 changing only the observable makes the stored row stale and the fit need a refit")
+        ok(stale_ids(sett, [row]) == ["T1"] and fitted_problems(fd, sett) == ["refit required: T1"],
+           "BS50 changing only an arm's setting makes the stored row stale and the fit need a refit")
+        rule = dict(toy, fit=[{"param": "eff_a", "grid": [0.1, 0.9], "targets": ["T1"]}])
+        ok(fitted_problems(fd, rule) != [], "BS51 changing the fit rule (grid, box, design) needs a refit")
+    case("BS49-51", r3_1)
+
+    def r3_2():
+        from toolkit.engines.contract import ToyEngine
+        with tempfile.TemporaryDirectory() as d:
+            yaml.safe_dump(toy, open(os.path.join(d, "pack.yaml"), "w"))
+            res = BM.stamp(BM.run_pack(toy, eng, BM.Runner(toy, eng, 1), {}), eng)
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(res, open(rp, "w"))
+            got = {}
+            b0 = toy["benchmarks"][0]
+            for name, pk_ in (("malformed", dict(toy, benchmarks=toy["benchmarks"] + [None])),
+                              ("estimand", dict(toy, benchmarks=[dict(b0, estimand_type="hazard_ratio")]))):
+                yaml.safe_dump(pk_, open(os.path.join(d, "pack.yaml"), "w"))
+                got[name] = BM.verified_benchmarks(ToyEngine(results_path=rp))
+            open(os.path.join(d, "pack.yaml"), "w").write(":: [")
+            got["unreadable"] = BM.verified_benchmarks(ToyEngine(results_path=rp))
+        ok(got["malformed"][0] == [] and "not a mapping" in str(got["malformed"][1])
+           and got["estimand"][0] == [] and "estimand_mapping" in str(got["estimand"][1])
+           and got["unreadable"][0] == [] and "unreadable" in str(got["unreadable"][1]),
+           f"BS52 verified_benchmarks refuses a pack whose sources fail the check or that cannot be read: {got}")
+    case("BS52", r3_2)
+
+    def r3_3():
+        import types
+
+        class Fitted:
+            def parameters(self):
+                return [types.SimpleNamespace(name="k", kind="fitted")]
+
+        class Unfitted:
+            def parameters(self):
+                return [types.SimpleNamespace(name="k", kind="fixed")]
+        with tempfile.TemporaryDirectory() as d:
+            gone = os.path.join(d, "fitted.yaml")
+            link = os.path.join(d, "dangling.yaml")
+            os.symlink(os.path.join(d, "nowhere.yaml"), link)
+            res = {}
+            for name, cls, fp in (("missing", Fitted, gone), ("dangling", Fitted, link), ("unfitted", Unfitted, gone)):
+                e = cls()
+                e.fitted_path = fp
+                res[name] = engine_fitted_problems(e)
+        ok(all("refit required" in str(res[k]) for k in ("missing", "dangling")) and res["unfitted"] == [],
+           f"BS53 a configured fitted file that is missing or a dangling link is unusable evidence for an engine with "
+           f"fitted parameters; an engine with none is exempt: {res}")
+    case("BS53", r3_3)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
