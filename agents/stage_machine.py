@@ -2506,6 +2506,15 @@ def _self_test() -> int:
                f"in an accepted one it is not ({k82})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"T82 raised {type(e).__name__}: {e}")
+        try:   # round 3: an indented block marker still ends the negated clause, in the machine's check too
+            hits82 = []
+            for t82 in ("Not run\n  - Validated against trials.\n", "Not accepted\n   ## Validated allocation\n",
+                        "Not tested\n  > Validated by the trial\n"):
+                open(os.path.join(f80, "manuscript.md"), "w").write(t82)
+                hits82.append(bool(report_acceptance_findings(f80, "declared")))
+            ok(all(hits82), f"T82b indented bullets, headings and quotes keep their clause boundary ({hits82})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T82b raised {type(e).__name__}: {e}")
         try:
             nj = {"action": "ACCEPT", "rule_matched": 4,
                   "done_when_status": {"D-009": {"passes": None, "result": "not_judged", "open": True,
@@ -2563,6 +2572,29 @@ def _self_test() -> int:
                 ok(s == want and not any(c.endswith(":repair") for c in T.calls)
                    and os.path.exists(os.path.join(d, "report.md")),
                    f"T89 'not yet' + soft break + 'validated' is negated: delivered, no repair ({s})")
+        # T90-T91 (round 3): the rejected report is quarantined before its repair; a repair with no budget or a
+        # failed repair task ends with no deliverable report.md (the rejected one stays in report_withheld.md).
+        from v2_tasks import TaskResult as _TR
+        for name, outcome in (("t90", None), ("t91", _TR(False, None, 0.0, "stub: failed"))):
+            d, T, st = new_run(name, {"critics": {1: {"critique-presentation": [nofix84]}},
+                                      "manuscript": "The plan is validated against the trials.\n"}, max_rounds=1)
+            m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+            real_task = m._task
+
+            def _task(key, name_, *args, _real=real_task, _out=outcome, **kw):
+                if name_ == "write" and len(args) > 2:      # the language repair (feedback given)
+                    return _out
+                return _real(key, name_, *args, **kw)
+            m._task = _task
+            try:
+                s = m.run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            rp, wp = os.path.join(d, "report.md"), os.path.join(d, "report_withheld.md")
+            ok(s == "completed_no_report" and not os.path.exists(rp) and os.path.exists(wp)
+               and "validated" in open(wp).read(),
+               f"T{name[1:]} a repair {'with no budget' if outcome is None else 'that fails'} leaves no deliverable "
+               f"report with acceptance language ({s}, report.md exists: {os.path.exists(rp)})")
         # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
         # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
         judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",
