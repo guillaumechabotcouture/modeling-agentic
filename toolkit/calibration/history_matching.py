@@ -2445,6 +2445,18 @@ def _self_test() -> int:
                 ok(isinstance(e, CalibrationInputError), f"HM29 refused: {why}")
     safe(hm29, "HM29")
 
+    def hm30():          # one block per unit (one survey shared by the group, the other the unit's own error)
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.1 + (0.4 if g == "g0" else -0.3), 0.7)  # noqa: E731
+        P, sim = gtoy({"g0": 5, "g1": 5}, f0, f1, obs, sd_b=0.3, key=lambda ob, g: f"{ob}|{g}" if ob == "w0" else None)
+        r = calibrate(P, sim, seed=2, waves=1, log=q, candidates_log2=8, points_per_unit=20)
+        b = r.get("bias") or {}
+        ok(r["status"] == "matched" and set(b) == {"w0|g0", "w0|g1"} and all(abs(v["z"]) <= 3 for v in b.values())
+           and all(t.bias_key is None for t in P.targets if t.observable == "w1"),
+           f"HM30 one block per unit: matched, one offset per group inside its prior ({r['status']}, {b})")
+    safe(hm30, "HM30")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
