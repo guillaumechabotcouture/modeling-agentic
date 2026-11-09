@@ -880,7 +880,8 @@ def _self_test_priors(ok, q):
            f"RP4 the emulator-error model and its held-out evidence are in the report: {em and em['sd_common_median']}")
         prt = {x["test_id"]: x for x in R["decision_tests"]}
         t = prt.get("prior_range_dw")
-        ok(set(prt) == {"prior_range_dw", "prior_range_synergy"} and t["automatic"] and t["status"] == "run"
+        ok({k for k in prt if k.startswith("prior_range_")} == {"prior_range_dw", "prior_range_synergy"}
+           and t["automatic"] and t["status"] == "run"
            and [x["value"] for x in t["results"]] == [0.005, 0.02]
            and t["results"][0]["point_plan_objective_under_test"] < t["results"][1]["point_plan_objective_under_test"]
            and os.path.exists(os.path.join(d, t["path"])),
@@ -936,7 +937,8 @@ def _self_test_test_ranges(ok, q):
         r = yaml.safe_load(open(p))
         r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
         r["uncertainty"]["sources"].append({"kind": "emulator"})
-        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"},
+                                        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
         r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
                                             "values": [0.002], "text": "weaker weight, below the prior range"}]
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)

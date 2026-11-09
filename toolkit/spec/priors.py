@@ -240,11 +240,22 @@ def problems(spec) -> list[str]:
                           declared=PV.declared(spec))
     bad = card["problems"] + bad
     allp = set(all_priors(spec, eng, card, sp))
-    for name, why in excluded_parameters(u).items():
-        if name not in allp:
-            bad.append(f"uncertainty.excluded: parameter {name} has no prior (only a prior parameter is excluded by name)")
+    scen = {q.name: q for q in eng.parameters() if q.kind == "scenario"}
+    exc = excluded_parameters(u)
+    for name, why in exc.items():
+        if name not in allp and name not in scen:
+            bad.append(f"uncertainty.excluded: parameter {name} has no prior (only a prior parameter, or a scenario "
+                       "parameter, is excluded by name)")
         if not why:
             bad.append(f"uncertainty.excluded: parameter {name} needs a reason")
+    for name, q in sorted(scen.items()):
+        # F6 S1-4: a scenario value is a choice, not evidence; it is varied (its range enters the draws, the emulator
+        # design and an automatic decision test) or the spec says by name why it is held fixed
+        if name not in allp and name not in exc:
+            bad.append(f"scenario_without_range: engine parameter {name} is a scenario value ({q.value}) with no "
+                       f"declared range: give it one (uncertainty.priors.{name}: {{dist, range, source}}, or a range on "
+                       f"its engine_parameters value) so the draws vary it and it gets a decision test, or exclude it by "
+                       "name with a reason (uncertainty.excluded)")
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
     if spec.raw["calibration"].get("method") in ("likelihood", "posterior") and drawn(spec):
         bad.append(f"uncertainty: {spec.raw['calibration']['method']} calibration does not condition on prior draws (its fit and covariance hold "
@@ -328,8 +339,9 @@ def plan(spec) -> dict:
             row.update(status="drawn" if "calibration" in inc and ps.name in moves else "fixed",
                        source_kind="calibration", source=ps.source)
         elif ps.name in exc:
+            pr_ = card["priors"].get(ps.name) or sp.get(ps.name)
             row.update(status="fixed", reason=f"excluded by the spec: {exc[ps.name]}",
-                       prior=asdict(card["priors"].get(ps.name) or sp[ps.name]))
+                       prior=asdict(pr_) if pr_ is not None else None)
         elif ps.name in card["priors"] or ps.name in sp:
             row.update(status="fixed", reason=f"priors excluded by the spec: {kex.get('priors')}")
         elif ps.kind == "scenario":
@@ -421,7 +433,7 @@ def _self_test() -> int:
         ok(st == {"engine_parameters": "drawn", "calibration": "drawn", "costs": "excluded", "emulator": "excluded",
                   "priors": "drawn"}, f"PR3 the draw plan lists every source with its status: {st}")
         fx = {x["name"]: x for x in P["fixed"]}
-        ok(fx["synergy"]["reason"].startswith("scenario value") and fx["base"]["reason"] == "toy: no range"
+        ok(fx["synergy"]["reason"].startswith("excluded by the spec: toy") and fx["base"]["reason"] == "toy: no range"
            and fx["noise"]["status"] == "setting" and P["label_fixed"] == {"named": ["synergy"], "other": 2},
            f"PR4 fixed parameters are listed with why, scenario ones named for the label: {P['label_fixed']}")
         ok(P["prior_dominated"] == ["dw"] and P["drawn"][-1]["identifiability"] == "prior_dominated",
@@ -450,6 +462,7 @@ def _self_test() -> int:
         bad(lambda x: None, "only a fixed parameter", "PR13 a card prior on a fitted parameter is refused")
         toy_priors_file(d)
         r2 = copy.deepcopy(r)
+        r2["uncertainty"]["excluded"] = [x for x in r2["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
         r2["uncertainty"]["priors"] = {"synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "spec citation"}}
         r2["uncertainty"]["excluded"].append({"parameter": "dw", "reason": "owner: fixed for this test"})
         s2 = schema.Spec(r2, d)
