@@ -115,7 +115,7 @@ function specHTML(d) {
     `<div class="sub">Base year ${esc(pr.base_year || "—")}${pr.index_name ? `; ${T("price rule", "price index")}: ${esc(pr.index_name)} (${(pr.index || []).map(([y, v]) => `${esc(y)}: ${num(v)}`).join(" · ")})` : ""}.</div>` +
     tbl(["item", "component", ["value"], "price year", T("price rule", "rule"), T("cost basis", "basis"), "includes", [`${esc(pr.base_year || "base")} value`], [T("per person", "per person, window")]],
       (d.cost_items || []).map((c) => [esc(c.id), esc(c.component), money(c.value), esc(c.price_year || "—"), esc(c.rule || "—"),
-        esc(c.basis || "—") + (c.extra && c.extra.length ? `<div class="sub">${esc(c.extra.join("; "))}</div>` : ""), val(c.includes), money(c.base_value),
+        esc(c.basis || "—") + (c.extra && c.extra.length ? `<div class="sub">${esc(c.extra.join("; "))}</div>` : ""), val(c.includes) + (c.not_double_counted || []).map((n) => `<div class="sub">not a double count with ${esc(n.item)}: ${more(n.reason, 160)}</div>`).join(""), money(c.base_value),
         c.per_person != null ? money(c.per_person) + `<div class="sub">${esc(c.per_label)}</div>` : `<span class="muted" title="${esc(c.why_no_per_person || "")}">${esc(c.per_label || "—")}</span>`])));
   const o = d.objective || {}, k = d.constraints || {}, cp = d.comparator || {};
   h += section("Objective and constraints", `What the plan maximises, within which budget, against which ${T("comparator")}.`, "no.", d.file,
