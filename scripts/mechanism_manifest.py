@@ -353,10 +353,29 @@ def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
                       f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
-    if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
+    # F6 S1-5: regret and dollars moved are further criteria, each checked against its own threshold; the verdict
+    # is the union of the criteria given, and `triggered_by`, when given, names exactly those that fire
+    crit = {"share": (share, thr)}
+    for name, vk, tk in (("regret", "regret_share", "regret_threshold"),
+                         ("dollars", "dollars_moved_share", "dollars_threshold")):
+        if res.get(vk) is not None or res.get(tk) is not None:
+            v, t = _num(res.get(vk)), _num(res.get(tk))
+            if v is None or t is None or not 0 <= t <= 1:
+                out.append(_f("mechanism_manifest_invalid", "HIGH",
+                              f"`{rel}`: {vk} and {tk} must both be numbers ({tk} a fraction in [0, 1]) when either "
+                              f"is given (got {res.get(vk)!r}, {res.get(tk)!r})."))
+                continue
+            crit[name] = (v, t)
+    known = {k: v > t for k, (v, t) in crit.items() if v is not None and t is not None}
+    if known and any(known.values()) != res["decision_changes"]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
-                      f"`{rel}`: share_units_changed {share} vs share_threshold {thr} contradicts "
+                      f"`{rel}`: criteria {', '.join(f'{k} {crit[k][0]} vs {crit[k][1]}' for k in known)} contradict "
                       f"decision_changes: {res['decision_changes']}."))
+    tb = res.get("triggered_by")
+    if tb is not None and (not isinstance(tb, list) or sorted(map(str, tb)) != sorted(k for k, f in known.items() if f)):
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{rel}`: triggered_by {tb!r} is not the criteria its numbers fire "
+                      f"({sorted(k for k, f in known.items() if f)})."))
     if isinstance(restated, bool) and restated != res["decision_changes"]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{PATH}`: {label} restates decision_changes: {restated}, but its "

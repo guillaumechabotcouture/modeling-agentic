@@ -39,6 +39,20 @@ def clamped_hits(cal: dict) -> list:
             for i, v in (cal.get("units") or {}).items() if v.get("clamped")]
 
 
+class CostTable(dict):
+    """{unit: {package: total $}}, with `by_component` {unit: {package: {component: $}}} (F6 S1-5: the dollars a
+    re-solved plan moves between components)."""
+
+    def __init__(self, totals, by_component):
+        super().__init__(totals)
+        self.by_component = by_component
+
+
+def merge_costs(base: CostTable, part: CostTable) -> CostTable:
+    """`base` with the units of `part` replaced (a stability fold that re-evaluates its held-out units)."""
+    return CostTable({**base, **part}, {**base.by_component, **part.by_component})
+
+
 class AnalysisBlocked(RuntimeError):
     """The run stopped before publishing (analysis/blocked.yaml says why): model corrections bear on a plan, or (at
     the calibration step, `reason` given) units the calibration cannot match."""
@@ -142,12 +156,18 @@ class Analysis:
         units = [self.by_id[i] for i in ids]
         fn = lambda u, p: out[str(u[self.spec.uid])]["cost"][p]  # noqa: E731
         cm = acosts.cost_matrix(self.alloc, units, outcome=fn)
+        comp_of = {it["id"]: it["component"] for it in self.alloc["cost_items"]}
+        by = {i: {k: {} for k in self.pk} for i in ids}
+        for i in ids:
+            for k in self.pk:
+                for it, v in cm[i][k]["items"].items():
+                    by[i][k][comp_of[it]] = by[i][k].get(comp_of[it], 0.0) + v * (cost_mult or {}).get(it, 1.0)
         if cost_mult:
             cost = {i: {k: sum(v * cost_mult.get(it, 1.0) for it, v in cm[i][k]["items"].items()) for k in self.pk}
                     for i in ids}
         else:
             cost = {i: {k: cm[i][k]["total"] for k in self.pk} for i in ids}
-        return out, ben, cost
+        return out, ben, CostTable(cost, by)
 
     def plan_corrections(self, events, plan) -> list[dict]:
         """The model corrections (extrapolation, clips, floors) that bear on the plan: on a unit's chosen package,

@@ -987,10 +987,13 @@ def fig_decision_tests(R, t):
             ax.plot([float(th) / 100] * 2, [y - 0.35, y + 0.35], color=t["ink"], lw=1.2)
         if v == "CHANGES_PLAN":
             k += 1
-            ax.text(1.02, y, "changes the plan", transform=ax.get_yaxis_transform(), va="center", fontsize=7.5,
-                    color=t["ink"])
+            on = [c for c in x.get("triggered_by") or [] if c != "share"]      # F6 S1-5: say when not on the share
+            ax.text(1.02, y, "changes the plan" + (f" ({', '.join(on)})" if on else ""),
+                    transform=ax.get_yaxis_transform(), va="center", fontsize=7.5, color=t["ink"])
         rows.append({"test": x.get("test_id"), "verdict": v, "share_pct": sh, "threshold_pct": th,
-                     "statement": x.get("statement")})
+                     "regret_pct": x.get("regret_pct"), "dollars_moved_pct": x.get("dollars_moved_pct"),
+                     "population_changed": x.get("population_changed"),
+                     "triggered_by": ";".join(x.get("triggered_by") or []), "statement": x.get("statement")})
     ax.set_yticks(range(len(tests)))
     texts = {str(d.get("id")): str(d.get("text") or "") for d in
              ((R.spec.get("analysis") or {}).get("decision_tests") or []) if isinstance(d, dict)}
@@ -1008,7 +1011,8 @@ def fig_decision_tests(R, t):
     title = f"{k} of {n_run} decision tests change the plan" + (
         f"; {len(tests) - n_run} not run" if len(tests) > n_run else "")
     cap = ("Each decision test re-solves the plan under its alternative and counts the units that change package; "
-           "filled bars cross the test's threshold.")
+           "filled bars change the plan, on the share or (named at right) on regret or dollars moved between "
+           "components; the table gives all three.")
     return fig, title, cap, rows, "decision tests: does the plan change?"
 
 
@@ -1827,6 +1831,8 @@ def fig_sensitivity(R, t):
                                                                              or 0))
             thr, changes, by = spec_thr, None, f"sensitivity re-optimisation ({spec_src})"
             changes = share > thr
+            if "decision_changes" in r["low"]:      # F6 S1-5: each end's own criteria (share, regret, dollars)
+                changes = bool(r["low"]["decision_changes"] or r["high"].get("decision_changes"))
         out.append({"name": r["name"], "label": R.labels.parameter(r["name"]), "units": R.labels.parameter_units(r["name"]),
                     "point": r.get("point"), "low": r["low"]["value"], "high": r["high"]["value"], "d_low": lo,
                     "d_high": hi, "changes_plan": bool(changes), "share_units_changed": share, "threshold": thr,

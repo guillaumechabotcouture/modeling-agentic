@@ -1257,9 +1257,10 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         bad.append("analysis.sensitivity.parameters: `fitted` or a list of engine parameter names")
     comps = set(s.raw["options"]["components"])
     seen = set()
-    thr = an.get("share_threshold", 0.10)
-    if not (_isnum(thr) and 0 <= thr <= 1):
-        bad.append("analysis.share_threshold: a fraction in [0, 1]")
+    for k in ("share_threshold", "regret_threshold", "dollars_threshold"):     # F6 S1-5: toolkit/analysis/moves.py
+        thr = an.get(k, 0.10)
+        if not (_isnum(thr) and 0 <= thr <= 1):
+            bad.append(f"analysis.{k}: a fraction in [0, 1]")
     rules = {g.get("id") for g in s.raw["constraints"].get("group_rules") or []}
     for dt in an.get("decision_tests") or []:
         i = dt.get("id")

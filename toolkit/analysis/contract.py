@@ -414,7 +414,8 @@ def _decision_tests(run_dir, man) -> list[dict]:
             miss = [k for k in need if k not in doc]
             if miss or not isinstance(doc.get("decision_changes"), bool):
                 out.append(_f("analysis_contract_decision_test", f"{rel}: lacks {miss} or a boolean verdict", rel))
-            elif (doc["share_units_changed"] > doc["share_threshold"]) != doc["decision_changes"]:
+            elif doc["share_units_changed"] > doc["share_threshold"] and not doc["decision_changes"]:
+                # F6 S1-5: regret or dollars moved can also change the plan (toolkit/analysis/moves.py)
                 out.append(_f("analysis_contract_decision_test", f"{rel}: share and threshold contradict the verdict", rel))
     return out
 

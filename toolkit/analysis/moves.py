@@ -27,23 +27,88 @@ SPEC_KEYS = {"share": "share_threshold", "regret": "regret_threshold", "dollars"
 
 
 def thresholds(analysis: dict) -> dict:
-    raise NotImplementedError
+    """{criterion: threshold}: thresholds.yaml decision_tests, each overridden by the spec's analysis field."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        base = yaml.safe_load(f)["decision_tests"]
+    default = {"share": base["share_threshold"], "regret": base["regret_share_threshold"],
+               "dollars": base["dollars_share_threshold"]}
+    return {k: float((analysis or {}).get(SPEC_KEYS[k], default[k])) for k in CRITERIA}
 
 
 def component_totals(ccost: dict, plan: dict, ids) -> dict:
-    raise NotImplementedError
+    """{component: dollars} of a plan under a cost table split by component ({unit: {package: {component: $}}})."""
+    tot: dict = {}
+    for i in ids:
+        for c, v in ccost[i][plan[i]].items():
+            tot[c] = tot.get(c, 0.0) + float(v)
+    return tot
 
 
 def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, components) -> dict:
-    raise NotImplementedError
+    """What moves from the point plan `plan` to the plan `ch` re-solved under a test (benefits `ben`, costs `ccost`
+    split by component, re-optimised objective `objective`). `pop`: {unit: population}; `region`: {unit: group} or
+    None. Fails closed on a unit without a population or costs without a component split."""
+    if ccost is None:
+        raise ValueError("decision summary: the costs carry no split by component (toolkit/analysis/core.py "
+                         "CostTable); dollars moved cannot be computed")
+    miss = [i for i in ids if pop.get(i) is None]
+    if miss:
+        raise ValueError(f"decision summary: no population for units {miss[:5]}")
+    changed = [i for i in ids if ch[i] != plan[i]]
+    point = sum(ben[i][plan[i]] for i in ids)
+    regret = float(objective) - point
+    pt, re = component_totals(ccost, plan, ids), component_totals(ccost, ch, ids)
+    delta = {c: re.get(c, 0.0) - pt.get(c, 0.0) for c in components}
+    moved = max(sum(v for v in delta.values() if v > 0), -sum(v for v in delta.values() if v < 0))
+    total_pop = sum(float(pop[i]) for i in ids)
+    pc = sum(float(pop[i]) for i in changed)
+    by = None
+    if region is not None:
+        n: dict = {}
+        for i in ids:
+            g = n.setdefault(str(region[i]), [0, 0])
+            g[1] += 1
+            g[0] += ch[i] != plan[i]
+        by = [{"group": g, "changed": v[0], "units": v[1]} for g, v in sorted(n.items(), key=lambda kv: (-kv[1][0],
+                                                                                                         kv[0])) if v[0]]
+    rec = {"units_changed": len(changed), "share_units_changed": len(changed) / len(ids),
+           "point_plan_objective_under_test": point, "reoptimised_objective": float(objective), "regret": regret,
+           "regret_share": regret / float(objective) if objective > 0 else None,
+           "population_changed": pc, "population_changed_share": pc / total_pop if total_pop > 0 else None,
+           "dollars_by_component": delta, "dollars_moved": moved,
+           "dollars_moved_share": moved / float(budget) if budget > 0 else None, "units_changed_by_group": by}
+    vals = {"share": rec["share_units_changed"], "regret": rec["regret_share"], "dollars": rec["dollars_moved_share"]}
+    rec["triggered_by"] = [k for k in CRITERIA if vals[k] is not None and vals[k] > thr[k]]
+    rec["decision_changes"] = bool(rec["triggered_by"])
+    return rec
 
 
 def component_stability(pk: dict, pairs, components) -> dict:
-    raise NotImplementedError
+    """Per component, over (point package, fold package) pairs: provided in both (stable provision), absent in both
+    (stable absence), or changed; so a component consistently not chosen is not counted as a stable choice."""
+    by = {c: {"provided": 0, "absent": 0, "changed": 0} for c in components}
+    for a, b in pairs:
+        for c in components:
+            ia, ib = c in pk[a], c in pk[b]
+            by[c]["provided" if ia and ib else "absent" if not ia and not ib else "changed"] += 1
+    return {"by_component": by, "stable_provision": sum(v["provided"] for v in by.values()),
+            "stable_absence": sum(v["absent"] for v in by.values()),
+            "changed": sum(v["changed"] for v in by.values())}
+
+
+def population(A) -> dict:
+    """{unit: population} from the spec's options.populations.total column (toolkit/alloc/costs.py requires it)."""
+    col = ((A.alloc.get("units") or {}).get("populations") or {}).get("total")
+    if not col:
+        raise ValueError("decision summary: options.populations.total names no population column")
+    return {i: float(A.by_id[i][col]) for i in A.ids}
 
 
 def summarise(A, plan, ch, ben, cost, objective) -> dict:
-    raise NotImplementedError
+    """compare() for the analysis state: its population, region, allocatable budget, thresholds and components."""
+    reg = {i: A.by_id[i].get(A.region) for i in A.ids} if A.region else None
+    return compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
+                   A.budget, thresholds(A.spec["analysis"]), list(A.spec["options"]["components"]))
 
 
 # --------------------------------------------------------------------------- self-test

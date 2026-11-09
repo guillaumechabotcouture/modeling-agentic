@@ -10,6 +10,12 @@ decision_tests:
   # Phase 49 result files: the plan changes when more than this share of units change package
   # (the spec's analysis.share_threshold overrides it).
   share_threshold: 0.10
+  # F6 S1-5 (proposals for the owner's review): a test also changes the plan when keeping the point plan loses more
+  # than this share of the re-optimised objective (regret; the stability robust bound, 1%), or when more than this
+  # share of the allocatable budget moves between components. The spec's analysis.regret_threshold and
+  # analysis.dollars_threshold override them (toolkit/analysis/moves.py).
+  regret_share_threshold: 0.01
+  dollars_share_threshold: 0.05
 calibration:
   # v2d §3.1-§3.3 (proposals for the owner's review, open question 7). The `posterior` method's sampler is chosen by
   # dimension: importance sampling over the prior plus adaptive stages up to `max_importance_params`, adaptive

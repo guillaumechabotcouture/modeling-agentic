@@ -355,6 +355,13 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
+         # F6 S1-5: what moves beside the share, and which criterion changed the plan
+         **{k: (None if x.get(f) is None else 100.0 * x[f]) for k, f in (
+             ("regret_pct", "regret_share"), ("regret_threshold_pct", "regret_threshold"),
+             ("dollars_moved_pct", "dollars_moved_share"), ("dollars_threshold_pct", "dollars_threshold"),
+             ("population_changed_pct", "population_changed_share"))},
+         **{k: x.get(k) for k in ("regret", "dollars_moved", "population_changed", "triggered_by",
+                                  "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
@@ -1007,22 +1014,28 @@ def _self_test_stability_flagged(ok):
     """Codex r6 P1-3, P2: a flagged unit informs neither the held-out prediction nor the covariate scaling; a fold
     without enough unflagged training units is reported not_run, and the metrics are computed without it."""
     from toolkit.analysis import stability as SB
+    from toolkit.analysis.core import CostTable
+
+    def ct(ids):        # F6 S1-5: costs carry their split by component
+        return CostTable({i: [1.0, 2.0] for i in ids}, {i: [{}, {"c": 2.0}] for i in ids})
 
     class _A:
-        method, theta0 = "emulator_inversion", {}
+        method, theta0, region, budget = "emulator_inversion", {}, None, 10.0
+        pk, alloc = {0: frozenset(), 1: frozenset({"c"})}, {"units": {"populations": {"total": "pop"}}}
 
         def __init__(self, ids, xs, flagged):
             self.ids = list(ids)
-            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i]} for n, i in enumerate(ids)}
-            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}}}
+            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
+            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
+                         "options": {"components": {"c": {}}}}
             self.flagged, self.seen = flagged, {}
 
         def evaluate(self, theta, zh, hid):
             self.seen.update({i: zh[i] for i in hid})
-            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, {i: [1.0, 2.0] for i in hid}
+            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, ct(hid)
 
         def solve(self, ben, cost):
-            return {"choice": {i: 0 for i in self.ids}}
+            return {"choice": {i: 0 for i in self.ids}, "objective": sum(ben[i][0] for i in self.ids)}
 
         def guard(self, *a):
             pass
@@ -1030,7 +1043,7 @@ def _self_test_stability_flagged(ok):
     xs = {i: float(k) for k, i in enumerate(ids)}
     z0 = {i: 0.1 * k for k, i in enumerate(ids)}
     ben = {i: [1.0, 0.5] for i in ids}
-    cost = {i: [1.0, 2.0] for i in ids}
+    cost = ct(ids)
     plan = {i: 0 for i in ids}
     xs_out = dict(xs, u11=1000.0)
     with_flag = _A(ids, xs_out, {"u11": {"reason": "toy"}})

@@ -17,6 +17,7 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/claims.py"
 SPEC_REL = os.path.join("models", "claims_spec.yaml")
+GROUPS_SHOWN = 3        # results.md names the groups with the most units changing package in each decision test
 
 
 def _scripts():
@@ -76,6 +77,16 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
                _c("stability.identity_verdict", "label", arts["stability"], "data.verdict"),
                _c("stability.concordance_mean", "percentage", arts["stability"],
                   "data.metrics.package_concordance_pct_mean", "%")]
+        m = stab["metrics"]       # F6 S1-5: what moves in the worst fold; stable provision apart from stable absence
+        cl += [_c("stability.dollars_worst", "currency", arts["stability"], "data.metrics.dollars_moved_worst_fold", "USD"),
+               _c("stability.population_worst", "scalar", arts["stability"],
+                  "data.metrics.population_changed_worst_fold", "people")]
+        if m.get("regret_pct_worst_fold") is not None:
+            cl.append(_c("stability.regret_worst", "percentage", arts["stability"], "data.metrics.regret_pct_worst_fold",
+                         "%"))
+        if stab.get("components"):
+            cl += [_c(f"stability.{k}", "count", arts["stability"], f"data.components.{k}", "unit-components")
+                   for k in ("stable_provision", "stable_absence", "changed")]
         if stab["metrics"].get("rank_correlation_worst_fold") is not None:
             cl.append(_c("stability.rank_worst", "scalar", arts["stability"], "data.metrics.rank_correlation_worst_fold"))
     for j, d in enumerate(dts):
@@ -84,8 +95,15 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
         cl.append(_c(f"dt.{tid}.threshold", "percentage", arts["decision_tests"],
                      f"data.tests[{j}].threshold_pct", "%"))
         if d.get("status") != "not_run":
-            cl.append(_c(f"dt.{tid}.share", "percentage", arts["decision_tests"],
-                         f"data.tests[{j}].share_pct", "%"))
+            f = f"data.tests[{j}]"
+            cl += [_c(f"dt.{tid}.share", "percentage", arts["decision_tests"], f"{f}.share_pct", "%"),
+                   _c(f"dt.{tid}.dollars", "currency", arts["decision_tests"], f"{f}.dollars_moved", "USD"),
+                   _c(f"dt.{tid}.population", "scalar", arts["decision_tests"], f"{f}.population_changed", "people")]
+            if d.get("regret_share") is not None:      # undefined when the re-optimised objective is not positive
+                cl.append(_c(f"dt.{tid}.regret_pct", "percentage", arts["decision_tests"], f"{f}.regret_pct", "%"))
+            for k, _g in enumerate((d.get("units_changed_by_group") or [])[:GROUPS_SHOWN]):
+                cl.append(_c(f"dt.{tid}.group{k}", "count", arts["decision_tests"],
+                             f"{f}.units_changed_by_group[{k}].changed", "units"))
     for r in _spec_rows(A, claimable=True):     # spec-declared engine parameter values and the card values they replace
         n, f = r["name"], f"data.spec_values.{r['name']}"
         cl.append(_c(f"spec_value.{n}.value", "scalar", arts["engine"], f"{f}.value", r["units"]))
@@ -229,21 +247,45 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
               f"[CLAIM:stability.concordance_mean], verdict [CLAIM:stability.identity_verdict]"
               + (" (worst-fold rank r [CLAIM:stability.rank_worst])." if stab['metrics'].get('rank_correlation_worst_fold')
                  is not None else "."), ""]
+        L += [f"Across folds, up to [CLAIM:stability.dollars_worst] moves between components and up to "
+              f"[CLAIM:stability.population_worst] people live in units whose package changes"
+              + ("; keeping the point plan under a fold's calibration loses up to [CLAIM:stability.regret_worst] of "
+                 "that fold's re-optimised objective." if stab["metrics"].get("regret_pct_worst_fold") is not None else "."), ""]
+        if stab.get("components"):
+            L += ["Held-out units, component by component, against the point plan: stable provision (the component "
+                  "in both plans) [CLAIM:stability.stable_provision], stable absence (in neither) "
+                  "[CLAIM:stability.stable_absence], changed [CLAIM:stability.changed].", ""]
     else:
         L += [f"Not run: {stab.get('reason', '')}", ""]
     L += ["## Sensitivity (one at a time)", "", "| Input | Range basis | Low end | High end | Objective swing (% of point) "
-          "| Units changing package (max) |", "|---|---|---|---|---|---|"]
+          "| Units changing package (max) | Regret (max, % of objective) | Dollars moved between components (max) "
+          "| Population changing (max) | Changes the plan on |", "|---|---|---|---|---|---|---|---|---|---|"]
     for r in sens["rows"]:
+        e2 = (r["low"], r["high"])
+        rg = [e["regret_share"] for e in e2 if e.get("regret_share") is not None]
+        trig = [k for k in ("share", "regret", "dollars") if any(k in (e.get("triggered_by") or []) for e in e2)]
         L.append(f"| {r['name']} | {r['basis']} | {_fmt(r['low']['value'])} | {_fmt(r['high']['value'])} | "
                  f"{_fmt(r['swing_pct_of_point'])} | "
-                 f"{max(r['low']['share_units_changed'], r['high']['share_units_changed']):.0%} |")
+                 f"{max(r['low']['share_units_changed'], r['high']['share_units_changed']):.0%} | "
+                 f"{f'{max(rg):.2%}' if rg else 'n/a'} | {_fmt(max(e.get('dollars_moved') or 0.0 for e in e2))} | "
+                 f"{_fmt(max(e.get('population_changed') or 0.0 for e in e2))} | {', '.join(trig) or 'none'} |")
     L += ["", "## Decision tests", ""]
     for d in dts:   # words from code, numbers from claims (Codex P1-4)
         if d.get("status") == "not_run":
             L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{_cid(d['test_id'])}.verdict]. "
                   "No result file was written.", ""]
             continue
-        L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{_cid(d['test_id'])}.verdict]; "
-              f"largest share of units changing package [CLAIM:dt.{_cid(d['test_id'])}.share] (the plan changes when more "
-              f"than [CLAIM:dt.{_cid(d['test_id'])}.threshold] of units change package). Result file: `{d['path']}`.", ""]
+        t = _cid(d["test_id"])
+        grp = d.get("units_changed_by_group") or []
+        L += [f"**{d['test_id']}** ({d['question']}) {d['statement']} Verdict: [CLAIM:dt.{t}.verdict]; "
+              f"largest share of units changing package [CLAIM:dt.{t}.share] (the plan changes when more "
+              f"than [CLAIM:dt.{t}.threshold] of units change package, or on regret or dollars moved). "
+              + (f"Keeping the point plan loses up to [CLAIM:dt.{t}.regret_pct] of the re-optimised objective; "
+                 if d.get("regret_share") is not None else "")
+              + f"up to [CLAIM:dt.{t}.dollars] moves between components, and up to [CLAIM:dt.{t}.population] people "
+              "live in units whose package changes"
+              + (" (most changes in " + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]"
+                                                for k, g in enumerate(grp[:GROUPS_SHOWN])) + ")" if grp else "")
+              + ". " + (f"Changes the plan on: {', '.join(d['triggered_by'])}. " if d.get("triggered_by") else "")
+              + f"Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"
