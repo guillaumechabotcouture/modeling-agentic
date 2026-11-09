@@ -13,8 +13,10 @@ The problem (disease-agnostic; the harness adapter toolkit/analysis/joint_calibr
 Every target carries a measurement model: sampling variance from its own interval or sample size, a source bias
 variance and a model discrepancy variance. No source is ground truth: a target whose total sd is zero is refused.
 A source bias shared by the units of a group (bias_key: one block per source and group) is one latent offset per
-block, profiled like a unit parameter, not added to each target's variance (F6 S2-3; see _bias_witness). The best
-point weights each group of units once.
+block, profiled like a unit parameter, not added to each target's variance (F6 S2-3; see _bias_witness). Profiling
+is a feasibility rule, not marginal Gaussian implausibility: a target alone may sit up to cutoff (sd_e + sd_bias)
+away (each bound at the cutoff), where integrating the offset out gives cutoff sqrt(sd_e^2 + sd_bias^2); it is
+stricter on contrasts within a block. A spec may weight each group once in the best point (best_point_weighting).
 
 Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
 implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
@@ -621,7 +623,7 @@ class HistoryMatch:
         self.vth = th["verification"]
         self.bth = th["blocking"]
         self.cut = float(self.th["implausibility_cutoff"])
-        if self.th.get("best_point_weighting", "per_group") not in ("per_group", "per_unit"):
+        if self.th.get("best_point_weighting", "per_unit") not in ("per_group", "per_unit"):
             raise CalibrationInputError([f"best_point_weighting {self.th['best_point_weighting']!r}: per_group or "
                                          "per_unit"])
         self.G = int(self.th["z_grid"])
@@ -639,8 +641,11 @@ class HistoryMatch:
         self.top_up = top_up
         self.uobs = problem.observables("unit")
         self.sobs = problem.observables("shared")
-        # F6 S2-3: shared offsets, profiled on a grid in sd units over +-cutoff (half a step allowed as slack)
+        # F6 S2-3: shared offsets, profiled on a grid in sd units over +-cutoff (see _bias_witness)
         self.bcomp = problem.bias_components()
+        # Codex r1 P2-2: a group target whose units all lie in one component is checked while its offset is profiled
+        self.bgt = [[t for t in problem.targets if t.kind == "group" and set(t.weights) <= set(us)]
+                    for _, us in self.bcomp]
         self.bsd = {t.bias_key: t.sd_bias for t in problem.targets if t.kind == "unit" and t.bias_key is not None}
         nb = int(self.th["bias_grid"])
         self.bgrid = np.linspace(-self.cut, self.cut, nb)
@@ -869,7 +874,7 @@ class HistoryMatch:
         need_g = {u for t in P.targets if t.kind == "group" for u in t.weights}
         S = np.tile(self.zg, N)
         T = np.repeat(C, G, axis=0)
-        bias, alone = self._bias_witness(em, C, S, T) if self.bcomp else ({}, {})
+        bias, alone, bias_F = self._bias_witness(em, C, S, T) if self.bcomp else ({}, {}, [])
         for u in P.units:
             I = np.zeros(N * G)
             sign = np.zeros(N * G)
@@ -896,7 +901,7 @@ class HistoryMatch:
                 shared[t.id] = {"I": np.abs(m - t.y) / np.sqrt(v + t.var), "mean": m}
         if gobs:
             shared.update(self._group_witness(units, N))
-        return {"C": C, "units": units, "targets": shared, "bias": bias}
+        return {"C": C, "units": units, "targets": shared, "bias": bias, "bias_F": bias_F}
 
     # ---------------------------------------------------------------- shared offsets (F6 S2-3)
     # A survey's error is partly shared by the units of a group (the same design, fieldwork and model of the small-area
@@ -908,48 +913,144 @@ class HistoryMatch:
     # the block matchable by its own parameter (Vernon et al. 2010 treat structured discrepancy the same way: a term
     # with a prior inside the implausibility). The witness offset is the most probable such value (smallest |b| / sd);
     # when none exists, the value matching the most units, so the rest are reported as conflicting.
+    # Codex r1: (1) a coarse pass over offset cells with half a cell of slack (an outer bound: it never excludes what a
+    # continuous offset keeps); (2) the bias_cells most probable feasible cells per candidate are refined on
+    # bias_refine points per axis with no slack, and the witness is one common offset at which every unit (and every
+    # group target whose units all lie in the component) holds exactly (P2-2, P2-3); (3) the region sample draws the
+    # offset among the feasible cells, then the units given it (P1).
     def _impl(self, t, m, v, b=None):
-        """|m - (y - b)| / sd: with an offset b, less half the offset grid's step (never stricter than a continuous b)."""
-        if b is None or t.bias_key is None:
-            return np.abs(m - t.y) / np.sqrt(v + t.var_fit)
-        return np.maximum(np.abs(m - t.y + b) - 0.5 * self.bstep * t.sd_bias, 0.0) / np.sqrt(v + t.var_fit)
+        """|m - (y - b)| / sd: a target judged at its block's offset b (exact; no grid slack)."""
+        y = t.y if b is None or t.bias_key is None else t.y - b
+        return np.abs(m - y) / np.sqrt(v + t.var_fit)
+
+    def _cells(self, k, fine=False):
+        """(points, k) offsets in sd units: the grid's product, row-major (as a (nb,) * k array reshaped)."""
+        g = self.bgrid if not fine else np.linspace(-self.cut, self.cut, (len(self.bgrid) - 1) * int(
+            self.th["bias_refine"]) + 1)
+        return np.array(np.meshgrid(*[g] * k, indexing="ij")).reshape(k, -1).T
+
+    def _comp_preds(self, em, ci, S, T, M):
+        """The component's unit-target predictions [(target, mean, sd)] per unit, and its group targets' member
+        values and sds on the natural scale, each (M, G)."""
+        _, us = self.bcomp[ci]
+        noise = bool(self.th["include_run_noise"])
+        pl, gp = {}, {}
+        for u in us:
+            pl[u] = []
+            for t in self.P.unit_targets(u):
+                m, v = em["unit"][t.observable].predict(u, S, T, noise=noise)
+                pl[u].append((t, m.reshape(M, -1), np.sqrt(v.reshape(M, -1) + t.var_fit)))
+        for gt in self.bgt[ci]:
+            for u in gt.weights:
+                m, v = em["unit"][gt.observable].predict(u, S, T, noise=False)
+                m, v = m.reshape(M, -1), v.reshape(M, -1)
+                gp[(gt.id, u)] = (inv(m, gt.scale).astype(np.float32),
+                                  (np.abs(dinv(m, gt.scale)) * np.sqrt(v)).astype(np.float32))
+        return pl, gp
+
+    def _check(self, blocks, pl, gp, gts, B, slack, M):
+        """Every unit of a component, and its group targets, at offsets B (M or 1, S, k) on the natural scale:
+        (all hold (M, S), {unit: matchable (M, S)}, {unit: z mask (M, G)} when S == 1). A group target holds when the
+        range its members reach (each over its matching values) comes within the cutoff of it, with the members'
+        emulator sds added as perfectly correlated (as _group_terms)."""
+        S, G, cut = B.shape[1], len(self.zg), self.cut
+        allok, uoks, masks = np.ones((M, S), bool), {}, {}
+        agg = {gt.id: [0.0, 0.0, 0.0] for gt in gts}
+        for u, lst in pl.items():
+            okz = np.ones((M, G, S), bool)
+            for t, m, sd in lst:
+                if t.bias_key is None:
+                    okz &= (np.abs(m - t.y) <= cut * sd)[..., None]
+                    continue
+                h = 0.5 * self.bstep * t.sd_bias if slack else 0.0
+                okz &= np.abs(m[..., None] - t.y + B[:, None, :, blocks.index(t.bias_key)]) - h <= cut * sd[..., None]
+            uoks[u] = okz.any(1)
+            allok &= uoks[u]
+            for gt in gts:
+                if u in gt.weights:
+                    nat, sdn = gp[(gt.id, u)]
+                    w, a = gt.weights[u] / sum(gt.weights.values()), agg[gt.id]
+                    a[0] = a[0] + w * np.where(okz, nat[..., None], np.inf).min(1)
+                    a[1] = a[1] + w * np.where(okz, nat[..., None], -np.inf).max(1)
+                    a[2] = a[2] + w * np.where(okz, sdn[..., None], 0.0).max(1)
+            if S == 1:
+                masks[u] = okz[..., 0]
+        for gt in gts:
+            lo, hi, sdg = agg[gt.id]
+            fin = np.isfinite(lo) & np.isfinite(hi)
+            near = np.clip(gt.y, tr(np.where(fin, lo, 0.5), gt.scale), tr(np.where(fin, hi, 0.5), gt.scale))
+            d = 1.0 / np.maximum(np.abs(dinv(near, gt.scale)), 1e-12)
+            allok &= fin & (np.abs(gt.y - near) <= cut * np.sqrt(gt.var + (d * sdg) ** 2))
+        return allok, uoks, masks
 
     def _bias_witness(self, em, C, S, T):
-        """({block: offset per candidate}, {unit: matchable at some offset, per candidate})."""
+        """({block: certified offset per candidate}, {unit: matchable at some offset}, [coarse feasibility (N, cells)
+        per component])."""
         N, G, nb, cut = len(C), len(self.zg), len(self.bgrid), self.cut
-        noise = bool(self.th["include_run_noise"])
-        offs, alone = {}, {}
-        for blocks, us in self.bcomp:
-            k = len(blocks)
-            shape = (N,) + (nb,) * k
-            F, cnt = np.ones(shape, bool), np.zeros(shape, np.int32)
-            for u in us:
-                ind = np.ones((N, G), bool)
-                O = [np.ones((N, G, 1), bool) for _ in blocks]
-                for t in self.P.unit_targets(u):
-                    m, v = em["unit"][t.observable].predict(u, S, T, noise=noise)
-                    m, sd = m.reshape(N, G), np.sqrt(v.reshape(N, G) + t.var_fit)
-                    if t.bias_key is None:
-                        ind &= np.abs(m - t.y) <= cut * sd
-                        continue
-                    j = blocks.index(t.bias_key)
-                    b = self.bgrid * t.sd_bias
-                    O[j] = O[j] & (np.abs(m[..., None] - t.y + b) - 0.5 * self.bstep * t.sd_bias <= cut * sd[..., None])
-                O[0] = O[0] & ind[..., None]
-                if k == 1:
-                    A = O[0].any(1)
-                else:      # some z matches every target: an OR over the z grid of the blocks' joint feasibility
-                    A = np.matmul(O[0].transpose(0, 2, 1).astype(np.float32), O[1].astype(np.float32)) > 0.5
-                A = np.broadcast_to(A, shape)
-                F &= A
-                cnt += A
-                alone[u] = A.reshape(N, -1).any(1)
-            D = sum(np.expand_dims(self.bgrid ** 2, [i for i in range(k) if i != j]) for j in range(k))
-            key = cnt * (k * cut ** 2 + 1.0) - D[None]
-            sub = np.unravel_index(key.reshape(N, -1).argmax(1), (nb,) * k)
+        L, R = int(self.th["bias_cells"]), int(self.th["bias_refine"])
+        offs, alone, Fs = {}, {}, []
+        for ci, (blocks, us) in enumerate(self.bcomp):
+            k, gts = len(blocks), self.bgt[ci]
+            cells, sds = self._cells(k), np.array([self.bsd[b] for b in blocks])
+            pl, gp = self._comp_preds(em, ci, S, T, N)
+            if gts:
+                F, uoks, _ = self._check(blocks, pl, gp, gts, (cells * sds)[None], True, N)
+            else:          # fast path: some z matches every target, an OR over the z grid per pair of cells
+                F, uoks = np.ones((N, len(cells)), bool), {}
+                for u in us:
+                    ind, O = np.ones((N, G), bool), [np.ones((N, G, 1), bool) for _ in blocks]
+                    for t, m, sd in pl[u]:
+                        if t.bias_key is None:
+                            ind &= np.abs(m - t.y) <= cut * sd
+                            continue
+                        j = blocks.index(t.bias_key)
+                        O[j] = O[j] & (np.abs(m[..., None] - t.y + self.bgrid * t.sd_bias) - 0.5 * self.bstep *
+                                       t.sd_bias <= cut * sd[..., None])
+                    O[0] = O[0] & ind[..., None]
+                    A = O[0].any(1) if k == 1 else \
+                        np.matmul(O[0].transpose(0, 2, 1).astype(np.float32), O[1].astype(np.float32)) > 0.5
+                    uoks[u] = np.broadcast_to(A, (N,) + (nb,) * k).reshape(N, -1)
+                    F &= uoks[u]
+            cnt = sum(uoks.values())
+            alone.update({u: a.any(1) for u, a in uoks.items()})
+            D = (cells ** 2).sum(1)
+            top = np.argsort(-(F * 1e6 + cnt * 1e3 - D[None]), axis=1, kind="stable")[:, :L]
+            sub = np.array(np.meshgrid(*[np.linspace(-0.5, 0.5, R) * self.bstep] * k, indexing="ij")).reshape(k, -1).T
+            Bs = np.clip((cells[top][:, :, None, :] + sub[None, None]).reshape(N, -1, k), -cut, cut)
+            ok, uo, _ = self._check(blocks, pl, gp, gts, Bs * sds, False, N)
+            pick = np.argmax(ok * 1e6 + sum(uo.values()) * 1e3 - (Bs ** 2).sum(-1), axis=1)
             for j, bk in enumerate(blocks):
-                offs[bk] = self.bgrid[sub[j]] * self.bsd[bk]
-        return offs, alone
+                offs[bk] = Bs[np.arange(N), pick, j] * sds[j]
+            Fs.append(F)
+        return offs, alone, Fs
+
+    def _offset_draws(self, pick, rng) -> dict:
+        """Codex r1 P1: {unit: grid index per draw} for the units of components without group targets. Per draw and
+        component: a cell among the candidate's feasible cells (weights: the offset prior's density), a uniform point
+        in it, kept when every unit of the component matches there exactly (bias_tries proposals; else the
+        witness); then each unit's value uniform over its matching grid values at that offset."""
+        st, n, G = self.state, len(pick), len(self.zg)
+        S, T = np.tile(self.zg, n), np.repeat(st["C"][pick], G, axis=0)
+        tries, out = int(self.th["bias_tries"]), {}
+        for ci, (blocks, us) in enumerate(self.bcomp):
+            if self.bgt[ci]:
+                continue
+            k, cells = len(blocks), self._cells(len(blocks))
+            sds = np.array([self.bsd[b] for b in blocks])
+            w = st["bias_F"][ci][pick] * np.exp(-0.5 * (cells ** 2).sum(1))[None]
+            ci_ = np.array([rng.choice(len(cells), tries, p=x / x.sum()) if x.sum() > 0 else np.zeros(tries, int)
+                            for x in w])
+            Bs = np.clip(cells[ci_] + rng.uniform(-0.5, 0.5, (n, tries, k)) * self.bstep, -self.cut, self.cut)
+            wit = np.stack([st["bias"][b][pick] / self.bsd[b] for b in blocks], -1)
+            Bs = np.concatenate([Bs, wit[:, None]], 1)
+            pl, gp = self._comp_preds(self.em, ci, S, T, n)
+            ok, _, _ = self._check(blocks, pl, gp, [], Bs * sds, False, n)
+            first = np.where(ok.any(1), ok.argmax(1), tries)
+            _, _, masks = self._check(blocks, pl, gp, [], (Bs[np.arange(n), first] * sds)[:, None], False, n)
+            for u in us:
+                out[u] = (masks[u], [int(rng.choice(np.flatnonzero(masks[u][i]))) if masks[u][i].any() else
+                                     int(st["units"][u]["g"][pick[i]]) for i in range(n)])
+        return out
 
     # ---------------------------------------------------------------- group targets (Codex r1 P1-1)
     # A group target constrains its units' parameters jointly. For each candidate, each member unit's non-implausible
@@ -1050,7 +1151,8 @@ class HistoryMatch:
         if a is None:
             return b
         out = {"C": np.vstack([a["C"], b["C"]]), "units": {}, "targets": {},
-               "bias": {k: np.concatenate([v, b["bias"][k]]) for k, v in a["bias"].items()}}
+               "bias": {k: np.concatenate([v, b["bias"][k]]) for k, v in a["bias"].items()},
+               "bias_F": [np.concatenate([x, y]) for x, y in zip(a["bias_F"], b["bias_F"])]}
         for u in a["units"]:
             x, y = a["units"][u], b["units"][u]
             r = {k: np.concatenate([x[k], y[k]]) for k in ("I", "ok", "m", "g", "sign", "alone") if k in x}
@@ -1095,11 +1197,10 @@ class HistoryMatch:
             conflicting = sorted({u for u in matchable if not um[u][region].any()}, key=str)
             if not conflicting:      # different candidates miss different units: every unit missed somewhere
                 conflicting = sorted({u for u in matchable if (~um[u][region]).any()}, key=str)
-        # Codex r5 P1-2: units no value matches do not steer the choice of the best shared point. F6 S2-3: each group
-        # of units counts once (its units' mean), so a large group does not outweigh small ones by repetition: a
-        # model discrepancy shared within a group (one survey, one climate) makes its units' misfits far from
-        # independent, and per-group weights are the limit of full within-group correlation. Each block's offset
-        # enters once, as its own prior term (b / sd)^2.
+        # Codex r5 P1-2: units no value matches do not steer the choice of the best shared point. F6 S2-3: with
+        # best_point_weighting per_group (a spec's choice), each group of units counts once (its units' mean): a chosen
+        # balancing rule so a large group does not outweigh small ones by repetition, not a likelihood. Each block's
+        # offset enters once, as its own prior term (b / sd)^2.
         keep = [u for u in self.P.units if u not in unmatchable]
         wts = self._unit_weights(keep)
         score = sum(wts[u] * st["units"][u]["m"] ** 2 for u in keep) if keep else np.zeros(N)
@@ -1117,7 +1218,7 @@ class HistoryMatch:
     def _unit_weights(self, units) -> dict:
         """{unit: weight in the best point's score}: 1 / (units of its group) with best_point_weighting per_group and
         group labels; 1 per unit otherwise (a unit without a label is its own group)."""
-        if self.th.get("best_point_weighting", "per_group") != "per_group" or not self.P.groups:
+        if self.th.get("best_point_weighting", "per_unit") != "per_group" or not self.P.groups:
             return {u: 1.0 for u in units}
         n = {}
         for u in units:
@@ -1417,7 +1518,8 @@ class HistoryMatch:
         out = {"units": {}, "targets": {}}
         byu = {}
         b_at = self._verify_offsets(urows)
-        out["bias"] = b_at
+        if b_at:
+            out["bias"] = b_at
         for u in self.P.units:
             best = None
             for r in (x for x in urows if x["unit"] == u):
@@ -1454,13 +1556,24 @@ class HistoryMatch:
         return out
 
     def _verify_offsets(self, urows) -> dict:
-        """{block: offset} re-profiled on the engine's runs at the best point, as the unit parameter is: per component,
-        the grid offsets leaving the fewest units unmatched (each unit at its best run), then the smallest worst
-        implausibility, then the smallest |b| / sd."""
+        """{block: offset} re-profiled on the engine's runs at the best point, as the unit parameter is, and solved
+        exactly (Codex r1 P2-3): each run of each unit holds on an interval of each block's offset, so a common offset
+        exists exactly when one built from the intervals' ends lies in every unit's set. Per component, among those
+        ends and the fine grid (inside +-cutoff sd): the fewest units unmatched (each at its best run), then the
+        smallest worst implausibility, then the smallest |b| / sd."""
         out = {}
         for blocks, us in self.bcomp:
-            k = len(blocks)
-            combos = np.array(np.meshgrid(*[self.bgrid] * k, indexing="ij")).reshape(k, -1).T
+            k, sds = len(blocks), np.array([self.bsd[b] for b in blocks])
+            axes = [list(self._cells(1, fine=True)[:, 0] * s) for s in sds]
+            for r in (x for x in urows if x["unit"] in set(us)):
+                for tg in self.P.unit_targets(r["unit"]):
+                    if tg.bias_key is not None:
+                        noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                        e = (self.cut - 1e-9) * math.sqrt(noise + tg.var_fit)
+                        c = tg.y - float(tr(r["obs"][tg.observable], tg.scale))
+                        axes[blocks.index(tg.bias_key)] += [c - e, c + e]
+            axes = [np.clip(np.unique(a), -self.cut * s, self.cut * s) / s for a, s in zip(axes, sds)]
+            combos = np.array(np.meshgrid(*axes, indexing="ij")).reshape(k, -1).T
             W = []
             for u in us:
                 best = np.full(len(combos), np.inf)
@@ -1605,7 +1718,7 @@ class HistoryMatch:
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
                 "verification": ver, "bias": bias,
-                "weighting": {"best_point": self.th.get("best_point_weighting", "per_group"),
+                "weighting": {"best_point": self.th.get("best_point_weighting", "per_unit"),
                               "bias_grid": len(self.bgrid)},
                 "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
                 "emulators": {"unit": {ob: e.hyper for ob, e in self.em["unit"].items()},
@@ -1632,15 +1745,19 @@ class HistoryMatch:
         step = 1.0 / max(len(self.zg) - 1, 1)
         own = self._owner()
         gts = [t for t in P.targets if t.kind == "group"]
-        for c in pick:
+        zd = self._offset_draws(pick, rng) if self.bcomp else {}         # Codex r1 P1: offsets drawn first
+        for i, c in enumerate(pick):
             row = [float(p.natural(st["C"][c][j])) for j, p in enumerate(P.shared)]
             gsel = self._group_draw(gts, own, int(c), rng) if gts else {}
             for u in P.units:
                 if u in gsel:
                     row.append(float(P.z_natural(self.zg[gsel[u]])))
                     continue
-                okc = np.flatnonzero(st["units"][u]["ok"][c])
-                gi = rng.choice(okc) if len(okc) else int(st["units"][u]["g"][c])
+                if u in zd:
+                    okc, gi = np.flatnonzero(zd[u][0][i]), zd[u][1][i]
+                else:
+                    okc = np.flatnonzero(st["units"][u]["ok"][c])
+                    gi = rng.choice(okc) if len(okc) else int(st["units"][u]["g"][c])
                 s = float(np.clip(self.zg[gi] + rng.uniform(-0.5, 0.5) * step, 0, 1)) if len(okc) else self.zg[gi]
                 if len(okc):       # stay inside the non-implausible bracket around the chosen grid value
                     lo = self.zg[gi - 1] if gi > 0 and gi - 1 in okc else self.zg[gi]
@@ -1655,7 +1772,9 @@ class HistoryMatch:
                 "weighting": ("prior density over the non-implausible region" + ("" if sobol_only else
                               " (including refinement candidates, whose proposal density is not corrected)") +
                               "; a unit's parameter uniform within its non-implausible values; units of a group "
-                              "target at a joint draw that holds every group target")}
+                              "target at a joint draw that holds every group target" +
+                              ("; each shared offset drawn among its feasible cells (prior-weighted), the units of "
+                               "its block given it" if self.bcomp else ""))}
 
     def _group_draw(self, gts, own, c, rng) -> dict:
         """{unit: grid index} for the group members at candidate c, kept only when every group target holds at the

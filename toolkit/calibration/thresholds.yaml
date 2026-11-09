@@ -31,16 +31,22 @@ history_matching:
   include_run_noise: true
   # F6 S2-3: a survey's error shared by the units of a group. A unit target with a bias_key (one per source and
   # group) does not add its sd_bias to its own variance; the block has one latent offset b ~ N(0, sd_bias^2), and the
-  # targets are judged at y - b. The offset is profiled on bias_grid values over +-implausibility_cutoff sd (|b| / sd
-  # beyond the cutoff is implausible itself); half a grid step is allowed as slack, so the grid never rules out what a
-  # continuous offset would keep. Blocks linked through units with targets in several of them are profiled jointly
-  # (bias_grid^k values), at most bias_blocks_max of them.
+  # targets are judged at y - b. The offset is profiled on bias_grid cells over +-implausibility_cutoff sd (|b| / sd
+  # beyond the cutoff is implausible itself). A coarse pass allows half a cell as slack, so it never rules out what a
+  # continuous offset would keep; the bias_cells most probable feasible cells are then refined on bias_refine points
+  # per axis with no slack, and the witness is one offset at which every unit holds exactly. Blocks linked through
+  # units with targets in several of them are profiled jointly (bias_grid^k cells), at most bias_blocks_max of them.
+  # The region sample draws each component's offset among its feasible cells, bias_tries proposals per draw.
   bias_grid: 21
   bias_blocks_max: 2
-  # The best point (the verification point; never the answer, the region is): per_group gives each group of units
-  # (Problem.groups, for example decision_units.region) one share of the score, its units' mean squared implausibility,
-  # so a large group does not outweigh small ones by repetition; per_unit sums over units (the earlier rule).
-  best_point_weighting: per_group
+  bias_cells: 4
+  bias_refine: 5
+  bias_tries: 8
+  # The best point (the verification point; never the answer, the region is): per_unit sums over units (the rule of
+  # every spec that does not choose); per_group (a spec opts in with calibration.joint.best_point_weighting) gives each
+  # group of units (Problem.groups) one share, its units' mean squared implausibility, a chosen balancing rule so a
+  # large group does not outweigh small ones by repetition.
+  best_point_weighting: per_unit
 emulator:
   # Each wave holds out this share of its simulations, fits the emulator on the rest and checks the held-out
   # standardised errors (prediction - simulated) / predictive sd. More than outside_share_max beyond std_error_max

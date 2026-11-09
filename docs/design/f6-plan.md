@@ -180,7 +180,7 @@ runs for a sample of LGAs at the boundary values.
 | S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 in review (#154) |
 | S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 merged (#156); S1-5 in review (#162) |
 | S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | S1-3 merged (#159); S1-8 in review (#161: launch handover, code-only fingerprint, `reuse-check`; real smoke passed, cases A and B, 2026-11-09); S1-6 not started |
-| S2-3 calibration error model | lead; engine agent for part 2 | part 1 now; part 2 after the engine change | part 1 in review (shared offset per survey and group, group-weighted best point, change between surveys by group with a threshold); part 2 next: historical and future coverage as separate parameters, history anchored to delivery surveys (needs an engine parameter for past coverage) |
+| S2-3 calibration error model | lead; engine agent for part 2 | part 1 now; part 2 after the engine change | part 1 in review (#166: shared offset per survey and group, drawn with the region; optional group-weighted best point); S2-3b next (change between surveys by group with a threshold); part 2 after that: historical and future coverage as separate parameters, history anchored to delivery surveys (needs an engine parameter for past coverage) |
 | S2-1, S2-2, S2-4, S2-5 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 

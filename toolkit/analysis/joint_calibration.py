@@ -19,11 +19,12 @@ The spec field (signed with the spec; without it nothing changes):
                                       # {column, count: <separator>, empty: <text>} (the number of listed items)
         discrepancy_sd: 0.1           # model discrepancy sd of every target on its scale (a target may override)
         seed, waves, points_per_unit, shared_points   # optional; defaults in toolkit/calibration/thresholds.yaml
+        best_point_weighting: per_unit | per_group    # optional (default per_unit): per_group counts each group once
         targets:
           - {id, kind: unit, column, window: [a, b], metric, scale, sd | sd_column | ci_columns: [lo, hi] |
-             n_column, bias_sd, bias_by, discrepancy_sd, source}
-             # bias_by: a units column (e.g. the region); bias_sd is then one offset per source and group, shared
-             # by the group's units, not each unit's own error (F6 S2-3)
+             n_column, bias_sd, bias_by, bias_source, discrepancy_sd, source}
+             # bias_by: a units column (e.g. the region); bias_sd is then one offset per survey (bias_source,
+             # default the target id) and group, shared by the group's units and the survey's targets (F6 S2-3)
           - {id, kind: group, csv, filter: {col: value}, key: {csv: col, units: col}, value, multiplier,
              ci: [lo_col, hi_col], ci_level, weights: <units column>, window, metric, scale, bias_sd, discrepancy_sd,
              source}
@@ -109,9 +110,12 @@ def spec_problems(spec) -> list[str]:
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
-                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity"})
+                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
+                           "best_point_weighting"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
+    if j.get("best_point_weighting", "per_unit") not in ("per_unit", "per_group"):
+        bad.append(f"{w}.best_point_weighting: per_unit (the default) or per_group")
     sh = j.get("shared")
     if not (isinstance(sh, list) and all(isinstance(x, str) and x for x in sh) and len(set(sh)) == len(sh)):
         bad.append(f"{w}.shared: a list of distinct engine parameter names")
@@ -175,7 +179,7 @@ def spec_problems(spec) -> list[str]:
     tg = j.get("targets")
     if not (isinstance(tg, list) and tg):
         return bad + [f"{w}.targets: a non-empty list"]
-    ids = []
+    ids, surveys = [], {}
     for n, t in enumerate(tg):
         tw = f"{w}.targets[{n}]"
         if not isinstance(t, dict):
@@ -224,6 +228,14 @@ def spec_problems(spec) -> list[str]:
                 bad.append(f"{tw}.bias_by: no units column {t['bias_by']!r}")
             if not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
                 bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset)")
+            src = t.get("bias_source", t.get("id"))      # Codex r1 P2-4: the survey, shared by its targets
+            if not _text(src):
+                bad.append(f"{tw}.bias_source: the survey's name (text)")
+            other = surveys.setdefault(src, (t.get("bias_sd"), t["bias_by"]))
+            if other != (t.get("bias_sd"), t["bias_by"]):
+                bad.append(f"{tw}: survey {src!r} is declared with two bias_sd or bias_by values ({other})")
+        elif "bias_source" in t:
+            bad.append(f"{tw}.bias_source: needs bias_by")
         if k == "unit":
             c = t.get("column", cal.get("target_column"))
             if c not in cols:
@@ -435,7 +447,8 @@ def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, j, n, x) -> dic
     sim = Simulator(s2, run_dir, meta2, compute_kw, log)
     sim.calls = 1000 * (n + 1)
     r2 = HM.calibrate(P2, sim, seed=int(j.get("seed", 0)), waves=0, log=log, prior=prior,
-                      record=meta2["record"], **{k: j[k] for k in ("points_per_unit", "shared_points") if k in j})
+                      record=meta2["record"],
+                      **{k: j[k] for k in ("points_per_unit", "shared_points", "best_point_weighting") if k in j})
     r2["prior_runs"] = {"reused": len(prior["unit"]), "shared_reused": len(prior["shared"]),
                         "from": "the primary setting, same process"}
     r2["adapter"] = {"windows": meta2["windows"], "units": len(meta2["units"]), "shared": list(j["shared"])}
@@ -515,7 +528,8 @@ def build(spec, units=None) -> tuple:
                 targets.append(HM.Target(f"{t['id']}:{i}", "unit", _observable(t, wins), v, sc,
                                          sd_obs=_unit_sd(t, rows[i], sc, v), sd_bias=float(t.get("bias_sd", 0.0)),
                                          sd_md=md, unit=i, source=t["source"],
-                                         bias_key=f"{t['id']}|{rows[i][t['bias_by']]}" if t.get("bias_by") else None))
+                                         bias_key=f"{t.get('bias_source', t['id'])}|{rows[i][t['bias_by']]}"
+                                         if t.get("bias_by") else None))
         elif t["kind"] == "group":
             sc = t.get("scale", "logit")
             mult = float(t.get("multiplier", 1.0))
@@ -891,7 +905,7 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, w
     CalibrationInputError on a refused declaration; a blocked result is returned (report['blocked'])."""
     P, meta = build(spec, units)
     j = declared(spec)
-    ov = {k: j[k] for k in ("points_per_unit", "shared_points") if k in j}
+    ov = {k: j[k] for k in ("points_per_unit", "shared_points", "best_point_weighting") if k in j}
     ov.update(override)
     prior, pinfo = load_prior(spec, prior_dir, meta, log) if prior_dir else (None, None)
     sim = Simulator(spec, run_dir, meta, compute_kw, log)

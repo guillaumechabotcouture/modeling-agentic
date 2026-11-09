@@ -303,22 +303,41 @@ scikit-learn: `toolkit/calibration/history_matching.py` (disease-agnostic; thres
 
 **Error model (F6 S2-3, part 1).** A survey's error is partly shared by the units of a group: one design and fieldwork,
 and one modelled small-area surface. A unit target with `bias_by: <units column>` gets one latent offset per source and
-group, b ~ N(0, bias_sd²): y = f + b + e, with e (sampling and discrepancy) independent per target. The old rule added
+group, b ~ N(0, bias_sd²): y = f + b + e, with e (sampling and discrepancy) independent per target. `bias_source` names
+the survey (default: the target id), so two targets from one survey share one offset per group. The old rule added
 bias_sd² to each target's own variance. That lets every unit use its own offset, so a group's units pull on one survey
 anchor as if they were independent, and the within-group contrasts that identify shared parameters are lost.
 - **Profiling.** The offset is a nuisance parameter, treated like the unit parameter. A shared value is compatible
-  with a group when one offset with |b| / sd within the cutoff leaves every unit matchable by its own parameter. The
-  offset grid has `bias_grid` points, and half a step is allowed as slack, so the grid never rules out a value that a
-  continuous offset would keep. Offsets linked through units are profiled jointly: two surveys of one group give a
-  two-dimensional grid. The witness is the most probable feasible offset. The engine verification re-profiles it on
-  the engine's own runs.
-- **Best point.** Each group counts once: its units' mean squared implausibility. Each offset counts once, as
-  (b / sd)². Model discrepancy shared within a group makes its units' misfits far from independent, and per-group
-  weights are the limit of full within-group correlation. The region does not depend on this weighting; only the
+  with a group when one offset with |b| / sd within the cutoff leaves every unit matchable by its own parameter.
+  - A coarse pass over `bias_grid` cells allows half a cell as slack, an outer bound that never rules out a value a
+    continuous offset would keep.
+  - The `bias_cells` most probable feasible cells are then refined on `bias_refine` points per axis with no slack.
+    The witness is one common offset at which every unit holds exactly.
+  - A group target whose units all lie in one component is checked inside the profile, so an offset is chosen only
+    where the aggregate also holds.
+  - Offsets linked through units are profiled jointly: two surveys of one group give a two-dimensional grid.
+  - The engine verification solves the common offset exactly from the engine's own runs.
+- **Region sample.** Each draw takes an offset for each group among its feasible cells, weighted by the offset's
+  prior. It then draws each unit's parameter given that offset. Units therefore move together with their survey's
+  offset, and group totals keep that shared uncertainty.
+- **Not marginal implausibility.** Profiling is a feasibility rule. A single target may sit up to 3 (sd_e + sd_b)
+  from the model, where integrating the offset out (marginal Gaussian implausibility) allows 3 √(sd_e² + sd_b²). It is
+  stricter on contrasts between units of one group. Vernon et al. (2010, Bayesian Analysis 5:619) treat structured
+  discrepancy through the covariance instead. A simulation of one group of n units at the truth (200,000 draws,
+  sd_b / sd_e of 0.5, 1 and 3) compares the two rules:
+  - The profiled rule keeps the truth in 99.9–100% of draws for n = 1 to 6, and 99.4% for n = 24.
+  - The marginal rule keeps it in 94.0–99.7%.
+  - For a contrast of 4 sd_e between two halves of a 6-unit group, the profiled rule keeps 30–62% of draws, against
+    4–93% for the marginal rule. The marginal rule keeps most of them when the offset sd is large.
+- **Best point.** By default the score sums the units, as before. A spec may choose
+  `calibration.joint.best_point_weighting: per_group`: each group then counts once (its units' mean squared
+  implausibility) and each offset counts once, as (b / sd)². This is a chosen balancing rule, so a large group does not
+  outweigh small ones by repetition; it is not derived from a likelihood. The region does not depend on it; only the
   verification point does.
 
-The change between surveys by group (a calibration diagnostic with a threshold) follows in S2-3b. Part 2 (historical and future intervention parameters, and histories anchored to delivery surveys) needs an engine
-parameter for past coverage. It follows separately.
+The change between surveys by group (a calibration diagnostic with a threshold) follows in S2-3b. Part 2 (historical
+and future intervention parameters, and histories anchored to delivery surveys) needs an engine parameter for past
+coverage. It follows separately.
 
 ### 5.4 Incremental rebuilds
 
