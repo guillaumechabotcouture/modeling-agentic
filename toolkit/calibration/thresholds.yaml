@@ -29,19 +29,18 @@ history_matching:
   # The emulator's run-to-run noise (the fitted nugget) is part of the emulator variance: a stochastic engine's single
   # runs scatter around their mean, and the comparison is with one realised survey.
   include_run_noise: true
-  # F6 S2-3: a survey's error shared by the units of a group. A unit target with a bias_key (one per source and
-  # group) does not add its sd_bias to its own variance; the block has one latent offset b ~ N(0, sd_bias^2), and the
-  # targets are judged at y - b. The offset is profiled on bias_grid cells over +-implausibility_cutoff sd (|b| / sd
-  # beyond the cutoff is implausible itself). A coarse pass allows half a cell as slack, so it never rules out what a
-  # continuous offset would keep; the bias_cells most probable feasible cells are then refined on bias_refine points
-  # per axis with no slack, and the witness is one offset at which every unit holds exactly. Blocks linked through
-  # units with targets in several of them are profiled jointly (bias_grid^k cells), at most bias_blocks_max of them.
-  # The region sample draws each component's offset among its feasible cells, bias_tries proposals per draw.
-  bias_grid: 21
-  bias_blocks_max: 2
-  bias_cells: 4
-  bias_refine: 5
-  bias_tries: 8
+  # F6 S2-3: a survey's error shared by the units of a group. A unit target with a bias_key (one per survey and
+  # group; at most one per unit) does not add its sd_bias to its own variance; the block has one latent offset
+  # b ~ N(0, sd_bias^2), and the targets are judged at y - b. Each unit's feasible offsets are exact intervals; a
+  # block's set is their intersection; offsets are drawn from the prior restricted to it and kept when the
+  # component's group targets are reachable. bias_draws proposals per candidate, doubled while none is accepted up
+  # to bias_draws_max; only then is a component infeasible there (recorded with the count reached). The region sample
+  # draws a fresh offset per row, redrawn with its units' values (up to bias_draws_max times) until the group targets
+  # hold. bias_accept_min: an acceptance rate over the region's candidates below it blocks
+  # (offset_sampling_low_acceptance), never a silent point mass; so does any region-sample row that never holds.
+  bias_draws: 64
+  bias_draws_max: 1024
+  bias_accept_min: 0.001
   # The best point (the verification point; never the answer, the region is): per_unit sums over units (the rule of
   # every spec that does not choose); per_group (a spec opts in with calibration.joint.best_point_weighting) gives each
   # group of units (Problem.groups) one share, its units' mean squared implausibility, a chosen balancing rule so a

@@ -259,6 +259,10 @@ def spec_problems(spec) -> list[str]:
                 bad.append(f"{tw}: ci: [lo, hi] columns of the table, or sd")
     if len(set(ids)) != len(ids):
         bad.append(f"{w}.targets: repeated ids")
+    if len(surveys) > 1:         # Codex r2: every unit target applies to every unit, so two surveys mean two blocks
+        bad.append(f"{w}.targets: {len(surveys)} surveys carry bias_by ({sorted(surveys)}); one survey per unit may "
+                   "carry a shared offset. Declare the other as a group target (an aggregate over the group's units) "
+                   "or without bias_by")
     return bad
 
 
