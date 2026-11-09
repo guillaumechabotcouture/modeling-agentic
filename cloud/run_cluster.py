@@ -12,7 +12,8 @@
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> keeper            # reconcile, then start missing helpers for the run
                                                               # cluster clusters.json records (after exit 3 or 5)
-    python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke)
+    python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke);
+                                                              # exit 6: the run cluster stopped while it connected
     python cloud/run_cluster.py <config.py> smoke-run [--minutes 20] [--interrupt-on TEXT]
                                                               # a smoke: `launch` as a child under a wall-clock bound;
                                                               # waits for it and every cluster it tagged; at the limit
@@ -538,6 +539,7 @@ def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=Non
 
 
 EXIT_LAUNCHED, EXIT_FAILED, EXIT_SUBMITTED_LOST, EXIT_UNCONFIRMED, EXIT_INCOMPLETE = 0, 1, 3, 4, 5   # module doc
+EXIT_PROBE_LOST = 6        # ack-probe: the run cluster went away while it connected (no evidence either way)
 ACK_ATTEMPTS, ACK_DELAY_S = 36, 5.0      # about 3 minutes for the scheduler to list a run (F5 resume: 43 s)
 # a lost connection to the scheduler: distributed's CommClosedError and connect timeouts are OSErrors
 CONNECTION_ERRORS = (OSError, TimeoutError, ws.SchedulerInfoUnavailable)
@@ -831,14 +833,18 @@ def ack_probe(cfg, lister=None, security_fn=None, client_cls=None) -> int:
     sec, info = security_fn(cid)
     if client_cls is None:
         from distributed import Client as client_cls
-    client = client_cls(info["address_to_use"], security=sec, timeout="60s")
-    key = f"ack-probe-{int(time.time())}"
-    fut = client.submit(ws.ack_probe, pure=False, key=key)
-    fire_and_forget(fut)
-    print(f"submitted {key}", flush=True)
-    time.sleep(10)                        # long past the task's run time: nothing is left to list as processing
-    why = []
-    got = wait_listed(client, key, fut, attempts=3, why=why)
+    key, why = f"ack-probe-{int(time.time())}", []
+    try:   # a run that ends now stops its cluster under the probe (smoke case A rerun): no evidence, no traceback
+        client = client_cls(info["address_to_use"], security=sec, timeout="60s")
+        fut = client.submit(ws.ack_probe, pure=False, key=key)
+        fire_and_forget(fut)
+        print(f"submitted {key}", flush=True)
+        time.sleep(10)                    # long past the task's run time: nothing is left to list as processing
+        got = wait_listed(client, key, fut, attempts=3, why=why)
+    except CONNECTION_ERRORS as e:
+        print(f"ack-probe {key}: the run cluster stopped while ack-probe was connecting: no acknowledgement evidence "
+              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
+        return EXIT_PROBE_LOST
     print(f"ack-probe {key}: {'acknowledged by ' + why[0] if got else 'NOT acknowledged'} (future {fut.status})")
     return 0 if got else 1
 
