@@ -744,8 +744,8 @@ def _self_test() -> int:
         ok(stale_ids(as_value, res["benchmarks"]) == ["T1"] and rows == [] and "rerun required: T1" in str(why),
            f"BS56 a change from a sourced to an exempt type makes the stored row stale (every type is digested): {why}")
         legacy = {"id": "T1", "compare": "eq", "computed": 1.0}
-        ok(stale_ids(as_value, [legacy]) == [] and stale_ids(as_value, [{"id": "T1", "computed": 0.4}]) == ["T1"],
-           "BS57 a stored oracle row from before digests is accepted only with an oracle row's shape")
+        ok(stale_ids(as_value, [legacy]) == ["T1"] and stale_ids(as_value, [{"id": "T1", "computed": 0.4}]) == ["T1"],
+           "BS57 a stored row without a digest, an oracle row included, is stale (rerun required)")
     case("BS56-57", r4_2)
 
     def r4_3():
@@ -754,8 +754,12 @@ def _self_test() -> int:
         calls = []
         orig = BM.run_pack
         with tempfile.TemporaryDirectory() as d:
-            for f in ("pack.yaml", "equilibration.yaml"):
-                shutil.copy(os.path.join(mdir, f), os.path.join(d, f))
+            shutil.copy(os.path.join(mdir, "equilibration.yaml"), os.path.join(d, "equilibration.yaml"))
+            fpath = os.path.join(d, "elsewhere", "fitted.yaml")
+            os.makedirs(os.path.dirname(fpath))
+            yaml.safe_dump({"parameters": {}, "band_declarations": {"B10": "an older declaration"}}, open(fpath, "w"))
+            yaml.safe_dump(dict(pk, configs={"stale": {"fitted_path": fpath}}, default_config="stale"),
+                           open(os.path.join(d, "pack.yaml"), "w"))
             try:
                 BM.run_pack = lambda *a, **k: calls.append(1) or {}
                 rc = BM.main([os.path.join(d, "pack.yaml"), "run", "--workers", "1", "--seeds", "1"])
@@ -791,17 +795,95 @@ def _self_test() -> int:
         cp = ev.pack
         cp["benchmarks"][0]["band"] = [0.0, 9.0]
         ok(ev.pack["benchmarks"][0]["band"] == [0.3, 0.5] and ev.problems == () and set(ev.fitted) == {"eff_a", "eff_b"},
-           "BS61 the evidence snapshot is immutable: a consumer's copy cannot change it")
-        import inspect
-        from toolkit.analysis import batch as Bt, estimates as ES, run as RUNm
-        src = {n: inspect.getsource(f) for n, f in (("fitted_ranges", Bt.fitted_ranges), ("_run", RUNm._run),
-               ("benchmark_acceptance", ES.benchmark_acceptance), ("verified_benchmarks", BM.verified_benchmarks),
-               ("verified_spec_benchmarks", EP.verified_spec_benchmarks), ("spec_benchmarks", EP.spec_benchmarks),
-               ("merge_results", BM.merge_results), ("rescore_results", BM.rescore_results), ("main", BM.main))}
-        ok(all("load_evidence" in v for v in src.values()) and not any("fitted_problems(" in v or "stale_ids(" in v
-                                                                       for v in src.values()),
-           f"BS62 every consumer reads the one snapshot: {[k for k, v in src.items() if 'load_evidence' not in v]}")
-    case("BS61-62", r4_5)
+           "BS61 the evidence snapshot returns detached copies: a consumer's copy cannot change it")
+    case("BS61", r4_5)
+
+    # ---- S1-2b Codex round 1 (#158): behavioural bypass tests with self-contained stale fixtures
+    from toolkit.engines.contract import ToyEngine
+
+    class FittedToy(ToyEngine):          # a subclass of a listed toy: not exempt (P2-6)
+        pass
+
+    def stale_toy(d):
+        fp = os.path.join(d, "fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T1": "an older declaration"}}, open(fp, "w"))
+        e = FittedToy()
+        e.fitted_path = fp
+        return e
+
+    def b1():
+        with tempfile.TemporaryDirectory() as d:
+            st = stale_toy(d)
+            try:
+                BM.run_pack(toy, st, BM.Runner(toy, st, 1), {})
+                ok(False, "BS62 run_pack refuses to score with fitted values without current provenance")
+            except ValueError as ex:
+                ok("refit required" in str(ex), f"BS62 run_pack refuses to score with stale fitted values: {ex}")
+            rf = BM.Runner(toy, st, 1, mode="fit")          # fitting is the one mode that sets fitted values
+            ok(rf.evaluate("T1", {"eff_a": 0.6})["computed"] is not None,
+               "BS63 fitting runs in its own explicit mode, with candidate fitted values")
+            e2 = FittedToy()
+            fp2 = os.path.join(d, "current.yaml")
+            yaml.safe_dump({"parameters": {k: {"value": v[2], "lo": v[0], "hi": v[1]}
+                                           for k, v in load_evidence(eng, pack=toy).fitted.items()},
+                            "band_declarations": fit_declarations(toy)}, open(fp2, "w"))
+            e2.fitted_path = fp2
+            rn = BM.Runner(toy, e2, 1)
+            try:
+                BM.run_pack(toy, e2, rn, {"eff_a": 0.65})
+                ok(False, "BS64 scoring refuses caller fitted values that are not the evidence's")
+            except ValueError as ex:
+                ok("evidence" in str(ex), f"BS64 scoring refuses caller fitted values that are not the evidence's: {ex}")
+        ok(any("refit required" in x for x in load_evidence(FittedToy(), pack=toy).problems),
+           "BS65 only exact registered toys are exempt: a subclass with fitted parameters and no file needs a refit")
+    case("BS62-65", b1)
+
+    def b2():
+        rn = BM.Runner(toy, eng, 1)
+        view = rn.pack
+        view["benchmarks"][0]["band"] = [0.2, 0.5]
+        try:
+            rn.evaluate(view["benchmarks"][0], {})
+            ok(False, "BS66 the runner's validated declarations cannot be changed through its pack")
+        except ValueError:
+            ok(rn.pack["benchmarks"][0]["band"] == [0.3, 0.5],
+               "BS66 the runner's validated declarations cannot be changed through its pack")
+    case("BS66", b2)
+
+    def b3():
+        cov = {"id": "C1", "estimand": {"type": "coverage", "calibrator": {"fn": "toolkit.engines.benchmark:x"}}}
+        p1 = dict(toy, benchmarks=[cov], coverage_scoring={"refusal_share_max": 0.02}, oracles="toolkit.engines.benchmark")
+        row = {"id": "C1", "band_sha256": band_digest(cov, p1)}
+        p2 = dict(p1, coverage_scoring={"refusal_share_max": 0.0})
+        b0 = toy["benchmarks"][0]
+        o1 = dict(toy, oracles="toolkit.engines.benchmark")
+        ok(stale_ids(p2, [row]) == ["C1"] and band_digest(b0, o1) != band_digest(b0, dict(o1, oracles="toolkit.engines.contract")),
+           "BS67 the digest covers pack-level coverage scoring and the oracle and calibrator modules' code")
+    case("BS67", b3)
+
+    def b4():
+        from toolkit.spec import engine_parameters as EPm
+        orig = EPm.benchmark_pack
+        try:
+            def broken(e):
+                raise EPm.PackError("unreadable")
+            EPm.benchmark_pack = broken
+            unreadable = load_evidence(eng).problems
+        finally:
+            EPm.benchmark_pack = orig
+        empty = load_evidence(eng, pack=dict(toy, benchmarks=[])).problems
+        missing = load_evidence(eng, pack=toy, rows=[]).problems
+        partial = load_evidence(eng, pack=toy, rows=[], partial=True).problems
+        ok(unreadable and empty and any("rerun required: T1" in x for x in missing) and partial == (),
+           f"BS68 an unreadable pack, an empty pack and missing rows are problems; partial rows are explicit: "
+           f"{unreadable} | {empty} | {missing} | {partial}")
+        with tempfile.TemporaryDirectory() as d:
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(BM.stamp({"note": "no rows"}, eng), open(rp, "w"))
+            yaml.safe_dump(toy, open(os.path.join(d, "pack.yaml"), "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+        ok(rows == [] and why, f"BS69 a results file without a benchmarks list is refused: {why}")
+    case("BS68-69", b4)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
