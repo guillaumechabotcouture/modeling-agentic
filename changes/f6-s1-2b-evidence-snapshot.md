@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "S1-2b α–γ"
+commit: "S1-2b α–δ"
 status_group: "F6 Stage 1"
 ---
 

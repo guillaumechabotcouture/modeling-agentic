@@ -47,7 +47,7 @@ SOURCED_TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome")
 EXEMPT_TYPES = ("value", "identity", "coverage", "curve_rules")     # oracle and rule checks: no published interval
 TOY_ENGINE_REFS = ("toolkit.engines.contract:ToyEngine", "toolkit.engines.benchmark:SharedStateToy",
                    "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine",
-                   "toolkit.spec.priors:ToyPriorEngine")
+                   "toolkit.spec.priors:ToyPriorEngine", "toolkit.engines.hooks:ToyScheduleEngine")
 ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio", "cost_per_outcome")
 # engine estimand type -> source estimand types it stands for without a mapping note
 COMPATIBLE = {"odds_ratio": {"odds_ratio"}, "interaction_or": {"odds_ratio"}, "ratio": {"risk_ratio", "rate_ratio"},
@@ -327,8 +327,7 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None) ->
     engine's own pack). `rows`: stored result rows to validate (None: fitted values only). Problems: a pack that cannot
     be read or fails the source check, rows scored against other declarations ('rerun required'), and fitted values
     without current provenance ('refit required'). A self-test toy engine may have no pack."""
-    ref = f"{type(engine).__module__}:{type(engine).__name__}"
-    toy = ref in TOY_ENGINE_REFS
+    toy = any(f"{c.__module__}:{c.__name__}" in TOY_ENGINE_REFS for c in type(engine).__mro__)   # a toy or a subclass
     probs = []
     if pack is None:
         from toolkit.spec import engine_parameters as EP
