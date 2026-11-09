@@ -2361,28 +2361,31 @@ def _self_test() -> int:
         return P, sim
 
     def hm26():          # a shared survey offset per group: independent errors give the wrong compatible region
-        off = {"g0": (0.35, -0.3), "g1": (-0.3, 0.35), "g2": (0.2, 0.4), "g3": (-0.4, 0.1)}
+        off = {"g0": 0.2, "g1": -0.2, "g2": 0.1, "g3": -0.15}
         tr_ = lambda u: float(int(u[-1]) % 2)  # noqa: E731  -- treated units alternate within each group
         f0 = lambda u, z, th: z  # noqa: E731
         f1 = lambda u, z, th: z - 3.0 * th["e"] * tr_(u)  # noqa: E731
-        obs = lambda u, g: (0.2 + off[g][0], 0.2 - 1.8 * tr_(u) + off[g][1])  # noqa: E731  -- truth e = 0.6
+        obs = lambda u, g: (0.2, 0.2 - 1.8 * tr_(u) + off[g])  # noqa: E731  -- truth e = 0.6; w1 carries the offset
         per = {g: 6 for g in off}
-        Ps, ss = gtoy(per, f0, f1, obs, sd_b=0.3, key=lambda ob, g: f"{ob}|{g}")
-        Pi, si = gtoy(per, f0, f1, obs, sd_b=0.3)
+        Ps, ss = gtoy(per, f0, f1, obs, sd_b=0.4, key=lambda ob, g: f"{ob}|{g}" if ob == "w1" else None)
+        Pi, si = gtoy(per, f0, f1, obs, sd_b=0.4)
+        for t in Ps.targets + Pi.targets:          # w0 is each unit's own survey, without a source bias
+            if t.observable == "w0":
+                t.sd_bias = 0.0
         hs = HistoryMatch(Ps, ss, 11, q, candidates_log2=9, points_per_unit=10)
         rs = hs.run(2)
         hi_ = HistoryMatch(Pi, si, 11, q, candidates_log2=9, points_per_unit=10)
         ri = hi_.run(2)
-        ok(rs["status"] == "matched" and hs.compatible({"e": 0.6}) and not hs.compatible({"e": 0.9}),
+        ok(rs["status"] == "matched" and hs.compatible({"e": 0.6}) and not hs.compatible({"e": 0.85}),
            f"HM26a one offset per (source, group): the truth is compatible, a value the within-group contrast rules "
            f"out is not ({rs['status']}, {rs['blocks']}, region {rs['region']['ranges']})")
-        ok(hi_.compatible({"e": 0.9}) and ri["region"]["contraction"]["e"] + 0.25 < rs["region"]["contraction"]["e"],
+        ok(hi_.compatible({"e": 0.85}) and ri["region"]["contraction"]["e"] + 0.25 < rs["region"]["contraction"]["e"],
            f"HM26b the same bias sd added to each target independently keeps the wrong value and a wider region "
            f"({ri['region']['ranges']} vs {rs['region']['ranges']})")
         b = rs.get("bias") or {}
-        ok(set(b) == {f"{ob}|{g}" for ob in ("w0", "w1") for g in off}
-           and all(abs(v["z"]) <= rs["cutoff"] + 1e-9 and v["sd"] == 0.3 for v in b.values()),
-           f"HM26c the report gives each block's offset at the best point, inside its prior ({b})")
+        ok(set(b) == {f"w1|{g}" for g in off}
+           and all(abs(v["mean"]) <= 3 * 0.4 and v["sd_prior"] == 0.4 and v["draws"] > 0 for v in b.values()),
+           f"HM26c the report gives each block's offset draws at the best point, inside its prior ({b})")
     safe(hm26, "HM26")
 
     def hm27():          # the best point weights each group once, not each of its units
@@ -2423,13 +2426,10 @@ def _self_test() -> int:
                                     weights={P.units[0]: 1.0}, source="t", bias_key="k"))
         cases.append(("a bias block on a group target", c3))
 
-        def c6(P):
-            u = P.units[0]
-            for n, t in enumerate(P.unit_targets(u)):
-                t.bias_key, t.sd_bias = f"k{n}", 0.1
-            P.targets += [Target(f"{u}:x{n}", "unit", "w0", 0.5, "logit", sd_obs=0.1, sd_bias=0.1, unit=u, source="t",
-                                 bias_key=f"x{n}") for n in range(3)]
-        cases.append(("more bias blocks linked by units than bias_blocks_max", c6))
+        def c6(P):           # Codex r2: one offset block per unit
+            for n, t in enumerate(P.unit_targets(P.units[0])):
+                t.bias_key, t.sd_bias = f"s{n}|g0", 0.1
+        cases.append(("a unit with targets in two offset blocks", c6))
         for why, mut in cases:
             P, sim = gtoy({"g0": 3}, f, f, obs)
             mut(P)
@@ -2447,16 +2447,17 @@ def _self_test() -> int:
         P, sim = gtoy({"g0": 5, "g1": 5}, f0, f1, obs, sd_b=0.3, key=lambda ob, g: f"{ob}|{g}" if ob == "w0" else None)
         r = calibrate(P, sim, seed=2, waves=1, log=q, candidates_log2=8, points_per_unit=20)
         b = r.get("bias") or {}
-        ok(r["status"] == "matched" and set(b) == {"w0|g0", "w0|g1"} and all(abs(v["z"]) <= 3 for v in b.values())
+        ok(r["status"] == "matched" and set(b) == {"w0|g0", "w0|g1"} and all(abs(v["mean"]) <= 3 * 0.3 for v in b.values())
            and all(t.bias_key is None for t in P.targets if t.observable == "w1"),
            f"HM30 one block per unit: matched, one offset per group inside its prior ({r['status']}, {b})")
     safe(hm30, "HM30")
 
-    def one_group(ys, sd=0.01, sd_b=0.2, zr=(0.0, 1.0), slope=1.0, extra=()):
+    def one_group(ys, sd=0.01, sd_b=0.2, zr=(0.0, 1.0), slope=1.0, extra=(), groups=None):
         units = [f"u{i}" for i in range(len(ys))]
+        gs = groups or ["g"] * len(ys)
         tg = [Target(f"{u}:x", "unit", "x", y, "identity", sd_obs=sd, sd_bias=sd_b, unit=u, source="toy",
-                     bias_key="s|g") for u, y in zip(units, ys)] + list(extra)
-        P = Problem([], {"name": "z", "lo": zr[0], "hi": zr[1]}, units, tg, groups={u: "g" for u in units})
+                     bias_key=f"s|{g}") for u, y, g in zip(units, ys, gs)] + list(extra)
+        P = Problem([], {"name": "z", "lo": zr[0], "hi": zr[1]}, units, tg, groups=dict(zip(units, gs)))
 
         def sim(pts):
             return [{"x": slope * p["z"] + 1e-4 * np.random.default_rng(p["seed"]).normal()} for p in pts]
@@ -2472,6 +2473,25 @@ def _self_test() -> int:
         ratio = float(np.var(R.mean(1)) / max(np.mean(np.var(R, 0)), 1e-12))
         ok(ratio > 0.8, f"HM31b the units move together with their shared offset: the variance of the group mean is "
                         f"close to a unit's (ratio {ratio:.2f}; independent draws would give 0.25)")
+        from scipy.stats import truncnorm
+        want = float(truncnorm.var(-0.53 / 0.2, 0.53 / 0.2, scale=0.2))      # the offset prior over its feasible set
+
+        def var_check(r, label, extra=""):
+            R = np.asarray(r["sample"]["rows"]) if r.get("sample") else np.full((2, 4), 0.5)
+            v = float(np.var(R.mean(1)))
+            at = float(np.mean(np.abs(R[:, 0] - 0.5) < 1e-3))
+            ok(r["status"] == "matched" and abs(v - want) <= 0.15 * want and at < 0.15,
+               f"{label}: the group mean's variance is the offset prior's over its feasible set ({v:.5f} vs "
+               f"{want:.5f}); no point mass at one offset (share of draws at z = 0.5: {at:.3f}){extra}")
+        var_check(r, "HM31c")
+        agg = Target("agg", "group", "x", 0.5, "identity", sd_obs=0.2, weights={f"u{i}": 1.0 for i in range(4)},
+                     source="toy")
+        P, sim = one_group([0.5] * 4, extra=[agg])
+        var_check(calibrate(P, sim, seed=3, waves=1, log=q, points_per_unit=20), "HM31d (Codex r2 P1-1) with a weak "
+                  "aggregate")
+        P, sim = one_group([0.5] * 4, sd=1e-5)
+        var_check(calibrate(P, sim, seed=3, waves=1, log=q, points_per_unit=20), "HM31e (Codex r2 P1-2) with a "
+                  "sampling sd of 1e-5")
     safe(hm31, "HM31")
 
     def hm32():          # Codex r1 P2-2: a group target is checked while the offset is profiled
@@ -2483,6 +2503,16 @@ def _self_test() -> int:
         ok(r["status"] == "matched" and z and all(abs(x - 0.7) < 0.08 for x in z),
            f"HM32 a unit survey at 0.5 and an aggregate at 0.7: an offset near -0.2 fits both, and the aggregate is "
            f"checked before an offset is chosen ({r['status']}, {r['blocks']}, z {np.round(z, 3)})")
+        agg = Target("agg", "group", "x", 0.7, "identity", sd_obs=0.01, weights={f"u{i}": 1.0 for i in range(4)},
+                     source="toy")
+        P, sim = one_group([0.5] * 4, zr=(0.0, 1.5), extra=[agg], groups=["g0", "g0", "g1", "g1"])
+        r = calibrate(P, sim, seed=4, waves=1, log=q, points_per_unit=20)
+        z = list((r.get("best") or {}).get("z", {}).values())
+        comp = r.get("bias_components") or []
+        ok(r["status"] == "matched" and z and abs(np.mean(z) - 0.7) < 0.05 and len(comp) == 1
+           and comp[0]["blocks"] == ["s|g0", "s|g1"],
+           f"HM32b (Codex r2 P2-4) an aggregate over two groups joins their offsets in one component and is fitted "
+           f"with them ({r['status']}, {r['blocks']}, mean z {np.mean(z) if z else None}, {comp})")
     safe(hm32, "HM32")
 
     def hm33():          # Codex r1 P2-3: no common offset exists; grid slack must not certify one
@@ -2493,7 +2523,30 @@ def _self_test() -> int:
            f"HM33a two units whose offsets must be 0.14 and -0.14 conflict ({r['status']}, {r['conflicting']})")
         ok(ver and not all(v["ok"] for v in ver.values()),
            f"HM33b the engine verification does not certify a common offset either ({ver})")
+        P, sim = one_group([0.137, 0.137], sd=0.001, sd_b=1.0, zr=(-1.0, 1.0), slope=0.001)
+        r = calibrate(P, sim, seed=5, waves=1, log=q, points_per_unit=20)
+        b = (r.get("bias") or {}).get("s|g") or {}
+        ok(r["status"] == "matched" and abs(b.get("mean", 9) - 0.137) < 0.01,
+           f"HM33c (Codex r2 P2-3) two units whose offsets fit on [0.134, 0.140]: found exactly ({r['status']}, {b})")
     safe(hm33, "HM33")
+
+    def hm34():          # Codex r2: proposals double until a small feasible region is found, or up to the maximum
+        agg = Target("agg", "group", "x", 2.55, "identity", sd_obs=0.005, weights={f"u{i}": 1.0 for i in range(4)},
+                     source="toy")
+        P, sim = one_group([0.5] * 4, sd_b=1.0, zr=(-3.0, 3.0), extra=[agg])
+        r = calibrate(P, sim, seed=6, waves=1, log=q, points_per_unit=20, bias_draws_max=4096)
+        comp = (r.get("bias_components") or [{}])[0]
+        b = (r.get("bias") or {}).get("s|g") or {}
+        ok(r["status"] == "matched" and comp.get("draws_max", 0) > 64 and abs(b.get("mean", 9) + 2.05) < 0.05,
+           f"HM34a an offset region of about 0.3% of the prior is found by doubling the proposals ({r['status']}, "
+           f"{comp}, {b})")
+        agg.value = 5.0                     # beyond any unit value: no offset makes the aggregate reachable
+        r = calibrate(P, sim, seed=6, waves=1, log=q, points_per_unit=20, bias_draws_max=256)
+        comp = (r.get("bias_components") or [{}])[0]
+        ok(r["blocked"] and comp.get("no_accepted") and comp.get("draws_max") == 256,
+           f"HM34b no proposal accepted up to the maximum: infeasible, with the reason and the count reached "
+           f"({r['status']}, {comp})")
+    safe(hm34, "HM34")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

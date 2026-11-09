@@ -1527,7 +1527,8 @@ def _self_test() -> int:
             raw = yaml.safe_load(open(p))
             j = raw["calibration"]["joint"]
             j["targets"][0].update(bias_sd=0.2, bias_by="region", bias_source="survey_a")
-            j["targets"].append(dict(j["targets"][0], id="unit_t2", window=[2, 3], bias_source="survey_b"))
+            j["targets"].append({k: v for k, v in j["targets"][0].items() if not k.startswith("bias")}
+                                | {"id": "unit_t2", "window": [2, 3]})
             j["best_point_weighting"] = "per_group"
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             r3 = yaml.safe_load(open(p))      # Codex r1 P2-4: a second target of the same survey shares its offset
@@ -1536,7 +1537,7 @@ def _self_test() -> int:
             yaml.safe_dump(r3, open(p3, "w"), sort_keys=False)
             P, _ = build(schema.load(p3))
             key = {t.id: getattr(t, "bias_key", None) for t in P.targets}
-            ok(key.get("unit_t:0") == key.get("unit_t3:0") == "survey_a|r0" and key.get("unit_t2:0") == "survey_b|r0",
+            ok(key.get("unit_t:0") == key.get("unit_t3:0") == "survey_a|r0" and key.get("unit_t2:0") is None,
                f"JA15a bias_by with bias_source: one offset per survey and region, shared by the survey's targets "
                f"({key.get('unit_t:0')}, {key.get('unit_t3:0')}, {key.get('unit_t2:0')})")
             bad_cases = [("bias_by names no units column", lambda j: j["targets"][0].update(bias_by="nope")),
@@ -1550,6 +1551,8 @@ def _self_test() -> int:
                          ("one survey grouped by two columns", lambda j: j["targets"].append(
                              dict(j["targets"][0], id="unit_t3", bias_by="grp"))),
                          ("bias_source without bias_by", lambda j: j["targets"][0].pop("bias_by")),
+                         ("two surveys with offsets for the same units (one block per unit)",
+                          lambda j: j["targets"][1].update(bias_sd=0.2, bias_by="region", bias_source="s_b")),
                          ("an unknown best_point_weighting", lambda j: j.update(best_point_weighting="per_x"))]
             for why, mut in bad_cases:
                 r2 = yaml.safe_load(open(p))
@@ -1559,7 +1562,7 @@ def _self_test() -> int:
                 bad = spec_problems(schema.load(p2))
                 ok(bool(bad), f"JA15b refused: {why} ({bad[:2]})")
             rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
-            ok(set(rep.get("bias") or {}) == {f"{s}|r{k}" for s in ("survey_a", "survey_b") for k in range(3)}
+            ok(set(rep.get("bias") or {}) == {f"survey_a|r{k}" for k in range(3)}
                and (rep.get("weighting") or {}).get("best_point") == "per_group",
                f"JA15c the toy run reports each block's offset and uses the signed per_group weighting "
                f"({rep.get('weighting')}, {summary(rep)})")
