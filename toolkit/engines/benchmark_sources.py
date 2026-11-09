@@ -438,16 +438,12 @@ def _self_test() -> int:
                 ok(False, "BS39 merge refuses rows computed for another band declaration")
             except ValueError as ex:
                 ok("T1" in str(ex), f"BS39 merge refuses rows computed for another band declaration ({ex})")
-            rs = BM.rescore_results(pk2, res, pk_, eng)
-            r0 = rs["benchmarks"][0]
-            ok(r0["band"] == [0.35, 0.5] and r0["band_sha256"] == band_digest(new) and "rescored_from" in r0
-               and r0["status"] == ("in_band" if 0.35 <= r0["computed"] <= 0.5 else "out_of_band"),
-               "BS40 rescore re-scores a stale row against the new band and marks it rescored")
-            try:
-                BM.rescore_results(pk2, res, pk2, eng)
-                ok(False, "BS41 rescore refuses a row not computed for the stated previous declaration")
-            except ValueError:
-                ok(True, "BS41 rescore refuses a row not computed for the stated previous declaration")
+            for prev in (pk_, pk2):
+                try:
+                    BM.rescore_results(pk2, res, prev, eng)
+                    ok(False, "BS40 rescore refuses a row scored against another band declaration")
+                except ValueError as ex:
+                    ok("rerun required: T1" in str(ex), f"BS40 rescore refuses a stale row: {ex}")
         fd = {"band_declarations": band_declarations(toy, ["T1"])}
         ok(fitted_problems(fd, toy) == [] and fitted_problems(fd, pk2) == ["refit required: T1"]
            and fitted_problems({}, toy) == ["refit required: T1"],
@@ -488,6 +484,46 @@ def _self_test() -> int:
         ok("engine_fitted_problems" in inspect.getsource(RUNm._run),
            "BS45 the analysis entry blocks on stale fitted values before the joint calibration or the batch")
     case("BS44-45", r1_2b)
+
+    # ---- review round 2 (Codex, PR #154)
+    def r2_6():
+        fd2 = {"band_declarations": dict(band_declarations(toy, ["T1"]), T9="a former fit target")}
+        ok(fitted_problems(fd2, toy) == ["refit required: T9"],
+           f"BS46 a fit whose recorded target set differs from the current one needs a refit: {fitted_problems(fd2, toy)}")
+    case("BS46", r2_6)
+
+    def r2_5():
+        class NoPack:
+            def parameters(self):
+                return []
+        with tempfile.TemporaryDirectory() as d:
+            e = NoPack()
+            e.fitted_path = os.path.join(d, "fitted.yaml")
+            yaml.safe_dump({"parameters": {}}, open(e.fitted_path, "w"))
+            orig = EP.benchmark_pack
+            try:
+                EP.benchmark_pack = lambda en: (None, "no pack")
+                probs = engine_fitted_problems(e)
+            finally:
+                EP.benchmark_pack = orig
+        ok(len(probs) == 1 and "unusable" in probs[0],
+           f"BS47 fitted values with no readable pack to check them against are unusable evidence: {probs}")
+    case("BS47", r2_5)
+
+    def r2_4():
+        from toolkit.analysis import estimates as ES
+        from toolkit.engines.contract import code_fingerprint
+        from toolkit.engines.malaria.engine import MalariaEngine
+        me = MalariaEngine()
+        doc = {"producer": BM.PRODUCER, "engine_identity": {"code_sha256": code_fingerprint(me)},
+               "benchmarks": [{"id": b["id"], "status": "in_band", "band_sha256": band_digest(b)} for b in pk["benchmarks"]]}
+        doc["benchmarks"][[b["id"] for b in pk["benchmarks"]].index("B10")]["band_sha256"] = "an older declaration"
+        try:
+            ES.benchmark_acceptance(me, doc=doc)
+            ok(False, "BS48 estimates acceptance refuses statuses scored against another band declaration")
+        except ValueError as ex:
+            ok("rerun required: B10" in str(ex), f"BS48 estimates acceptance refuses a stale status: {ex}")
+    case("BS48", r2_4)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

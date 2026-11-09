@@ -728,6 +728,28 @@ def _self_test_joint(ok, q):
                and os.path.exists(os.path.join(d, "analysis", "joint_calibration.yaml")),
                "JR1 a unit the joint calibration cannot match stops the run at the calibration step, before the "
                "outcome batch (blocked.yaml names it; the joint calibration artifact is written)")
+    with tempfile.TemporaryDirectory() as d:     # F6 S1-2 (Codex r2 P2-7): stale fitted values, joint calibration spec
+        from toolkit.engines.contract import ToyEngine
+        from toolkit.spec import engine_parameters as EPm
+        JC._toy_joint(d, group=False)
+        signoff.sign(d, "lead", note="self-test")
+        fpath = os.path.join(d, "stale_fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(fpath, "w"))
+        orig_bp = EPm.benchmark_pack
+        try:
+            ToyEngine.fitted_path = fpath
+            EPm.benchmark_pack = lambda e: (dict(_toy_pack(), fit_joint={"targets": ["T2"]}), "pack.yaml")
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR0 stale fitted values block a joint-calibration run")
+        except AnalysisBlocked as e:
+            b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "fitted_values" and b["reason"] == "refit required: T2",
+               f"JR0 stale fitted values block a joint-calibration run with the blocked artifact: {b['reason']}")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"JR0 stale fitted values block a joint-calibration run (got {type(e).__name__}: {e})")
+        finally:
+            del ToyEngine.fitted_path
+            EPm.benchmark_pack = orig_bp
     with tempfile.TemporaryDirectory() as d:     # owner decision 2026-11-06: flagged, never silently
         sp = JC._toy_joint(d, unreachable="5", group=False)
         raw = yaml.safe_load(open(sp))

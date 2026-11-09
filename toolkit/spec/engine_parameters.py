@@ -1153,6 +1153,35 @@ def _self_test() -> int:
                and all(x.get("engine_identity") == engine_identity(A.eng) for x in arms.values()),
                f"EP32 the harness step writes the file under analysis/ with a record of its digest and of the engine and "
                f"configuration each arm ran with: {sorted(arms)}")
+            # F6 S1-2 (Codex r2 P1-3): the reader and the producer check band declarations and fitted provenance
+            from toolkit.engines.contract import ToyEngine
+            sp_ = schema.load(p)
+            tp = RUN._toy_pack()
+            moved = dict(tp, benchmarks=[dict(tp["benchmarks"][0], band=[0.7, 1.25],
+                                              band_override=dict(tp["benchmarks"][0]["band_override"], band=[0.7, 1.25]))])
+            stale_f = os.path.join(d, "stale_fitted.yaml")
+            yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(stale_f, "w"))
+            got0 = EPm.verified_spec_benchmarks(A.eng, sp_)
+            orig_bp = EPm.benchmark_pack
+            try:
+                EPm.benchmark_pack = lambda e: (moved, "pack.yaml")
+                got1 = EPm.verified_spec_benchmarks(A.eng, sp_)
+                EPm.benchmark_pack = lambda e: (dict(tp, fit_joint={"targets": ["T2"]}), "pack.yaml")
+                ToyEngine.fitted_path = stale_f
+                got2 = EPm.verified_spec_benchmarks(A.eng, sp_)
+                try:
+                    EPm.spec_benchmarks(tp, A.eng, sp_)
+                    got3 = "accepted"
+                except ValueError as e:
+                    got3 = str(e)
+            finally:
+                EPm.benchmark_pack = orig_bp
+                if "fitted_path" in vars(ToyEngine):
+                    del ToyEngine.fitted_path
+            ok(got0[0] and got1[0] == [] and "rerun required: T2" in str(got1[1]) and got2[0] == []
+               and "refit required: T2" in str(got2[1]) and "refit required: T2" in got3,
+               f"EP32b verified_spec_benchmarks refuses rows for another band declaration and stale fitted values, and "
+               f"spec_benchmarks refuses stale fitted values: {got1[1]} | {got2[1]} | {got3}")
             doc = yaml.safe_load(open(path))
             b = {x["id"]: x for x in doc["benchmarks"]}["T2"]
             arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}
