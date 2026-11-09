@@ -285,8 +285,9 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
                  if d.get("point_plan_feasible") is False else "")
               + (f"Keeping the point plan loses up to [CLAIM:dt.{t}.regret_pct] of the re-optimised objective; "
                  if d.get("regret_share") is not None else "")
-              + f"up to [CLAIM:dt.{t}.dollars] moves between components and up to [CLAIM:dt.{t}.reallocated] between "
-              f"units, and up to [CLAIM:dt.{t}.population] people live in units whose package changes"
+              + f"up to [CLAIM:dt.{t}.reallocated] is reallocated across units and components and the net change "
+              f"between components is up to [CLAIM:dt.{t}.dollars] (each at its own worst tested value), and up to "
+              f"[CLAIM:dt.{t}.population] people live in units whose package changes"
               + (" (at the value with the most units changing, most changes in "
                  + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]" for k, g in enumerate(grp[:GROUPS_SHOWN]))
                  + ")" if grp else "")

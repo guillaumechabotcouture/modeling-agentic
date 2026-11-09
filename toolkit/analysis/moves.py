@@ -88,7 +88,10 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
     pt, re = component_totals(ccost, plan, ids), component_totals(ccost, ch, ids)
     delta = {c: re.get(c, 0.0) - pt.get(c, 0.0) for c in components}
     moved = max(sum(v for v in delta.values() if v > 0), -sum(v for v in delta.values() if v < 0))
-    realloc = 0.5 * sum(abs(cost[i][ch[i]] - cost[i][plan[i]]) for i in ids)     # between units, any component
+    # Codex r2 P2-2: over unit x component before anything cancels, so a swap between components inside a unit and a
+    # transfer between units within a component both count
+    realloc = 0.5 * sum(abs(ccost[i][ch[i]].get(c, 0.0) - ccost[i][plan[i]].get(c, 0.0))
+                        for i in ids for c in set(ccost[i][ch[i]]) | set(ccost[i][plan[i]]))
     total_pop = sum(float(pop[i]) for i in ids)
     pc = sum(float(pop[i]) for i in changed)
     by = None
@@ -108,12 +111,27 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
            "population_changed": pc, "population_changed_share": pc / total_pop if total_pop > 0 else None,
            "dollars_by_component": delta, "dollars_moved": moved, "dollars_moved_share": share(moved),
            "dollars_reallocated": realloc, "dollars_reallocated_share": share(realloc),
-           "dollars_share": share(max(moved, realloc)), "units_changed_by_group": by}
-    vals = {"share": rec["share_units_changed"], "regret": rec["regret_share"], "dollars": rec["dollars_share"]}
-    rec["triggered_by"] = (["infeasible"] if why else []) + [k for k in CRITERIA if vals[k] is not None
-                                                             and vals[k] > thr[k]]
+           "dollars_share": share(realloc), "units_changed_by_group": by}
+    rec["triggered_by"] = (["infeasible"] if why else []) + [k for k in CRITERIA if fires(rec, k, thr[k])]
     rec["decision_changes"] = bool(rec["triggered_by"])
     return rec
+
+
+REGRET_TOL = 1e-9      # relative to max(1, |objective|); scripts/mechanism_manifest.py holds the same rule
+
+
+def fires(rec: dict, k: str, t: float) -> bool:
+    """Criterion k against threshold t. Regret under a non-positive re-optimised objective has no share: any regret
+    above the tolerance is then a change (Codex r2 P2-1)."""
+    if k == "share":
+        return rec["share_units_changed"] > t
+    if k == "dollars":
+        return rec["dollars_share"] is not None and rec["dollars_share"] > t
+    if rec.get("regret") is None:
+        return False
+    if rec.get("regret_share") is not None:
+        return rec["regret_share"] > t
+    return rec["regret"] > REGRET_TOL * max(1.0, abs(rec["reoptimised_objective"]))
 
 
 def component_stability(pk: dict, pairs, components) -> dict:
@@ -151,8 +169,11 @@ def aggregate(rows: list) -> dict:
     def worst(key):
         c = [r for r in rows if r.get(key) is not None]
         return max(c, key=lambda r: r[key]) if c else None
-    w = {"share": worst("share_units_changed"), "regret": worst("regret_share") or worst("regret") or rows[0],
-         "dollars": worst("dollars_share") or rows[0], "population": worst("population_changed")}
+    rg = [r for r in rows if "regret" in (r.get("triggered_by") or [])]   # a value that fires on regret comes first
+    w = {"share": worst("share_units_changed"),
+         "regret": (max(rg, key=lambda r: r["regret"]) if rg else worst("regret_share") or worst("regret") or rows[0]),
+         "dollars": worst("dollars_reallocated") or rows[0], "dollars_moved": worst("dollars_moved") or rows[0],
+         "population": worst("population_changed")}
     wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for k, r in w.items()}
     trig = [k for k in ("infeasible",) + CRITERIA if any(k in (r.get("triggered_by") or []) for r in rows)]
     return {"decision_changes": bool(trig), "triggered_by": trig,
@@ -160,9 +181,9 @@ def aggregate(rows: list) -> dict:
             "share_units_changed": w["share"]["share_units_changed"],
             "units_changed_by_group": w["share"]["units_changed_by_group"],
             **{k: w["regret"].get(k) for k in ("regret", "regret_share", "reoptimised_objective", "objective_gap")},
-            **{k: w["dollars"].get(k) for k in ("dollars_share", "dollars_moved", "dollars_moved_share",
-                                                 "dollars_reallocated", "dollars_reallocated_share",
-                                                 "dollars_by_component")},
+            # Codex r2 P2-3: each dollar measure from its own worst value
+            **{k: w["dollars"].get(k) for k in ("dollars_share", "dollars_reallocated", "dollars_reallocated_share")},
+            **{k: w["dollars_moved"].get(k) for k in ("dollars_moved", "dollars_moved_share", "dollars_by_component")},
             "population_changed": w["population"]["population_changed"],
             "population_changed_share": w["population"]["population_changed_share"], "worst_by_criterion": wb}
 

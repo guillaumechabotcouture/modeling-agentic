@@ -279,7 +279,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            "test_id": dt["id"], "type": t, "question": dt.get("text", ""), "varied": varied,
            "criterion": (f"the package changes in more than {thr:.0%} of units, or keeping the point plan loses more "
                          f"than {th['regret']:.1%} of the re-optimised objective, or more than {th['dollars']:.0%} of "
-                         "the allocatable budget moves between components or between units, or the point plan is "
+                         "the allocatable budget is reallocated across units and components, or the point plan is "
                          "not feasible under the test"),
            **agg, "share_threshold": thr, "regret_threshold": th["regret"], "dollars_threshold": th["dollars"],
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
