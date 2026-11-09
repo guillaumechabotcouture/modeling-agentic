@@ -170,7 +170,7 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 id=str(b["id"]), kind="critique_blocker", severity=str(b.get("severity") or "HIGH").upper(),
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
-                last_seen_round=doc.get("round"), claim=str(b.get("claim") or "")[:600],
+                last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""),
                 done_when=b.get("done_when") if isinstance(b.get("done_when"), list) else None))
     return found, problems
 
@@ -213,7 +213,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 owner_state_known=known, target_stage=str(stage or ""),
                 scope_declarable=v.get("scope_declarable") is not False,
                 first_seen_round=v.get("first_seen_round", round_n), last_seen_round=round_n,
-                claim=str(v.get("claim") or v.get("evidence") or "")[:600])
+                claim=str(v.get("claim") or v.get("evidence") or ""))
             if v.get("owner_signoff"):
                 rows[fid].resolution_type = "owner_decision"
     # Blocking gate entries whose kind no violation list carries (e.g. a required artifact).
@@ -228,7 +228,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                              owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                              scope_declarable=b.get("scope_declarable") is not False,
                              first_seen_round=b.get("first_seen_round", round_n), last_seen_round=round_n,
-                             claim=str(b.get("claim") or "")[:600])
+                             claim=str(b.get("claim") or ""))
         if b.get("owner_signoff"):
             rows[kind].resolution_type = "owner_decision"
     for f in rows.values():
@@ -243,7 +243,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 id=str(b["id"]), kind="critique_blocker", severity="HIGH", source=str(b.get("reviewer")),
                 owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 first_seen_round=b.get("first_seen_round"), last_seen_round=round_n,
-                claim=str(b.get("claim") or "")[:600])).blocking = True
+                claim=str(b.get("claim") or ""))).blocking = True
     return list(rows.values()), problems
 
 

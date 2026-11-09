@@ -240,7 +240,7 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
         elif status in ("exempt", "invalid"):
             t["detail"] = detail
         decls.append({"id": str(e.get("id") or ""), "test": t,
-                      "text": {f: str(e.get(f))[:1200] for f in sd.JUSTIFICATION_FIELDS if e.get(f)}})
+                      "text": {f: str(e.get(f)) for f in sd.JUSTIFICATION_FIELDS if e.get(f)}})
     # Codex review (#85): the evidence is part of what the owner approves. The finding's own
     # result (its claim: observed values, metrics; for a persistence escalation the base
     # finding's), each declaration and the decision-test files' contents.
@@ -250,7 +250,7 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
                                     "sources": src,
                                     "entries": sorted(cover, key=lambda e: str(e.get("id"))),
                                     "tests": tests}, sort_keys=True, default=str).encode()).hexdigest()[:16]
-    return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or "")[:600],
+    return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or ""),
             "declarations": decls, "declared": bool(cover), "fingerprint": fp}
 
 

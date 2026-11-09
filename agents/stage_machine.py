@@ -450,7 +450,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
-                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or "")[:300]})
+                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
+                        "fix_requires": _remedy(b)})
     critic_open = {o["id"] for o in out}
     seen = set()
     for v in decision.get("rigor_violations") or []:
@@ -465,8 +466,43 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         seen.add(fid)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
                     "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
-                    "claim": str(v.get("claim") or "")[:300]})
+                    "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
     return out
+
+
+def _remedy(f: dict) -> str | None:
+    """A finding's required remedy, in full (critics write `fix_requires`)."""
+    r = f.get("fix_requires") or f.get("remedy")
+    return " ".join(str(r).split()) if r else None
+
+
+def short_label(text: str, n: int = 120) -> str:
+    """F6 S1-7: a short label for a field that must be short. It never replaces the full text: the
+    claim is kept beside it, and a cut label says so with an ellipsis."""
+    t = " ".join(str(text or "").split())
+    first = t.split(". ")[0]
+    return first if len(first) <= n else first[:n - 1].rstrip() + "…"
+
+
+def require_judged(d: dict, opened: list | None = None) -> dict:
+    """F6 S1-7: passed, failed and not-judged tests are counted apart (`check_summary`), and a required
+    test (an open HIGH or MEDIUM finding's) that is not judged cannot yield ACCEPT: the finding is
+    declared (rule 3j), like an open finding with no test the fix loop can work to (rule 3m)."""
+    import done_when as DW
+    summ = DW.summary(d.get("done_when_status") or {}, required=("HIGH", "MEDIUM"))
+    d = dict(d, check_summary=summ)
+    nj = summ["required_not_judged"]
+    if d.get("action") != "ACCEPT" or not nj:
+        return d
+    if opened is not None:
+        have = {o["id"] for o in opened}
+        opened += [{"id": i, "source": "done-when", "severity": (d["done_when_status"].get(i) or {}).get("severity"),
+                    "tested": False, "claim": str((d["done_when_status"].get(i) or {}).get("detail") or ""),
+                    "fix_requires": None} for i in nj if i not in have]
+    d.update(action="DECLARE_SCOPE", rule_matched="3j", declared_open=list(nj),
+             rationale=(f"{len(nj)} required test(s) are not judged ({', '.join(nj)}): not judged is not a pass, "
+                        "so they are declared in the write-up (declared_findings.yaml), not accepted."))
+    return d
 
 
 def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool) -> dict:
@@ -499,8 +535,10 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
     _put(run_dir, DECLARED_FILE, yaml.safe_dump({
         "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
-        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"], "claim": o["claim"]}
-                     for o in opened]}, sort_keys=False))
+        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
+                      "label": short_label(o["claim"]), "claim": o["claim"],
+                      "required_remedy": o.get("fix_requires"), "tested": bool(o.get("tested"))}
+                     for o in opened]}, sort_keys=False, width=10**6))
 
 
 # ---- provenance of inputs
@@ -665,6 +703,30 @@ def report_claim_findings(run_dir: str) -> list[dict]:
                     "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}) that are not in the spec, "
                              "the claims ledger or the question; write each as a [CLAIM:id] the harness renders."})
     return out
+
+
+def report_acceptance_findings(run_dir: str, write_mode: str | None) -> list[dict]:
+    """F6 S1-7: a declared-scope or not-accepted write-up uses no acceptance language (the terms are in
+    .claude/orchestration/acceptance_language.yaml; the check is scripts/writer_qa.py's). MEDIUM: a
+    write-up fix the loop can make, declared when it cannot."""
+    if write_mode not in ("declared", "not_accepted"):
+        return []
+    try:
+        text = open(os.path.join(run_dir, "manuscript.md")).read()
+    except OSError:
+        return []
+    try:
+        import writer_qa as WQ
+        hits = WQ.acceptance_language_hits(text, "completed_scope_declared" if write_mode == "declared" else "not_accepted")
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        hits = [f"the check could not run ({type(e).__name__}: {e})"]
+    if not hits:
+        return []
+    return [{"kind": "report_acceptance_language", "severity": "MEDIUM", "stage": "WRITE", "target_stage": "WRITE",
+             "key": "acceptance", "scope_declarable": True,
+             "claim": (f"The write-up is {'declared scope' if write_mode == 'declared' else 'not accepted'} but uses "
+                       f"acceptance language ({len(hits)}): " + "; ".join(hits)
+                       + ". Say what was tested and what is declared.")}]
 
 
 _SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}
@@ -927,6 +989,7 @@ class Machine:
                  "key": "deliverable", "scope_declarable": False, "claim": p} for p in deliverable_problems(self.run_dir)]
         if self.st.v2_rules:
             out += report_claim_findings(self.run_dir)
+            out += report_acceptance_findings(self.run_dir, self.st.write_mode)
         if self.st.derived_inputs or os.path.exists(os.path.join(self.run_dir, "data", "derivations.yaml")):
             import pipeline as P
             try:
@@ -1241,14 +1304,20 @@ class Machine:
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
+                d = require_judged(d, opened)
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
             if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
                 # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
                 write_declared(self.run_dir, opened, d)
-                if pw and self._has_draft():
-                    render_report(self.run_dir, self.backend)
+            if self.st.v2_rules and pw and d.get("action") and self._has_draft():
+                # The final status heads the report; a not-accepted one records any acceptance language.
+                fst = route_gate(d, pw)[1]
+                render_report(self.run_dir, self.backend, status=fst or "pending")
+                if fst not in ACCEPTED_STATUSES:
+                    hits = report_acceptance_findings(self.run_dir, "not_accepted")
+                    d["report_acceptance_language"] = [h["claim"] for h in hits]
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -1483,9 +1552,33 @@ def _pre_engine_check(spec: dict) -> list[str]:
     return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec]
 
 
-def render_report(run_dir: str, backend=AB) -> str:
-    """report.md = the writer's draft plus the blocks the harness renders from artifacts: the
-    headline numbers, the declared limits (verbatim), and the deliverable file the spec names."""
+ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+STATUS_MARK = "<!-- harness: run status -->"
+
+
+def _status_line(run_dir: str, status: str | None) -> str:
+    """F6 S1-7: the run status, from .claude/orchestration/acceptance_language.yaml (a declared-scope
+    run reads "declared scope, not accepted"). Without a status: the run state's, else the write mode's."""
+    if status is None:
+        try:
+            st = load_state(run_dir)
+        except (OSError, ValueError, TypeError):
+            st = None
+        status = (st.status or {"declared": "completed_scope_declared", "not_accepted": "not_accepted"}.get(
+            st.write_mode or "", "pending")) if st else "pending"
+    try:
+        import writer_qa as WQ
+        lines = WQ.load_acceptance_language()["status_lines"]
+    except Exception:  # noqa: BLE001 -- fail closed: never reads as accepted
+        lines = {}
+    text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"
+    return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
+
+
+def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
+    """report.md = the run status line, the writer's draft, and the blocks the harness renders from
+    artifacts: the headline numbers, the declared limits and open findings (in full, with their
+    required remedy), and the deliverable file the spec names."""
     import yaml
     draft = open(os.path.join(run_dir, "manuscript.md")).read()
     lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
@@ -1515,16 +1608,18 @@ def render_report(run_dir: str, backend=AB) -> str:
     if decl:
         lines += ["", "## Declared limits (rendered verbatim from scope_declaration.yaml)", ""]
         for e in decl:
+            fix = e.get("fix_requires") or e.get("required_remedy") or e.get("remedy")
             lines.append(f"- **{e.get('id')}** ({e.get('blocker_id')}): {e.get('why_unresolved', '')} "
-                         f"Impact: {e.get('impact_on_conclusions', '')}")
+                         f"Impact: {e.get('impact_on_conclusions', '')}" + (f" Required remedy: {fix}" if fix else ""))
     try:
         dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
     except OSError:
         dec2 = {}
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
-        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']}" for e in dec2["declared"]]
-    _put(run_dir, "report.md", draft.rstrip() + "\n" + "\n".join(lines) + "\n")
+        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
+                  f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    _put(run_dir, "report.md", _status_line(run_dir, status) + draft.rstrip() + "\n" + "\n".join(lines) + "\n")
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
 

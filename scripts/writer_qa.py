@@ -23,6 +23,10 @@ Validates `{run_dir}/report.md` for:
    that was resolved in a later round (cross-checked against
    pipeline_state.yaml round_progression).
 
+5. Acceptance language (F6 S1-7) — a report whose run was not accepted
+   (declared scope, not accepted, failed, or not yet decided) uses a term
+   from .claude/orchestration/acceptance_language.yaml.
+
 Output: `{run_dir}/writer_qa_report.yaml` with verdict
 CLEAN / REVISE / MAJOR_REVISION and a list of issues.
 
@@ -421,6 +425,81 @@ def _check_stale_caveat(text: str, run_dir: str,
     return issues
 
 
+ACCEPTANCE_MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   ".claude", "orchestration", "acceptance_language.yaml")
+
+
+def load_acceptance_language(path: str = ACCEPTANCE_MANIFEST) -> dict:
+    """The acceptance-language manifest. Raises on a missing or malformed file (callers fail closed)."""
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    if not isinstance(doc.get("terms"), list) or not doc["terms"] or not isinstance(doc.get("status_lines"), dict):
+        raise ValueError(f"{os.path.basename(path)}: needs a non-empty `terms` list and `status_lines`")
+    for t in doc["terms"]:
+        re.compile(t["pattern"])
+    return doc
+
+
+def run_status(run_dir: str) -> Optional[str]:
+    """The run's terminal status if one is recorded (metadata.json, then run_state.json), else
+    `completed_scope_declared` when the final gate declared, else None (not yet decided)."""
+    for name in ("metadata.json", "run_state.json"):
+        try:
+            st = (json.load(open(os.path.join(run_dir, name))) or {}).get("status")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if st:
+            return str(st)
+    try:
+        action = (json.load(open(os.path.join(run_dir, "final_gate.json"))) or {}).get("action")
+    except (OSError, ValueError, AttributeError):
+        action = None
+    return {"ACCEPT": "completed", "DECLARE_SCOPE": "completed_scope_declared"}.get(action, action and "not_accepted")
+
+
+def strip_harness_blocks(text: str) -> str:
+    """The writer's text: drop the harness-rendered blocks (each opens with an `<!-- harness:` comment;
+    the rendered tail runs to the end), which quote findings and state the status themselves."""
+    i = text.find("<!-- harness: rendered")
+    text = text if i < 0 else text[:i]
+    return re.sub(r"^<!-- harness:[^\n]*-->\n(?:[^\n]+\n)*", "", text, flags=re.M)
+
+
+def acceptance_language_hits(text: str, status: Optional[str], manifest: Optional[dict] = None) -> list[str]:
+    """Each use of an acceptance term ("<term id>: <context>") in a report whose status is not an
+    accepted one. A term negated within the manifest's window, or an allowed phrase, does not count."""
+    m = manifest or load_acceptance_language()
+    if status in (m.get("accepted_statuses") or []):
+        return []
+    text = strip_harness_blocks(text)
+    for a in m.get("allowed") or []:
+        text = re.sub(a, " ", text, flags=re.I)
+    negs = {str(n).lower() for n in m.get("negations") or []}
+    win = int(m.get("negation_window", 3))
+    out = []
+    for t in m["terms"]:
+        for hit in re.finditer(t["pattern"], text, re.I):
+            before = re.findall(r"[A-Za-z']+", text[max(0, hit.start() - 80):hit.start()].lower())[-win:]
+            if any(w in negs or w.endswith("n't") for w in before):
+                continue
+            ctx = " ".join(text[max(0, hit.start() - 60):hit.end() + 60].split())
+            out.append(f"{t['id']}: ...{ctx}...")
+    return out
+
+
+def _check_acceptance_language(text: str, run_dir: str) -> list[QAIssue]:
+    status = run_status(run_dir)
+    try:
+        hits = acceptance_language_hits(text, status)
+    except Exception as e:  # noqa: BLE001 -- fail closed: the check could not run
+        return [QAIssue(kind="acceptance_language_unchecked", severity="MAJOR", section=None,
+                        description=f"The acceptance-language manifest could not be read ({type(e).__name__}: {e}).")]
+    return [QAIssue(kind="acceptance_language", severity="MAJOR", section=None,
+                    description=(f"The run status is {status or 'not yet decided'}, so the report may not use "
+                                 "acceptance language; say what was tested and what is declared."),
+                    evidence=h) for h in hits]
+
+
 def writer_qa(run_dir: str) -> QAResult:
     """Run all writer-QA checks on report.md. Returns QAResult."""
     report_path = os.path.join(run_dir, "report.md")
@@ -448,6 +527,7 @@ def writer_qa(run_dir: str) -> QAResult:
         text, extract_numeric))
     issues.extend(_check_annotation_vs_body(text, extract_numeric))
     issues.extend(_check_stale_caveat(text, run_dir, strip_limitations))
+    issues.extend(_check_acceptance_language(text, run_dir))
 
     n_major = sum(1 for i in issues if i.severity == "MAJOR")
     n_minor = sum(1 for i in issues if i.severity == "MINOR")

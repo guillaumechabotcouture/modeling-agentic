@@ -1,0 +1,25 @@
+# Acceptance language (F6 S1-7). A report may use these terms only when the run's final gate accepted it.
+# scripts/writer_qa.py flags each use in a report whose run status is not in `accepted_statuses`; the v2
+# stage machine (agents/stage_machine.py) makes the same check a write-up finding for a declared-scope or
+# not-accepted write-up. A term preceded, within `negation_window` words, by a negation ("not accepted",
+# "was never validated") is not acceptance language. Disease-agnostic: no unit, disease or intervention names.
+accepted_statuses: [completed, completed_with_report_restored]
+negation_window: 3
+negations: [not, never, no, nor, without, "n't", cannot, neither, yet]
+terms:
+  - {id: accepted, pattern: '\baccepted\b'}
+  - {id: validated, pattern: '\bvalidat(?:ed|ion\s+(?:shows|confirms))\b'}
+  - {id: conclusive, pattern: '\bconclusive(?:ly)?\b'}
+  - {id: definitive, pattern: '\bdefinitive(?:ly)?\b'}
+  - {id: proven, pattern: '\bprov(?:en|es)\b'}
+  - {id: passed_gate, pattern: '\bpasse[sd]\s+(?:the\s+)?(?:final\s+)?(?:gate|all\s+(?:checks|tests))\b'}
+  - {id: approved, pattern: '\bapproved\s+(?:plan|allocation|for\s+implementation)\b'}
+# Uses that are not a claim about the run: the owner accepting a declared limit (Phase 49 sign-off).
+allowed: ['\bowner\s+accepted\b', '\baccepted\s+by\s+the\s+owner\b']
+# The harness's status line, rendered at the top of report.md by agents/stage_machine.py:render_report.
+status_lines:
+  completed: accepted by the final gate
+  completed_with_report_restored: accepted by the final gate
+  completed_scope_declared: declared scope, not accepted
+  pending: not yet decided by the final gate
+  other: not accepted

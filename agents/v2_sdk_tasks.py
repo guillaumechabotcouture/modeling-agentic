@@ -121,7 +121,9 @@ interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
-Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
+Limitations section that repeats each declaration in full with its required remedy. In both modes the
+report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
+.claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
