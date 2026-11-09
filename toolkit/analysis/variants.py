@@ -155,13 +155,14 @@ def run(A, ben0, cost0, plan) -> dict | None:
             continue
         vp, vo = sol["choice"], float(sol["objective"])
         A.guard(f"plan variant {v['id']}", [vp])
-        m = MV.summarise(A, up, vp, ben0, cost0, vo)
+        m = MV.summarise(A, up, vp, ben0, cost0, vo, feas=getattr(A, "base_feas", None) or A.feas)
         lost = uo - vo
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
                    **{k: m[k] for k in ("units_changed", "share_units_changed", "population_changed",
                                         "population_changed_share", "dollars_by_component", "dollars_moved",
-                                        "dollars_moved_share", "units_changed_by_group")})
+                                        "dollars_moved_share", "dollars_reallocated", "dollars_reallocated_share",
+                                        "units_changed_by_group")})
         out["variants"].append(rec)
     hv = cfg.get("headline")
     if hv is not None:

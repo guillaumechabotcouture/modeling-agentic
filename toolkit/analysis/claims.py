@@ -179,6 +179,7 @@ def variant_claims(A, arts, pv) -> list[dict]:
         f, c = f"data.variants[{j}]", f"variant.{v['id']}"
         out += [_c(f"{c}.value_lost", "scalar", arts["plan_variants"], f"{f}.value_lost", A.primary),
                 _c(f"{c}.dollars", "currency", arts["plan_variants"], f"{f}.dollars_moved", "USD"),
+                _c(f"{c}.reallocated", "currency", arts["plan_variants"], f"{f}.dollars_reallocated", "USD"),
                 _c(f"{c}.no_package", "count", arts["plan_variants"], f"{f}.units_no_package", "units"),
                 _c(f"{c}.units_changed", "count", arts["plan_variants"], f"{f}.units_changed", "units")]
         if v.get("value_lost_pct") is not None:      # undefined when the unconstrained objective is not positive
@@ -200,15 +201,16 @@ def variants_markdown(A, pv) -> str:
          + ("The headline plan is the unconstrained plan." if hv == "unconstrained" else
             f"The headline plan is the variant {hv}, as the spec states (analysis.plan_variants.headline)."), "",
          f"| Variant | Rule | Value lost ({A.primary}) | Value lost (% of the unconstrained plan) | Dollars moved between "
-         "components | Units changing package | Units with no package |", "|---|---|---|---|---|---|---|"]
+         "components | Dollars reallocated between units | Units changing package | Units with no package |",
+         "|---|---|---|---|---|---|---|---|"]
     for v in pv["variants"]:
         c = f"variant.{v['id']}"
         if v.get("status") != "solved":
-            L.append(f"| {v['id']} | {v['text']} | not solved: {v.get('reason', '')} | | | | |")
+            L.append(f"| {v['id']} | {v['text']} | not solved: {v.get('reason', '')} | | | | | |")
             continue
         L.append(f"| {v['id']} | {v['text']} | [CLAIM:{c}.value_lost] | "
                  + (f"[CLAIM:{c}.value_lost_pct]" if v.get("value_lost_pct") is not None else "n/a")
-                 + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
+                 + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.reallocated] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
     return "\n".join(L) + "\n"
 
 
