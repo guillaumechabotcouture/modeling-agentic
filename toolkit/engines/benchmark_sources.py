@@ -59,6 +59,10 @@ COMPATIBLE = {"odds_ratio": {"odds_ratio"}, "interaction_or": {"odds_ratio"}, "r
               "cost_per_outcome": {"cost_per_outcome"}}
 SCALE_OF = {"ratio": "ratio", "odds_ratio": "ratio", "interaction_or": "ratio", "cost_per_outcome": "currency_per_outcome"}
 SCALES = tuple(sorted(set(SCALE_OF.values())))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# what the oracle and coverage checks exercise beyond their oracle and calibrator modules (Codex r2 on #158)
+OBSERVATION_FILES = (os.path.join(_REPO, "toolkit", "analysis", "observation.py"),
+                     os.path.join(_REPO, "toolkit", "analysis", "thresholds.yaml"))
 DIGEST_FIELDS = ("id", "target", "band", "published", "band_override", "estimand_type", "estimand_mapping", "requires")
 TOL = 1e-9
 
@@ -174,10 +178,12 @@ def check_benchmark(b, byid: dict | None = None, toy: bool = False) -> list[str]
     return bad
 
 
-def check_pack(pack) -> list[str]:
+def check_pack(pack, toy: bool | None = None) -> list[str]:
+    """Every source finding. `toy`: whether the pack's verified engine is an exact self-test toy (load_evidence passes
+    it from the engine's class); None derives it from the pack's own `engine` field (the standalone check)."""
     if not isinstance(pack, dict) or not isinstance(pack.get("benchmarks"), list):
         return ["pack has no benchmarks list"]
-    toy = pack.get("engine") in TOY_ENGINE_REFS
+    toy = pack.get("engine") in TOY_ENGINE_REFS if toy is None else toy
     byid = {b.get("id"): b for b in pack["benchmarks"] if isinstance(b, dict)}
     return [x for b in pack["benchmarks"] for x in check_benchmark(b, byid, toy)]
 
@@ -206,10 +212,20 @@ def band_digest(b: dict, pack: dict) -> str:
     code = {"oracles": _module_sha("oracle", pack.get("oracles"))}
     if isinstance(e.get("calibrator"), dict):
         code["calibrator"] = _module_sha("calibrator", str(e["calibrator"].get("fn", "")).split(":")[0])
+    from toolkit.engines.benchmark import COMPARE_TYPES
+    if e.get("type") in COMPARE_TYPES + ("coverage",):
+        code["observation"] = [_file_sha(f) for f in OBSERVATION_FILES]
     return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": e, "arms": arms,
                  "settings": sets, "configs": cfgs, "default_config": pack.get("default_config"),
                  "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine"),
                  "coverage_scoring": pack.get("coverage_scoring"), "code": code})
+
+
+def _file_sha(f: str) -> str:
+    try:
+        return hashlib.sha256(open(f, "rb").read()).hexdigest()
+    except OSError:
+        return f"missing:{os.path.basename(f)}"
 
 
 def _module_sha(kind: str, name) -> str | None:
@@ -241,12 +257,21 @@ def fit_declarations(pack: dict) -> dict:
 def stale_ids(pack: dict, rows: list) -> list:
     """Ids of stored rows not scored against the pack's current declaration, or not in the pack. Every row must carry
     the digest of its declaration (no legacy acceptance: a row without one is stale, oracle rows included)."""
+    from toolkit.engines.benchmark import calibrator_code_digest, declaration_digest
     cur = {b.get("id"): b for b in pack.get("benchmarks") or [] if isinstance(b, dict)}
     out = []
     for r in rows:
         b = cur.get(r.get("id")) if isinstance(r, dict) else None
         if b is None or r.get("band_sha256") != band_digest(b, pack):
             out.append(r.get("id") if isinstance(r, dict) else r)
+        elif _etype(b) == "coverage":            # its own declaration and calibration-code digests too
+            try:
+                ok_ = (r.get("declaration_sha256") == declaration_digest(b, pack)
+                       and r.get("code_sha256") == calibrator_code_digest(pack, b["estimand"]))
+            except (KeyError, TypeError, ValueError):
+                ok_ = False
+            if not ok_:
+                out.append(b["id"])
     return out
 
 
@@ -350,8 +375,12 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
     required'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
     no pack."""
     from toolkit.engines.contract import engine_identity
-    toy = f"{type(engine).__module__}:{type(engine).__name__}" in TOY_ENGINE_REFS
+    ref = f"{type(engine).__module__}:{type(engine).__name__}"
+    toy = ref in TOY_ENGINE_REFS
     probs = []
+    if pack is not None and isinstance(pack, dict) and pack.get("engine") != ref:   # an explicit pack, bound to the class
+        probs.append(f"the pack is for engine {pack.get('engine')!r}, not the engine supplied ({ref})")
+        toy = False
     if pack is None:
         from toolkit.spec import engine_parameters as EP
         try:
@@ -366,7 +395,7 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
         probs.append("the benchmark pack is not a mapping with a non-empty benchmarks list")
         pack = pack if isinstance(pack, dict) else {}
     if pack is not None:
-        probs += [x for x in check_pack(pack) if x != "pack has no benchmarks list"]
+        probs += [x for x in check_pack(pack, toy=toy) if x != "pack has no benchmarks list"]
     if rows is not None and pack is not None:       # an absent pack: refused above unless an exact toy's
         if not (isinstance(rows, list) and all(isinstance(r, dict) and r.get("id") for r in rows)):
             probs.append("the stored rows are not a list of mappings with ids")

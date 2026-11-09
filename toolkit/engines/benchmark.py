@@ -1227,29 +1227,39 @@ def stamp(out: dict, engine) -> dict:
 def verified_benchmarks(engine) -> tuple[list, str | None]:
     """(benchmark rows, None) when the engine's results file was written by this runner for this engine's current
     code; else ([], why). Decision tests read benchmark arm ratios only from here."""
+    doc, why = verified_results(engine)
+    return (doc["benchmarks"], None) if doc is not None else ([], why)
+
+
+def verified_results(engine) -> tuple[dict | None, str | None]:
+    """(the whole results document, None) when its envelope (producer, the engine identity, which binds the fitted
+    values in use, and configuration) and its rows pass the evidence snapshot; its rows are the snapshot's. Else
+    (None, why)."""
     from toolkit.engines.contract import engine_identity
     path = getattr(engine, "results_path", None)
     if not path or not os.path.exists(path):
-        return [], "the engine has no benchmark results file"
+        return None, "the engine has no benchmark results file"
     try:
         doc = yaml.safe_load(open(path)) or {}
     except (OSError, yaml.YAMLError) as e:
-        return [], f"benchmark results unreadable: {e}"
+        return None, f"benchmark results unreadable: {e}"
     if doc.get("producer") != PRODUCER:
-        return [], f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
+        return None, f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
     if doc.get("engine_identity") != engine_identity(engine):
-        return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
+        return None, f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
-        return [], f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
+        return None, f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
     pp = os.path.join(os.path.dirname(path), "pack.yaml")
     try:
         pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
     except (OSError, yaml.YAMLError) as e:
-        return [], f"{os.path.basename(pp)} beside the results is unreadable: {e}"
+        return None, f"{os.path.basename(pp)} beside the results is unreadable: {e}"
     if not isinstance(doc.get("benchmarks"), list):
-        return [], f"{os.path.basename(path)} has no benchmarks list"
+        return None, f"{os.path.basename(path)} has no benchmarks list"
     ev = load_evidence(engine, pack=pack, rows=doc["benchmarks"])
-    return ([], f"{os.path.basename(path)}: {'; '.join(ev.problems)}") if ev.problems else (ev.rows, None)
+    if ev.problems:
+        return None, f"{os.path.basename(path)}: {'; '.join(ev.problems)}"
+    return dict(doc, benchmarks=ev.rows), None
 
 
 def refusal_share_max(e: dict, pack: dict) -> float:

@@ -209,22 +209,34 @@ def render_runtime(rt: dict) -> str:
     return "\n".join(out)
 
 
-def write(path=NOTES) -> None:
-    new = _y(os.path.join(HERE, "results.yaml"))
-    if new is None:
-        raise SystemExit("results.yaml missing: run the pack first")
+def validated_inputs(here: str = HERE) -> tuple:
+    """(results document, fitted document) for rendering, both validated (S1-2b): the whole results envelope against
+    the engine identity and fitted values the snapshot captured (verified_results), and the fitted document parsed
+    from the bytes whose digest the snapshot recorded (None for an engine without a fitted file)."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
-    from toolkit.engines.benchmark import load_engine
-    from toolkit.engines.benchmark_sources import load_evidence
     import hashlib
-    pack = _y(os.path.join(HERE, "pack.yaml")) or {}
-    ev = load_evidence(load_engine(pack.get("engine")), pack=pack, rows=new.get("benchmarks"))
-    fp = os.path.join(HERE, "fitted.yaml")
-    if ev.problems or (ev.fitted_sha256 and hashlib.sha256(open(fp, "rb").read()).hexdigest() != ev.fitted_sha256):
-        raise SystemExit(f"stale benchmark evidence, not rendered: {list(ev.problems)} (refit and re-run)")
-    new = dict(new, benchmarks=ev.rows)          # S1-2b: render() formats the snapshot's rows and its fitted file
+    from toolkit.engines.benchmark import load_engine, verified_results
+    from toolkit.engines.benchmark_sources import load_evidence
+    pack = _y(os.path.join(here, "pack.yaml")) or {}
+    eng = load_engine(pack.get("engine"), (pack.get("configs") or {}).get(pack.get("default_config")))
+    ev = load_evidence(eng, pack=pack)
+    doc, why = verified_results(eng)
+    if doc is None or ev.problems:
+        raise SystemExit(f"stale benchmark evidence, not rendered: {why or list(ev.problems)} (refit and re-run)")
+    if not ev.fitted_sha256:
+        return doc, None
+    raw = open(eng.fitted_path, "rb").read()
+    if hashlib.sha256(raw).hexdigest() != ev.fitted_sha256:
+        raise SystemExit("fitted.yaml changed after the evidence was loaded: not rendered")
+    return doc, yaml.safe_load(raw)
+
+
+def write(path=NOTES) -> None:
+    if not os.path.exists(os.path.join(HERE, "results.yaml")):
+        raise SystemExit("results.yaml missing: run the pack first")
+    new, fdoc = validated_inputs()               # S1-2b: render() formats only the validated documents
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),
-                   _y(fp), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
+                   fdoc, _y(os.path.join(HERE, "b15_mechanisms.yaml")),
                    extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
                           (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"),
                            ("v0.3", "results_v0.3.yaml"), ("v0.4", "results_v0.4.yaml"),
