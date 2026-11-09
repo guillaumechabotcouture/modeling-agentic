@@ -883,6 +883,7 @@ class Machine:
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
+            self._withhold_if_acceptance_language()
             self._finish()
         save_state(self.run_dir, self.st)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
@@ -1330,6 +1331,8 @@ class Machine:
                 self.st.tries["language"] = lang["repairs"] + 1
                 self.st.tries["language_feedback"] = lang["remaining"]
                 self.st.write_mode = lang["mode"]
+                # Quarantined until a repaired draft passes the whole post-write gate.
+                os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
                 return self._go("WRITE", f"acceptance language in a {lang['mode']} report: the writer repairs it")
             os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
             return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
@@ -1420,6 +1423,17 @@ class Machine:
             except (OSError, ValueError):
                 continue
         return None
+
+    def _withhold_if_acceptance_language(self) -> None:
+        """F6 S1-7: whatever path ends the run, a report it did not accept is never left deliverable with
+        acceptance language in it: report.md is moved to report_withheld.md."""
+        rp = os.path.join(self.run_dir, "report.md")
+        if (not self.st.v2_rules or self.st.status in ACCEPTED_STATUSES or not os.path.exists(rp)
+                or not report_acceptance_findings(self.run_dir, "not_accepted")):
+            return
+        os.replace(rp, os.path.join(self.run_dir, "report_withheld.md"))
+        if str(self.st.status).startswith("completed"):
+            self.st.status = "completed_no_report"
 
     def _finish(self) -> None:
         meta_p = os.path.join(self.run_dir, "metadata.json")

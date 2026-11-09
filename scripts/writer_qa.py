@@ -23,9 +23,11 @@ Validates `{run_dir}/report.md` for:
    that was resolved in a later round (cross-checked against
    pipeline_state.yaml round_progression).
 
-5. Acceptance language (F6 S1-7) — a report whose run was not accepted
-   (declared scope, not accepted, failed, or not yet decided) uses a term
-   from .claude/orchestration/acceptance_language.yaml.
+5. Acceptance language (F6 S1-7) — the report uses a term from
+   .claude/orchestration/acceptance_language.yaml. This script grants no
+   exemption from any record a run directory holds (v1 runs it before its
+   final gate, and v1 is retired); the v2 machine checks against its own
+   final-gate outcome (agents/stage_machine.py).
 
 Output: `{run_dir}/writer_qa_report.yaml` with verdict
 CLEAN / REVISE / MAJOR_REVISION and a list of issues.
@@ -459,30 +461,6 @@ def _record(run_dir: str, name: str) -> Optional[dict]:
     return doc if isinstance(doc, dict) else {}
 
 
-def run_status(run_dir: str) -> Optional[str]:
-    """The run's status from the harness's own records: the final gate's decision (final_gate.json) and
-    the v2 machine's state (run_state.json). metadata.json is not read: agents can edit it. Records that
-    disagree on acceptance are `records_conflict` (not accepted); a run still in progress is `pending`.
-    Only a current gate decision counts: none, or one older than report.md, is `no_gate_decision`."""
-    g, rs = _record(run_dir, "final_gate.json"), _record(run_dir, "run_state.json")
-    try:
-        stale = os.path.getmtime(os.path.join(run_dir, "final_gate.json")) < os.path.getmtime(
-            os.path.join(run_dir, "report.md"))
-    except OSError:
-        stale = g is None
-    if g is None or stale:
-        return "no_gate_decision"
-    action = (g or {}).get("action")
-    by_gate = {"ACCEPT": "completed", "DECLARE_SCOPE": "completed_scope_declared"}.get(action) or (
-        "not_accepted" if g is not None else None)
-    st = (rs or {}).get("status")
-    if st and by_gate and (st in ACCEPTED_STATUSES) != (by_gate == "completed"):
-        return "records_conflict"
-    if rs is not None:
-        return str(st) if st else "pending"
-    return by_gate
-
-
 def report_writer_text(run_dir: str, text: str) -> str:
     """The part of report.md to check: the writer's span the harness recorded when it rendered the
     report (report_render.json), only while the record's hash matches the report; else all of it."""
@@ -512,7 +490,7 @@ def acceptance_language_hits(text: str, status: Optional[str], manifest: Optiona
         text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
     # A Markdown soft break (one newline inside a paragraph) is a space; a blank line, a heading, a list
     # item, a quote or a table row still starts a new clause.
-    text = re.sub(r"(?<!\n)\n(?![\n#>|*+-]|\s*\d+[.)]\s)", " ", text)
+    text = re.sub(r"\n(?![ \t]*(?:[\n#>|*+-]|\d+[.)]\s))", " ", text)
     negs = {n.lower() for n in m.get("negations") or []}
     win = int(m.get("negation_window", 3))
     out = []
@@ -529,15 +507,14 @@ def acceptance_language_hits(text: str, status: Optional[str], manifest: Optiona
 
 
 def _check_acceptance_language(text: str, run_dir: str) -> list[QAIssue]:
-    status = run_status(run_dir)
-    try:
-        hits = acceptance_language_hits(report_writer_text(run_dir, text), status)
+    try:   # never exempt here: no file in the run directory can grant acceptance (F6 S1-7 round 3)
+        hits = acceptance_language_hits(report_writer_text(run_dir, text), "not_accepted")
     except Exception as e:  # noqa: BLE001 -- fail closed: the check could not run
         return [QAIssue(kind="acceptance_language_unchecked", severity="MAJOR", section=None,
                         description=f"The acceptance-language manifest could not be read ({type(e).__name__}: {e}).")]
     return [QAIssue(kind="acceptance_language", severity="MAJOR", section=None,
-                    description=(f"The run status is {status or 'not yet decided'}, so the report may not use "
-                                 "acceptance language; say what was tested and what is declared."),
+                    description=("Writer QA checks every report as not accepted: do not use acceptance "
+                                 "language; say what was tested and what is declared."),
                     evidence=h) for h in hits]
 
 
