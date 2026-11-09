@@ -837,10 +837,12 @@ def _self_test() -> int:
     class FittedToy(ToyEngine):          # a subclass of a listed toy: not exempt (P2-6)
         pass
 
+    ftoy = dict(toy, engine=f"{FittedToy.__module__}:{FittedToy.__name__}")
+
     def stale_toy(d):
         fp = os.path.join(d, "fitted.yaml")
         yaml.safe_dump({"parameters": {}, "band_declarations": {"T1": "an older declaration"}}, open(fp, "w"))
-        e = FittedToy()
+        e = ToyEngine()                  # an exact toy that names a fitted file must back its values with it
         e.fitted_path = fp
         return e
 
@@ -859,15 +861,15 @@ def _self_test() -> int:
             fp2 = os.path.join(d, "current.yaml")
             yaml.safe_dump({"parameters": {k: {"value": v[2], "lo": v[0], "hi": v[1]}
                                            for k, v in load_evidence(eng, pack=toy).fitted.items()},
-                            "band_declarations": fit_declarations(toy)}, open(fp2, "w"))
+                            "band_declarations": fit_declarations(ftoy)}, open(fp2, "w"))
             e2.fitted_path = fp2
-            rn = BM.Runner(toy, e2, 1)
+            rn = BM.Runner(ftoy, e2, 1)
             try:
-                BM.run_pack(toy, e2, rn, {"eff_a": 0.65})
+                BM.run_pack(ftoy, e2, rn, {"eff_a": 0.65})
                 ok(False, "BS64 scoring refuses caller fitted values that are not the evidence's")
             except ValueError as ex:
                 ok("evidence" in str(ex), f"BS64 scoring refuses caller fitted values that are not the evidence's: {ex}")
-        ok(any("refit required" in x for x in load_evidence(FittedToy(), pack=toy).problems),
+        ok(any("refit required" in x for x in load_evidence(FittedToy(), pack=ftoy).problems),
            "BS65 only exact registered toys are exempt: a subclass with fitted parameters and no file needs a refit")
     case("BS62-65", b1)
 
@@ -917,6 +919,73 @@ def _self_test() -> int:
             rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
         ok(rows == [] and why, f"BS69 a results file without a benchmarks list is refused: {why}")
     case("BS68-69", b4)
+
+    # ---- S1-2b Codex round 2 (#158)
+    def c1():
+        global OBSERVATION_FILES
+        from toolkit.engines.benchmark import calibrator_code_digest, declaration_digest
+        cov = {"id": "C1", "estimand": {"type": "coverage", "calibrator": {"fn": "toolkit.engines.benchmark:x"}}}
+        pc = dict(toy, benchmarks=[cov], oracles="toolkit.engines.benchmark")
+        good = {"id": "C1", "band_sha256": band_digest(cov, pc), "declaration_sha256": declaration_digest(cov, pc),
+                "code_sha256": calibrator_code_digest(pc, cov["estimand"])}
+        ok(stale_ids(pc, [good]) == [] and stale_ids(pc, [dict(good, declaration_sha256="x")]) == ["C1"]
+           and stale_ids(pc, [dict(good, code_sha256="x")]) == ["C1"],
+           "BS70 a coverage row is checked on its own declaration and calibration-code digests too")
+        val = {"id": "V1", "estimand": {"type": "value", "not_transcribed": "x"}}
+        pv = dict(toy, benchmarks=[val])
+        with tempfile.TemporaryDirectory() as d:
+            files = [os.path.join(d, "observation.py"), os.path.join(d, "thresholds.yaml")]
+            for f in files:
+                open(f, "w").write("a")
+            saved = OBSERVATION_FILES
+            try:
+                OBSERVATION_FILES = tuple(files)
+                d0 = band_digest(val, pv)
+                open(files[0], "w").write("b")
+                d1 = band_digest(val, pv)
+                open(files[1], "w").write("b")
+                d2 = band_digest(val, pv)
+            finally:
+                OBSERVATION_FILES = saved
+        ok(d0 != d1 != d2, "BS71 an oracle or coverage digest changes with the observation code and analysis thresholds")
+    case("BS70-71", c1)
+
+    def c2():
+        from toolkit.engines.compartmental.engine import CompartmentalEngine
+        ce = CompartmentalEngine()
+        unsourced = dict(toy, benchmarks=[{"id": "U", "target": 1.0, "band": [0.5, 2.0], "estimand": {"type": "ratio"}}])
+        probs = load_evidence(ce, pack=unsourced).problems
+        try:
+            BM.Runner(unsourced, ce, 1)
+            built = True
+        except ValueError:
+            built = False
+        ok(any("engine" in x and "CompartmentalEngine" in x for x in probs) and not built,
+           f"BS72 an explicit pack is bound to the engine's class; a toy pack cannot lend a real engine its exemption: "
+           f"{probs}")
+    case("BS72", c2)
+
+    def c3():
+        from toolkit.engines.malaria.benchmarks import render_notes as RN
+        with tempfile.TemporaryDirectory() as d:
+            res_p = os.path.join(d, "results.yaml")
+            tp = dict(toy, configs={"here": {"results_path": res_p}}, default_config="here")
+            yaml.safe_dump(tp, open(os.path.join(d, "pack.yaml"), "w"))
+            te = BM.load_engine(tp["engine"], tp["configs"]["here"])
+            yaml.safe_dump(BM.stamp(BM.run_pack(tp, te, BM.Runner(tp, te, 1), {}), te), open(res_p, "w"))
+            doc, fdoc = RN.validated_inputs(d)
+            clean = doc["benchmarks"][0]["id"] == "T1" and fdoc is None
+            bad = yaml.safe_load(open(res_p))
+            bad["engine_identity"] = dict(bad["engine_identity"], code_sha256="stale-engine-code")
+            yaml.safe_dump(bad, open(res_p, "w"))
+            try:
+                RN.validated_inputs(d)
+                refused = False
+            except SystemExit as ex:
+                refused = "engine identity" in str(ex)
+        ok(clean and refused, "BS73 render_notes renders only a results envelope validated against the engine "
+                              "identity and fitted values it captured, with the validated fitted document")
+    case("BS73", c3)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
