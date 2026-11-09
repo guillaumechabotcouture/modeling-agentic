@@ -129,6 +129,10 @@ def carry(A, feas: dict) -> dict:
     return restrict(feas, A.pk, v.get("components") or list(A.spec["options"]["components"]))
 
 
+def contract_findings(raw: dict, point: dict, pv) -> list[str]:
+    raise NotImplementedError
+
+
 def run(A, ben0, cost0, plan) -> dict | None:
     """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
     headline plan's budget (A.solve: the reserve when enforced). None when the spec asks for none."""
@@ -208,6 +212,80 @@ def _toy():
     return A, ben, cost, ms, gr
 
 
+def _self_test_round1(ok, attempt):
+    """Codex round 1 on S1-6."""
+    from toolkit.analysis import moves as MV
+    from toolkit.analysis.core import AnalysisBlocked
+    # P1-1: the point evaluation's corrections guard the unconstrained plan and every variant
+    A, ben, cost, ms, gr = _toy()
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms]}
+    plan = A.solve(ben, cost)["choice"]
+    A.last_events = []                                     # a later step's (clean) events
+    _, e1 = attempt(run, A, ben, cost, plan, [{"unit": "u4", "package": "n1", "kind": "extrapolation"}])
+    _, e2 = attempt(run, A, ben, cost, plan, [{"unit": "u1", "package": plan["u1"], "kind": "clip"}])
+    ok(isinstance(e1, AnalysisBlocked) and isinstance(e2, AnalysisBlocked),
+       f"PV12 the point corrections guard each variant and the unconstrained plan ({e1!r}, {e2!r})")
+    # P1-2: a signed rule whose name a variant's internal id could take is never replaced
+    A, ben, cost, ms, gr = _toy()
+    A.alloc["group_rules"] = {"variant_one_net": {"components": ["s"], "by": "r", "rule": "same_choice"}}
+    A.feas = apackages.feasibility(A.alloc, A.spec.units())
+    signed = A.feas
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [gr], "headline": "one_net"}
+    attempt(apply_headline, A)
+    hp = A.solve(ben, cost)["choice"]
+    net = {i: "+".join(sorted(A.pk[hp[i]] & {"n1", "n2"})) or "none" for i in A.ids}
+    ok(MV.infeasible_reasons(A.ids, hp, cost, signed, A.budget) == []
+       and all(len({net[i] for i in A.ids if A.by_id[i]["r"] == g}) == 1 for g in "NS"),
+       f"PV13 the headline keeps the signed rule of the same name and adds its own ({hp})")
+    # P2-3: a group-rule decision test can neither replace nor remove the headline variant's rule
+    base_rules = set(getattr(A, "base_alloc", A.alloc).get("group_rules") or {})
+    hrule = sorted(set(A.alloc.get("group_rules") or {}) - base_rules)
+    test_alloc = copy.deepcopy(getattr(A, "base_alloc", A.alloc))
+    test_alloc["group_rules"] = {(hrule or ["x"])[0]: {"components": ["s"], "by": "r", "rule": "same_choice"}}
+    f3, e3 = attempt(carry, A, test_alloc)
+    ok(e3 is None and len((f3 or {}).get("links") or []) == 2,
+       f"PV14 a decision test's rules are joined to the headline variant's ({e3!r}, "
+       f"{[x['name'] for x in (f3 or {}).get('links') or []]})")
+    # P2-5: units with no package are those with no component, not those on the comparator package
+    A, ben, cost, ms, gr = _toy()
+    A.comp = "n1"
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms]}
+    r5, e5 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    n5 = {x["id"]: x for x in (r5 or {}).get("variants", [])}.get("nets") or {}
+    ok(e5 is None and n5.get("units_no_package") == 0 and n5.get("units_on_comparator") == 3
+       and "units_on_comparator" in (r5 or {}).get("unconstrained", {}),
+       f"PV15 a non-empty comparator: no unit is without a package; comparator allocations apart ({e5!r}, {n5})")
+    A.outcomes, A.dfac = ["dalys"], 1.0
+    out = {i: {"y": {k: {"dalys": 1.0} for k in A.pk}} for i in A.ids}
+    s5, e5b = attempt(A.summary, {i: "n1" for i in A.ids}, out, cost)
+    ok(e5b is None and s5["mix"]["no_package"] == 0 and s5.get("units_on_comparator") == 4,
+       f"PV15b the headline summary counts units with no component ({e5b!r})")
+    # P3: each group's selected class is reported; `provide` requires provision beside the rule
+    A, ben, cost, ms, gr = _toy()
+    gp = dict(gr, id="one_net_p", provide=True, text="one net per region, provided")
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [gr, gp]}
+    r6, e6 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    v6 = {x["id"]: x for x in (r6 or {}).get("variants", [])}
+    ok(e6 is None and v6.get("one_net", {}).get("group_choices") == {"N": "n2", "S": "none"}
+       and v6["one_net"].get("groups_none") == 1 and v6.get("one_net_p", {}).get("status") == "solved"
+       and "none" not in v6["one_net_p"].get("group_choices", {"x": "none"}).values()
+       and validate({"options": {"components": {"a": {}}}, "analysis": {"plan_variants": {"variants": [
+           dict(gp, components=["a"], by="r")]}}}, {"r"}) == [],
+       f"PV16 group choices are reported (a shared none is allowed); provide: true requires provision ({e6!r})")
+    # P2-4: the contract reconciles the spec, point.headline_variant, the artifact and the headline plan
+    raw = {"analysis": {"plan_variants": {"variants": [ms, gr], "headline": "nets"}}}
+    good = {"headline": "nets", "unconstrained": {}, "variants": [{"id": "nets", "status": "solved", "plan": {"u": "a"}},
+                                                                  {"id": "one_net", "status": "not_solved"}]}
+    pt = {"plan": {"u": "a"}, "headline_variant": "nets"}
+    cf = lambda r, p, v: attempt(contract_findings, r, p, v)[0]  # noqa: E731
+    bad = [cf(raw, pt, None), cf(raw, dict(pt, headline_variant=None), good), cf(raw, pt, dict(good, headline="x")),
+           cf(raw, pt, dict(good, variants=good["variants"][:1])),
+           cf(raw, pt, dict(good, variants=[dict(good["variants"][0], status="maybe"), good["variants"][1]])),
+           cf(raw, dict(pt, plan={"u": "b"}), good), cf({"analysis": {}}, pt, None)]
+    ok(cf(raw, pt, good) == [] and all(b for b in bad),
+       f"PV17 the contract requires the artifact and agreement on the headline ({[len(b or []) for b in bad]})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -281,6 +359,7 @@ def _self_test() -> int:
     ok(e8 is None and all(any(w in x for x in errs) for w in want) and not any("variant x:" in x for x in errs),
        f"PV10 the spec's variants are validated ({errs}, {e8!r})")
     ok(validate({"analysis": {}}, set()) == [] if e8 is None else False, "PV11 no plan_variants: nothing to validate")
+    _self_test_round1(ok, attempt)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

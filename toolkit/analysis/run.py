@@ -946,6 +946,17 @@ def _self_test_variants(ok, q):
         ok(st["components"]["by_component"] and all(x["units_changed"] >= 0 for x in st["folds"])
            and contract.gate_findings(d) == [],
            f"PV-R7 the contract checks pass with a variant headline: {contract.gate_findings(d)}")
+        # Codex S1-6 r1 P2-4: the spec's headline and point.yaml's marker must agree, in the contract and in rebuild
+        _resign(d, lambda x: x["analysis"]["plan_variants"].pop("headline"))
+        kinds = {f["kind"] for f in contract.gate_findings(d)}
+        try:
+            FD.rebuild(d, log=q)
+            why = ""
+        except FD.RebuildRefused as e:
+            why = str(e)
+        ok("analysis_contract_plan_variants" in kinds and "headline" in why,
+           f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)}; "
+           f"rebuild: {why[:120]})")
 
 
 def _self_test_posterior(ok, q):
