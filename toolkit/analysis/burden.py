@@ -865,6 +865,67 @@ def _self_test() -> int:
         ok(st_after == "changed" and st_gone == "changed" and signoff.status(d) == "signed",
            f"BV25 a reference file changed or removed after signing leaves the spec unsigned ({st_after}, {st_gone}); "
            "restored, it is signed again")
+    # Codex #165 r4: one path semantics (no traversal, no link) and one read of the reference file
+    with tempfile.TemporaryDirectory() as d:
+        import hashlib
+        from toolkit.spec import signoff
+        p = schema.toy_spec(d)
+        head = ",".join(COLUMNS)
+        row = "a,r0,,cases,count,,1,100,0,1e9,estimated,s,overlap,,,WMR-X,\n"
+        os.makedirs(os.path.join(d, "a"))
+        os.makedirs(os.path.join(d, "b", "sub"))
+        os.symlink(os.path.join("..", "b", "sub"), os.path.join(d, "a", "link"))
+        open(os.path.join(d, "a", "refs.csv"), "w").write(head + "\n" + row)
+        open(os.path.join(d, "b", "refs.csv"), "w").write(head + "\n" + row.replace("WMR-X", "WMR-B"))
+        open(os.path.join(d, "b", "sub", "refs.csv"), "w").write(head + "\n" + row)
+
+        def with_csv(c):
+            raw = yaml.safe_load(open(p))
+            raw["validation"] = {"burden": {"csv": c}}
+            raw["calibration"]["target_source_id"] = "SURVEY-T"
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            return schema.load(p)
+        for c in ("a/link/../refs.csv", "a/link/refs.csv", "./a/refs.csv"):
+            sp = with_csv(c)
+            got = load_references(sp)[1]
+            try:
+                signoff.sign(d, "lead", note="self-test")
+                signed = True
+            except ValueError:
+                signed = False
+            ok(any("reference file" in x for x in got) and not signed and signoff.burden_reference(sp.raw) == c,
+               f"BV26 a reference path with a traversal component or a link ({c}) is refused by validation and at "
+               f"signing, never normalised: {got[:1]}")
+        # the sheet is rendered, validated and hashed from one read: a swap during generation cannot show old
+        # provenance while binding new bytes
+        sp = with_csv("a/refs.csv")
+        rp_ = os.path.join(d, "a", "refs.csv")
+        old_b = open(rp_, "rb").read()
+        import toolkit.analysis.burden as BVm        # the module the sign-off sheet calls (this file may be __main__)
+        orig = BVm.load_references
+        calls = []
+
+        def swapping(s_, data=None):
+            out = orig(s_, data) if data is not None else orig(s_)
+            if not calls:
+                open(rp_, "wb").write(old_b.replace(b"WMR-X", b"WMR-NEW"))
+            calls.append(1)
+            return out
+        BVm.load_references = swapping
+        try:
+            signoff.write_sheet(d)
+        finally:
+            BVm.load_references = orig
+        txt = open(os.path.join(d, signoff.SHEET)).read()
+        foot = (signoff.sheet_sources(txt) or {}).get("burden_references_sha256")
+        try:
+            signoff.sign(d, "lead", note="self-test")
+            refused = False
+        except ValueError as e:
+            refused = "stale" in str(e)
+        ok(calls and b"WMR-NEW" in open(rp_, "rb").read() and "WMR-X" in txt and "WMR-NEW" not in txt and foot == hashlib.sha256(old_b).hexdigest() and refused,
+           f"BV27 a file swapped during sheet generation: the sheet shows and binds the bytes it read, and signing "
+           f"refuses the new file (footer {str(foot)[:12]}, refused {refused})")
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]
