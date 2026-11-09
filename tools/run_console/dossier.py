@@ -233,7 +233,8 @@ def _factor(it: dict, prices: dict):
 
 
 PER = {"per_person": "per person", "per_eligible": "per eligible person", "per_reached": "per person reached",
-       "per_commodity": "per person covered", "fixed": "fixed", "per_outcome": "per outcome"}
+       "per_commodity": "per person covered", "fixed": "per unit receiving it", "per_unit": "per unit receiving it",
+       "per_outcome": "per outcome"}
 
 
 def _cost_items(opts: dict) -> list:
@@ -267,10 +268,12 @@ def _cost_items(opts: dict) -> list:
             extra.append(f"outcome {it.get('outcome')}" + (" (incremental)" if it.get("incremental") else ""))
         out.append({"id": it.get("id"), "component": it.get("component"), "value": v, "price_year": it.get("price_year"),
                     "rule": it.get("price_rule"), "basis": basis, "includes": _l(it.get("includes")),
+                    "not_double_counted": [{"item": str(k), "reason": str(w)}
+                                           for k, w in _m(it.get("not_double_counted")).items()],
                     "extra": extra, "factor": f, "base_value": base, "per_person": per, "per_label": PER.get(basis, basis),
                     "why_no_per_person": None if per is not None else
                     ("priced per outcome (a model output)" if basis == "per_outcome" else "a fixed amount"
-                     if basis == "fixed" else "the price year has no index entry" if f is None else "not computable")})
+                     if basis in ("fixed", "per_unit") else "the price year has no index entry" if f is None else "not computable")})
     return out
 
 
@@ -1349,6 +1352,27 @@ def _self_test_review1(ok, td: str) -> None:
         ok("1e-15" in p.stdout and "abs: 0;" not in p.stdout,
            f"DR12 a tolerance of 1e-15 is shown as 1e-15, not 0 ({p.stdout[:160]!r})")
     case("DR12", dr12)
+
+    # DR13 (Codex S1-3 P3) an overlap a cost item justifies is shown beside includes, with its reason
+    def dr13():
+        opts = {"components": {"t": {}}, "prices": {"base_year": "2024"},
+                "cost_items": [{"id": "t_case", "component": "t", "value": 1.0, "price_year": "2024",
+                                "price_rule": "as_published", "basis": "per_outcome", "outcome": "treated",
+                                "includes": ["programme"]},
+                               {"id": "t_setup", "component": "t", "value": 9.0, "price_year": "2024",
+                                "price_rule": "as_published", "basis": "per_unit", "includes": ["programme"],
+                                "not_double_counted": {"t_case": "per-case staff time only; this is overhead"}}]}
+        it = {x["id"]: x for x in _cost_items(opts)}
+        ok(it["t_setup"].get("not_double_counted") == [{"item": "t_case",
+                                                        "reason": "per-case staff time only; this is overhead"}]
+           and it["t_case"].get("not_double_counted") == [],
+           f"DR13a a cost item carries the overlap it justifies and the reason ({it['t_setup']})")
+        if node:
+            p = _node(node, "process.stdout.write(dossierHTML('spec', " + json.dumps({"cost_items": list(it.values())})
+                      + ")); process.exit(0);\n")
+            ok("not a double count with t_case" in p.stdout and "this is overhead" in p.stdout,
+               f"DR13b the page shows the justified overlap beside includes ({(p.stdout or p.stderr)[-200:]!r})")
+    case("DR13", dr13)
 
 
 def _self_test() -> int:

@@ -41,19 +41,32 @@ sections of the template spec):
         price_year: 2021
         price_rule: index                 # index: base-currency index; local_index: through the local currency
                                           # (source-year rate, local inflation, base-year rate); as_published
-        basis: per_eligible               # per_person | per_eligible | per_reached | per_commodity | fixed
+        basis: per_eligible               # per_person | per_eligible | per_reached | per_commodity | per_unit
                                           # | per_outcome (a model output: outcome: <name>, incremental:
                                           #   true for the package minus the package without this component)
+                                          # per_unit (F6 S1-3; `fixed` is the older name): a fixed amount per
+                                          #   unit whose package has the component (setup, supervision,
+                                          #   capacity), whatever its population
         times: 4                          # e.g. cycles per year
         years: 3                          # charged per year over the window (default 1: once)
         share: 1.0                        # share of the basis population charged (e.g. sprayed structures)
         includes: [drug, delivery]        # what the value covers: two items of one component may not overlap
+        not_double_counted:               # optional: why an overlap with another item of the component is
+          other_item_id: "<reason>"       #   not a double count (a reason of at least 10 characters)
         people_per_commodity: 1.8         # per_commodity only
+
+Floored increments: an incremental per_outcome cost is floored at zero when the
+package has less of the outcome than the package without the component (prevention
+in the package removes cases). `cost_matrix(..., floors=[])` records each one and
+`floor_report()` counts them as units x packages, with a statement that they are
+floors, not costs or savings.
 
 Validation (fail closed, before computing):
 - unknown components and missing population fields;
 - an index price rule without index entries for its price year and the base year;
-- two items of one component whose `includes` overlap (a double count);
+- two items of one component whose `includes` overlap (a double count), unless
+  one of them states why under `not_double_counted: {<other id>: <reason>}`;
+- a per_unit item charged on a population (it is charged once per unit);
 - for a targeted component (one with an eligible population), any
   population-based cost charged on another population, whatever its basis,
   unless the item gives `charged_beyond_eligible: <reason>`; so a targeted
@@ -75,7 +88,14 @@ import tempfile
 
 import yaml
 
-BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "fixed", "per_outcome")
+BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "per_unit", "fixed", "per_outcome")
+PER_UNIT = ("per_unit", "fixed")     # F6 S1-3: a fixed amount per unit receiving the component (`fixed`: older name)
+MIN_REASON = 10
+
+
+def _reason_ok(w) -> bool:
+    """A stated reason: a string with at least MIN_REASON non-whitespace characters (Codex S1-3 P2)."""
+    return isinstance(w, str) and len("".join(w.split())) >= MIN_REASON
 RULES = ("index", "local_index", "as_published")
 
 
@@ -190,6 +210,9 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
                 errs.append(f"cost_items.{iid}: per_outcome needs `outcome: <model output name>`")
             if it.get("population") is not None:
                 errs.append(f"cost_items.{iid}: per_outcome is charged on a model output, not a population")
+        if basis in PER_UNIT and it.get("population") is not None:
+            errs.append(f"cost_items.{iid}: {basis} is charged once per unit receiving {c}, not on a population; "
+                        "drop `population`, or use per_person")
         if basis == "per_commodity" and not (_num(it.get("people_per_commodity")) or 0) > 0:
             errs.append(f"cost_items.{iid}: per_commodity needs people_per_commodity > 0")
         for k in ("times", "years", "share"):
@@ -198,11 +221,33 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
         if not isinstance(it.get("includes"), list) or not it["includes"]:
             errs.append(f"cost_items.{iid}: includes must list what the value covers (e.g. [drug, delivery])")
     for c, its in by_comp.items():
+        overlaps = set()
         for a, b in itertools.combinations(its, 2):
             both = sorted(set(map(str, a.get("includes") or [])) & set(map(str, b.get("includes") or [])))
-            if both:
-                errs.append(f"cost_items.{a.get('id')} and {b.get('id')} both include {', '.join(both)} for {c}: "
-                            "a double count")
+            if not both:
+                continue
+            ia, ib = str(a.get("id")), str(b.get("id"))
+            overlaps |= {(ia, ib), (ib, ia)}
+            why = [x["not_double_counted"].get(o) for x, o in ((a, ib), (b, ia))
+                   if isinstance(x.get("not_double_counted"), dict)]
+            if not any(_reason_ok(w) for w in why):
+                errs.append(f"cost_items.{ia} and {ib} both include {', '.join(both)} for {c}: a double count; "
+                            f"remove the part from one item, or state under `not_double_counted: {{{ib}: <reason>}}` "
+                            f"in {ia} why the two prices do not cover the same thing")
+        for it in its:
+            ndc = it.get("not_double_counted")
+            if ndc is None:
+                continue
+            if not isinstance(ndc, dict):
+                errs.append(f"cost_items.{it.get('id')}: not_double_counted must map another item's id to a reason")
+                continue
+            for o, w in ndc.items():
+                if (str(it.get("id")), str(o)) not in overlaps:
+                    errs.append(f"cost_items.{it.get('id')}: not_double_counted names {o}, which is not an item of {c} "
+                                "whose includes overlap this one's")
+                elif not _reason_ok(w):
+                    errs.append(f"cost_items.{it.get('id')}: not_double_counted.{o} needs a reason: text of at least "
+                                f"{MIN_REASON} characters other than spaces")
     used = set().union(*pk.values()) if pk else set()
     for c in sorted(used - set(by_comp)):
         if not str((comps.get(c) or {}).get("cost_free") or "").strip():
@@ -223,9 +268,11 @@ def _factor(it: dict, prices: dict) -> float:
     return idx[b] / idx[py]
 
 
-def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None) -> float:
+def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None,
+              floors: list | None = None) -> float:
     """One item's cost for one unit over the window, in base-year prices. A per_outcome item
-    needs the package and `outcome(unit, package) -> {name: value}` (the run's model)."""
+    needs the package and `outcome(unit, package) -> {name: value}` (the run's model). An
+    incremental increment below zero is floored, and recorded in `floors` when given."""
     comps, pops = spec["components"], spec["units"]["populations"]
     cd = comps[it["component"]] or {}
     basis = it["basis"]
@@ -245,9 +292,12 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             b = _num(outcome(unit, base).get(it["outcome"]))
             if b is None:
                 raise ValueError(f"outcome {it['outcome']} for package {base} is not a number")
+            if v - b < 0 and floors is not None:
+                floors.append({"unit": str(unit.get(spec["units"]["id"])), "package": package, "item": it["id"],
+                               "increment": v - b})
             v = max(v - b, 0.0)
         q = v
-    elif basis == "fixed":
+    elif basis in PER_UNIT:
         q = 1.0
     else:
         pop_name = cd["eligible"] if basis in ("per_eligible", "per_reached") else it.get("population", "total")
@@ -260,9 +310,10 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             * float(it.get("times", 1.0)) * float(it.get("years", 1.0)))
 
 
-def cost_matrix(spec: dict, units: list[dict], outcome=None) -> dict:
+def cost_matrix(spec: dict, units: list[dict], outcome=None, floors: list | None = None) -> dict:
     """{unit_id: {package: {"total": $, "items": {item_id: $}}}} in base-year prices.
-    `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items."""
+    `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items;
+    `floors`, a list, receives each incremental per_outcome cost floored at zero."""
     errs = validate(spec, set(units[0]) if units else None)
     if errs:
         raise ValueError("invalid cost spec: " + "; ".join(errs))
@@ -288,10 +339,41 @@ def cost_matrix(spec: dict, units: list[dict], outcome=None) -> dict:
                      if it["component"] in cs}
             for it in out_items:
                 if it["component"] in cs:
-                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk)
+                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk, floors)
             row[name] = {"total": sum(items.values()), "items": items}
         out[str(u[uid])] = row
     return out
+
+
+def floor_report(floors: list, spec: dict | None = None) -> dict:
+    """Floored per-outcome increments as units x packages (F6 S1-3), with a statement for readers. `items`: the
+    spec's incremental per_outcome items (the ones a floor can apply to)."""
+    items = sorted(str(it["id"]) for it in (spec or {}).get("cost_items") or []
+                   if it.get("basis") == "per_outcome" and it.get("incremental"))
+    pairs = {(f["unit"], f["package"]) for f in floors}
+    by_item: dict = {}
+    for f in floors:
+        by_item.setdefault(f["item"], set()).add((f["unit"], f["package"]))
+    n = len(pairs)
+    return {"items": items, "n_unit_packages": n, "by_item": {k: len(v) for k, v in sorted(by_item.items())},
+            # number-free, so results.md can carry it beside the count's claim
+            "statement": ("In each of these combinations the package has less of the outcome than the same package "
+                          "without the component, so the increment is below zero and is charged as nothing. These "
+                          "are floors, not a cost or a saving." if n else
+                          "No per-outcome cost increment was floored at zero here.")}
+
+
+def draw_floor_summary(per_draw: list) -> dict:
+    """The floors of every uncertainty draw (F6 S1-3, Codex P2): `per_draw` is each draw's floor records. Published
+    beside the point's, so a point without floors never reads as none anywhere."""
+    counts = [len({(f["unit"], f["package"]) for f in fl}) for fl in per_draw]
+    k = sum(c > 0 for c in counts)
+    return {"draws": len(counts), "draws_with_floors": k, "max_unit_packages": max(counts, default=0),
+            "per_draw": counts,
+            "statement": ("In the draws with floors, a per-outcome cost increment below zero is charged as nothing; "
+                          "these are floors, not a cost or a saving, and they enter the draws' costs and "
+                          "affordability as zeros." if k else "No uncertainty draw floored a per-outcome cost "
+                          "increment at zero.")}
 
 
 def load_units(spec: dict, base_dir: str, csv_path: str | None = None) -> list[dict]:
@@ -398,6 +480,7 @@ def _self_test() -> int:
        f"TC17 local_index converts through the local currency (Turner method 3): {validate(loc)}")
     ok(any("prices.local entries" in e for e in validate({**loc, "prices": spec["prices"]})),
        "TC18 local_index without local rates and index fails")
+    _self_test_structure(ok, spec, units, po, treated)
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
@@ -405,6 +488,95 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_structure(ok, spec, units, po, treated) -> None:
+    """F6 S1-3: a fixed cost per unit receiving a component, what each price includes, and floored increments."""
+    pu = {**spec, "cost_items": spec["cost_items"] + [
+        {"id": "c2_setup", "component": "c2", "value": 500.0, "price_year": 2024, "price_rule": "as_published",
+         "basis": "per_unit", "years": 3, "includes": ["supervision", "setup"]}]}
+    ok(validate(pu) == [], f"TC25 a per_unit cost item is valid: {validate(pu)}")
+    try:
+        m = cost_matrix(pu, units)
+        ok(m["u0"]["c2"]["items"].get("c2_setup") == 1500.0 and m["u3"]["c1+c2"]["items"].get("c2_setup") == 1500.0
+           and "c2_setup" not in m["u0"]["c1"]["items"] and m["u0"]["none"]["total"] == 0.0,
+           f"TC26 per_unit charges value x years once per unit receiving the component, whatever its population: {m['u0']}")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC26 per_unit is costed: {e!r}")
+    ok(any("per_unit" in e and "population" in e for e in validate(
+        {**pu, "cost_items": pu["cost_items"][:-1] + [{**pu["cost_items"][-1], "population": "total"}]})),
+       "TC27 a per_unit item charged on a population is refused (it is charged once per unit)")
+    # The hand calculation: 3 units, pick one of none / t / p per unit. t costs $1,000 and averts 100 everywhere; p
+    # costs $2,000 and averts 150, 140, 130. Budget $3,000. Without a fixed part the optimum is t in all three
+    # (300 averted, $3,000; p + t is 250). With a per-unit fixed cost of $1,500 for t, t costs $2,500 a unit, so
+    # nothing pairs within $3,000 and the best single option is p in u0 (150 averted, $2,000).
+    try:
+        from toolkit.alloc import optimize as opt, packages as pkm
+    except ImportError:
+        import optimize as opt   # noqa: E402  (run as a script from toolkit/alloc)
+        import packages as pkm   # noqa: E402
+    hu = [{"id": f"h{i}", "pop": 1000, "elig": 1000} for i in range(3)]
+    hs = {"units": {"id": "id", "populations": {"total": "pop", "eligible": "elig"}},
+          "components": {"t": {}, "p": {"eligible": "eligible"}}, "packages": {"none": [], "t": ["t"], "p": ["p"]},
+          "prices": {"base_year": 2024, "index": {"2024": 1.0}},
+          "cost_items": [{"id": "t_drug", "component": "t", "value": 1.0, "price_year": 2024, "price_rule": "index",
+                          "basis": "per_person", "includes": ["treatment"]},
+                         {"id": "p_all_in", "component": "p", "value": 2.0, "price_year": 2024, "price_rule": "index",
+                          "basis": "per_eligible", "includes": ["drug", "delivery"]}]}
+    hb = {f"h{i}": {"none": 0.0, "t": 100.0, "p": 150.0 - 10 * i} for i in range(3)}
+
+    def plan(s):
+        cm = cost_matrix(s, hu)
+        r = opt.solve(hb, {u: {p: v["total"] for p, v in ps.items()} for u, ps in cm.items()},
+                      pkm.feasibility(s, hu), 3000.0, method="ilp")
+        return r["choice"], r["objective"]
+    c0, o0 = plan(hs)
+    ok(c0 == {"h0": "t", "h1": "t", "h2": "t"} and abs(o0 - 300.0) < 1e-9, f"TC28 without a fixed part: t everywhere, 300 ({c0}, {o0})")
+    try:
+        c1, o1 = plan({**hs, "cost_items": hs["cost_items"] + [
+            {"id": "t_capacity", "component": "t", "value": 1500.0, "price_year": 2024, "price_rule": "index",
+             "basis": "per_unit", "includes": ["supervision", "capacity"]}]})
+        ok(c1 == {"h0": "p", "h1": "none", "h2": "none"} and abs(o1 - 150.0) < 1e-9,
+           f"TC29 a $1,500 fixed part per unit for t moves the plan to p in h0 alone, 150, as computed by hand ({c1}, {o1})")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC29 a per-unit fixed part changes the plan as computed by hand: {e!r}")
+    # what each price includes: a per-outcome item and a per-unit item that both list a programme are refused
+    ov = {**po, "cost_items": po["cost_items"][:-1] + [
+        {**po["cost_items"][-1], "includes": ["treatment", "programme"]},
+        {"id": "c2_programme", "component": "c2", "value": 900.0, "price_year": 2024, "price_rule": "index",
+         "basis": "per_unit", "includes": ["programme", "supervision"]}]}
+    ev = validate(ov)
+    ok(any("c2_per_case and c2_programme both include programme" in e and "not_double_counted" in e for e in ev),
+       f"TC30 a per-outcome and a per-unit item listing the same part are refused, and the remedy is named: {ev}")
+    why = {**ov, "cost_items": ov["cost_items"][:-1] + [
+        {**ov["cost_items"][-1], "not_double_counted": {"c2_per_case": "the per-case price covers only staff time "
+                                                        "per case; this item is the fixed programme overhead"}}]}
+    ok(validate(why) == [], f"TC31 ... unless the spec states why they do not double count: {validate(why)}")
+    for bad, label in (({"c2_per_case": "short"}, "a reason under 10 characters"),
+                       ({"c1_delivered": "covers a different component entirely"}, "a reason naming an item it "
+                                                                                    "does not overlap"),
+                       ({"c2_per_case": 1234567890}, "a number as the reason (Codex S1-3 P2)"),
+                       ({"c2_per_case": ["1234567890"]}, "a list as the reason"),
+                       ({"c2_per_case": {"x": "1234567890"}}, "a mapping as the reason"),
+                       ({"c2_per_case": "a b c d e f g h i"}, "a reason under 10 non-whitespace characters")):
+        b2 = {**ov, "cost_items": ov["cost_items"][:-1] + [{**ov["cost_items"][-1], "not_double_counted": bad}]}
+        ok(any("not_double_counted" in e for e in validate(b2)), f"TC32 {label} is refused")
+    # floored increments: c2 adds 30 treated cases alone, but with c1 the package has fewer cases than c1 alone
+    # (prevention removes them), so the increment is floored at zero in every unit's c1+c2 package
+    neg = lambda u, p: {"treated": 100.0 + (30.0 if "c2" in packages(po)[p] else 0.0)  # noqa: E731
+                        - (50.0 if packages(po)[p] == {"c1", "c2"} else 0.0)}
+    try:
+        fl: list = []
+        mf = cost_matrix(po, units, outcome=neg, floors=fl)
+        rep = floor_report(fl)
+        ok(mf["u0"]["c1+c2"]["items"]["c2_per_case"] == 0.0 and rep.get("n_unit_packages") == len(units)
+           and rep.get("by_item") == {"c2_per_case": len(units)} and "not a cost" in rep.get("statement", ""),
+           f"TC33 floored per-outcome increments are counted as units x packages, with a statement: {rep}")
+        fl2: list = []
+        cost_matrix(po, units, outcome=treated, floors=fl2)
+        ok(floor_report(fl2).get("n_unit_packages") == 0, "TC34 no floor applied: a count of zero")
+    except Exception as e:   # noqa: BLE001
+        ok(False, f"TC33 floored increments are reported: {e!r}")
 
 
 def main(argv=None) -> int:
