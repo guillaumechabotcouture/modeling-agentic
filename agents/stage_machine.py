@@ -136,6 +136,13 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _quarantine_report(run_dir: str) -> None:
+    """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
+    a linked report.md is refused, a link at the destination is replaced)."""
+    from lib.safe_io import rename_nofollow
+    rename_nofollow(run_dir, "report.md", "report_withheld.md")
+
+
 def _put(run_dir: str, rel: str, text: str) -> None:
     """A harness file in the run dir, published atomically with no link followed (lib.safe_io; review round 4)."""
     from lib.safe_io import write_nofollow
@@ -1332,9 +1339,9 @@ class Machine:
                 self.st.tries["language_feedback"] = lang["remaining"]
                 self.st.write_mode = lang["mode"]
                 # Quarantined until a repaired draft passes the whole post-write gate.
-                os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
+                _quarantine_report(self.run_dir)
                 return self._go("WRITE", f"acceptance language in a {lang['mode']} report: the writer repairs it")
-            os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
+            _quarantine_report(self.run_dir)
             return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
                             "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
@@ -1431,7 +1438,7 @@ class Machine:
         if (not self.st.v2_rules or self.st.status in ACCEPTED_STATUSES or not os.path.exists(rp)
                 or not report_acceptance_findings(self.run_dir, "not_accepted")):
             return
-        os.replace(rp, os.path.join(self.run_dir, "report_withheld.md"))
+        _quarantine_report(self.run_dir)
         if str(self.st.status).startswith("completed"):
             self.st.status = "completed_no_report"
 
