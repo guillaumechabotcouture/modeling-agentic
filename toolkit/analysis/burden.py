@@ -129,6 +129,8 @@ def read_reference(base, rel) -> bytes:
     Validation, the sign-off sheet, signing, status and the analysis all read the file through this one semantics
     (Codex #165 r4)."""
     from toolkit.analysis.artifacts import _safe_io
+    if "\\" in str(rel):          # Codex #165 r5: safe_io reads a backslash as a separator, the filesystem does not
+        raise ValueError(f"{rel}: the reference file path contains a backslash; use / between components")
     sio = _safe_io()
     try:
         return sio.read_nofollow(base, str(rel))[0]
@@ -250,6 +252,8 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
                        "number or an engine parameter}}}}")
     if not isinstance(cfg["csv"], str) or not cfg["csv"]:
         return [], bad + [f"{P}.csv: the reference estimates file"]
+    if "\\" in cfg["csv"]:          # refused before any read (Codex #165 r5)
+        return [], bad + [f"{P}.csv: {cfg['csv']!r} contains a backslash; use / between components"]
     path = s.resolve(cfg["csv"])
     me = _identity(path)
     for c in calibration_inputs(s):
