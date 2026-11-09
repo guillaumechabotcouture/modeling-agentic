@@ -10,8 +10,9 @@
                          [--expect-spec-sha256 SHA] [--expect-derivations-sha256 SHA|none] [--expect-sheet-sha256 SHA] [note]
                                                               # pending scope declarations, a v2 spec, or the brief
     python cloud/run_cluster.py <config.py> relaunch <label>
-    python cloud/run_cluster.py <config.py> keeper            # start the overflow pool and keeper later, for the
-                                                              # run cluster clusters.json records (after exit 3 or 5)
+    python cloud/run_cluster.py <config.py> keeper            # reconcile, then start missing helpers for the run
+                                                              # cluster clusters.json records (after exit 3 or 5)
+    python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke)
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
@@ -375,11 +376,15 @@ def launch_record(cfg, worker, commit, launch_id, cluster_id, code, pipeline) ->
 
 # ---- commands ---------------------------------------------------------------------------
 
-def _submit(cfg, client, label, worker, code, question, keys, launch_id):
+def _task_key(label) -> str:
+    return f"run-{label}-{int(time.time())}"
+
+
+def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=None):
     """Fire one run on its agent VM; returns (task key, future). The future is held through the acknowledgement: a
     run that finishes between two polls is seen through it (Codex P2-7 on #161)."""
     from distributed import fire_and_forget
-    key = f"run-{label}-{int(time.time())}"
+    key = key or _task_key(label)       # callers record it in assignments.json first (Codex round 2, P2-2)
     fut = client.submit(ws.run_to_disk, label, code, question, main_flags(cfg), keys["ANTHROPIC_API_KEY"],
                         keys.get("OPENAI_API_KEY") if cfg.cross_model else None, list(cfg.labels),
                         cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
@@ -396,31 +401,47 @@ CONNECTION_ERRORS = (OSError, TimeoutError, ws.SchedulerInfoUnavailable)
 ACK_STATES = ("waiting", "no-worker", "queued", "processing", "memory", "erred")
 
 
-def _acknowledged(client, key, fut) -> bool:
-    if getattr(fut, "status", None) in ("finished", "error"):      # it ran: a fast run leaves no listing behind
-        return True
-    if any(key in (ks or ()) for ks in (client.processing() or {}).values()):
-        return True
+# scheduler task states of a run that is still to run or running (relaunch refuses a second copy)
+LIVE_STATES = ("waiting", "no-worker", "queued", "processing")
+
+
+def _scheduler_state(client, key):
+    """The scheduler's state of task `key` (worker_side.task_state, sent by value: the scheduler has no
+    worker_side module), or None when it does not hold it. Errors are raised."""
     try:
-        try:
-            import cloudpickle
-            cloudpickle.register_pickle_by_value(ws)              # the scheduler has no worker_side module
-        except ImportError:
-            pass
-        return client.run_on_scheduler(ws.task_state, key) in ACK_STATES
+        import cloudpickle
+        cloudpickle.register_pickle_by_value(ws)
+    except ImportError:
+        pass
+    return client.run_on_scheduler(ws.task_state, key)
+
+
+def _acknowledged(client, key, fut) -> str | None:
+    """What shows the scheduler has the run, or None."""
+    st = getattr(fut, "status", None)
+    if st in ("finished", "error"):          # it ran: a fast run leaves no listing behind
+        return f"future {'finished' if st == 'finished' else 'erred'}"
+    if any(key in (ks or ()) for ks in (client.processing() or {}).values()):
+        return "processing"
+    try:
+        state = _scheduler_state(client, key)
     except CONNECTION_ERRORS:
         raise
     except Exception:  # noqa: BLE001 — no evidence either way; the processing listing still counts
-        return False
+        return None
+    return f"scheduler state {state}" if state in ACK_STATES else None
 
 
-def wait_listed(client, key, fut=None, attempts=ACK_ATTEMPTS, delay_s=ACK_DELAY_S, sleep=None) -> bool:
+def wait_listed(client, key, fut=None, attempts=ACK_ATTEMPTS, delay_s=ACK_DELAY_S, sleep=None, why=None) -> bool:
     """True once the scheduler has the run: its future finished or erred, the scheduler lists `key` as processing,
-    or holds it in an accepted state (queued, waiting, ...). False if not within `attempts` polls. A lost connection
-    is raised to the caller: it is not evidence either way."""
+    or holds it in an accepted state (queued, waiting, ...); `why` (a list) gets the evidence. False if not within
+    `attempts` polls. A lost connection is raised to the caller: it is not evidence either way."""
     sleep = sleep or time.sleep
     for i in range(max(1, int(attempts))):
-        if _acknowledged(client, key, fut):
+        got = _acknowledged(client, key, fut)
+        if got:
+            if why is not None:
+                why.append(got)
             return True
         if i < attempts - 1:
             sleep(delay_s)
@@ -485,17 +506,18 @@ def _config_lock(cfg):
         f.close()
 
 
-def start_helpers(cfg, compute, cluster_id, clusters: dict) -> None:
+def start_helpers(cfg, compute, cluster_id, clusters: dict, keep_overflow=None, keep_keeper=False) -> None:
     """The overflow pool and the keeper for run cluster `cluster_id`, each recorded in clusters.json right after its
-    constructor, before any step of its start-up that can fail (Codex P2-5)."""
+    constructor, before any step of its start-up that can fail (Codex P2-5). `keep_overflow` (an id) and
+    `keep_keeper`: helpers of this launch that `keeper` found healthy (Codex round 2, P2-1)."""
     def record(role, name, cid):
         clusters[role] = {"name": name, "id": cid}
         write_clusters(cfg, clusters)
     overflow = None
     if cfg.keeper and cfg.overflow_max:
-        overflow = start_overflow(cfg, compute, record=record)
+        overflow = _overflow_info(cfg, keep_overflow) if keep_overflow else start_overflow(cfg, compute, record=record)
         overflow["primary_vm_types"] = list(compute.WORKER_VM_TYPES)
-    if cfg.keeper:
+    if cfg.keeper and not keep_keeper:
         time.sleep(10)
         kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster_id, overflow, record=record)
         time.sleep(30)
@@ -583,17 +605,19 @@ def _launch_locked(cfg, inv) -> int:
                               submission="pending", invocation=inv) for label, w in zip(cfg.labels, workers)}
         _atomic_json(cfg.state_file, assign)
         for label, w in zip(cfg.labels, workers):
-            assign[label].update(submission="sent", submitted=time.strftime("%F %T"))
+            key = _task_key(label)
+            assign[label].update(submission="sent", submitted=time.strftime("%F %T"), task_key=key)
             _atomic_json(cfg.state_file, assign)
             sent.append(label)            # from the submit call on, the run may be going
-            key, fut = _submit(cfg, client, label, w, code, question, keys, launch_id)
+            key, fut = _submit(cfg, client, label, w, code, question, keys, launch_id, key=key)
             print(f"fired {label} -> {w} @ {commit} (pipeline {pipeline})", flush=True)
-            if not wait_listed(client, key, fut):
+            why = []
+            if not wait_listed(client, key, fut, why=why):
                 raise TimeoutError(f"the scheduler did not list {key} within {ACK_ATTEMPTS} polls")
             acked.append(label)
             assign[label]["submission"] = "listed"
             _atomic_json(cfg.state_file, assign)
-            print(f"listed {label} ({key}) by the scheduler", flush=True)
+            print(f"listed {label} ({key}) by the scheduler ({why[0]})", flush=True)
         clusters["status"] = "submitted"
         write_clusters(cfg, clusters)
         start_helpers(cfg, compute, cluster.cluster_id, clusters)
@@ -616,6 +640,43 @@ def _launch_locked(cfg, inv) -> int:
     return EXIT_LAUNCHED
 
 
+def _stop_id(name, cid) -> None:
+    """Stop one cluster by id (never an attach by name)."""
+    import coiled
+    coiled.delete_cluster(cluster_id=cid, workspace=WORKSPACE)
+    print(f"{name} ({cid}): stop requested by id")
+
+
+def _reconcile(cfg, clusters: dict, role: str, name: str):
+    """The id of the live `name` helper when it is the one clusters.json records for this launch (kept), else None.
+    A live helper with another id belongs to an earlier launch: it is stopped by that id first (Codex round 2, P2-1)."""
+    rec, live = (clusters.get(role) or {}).get("id"), live_id(name)
+    if live is not None and live == rec:
+        print(f"{name} ({live}): this launch's, live: kept")
+        return live
+    if live is not None:
+        print(f"{name} ({live}): live but not this launch's ({rec}): an earlier launch's helper")
+        _stop_id(name, live)
+    clusters.pop(role, None)
+    return None
+
+
+def ack_probe(cfg) -> int:
+    """`ack-probe`: the acknowledgement on a genuinely fast task. Submits worker_side.ack_probe (it returns at
+    once) to the live run cluster, lets it finish, then runs wait_listed and prints what acknowledged it."""
+    from distributed import fire_and_forget
+    client = attach(cfg.name).get_client()
+    key = f"ack-probe-{int(time.time())}"
+    fut = client.submit(ws.ack_probe, pure=False, key=key)
+    fire_and_forget(fut)
+    print(f"submitted {key}", flush=True)
+    time.sleep(10)                        # long past the task's run time: nothing is left to list as processing
+    why = []
+    got = wait_listed(client, key, fut, attempts=3, why=why)
+    print(f"ack-probe {key}: {'acknowledged by ' + why[0] if got else 'NOT acknowledged'} (future {fut.status})")
+    return 0 if got else 1
+
+
 def keeper_later(cfg) -> int:
     """`keeper`: the overflow pool and keeper of a launch that ended before starting them (exit 3 or 5), for the run
     cluster clusters.json records, and only while that cluster is the live one of its name."""
@@ -625,7 +686,19 @@ def keeper_later(cfg) -> int:
         live = live_id(cfg.name)
         if cid is None or live != cid:
             raise SystemExit(f"{cfg.name}: clusters.json records run cluster {cid}, the live one is {live}: refusing")
-        start_helpers(cfg, _compute(cfg), cid, clusters)
+        keep_o = _reconcile(cfg, clusters, "overflow", cfg.overflow_name) if cfg.keeper and cfg.overflow_max else None
+        keep_k = _reconcile(cfg, clusters, "keeper", cfg.keeper_name) if cfg.keeper else None
+        if keep_k is not None:            # this launch's keeper: kept only while it holds the pool
+            try:
+                confirm_keeper(cfg.keeper_name, ws.attach_existing(cfg.keeper_name, WORKSPACE, keep_k),
+                               run_alive=lambda: is_running(cfg.name))
+            except SystemExit as e:
+                print(f"{cfg.keeper_name} ({keep_k}): this launch's keeper is not holding the pool ({str(e)[:120]}); "
+                      "stopping it by id and starting a new one")
+                _stop_id(cfg.keeper_name, keep_k)
+                clusters.pop("keeper", None)
+                keep_k = None
+        start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
         write_clusters(cfg, clusters)
     print(f"{cfg.name}: keeper started for run cluster {cid}")
@@ -692,7 +765,12 @@ def start_overflow(cfg, compute, record=None) -> dict:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
     oc.get_client().upload_file(os.path.join(HERE, "worker_side.py"))
     print(f"{cfg.overflow_name}: ready at 0 workers ({', '.join(cfg.overflow_vm_types)}; up to {cfg.overflow_max})")
-    return {"name": cfg.overflow_name, "id": oc.cluster_id, "max": cfg.overflow_max,
+    return _overflow_info(cfg, oc.cluster_id)
+
+
+def _overflow_info(cfg, oid) -> dict:
+    """What the keeper needs to scale the overflow pool `oid`."""
+    return {"name": cfg.overflow_name, "id": oid, "max": cfg.overflow_max,
             "vm_types": list(cfg.overflow_vm_types), "hold_s": seconds(cfg.overflow_hold),
             "scale_down_s": seconds(cfg.scale_down_after), "hours": cfg.keeper_hours}
 
@@ -1171,18 +1249,32 @@ def relaunch(cfg, label) -> int:
                                ws.record_blob(cfg.storage_prefix, launch_id, label) in names)
         if why:
             raise SystemExit(f"{label}: {why}; not relaunching")
+        if assign[label].get("submission") in ("sent", "listed"):   # a VM with no run.log yet may be preparing it
+            tk = assign[label].get("task_key")
+            if not tk:
+                raise SystemExit(f"{label}: assignment is {assign[label]['submission']} but records no task key, so "
+                                 "the original task cannot be checked; not relaunching")
+            try:
+                st = _scheduler_state(client, tk)
+            except Exception as e:  # noqa: BLE001 — unknown: refuse rather than run a second copy
+                raise SystemExit(f"{label}: the state of task {tk} cannot be read ({type(e).__name__}); not "
+                                 "relaunching") from None
+            if st in LIVE_STATES:
+                raise SystemExit(f"{label}: task {tk} is still {st} on the scheduler (accepted, queued or preparing); "
+                                 "not relaunching")
         code, commit = code_tarball(cfg)
         pipeline = pipeline_preflight(cfg, code)
         client.upload_file(os.path.join(HERE, "worker_side.py"))
         question, keys = open(cfg.question_file).read().strip(), read_keys()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
                              launcher=f"run_cluster:{cfg.name}", eval_inputs_sha256=eval_paths.archive_sha256(code),
-                             submission="sent", invocation=inv)
+                             submission="sent", invocation=inv, task_key=_task_key(label))
         _atomic_json(cfg.state_file, assign)
         sent = []
         try:
             sent.append(label)            # from the submit call on, the run may be going
-            key, fut = _submit(cfg, client, label, assign[label]["worker"], code, question, keys, launch_id)
+            key, fut = _submit(cfg, client, label, assign[label]["worker"], code, question, keys, launch_id,
+                               key=assign[label]["task_key"])
             print(f"re-fired {label} -> {assign[label]['worker']} @ {commit} (pipeline {pipeline})", flush=True)
             if not wait_listed(client, key, fut):
                 raise TimeoutError(f"the scheduler did not list {key} within {ACK_ATTEMPTS} polls")
@@ -2048,7 +2140,7 @@ def _self_test_s18(ok, tb) -> None:
                 P(M, "start_keeper", side_effect=fake_helper("keeper", "lt-keeper", 79, types.SimpleNamespace(cluster_id=79))) as sk, \
                 P(M, "confirm_keeper", return_value=["tick"]), P(time, "sleep", lambda s: None), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with P(M, "live_id", return_value=77):
+            with P(M, "live_id", side_effect=lambda n: 77 if n == "lt" else None):
                 rc = kl(cfg) if kl else None
             cl = json.load(open(cfg.clusters_file))
             started = sk.call_args[0][2] if sk.call_args else None
@@ -2270,7 +2362,7 @@ def _self_test_s18_r1(ok) -> None:
                     P(M, "_on_worker", return_value={"state": vm}), \
                     P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
                     P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
-                    P(M, "_submit", side_effect=submit_), \
+                    P(M, "_submit", side_effect=submit_), P(M, "_task_key", side_effect=lambda lab: f"run-{lab}-1"), \
                     P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None), \
                     contextlib.redirect_stdout(out):
                 try:
@@ -2770,7 +2862,15 @@ def _self_test() -> int:
 
 def main(argv) -> int:
     if argv[1:2] == ["--self-test"]:
-        return _self_test()
+        # no cloud call from a self-test: a case that forgets a fake reaches this module, which refuses
+        import types
+        from unittest import mock
+
+        class _NoCloud(types.ModuleType):
+            def __getattr__(self, name):
+                raise RuntimeError(f"self-test reached the real coiled.{name}: every case must use a fake")
+        with mock.patch.dict(sys.modules, {"coiled": _NoCloud("coiled")}):
+            return _self_test()
     if len(argv) < 3:
         sys.exit(__doc__)
     cfg, cmd, rest = load_config(argv[1]), argv[2], argv[3:]
@@ -2778,6 +2878,8 @@ def main(argv) -> int:
         return launch(cfg)
     elif cmd == "keeper":
         return keeper_later(cfg)
+    elif cmd == "ack-probe":
+        return ack_probe(cfg)
     elif cmd == "reuse-check":
         if not rest or rest[0].startswith("-"):
             sys.exit(__doc__)

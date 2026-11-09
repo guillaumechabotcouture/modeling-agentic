@@ -244,6 +244,11 @@ def task_state(key, dask_scheduler=None):
     return getattr(ts, "state", None)
 
 
+def ack_probe():
+    """A task that returns at once (run_cluster.py ack-probe: the acknowledgement of a fast task)."""
+    return "ok"
+
+
 class SchedulerInfoUnavailable(RuntimeError):
     """The scheduler's worker table could not be read within the retry bound."""
 
