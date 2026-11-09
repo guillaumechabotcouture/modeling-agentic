@@ -314,8 +314,11 @@ shared parameters are lost.
   feasible offsets are the union of those intervals over g, in closed form and exact on the grid, as the unit
   parameter is. A block's feasible set is the intersection of its units' unions, computed by a sweep over the interval
   ends.
-- **Components.** Blocks are joined through every group target with a member in a block. A 2018 state aggregate over
-  a state's units and the state's 2021 offset are one component, and an aggregate over several groups joins them.
+- **Components.** Units, their blocks and every member of every group target are joined transitively, including
+  members without an offset and group targets connected only through a shared member. A 2018 state aggregate over a
+  state's units and the state's 2021 offset are one component, and an aggregate over several groups joins them. Each
+  unit belongs to one component, so a row draws it once. Group-target checks include the members' emulator sds
+  (perfectly correlated) and their run noise (independent), as the group-target scoring and the verification do.
 - **Offset draws.** Offsets are drawn from their prior restricted to each block's exact set, by inverse cdf over its
   intervals. A draw is kept when every group target of the component is reachable from its members' matching values.
   Kept draws are draws from the prior restricted to the component's feasible set.
@@ -324,10 +327,15 @@ shared parameters are lost.
     report records the count reached (`bias_components`).
   - Each unit's matching grid values at a candidate are those that fit at one of the kept draws.
 - **Region sample.** Each row draws a fresh offset from the restricted prior, then each unit's parameter uniformly over
-  its matching values at that offset, redrawn together until the group targets hold. There is no fixed witness. A row
-  that never holds, or an acceptance rate over the region below `bias_accept_min`, blocks the calibration
+  its matching values at that offset, redrawn together until the group targets hold. The values of a component with
+  group targets are kept as drawn (no jitter), so the returned rows meet them. There is no fixed witness. A row that
+  never holds, or an acceptance rate over the region below `bias_accept_min`, blocks the calibration
   (`offset_sampling_low_acceptance`).
-- **Engine verification** solves the common offset exactly from the engine's own runs, with the same sweep.
+- **Engine verification.** The verification point of a component with group targets is built from joint draws at the
+  best candidate. It takes the draw whose worst unit misfit at its own offset is least, then puts each unit at its best
+  value under that offset when every group target still holds there (else the draw's own values). That gives one
+  offset and one assignment, feasible together. The engine verification then solves the common offset exactly from
+  the engine's own runs, with the same sweep.
 - **Not marginal implausibility.** Profiling is a feasibility rule. A single target may sit up to 3 (sd_e + sd_b)
   from the model, where integrating the offset out (marginal Gaussian implausibility) allows 3 √(sd_e² + sd_b²). It is
   stricter on contrasts between units of one group. Vernon et al. (2010, Bayesian Analysis 5:619) treat structured
