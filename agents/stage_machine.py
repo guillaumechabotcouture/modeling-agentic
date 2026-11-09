@@ -2034,7 +2034,10 @@ def _self_test() -> int:
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
             ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed",
-               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s})")
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s}"
+               + ("" if s == "completed" else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+                  f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
+                  f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
 
