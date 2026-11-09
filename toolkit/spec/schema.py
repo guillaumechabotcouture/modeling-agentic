@@ -1497,12 +1497,25 @@ def _self_test() -> int:
 
     # F6 S2-2: a cost driver an engine produces only under a parameter setting (outputs.cost_drivers_when)
     when = {"c_kids": {"switch": 1.0}}
-    ok(conditional_driver_problems("kids", "c_kids", when, {}, {"switch": 0.0})
-       and "switch" in conditional_driver_problems("kids", "c_kids", when, {}, {"switch": 0.0})[0]
-       and conditional_driver_problems("kids", "c_kids", when, {"switch": 1}, {"switch": 0.0}) == []
-       and conditional_driver_problems("t", "treated", when, {}, {"switch": 0.0}) == [],
+
+    def cdp(raw, drawn=None):
+        dom = parameter_domain(raw, {"switch": 0.0}, drawn or {})
+        return conditional_driver_problems("kids", "c_kids", when, dom)
+    on = {"engine_parameters": {"switch": {"value": 1}}}
+    ok(cdp({}) and "switch" in cdp({})[0] and cdp(on) == []
+       and conditional_driver_problems("t", "treated", when, parameter_domain({}, {"switch": 0.0}, {})) == [],
        "SP-CD1 a conditional cost driver is refused unless the run sets its parameter (engine_parameters) to the "
        "stated value; an unconditional driver is never refused")
+    # Codex r1 P2-1: the predicate must hold over every value the analysis can give the parameter
+    rng = {"engine_parameters": {"switch": {"value": 1, "range": [0, 1], "dist": "uniform"}}}
+    dt = dict(on, analysis={"decision_tests": [{"id": "sw_off", "type": "parameter_value", "parameter": "switch",
+                                                "values": [1, 0]}]})
+    pri = dict(on, uncertainty={"priors": {"switch": {"dist": "uniform", "range": [0.5, 1]}}})
+    ok(any("range" in x for x in cdp(rng)) and any("sw_off" in x for x in cdp(dt)) and cdp(pri)
+       and cdp(on, {"switch": (0.0, 1.0)}) and cdp(dict(on, analysis={"decision_tests": [
+           {"id": "keep", "type": "parameter_value", "parameter": "switch", "values": [1]}]})) == [],
+       "SP-CD2 a range (engine_parameters, uncertainty.priors or a drawn card prior, which can reach a fractional "
+       "switch) or a decision-test value that turns the driver off is refused; a test at the stated value is not")
     with tempfile.TemporaryDirectory() as d:
         p = toy_spec(d)
         s = load(p)

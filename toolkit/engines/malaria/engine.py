@@ -2498,18 +2498,20 @@ def _self_test_v012(ok, e, unit) -> None:
         except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
             ok(False, f"{label} ({type(ex).__name__}: {ex})")
 
-    new = ("cm_target", "cm_age_lo_m", "cm_age_hi_m", "cm_ramp_years", "cm_severe_link")
+    new = ("cm_target", "cm_age_lo_m", "cm_age_hi_m", "cm_ramp_years", "cm_severe_link", "cm_catchment_share")
     v11 = {"nets_given", "smc_doses", "irs_sprayed", "treated_all"}
     drv = {"cm_child_years", "treated_cm_ages"}
 
     def c0():
         sp = {p.name: p for p in e.parameters()}
-        want = {"cm_target": 0.0, "cm_age_lo_m": 2.0, "cm_age_hi_m": 60.0, "cm_ramp_years": 2.5, "cm_severe_link": 0.0}
+        want = {"cm_target": 0.0, "cm_age_lo_m": 2.0, "cm_age_hi_m": 60.0, "cm_ramp_years": 2.5, "cm_severe_link": 0.0,
+                "cm_catchment_share": 0.3}
         got = {k: sp[k].value for k in want if k in sp and sp[k].kind == "fixed"}
         ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 12) and got == want and set(new) <= POST_FORK,
            f"C0 engine v0.12: the case-management options are fixed card parameters acting after the fork ({got})")
         ok("no published" in sp["cm_severe_link"].source and "Oresanya" in sp["cm_add"].source
-           and sp["cm_add"].kind == "scenario" and (sp["cm_add"].lo, sp["cm_add"].hi) == (0.0, 0.15),
+           and sp["cm_add"].kind == "scenario" and (sp["cm_add"].lo, sp["cm_add"].hi) == (0.0, 0.40)
+           and "Collins" in sp["cm_catchment_share"].source,
            "C0b cm_add stays a scenario parameter with a sourced range; cm_severe_link says no estimate was found")
         from toolkit.spec.priors import load_card
         mc = load_card(e)
@@ -2548,7 +2550,7 @@ def _self_test_v012(ok, e, unit) -> None:
            "C2b cm_target absent: severe-care access rises one for one with the add-on (v0.11)")
     case("C2", c2)
 
-    tp = dict(base, cm_target=1, cm_ramp_years=0)
+    tp = dict(base, cm_target=1, cm_ramp_years=0, cm_catchment_share=1.0)
 
     def c3():
         P = resolve_params(e, tp)
@@ -2588,8 +2590,18 @@ def _self_test_v012(ok, e, unit) -> None:
            f"C5 cost drivers: children 2-59 months covered per person-year {o1.cost_drivers['cm_child_years']:.4f} "
            f"(u5 share {sh:.4f}; 0 without the add-on) and treated episodes in the targeted ages "
            f"({o0.cost_drivers.get('treated_cm_ages')} -> {o1.cost_drivers.get('treated_cm_ages')})")
-        ok(z.cost_drivers["cm_child_years"] == o1.cost_drivers["cm_child_years"] and z.per_capita == o0.per_capita,
-           "C5b an add-on with cm_add 0 is still charged for the children it covers and changes no health outcome")
+        ok(z.cost_drivers["cm_child_years"] == o1.cost_drivers["cm_child_years"] and z.per_capita == o0.per_capita
+           and z.windows == o0.windows and {k: z.cost_drivers[k] for k in v11 | {"treated_cm_ages"}}
+           == {k: o0.cost_drivers[k] for k in v11 | {"treated_cm_ages"}},
+           "C5b an add-on with cm_add 0 is still charged for the children it covers and changes no health outcome, "
+           "window metric or other cost driver")
+        # Codex r1 P2-4: the catchment share scales the effect and the children charged alike
+        h = e.run_batch([dict(tp, cm_catchment_share=0.4)], uu, pk[1], hz, 5)[0]
+        ok(abs(h.cost_drivers["cm_child_years"] - 0.4 * o1.cost_drivers["cm_child_years"]) < 1e-12
+           and ratio(o0, "u5") < ratio(h, "u5") < ratio(o1, "u5") - 0.1,
+           f"C5c cm_catchment_share 0.4: child-years charged are 0.4 x the targeted ages' "
+           f"({h.cost_drivers['cm_child_years']:.4f} vs {o1.cost_drivers['cm_child_years']:.4f}) and the gain is "
+           f"diluted (treated share u5 {ratio(o0, 'u5'):.3f} / {ratio(h, 'u5'):.3f} / {ratio(o1, 'u5'):.3f})")
     case("C5", c5)
 
     def c6():
@@ -2609,7 +2621,8 @@ def _self_test_v012(ok, e, unit) -> None:
     def c7():
         bad = []
         for over in ({"cm_target": 0.5}, {"cm_age_lo_m": 60.0}, {"cm_age_hi_m": float("nan")}, {"cm_ramp_years": -1.0},
-                     {"cm_severe_link": 1.5}, {"cm_add": 1.2}, {"cm_add": -0.1}):
+                     {"cm_severe_link": 1.5}, {"cm_add": 1.2}, {"cm_add": -0.1}, {"cm_catchment_share": 0.0},
+                     {"cm_catchment_share": 1.5}):
             k = next(iter(over))
             q = dict(tp, n_agents=200, **over) if k != "cm_target" else dict(base, n_agents=200, **over)
             try:
@@ -2620,6 +2633,70 @@ def _self_test_v012(ok, e, unit) -> None:
                     bad.append((over, str(ex)[:60]))
         ok(not bad, f"C7 out-of-domain case-management options fail closed, naming the parameter (accepted: {bad})")
     case("C7", c7)
+
+    # Codex r1 P3: deterministic, hand-counted boundary cases of the pure functions Malaria.step and
+    # CaseManagement.step use
+    def c8():
+        a = np.array([0.0, 60.8, 60.84, 1000.0, 1824.9, 1825.0, 4000.0])       # 2 months = 60.833 d, 60 = 1825 d
+        pft, in_t = M.cm_treat_prob(a, 0.3, 0.2, 2.0, 60.0)
+        ok(in_t.tolist() == [False, False, True, True, True, False, False]
+           and np.allclose(pft, [0.3, 0.3, 0.5, 0.5, 0.5, 0.3, 0.3], atol=1e-15),
+           f"C8 the gain starts at exactly 2 months and stops at exactly 60 months ({in_t.tolist()})")
+        days = np.arange(0.0, 2000.0)                                          # one child ageing day by day
+        ok(int(M.cm_treat_prob(days, 0.3, 0.2, 2.0, 60.0)[1].sum()) == 1825 - 61,
+           "C8b a child ageing from birth gets the gain on days 61-1824 of life only (1,764 days, hand count)")
+        ok(float(M.cm_treat_prob(np.array([100.0]), 0.9, 0.2, 2.0, 60.0)[0][0]) == 0.95,
+           "C8c effective treatment is capped at 0.95")
+        sv = M.cm_severe_access(0.25, 0.3, 1.0, np.array([0.3, 0.5]))
+        sat = [float(M.cm_severe_access(0.25, 0.7, k, np.array([0.9]))[0]) for k in (1.0, 0.5, 0.2)]
+        ok(np.allclose(sv, [0.55, 0.75], atol=1e-15) and sat[:2] == [1.0, 1.0] and abs(sat[2] - 0.99) < 1e-12,
+           f"C8d severe-care access = access + cm_ft + link x gain, saturating at 1 ({sv.tolist()}, {sat})")
+        g = [M.cm_gain_at(y, 0.3, 0.5, 2020.0, 2021.0, 2.5, True) for y in (2019.9, 2020.0, 2020.5, 2020.999, 2021.0)]
+        ok(np.allclose(g, [0.0, 0.0, 0.03, 0.3 * 0.5 * 0.999 / 2.5, 0.0], atol=1e-12)
+           and M.cm_gain_at(2020.5, 0.3, 0.5, 2020.0, 2021.0, 2.5, False) == 0.0
+           and abs(M.cm_gain_at(2023.0, 0.3, 0.5, 2020.0, None, 2.5, True) - 0.15) < 1e-15,
+           f"C8e delivery stopping before the ramp completes ends the gain at the stop; no package, no gain ({g})")
+    case("C8", c8)
+
+    def c9():
+        from toolkit.engines.horizon import DeliveryHorizon
+        q = dict(tp, n_agents=1500, cm_catchment_share=0.5)
+        short = DeliveryHorizon(2016.0, 2018.0, (2017.0, 2018.0), {"d": [2017.0, 2018.0]}, delivery=(2017.0, 2018.0))
+        long_ = DeliveryHorizon(2016.0, 2019.0, (2017.0, 2019.0), {"d": [2017.0, 2018.0], "after": [2018.0, 2019.0]},
+                                delivery=(2017.0, 2018.0))
+        s0, s1 = e.run_batch([q] * 2, uu, pk, short, 8)
+        l0, l1 = e.run_batch([q] * 2, uu, pk, long_, 8)
+        ok(s1.cost_drivers == l1.cost_drivers and s0.cost_drivers == l0.cost_drivers and s1.windows["d"] == l1.windows["d"]
+           and l1.cost_drivers["cm_child_years"] > 0,
+           "C9 a longer outcome window: the cost drivers count only the delivery period, and the delivery year's "
+           "outcomes are unchanged")
+    case("C9", c9)
+
+    def c10():
+        from toolkit.alloc import costs as C
+        spec = {"units": {"id": "id", "populations": {"total": "pop"}}, "components": {"cm": {}},
+                "packages": {"none": [], "cm": ["cm"]},
+                "prices": {"base_year": 2024, "index": {"2012": 229.6, "2024": 313.7}},
+                "cost_items": [dict(it) for it in CM_COST_ITEMS]}
+        extra = {"id": "cm_act_rdt", "component": "cm", "value": 0.9, "price_year": 2024, "price_rule": "index",
+                 "basis": "per_outcome", "outcome": "treated_cm", "incremental": True,
+                 "includes": ["medicines", "supplies"]}
+        bad = C.validate(dict(spec, cost_items=spec["cost_items"] + [extra]))
+        ok(C.validate(spec) == [] and any("includes" in b or "overlap" in b for b in bad)
+           and all(it["outcome"] == "cm_child_years" for it in CM_COST_ITEMS if it["basis"] == "per_outcome"),
+           f"C10 the documented CM cost recipe (Collins 2014 recurrent total, medicines and supplies included) "
+           f"validates, and a separate ACT/RDT charge on the same component is refused as a double count ({bad[:1]})")
+    case("C10", c10)
+
+    def c11():
+        from toolkit.engines.conditional_drivers import check
+
+        class Small(MalariaEngine):
+            def run(self, params, unit, package, horizon, seed):
+                return super().run(dict({"n_agents": 400, "burnin_years": 0}, **params), unit, package, horizon, seed)
+        probs = check(Small(), uu, pk[1], Horizon(2016.0, 2017.0, (2016.5, 2017.0), {"w": [2016.5, 2017.0]}), 2)
+        ok(probs == [], f"C11 the conditional cost drivers pass the conditional-driver contract test {probs}")
+    case("C11", c11)
 
 
 def write_card(path: str) -> None:
