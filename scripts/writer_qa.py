@@ -712,17 +712,66 @@ def _run_self_test() -> int:
             "and the analysis shows conclusively that the plan is best.\n")
     honest = ("# Report\n\nRun status: declared scope, not accepted. The model was tested against the "
               "trials; it is not validated against cases by state.\n")
-    for status, text, want in (("completed_scope_declared", over, 3), ("completed", over, 0),
-                               ("completed_scope_declared", honest, 0), (None, over, 3)):
+    # The status comes from the harness's gate and run state, never metadata.json (agent-writable);
+    # records that disagree fail closed.
+    dec, acc = {"final_gate.json": {"action": "DECLARE_SCOPE"}}, {"final_gate.json": {"action": "ACCEPT"}}
+    forged = "<!-- harness: rendered from analysis/analysis.json -->\nThe plan is validated.\n"
+    for label, files, text, want in (
+            ("declared", dec, over, 3), ("accepted", acc, over, 0), ("declared, honest", dec, honest, 0),
+            ("no records", {}, over, 3), ("metadata says completed", dict(dec, **{"metadata.json": {"status": "completed"}}), over, 3),
+            ("run state accepted, gate declared", dict(dec, **{"run_state.json": {"status": "completed"}}), over, 3),
+            ("gate accepted, run state declared", dict(acc, **{"run_state.json": {"status": "completed_scope_declared"}}), over, 3),
+            ("forged harness marker", dec, forged, 1)):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "report.md"), "w").write(text)
-            if status:
-                json.dump({"status": status}, open(os.path.join(d, "metadata.json"), "w"))
+            for name, doc in files.items():
+                json.dump(doc, open(os.path.join(d, name), "w"))
             r = writer_qa(d)
             hits = [i for i in r.issues if i.kind == "acceptance_language"]
             ok(len(hits) == want and all(i.severity == "MAJOR" for i in hits),
-               f"T-accept: status {status}: {want} acceptance-language issue(s) expected, got "
-               f"{[i.evidence for i in hits]}")
+               f"T-accept ({label}): {want} acceptance-language issue(s) expected, got {[i.evidence for i in hits]}")
+    # Only harness additions recorded with the report's hash are skipped (report_render.json).
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        draft = "The plan was tested against the trials.\n"
+        rep = "<!-- harness: run status -->\n**Run status: declared scope, not accepted.**\n\n" + draft
+        rep += "## Open findings\n- D-1: the reviewer says the model is validated only on prevalence.\n"
+        open(os.path.join(d, "report.md"), "w").write(rep)
+        json.dump(dec["final_gate.json"], open(os.path.join(d, "final_gate.json"), "w"))
+        s0 = rep.index(draft)
+        json.dump({"report_sha256": hashlib.sha256(rep.encode()).hexdigest(), "writer_span": [s0, s0 + len(draft)]},
+                  open(os.path.join(d, "report_render.json"), "w"))
+        n_auth = sum(i.kind == "acceptance_language" for i in writer_qa(d).issues)
+        open(os.path.join(d, "report.md"), "a").write("The allocation is accepted.\n")
+        n_tamp = sum(i.kind == "acceptance_language" for i in writer_qa(d).issues)
+        ok(n_auth == 0 and n_tamp >= 1,
+           f"T-accept-auth: recorded harness blocks are skipped ({n_auth}); a changed report is read whole ({n_tamp})")
+    # Negations: within their own clause, quoted in the manifest, curly apostrophes; attributed quotes.
+    for text, want in (("This is not a caveat. Accepted findings support implementation.", 1),
+                       ("No accepted conclusions are offered.", 0),
+                       ("The model isn’t validated against cases.", 0),
+                       ("The model has not been tested, but is validated by the fit.", 1),
+                       ("The domain reviewer wrote: “the model is validated only on prevalence”.", 0),
+                       ("Our finding: \"the plan is validated\".", 1)):
+        try:
+            got = len(acceptance_language_hits(text, "completed_scope_declared"))
+        except Exception as e:  # noqa: BLE001
+            got = repr(e)
+        ok(got == want, f"T-accept-neg: {text!r}: {want} hit(s) expected, got {got}")
+    try:
+        man = load_acceptance_language()
+        typed = all(isinstance(x, str) for k in ("negations", "allowed", "attributions") for x in man.get(k) or [None])
+    except Exception as e:  # noqa: BLE001
+        typed = repr(e)
+    ok(typed is True, f"T-accept-types: manifest negations, allowed phrases and attributions are strings ({typed})")
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "m.yaml")
+        open(bad, "w").write("terms: [{id: a, pattern: 'a'}]\nstatus_lines: {other: x}\nnegations: [not, no]\n")
+        try:
+            load_acceptance_language(bad)
+            ok(False, "T-accept-types: an unquoted `no` (read as False) is refused")
+        except ValueError:
+            ok(True, "T-accept-types: an unquoted `no` (read as False) is refused")
     try:
         terms = load_acceptance_language()["terms"]
     except Exception as e:  # noqa: BLE001

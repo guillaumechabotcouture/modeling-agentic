@@ -460,12 +460,14 @@ def _self_test() -> int:
         longc = "a claim that runs well past six hundred characters; " * 20
         d15 = os.path.join(d, "l15")
         os.makedirs(d15)
-        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-003", "severity": "MEDIUM", "claim": longc}]},
+        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-003", "severity": "MEDIUM", "claim": longc,
+                                                  "fix_requires": "use a sourced range"}]},
                        open(os.path.join(d15, CRITIQUE_FILES["critique-domain"]), "w"))
         led, _ = sync(d15, {"rigor_violations": [{"kind": "long_gate", "severity": "MEDIUM", "stage": "MODEL",
                                                   "claim": longc}]}, 1)
-        ok(led["D-003"].claim == longc and led["long_gate"].claim == longc,
-           "L15 the ledger keeps each finding's full claim")
+        ok(led["D-003"].claim == longc and led["long_gate"].claim == longc
+           and getattr(load(d15)["D-003"], "fix_requires", None) == "use a sourced range",
+           "L15 the ledger keeps each finding's full claim and its required remedy")
     # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         open(os.path.join(out, "v"), "w").write("untouched")

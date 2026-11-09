@@ -492,6 +492,20 @@ def _self_test() -> int:
     ok("STAGE" not in FIX_PLANNER_PROMPT and "validate_critique_yaml" not in FIX_PLANNER_PROMPT
        and "spawn" not in FIX_PLANNER_PROMPT.lower(),
        "F12 the planner prompt has no stage protocol, validator invocation or spawn instructions")
+    # F16 (F6 S1-7): the planner gets each finding's full claim and required remedy, with a short label.
+    longc, fixr = "the effect is a fixed unsourced value; " * 20, "use a sourced range and rerun the test; " * 10
+    with tempfile.TemporaryDirectory() as d:
+        led16 = {"D-003": FL.Finding(id="D-003", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     claim=longc, blocking=True)}
+        try:
+            led16["D-003"].fix_requires = fixr
+        except Exception:  # noqa: BLE001
+            pass
+        f16 = build_packet(d, led16, 1, 3, None, None)["findings"][0]
+        ok(f16["claim"] == longc and f16.get("fix_requires") == fixr and 0 < len(f16.get("label") or "") <= 120
+           and "fix_requires" in FL.Finding.__dataclass_fields__
+           and len(default_plan({"findings": [f16]})["tasks"][0]["brief"]) <= 200,
+           "F16 the planner packet carries the full claim and remedy; labels and briefs stay short")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

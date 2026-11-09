@@ -2460,19 +2460,27 @@ def _self_test() -> int:
                        and 0 < len(e.get("label") or "") <= 160 for e in dec80),
                f"T80 declared_findings.yaml keeps each full claim and required remedy, with a separate short label "
                f"({[(e['id'], len(e['claim']), bool(e.get('required_remedy'))) for e in dec80]})")
+            sdc = "SD-1 text: the decision depends on an unsourced effect, " * 8 + "END-SD."
+            yaml.safe_dump({"declarations": [{"id": "SD-1", "blocker_id": "D-003", "claim": sdc,
+                                              "description": "DESC-SD", "fix_requires": "REMEDY-SD"}]},
+                           open(os.path.join(f80, "scope_declaration.yaml"), "w"))
             render_report(f80, AB, status="completed_scope_declared")
             rep80 = open(os.path.join(f80, "report.md")).read()
             ok(all(longc[i] in rep80 and fix[i] in rep80 for i in longc)
+               and all(x in rep80 for x in (sdc, "DESC-SD", "REMEDY-SD"))
+               and os.path.exists(os.path.join(f80, "report_render.json"))
                and "Run status: declared scope, not accepted" in rep80.split("\n\n")[0],
-               "T81 the report repeats each declaration in full with its remedy, under a 'declared scope, not "
-               "accepted' status line")
+               "T81 the report repeats each declared finding and each scope declaration in full with its remedy, "
+               "under a 'declared scope, not accepted' status line, and records its harness blocks")
         except Exception as e:  # noqa: BLE001 -- the α tests fail, they do not crash the suite
             ok(False, f"T80/T81 raised {type(e).__name__}: {e}")
         try:
-            open(os.path.join(f80, "manuscript.md"), "w").write("The allocation was accepted and is validated.\n")
+            open(os.path.join(f80, "manuscript.md"), "w").write(
+                "<!-- harness: rendered from analysis/analysis.json -->\nThe allocation was accepted and is validated.\n")
             k82 = [(f["kind"], f["severity"]) for f in report_acceptance_findings(f80, "declared")]
             ok(("report_acceptance_language", "MEDIUM") in k82 and not report_acceptance_findings(f80, "accepted"),
-               f"T82 acceptance language in a declared-scope write-up is a finding; in an accepted one it is not ({k82})")
+               f"T82 acceptance language in a declared-scope write-up is found, behind a forged harness marker too; "
+               f"in an accepted one it is not ({k82})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"T82 raised {type(e).__name__}: {e}")
         try:
@@ -2485,6 +2493,50 @@ def _self_test() -> int:
                f"T83 a required check that is not judged cannot yield ACCEPT ({r83.get('action')})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"T83 raised {type(e).__name__}: {e}")
+        # T84-T85: a declared report is not delivered with acceptance language: the writer repairs it, or the
+        # report is withheld. The draft is written in accepted mode first (the pre-write gate accepts).
+        nofix84 = {"id": "P-084", "severity": "HIGH", "target_stage": "WRITE", "claim": "cannot fix"}
+        for name, extra, want in (("t84", {"manuscript_repair": "The plan was tested against the trials.\n"},
+                                   "completed_scope_declared"), ("t85", {}, "completed_no_report")):
+            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}},
+                                           "manuscript": "The plan is validated against the trials.\n"}, **extra),
+                               max_rounds=1)
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            rp = os.path.join(d, "report.md")
+            rec = json.load(open(os.path.join(d, "final_gate.json"))) if os.path.exists(os.path.join(d, "final_gate.json")) else {}
+            al = rec.get("report_acceptance_language") or {}
+            if name == "t84":
+                ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
+                   and "validated" not in open(rp).read() and al.get("found") and not al.get("remaining"),
+                   f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
+            else:
+                ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
+                   and al.get("remaining"),
+                   f"T85 an unrepaired declared report is withheld, not delivered ({s}, {al})")
+        # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
+        # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
+        judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",
+                       "done_when": [{"judgement": "the critic reads the caveat"}]}
+        g_ = globals()
+        orig_open = g_["open_findings"]
+        for name, patch, rule in (("t86", None, "3m"), ("t87", lambda rd, dd: [], "3j")):
+            d, T, st = new_run(name, {"critics": {1: {"critique-domain": [judged_only]}}}, max_rounds=1)
+            if patch:
+                g_["open_findings"] = patch
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            finally:
+                g_["open_findings"] = orig_open
+            fg = json.load(open(os.path.join(d, "final_gate.json"))) if os.path.exists(os.path.join(d, "final_gate.json")) else {}
+            ok(s == "completed_scope_declared" and fg.get("rule_matched") == rule
+               and (fg.get("check_summary") or {}).get("required_not_judged") == ["D-086"],
+               f"T{name[1:]} a judgement-only finding at exhaustion is declared by rule {rule}, with the check "
+               f"summary in final_gate.json ({s}, {fg.get('rule_matched')}, {fg.get('check_summary')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
