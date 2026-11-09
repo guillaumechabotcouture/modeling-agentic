@@ -143,6 +143,8 @@ benchmarks:
   # (ASSUMPTION). The v0.3 definition (6 m-14 y) is reported as a diagnostic, not judged.
   - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)", target: 0.83,
      band: [0.68, 0.98], source: "C21 Pryce 2018 Cochrane CD000363.pub3",
+     published: {lower: 0.71, upper: 0.98, level: 0.95, scale: ratio, table: "abstract; Analysis 1.6 (ITN vs no nets, P. falciparum prevalence, 6 trials)"},
+     estimand_type: risk_ratio,
      estimand: {type: ratio, num: coch_pyr, den: coch_none,
                 values: [{path: windows.m12.pfpr_lt5, weight: 1, label: "Halbluetzel 1996 (0-59 months)"},
                          {path: windows.m12.pfpr_le15, weight: 1, label: "Moyou-Somo 1995 (15 and under)"},
@@ -151,36 +153,70 @@ benchmarks:
                          {path: windows.m12.pfpr_all, weight: 1, label: "Sochantha 2006 (all ages)"}],
                 diagnostic_values: [windows.m12.pfpr_6m14y]}}
   - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.46, 0.64],
-     source: "C22 Pryce 2018", estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
+     source: "C22 Pryce 2018",
+     published: {lower: 0.48, upper: 0.64, level: 0.95, scale: ratio, table: "abstract; Analysis 1.2 (ITN vs no nets, uncomplicated P. falciparum episodes, 5 trials)"},
+     estimand_type: rate_ratio,
+     estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
   # v0.2 basis fix: the trial's 0.37 and 0.40 are PBO LLIN alone vs standard LLIN (Table 2; the factorial model
   # has an interaction term, so its main-effect ORs equal the single-arm comparisons). v0.1 pooled over IRS arms.
   - {id: B9, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m", target: 0.37, band: [0.09, 0.65],
      source: "C15 Protopopoff 2018 Lancet, Table 2 (PBO LLIN vs standard LLIN, 9 months)",
+     published: {lower: 0.21, upper: 0.65, level: 0.95, scale: ratio, table: "abstract; Table 2, PBO LLIN vs standard LLIN, 9 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mul_pbo, den: mul_pyr, value: windows.m9.pfpr_6m14y}}
   - {id: B9b, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 21 m", target: 0.40, band: [0.20, 0.81],
      source: "C15 Protopopoff 2018, Table 2 (21 months; held-out durability check)",
+     published: {lower: 0.2, upper: 0.81, level: 0.95, scale: ratio, table: "abstract; Table 2, PBO LLIN vs standard LLIN, 21 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mul_pbo, den: mul_pyr, value: windows.m21.pfpr_6m14y}}
   - {id: B9c, metric: "PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)", target: 0.99, band: [0.67, 1.45],
      source: "C17 Mosha 2022 Lancet (added held-out durability check)",
+     published: {lower: 0.67, upper: 1.45, level: 0.95, scale: ratio, table: "abstract, Findings: PBO group vs pyrethroid-only, 24 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
   - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.23, 0.67],
-     source: "C17 Mosha 2022", estimand: {type: odds_ratio, num: mis_dual, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
+     source: "C17 Mosha 2022 Lancet (PMID 35339225)",
+     published: {lower: 0.3, upper: 0.67, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr group vs pyrethroid-only, 24 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
+     estimand: {type: odds_ratio, num: mis_dual, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
   - {id: B11, metric: "Dual-AI vs pyrethroid nets, incidence RR 0-24 m", target: 0.54, band: [0.38, 0.70],
-     source: "C20 Accrombessi 2023 Lancet", estimand: {type: ratio, num: ben_dual, den: ben_pyr, value: windows.m0_24.inc_u5}}
+     source: "C20 Accrombessi 2023 Lancet (PMID 36706778)",
+     published: {lower: 0.42, upper: 0.7, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr-pyrethroid LLIN vs pyrethroid-only, 2 years"},
+     estimand_type: hazard_ratio, age_band: "cohort of children about 6 months to 10 years",
+     estimand_mapping: "the trial reports a hazard ratio of malaria case incidence over 2 years of cohort follow-up;
+       the engine compares the arms' under-5 incidence rates over the same 24 months, read as a rate ratio that
+       stands for the hazard ratio",
+     estimand: {type: ratio, num: ben_dual, den: ben_pyr, value: windows.m0_24.inc_u5}}
   - {id: B12, metric: "Non-pyrethroid IRS added to ITN, prevalence RR at 12 m", target: 0.61, band: [0.34, 0.88],
      source: "C23 Pryce 2022 Cochrane CD012688.pub3",
+     published: {lower: 0.42, upper: 0.88, level: 0.95, scale: ratio, table: "abstract; Summary of findings 1; Analysis 1.5 (4 cRCTs, Corbel 2012 excluded)"},
+     estimand_type: risk_ratio, diagnostic: "blood smear or RDT",
      estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m12.pfpr_6m14y}}
   - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.49, 1.23],
-     source: "C23 Pryce 2022", estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m0_24.inc_u5}}
+     source: "C23 Pryce 2022",
+     published: {lower: 0.61, upper: 1.23, level: 0.95, scale: ratio, table: "abstract; Summary of findings 1; Analysis 1.1 (4 cRCTs)"},
+     estimand_type: rate_ratio, diagnostic: "blood smear microscopy or RDT",
+     age_band: "mixed: all ages (2 trials), under 6 years, 1 to 10 years",
+     estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m0_24.inc_u5}}
   - {id: B12m, metric: "Pirimiphos-methyl IRS added to pyrethroid nets (Muleba), prevalence OR at 9 m", target: 0.33,
      band: [0.19, 0.55], source: "Protopopoff 2018 Lancet, Table 2 (standard LLIN + IRS vs standard LLIN; band = 95% CI)",
+     published: {lower: 0.19, upper: 0.55, level: 0.95, scale: ratio, table: "Table 2, standard LLIN + IRS vs standard LLIN, 9 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mul_pyr_irs, den: mul_pyr, value: windows.m9.pfpr_6m14y}}
   - {id: B13, metric: "SMC, in-season clinical incidence RR (3-59 m)", target: 0.27, band: [0.14, 0.40],
-     source: "C27 Thwing 2024 AJTMH", estimand: {type: ratio, num: smc_on, den: smc_off, value: windows.m0_24.inc_u5_smc}}
+     source: "C27 Thwing 2024 AJTMH (PMC10793029)",
+     published: {lower: 0.25, upper: 0.29, level: 0.95, scale: ratio, table: "abstract; Figure 4 (8 randomised studies, fixed effect, I2 94%)"},
+     estimand_type: rate_ratio, diagnostic: "diagnostically confirmed parasitaemia", age_band: "under 5 years",
+     band_override: {band: [0.14, 0.40], status: pending_owner_review,
+       reason: "the pooled fixed-effect CI (0.25-0.29) understates heterogeneity across study settings (I2 94%;
+         study rate ratios 0.14-0.62); one simulated setting is compared with the pooled estimate"},
+     estimand: {type: ratio, num: smc_on, den: smc_off, value: windows.m0_24.inc_u5_smc}}
   # v0.2: band = the trial's 95% CI (v0.1 used x/2.5, 0.972-6.075, whose floor cannot separate "no interaction"
   # from 2.43). Assessable only when both single-arm effects are inside the trial's 95% CIs (`requires`).
   - {id: B15, metric: "ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)", target: 2.43, band: [1.19, 4.97],
      source: "C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)",
+     published: {lower: 1.19, upper: 4.97, level: 0.95, scale: ratio, table: "Table 2, interaction OR, 9 months"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      requires: {B9: [0.21, 0.65], B12m: [0.19, 0.55]},
      estimand: {type: interaction_or, a11: mul_pbo_irs, a10: mul_pbo, a01: mul_pyr_irs, a00: mul_pyr,
                 value: windows.m9.pfpr_6m14y}}
@@ -193,16 +229,24 @@ benchmarks:
   # irs_sprayed is person-rounds: $8.26 (2018 USD, C32) x 313.7/251.1 = $10.32. smc_doses: $3.97 per eligible
   # child-season / 4 cycles / 0.88 mean cycle coverage = $1.128 per delivered dose.
   - {id: B17, metric: "SMC $ per DALY averted (reference setting)", target: 38.37, band: [7.67, 191.9],
-     source: "C28 Gilmartin 2021", estimand: {type: cost_per_outcome, num: ce_smc, den: ce_none,
+     source: "C28 Gilmartin 2021",
+     band_override: {band: [7.67, 191.9], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     estimand: {type: cost_per_outcome, num: ce_smc, den: ce_none,
      value: per_capita_all.dalys, costs: {smc_doses: 1.128}}}
   - {id: B18, metric: "ITN vs none $ per DALY averted (reference setting)", target: 44.51, band: [8.90, 222.6],
-     source: "C29 Conteh 2021", estimand: {type: cost_per_outcome, num: ce_pyr, den: ce_none,
+     source: "C29 Conteh 2021",
+     band_override: {band: [8.90, 222.6], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     estimand: {type: cost_per_outcome, num: ce_pyr, den: ce_none,
      value: per_capita_all.dalys, costs: {nets_given: 1.618}}}
   - {id: B19, metric: "IRS vs none $ per DALY averted (reference setting)", target: 25.16, band: [5.03, 125.8],
-     source: "C29 Conteh 2021", estimand: {type: cost_per_outcome, num: ce_irs, den: ce_none,
+     source: "C29 Conteh 2021",
+     band_override: {band: [5.03, 125.8], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     estimand: {type: cost_per_outcome, num: ce_irs, den: ce_none,
      value: per_capita_all.dalys, costs: {irs_sprayed: 10.32}}}
   - {id: B20, metric: "Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)", target: 19.0,
-     band: [3.8, 95.0], source: "C19 Mosha 2022", estimand: {type: cost_per_outcome, num: cer_dual, den: cer_pyr,
+     band: [3.8, 95.0], source: "C19 Mosha 2022",
+     band_override: {band: [3.8, 95.0], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     estimand: {type: cost_per_outcome, num: cer_dual, den: cer_pyr,
      value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
 
 # v0.2: one joint fit of the parameters no published source sets. Pyrethroid and PBO nets use the Churcher 2016
