@@ -82,6 +82,17 @@ class Analysis:
         # re-optimisation (draws, stability, sensitivity) then compares like with like. `budget` stays the allocatable
         # envelope that affordability is judged against.
         self.plan_budget = None
+        self.reserve_fraction = None
+
+    def set_reserve(self, fraction):
+        """F6 S1-1b: plan within `fraction` of every allocatable budget (None: no reserve)."""
+        self.reserve_fraction = None if fraction is None else float(fraction)
+        self.plan_budget = None if fraction is None else float(fraction) * float(self.budget)
+
+    def planned(self, budget: float) -> float:
+        """The budget a plan is solved at for an allocatable `budget` (an envelope test, the frontier): the same reserve
+        fraction as the headline plan, so the declared envelope reproduces it."""
+        return float(budget) if self.reserve_fraction is None else self.reserve_fraction * float(budget)
 
     def set_joint(self, rep):
         """The joint calibration (toolkit/analysis/joint_calibration.py): its shared parameters move to the best point

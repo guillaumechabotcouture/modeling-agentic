@@ -59,8 +59,10 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
     if point.get("reserve"):     # F6 S1-1b: the plan solved within a reserve so that it meets the affordability rule
         cl += [_c("reserve.fraction", "scalar", arts["point"], "data.reserve.fraction", "share of budget"),
                _c("reserve.usd", "currency", arts["point"], "data.reserve.reserve_usd", "USD"),
-               _c("reserve.value_given_up", "scalar", arts["point"], "data.reserve.value_given_up", o),
-               _c("reserve.value_given_up_pct", "percentage", arts["point"], "data.reserve.value_given_up_pct", "%")]
+               _c("reserve.value_given_up", "scalar", arts["point"], "data.reserve.value_given_up", o)]
+        if point["reserve"].get("value_given_up_pct") is not None:      # undefined when the objective is not positive
+            cl.append(_c("reserve.value_given_up_pct", "percentage", arts["point"], "data.reserve.value_given_up_pct",
+                         "%"))
     for oc in A.outcomes[1:]:
         cl.append(_c(f"averted.{oc}.point", "scalar", arts["point"], f"data.averted.{oc}", oc))
         cl.append(_c(f"averted.{oc}.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{oc}.median", oc,

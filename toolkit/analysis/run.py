@@ -84,8 +84,9 @@ def decision_rule(A, out, plan) -> list[dict]:
 def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> dict:
     """F6 S1-1b: with `uncertainty.affordability.enforce`, the plan solved within a budget reserve. The uncertainty
     step's draws are evaluated once (same Drawer, seed and number of draws), and toolkit/analysis/uncertainty.py
-    reserve_search bisects on the budget fraction for the largest one whose plan exceeds the allocatable budget in at
-    most max_share_over_budget of those draws. No fraction at or above the floor: AnalysisBlocked (fail closed).
+    reserve_search visits budget fractions (a grid from the floor, then bisection) and keeps the best visited plan whose
+    cost exceeds the allocatable budget in at most max_share_over_budget of those draws (not a proven optimum). No
+    visited fraction meeting the rule: AnalysisBlocked (fail closed).
     Returns {solution, reserve (the point artifact's record), pre (the evaluated draws, for UQ.run)}."""
     rule = A.spec["uncertainty"]["affordability"]
     pre = UQ.evaluate_draws(A, draws, seed)
@@ -95,9 +96,12 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
     st = rs["steps"]
     if not rs["feasible"]:
         raise AnalysisBlocked("affordability", [dict(s, kind="reserve_step") for s in st], reason=(
-            f"no plan solved at or above the floor of {fl:g} x the allocatable budget meets the affordability rule "
-            f"(at most {rule['max_share_over_budget']} of {pre['draws']} draws over budget): the plan at the floor is "
-            f"over in {st[-1]['draws_over_budget']} draws"))
+            f"no visited fraction meets the affordability rule (at most {rule['max_share_over_budget']} of "
+            f"{pre['draws']} draws over budget): {len(st)} plans solved, at the full budget and at {rs['grid']} "
+            f"fractions from the floor of {fl:g}; the floor candidate "
+            + ("was proved infeasible by the solver" if st[1].get("infeasible") else
+               f"is over budget in {st[1]['draws_over_budget']} draws")
+            + ". This is not a proof that no plan within a reserve meets the rule"))
     u0, f = st[0], rs["fraction"]
     obj_u, obj_a = float(sol0["objective"]), float(rs["solution"]["objective"])
     sol = rs["solution"] if f < 1.0 else sol0
@@ -108,10 +112,11 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
                "draws": pre["draws"], "seed": pre["seed"],
                "unconstrained": {"objective": obj_u, "cost": plan_cost(sol0), "plan": dict(sol0["choice"]),
                                  "draws_over_budget": u0["draws_over_budget"], "share_over_budget": u0["share_over_budget"]},
-               "affordable": {"objective": float(sol["objective"]), "cost": plan_cost(sol),
+               "affordable": {"objective": float(sol["objective"]), "cost": plan_cost(sol), "plan": dict(sol["choice"]),
                               "draws_over_budget": rs["draws_over_budget"], "share_over_budget": rs["share_over_budget"]},
                "value_given_up": given, "value_given_up_pct": 100.0 * given / obj_u if obj_u > 0 else None,
-               "search": {k: rs[k] for k in ("tolerance", "floor", "max_solves", "solves", "converged", "steps")}}
+               "search": {k: rs[k] for k in ("result", "floor_met", "grid", "tolerance", "floor", "max_solves", "solves",
+                                             "converged", "steps")}}
     return {"solution": sol, "reserve": reserve, "pre": pre}
 
 
@@ -293,7 +298,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         # F6 S1-1b: the headline plan is the one solved within the reserve that meets the affordability rule
         ap = affordable_plan(A, ben0, cost0, sol, draws=draws)
         sol, reserve, pre = ap["solution"], ap["reserve"], ap["pre"]
-        A.plan_budget = reserve["budget_planned"]
+        A.set_reserve(reserve["fraction"])
         log(f"affordability: plan within {reserve['fraction']:.4f} of the budget ({reserve['reserve_usd']:,.0f} held "
             f"back), {reserve['value_given_up_pct'] or 0:.2f}% of the objective given up")
     plan = sol["choice"]

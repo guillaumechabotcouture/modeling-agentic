@@ -202,7 +202,9 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             return _not_run(A, dt, "an envelope above the declared one, and the packages were generated within the "
                                    "declared envelope (options.packages.within_envelope): drop within_envelope to "
                                    "test larger envelopes")
-        cases = [(v, ben0, cost0, float(v) - fixed, None) for v in dt["values"]]
+        # F6 S1-1b: the reserve policy holds at each envelope (the same fraction held back), so the declared envelope
+        # reproduces the headline plan
+        cases = [(v, ben0, cost0, A.planned(float(v) - fixed), None) for v in dt["values"]]
         lowers = [False] * len(cases)
     else:
         raise ValueError(f"decision test {dt.get('id')}: unknown type {t}")

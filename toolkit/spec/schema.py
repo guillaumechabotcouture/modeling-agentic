@@ -79,8 +79,11 @@ docs/design/v2-spec-and-analysis.md §1):
       affordability: {max_share_over_budget: 0.1, enforce: false}   # optional (F6 S1-1): the share of draws in
                                            # which the point plan may cost more than the allocatable budget; above
                                            # it, a gate finding. Without it the share is reported, not judged.
-                                           # enforce: true (S1-1b) plans within a reserve: the largest budget
-                                           # fraction whose plan meets the rule on the uncertainty draws
+                                           # enforce: true (S1-1b) plans within a reserve: the best visited
+                                           # budget fraction (a grid from 0.5, then bisection) whose plan meets the
+                                           # rule on the uncertainty draws, not a proven optimum; the same fraction
+                                           # applies to envelope tests and the frontier; no visited fraction
+                                           # meeting the rule blocks the analysis
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
