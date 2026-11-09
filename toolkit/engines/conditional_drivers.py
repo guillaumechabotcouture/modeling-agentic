@@ -6,8 +6,8 @@
 An engine card may declare `outputs.cost_drivers_when: {driver: {parameter: value}}`: cost drivers the engine
 produces only when each named engine parameter has the stated value. `contract.check_engine` checks
 `outputs.cost_drivers` in a default run; `check(engine, unit, package, horizon, seed)` checks the conditional list:
-its structure (a mapping of driver name to a non-empty mapping of known engine parameter to a finite number; a name
-not also listed as an unconditional driver), then one run per distinct predicate, with the predicate's parameter
+its structure (a mapping of driver name to a non-empty mapping of a known `fixed` engine parameter to a finite
+number, so the analysis never moves it; a name not also listed as an unconditional driver), then one run per distinct predicate, with the predicate's parameter
 values, in which each driver it activates must be present and finite. Engines call it beside check_engine.
 
 It lives beside contract.py, not inside it: contract.py is part of every engine's code fingerprint, so editing it
@@ -34,7 +34,7 @@ def structure_problems(engine) -> list[str]:
         return []
     if not isinstance(when, dict):
         return ["outputs.cost_drivers_when: a mapping {driver: {parameter: value}}"]
-    names = {p.name for p in engine.parameters()}
+    kinds = {p.name: p.kind for p in engine.parameters()}
     plain = set(out.get("cost_drivers") or [])
     bad = []
     for d, pred in when.items():
@@ -45,8 +45,10 @@ def structure_problems(engine) -> list[str]:
             bad.append(f"{w}: a non-empty mapping {{parameter: value}}")
             continue
         for p, v in pred.items():
-            if p not in names:
+            if p not in kinds:
                 bad.append(f"{w}: {p!r} is not an engine parameter")
+            elif kinds[p] != "fixed":       # Codex r2 P2-2: the analysis moves fitted, calibrated, scenario values
+                bad.append(f"{w}: {p!r} is a {kinds[p]} parameter; a predicate must name a fixed (structural) one")
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
                 bad.append(f"{w}.{p}: {v!r} is not a finite number")
     return bad

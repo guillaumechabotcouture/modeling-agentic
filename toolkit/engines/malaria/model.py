@@ -33,9 +33,10 @@ v0.3-v0.10 cleared, then protected at a flat smc_pe for 28 days, with two access
 
 v0.12: case management as a package (ENGINE_NOTES.md, v0.12), with cm_target = 1. The add-on raises effective
 treatment of clinical episodes only in ages [cm_age_lo_m, cm_age_hi_m) months (default 2-59 months), ramped in
-linearly over cm_ramp_years from its start (cm_ramp); cm_add is the gain inside the iCCM catchment and
-the unit-wide gain is cm_add x cm_catchment_share (cm_gain_at). Severe-care access is severe_access_add + the unit's effective
-treatment, plus cm_severe_link x the add-on's realised gain in a person's ages (default 0). The cost drivers count
+linearly over cm_ramp_years from its start (cm_ramp); cm_add is the gain inside the iCCM catchment
+(cm_gain_at), capped there at 0.95 and then weighted by cm_catchment_share (cm_treat_prob). Severe-care access is
+severe_access_add + the unit's effective treatment, plus, inside the catchment, cm_severe_link x the add-on's capped
+gain, capped at 1 and then weighted by the share (cm_severe_access; default link 0). The cost drivers count
 children in the catchment (cm_catchment_share x the targeted ages) while the add-on runs, and treated episodes in the
 targeted ages. cm_target = 0 (the default)
 is the v0.11 add-on: all ages, from its start, severe-care access raised one for one.
@@ -341,7 +342,8 @@ class Malaria(ss.Disease):
         clin = self.rs.random(len(ui)) < phi
         tgt = bool(P.get('cm_target', 0.0))
         if tgt:     # v0.12: the add-on's gain only in the targeted ages (the same draws as v0.11)
-            pft, in_t = cm_treat_prob(a_i, p.ft, self.cm_gain, P['cm_age_lo_m'], P['cm_age_hi_m'])
+            pft, in_t = cm_treat_prob(a_i, p.ft, self.cm_gain, P['cm_catchment_share'], P['cm_age_lo_m'],
+                                      P['cm_age_hi_m'])
             treat = clin & (self.rs.random(len(ui)) < pft)
         else:
             treat = clin & (self.rs.random(len(ui)) < p.ft)
@@ -389,8 +391,9 @@ class Malaria(ss.Disease):
             cfr = (1 - pt) * P['cfr_severe_untreated'] + pt * P['cfr_severe_treated']
             cfr_i = None
             if tgt and self.cm_gain > 0 and P['cm_severe_link'] > 0:
-                # v0.12: severe-care access rises only through the declared link, by a person's realised gain
-                pti = cm_severe_access(P['severe_access_add'], p.ft, P['cm_severe_link'], pft)
+                # v0.12: severe-care access rises only through the declared link, in the targeted ages
+                pti = np.where(in_t, cm_severe_access(P['severe_access_add'], p.ft, P['cm_severe_link'], self.cm_gain,
+                                                      P['cm_catchment_share']), pt)
                 cfr_i = (1 - pti) * P['cfr_severe_untreated'] + pti * P['cfr_severe_treated']
             for g in range(3):
                 m = agi == g
@@ -613,13 +616,14 @@ def cm_ramp(yr, start, years) -> float:
     return float(min(1.0, max(0.0, (yr - start) / years)))
 
 
-def cm_gain_at(yr, add, share, start, stop, ramp_years, pkg) -> float:
-    """v0.12: the unit-wide gain in effective treatment in the targeted ages at decimal year `yr`: the within-catchment
-    gain `add` x the catchment share x cm_ramp, while the package's add-on runs (start <= yr < stop; stop None: no
-    end), else 0. A delivery period that stops before the ramp completes ends the gain at the stop."""
+def cm_gain_at(yr, add, start, stop, ramp_years, pkg) -> float:
+    """v0.12: the within-catchment gain in effective treatment in the targeted ages at decimal year `yr`: `add` x
+    cm_ramp while the package's add-on runs (start <= yr < stop; stop None: no end), else 0. A delivery period that
+    stops before the ramp completes ends the gain at the stop. The catchment share weights it after the caps
+    (cm_treat_prob, cm_severe_access; Codex r2 P2-1)."""
     if not pkg or yr < start or (stop is not None and yr >= stop):
         return 0.0
-    return add * share * cm_ramp(yr, start, ramp_years)
+    return add * cm_ramp(yr, start, ramp_years)
 
 
 def cm_in_ages(age_days, lo_m, hi_m):
@@ -628,17 +632,23 @@ def cm_in_ages(age_days, lo_m, hi_m):
     return (a >= lo_m * DAYS_PER_MONTH) & (a < hi_m * DAYS_PER_MONTH)
 
 
-def cm_treat_prob(age_days, ft, gain, lo_m, hi_m):
-    """v0.12: (per-person effective-treatment probability, in the targeted ages): ft + gain in the targeted ages,
-    capped at 0.95, else ft."""
+def cm_treat_prob(age_days, ft, gain, share, lo_m, hi_m):
+    """v0.12: (per-person effective-treatment probability, in the targeted ages). In the targeted ages it is the
+    catchment-weighted mean (1 - share) ft + share min(0.95, ft + gain): the cap applies inside the catchment, before
+    weighting (Codex r2 P2-1). Elsewhere, and with no gain, ft exactly."""
     in_t = cm_in_ages(age_days, lo_m, hi_m)
-    return np.where(in_t, min(0.95, ft + gain), ft), in_t
+    if not gain > 0:
+        return np.full(in_t.shape, ft, dtype=float), in_t
+    return np.where(in_t, (1.0 - share) * ft + share * min(0.95, ft + gain), ft), in_t
 
 
-def cm_severe_access(access_add, ft, link, pft):
-    """v0.12: per-person severe-care access, access_add + ft + link x (the person's realised gain pft - ft), capped
-    at 1."""
-    return np.minimum(1.0, access_add + ft + link * (np.asarray(pft, float) - ft))
+def cm_severe_access(access_add, ft, link, gain, share) -> float:
+    """v0.12: severe-care access of a person in the targeted ages, the catchment-weighted mean
+    (1 - share) min(1, access_add + ft) + share min(1, access_add + ft + link x (min(0.95, ft + gain) - ft)): each cap
+    inside, then the weights (Codex r2 P2-1)."""
+    out = min(1.0, access_add + ft)
+    inside = min(1.0, access_add + ft + link * (min(0.95, ft + gain) - ft))
+    return (1.0 - share) * out + share * inside
 
 
 def cm_check(P: dict) -> None:
@@ -668,8 +678,9 @@ def cm_check(P: dict) -> None:
 
 class CaseManagement(ss.Intervention):
     """Effective treatment probability of clinical episodes; `add` from `start` until `stop` (v0.6; None: no end).
-    v0.12: with cm_target = 1 the unit's level `base` applies to every age and the add-on's gain (cm_gain_at: `add`, the
-    within-catchment gain, x cm_catchment_share x cm_ramp) to the targeted ages only (Malaria.step); `pkg` (set by the engine) says the package has the add-on, whose cost
+    v0.12: with cm_target = 1 the unit's level `base` applies to every age and the add-on's within-catchment gain
+    (cm_gain_at: `add` x cm_ramp) to the targeted ages only, weighted by cm_catchment_share after the cap
+    (Malaria.step); `pkg` (set by the engine) says the package has the add-on, whose cost
     drivers count even at add 0."""
     def __init__(self, base=0.3, add=0.0, start=2024.0, stop=None, name=None):
         super().__init__(name=name)
@@ -685,5 +696,4 @@ class CaseManagement(ss.Intervention):
             return
         dz.pars.ft = min(0.95, self.base)
         dz.cm_on = bool(on and self.pkg)
-        dz.cm_gain = cm_gain_at(yr, self.add, dz.P["cm_catchment_share"], self.start, self.stop, dz.P["cm_ramp_years"],
-                                self.pkg)
+        dz.cm_gain = cm_gain_at(yr, self.add, self.start, self.stop, dz.P["cm_ramp_years"], self.pkg)

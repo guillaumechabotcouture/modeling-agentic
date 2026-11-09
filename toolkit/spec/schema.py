@@ -1012,7 +1012,8 @@ def _validate(s: Spec) -> list[str]:
                                  f"cost drivers ({type(ex).__name__}: {ex})"]
         dom = parameter_domain(r, {n: p.value for n, p in pnames.items()}, dr)
         for k, m in (an.get("cost_outputs") or {}).items():
-            bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, dom)
+            bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, dom,
+                                               {n: q.kind for n, q in pnames.items()})
     cost_outs = an.get("cost_outputs") or {}
     for it in opts.get("cost_items") or []:
         if it.get("basis") == "per_outcome" and it.get("outcome") not in cost_outs:
@@ -1096,13 +1097,20 @@ def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
     return dom
 
 
-def conditional_driver_problems(name, driver, when: dict, domain: dict) -> list[str]:
+def conditional_driver_problems(name, driver, when: dict, domain: dict, kinds: dict | None = None) -> list[str]:
     """F6 S2-2 (Codex r1 P2-1): a cost driver the engine card lists under outputs.cost_drivers_when
     ({driver: {parameter: value}}) is produced only when each parameter has its stated value, so every value the
     analysis can give it (parameter_domain: the point value, any range, every decision-test value) must equal that
-    value. A range is refused unless both ends equal it (a continuous range reaches fractional switches)."""
+    value. A range is refused unless both ends equal it (a continuous range reaches fractional switches).
+    Codex r2 P2-2: with `kinds` ({parameter: kind}), a predicate may name only a `fixed` engine parameter; fitted,
+    calibrated and scenario parameters are moved by the analysis (draws, emulator designs, tests), so it is refused."""
     out = []
     for p, v in ((when or {}).get(driver) or {}).items():
+        if kinds is not None and kinds.get(p) != "fixed":
+            out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} depends on {p}, a "
+                       f"{kinds.get(p, 'unknown')} parameter; a conditional driver's predicate must name a fixed "
+                       "(structural) engine parameter")
+            continue
         for where, vals in domain.get(p) or [("point value", [None])]:
             try:
                 same = bool(vals) and all(float(x) == float(v) for x in vals)
