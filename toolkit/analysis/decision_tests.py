@@ -221,7 +221,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         a["group_rules"] = rules
         if not rules:
             a.pop("group_rules")
-        feas = apackages.feasibility(a, A.spec.units())
+        from toolkit.analysis import variants as V
+        feas = V.carry(A, apackages.feasibility(a, A.spec.units()))      # F6 S1-6: a variant headline's rule holds
         cases = [("with" if dt.get("add") else "without", ben0, cost0, None, feas)]
         lowers = [False]
     elif t == "envelope":

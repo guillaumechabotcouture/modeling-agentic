@@ -40,23 +40,135 @@ def headline_id(raw: dict):
 
 
 def validate(raw: dict, cols) -> list[str]:
-    raise NotImplementedError
+    """Spec errors in analysis.plan_variants (called by toolkit/spec/schema.py validate)."""
+    pv = (raw.get("analysis") or {}).get("plan_variants")
+    if pv is None:
+        return []
+    if not isinstance(pv, dict) or not isinstance(pv.get("variants"), list) or not pv["variants"]:
+        return ["analysis.plan_variants: {variants: [...], headline: <variant id>} with at least one variant"]
+    bad, ids = [], []
+    comps = set((raw.get("options") or {}).get("components") or {})
+    for v in pv["variants"]:
+        i = v.get("id") if isinstance(v, dict) else None
+        if not isinstance(i, str) or not re.fullmatch(r"[A-Za-z0-9_\-]+", i) or i in ids or i == "unconstrained":
+            bad.append(f"analysis.plan_variants: id {i!r} missing, duplicated, reserved or not [A-Za-z0-9_-]")
+            continue
+        ids.append(i)
+        if v.get("type") not in TYPES:
+            bad.append(f"plan variant {i}: type {v.get('type')!r} not in {TYPES}")
+            continue
+        cs = v.get("components")
+        if (cs is not None or v["type"] == "group_rule") and not (
+                isinstance(cs, list) and cs and all(c in comps for c in cs)):
+            bad.append(f"plan variant {i}: components must be a non-empty list of known components")
+        if v["type"] == "group_rule" and v.get("by") not in cols:
+            bad.append(f"plan variant {i}: by {v.get('by')!r} is not a column of the units table")
+        txt = str(v.get("text") or "")
+        if not txt.strip() or any(ch.isdigit() for ch in txt):
+            bad.append(f"plan variant {i}: text (what the rule means, in words, no numbers)")
+        for k in sorted(set(v) - {"id", "type", "components", "by", "text"}):
+            bad.append(f"plan variant {i}: unknown key {k}")
+    for k in sorted(set(pv) - {"variants", "headline"}):
+        bad.append(f"analysis.plan_variants: unknown key {k}")
+    if pv.get("headline") is not None and pv["headline"] not in ids:
+        bad.append(f"analysis.plan_variants.headline: {pv['headline']!r} is not a variant id")
+    return bad
 
 
 def restrict(feas: dict, pk: dict, comps) -> dict:
-    raise NotImplementedError
+    """Feasibility with every package that has none of `comps` removed (minimum service). Fails closed when a unit has
+    no package left (a lock, or eligibility, rules every listed component out there)."""
+    out = copy.deepcopy(feas)
+    cs = set(comps)
+    for i, row in out["feasible"].items():
+        for p in row:
+            if row[p] and not pk[p] & cs:
+                row[p] = False
+                out["reasons"].setdefault(i, {}).setdefault(p, []).append(
+                    f"minimum service: at least one of {sorted(cs)}")
+        if not any(row.values()):
+            raise ValueError(f"minimum service: unit {i} has no feasible package with any of {sorted(cs)}")
+    return out
 
 
 def feasibility(A, v: dict) -> tuple[dict, dict]:
-    raise NotImplementedError
+    """(alloc, feasibility) of variant `v` on top of the unconstrained alloc spec."""
+    a = copy.deepcopy(getattr(A, "base_alloc", None) or A.alloc)
+    if v["type"] == "group_rule":
+        a["group_rules"] = dict(a.get("group_rules") or {})
+        a["group_rules"][f"variant_{v['id']}"] = {"components": list(v["components"]), "by": v["by"],
+                                                  "rule": "same_choice"}
+    feas = apackages.feasibility(a, A.spec.units())
+    if v["type"] == "minimum_service":
+        feas = restrict(feas, A.pk, v.get("components") or list(A.spec["options"]["components"]))
+    return a, feas
 
 
-def apply_headline(A):
-    raise NotImplementedError
+def apply_headline(A) -> str | None:
+    """With `headline: <id>`, the analysis's alloc and feasibility become the variant's (every later solve carries the
+    rule); the unconstrained ones are kept as A.base_alloc and A.base_feas. Returns the id, or None."""
+    hid = headline_id(A.spec.raw)
+    if hid is None:
+        return None
+    if getattr(A, "headline_variant", None) == hid:
+        return hid
+    v = next(x for x in config(A.spec.raw)["variants"] if x["id"] == hid)
+    A.base_alloc, A.base_feas = A.alloc, A.feas
+    A.alloc, A.feas = feasibility(A, v)
+    A.headline_variant = hid
+    return hid
+
+
+def carry(A, feas: dict) -> dict:
+    """A feasibility built from A.alloc (a group-rule decision test) with a minimum-service headline's rule applied
+    too (a group-rule headline is already in A.alloc)."""
+    hid = getattr(A, "headline_variant", None)
+    v = next((x for x in config(A.spec.raw).get("variants") or [] if x["id"] == hid), None)
+    if v is None or v["type"] != "minimum_service":
+        return feas
+    return restrict(feas, A.pk, v.get("components") or list(A.spec["options"]["components"]))
 
 
 def run(A, ben0, cost0, plan) -> dict | None:
-    raise NotImplementedError
+    """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
+    headline plan's budget (A.solve: the reserve when enforced). None when the spec asks for none."""
+    from toolkit.analysis import moves as MV
+    cfg = config(A.spec.raw)
+    if not cfg:
+        return None
+    u = A.solve(ben0, cost0, feas=getattr(A, "base_feas", None) or A.feas)
+    up, uo = u["choice"], float(u["objective"])
+
+    def row(p, obj):
+        return {"objective": obj, "cost": float(sum(cost0[i][p[i]] for i in A.ids)),
+                "units_no_package": sum(p[i] == A.comp for i in A.ids), "recommendation": A.mix_text(p)}
+    out = {"headline": cfg.get("headline") or "unconstrained", "outcome": A.primary,
+           "unconstrained": dict(row(up, uo), plan=dict(up)), "variants": []}
+    for v in cfg["variants"]:
+        rec = {"id": v["id"], "type": v["type"], "text": v["text"], "components": v.get("components"),
+               "by": v.get("by")}
+        try:
+            _a, feas = feasibility(A, v)
+            sol = A.solve(ben0, cost0, feas=feas)
+        except (ValueError, RuntimeError) as e:      # the rule or the budget leaves no feasible plan
+            out["variants"].append(dict(rec, status="not_solved", reason=str(e)))
+            continue
+        vp, vo = sol["choice"], float(sol["objective"])
+        A.guard(f"plan variant {v['id']}", [vp])
+        m = MV.summarise(A, up, vp, ben0, cost0, vo)
+        lost = uo - vo
+        rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
+                   value_lost_pct=100.0 * lost / uo if uo > 0 else None,
+                   **{k: m[k] for k in ("units_changed", "share_units_changed", "population_changed",
+                                        "population_changed_share", "dollars_by_component", "dollars_moved",
+                                        "dollars_moved_share", "units_changed_by_group")})
+        out["variants"].append(rec)
+    hv = cfg.get("headline")
+    if hv is not None:
+        h = next(x for x in out["variants"] if x["id"] == hv)
+        if h.get("status") != "solved" or h["plan"] != dict(plan):
+            raise RuntimeError(f"plan variant {hv}: the headline plan is not the variant's solved plan")
+    return out
 
 
 # --------------------------------------------------------------------------- self-test

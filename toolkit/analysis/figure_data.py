@@ -427,6 +427,8 @@ def rebuild(run_dir: str, log=print):
                 and abs(float(rv.get("budget_planned", -1)) - f * A.budget) <= 1e-9 * max(1.0, A.budget)):
             raise RebuildRefused("the spec enforces the affordability rule but point.yaml has no consistent reserve")
         A.set_reserve(f)
+    from toolkit.analysis import variants as V
+    V.apply_headline(A)          # F6 S1-6: a variant headline's rule, as the run solved it
     sol = A.solve(ben0, cost0)
     plan = {str(k): v for k, v in point["plan"].items()}
     diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]

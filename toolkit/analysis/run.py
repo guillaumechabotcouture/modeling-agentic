@@ -262,6 +262,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
+    from toolkit.analysis import variants as V
+    V.apply_headline(A)     # F6 S1-6: `headline: <variant>`: every solve from here carries the variant's rule
     # ---- calibration
     A.fit_calibration()
     cal0 = A.calibrate(A.theta0)
@@ -327,6 +329,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     if reserve is not None:
         point["reserve"] = reserve
+    if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
+        point["headline_variant"] = A.headline_variant
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
@@ -345,6 +349,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         _safe_io().write_nofollow(run_dir, "models/allocation_robustness.yaml",
                                   yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
+    # ---- plan variants (F6 S1-6), on the point tables within the headline plan's budget
+    pv = V.run(A, ben0, cost0, plan)
+    if pv is not None:
+        arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
     sens = SE.run(A, z0, ben0, cost0, plan, sol["objective"])
     arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
@@ -411,9 +419,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
-    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy)
+    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, pv=pv)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
-                                                                          "decision_tests", "calibration")])
+                                                                          "decision_tests", "calibration")]
+                             + ([arts["plan_variants"]] if pv is not None else []))
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
