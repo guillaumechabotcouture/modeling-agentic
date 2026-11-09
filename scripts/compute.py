@@ -3348,14 +3348,17 @@ def _self_test_s18(ok) -> None:
             w(repo_a, "scripts/lib/helper.py", "X = 2\n")
             fp1 = fp()
             ok(fp1 != fp0, "RU2 a change to repo code still changes the fingerprint")
+            w(rd, "decision_spec.yaml", "spec: 1\n")       # a v2 run: its spec at the run root
+            fp1 = fp()
             for rel in ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml",
-                        "models/decision_tests/DT1.yaml", "decision_spec.yaml", "analysis/point.json"):
+                        "decision_spec.yaml", "analysis/point.json"):
                 w(rd, rel, "written: 1\n")
-            ok(fp() == fp1, "RU3 harness-written analysis outputs under models/ and the spec keep the fingerprint")
-            w(rd, "models/decision_tests/DT1.yaml", "written: 2\n")
-            ok(fp() == fp1, "RU3b a rewritten decision test keeps the fingerprint")
-            w(rd, "data/input_checks.json", "{}\n")
-            ok(fp() == fp1, "RU3c the harness's input-check record under data/ keeps the fingerprint")
+            ok(fp() == fp1, "RU3 a v2 run's fixed harness outputs under models/ and the spec keep the fingerprint")
+            for rel in ("models/decision_tests/DT1.yaml", "models/decision_tests/custom.yaml", "data/input_checks.json"):
+                w(rd, rel, "written: 2\n")
+                fpx = fp()
+                ok(fpx != fp1, f"RU3b (Codex P2-9) no wildcard: {rel} is hashed")
+                fp1 = fpx
             for rel in ("models/notes.yaml", "models/decision_tests/helper.py", "models/ext/claims_spec.yaml"):
                 w(rd, rel, "x = 1\n")
                 fpx = fp()
@@ -3368,7 +3371,7 @@ def _self_test_s18(ok) -> None:
                             out, backend="local", max_workers=1, ledger=False)
             ok(s1.get("computed") == 3, f"RU6 setup: the first batch computes 3 rows ({s1.get('computed')})")
             r = rep(rd)
-            ok(r.get("stored") == 3 and r.get("reusable") == 3,
+            ok(r.get("stored") == 3 and r.get("eligible") == 3,
                f"RU7 reuse_report: every stored row would be reused with unchanged code ({r})")
         # each launch extracts its code to a new temporary directory, and a resume tree is a copy of the run
         repo_b, rd_b = os.path.join(td, "repo_b"), os.path.join(td, "run_b")
@@ -3377,7 +3380,7 @@ def _self_test_s18(ok) -> None:
         w(repo_b, "scripts/lib/code_commit.txt", "2" * 40 + "\n")
         with mock.patch.dict(g, {"REPO": repo_b}):
             r = rep(rd_b)
-            ok(r.get("stored") == 3 and r.get("reusable") == 3,
+            ok(r.get("stored") == 3 and r.get("eligible") == 3,
                f"RU8 another tree at another commit, the run dir moved: every stored row would be reused ({r})")
             _, s2 = run_map(rd_b, os.path.join(repo_b, "toolkit", "eng", "m.py") + "::f", [{"x": i} for i in range(4)],
                             os.path.join(rd_b, "models", "batch.jsonl"), backend="local", max_workers=1, ledger=False)
@@ -3386,7 +3389,7 @@ def _self_test_s18(ok) -> None:
                f"{s2.get('computed')} computed, {s2.get('reused')} reused")
             w(repo_b, "toolkit/eng/m.py", "# changed\n", "a")
             r = rep(rd_b)
-            ok(r.get("stored") == 4 and r.get("reusable") == 0 and all(b.get("why") for b in r.get("batches") or [{}]),
+            ok(r.get("stored") == 4 and r.get("eligible") == 0 and all(b.get("why") for b in r.get("batches") or [{}]),
                f"RU10 changed engine code: nothing would be reused, and the report says why ({r})")
         # the CLI a launcher runs locally, from the tree it would ship
         rd_c = os.path.join(td, "run_c")
@@ -3399,26 +3402,49 @@ def _self_test_s18(ok) -> None:
             got = json.loads(cli.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             got = {}
-        ok(cli.returncode == 0 and got.get("stored") == 2 and got.get("reusable") == 2,
+        ok(cli.returncode == 0 and got.get("stored") == 2 and got.get("eligible") == 2 and "identical inputs" in got.get("note", ""),
            f"RU11 `compute.py reuse-check <run_dir>` prints the counts as JSON: rc={cli.returncode} {got} "
            f"{cli.stderr[-200:]}")
         w(rd_c, "models/fn.py", "# changed\n", "a")
         cli = _sp.run(cmd + ["--expect-all"], capture_output=True, text=True, timeout=120)
         ok(cli.returncode == 1, f"RU12 `reuse-check --expect-all` exits 1 when a stored row would be recomputed "
                                 f"(rc={cli.returncode})")
-    # the explicit list covers every models/ path toolkit/analysis names (a drift check, not a guess)
-    lits = set()
-    for f in sorted(os.listdir(os.path.join(REPO, "toolkit", "analysis"))):
-        if f.endswith(".py"):
-            src = open(os.path.join(REPO, "toolkit", "analysis", f)).read()
-            lits |= {"models/" + x for x in _re.findall(r"[\"']models/([A-Za-z0-9_.]+/?)", src)}
-            lits |= {"models/" + x + ("/" if not x.endswith((".yaml", ".json")) else "")
-                     for x in _re.findall(r"os\.path\.join\(\"models\", \"([A-Za-z0-9_.]+)\"", src)}
-    known = tuple(g.get("FP_HARNESS_OUTPUTS", ())) + tuple(g.get("FP_HARNESS_DIRS", {}))
-    miss = sorted(x for x in lits if x not in known and x.removeprefix("models/") not in _FP_RUNNER_FILES
-                  and not x.startswith("models/compute_ledger.json"))
-    ok(lits and not miss and "models/decision_tests/" in g.get("FP_HARNESS_DIRS", {}),
-       f"RU13 every models/ path toolkit/analysis writes is on the harness-output list: missing {miss}")
+    # Codex P2-9: exact paths only, each one a real harness output; a v1 run hashes everything
+    hd = tuple(g.get("FP_HARNESS_OUTPUTS", ()))
+    src = "".join(open(os.path.join(REPO, "toolkit", "analysis", f)).read()
+                  for f in sorted(os.listdir(os.path.join(REPO, "toolkit", "analysis"))) if f.endswith(".py"))
+    ok(hd and not g.get("FP_HARNESS_DIRS") and all("*" not in x and x.startswith("models/") and x in src for x in hd),
+       f"RU13 the harness-output list is exact paths that toolkit/analysis writes, no wildcard: {hd}")
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, rd = os.path.join(td, "repo"), os.path.join(td, "run")
+        for root, rel, txt in ((repo, "scripts/x.py", "X = 1\n"), (repo, "requirements.txt", "starsim==3.0.0\n"),
+                               (rd, "models/fn.py", "def f(p):\n    return {'y': open('models/claims_ledger.yaml').read()}\n"),
+                               (rd, "models/claims_ledger.yaml", "a\n")):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), "w").write(txt)
+        with mock.patch.dict(g, {"REPO": repo}):
+            fp0 = code_fingerprint(rd, "models/fn.py::f")
+            open(os.path.join(rd, "models", "claims_ledger.yaml"), "w").write("b\n")
+            fp1 = code_fingerprint(rd, "models/fn.py::f")
+            ok(fp1 != fp0, "RU14 (Codex P2-9) a v1 function reading models/claims_ledger.yaml: the file is hashed")
+            out = os.path.join(rd, "models", "o.jsonl")
+            cwd = os.getcwd()
+            os.chdir(rd)
+            try:
+                run_map(rd, "models/fn.py::f", [{"x": 1}], out, backend="local", max_workers=1, ledger=False)
+                open(os.path.join(rd, "models", "claims_ledger.yaml"), "w").write("c\n")
+                rows, s3 = run_map(rd, "models/fn.py::f", [{"x": 1}], out, backend="local", max_workers=1, ledger=False)
+            finally:
+                os.chdir(cwd)
+            ok(s3.get("computed") == 1, f"RU14b the v1 batch reading that file is recomputed after it changes: {s3.get('computed')}")
+            fp2 = code_fingerprint(rd, "models/fn.py::f")
+            open(os.path.join(repo, "requirements.txt"), "w").write("starsim==3.1.0\n")
+            ok(code_fingerprint(rd, "models/fn.py::f") != fp2,
+               "RU15 (Codex P2-8) a dependency-only change (requirements.txt) changes the fingerprint")
+            summ = json.load(open(out + ".summary.json"))
+            ok((summ.get("runtime") or {}).get("python") == ".".join(map(str, sys.version_info[:3])),
+               f"RU16 (Codex P2-8) a batch records the runtime versions it ran under: {summ.get('runtime')}")
 
 
 def _self_test_wall(ok) -> None:

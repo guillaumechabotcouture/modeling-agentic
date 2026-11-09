@@ -1792,6 +1792,9 @@ def _self_test_s18(ok, tb) -> None:
         def scheduler_info(self):
             return {"workers": table}
 
+        def run_on_scheduler(self, fn, *a):
+            return None
+
         def processing(self, workers=None):
             self.seen.append(json.load(open(self.cf)) if os.path.exists(self.cf) else None)
             step = self.listing.pop(0) if len(self.listing) > 1 else self.listing[0]
@@ -1820,7 +1823,7 @@ def _self_test_s18(ok, tb) -> None:
                     P(M, "is_running", return_value=False), P(M, "live_id", return_value=77), \
                     P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
                     P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
-                    P(M, "_compute", return_value=comp), P(M, "_submit", side_effect=lambda c_, cl, lab, *a: f"run-{lab}-1"), \
+                    P(M, "_compute", return_value=comp), P(M, "_submit", side_effect=lambda c_, cl, lab, *a: (f"run-{lab}-1", types.SimpleNamespace(status="pending"))), \
                     P(M, "start_overflow", side_effect=overflow_exc or (lambda *a: {"id": 78})), \
                     P(M, "start_keeper", return_value=types.SimpleNamespace(cluster_id=79)), \
                     P(M, "confirm_keeper", side_effect=keeper_exc or (lambda *a, **k: ["tick"])), \
@@ -1880,8 +1883,10 @@ def _self_test_s18(ok, tb) -> None:
     fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append(kw) or "fut")
     with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}):
         cfg = RunConfig(name="z", question_file="q", pipeline="v2")
-        key = _submit(cfg, fc, "R1", "w", b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
-    ok(sub and key == sub[0].get("key") and str(key).startswith("run-R1-"), f"LR9 _submit returns its task key: {key}")
+        got = _submit(cfg, fc, "R1", "w", b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
+    key = got[0] if isinstance(got, tuple) else got
+    ok(sub and isinstance(got, tuple) and got[1] == "fut" and key == sub[0].get("key") and str(key).startswith("run-R1-"),
+       f"LR9 _submit returns its task key and the future it holds (P2-7): {got}")
     wl = g.get("wait_listed")
     if wl:
         sl = []
@@ -1931,6 +1936,205 @@ def _self_test_s18(ok, tb) -> None:
     ok(r.get("stored") == 5 and r.get("reusable") == 4 and r.get("argv", [None])[:2] == ["reuse-check", d]
        and not str(r.get("here", "")).startswith(os.path.dirname(HERE)),
        f"LR12 reuse_check runs the tarball's own compute.py reuse-check on the run dir: {r}")
+
+
+def _self_test_s18_r1(ok) -> None:
+    """Codex round 1 on #161 (no Coiled, no network): every post-submit path of launch and relaunch ends in a
+    do-not-shut-down code (P1-1, P1-2); exit 1 never points at a previous launch's record (P1-3); a per-config lock and
+    record ownership (P2-4); helper ids recorded at construction (P2-5); every assignment before the first submit
+    (P2-6); a fast or queued run is acknowledged (P2-7)."""
+    import contextlib
+    import fcntl
+    import io
+    import tempfile
+    import types
+    from unittest import mock
+    M, P = sys.modules[__name__], mock.patch.object
+    table = {f"tls://10.0.0.{i}:1": {} for i in range(3)}
+    lost = OSError("Timed out trying to connect to tls://10.1.2.3:443 after 30 s")
+
+    class Client:
+        def __init__(self, listing=None, state=None):
+            self.status, self.listing, self.state = "running", list(listing or [{}]), state
+
+        def wait_for_workers(self, *a, **kw):
+            pass
+
+        def upload_file(self, *a):
+            pass
+
+        def scheduler_info(self):
+            return {"workers": table}
+
+        def run_on_scheduler(self, fn, *a):
+            return self.state
+
+        def processing(self, workers=None):
+            step = self.listing.pop(0) if len(self.listing) > 1 else self.listing[0]
+            if isinstance(step, BaseException):
+                raise step
+            return step
+
+    def lists(*labels):
+        return {"tls://10.0.0.0:1": [f"run-{x}-1" for x in labels]}
+
+    def go(listing=None, labels=("R1",), keeper=False, fut_status="pending", state=None, writes_fail=(),
+           live_exc=None, overflow_exc=None, pre=None, running=False, preflight_exc=None, real_overflow=False,
+           hold_lock=False, env=None):
+        with tempfile.TemporaryDirectory() as d:
+            q = os.path.join(d, "q.txt")
+            open(q, "w").write("question")
+            cfg = RunConfig(name="lt", question_file=q, labels=labels, out_dir=d, keeper=keeper,
+                            overflow_max=4 if keeper else 0, pipeline="v2")
+            if pre is not None:
+                json.dump(pre, open(cfg.clusters_file, "w"))
+            client = Client(listing if listing is not None else [lists(*labels)], state)
+            real_write = g.get("write_clusters")
+
+            def write(cfg_, cl, *a, **kw):
+                if cl.get("status") in writes_fail:
+                    raise OSError(f"disk full writing {cl.get('status')}")
+                return real_write(cfg_, cl, *a, **kw)
+
+            def cluster(**kw):
+                cl = types.SimpleNamespace(cluster_id=78 if kw.get("name", "").endswith("-overflow") else 77,
+                                           get_client=lambda: client)
+                if kw.get("name", "").endswith("-overflow"):
+                    def boom(*a):
+                        raise RuntimeError("upload failed")
+                    cl.get_client = lambda: types.SimpleNamespace(upload_file=boom)
+                return cl
+            fake_coiled = types.ModuleType("coiled")
+            fake_coiled.Cluster = cluster
+            fake_coiled.list_clusters = lambda workspace: []
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+                                         register_compute_tags=lambda c, exclude: None)
+            pats = [P(M, "is_running", return_value=running),
+                    P(M, "live_id", side_effect=live_exc or (lambda n: 77)),
+                    P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}),
+                    P(M, "code_tarball", return_value=(b"", "c0")),
+                    P(M, "pipeline_preflight", side_effect=preflight_exc or (lambda *a: "v2")),
+                    P(M, "_compute", return_value=comp),
+                    P(M, "_submit", side_effect=lambda c_, cl, lab, *a: (f"run-{lab}-1",
+                                                                         types.SimpleNamespace(status=fut_status))),
+                    P(M, "start_keeper", return_value=types.SimpleNamespace(cluster_id=79)),
+                    P(M, "confirm_keeper", return_value=["tick"]),
+                    P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None)]
+            if not real_overflow:
+                pats.append(P(M, "start_overflow", side_effect=overflow_exc or (lambda *a, **k: {"id": 78})))
+            if real_write:
+                pats.append(P(M, "write_clusters", side_effect=write))
+            lock = None
+            if hold_lock:
+                lock = open(os.path.join(d, ".run_cluster.lock"), "a")
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out = io.StringIO()
+            with contextlib.ExitStack() as es:
+                es.enter_context(mock.patch.dict(sys.modules, {"coiled": fake_coiled}))
+                es.enter_context(mock.patch.dict(os.environ, env or {}))
+                for p_ in pats:
+                    es.enter_context(p_)
+                es.enter_context(contextlib.redirect_stdout(out))
+                try:
+                    rc = launch(cfg)
+                except SystemExit as e:
+                    rc = ("exit", e.code)
+                except BaseException as e:  # noqa: BLE001
+                    rc = ("raised", type(e).__name__)
+            if lock:
+                lock.close()
+            cl = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else {}
+            asg = json.load(open(cfg.state_file)) if os.path.exists(cfg.state_file) else {}
+            return rc, cl, asg, out.getvalue()
+
+    g = globals()
+    # P1-1: the whole post-submit path
+    rc, cl, _, out = go(writes_fail=("submitted", "submitted_connection_lost", "submitted_unconfirmed",
+                                     "submitted_launch_incomplete"))
+    ok(rc in (3, 5), f"R1a a record write that fails after the submission still exits 3 or 5, never raises: {rc}")
+    rc, cl, _, out = go(writes_fail=("launched",))
+    ok(rc == 0, f"R1b the final record write is best effort after a confirmed launch: {rc}")
+    rc, cl, _, out = go(keeper=True, overflow_exc=lost, live_exc=KeyboardInterrupt)
+    ok(rc == 3, f"R1c an interrupt during the handover's own reporting keeps the safe code: {rc}")
+    rc, cl, _, out = go(listing=[KeyboardInterrupt()])
+    ok(rc == 4, f"R1d an interrupt while waiting for the listing is 'submitted, not confirmed': {rc}")
+    # P1-3: exit 1 never points at an older record
+    old = {"run": {"name": "lt", "id": 5}, "launch_id": "old", "invocation": "old-token", "status": "launched"}
+    for kw, what in ((dict(running=True), "already running"), (dict(preflight_exc=SystemExit("no pipeline")), "preflight"),
+                     (dict(hold_lock=True), "lock held")):
+        rc, cl, _, out = go(pre=old, **kw)
+        ok(isinstance(rc, tuple) and cl == old and "invocation " in out and "old-token" not in out.split("invocation ")[-1][:40],
+           f"R3 a refusal ({what}) leaves the earlier record untouched and prints its own invocation token: {rc} {cl}")
+    rc, cl, _, out = go(env={"MA_LAUNCH_INVOCATION": "wd-123"})
+    ok(rc == 0 and cl.get("invocation") == "wd-123", f"R3b the record carries the watchdog's invocation token: {cl}")
+    # P2-4: record ownership
+    wc = g.get("write_clusters")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2")
+        json.dump({"invocation": "B", "status": "submitting"}, open(cfg.clusters_file, "w"))
+        try:
+            wc(cfg, {"invocation": "A", "status": "submitted"}) if wc else None
+            refused = False
+        except Exception:  # noqa: BLE001
+            refused = True
+        ok(refused and json.load(open(cfg.clusters_file))["invocation"] == "B",
+           "R4 a record owned by another invocation is never replaced")
+        ok(not [f for f in os.listdir(d) if f.endswith(".tmp")], "R4b no temporary record file is left behind")
+    # P2-5: a helper id is recorded right after its constructor
+    rc, cl, _, out = go(keeper=True, real_overflow=True)
+    ok(rc == 5 and (cl.get("overflow") or {}).get("id") == 78,
+       f"R5 an overflow pool whose upload fails is still in clusters.json: rc={rc} {cl.get('overflow')}")
+    # P2-6: every assignment before the first submission
+    rc, cl, asg, out = go(labels=("R1", "R2"), listing=[{}])
+    ok(rc == 4 and set(asg) == {"R1", "R2"} and asg["R2"].get("submission") == "pending"
+       and asg["R1"].get("submission") == "sent" and "relaunch" in out and "R2" in out,
+       f"R6 an unconfirmed R1 leaves R2 assigned and pending, so `relaunch R2` can run: rc={rc} "
+       f"{ {k: v.get('submission') for k, v in asg.items()} }")
+    rc, cl, asg, out = go(labels=("R1", "R2"), listing=[lists("R1", "R2")])
+    ok(rc == 0 and all(v.get("submission") == "listed" for v in asg.values()), f"R6b both listed: {rc} {asg}")
+    # P2-7: a run that finished between polls, and one the scheduler queued
+    rc, cl, _, out = go(listing=[{}], fut_status="finished")
+    ok(rc == 0, f"R7 a run that finished before the first poll is acknowledged by its future: {rc}")
+    rc, cl, _, out = go(listing=[{}], state="queued")
+    ok(rc == 0, f"R7b a run the scheduler holds as queued is acknowledged: {rc}")
+    rc, cl, _, out = go(listing=[{}], state="released")
+    ok(rc == 4, f"R7c a released key is not an acknowledgement: {rc}")
+
+    # P1-2: relaunch, same boundary and guards
+    def re(submit=None, listing=None, state=None):
+        with tempfile.TemporaryDirectory() as d:
+            q = os.path.join(d, "q.txt")
+            open(q, "w").write("question")
+            cfg = RunConfig(name="lt", question_file=q, labels=("R1", "R2"), out_dir=d, pipeline="v2", tree=d)
+            json.dump({x: {"worker": "tls://10.0.0.0:1", "launch_id": "L", "submission": "pending"}
+                       for x in cfg.labels}, open(cfg.state_file, "w"))
+            client = Client(listing or [lists("R2")], state)
+            rs = types.ModuleType("results_store")
+            rs.list_blobs = lambda *a: []
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"results_store": rs}), \
+                    P(M, "attach", return_value=types.SimpleNamespace(get_client=lambda: client)), \
+                    P(M, "_on_worker", return_value={"state": "none"}), \
+                    P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
+                    P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
+                    P(M, "_submit", side_effect=submit or (lambda c_, cl, lab, *a: (f"run-{lab}-1",
+                                                                                     types.SimpleNamespace(status="pending")))), \
+                    P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None), \
+                    contextlib.redirect_stdout(out):
+                try:
+                    return relaunch(cfg, "R2")
+                except SystemExit as e:
+                    return ("exit", e.code)
+                except BaseException as e:  # noqa: BLE001
+                    return ("raised", type(e).__name__)
+
+    def accepted_then_raise(*a):
+        raise RuntimeError("submit raised after the scheduler accepted it")
+    ok(re() == 0, f"R2a relaunch of a pending label, listed: exit 0 ({re()})")
+    ok(re(submit=accepted_then_raise) == 4, f"R2b relaunch: _submit raising is 'not confirmed', never 1: {re(submit=accepted_then_raise)}")
+    ok(re(listing=[KeyError("workers")]) == 4, f"R2c relaunch: a non-connection error while waiting is 4: "
+                                                f"{re(listing=[KeyError('workers')])}")
+    ok(re(listing=[KeyboardInterrupt()]) == 4, "R2d relaunch: an interrupt after the submission is 4")
 
 
 def _self_test_bwrap(ok) -> None:
@@ -2306,6 +2510,10 @@ def _self_test() -> int:
         _self_test_s18(ok, tb)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"LR: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18_r1(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"R: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
