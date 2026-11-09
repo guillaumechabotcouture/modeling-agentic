@@ -1205,8 +1205,7 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     pack = yaml.safe_load(open(pp)) or {}
     stale = stale_ids(pack, rows)
     if stale:
-        return [], (f"{os.path.basename(path)} was scored against other band declarations for {', '.join(stale)}: "
-                    "re-run or rescore the pack")
+        return [], f"{os.path.basename(path)}: rerun required: {', '.join(stale)} (scored against other band declarations)"
     fprob = engine_fitted_problems(engine)
     if fprob:
         return [], f"{os.path.basename(path)}: {'; '.join(fprob)}"
@@ -1268,8 +1267,7 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
     for r in doc.get("benchmarks") or []:
         b = cur.get(r["id"])
         if b is not None and band_digest(b) is not None and r.get("band_sha256") != band_digest(b):
-            rows.append(_rescore_band(r, b, old.get(r["id"])))
-            continue
+            raise ValueError(f"rescore: rerun required: {r['id']} was scored against another band declaration")
         if b is None or b["estimand"]["type"] != "coverage":
             rows.append(r)
             continue
@@ -1293,13 +1291,6 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
         r["computation_sha256"] = computation_digest(b, pack)
         r["in_band"] = r["status"] == "in_band"
         rows.append(r)
-    if any("rescored_from" in x and x.get("requires") for x in rows):
-        for x in rows:
-            if x.get("requires") and x.get("status") == "not_assessable":
-                x["status"] = "in_band" if x["band"][0] <= x["computed"] <= x["band"][1] else "out_of_band"
-        apply_requires(rows)
-        for x in rows:
-            x["in_band"] = x["status"] == "in_band"
     out = {k: v for k, v in doc.items() if k not in ("producer", "engine_identity", "engine_config_sha256")}
     out["benchmarks"] = rows
     by = {st: sum(x["status"] == st for x in rows) for st in STATUSES}
@@ -1307,22 +1298,6 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
                       "held_out_in_band": sum(x["status"] == "in_band" for x in rows if x["role"] == "held_out"),
                       "held_out_total": sum(x["role"] == "held_out" for x in rows)}
     return stamp(out, engine)
-
-
-def _rescore_band(r: dict, b: dict, bo: dict | None) -> dict:
-    """A stored trial row re-scored against the current band (F6 S1-2), without a re-run: only a ratio row computed for
-    the previous pack's declaration of its case (its digest, or for a row stored before digests, the same band)."""
-    legacy = "band_sha256" not in r and bo is not None and r.get("band") == bo.get("band")
-    if bo is None or not (legacy or r.get("band_sha256") == band_digest(bo)):
-        raise ValueError(f"rescore: {r['id']} was not scored against the previous pack's band declaration")
-    if b["estimand"]["type"] == "cost_per_outcome" or not isinstance(r.get("computed"), (int, float)):
-        raise ValueError(f"rescore: {r['id']}: its band changed and it cannot be re-scored without a re-run")
-    r = dict(r, rescored_from={"band": r.get("band"), "band_sha256": r.get("band_sha256"),
-                               "note": "re-scored against the current band declaration; no new run"})
-    lo, hi = b["band"]
-    r.update(band=list(b["band"]), band_sha256=band_digest(b), in_band=bool(lo <= r["computed"] <= hi))
-    r["status"] = "in_band" if r["in_band"] else "out_of_band"
-    return r
 
 
 def declaration_digest(b: dict, pack: dict | None = None) -> str:
@@ -1395,7 +1370,7 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
                 raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
     stale = stale_ids(pack, [r for r in rows.values() if r["id"] in ids])
     if stale:
-        raise ValueError(f"merge: {', '.join(stale)} scored against other band declarations (re-run or rescore)")
+        raise ValueError(f"merge: rerun required: {', '.join(stale)} (scored against other band declarations)")
     miss = [i for i in ids if i not in rows]
     extra = sorted(set(rows) - set(ids))
     if miss or extra:

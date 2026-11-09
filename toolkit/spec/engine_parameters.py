@@ -630,6 +630,9 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     if bad:                             # F6 S1-2: a band that differs from its source is refused before any run
         raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
     pe = _check_pack_engine(pack, spec, engine)
+    from toolkit.engines.benchmark_sources import engine_fitted_problems
+    if engine_fitted_problems(pe):
+        raise ValueError("benchmark pack: " + "; ".join(engine_fitted_problems(pe)))
     vals = values(spec)
     runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
     out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
@@ -708,7 +711,16 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
-    return list(doc.get("benchmarks") or []), None
+    out = list(doc.get("benchmarks") or [])
+    from toolkit.engines.benchmark_sources import TOY_ENGINE_REFS, pack_evidence_problems
+    try:
+        pack, why = benchmark_pack(engine)
+    except PackError as e:
+        pack, why = None, str(e)
+    if pack is None:          # F6 S1-2: rows are trusted only against the engine's own pack (a self-test toy has none)
+        return (out, None) if _ref_of(spec) in TOY_ENGINE_REFS else ([], f"no benchmark pack to check the rows ({why})")
+    bad = pack_evidence_problems(pack, out, engine)
+    return ([], "; ".join(bad) + f"; {how}") if bad else (out, None)
 
 
 def rows(spec, engine) -> list[dict]:

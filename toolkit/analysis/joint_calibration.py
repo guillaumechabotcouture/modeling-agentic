@@ -138,8 +138,8 @@ def spec_problems(spec) -> list[str]:
         except Exception as e:  # noqa: BLE001 -- the priors' own check names it
             dr = {}
             bad.append(f"{w}: the priors cannot be read ({e})")
-        from toolkit.analysis.batch import fitted_ranges
-        fr = fitted_ranges(eng)
+        # names only: whether the fitted values are current is the analysis entry's check (a blocked run, F6 S1-2)
+        fr = {p.name for p in eng.parameters() if p.kind == "fitted"}
         for s in sh:
             if s not in dr and s not in fr:
                 bad.append(f"{w}.shared: {s} is not a prior the uncertainty draws vary (an engine-card prior, an "

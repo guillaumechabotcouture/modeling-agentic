@@ -211,7 +211,7 @@ def fitted_problems(fitted: dict, pack: dict) -> list[str]:
     from toolkit.engines.benchmark import fit_targets
     want = band_declarations(pack, fit_targets(pack))
     have = (fitted or {}).get("band_declarations") or {}
-    ids = sorted(k for k, v in want.items() if have.get(k) != v)
+    ids = sorted(k for k in set(want) | set(have) if have.get(k) != want.get(k))     # the target set and each digest
     return [f"refit required: {', '.join(ids)}"] if ids else []
 
 
@@ -222,10 +222,25 @@ def engine_fitted_problems(engine) -> list[str]:
     if not fp or not os.path.exists(fp):
         return []
     from toolkit.spec import engine_parameters as EP
-    pack, _ = EP.benchmark_pack(engine)
+    try:
+        pack, why = EP.benchmark_pack(engine)
+    except ValueError as e:
+        pack, why = None, str(e)
     if pack is None:
-        return []
-    return fitted_problems(yaml.safe_load(open(fp)) or {}, pack)
+        return [f"fitted values {fp} are unusable evidence: no readable benchmark pack to check them against ({why})"]
+    try:
+        doc = yaml.safe_load(open(fp)) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [f"fitted values {fp} are unusable evidence: unreadable ({e})"]
+    return fitted_problems(doc, pack)
+
+
+def pack_evidence_problems(pack: dict, rows: list, engine=None) -> list[str]:
+    """Every reason stored benchmark rows cannot be trusted against `pack`: its bands do not match their sources, rows
+    scored against other band declarations ("rerun required"), or the engine's fitted values are stale."""
+    stale = stale_ids(pack, rows)
+    return (check_pack(pack) + ([f"rerun required: {', '.join(stale)}"] if stale else [])
+            + (engine_fitted_problems(engine) if engine is not None else []))
 
 
 def main(argv=None) -> int:

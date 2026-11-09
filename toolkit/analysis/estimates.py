@@ -354,6 +354,10 @@ def benchmark_acceptance(eng, doc: dict | None = None) -> str:
     if len(set(got)) != len(got) or set(got) != set(want):
         raise ValueError(f"engine {name}: the results do not hold exactly the pack's benchmarks (missing "
                          f"{sorted(set(want) - set(got))}, extra {sorted(set(got) - set(want))})")
+    from toolkit.engines.benchmark_sources import pack_evidence_problems
+    stale = pack_evidence_problems(pack, rows, eng)      # F6 S1-2: never a stored status the pack no longer backs
+    if stale:
+        raise ValueError(f"engine {name}: benchmarks not accepted: {'; '.join(stale)}")
     bad = []
     for r in rows:
         untranscribed = bool((want[r["id"]].get("estimand") or {}).get("not_transcribed"))
