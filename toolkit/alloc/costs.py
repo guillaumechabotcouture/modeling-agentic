@@ -536,7 +536,11 @@ def _self_test_structure(ok, spec, units, po, treated) -> None:
     ok(validate(why) == [], f"TC31 ... unless the spec states why they do not double count: {validate(why)}")
     for bad, label in (({"c2_per_case": "short"}, "a reason under 10 characters"),
                        ({"c1_delivered": "covers a different component entirely"}, "a reason naming an item it "
-                                                                                    "does not overlap")):
+                                                                                    "does not overlap"),
+                       ({"c2_per_case": 1234567890}, "a number as the reason (Codex S1-3 P2)"),
+                       ({"c2_per_case": ["1234567890"]}, "a list as the reason"),
+                       ({"c2_per_case": {"x": "1234567890"}}, "a mapping as the reason"),
+                       ({"c2_per_case": "a b c d e f g h i"}, "a reason under 10 non-whitespace characters")):
         b2 = {**ov, "cost_items": ov["cost_items"][:-1] + [{**ov["cost_items"][-1], "not_double_counted": bad}]}
         ok(any("not_double_counted" in e for e in validate(b2)), f"TC32 {label} is refused")
     # floored increments: c2 adds 30 treated cases alone, but with c1 the package has fewer cases than c1 alone

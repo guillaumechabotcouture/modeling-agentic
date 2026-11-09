@@ -726,6 +726,7 @@ def _self_test() -> int:
             EPm.benchmark_pack = orig_bp
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
+        _self_test_floors_e2e(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -1149,6 +1150,7 @@ def _self_test_cost_structure(ok, A, R):
            "R5p the uncertainty draws cost the plan with the drawn multiplier on the fixed part")
     finally:
         A.alloc, A.spec.raw["options"], A.spec.raw["uncertainty"] = saved
+    _self_test_draw_floors(ok, A, R)
     fl = R["point"].get("cost_floors") or {}
     ok(fl.get("n_unit_packages") == 0 and fl.get("items") == [] and "statement" in fl,
        f"R5q the point records floored per-outcome increments (none in this toy): {fl}")
@@ -1159,9 +1161,94 @@ def _self_test_cost_structure(ok, A, R):
     ids = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
                                                               "calibration", "engine")}, fake, R["uncertainty"],
                                           R["stability"], R["decision_tests"], R["calibration"])}
-    ok("[CLAIM:cost.floored_unit_packages]" in txt and "S1-3 floor statement" in txt
-       and "cost.floored_unit_packages" in ids,
+    ok("[CLAIM:cost.floored_unit_packages.point]" in txt and "S1-3 floor statement" in txt
+       and "cost.floored_unit_packages.point" in ids,
        "R5r the results state the floored increments, with the count as a claim")
+
+
+def _floor_q(theta, theta0, at_point):
+    """The injected cost output q of the floor tests: 10 per unit with b, 20 less where a is beside b when floored (at
+    the point if `at_point`, else only away from the point values: a draw), so b's increment in a+b is then -10."""
+    floored = at_point or dict(theta) != dict(theta0)
+    return lambda p: 10.0 * ("b" in p.split("+")) - (20.0 if floored and {"a", "b"} <= set(p.split("+")) else 0.0)
+
+
+def _self_test_draw_floors(ok, A, R):
+    """Codex S1-3 P2: floors that occur only in the uncertainty draws are published, with and without the reserve
+    search's precomputed draws."""
+    import copy
+    from toolkit.analysis import uncertainty as U
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    orig = A.model.predict
+
+    def pred(zs, theta, ids, noise=None):
+        out = orig(zs, theta, ids, noise=noise)
+        f = _floor_q(theta, A.theta0, False)
+        for i in out:
+            for p in out[i]["cost"]:
+                out[i]["cost"][p]["q"] = f(p)
+        return out
+    saved = copy.deepcopy(A.alloc)
+    try:
+        A.model.predict = pred
+        A.alloc["cost_items"].append({"id": "cb_q", "component": "b", "value": 1.0, "price_year": "2024",
+                                      "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                      "incremental": True, "includes": ["per_case"]})
+        A.evaluate(A.theta0, z0)
+        ok(A.last_cost_floors == [], "R5s at the point values nothing is floored")
+        n_ab = len(A.ids)       # every unit's a+b package floors b's increment in a draw
+        for label, pre in (("without", None), ("with", U.evaluate_draws(A, draws=4, seed=5))):
+            cf = U.run(A, plan, "total_dalys_averted", draws=4, seed=5, pre=pre)["data"].get("cost_floors") or {}
+            ok(cf.get("draws") == 4 and cf.get("draws_with_floors") == 4 and cf.get("max_unit_packages") == n_ab
+               and cf.get("per_draw") == [n_ab] * 4 and "not a cost" in (cf.get("statement") or ""),
+               f"R5t floors only in the draws are published ({label} the reserve search's precomputed draws): {cf}")
+    finally:
+        del A.model.predict
+        A.alloc = saved
+
+
+def _self_test_floors_e2e(ok, d, q):
+    """Codex S1-3 P2: a run whose point floors per-outcome increments publishes them in point.yaml and the uncertainty
+    artifact, resolves the claims, and states them in results.md."""
+    import yaml
+    from toolkit.analysis.model import EmulatorModel
+
+    def mut(r):
+        r["analysis"]["cost_outputs"] = {"q": {"cost_driver": "b_doses"}}
+        r["options"]["cost_items"].append({"id": "cb_q", "component": "b", "value": 1.0, "price_year": "2024",
+                                           "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                           "incremental": True, "includes": ["per_case"]})
+    orig = EmulatorModel.predict
+
+    def pred(self, zs, theta, ids, noise=None):
+        out = orig(self, zs, theta, ids, noise=noise)
+        f = _floor_q(theta, {}, True)
+        for i in out:
+            for p in out[i]["cost"]:
+                out[i]["cost"][p]["q"] = f(p)
+        return out
+    try:
+        _resign(d, mut)
+        EmulatorModel.predict = pred
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5u a run with floored increments completes: {type(e).__name__}: {e}")
+        return
+    finally:
+        EmulatorModel.predict = orig
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))["data"]
+    un = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    n = len(R["_A"].ids)
+    ok((pt.get("cost_floors") or {}).get("n_unit_packages") == n and pt["cost_floors"]["items"] == ["cb_q"]
+       and (un.get("cost_floors") or {}).get("draws_with_floors") == 4,
+       f"R5u point.yaml and uncertainty.yaml record the floors ({pt.get('cost_floors')}; {un.get('cost_floors')})")
+    led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {}).get("claims", [])}
+    res = open(os.path.join(d, "results.md")).read()
+    ok(float((led.get("cost.floored_unit_packages.point") or {}).get("value") or -1) == n
+       and "cost.floored_unit_packages.draws_with_floors" in led and "floors, not a cost" in res,
+       f"R5v the claims resolve the point and draw counts and results.md states them "
+       f"({ {k: (v or {}).get('value') for k, v in led.items() if 'floored' in k} })")
 
 
 def _self_test_reserve(ok, A, R, u_unc):
