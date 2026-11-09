@@ -924,6 +924,23 @@ def _self_test() -> int:
             ok(any("reference file" in x for x in got) and not signed and signoff.burden_reference(sp.raw) == c,
                f"BV26 a reference path with a traversal component or a link ({c}) is refused by validation and at "
                f"signing, never normalised: {got[:1]}")
+        # Codex #165 r5: two files, a/refs.csv and one literally named a\refs.csv; a backslash is refused before any
+        # read, so no consumer can take one for the other
+        open(os.path.join(d, "a\\refs.csv"), "w").write(head + "\n" + row.replace("WMR-X", "WMR-BS"))
+        sp = with_csv("a\\refs.csv")
+        got = load_references(sp)[1]
+        try:
+            read_reference(d, "a\\refs.csv")
+            read_ok = True
+        except ValueError as e:
+            read_ok = "backslash" not in str(e)
+        try:
+            signoff.sign(d, "lead", note="self-test")
+            signed = True
+        except ValueError:
+            signed = False
+        ok(any("backslash" in x for x in got) and not read_ok and not signed,
+           f"BV28 a backslash in the reference path is refused by validation, the reader and signing: {got[:1]}")
         # the sheet is rendered, validated and hashed from one read: a swap during generation cannot show old
         # provenance while binding new bytes
         sp = with_csv("a/refs.csv")
