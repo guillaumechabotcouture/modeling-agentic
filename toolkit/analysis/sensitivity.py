@@ -5,8 +5,9 @@ Each parameter is set to each end of its range, the others at their point values
   prior parameters           their declared prior range (drawn, so emulator inputs too);
   calibrated parameters      estimate -/+ 1.96 standard errors (likelihood calibration);
   cost items                 `analysis.sensitivity.cost_items: {id: [lo, hi]}` multipliers.
-For each end: the point plan's objective, the re-optimised objective, and the share of units
-whose package changes. Rows are sorted by the swing of the point plan's objective (a tornado).
+For each end: the point plan's objective, the re-optimised objective, the share of units
+whose package changes, and what moves (toolkit/analysis/moves.py: regret, population, dollars by component, units by
+group, and the criteria that change the plan). Rows are sorted by the swing of the point plan's objective (a tornado).
 On the emulator path a changed parameter re-runs the calibration, as the uncertainty draws do.
 """
 from __future__ import annotations
@@ -88,7 +89,9 @@ def _end(A, v, ben, cost, plan) -> dict:
     sol = A.solve(ben, cost)
     A.guard(f"sensitivity at {v}", [plan, sol["choice"]])
     spent = sum(cost[i][plan[i]] for i in A.ids)
-    return {"value": float(v), "point_plan_objective": sum(ben[i][plan[i]] for i in A.ids),
+    from toolkit.analysis import moves as MV      # F6 S1-5: what moves, and which criterion changes the plan
+    return {**MV.summarise(A, plan, sol["choice"], ben, cost, sol["objective"]),
+            "value": float(v), "point_plan_objective": sum(ben[i][plan[i]] for i in A.ids),
             "point_plan_cost": spent, "point_plan_within_budget": spent <= A.budget * (1 + 1e-9),
             "reoptimised_objective": sol["objective"],
             "share_units_changed": sum(sol["choice"][i] != plan[i] for i in A.ids) / len(A.ids)}

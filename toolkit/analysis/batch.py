@@ -51,11 +51,8 @@ def fitted_ranges(engine) -> dict:
     """{name: (lo, hi, value)} of the engine's fitted parameters, in engine order. Refused (ValueError "refit required")
     when the engine's fitted file was fitted against other band declarations of its pack (F6 S1-2): every analysis read
     of fitted values goes through here (core, the batch design, joint calibration)."""
-    from toolkit.engines.benchmark_sources import engine_fitted_problems
-    bad = engine_fitted_problems(engine)
-    if bad:
-        raise ValueError("; ".join(bad))
-    return {p.name: (p.lo, p.hi, p.value) for p in engine.parameters() if p.kind == "fitted"}
+    from toolkit.engines.benchmark_sources import load_evidence
+    return load_evidence(engine).require().fitted
 
 
 def prior_ranges(spec) -> dict:

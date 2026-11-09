@@ -80,14 +80,13 @@ def _feature(row, f):
 
 def _benchmarks(eng):
     from toolkit.engines import benchmark as BM
-    from toolkit.spec import engine_parameters as PV
-    pack, why = PV.benchmark_pack(eng)
-    if pack is None:
-        return None, set(), why
-    from toolkit.engines.benchmark_sources import check_pack as band_sources
-    bad = band_sources(pack)            # F6 S1-2: a band read as a 95% interval must be its source's interval
-    if bad:
-        return None, set(), "the engine's benchmark bands do not match their sources: " + "; ".join(bad)
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(eng)             # S1-2b: the snapshot's declarations (fitted freshness: the analysis entry)
+    if ev.decl_problems:
+        return None, set(), "the engine's benchmark evidence is not usable: " + "; ".join(ev.decl_problems)
+    pack = ev.pack
+    if not pack.get("benchmarks"):
+        return None, set(), "the engine has no benchmark pack"
     return pack, BM.fit_targets(pack), None
 
 
@@ -483,11 +482,12 @@ def build(spec, units=None) -> tuple:
     cal = spec.raw["calibration"]
     from toolkit.analysis.batch import fitted_ranges
     dr = PRI.drawn(spec)
-    fr = {p.name: p for p in spec.engine().parameters() if p.kind == "fitted"}
+    eng_ = spec.engine()
+    fr = fitted_ranges(eng_)                     # S1-2b: the snapshot's fitted values, carried (not reread)
+    src = {p.name: p.source for p in eng_.parameters() if p.kind == "fitted"}
     shared = [HM.Param(n, dr[n].lo, dr[n].hi, dr[n].dist, dr[n].value, dr[n].source) if n in dr else
-              HM.Param(n, fr[n].lo, fr[n].hi, "uniform", fr[n].value, f"engine card fitted range ({fr[n].source})")
+              HM.Param(n, fr[n][0], fr[n][1], "uniform", fr[n][2], f"engine card fitted range ({src.get(n)})")
               for n in j["shared"]]
-    _ = fitted_ranges
     rows = {str(r[spec.uid]): r for r in spec.units()}
     ids = [i for i in spec.unit_ids() if units is None or i in set(units)]
     missing = sorted(set(units or []) - set(rows))
@@ -581,7 +581,7 @@ def _runner_cls():
         evaluation (_Deferred), so the jobs of every point are batched together."""
 
         def __init__(self, pack, engine, cache, pending, base_params=None):
-            super().__init__(pack, engine, workers=1, base_params=base_params)
+            super().__init__(pack, engine, workers=1, base_params=base_params, mode="fit")   # θ includes fitted
             self._jc_cache, self._jc_pending = cache, pending
 
         def _map(self, jobs, chunk: int = 300):

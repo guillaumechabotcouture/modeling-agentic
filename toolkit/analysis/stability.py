@@ -11,7 +11,10 @@ with the full calibration:
 Metrics: the share of the objective lost over all units (the headline, lesson 5) and in the
 held-out units; rank correlation of the held-out units' spend; package concordance. The
 identity verdict is scripts/allocation_robustness.compute_verdict; `value_verdict` applies the
-value-lost thresholds in toolkit/analysis/thresholds.yaml.
+value-lost thresholds in toolkit/analysis/thresholds.yaml. Each fold also reports what moves
+(toolkit/analysis/moves.py: regret, population and dollars moved, units by group), and `components` counts,
+per component, the held-out units where it is provided in both plans (stable provision) apart from those where
+it is absent from both (stable absence).
 """
 from __future__ import annotations
 
@@ -22,7 +25,8 @@ import sys
 import numpy as np
 import yaml
 
-from toolkit.analysis import calibration as C
+from toolkit.analysis import calibration as C, moves as MV
+from toolkit.analysis.core import merge_costs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/stability.py"
@@ -65,7 +69,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             raise ValueError("analysis.stability.covariates: emulator inversion needs covariates to predict held-out units")
         Xall = np.array([[float(A.by_id[i][c]) for c in cov] for i in A.ids])
         y = np.array([z0[i] for i in A.ids])
-    folds = []
+    folds, pairs = [], []
     for gv in groups:
         m = np.array([A.by_id[i][g] == gv for i in A.ids])
         if m.all():
@@ -90,9 +94,9 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                 if k:
                     zh[i] = float(Xs[A.ids.index(i)] @ beta)
             oh, bh, ch = A.evaluate(theta, zh, hid)
-            ben_f, cost_f = dict(ben0), dict(cost0)
+            ben_f = dict(ben0)
             ben_f.update(bh)
-            cost_f.update(ch)
+            cost_f = merge_costs(cost0, ch)
         elif A.method == "likelihood":
             rows = [r for r in C.read_targets(A.spec) if r["unit"] not in set(hid)]
             fit = C.fit_likelihood(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
@@ -121,7 +125,10 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         tot_fold = sum(ben0[i][pf[i]] for i in A.ids)
         b_full = sum(ben0[i][plan[i]] for i in hid)
         b_fold = sum(ben0[i][pf[i]] for i in hid)
-        folds.append({"group": gv, "n_units": len(hid), "rank_corr": rho,
+        pairs += [(plan[i], pf[i]) for i in hid]
+        # F6 S1-5: what moves under the fold (regret: the fold's re-optimised objective minus the point plan's there)
+        folds.append({**MV.summarise(A, plan, pf, ben_f, cost_f, sol["objective"]),
+                      "group": gv, "n_units": len(hid), "rank_corr": rho,
                       "package_concordance_pct": 100.0 * np.mean([plan[i] == pf[i] for i in hid]),
                       "benefit_gap_pct": 100.0 * (b_full - b_fold) / b_full if b_full > 0 else 0.0,
                       "total_benefit_loss_pct": 100.0 * (tot_full - tot_fold) / tot_full if tot_full > 0 else 0.0,
@@ -140,7 +147,11 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
            "package_concordance_pct_worst_fold": min((f["package_concordance_pct"] for f in folds), default=None),
            "package_concordance_pct_worst_fold_ge5": min((f["package_concordance_pct"] for f in big), default=None),
            "benefit_gap_pct_mean": _mean([f["benefit_gap_pct"] for f in folds]),
-           "benefit_gap_pct_worst_fold": max((f["benefit_gap_pct"] for f in folds), default=None)}
+           "benefit_gap_pct_worst_fold": max((f["benefit_gap_pct"] for f in folds), default=None),
+           "regret_pct_worst_fold": max((100.0 * f["regret_share"] for f in folds if f["regret_share"] is not None),
+                                        default=None),
+           "dollars_moved_worst_fold": max((f["dollars_moved"] for f in folds), default=None),
+           "population_changed_worst_fold": max((f["population_changed"] for f in folds), default=None)}
     verdict = _ar().compute_verdict({"rank_correlation_worst_fold": met["rank_correlation_worst_fold"],
                                      "cases_averted_gap_pct_worst_fold": met["benefit_gap_pct_worst_fold"],
                                      "rule_classification_concordance_pct_worst_fold":
@@ -153,6 +164,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
           "FRAGILE" if w <= th["value_loss_pct_fragile"] else "UNSTABLE")
     return {"method": f"leave-one-{g}-out", "holdout_group": g, "calibration_method": A.method,
             "n_folds": len(folds), "folds": folds, "folds_not_run": skipped, "metrics": met, "verdict": verdict, "value_verdict": vv,
+            # each held-out unit's package in its own fold against the point plan, per component (F6 S1-5)
+            "components": MV.component_stability(A.pk, pairs, list(A.spec["options"]["components"])) if pairs else None,
             "value_thresholds_pct": th, "headline_metric": "total_benefit_loss_pct_worst_fold"}
 
 

@@ -146,6 +146,7 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join("models", "mechanism_manifest.yaml")
+REGRET_TOL = 1e-9   # F6 S1-5: as toolkit/analysis/moves.py (regret under a non-positive optimum, relative to max(1, |obj|))
 STATUSES = ("modelled", "fixed", "simplified")
 _CODE_EXT = (".py", ".r", ".jl", ".ipynb")
 
@@ -353,10 +354,52 @@ def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[dict]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
                       f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r})."))
-    if share is not None and thr is not None and (share > thr) != res["decision_changes"]:
+    # F6 S1-5: regret and dollars moved are further criteria, each checked against its own threshold; a point plan the
+    # test makes infeasible (point_plan_feasible: false) is a change. The verdict is the union of the criteria given,
+    # and `triggered_by`, when given, names exactly those that fire
+    def fired(r):
+        """{criterion: fires} for one set of values `r` (the file, or one tested value), thresholds from the file."""
+        crit = {"share": (_num(r.get("share_units_changed")), thr)}
+        for name, vk, tk in (("regret", "regret_share", "regret_threshold"),
+                             ("dollars", "dollars_share", "dollars_threshold")):
+            if r.get(vk) is not None or res.get(tk) is not None:
+                v, t = _num(r.get(vk)), _num(res.get(tk))
+                if name == "regret" and r.get(vk) is None and t is not None and 0 <= t <= 1 and (
+                        r.get("point_plan_feasible") is False
+                        or (_num(r.get("reoptimised_objective")) is not None and _num(r["reoptimised_objective"]) <= 0
+                            and _num(r.get("regret")) is not None)):
+                    # undefined, and the values say why: an infeasible point plan (no regret), or a non-positive
+                    # objective, where any regret above the tolerance is a change (toolkit/analysis/moves.py fires)
+                    if _num(r.get("regret")) is not None and r.get("point_plan_feasible") is not False:
+                        crit[name] = (_num(r["regret"]), REGRET_TOL * max(1.0, abs(_num(r["reoptimised_objective"]))))
+                    continue
+                if v is None or t is None or not 0 <= t <= 1:
+                    out.append(_f("mechanism_manifest_invalid", "HIGH",
+                                  f"`{rel}`: {vk} and {tk} must both be numbers ({tk} a fraction in [0, 1]) when "
+                                  f"either is given (got {r.get(vk)!r}, {res.get(tk)!r}), unless the point plan is "
+                                  "infeasible or the re-optimised objective is not positive."))
+                    continue
+                crit[name] = (v, t)
+        k_ = {k: v > t for k, (v, t) in crit.items() if v is not None and t is not None}
+        if "point_plan_feasible" in r:
+            k_["infeasible"] = r["point_plan_feasible"] is not True
+        return k_
+    rows = res.get("results")
+    if isinstance(rows, list) and rows and all(isinstance(x, dict) and "share_units_changed" in x for x in rows):
+        # Codex r3 P2-2: each criterion on the tested value it comes from; the verdict is the union over values
+        per = [fired(x) for x in rows]
+        known = {k: any(p.get(k, False) for p in per) for k in {k for p in per for k in p}}
+    else:
+        known = fired(res)
+    if known and any(known.values()) != res["decision_changes"]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
-                      f"`{rel}`: share_units_changed {share} vs share_threshold {thr} contradicts "
+                      f"`{rel}`: criteria {', '.join(f'{k}: {f}' for k, f in known.items())} contradict "
                       f"decision_changes: {res['decision_changes']}."))
+    tb = res.get("triggered_by")
+    if tb is not None and (not isinstance(tb, list) or sorted(map(str, tb)) != sorted(k for k, f in known.items() if f)):
+        out.append(_f("mechanism_manifest_invalid", "HIGH",
+                      f"`{rel}`: triggered_by {tb!r} is not the criteria its numbers fire "
+                      f"({sorted(k for k, f in known.items() if f)})."))
     if isinstance(restated, bool) and restated != res["decision_changes"]:
         out.append(_f("mechanism_manifest_invalid", "HIGH",
                       f"`{PATH}`: {label} restates decision_changes: {restated}, but its "
@@ -800,6 +843,19 @@ def _self_test() -> int:
         w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
                                   "share_units_changed": 0.8, "share_threshold": 10})
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7c a percentage threshold is invalid")
+        # F6 S1-5: a verdict may also be set by regret or dollars moved, each checked against its own threshold
+        mv = {"varied": "mix", "criterion": "c", "decision_changes": True, "share_units_changed": 0.03,
+              "share_threshold": 0.1, "regret_share": 0.02, "regret_threshold": 0.01, "triggered_by": ["regret"]}
+        w(d, "models/suff.yaml", mv)
+        ok("mechanism_manifest_invalid" not in kinds(gate_findings(d, 2, P)),
+           "MM7d a verdict set by regret, below the share threshold, is consistent")
+        w(d, "models/suff.yaml", dict(mv, decision_changes=False))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7e regret above its threshold, no change")
+        w(d, "models/suff.yaml", dict(mv, triggered_by=["dollars"]))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7f triggered_by its numbers contradict")
+        w(d, "models/suff.yaml", dict(mv, dollars_share=0.3))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)),
+           "MM7g dollars moved without its threshold fails closed")
         w(d, "models/model.py", "def mix_effect(u):\n    return u\n")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::mix_effect"}]})

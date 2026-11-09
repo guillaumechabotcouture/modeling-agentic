@@ -52,8 +52,34 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
     return f"bwrap: install failed ({rc}); derivations that must run will fail closed"
 
 
-def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5):
-    """Unpack the code, run main.py, return the run directory as a tarball."""
+def _run_main(cmd, cwd, env, log, timeout_s=None):
+    """main.py in its own process group; past `timeout_s` the group is killed and "timeout" returned (a smoke's
+    cloud-side bound), else the exit code."""
+    import os, signal, subprocess
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        return proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        return "timeout"
+
+
+def _hold(d, hold_s, sleep=None, clock=None):
+    """Hold the results on disk for `collect` (the VM stays busy) until collected or `hold_s` has passed."""
+    import os, time
+    sleep, clock = sleep or time.sleep, clock or time.time
+    t_end = clock() + hold_s
+    while clock() < t_end and not os.path.exists(f"{d}/collected"):
+        sleep(30)
+
+
+def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5,
+                 timeout_s=None):
+    """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball."""
     import glob, io, os, shutil, subprocess, sys, tarfile, time, urllib.request
     work = f"{WORK}/{label}"
     shutil.rmtree(work, ignore_errors=True)
@@ -91,9 +117,8 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     t0 = time.time()
     log_path = os.path.join(work, "run.log")
     with open(log_path, "w") as log:
-        proc = subprocess.run([sys.executable, "main.py", question, "--max-rounds", str(max_rounds),
-                               "--max-sessions", str(max_sessions), *flags],
-                              cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT)
+        returncode = _run_main([sys.executable, "main.py", question, "--max-rounds", str(max_rounds),
+                                "--max-sessions", str(max_sessions), *flags], work, env, log, timeout_s)
     runs = sorted(glob.glob(os.path.join(work, "runs", "*")), key=os.path.getmtime)
     buf, skipped = io.BytesIO(), []
     with tarfile.open(fileobj=buf, mode="w:gz") as t:
@@ -106,7 +131,7 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
                         continue
                     t.add(p, arcname=os.path.relpath(p, work))
         t.add(log_path, arcname="run.log")
-    return {"label": label, "exit_code": proc.returncode, "duration_s": round(time.time() - t0),
+    return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
             "notes": notes, "tarball": buf.getvalue()}
 
@@ -160,7 +185,7 @@ def all_stored(store, prefix, account, labels, launch_id):
 
 
 def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
-                max_rounds=8, max_sessions=5, shutdown_when_stored=True):
+                max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600):
     """The agent VM's task: run, store the run, its transcripts and its result
     record, then (last run of the launch) shut the cluster down. If any upload
     failed, hold the results on disk and stay busy until `collect` takes them:
@@ -178,7 +203,8 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     # Compute service: this VM's scheduler connection for the agent's batches; it takes no compute work itself.
     os.environ.update(compute.export_worker_env(os.path.join(os.path.expanduser("~"), ".ma_tls")))
     os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = get_worker().address
-    res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions)
+    res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
+                       timeout_s=run_timeout_s)
     d = f"{WORK}/{label}"
     try:   # the CLI transcripts (per-stage cost and time) exist only on this VM
         blob, _ = results_store.archive_dir(os.path.expanduser("~/.claude/projects"), "transcripts",
@@ -207,9 +233,7 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
         except Exception as e:  # noqa: BLE001 — hold the results for `collect`
             res["result_store_error"] = f"{type(e).__name__}: {e}"[:300]
             json.dump(res, open(f"{d}/result.json", "w"))
-    t_end = time.time() + 24 * 3600
-    while time.time() < t_end and not os.path.exists(f"{d}/collected"):
-        time.sleep(30)
+    _hold(d, hold_s)
     return res
 
 
@@ -235,6 +259,24 @@ def attach_existing(name, workspace, expected_id):
     import coiled
     return verify_attached(coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False,
                                           wait_for_workers=False), expected_id)
+
+
+def task_state(key, dask_scheduler=None):
+    """On the scheduler (client.run_on_scheduler): the state of task `key`, or None if it does not hold it. The
+    launcher's acknowledgement that the scheduler accepted a run (run_cluster.wait_listed)."""
+    ts = dask_scheduler.tasks.get(key) if dask_scheduler is not None else None
+    return getattr(ts, "state", None)
+
+
+def keeper_health():
+    """On the keeper VM: its status file, its log and its own clock (run_cluster.keeper_fresh)."""
+    import time
+    return {"status": keeper_status(), "log": keeper_log(), "now": time.time()}
+
+
+def ack_probe():
+    """A task that returns at once (run_cluster.py ack-probe: the acknowledgement of a fast task)."""
+    return "ok"
 
 
 class SchedulerInfoUnavailable(RuntimeError):

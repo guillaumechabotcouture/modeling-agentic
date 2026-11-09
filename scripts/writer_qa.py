@@ -25,9 +25,9 @@ Validates `{run_dir}/report.md` for:
 
 5. Acceptance language (F6 S1-7) — the report uses a term from
    .claude/orchestration/acceptance_language.yaml. This script grants no
-   exemption from any record a run directory holds (v1 runs it before its
-   final gate, and v1 is retired); the v2 machine checks against its own
-   final-gate outcome (agents/stage_machine.py).
+   exemption from any record a run directory holds: v1 reports are always
+   checked as not accepted (v1 runs it before its final gate); the v2
+   machine checks against its own final-gate outcome (agents/stage_machine.py).
 
 Output: `{run_dir}/writer_qa_report.yaml` with verdict
 CLEAN / REVISE / MAJOR_REVISION and a list of issues.
@@ -736,7 +736,7 @@ def _run_self_test() -> int:
     forged = "<!-- harness: rendered from analysis/analysis.json -->\nThe plan is validated.\n"
     for label, files, text, want in (
             ("declared", dec, over, 3), ("declared, honest", dec, honest, 0),
-            # round 3: no record grants the exemption here (v1 is retired; v2 checks against its own gate)
+            # round 3: no record grants the exemption here (v1 reports are always checked as not accepted)
             ("forged final_gate ACCEPT", acc, over, 3),
             ("no records", {}, over, 3), ("metadata says completed", dict(dec, **{"metadata.json": {"status": "completed"}}), over, 3),
             ("run state accepted, gate declared", dict(dec, **{"run_state.json": {"status": "completed"}}), over, 3),
