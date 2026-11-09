@@ -14,7 +14,11 @@ its two sources, so the stored spike batch reproduces):
   priors             (v2 priors, drawn whenever there is one) every prior parameter from its declared bounded
                      distribution (toolkit/spec/priors.py), on its own random stream, before calibration
 The point plan is evaluated in every draw (the headline interval) and the plan is
-re-optimised in every draw (package stability). The interval's label comes from the spec
+re-optimised in every draw (package stability). The point plan's cost is recorded in every draw
+too (F6 S1-1): costs move with treated cases and unit prices, so a plan within the budget at the
+point values can exceed it in a draw. `affordability` reports the share of draws over the
+allocatable budget and the cost quantiles, and checks the spec's `uncertainty.affordability`
+rule (max_share_over_budget) when one is declared. The interval's label comes from the spec
 (`Spec.uncertainty_scope`): what it covers and what it does not. Writes
 `uncertainty_report.yaml` in the schema of scripts/propagate_uncertainty.py (shared
 summariser), plus the scope and the draw plan: every source drawn or not, every engine
@@ -144,6 +148,23 @@ class Drawer:
         return theta, zs, noise, mult, sampled
 
 
+def affordability(costs, budget: float, rule: dict | None = None, level: float = 0.95) -> dict:
+    """The fixed plan's cost in each draw against the allocatable budget (F6 S1-1). A cost above budget * (1 + 1e-9), the
+    solver's own tolerance, counts as over budget. With a rule (`uncertainty.affordability`), rule_met says whether the share of
+    draws over budget is at most rule.max_share_over_budget; without one, rule_met is None (reported, not judged).
+    No draws, or a non-finite cost, fails closed."""
+    c = np.asarray(costs, float)
+    if c.size == 0 or not np.all(np.isfinite(c)):
+        raise ValueError("affordability: the fixed plan's cost needs one finite value per draw")
+    b = float(budget)
+    over = int(np.sum(c > b * (1 + 1e-9)))       # the solver's relative budget tolerance (toolkit/alloc BUDGET_RTOL)
+    share = over / c.size
+    met = None if not rule else bool(share <= float(rule["max_share_over_budget"]) + 1e-12)
+    return {"budget_allocatable": b, "draws": int(c.size), "draws_over_budget": over, "share_over_budget": share,
+            "fixed_plan_cost": q(c, level), "per_draw_cost": [float(x) for x in c],
+            "rule": dict(rule) if rule else None, "rule_met": met}
+
+
 def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     sp = A.spec["uncertainty"]
     nd = int(draws if draws is not None else sp.get("draws", 32))
@@ -151,6 +172,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     D = Drawer(A, seed if seed is not None else sp.get("seed", 42))
     D.prepare(nd)
     fixed = {o: [] for o in A.outcomes}
+    fixed_cost = []
     opt_vals, same = [], np.zeros(len(A.ids))
     comps_used, outs, samples = set(), [], {}
     corr_any = corr_plan = 0
@@ -169,6 +191,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             fixed[o].append(v)
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
+        fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
         sol = A.solve(ben, cost)
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]])
         opt_vals.append(sol["objective"])
@@ -233,6 +256,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                     "per_draw": clamped_draws},
             "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
+            "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if prov is not None:
         data["draw_provenance"] = prov
@@ -255,7 +279,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
                                    for x in plan_["drawn"]],
               "parameters_fixed": [{k: x.get(k) for k in ("name", "kind", "value", "reason")} for x in plan_["fixed"]
                                    if x["status"] == "fixed"],
-              "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"]}
+              "not_exposed": plan_["not_exposed"], "emulator_error": plan_["emulator_error"],
+              "affordability": data["affordability"]}
     if flagged:
         report["low_confidence_units"] = [{k: f.get(k) for k in ("unit", "region", "status", "reason", "implausibility")}
                                           for f in flagged]
@@ -336,6 +361,31 @@ def _self_test() -> int:
             p = write_report(os.path.realpath(d), rep)
             ok((yaml.safe_load(open(p)) or {}).get("scalar_outputs", {}).get("a", {}).get("n") == 4000,
                "U5 write_report publishes uncertainty_report.yaml, which reads back")
+    # F6 S1-1: the fixed plan's cost across the draws against the allocatable budget
+    aff = globals().get("affordability")
+    ok(callable(aff), "U6 affordability() exists")
+    if callable(aff):
+        r = aff([90.0, 110.0, 120.0, 95.0], 100.0, None, 0.9)
+        ok(r["draws"] == 4 and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.5) < 1e-12
+           and r["rule_met"] is None and r["budget_allocatable"] == 100.0,
+           f"U7 two of four draws over budget, share 0.5; no rule declared: rule_met is None ({r})")
+        fc = r.get("fixed_plan_cost") or {}
+        ok(fc.get("level") == 0.9 and fc.get("ci_low") <= fc.get("median") <= fc.get("ci_high"),
+           "U8 the fixed plan's cost quantiles at the declared level")
+        ok(aff([90.0, 110.0, 120.0, 95.0], 100.0, {"max_share_over_budget": 0.1}, 0.95)["rule_met"] is False,
+           "U9 share 0.5 against a rule of at most 0.1: the rule is not met")
+        ok(aff([90.0, 110.0, 120.0, 95.0], 100.0, {"max_share_over_budget": 0.5}, 0.95)["rule_met"] is True,
+           "U10 share 0.5 against a rule of at most 0.5: met")
+        ok(aff([100.0 * (1 + 1e-12)], 100.0, None, 0.95)["draws_over_budget"] == 0,
+           "U11 a cost equal to the budget up to rounding is not over budget")
+        ok(aff([2e-10], 1e-10, None, 0.95)["draws_over_budget"] == 1,
+           "U11b the tolerance is relative to the budget, as the solver's (no absolute floor): 2e-10 is over 1e-10")
+        for label, v in (("no draws", []), ("a non-finite cost", [90.0, float("nan")])):
+            try:
+                aff(v, 100.0, None, 0.95)
+                ok(False, f"U12 {label} fails closed")
+            except ValueError:
+                ok(True, f"U12 {label} fails closed")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

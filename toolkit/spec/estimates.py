@@ -281,6 +281,8 @@ def validate_pending(s) -> list[str]:
             bad.append(f"calibration.targets: {t.get('csv')} unreadable: {e}")
     # uncertainty
     u = r["uncertainty"]
+    if isinstance(u, dict) and "affordability" in u:      # F6 S1-1: no allocation, so no plan cost to afford
+        bad.append("uncertainty.affordability: not supported for an estimates spec (it has no plan to afford)")
     srcs_k = [x.get("kind") for x in (u.get("sources") or []) if isinstance(x, dict)]
     exc = [x for x in (u.get("excluded") or []) if isinstance(x, dict)]
     for k in UQ_KINDS:
@@ -599,6 +601,8 @@ def _self_test() -> int:
             "ES6 an output that is not an engine window metric is refused")
         mut(lambda r: r["observations"]["sources"][0].update(bias=[{"mechanism": "fudge", "param": "f"}]),
             "bias_without_mechanism", "ES7 a free multiplier on a source is refused (closed vocabulary)")
+        mut(lambda r: r["uncertainty"].update(affordability={"max_share_over_budget": 0.1}), "uncertainty.affordability",
+            "ES-AF an estimates spec has no plan to afford: uncertainty.affordability is refused (Codex S1-1 P1)")
         mut(lambda r: r["uncertainty"].update(sources=[{"kind": "calibration"}]), "kind observation",
             "ES8 the observation kind must be covered or excluded with a reason")
         mut(lambda r: r["deliverable"]["decision"]["statements"].update(yes="above 1.0"), "no numbers",
