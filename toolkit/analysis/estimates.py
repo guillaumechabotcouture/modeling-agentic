@@ -355,9 +355,10 @@ def benchmark_acceptance(eng, doc: dict | None = None) -> str:
         raise ValueError(f"engine {name}: the results do not hold exactly the pack's benchmarks (missing "
                          f"{sorted(set(want) - set(got))}, extra {sorted(set(got) - set(want))})")
     from toolkit.engines.benchmark_sources import load_evidence
-    stale = load_evidence(eng, pack=pack, rows=rows).problems      # S1-2b: never a status the snapshot does not back
-    if stale:
-        raise ValueError(f"engine {name}: benchmarks not accepted: {'; '.join(stale)}")
+    ev = load_evidence(eng, pack=pack, rows=rows)      # S1-2b: never a status the snapshot does not back
+    if ev.problems:
+        raise ValueError(f"engine {name}: benchmarks not accepted: {'; '.join(ev.problems)}")
+    want, rows = {b["id"]: b for b in ev.pack["benchmarks"]}, ev.rows       # read from the snapshot from here on
     bad = []
     for r in rows:
         untranscribed = bool((want[r["id"]].get("estimand") or {}).get("not_transcribed"))

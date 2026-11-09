@@ -23,7 +23,12 @@ on a source estimand the engine's estimand does not match without a mapping note
 `requires` interval that differs from the referenced published interval.
 
 Exemptions, listed: the estimand types in EXEMPT_TYPES (oracle or rule checks, no trial interval), and entries with no
-`published` block in a pack whose engine is one of the self-test toys in TOY_ENGINE_REFS (their bands are test fixtures).
+`published` block in a pack whose engine is exactly one of the self-test toys in TOY_ENGINE_REFS (their bands are test
+fixtures; a subclass is not exempt).
+
+Threat model (S1-2b): stale or changed artifacts and declarations on disk, and code paths that read evidence without the
+loader. Deliberate in-process mutation by harness code is out of scope: the snapshot stores deep copies and returns
+detached copies, and consumers carry the values they captured instead of rereading them, but nothing is frozen.
 
 Stored evidence is bound to the declarations it was scored against: results rows carry `band_sha256`
 (band_digest), fitted.yaml carries `band_declarations` for its fit targets; `stale_ids`, `fitted_problems` and
@@ -197,9 +202,27 @@ def band_digest(b: dict, pack: dict) -> str:
                                                                     - {None})}
     names = {_config_name(pack, st or {}) for st in sets.values()} | {v for v in _walk_values(b) if isinstance(v, str)}
     cfgs = {c: (pack.get("configs") or {})[c] for c in sorted(names - {None}) if c in (pack.get("configs") or {})}
-    return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": b.get("estimand"), "arms": arms,
+    e = b.get("estimand") or {}
+    code = {"oracles": _module_sha("oracle", pack.get("oracles"))}
+    if isinstance(e.get("calibrator"), dict):
+        code["calibrator"] = _module_sha("calibrator", str(e["calibrator"].get("fn", "")).split(":")[0])
+    return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": e, "arms": arms,
                  "settings": sets, "configs": cfgs, "default_config": pack.get("default_config"),
-                 "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine")})
+                 "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine"),
+                 "coverage_scoring": pack.get("coverage_scoring"), "code": code})
+
+
+def _module_sha(kind: str, name) -> str | None:
+    """sha256 of an oracle or calibrator module's file, resolved through the import guard; a name it refuses or cannot
+    resolve is recorded as such (so the digest still changes with the name)."""
+    if not name:
+        return None
+    from toolkit import import_guard as G
+    try:
+        f = getattr(G.module(kind, name), "__file__", None)
+        return hashlib.sha256(open(f, "rb").read()).hexdigest() if f else f"unresolved:{name}"
+    except Exception:  # noqa: BLE001 -- recorded in the digest, never silently skipped
+        return f"unresolved:{name}"
 
 
 def band_declarations(pack: dict, ids=None) -> dict:
@@ -216,26 +239,14 @@ def fit_declarations(pack: dict) -> dict:
 
 
 def stale_ids(pack: dict, rows: list) -> list:
-    """Ids of stored rows not scored against the pack's current declaration (or not in the pack). A coverage row is
-    bound by its own declaration_sha256; an oracle row (value, identity) stored before digests is accepted only with an
-    oracle row's shape (`compare`, or a not-transcribed case left not_assessable), so a row of another type never passes
-    for one."""
-    from toolkit.engines.benchmark import COMPARE_TYPES, declaration_digest
+    """Ids of stored rows not scored against the pack's current declaration, or not in the pack. Every row must carry
+    the digest of its declaration (no legacy acceptance: a row without one is stale, oracle rows included)."""
     cur = {b.get("id"): b for b in pack.get("benchmarks") or [] if isinstance(b, dict)}
     out = []
     for r in rows:
         b = cur.get(r.get("id")) if isinstance(r, dict) else None
-        if b is None:
+        if b is None or r.get("band_sha256") != band_digest(b, pack):
             out.append(r.get("id") if isinstance(r, dict) else r)
-        elif _etype(b) == "coverage":
-            if r.get("declaration_sha256") != declaration_digest(b, pack):
-                out.append(b["id"])
-        elif "band_sha256" in r:
-            if r["band_sha256"] != band_digest(b, pack):
-                out.append(b["id"])
-        elif not (_etype(b) in COMPARE_TYPES and ("compare" in r or (b["estimand"].get("not_transcribed")
-                                                                    and r.get("status") == "not_assessable"))):
-            out.append(b["id"])
     return out
 
 
@@ -257,13 +268,21 @@ class Evidence:
     """An immutable, validated snapshot of one engine's benchmark evidence: the pack's declarations, the fitted values
     the engine actually uses with the digest of the file that backs them, and (when loaded) the stored result rows.
     `problems` lists every reason the evidence cannot be used; `require()` raises them. Accessors return copies."""
-    __slots__ = ("_pack", "_rows", "_fitted", "fitted_sha256", "problems")
+    __slots__ = ("_pack", "_rows", "_fitted", "fitted_sha256", "decl_problems", "fit_problems", "toy",
+                 "engine_identity")
 
-    def __init__(self, pack, rows, fitted, fitted_sha256, problems):
+    def __init__(self, pack, rows, fitted, fitted_sha256, decl_problems, fit_problems=(), toy=False,
+                 engine_identity=None):
         import copy
         for k, v in (("_pack", copy.deepcopy(pack)), ("_rows", copy.deepcopy(rows)), ("_fitted", dict(fitted)),
-                     ("fitted_sha256", fitted_sha256), ("problems", tuple(problems))):
+                     ("fitted_sha256", fitted_sha256), ("decl_problems", tuple(decl_problems)),
+                     ("fit_problems", tuple(fit_problems)), ("toy", toy), ("engine_identity", engine_identity)):
             object.__setattr__(self, k, v)
+
+    @property
+    def problems(self) -> tuple:
+        """The declarations' and rows' problems, then the fitted values' ('refit required')."""
+        return self.decl_problems + self.fit_problems
 
     def __setattr__(self, k, v):
         raise AttributeError("Evidence is immutable")
@@ -322,32 +341,46 @@ def _fitted_in_use(engine, pack, toy: bool) -> tuple:
     return eff, hashlib.sha256(raw).hexdigest(), probs
 
 
-def load_evidence(engine, pack: dict | None = None, rows: list | None = None) -> Evidence:
+def load_evidence(engine, pack: dict | None = None, rows: list | None = None, partial: bool = False) -> Evidence:
     """The one loader of benchmark evidence. `pack`: the declarations the rows were scored against (default: the
-    engine's own pack). `rows`: stored result rows to validate (None: fitted values only). Problems: a pack that cannot
-    be read or fails the source check, rows scored against other declarations ('rerun required'), and fitted values
-    without current provenance ('refit required'). A self-test toy engine may have no pack."""
-    toy = any(f"{c.__module__}:{c.__name__}" in TOY_ENGINE_REFS for c in type(engine).__mro__)   # a toy or a subclass
+    engine's own pack; its absence is permitted only for an engine with no rows to check and no fitted values to back;
+    an unreadable pack is always a problem). `rows`: stored result rows to validate (None: fitted values only); they
+    must cover every benchmark of the pack unless `partial`. Problems: a pack that cannot be read, is not a non-empty
+    benchmark list or fails the source check; missing rows and rows scored against other declarations ('rerun
+    required'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
+    no pack."""
+    from toolkit.engines.contract import engine_identity
+    toy = f"{type(engine).__module__}:{type(engine).__name__}" in TOY_ENGINE_REFS
     probs = []
     if pack is None:
         from toolkit.spec import engine_parameters as EP
         try:
             pack, why = EP.benchmark_pack(engine)
-        except ValueError as e:
-            pack, why = None, str(e)
+        except ValueError as e:                     # unreadable or malformed: never permitted
+            pack, why = {}, None
+            probs.append(f"the engine's benchmark pack cannot be read: {e}")
         if pack is None and rows is not None and not toy:
-            probs.append(f"no readable benchmark pack to check the stored rows against ({why})")
-    if pack is not None and not isinstance(pack, dict):
-        probs.append("the benchmark pack is not a mapping")
-        pack = {}
+            probs.append(f"no benchmark pack to check the stored rows against ({why})")
+    if pack is not None and not (isinstance(pack, dict) and isinstance(pack.get("benchmarks"), list)
+                                 and pack["benchmarks"]):
+        probs.append("the benchmark pack is not a mapping with a non-empty benchmarks list")
+        pack = pack if isinstance(pack, dict) else {}
     if pack is not None:
-        probs += check_pack(pack)
-        if rows is not None:
-            stale = stale_ids(pack, rows)
-            if stale:
-                probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
+        probs += [x for x in check_pack(pack) if x != "pack has no benchmarks list"]
+    if rows is not None and pack is not None:       # an absent pack: refused above unless an exact toy's
+        if not (isinstance(rows, list) and all(isinstance(r, dict) and r.get("id") for r in rows)):
+            probs.append("the stored rows are not a list of mappings with ids")
+            rows = []
+        ids = [b.get("id") for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)]
+        stale = stale_ids(pack or {}, rows) + ([] if partial else [i for i in ids if i not in {r["id"] for r in rows}])
+        if stale:
+            probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
     fitted, fsha, fprobs = _fitted_in_use(engine, pack, toy)
-    return Evidence(pack or {}, list(rows or []), fitted, fsha, probs + fprobs)
+    try:
+        ident = engine_identity(engine)
+    except Exception:  # noqa: BLE001 -- an object without the contract's describe(): no identity to bind
+        ident = None
+    return Evidence(pack or {}, list(rows or []), fitted, fsha, probs, fprobs, toy, ident)
 
 
 def main(argv=None) -> int:
@@ -461,12 +494,12 @@ def _self_test() -> int:
     orig = EP.benchmark_pack
     try:
         EP.benchmark_pack = lambda eng: (wide, None)
-        jw = JC._benchmarks(None)
+        jw = JC._benchmarks(BM.load_engine(toy["engine"]))
         EP.benchmark_pack = lambda eng: (toy, None)
-        jo = JC._benchmarks(None)
+        jo = JC._benchmarks(BM.load_engine(toy["engine"]))
     finally:
         EP.benchmark_pack = orig
-    ok(jw[0] is None and "do not match their sources" in str(jw[2]) and jo[0] is toy and jo[1] == {"T1"},
+    ok(jw[0] is None and "not usable" in str(jw[2]) and jo[0] == toy and jo[1] == {"T1"},
        "BS22 joint calibration reads a band as a 95% interval only when it matches its source")
 
     # ---- review round 1 (Codex, PR #154)

@@ -216,12 +216,15 @@ def write(path=NOTES) -> None:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
     from toolkit.engines.benchmark import load_engine
     from toolkit.engines.benchmark_sources import load_evidence
+    import hashlib
     pack = _y(os.path.join(HERE, "pack.yaml")) or {}
-    stale = list(load_evidence(load_engine(pack.get("engine")), pack=pack, rows=new.get("benchmarks") or []).problems)
-    if stale:                      # F6 S1-2: no verification claim from results the pack's bands no longer back
-        raise SystemExit(f"stale benchmark evidence, not rendered: {stale} (refit and re-run, or rescore)")
+    ev = load_evidence(load_engine(pack.get("engine")), pack=pack, rows=new.get("benchmarks"))
+    fp = os.path.join(HERE, "fitted.yaml")
+    if ev.problems or (ev.fitted_sha256 and hashlib.sha256(open(fp, "rb").read()).hexdigest() != ev.fitted_sha256):
+        raise SystemExit(f"stale benchmark evidence, not rendered: {list(ev.problems)} (refit and re-run)")
+    new = dict(new, benchmarks=ev.rows)          # S1-2b: render() formats the snapshot's rows and its fitted file
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),
-                   _y(os.path.join(HERE, "fitted.yaml")), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
+                   _y(fp), _y(os.path.join(HERE, "b15_mechanisms.yaml")),
                    extra=[(lab, _y(os.path.join(HERE, "history", f))) for lab, f in
                           (("v0.2 (round 1)", "results_v0.2.yaml"), ("v0.3 round 2", "results_v0.3-r2.yaml"),
                            ("v0.3", "results_v0.3.yaml"), ("v0.4", "results_v0.4.yaml"),

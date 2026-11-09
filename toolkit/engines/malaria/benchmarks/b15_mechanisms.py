@@ -63,7 +63,7 @@ def field_scan(pack0, eng, fitted, workers):
             if s == "muleba" and "net_retention_half" in o and o["net_retention_half"] != 1e9:
                 o.pop("net_retention_half")         # Muleba's retention comes from its own trial data
             st["params"] = dict(st.get("params") or {}, **o)
-        r = Runner(pack, eng, workers, pack["seeds"])
+        r = Runner(pack, eng, workers, pack["seeds"], mode="fit")    # a mechanism scan
         r.calibrate_settings(fitted, ["cochrane_itn", "muleba"])
         row = {"config": name, "overrides": over}
         for bid in ("B7", "B8", "B9", "B15"):
@@ -95,7 +95,7 @@ def main(argv=None) -> int:
         s = pack["settings"]["muleba"]
         s["params"] = dict(s.get("params") or {}, **over)
         s["unit"]["irs_product"] = product
-        r = Runner(pack, eng, a.workers, pack["seeds"])
+        r = Runner(pack, eng, a.workers, pack["seeds"], mode="fit")    # a mechanism scan at the validated values
         r.calibrate_settings(fitted, ["muleba"])
         e = r.evaluate(b15, fitted)
         row = {"config": name, "overrides": over, "irs_product": product,
