@@ -652,7 +652,7 @@ def _self_test() -> int:
             ok(False, "R23b stale fitted values block the analysis")
         except AnalysisBlocked as e:
             blk = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
-            ok(e.where == "fitted_values" and blk["reason"] == "refit required: T2",
+            ok(e.where == "fitted_values" and blk["reason"] == "refit required: T2, fit_rule",
                f"R23b stale fitted values block the analysis before the joint calibration or batch: {blk['reason']}")
         finally:
             del ToyEngine.fitted_path
@@ -786,7 +786,7 @@ def _self_test_joint(ok, q):
             ok(False, "JR0 stale fitted values block a joint-calibration run")
         except AnalysisBlocked as e:
             b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
-            ok(e.where == "fitted_values" and b["reason"] == "refit required: T2",
+            ok(e.where == "fitted_values" and b["reason"] == "refit required: T2, fit_rule",
                f"JR0 stale fitted values block a joint-calibration run with the blocked artifact: {b['reason']}")
         except Exception as e:  # noqa: BLE001
             ok(False, f"JR0 stale fitted values block a joint-calibration run (got {type(e).__name__}: {e})")

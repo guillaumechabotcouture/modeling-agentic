@@ -116,8 +116,8 @@ TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rul
 COMPARE_TYPES = ("value", "identity")
 COMPARES = ("eq", "le", "differ")
 STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
-from toolkit.engines.benchmark_sources import (TOY_ENGINE_REFS, band_declarations, band_digest,  # noqa: E402
-                                             engine_fitted_problems, fitted_problems, stale_ids)
+from toolkit.engines.benchmark_sources import (TOY_ENGINE_REFS, band_digest, fit_declarations,  # noqa: E402
+                                             fitted_problems, pack_evidence_problems, stale_ids)
 JOINT_RULES = {
     "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
                 "target's log value; infeasible targets dropped; argmin (n out of band, band-scaled squared log "
@@ -1125,8 +1125,8 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         r = runner.evaluate(b, fitted)
         row = {"id": b["id"], "metric": b["metric"], "role": "fit" if b["id"] in fit_ids else "held_out",
                "target": b.get("target"), "band": b.get("band"), "source": b.get("source", "")}
-        if band_digest(b) is not None:
-            row["band_sha256"] = band_digest(b)
+        if band_digest(b, pack) is not None:
+            row["band_sha256"] = band_digest(b, pack)
         if b.get("requires"):
             row["requires"] = b["requires"]
         if b["id"] in infeasible:
@@ -1202,14 +1202,12 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
     ref = f"{type(engine).__module__}:{type(engine).__name__}"
     if not os.path.exists(pp):
         return (rows, None) if ref in TOY_ENGINE_REFS else ([], f"no pack.yaml beside {os.path.basename(path)}")
-    pack = yaml.safe_load(open(pp)) or {}
-    stale = stale_ids(pack, rows)
-    if stale:
-        return [], f"{os.path.basename(path)}: rerun required: {', '.join(stale)} (scored against other band declarations)"
-    fprob = engine_fitted_problems(engine)
-    if fprob:
-        return [], f"{os.path.basename(path)}: {'; '.join(fprob)}"
-    return rows, None
+    try:
+        pack = yaml.safe_load(open(pp))
+    except (OSError, yaml.YAMLError) as e:
+        return [], f"{os.path.basename(pp)} beside the results is unreadable: {e}"
+    bad = pack_evidence_problems(pack if isinstance(pack, dict) else {}, rows, engine)
+    return ([], f"{os.path.basename(path)}: {'; '.join(bad)}") if bad else (rows, None)
 
 
 def refusal_share_max(e: dict, pack: dict) -> float:
@@ -1266,7 +1264,7 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
     rows = []
     for r in doc.get("benchmarks") or []:
         b = cur.get(r["id"])
-        if b is not None and band_digest(b) is not None and r.get("band_sha256") != band_digest(b):
+        if b is not None and band_digest(b, pack) is not None and r.get("band_sha256") != band_digest(b, pack):
             raise ValueError(f"rescore: rerun required: {r['id']} was scored against another band declaration")
         if b is None or b["estimand"]["type"] != "coverage":
             rows.append(r)
@@ -1444,7 +1442,7 @@ def main(argv=None) -> int:
         yaml.safe_dump(stamp(dict({"engine": pack["engine"], "engine_version": eng.describe().version,
                                    "fitted_at": time.strftime("%F %T"), "seeds": seeds,
                                    "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1),
-                                   "band_declarations": band_declarations(pack, fit_targets(pack))}, **out), eng),
+                                   "band_declarations": fit_declarations(pack)}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
         fp = os.path.join(d, "fitted.yaml")

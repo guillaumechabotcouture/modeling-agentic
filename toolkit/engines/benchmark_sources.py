@@ -180,27 +180,47 @@ def failing_ids(pack: dict) -> set:
 
 
 # ---- stored evidence bound to the declarations it was scored against
-def band_digest(b: dict) -> str | None:
-    """sha256 of a trial or cost benchmark's band declaration; None for an exempt type."""
+def _sha(x) -> str:
+    return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def band_digest(b: dict, pack: dict) -> str | None:
+    """sha256 of a trial or cost benchmark's declaration as resolved in `pack`: its band and source fields, its whole
+    engine estimand (observable, arms), and the arms, settings, configurations, horizon, seeds and engine it runs with
+    (Codex r3). None for an exempt type."""
     if _etype(b) not in SOURCED_TYPES:
         return None
-    return hashlib.sha256(json.dumps({k: b.get(k) for k in DIGEST_FIELDS}, sort_keys=True,
-                                     default=str).encode()).hexdigest()
+    from toolkit.engines.benchmark import _arms_of, _config_name
+    arms = {a: (pack.get("arms") or {}).get(a) for a in _arms_of(b["estimand"]) if isinstance(a, str)}
+    sets = {s: (pack.get("settings") or {}).get(s) for s in sorted({(v or {}).get("setting") for v in arms.values()}
+                                                                    - {None})}
+    cfgs = {c: (pack.get("configs") or {}).get(c) for c in {_config_name(pack, st or {}) for st in sets.values()}
+            if c is not None}
+    return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": b.get("estimand"), "arms": arms,
+                 "settings": sets, "configs": cfgs, "default_config": pack.get("default_config"),
+                 "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine")})
 
 
 def band_declarations(pack: dict, ids=None) -> dict:
     """{id: band_digest} of the pack's trial and cost benchmarks (only `ids` when given)."""
-    return {b["id"]: band_digest(b) for b in pack.get("benchmarks") or []
-            if band_digest(b) is not None and (ids is None or b["id"] in ids)}
+    return {b["id"]: band_digest(b, pack) for b in pack.get("benchmarks") or []
+            if isinstance(b, dict) and band_digest(b, pack) is not None and (ids is None or b["id"] in ids)}
+
+
+def fit_declarations(pack: dict) -> dict:
+    """What a fit is bound to: each fit target's declaration and the fit rule itself (box, grid, design)."""
+    from toolkit.engines.benchmark import fit_targets
+    return dict(band_declarations(pack, fit_targets(pack)),
+                fit_rule=_sha({"fit_joint": pack.get("fit_joint"), "fit": pack.get("fit")}))
 
 
 def stale_ids(pack: dict, rows: list) -> list:
     """Ids of stored trial or cost rows not scored against the pack's current declaration (or not in the pack)."""
-    cur = {b["id"]: b for b in pack.get("benchmarks") or []}
+    cur = {b.get("id"): b for b in pack.get("benchmarks") or [] if isinstance(b, dict)}
     out = []
     for r in rows:
         b = cur.get(r.get("id"))
-        if b is None or (band_digest(b) is not None and r.get("band_sha256") != band_digest(b)):
+        if b is None or (band_digest(b, pack) is not None and r.get("band_sha256") != band_digest(b, pack)):
             out.append(r.get("id"))
     return out
 
@@ -208,8 +228,7 @@ def stale_ids(pack: dict, rows: list) -> list:
 def fitted_problems(fitted: dict, pack: dict) -> list[str]:
     """["refit required: <ids>"] when fitted values were fitted against other declarations of the pack's fit targets
     (or carry none); else []."""
-    from toolkit.engines.benchmark import fit_targets
-    want = band_declarations(pack, fit_targets(pack))
+    want = fit_declarations(pack)
     have = (fitted or {}).get("band_declarations") or {}
     ids = sorted(k for k in set(want) | set(have) if have.get(k) != want.get(k))     # the target set and each digest
     return [f"refit required: {', '.join(ids)}"] if ids else []
@@ -219,8 +238,11 @@ def engine_fitted_problems(engine) -> list[str]:
     """fitted_problems for an engine's own fitted file (`fitted_path`) against its own pack; [] when it has none."""
     import yaml
     fp = getattr(engine, "fitted_path", None)
-    if not fp or not os.path.exists(fp):
+    if not fp:
         return []
+    if not os.path.isfile(fp):          # missing, or a dangling link: no fitted evidence for fitted parameters (Codex r3)
+        has_fitted = any(getattr(p, "kind", None) == "fitted" for p in engine.parameters())
+        return [f"refit required: fitted values file {fp} is missing (unusable evidence)"] if has_fitted else []
     from toolkit.spec import engine_parameters as EP
     try:
         pack, why = EP.benchmark_pack(engine)
@@ -459,12 +481,12 @@ def _self_test() -> int:
                     ok(False, "BS40 rescore refuses a row scored against another band declaration")
                 except ValueError as ex:
                     ok("rerun required: T1" in str(ex), f"BS40 rescore refuses a stale row: {ex}")
-        fd = {"band_declarations": band_declarations(toy, ["T1"])}
+        fd = {"band_declarations": fit_declarations(toy)}
         ok(fitted_problems(fd, toy) == [] and fitted_problems(fd, pk2) == ["refit required: T1"]
-           and fitted_problems({}, toy) == ["refit required: T1"],
+           and fitted_problems({}, toy) == ["refit required: T1, fit_rule"],
            "BS42 fitted values bound to their targets' declarations: a changed or missing digest is 'refit required'")
         mf = yaml.safe_load(open(os.path.join(root, "malaria", "benchmarks", "fitted.yaml")))
-        ok(fitted_problems(mf, pk) == ["refit required: B10, B11, B12, B12b, B12m"],
+        ok(fitted_problems(mf, pk) == ["refit required: B10, B11, B12, B12b, B12m, fit_rule"],
            f"BS43 the stored malaria fitted values report refit required: {fitted_problems(mf, pk)}")
     case("BS36-43", r1_2)
 
@@ -492,7 +514,7 @@ def _self_test() -> int:
                     raised = "refit required: T1" in str(ex)
             finally:
                 EP.benchmark_pack = orig
-        ok(probs == ["refit required: T1"] and raised,
+        ok(probs == ["refit required: T1, fit_rule"] and raised,
            "BS44 an engine whose fitted values are stale: every analysis read of them (fitted_ranges) is refused")
         import inspect
         from toolkit.analysis import run as RUNm
@@ -502,7 +524,7 @@ def _self_test() -> int:
 
     # ---- review round 2 (Codex, PR #154)
     def r2_6():
-        fd2 = {"band_declarations": dict(band_declarations(toy, ["T1"]), T9="a former fit target")}
+        fd2 = {"band_declarations": dict(fit_declarations(toy), T9="a former fit target")}
         ok(fitted_problems(fd2, toy) == ["refit required: T9"],
            f"BS46 a fit whose recorded target set differs from the current one needs a refit: {fitted_problems(fd2, toy)}")
     case("BS46", r2_6)
@@ -542,7 +564,7 @@ def _self_test() -> int:
 
     # ---- review round 3 (Codex, PR #154)
     def r3_1():
-        fd = {"band_declarations": band_declarations(toy, ["T1"])}
+        fd = {"band_declarations": fit_declarations(toy)}
         b0 = toy["benchmarks"][0]
         obs = dict(toy, benchmarks=[dict(b0, estimand=dict(b0["estimand"], value="windows.w.prev"))])
         sett = dict(toy, settings={"s": {"unit": {"x": 0.5}}})
