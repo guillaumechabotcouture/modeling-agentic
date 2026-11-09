@@ -375,6 +375,7 @@ def _toy_pack() -> dict:
             "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}},
                      "b": {"setting": "s", "package": {"b": 1}}, "ab": {"setting": "s", "package": {"a": 1, "b": 1}}},
             "benchmarks": [{"id": "T2", "metric": "interaction", "target": 1.0, "band": [0.8, 1.25],
+                            "band_override": {"band": [0.8, 1.25], "reason": "self-test toy: no published source"},
                             "estimand": {"type": "interaction_or", "a11": "ab", "a10": "a", "a01": "b", "a00": "none",
                                          "value": "windows.w.prev"}}]}
 

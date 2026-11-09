@@ -42,6 +42,9 @@ Pack schema:
     arms: {<name>: {setting: <name>, package: {...}}}
     benchmarks:
       - id, metric, source, target, band: [lo, hi]
+        published: {lower, upper, level, scale, table}   # trial and cost types: the source's interval, or
+        band_override: {band, reason}   # a recorded override; band must equal it (benchmark_sources.py, F6 S1-2)
+        estimand_type, diagnostic, age_band, estimand_mapping   # as the source reports them
         requires: {<id>: [lo, hi]}      # optional: assessable only if each is inside [lo, hi]
         estimand:
           {type: ratio | odds_ratio, num: arm | [arms], den: arm | [arms], value: <path>}
@@ -1378,6 +1381,8 @@ def main(argv=None) -> int:
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
     bad = validate(pack, eng, base=os.path.dirname(os.path.abspath(a.pack)))
+    from toolkit.engines.benchmark_sources import check_pack as _band_sources
+    bad += _band_sources(pack)          # F6 S1-2: every band equals its published interval or a recorded override
     if bad:
         print("pack invalid:\n  " + "\n  ".join(bad))
         return 2

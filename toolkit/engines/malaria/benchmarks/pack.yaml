@@ -3,8 +3,10 @@
 #   python3 -m toolkit.engines.benchmark toolkit/engines/malaria/benchmarks/pack.yaml run
 # Targets and bands are E7 attempt 8's locked benchmark targets (models/benchmark_targets.yaml,
 # sources C15-C35 in its citations.md), plus two held-out PBO durability checks from the same
-# trials (B9b, B9c). Trial-site settings (species mix, resistance, seasonality, net use) are
-# ASSUMPTIONS written from the trial descriptions, not data the evidence service has checked.
+# trials (B9b, B9c). F6 S1-2: every trial band equals the published 95% interval recorded beside it (`published`,
+# with its place in the source), or a recorded `band_override` with its reason; toolkit/engines/benchmark_sources.py
+# refuses any other band, and the runner checks it before fit or run. Trial-site settings (species mix, resistance,
+# seasonality, net use) are ASSUMPTIONS written from the trial descriptions, not data the evidence service has checked.
 # Each site's transmission is set by `calibrate` to the site's control-arm or baseline level,
 # which is setting description, not engine tuning; settings may not override fitted parameters.
 engine: toolkit.engines.malaria.engine:MalariaEngine
@@ -142,7 +144,7 @@ benchmarks:
   # p = 0.042). The sixth trial is not identified. Equal weights: the Cochrane weights are not in the accessible text
   # (ASSUMPTION). The v0.3 definition (6 m-14 y) is reported as a diagnostic, not judged.
   - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)", target: 0.83,
-     band: [0.68, 0.98], source: "C21 Pryce 2018 Cochrane CD000363.pub3",
+     band: [0.71, 0.98], source: "C21 Pryce 2018 Cochrane CD000363.pub3",
      published: {lower: 0.71, upper: 0.98, level: 0.95, scale: ratio, table: "abstract; Analysis 1.6 (ITN vs no nets, P. falciparum prevalence, 6 trials)"},
      estimand_type: risk_ratio,
      estimand: {type: ratio, num: coch_pyr, den: coch_none,
@@ -152,14 +154,14 @@ benchmarks:
                          {path: windows.m12.pfpr_lt10, weight: 1, label: "Smithuis 2013 (under 10)"},
                          {path: windows.m12.pfpr_all, weight: 1, label: "Sochantha 2006 (all ages)"}],
                 diagnostic_values: [windows.m12.pfpr_6m14y]}}
-  - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.46, 0.64],
+  - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.48, 0.64],
      source: "C22 Pryce 2018",
      published: {lower: 0.48, upper: 0.64, level: 0.95, scale: ratio, table: "abstract; Analysis 1.2 (ITN vs no nets, uncomplicated P. falciparum episodes, 5 trials)"},
      estimand_type: rate_ratio,
      estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
   # v0.2 basis fix: the trial's 0.37 and 0.40 are PBO LLIN alone vs standard LLIN (Table 2; the factorial model
   # has an interaction term, so its main-effect ORs equal the single-arm comparisons). v0.1 pooled over IRS arms.
-  - {id: B9, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m", target: 0.37, band: [0.09, 0.65],
+  - {id: B9, metric: "PBO vs pyrethroid nets (no IRS), prevalence OR at 9 m", target: 0.37, band: [0.21, 0.65],
      source: "C15 Protopopoff 2018 Lancet, Table 2 (PBO LLIN vs standard LLIN, 9 months)",
      published: {lower: 0.21, upper: 0.65, level: 0.95, scale: ratio, table: "abstract; Table 2, PBO LLIN vs standard LLIN, 9 months"},
      estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
@@ -174,12 +176,12 @@ benchmarks:
      published: {lower: 0.67, upper: 1.45, level: 0.95, scale: ratio, table: "abstract, Findings: PBO group vs pyrethroid-only, 24 months"},
      estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
-  - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.23, 0.67],
+  - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.30, 0.67],
      source: "C17 Mosha 2022 Lancet (PMID 35339225)",
      published: {lower: 0.3, upper: 0.67, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr group vs pyrethroid-only, 24 months"},
      estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mis_dual, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
-  - {id: B11, metric: "Dual-AI vs pyrethroid nets, incidence RR 0-24 m", target: 0.54, band: [0.38, 0.70],
+  - {id: B11, metric: "Dual-AI vs pyrethroid nets, incidence HR 0-24 m (engine: rate ratio)", target: 0.54, band: [0.42, 0.70],
      source: "C20 Accrombessi 2023 Lancet (PMID 36706778)",
      published: {lower: 0.42, upper: 0.7, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr-pyrethroid LLIN vs pyrethroid-only, 2 years"},
      estimand_type: hazard_ratio, age_band: "cohort of children about 6 months to 10 years",
@@ -187,12 +189,12 @@ benchmarks:
        the engine compares the arms' under-5 incidence rates over the same 24 months, read as a rate ratio that
        stands for the hazard ratio",
      estimand: {type: ratio, num: ben_dual, den: ben_pyr, value: windows.m0_24.inc_u5}}
-  - {id: B12, metric: "Non-pyrethroid IRS added to ITN, prevalence RR at 12 m", target: 0.61, band: [0.34, 0.88],
+  - {id: B12, metric: "Non-pyrethroid IRS added to ITN, prevalence RR at 12 m", target: 0.61, band: [0.42, 0.88],
      source: "C23 Pryce 2022 Cochrane CD012688.pub3",
      published: {lower: 0.42, upper: 0.88, level: 0.95, scale: ratio, table: "abstract; Summary of findings 1; Analysis 1.5 (4 cRCTs, Corbel 2012 excluded)"},
      estimand_type: risk_ratio, diagnostic: "blood smear or RDT",
      estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m12.pfpr_6m14y}}
-  - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.49, 1.23],
+  - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.61, 1.23],
      source: "C23 Pryce 2022",
      published: {lower: 0.61, upper: 1.23, level: 0.95, scale: ratio, table: "abstract; Summary of findings 1; Analysis 1.1 (4 cRCTs)"},
      estimand_type: rate_ratio, diagnostic: "blood smear microscopy or RDT",

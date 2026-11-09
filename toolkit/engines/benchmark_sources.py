@@ -33,7 +33,11 @@ out of scope. Disease-agnostic: nothing here names a disease, trial or intervent
 from __future__ import annotations
 
 import math
+import os
 import sys
+
+if not __package__:  # run as a file (the self-test runner): make the repository importable
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 SOURCED_TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome")
 ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio")
@@ -154,7 +158,6 @@ def main(argv=None) -> int:
 
 
 def _self_test() -> int:
-    import os
     import yaml
     fails = []
 
@@ -214,6 +217,44 @@ def _self_test() -> int:
         p = os.path.join(root, name, "benchmarks", "pack.yaml")
         if os.path.exists(p):
             ok(check_pack(yaml.safe_load(open(p))) == [], f"BS19 the {name} pack passes (oracle types only)")
+    # the runner CLI and the harness step refuse a pack whose band differs from its source, before any run
+    import tempfile
+    from toolkit.engines import benchmark as BM
+    from toolkit.spec import engine_parameters as EP
+    toy = {"engine": "toolkit.engines.contract:ToyEngine", "seeds": [1],
+           "initialisation": {"method": "closed form", "evidence": ["not applicable: no dynamic state"]},
+           "horizon": {"start": 0, "stop": 3, "window": [0, 3], "windows": {"w": [1, 2]}},
+           "settings": {"s": {"unit": {"x": 0.0}}},
+           "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}}},
+           "benchmarks": [{"id": "T1", "metric": "a vs none", "target": 0.4, "band": [0.3, 0.5],
+                           "published": dict(pub, lower=0.3, upper=0.5), "estimand_type": "risk_ratio",
+                           "estimand": {"type": "ratio", "num": "a", "den": "none", "value": "per_capita.cases.all"}}],
+           "fit": [{"param": "eff_a", "grid": [0.3, 0.5], "targets": ["T1"]}]}
+    wide = dict(toy, benchmarks=[dict(toy["benchmarks"][0], band=[0.2, 0.5])])
+    with tempfile.TemporaryDirectory() as d:
+        rc = {}
+        for name, pk_ in (("ok", toy), ("wide", wide)):
+            path = os.path.join(d, name + ".yaml")
+            yaml.safe_dump(pk_, open(path, "w"))
+            rc[name] = BM.main([path, "validate"])
+    ok(rc == {"ok": 0, "wide": 2}, f"BS20 the runner CLI validates a matching band and refuses a wider one ({rc})")
+    try:
+        EP.spec_benchmarks(wide, None, None)
+        refused = False
+    except ValueError as ex:
+        refused = "do not match their sources" in str(ex)
+    ok(refused, "BS21 the harness step (spec_benchmarks) refuses the pack before it touches the engine or spec")
+    from toolkit.analysis import joint_calibration as JC
+    orig = EP.benchmark_pack
+    try:
+        EP.benchmark_pack = lambda eng: (wide, None)
+        jw = JC._benchmarks(None)
+        EP.benchmark_pack = lambda eng: (toy, None)
+        jo = JC._benchmarks(None)
+    finally:
+        EP.benchmark_pack = orig
+    ok(jw[0] is None and "do not match their sources" in str(jw[2]) and jo[0] is toy and jo[1] == {"T1"},
+       "BS22 joint calibration reads a band as a 95% interval only when it matches its source")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

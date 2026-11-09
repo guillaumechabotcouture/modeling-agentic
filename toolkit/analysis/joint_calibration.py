@@ -84,6 +84,10 @@ def _benchmarks(eng):
     pack, why = PV.benchmark_pack(eng)
     if pack is None:
         return None, set(), why
+    from toolkit.engines.benchmark_sources import check_pack as band_sources
+    bad = band_sources(pack)            # F6 S1-2: a band read as a 95% interval must be its source's interval
+    if bad:
+        return None, set(), "the engine's benchmark bands do not match their sources: " + "; ".join(bad)
     return pack, BM.fit_targets(pack), None
 
 
@@ -530,7 +534,9 @@ def build(spec, units=None) -> tuple:
                                          weights={i: float(rows[i][t["weights"]]) for i in members},
                                          source=t["source"]))
         else:
-            pack, fit, _ = _benchmarks(spec.engine())
+            pack, fit, why = _benchmarks(spec.engine())
+            if pack is None:
+                raise HM.CalibrationInputError([f"benchmark target {t['id']}: no usable engine pack ({why})"])
             b = next(x for x in pack["benchmarks"] if x["id"] == t["id"])
             lo, hi = (float(x) for x in b["band"])
             sc = "log" if lo > 0 and float(b["target"]) > 0 else "identity"

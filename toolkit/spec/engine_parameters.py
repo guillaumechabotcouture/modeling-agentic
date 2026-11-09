@@ -625,6 +625,10 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     conditions win; review round 3, R3-3) and over the engine defaults, stamped by the benchmark runner for the engine
     the arms ran with. `engine` must be the run's engine (it is checked, not used)."""
     from toolkit.engines import benchmark as BM
+    from toolkit.engines.benchmark_sources import check_pack as band_sources
+    bad = band_sources(pack)
+    if bad:                             # F6 S1-2: a band that differs from its source is refused before any run
+        raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
     pe = _check_pack_engine(pack, spec, engine)
     vals = values(spec)
     runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
