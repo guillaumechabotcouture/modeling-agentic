@@ -91,6 +91,11 @@ import yaml
 BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "per_unit", "fixed", "per_outcome")
 PER_UNIT = ("per_unit", "fixed")     # F6 S1-3: a fixed amount per unit receiving the component (`fixed`: older name)
 MIN_REASON = 10
+
+
+def _reason_ok(w) -> bool:
+    """A stated reason: a string with at least MIN_REASON non-whitespace characters (Codex S1-3 P2)."""
+    return isinstance(w, str) and len("".join(w.split())) >= MIN_REASON
 RULES = ("index", "local_index", "as_published")
 
 
@@ -223,9 +228,9 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
                 continue
             ia, ib = str(a.get("id")), str(b.get("id"))
             overlaps |= {(ia, ib), (ib, ia)}
-            why = [str((x.get("not_double_counted") or {}).get(o) or "").strip()
-                   for x, o in ((a, ib), (b, ia)) if isinstance(x.get("not_double_counted"), dict)]
-            if not any(len(w) >= MIN_REASON for w in why):
+            why = [x["not_double_counted"].get(o) for x, o in ((a, ib), (b, ia))
+                   if isinstance(x.get("not_double_counted"), dict)]
+            if not any(_reason_ok(w) for w in why):
                 errs.append(f"cost_items.{ia} and {ib} both include {', '.join(both)} for {c}: a double count; "
                             f"remove the part from one item, or state under `not_double_counted: {{{ib}: <reason>}}` "
                             f"in {ia} why the two prices do not cover the same thing")
@@ -240,9 +245,9 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
                 if (str(it.get("id")), str(o)) not in overlaps:
                     errs.append(f"cost_items.{it.get('id')}: not_double_counted names {o}, which is not an item of {c} "
                                 "whose includes overlap this one's")
-                elif len(str(w or "").strip()) < MIN_REASON:
-                    errs.append(f"cost_items.{it.get('id')}: not_double_counted.{o} needs a reason of at least "
-                                f"{MIN_REASON} characters")
+                elif not _reason_ok(w):
+                    errs.append(f"cost_items.{it.get('id')}: not_double_counted.{o} needs a reason: text of at least "
+                                f"{MIN_REASON} characters other than spaces")
     used = set().union(*pk.values()) if pk else set()
     for c in sorted(used - set(by_comp)):
         if not str((comps.get(c) or {}).get("cost_free") or "").strip():
@@ -355,7 +360,20 @@ def floor_report(floors: list, spec: dict | None = None) -> dict:
             "statement": ("In each of these combinations the package has less of the outcome than the same package "
                           "without the component, so the increment is below zero and is charged as nothing. These "
                           "are floors, not a cost or a saving." if n else
-                          "No per-outcome cost increment was floored at zero.")}
+                          "No per-outcome cost increment was floored at zero here.")}
+
+
+def draw_floor_summary(per_draw: list) -> dict:
+    """The floors of every uncertainty draw (F6 S1-3, Codex P2): `per_draw` is each draw's floor records. Published
+    beside the point's, so a point without floors never reads as none anywhere."""
+    counts = [len({(f["unit"], f["package"]) for f in fl}) for fl in per_draw]
+    k = sum(c > 0 for c in counts)
+    return {"draws": len(counts), "draws_with_floors": k, "max_unit_packages": max(counts, default=0),
+            "per_draw": counts,
+            "statement": ("In the draws with floors, a per-outcome cost increment below zero is charged as nothing; "
+                          "these are floors, not a cost or a saving, and they enter the draws' costs and "
+                          "affordability as zeros." if k else "No uncertainty draw floored a per-outcome cost "
+                          "increment at zero.")}
 
 
 def load_units(spec: dict, base_dir: str, csv_path: str | None = None) -> list[dict]:

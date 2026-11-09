@@ -268,6 +268,8 @@ def _cost_items(opts: dict) -> list:
             extra.append(f"outcome {it.get('outcome')}" + (" (incremental)" if it.get("incremental") else ""))
         out.append({"id": it.get("id"), "component": it.get("component"), "value": v, "price_year": it.get("price_year"),
                     "rule": it.get("price_rule"), "basis": basis, "includes": _l(it.get("includes")),
+                    "not_double_counted": [{"item": str(k), "reason": str(w)}
+                                           for k, w in _m(it.get("not_double_counted")).items()],
                     "extra": extra, "factor": f, "base_value": base, "per_person": per, "per_label": PER.get(basis, basis),
                     "why_no_per_person": None if per is not None else
                     ("priced per outcome (a model output)" if basis == "per_outcome" else "a fixed amount"
