@@ -17,7 +17,14 @@ ages, or a decision_units.populations key); outcome (one the spec reports); meas
 the band); year (within max_year_gap of the decision window); value, lower, upper (finite, >= 0, lower <= value <=
 upper); kind (estimated | reported: reported values are shown for information only, never judged or fitted); source
 (the citation); tolerance (ratio: model / value inside [ratio_low, ratio_high], blank for the manifest default and
-never wider than its widest band | overlap: the model interval meets [lower, upper]).
+never wider than its widest band | overlap: the model interval meets [lower, upper]); source_id (the publication or
+dataset) and derived_from (its upstream source ids, ; separated, may be empty).
+
+Independence is declared, not inferred: every calibration input names its source ids (observation targets per row in
+their `source` column; `calibration.targets.source_id`, `calibration.target_source_id` for the inversion target column,
+and `source_id` on each joint unit or group target), and a reference whose source_id or derived_from meets that set is
+refused. The reference file may not be a calibration input by path, inode or content. The sign-off sheet shows the
+declared sources, so the owner attests independence; the artifact records them.
 
 The model value is the arm's annual mean over the decision window (window total / window years), summed over the
 group's units. Its interval comes from the uncertainty draws for all-age references; an age-banded reference is the
@@ -40,7 +47,7 @@ if ROOT not in sys.path:
 PRODUCER = "toolkit/analysis/burden.py"
 KEYS = {"csv", "group", "arm", "daly_parts"}
 COLUMNS = ("id", "group", "age_band", "outcome", "measure", "per", "year", "value", "lower", "upper", "kind", "source",
-           "tolerance", "ratio_low", "ratio_high")
+           "tolerance", "ratio_low", "ratio_high", "source_id", "derived_from")
 KINDS = ("estimated", "reported")
 TOLERANCES = ("ratio", "overlap")
 STATUSES = ("within", "outside", "information", "unmatched")
@@ -122,34 +129,73 @@ def provenance(s) -> dict:
     me = _identity(path)
     ins = [(c["path"], _identity(c["path"])) for c in calibration_inputs(s)]
     rel = lambda q: os.path.relpath(q, s.base) if os.path.isabs(q) else q  # noqa: E731
+    refs = load_references(s)[0]
+    cids, cbad = calibration_source_ids(s)
+    shared = [x["id"] for x in refs if x["source_id"] in cids or set(x["derived_from"]) & set(cids)]
     return {"csv": config(s)["csv"], "realpath": me[0] if me else None, "sha256": me[2] if me else None,
             "calibration_inputs": [{"path": rel(q), "sha256": i[2] if i else None} for q, i in ins],
-            "independent": bool(me) and not any(_same_file(me, i) for _q, i in ins)}
+            "calibration_source_ids": cids,
+            "references": [{"id": x["id"], "source_id": x["source_id"], "derived_from": x["derived_from"]} for x in refs],
+            "basis": "declared source ids, attested by the owner on the sign-off sheet",
+            "independent": bool(me) and not any(_same_file(me, i) for _q, i in ins) and not shared and not cbad}
 
 
-def _coincident(s, refs) -> list[str]:
-    """References whose value repeats a fitted observation: a value (> 0) in a calibration input's fitted cells, in a
-    row that names the reference's group (any row for *)."""
-    bad = []
-    for c in calibration_inputs(s):
+def sheet_lines(raw, run_dir) -> list[str]:
+    """The sign-off sheet's section: each reference's declared sources beside the calibration's, which signing
+    attests are independent (it cannot be inferred from the numbers)."""
+    if section(raw) is None:
+        return []
+    out = ["## Burden validation references", ""]
+    try:
+        from toolkit.spec import schema
+        sp = schema.Spec(raw, run_dir)
+        pv, (refs, bad) = provenance(sp), load_references(sp)
+    except Exception as e:  # noqa: BLE001 -- the sheet says so rather than omitting the section
+        return out + [f"Unreadable: {type(e).__name__}: {e}", ""]
+    out += [f"Signing attests that no reference below comes from, or is derived from, a source the calibration fits "
+            f"(calibration sources: {', '.join(pv['calibration_source_ids']) or 'none declared'}). Reference file "
+            f"`{pv['csv']}` (sha256 `{(pv['sha256'] or 'unreadable')[:16]}`).", "",
+            "| Reference | Kind | Source id | Derived from | Citation |", "|---|---|---|---|---|"]
+    out += [f"| {x['id']} | {x['kind']} | {x['source_id']} | {', '.join(x['derived_from']) or 'none'} | {x['source']} |"
+            for x in refs]
+    return out + [f"- problem: {b}" for b in bad] + [""]
+
+
+def _ids(v):
+    """A declared source id (a non-empty string) or list of them, else None."""
+    v = [v] if isinstance(v, str) else v
+    return [x.strip() for x in v] if isinstance(v, list) and v and all(isinstance(x, str) and x.strip() for x in v) \
+        else None
+
+
+def calibration_source_ids(s) -> tuple[list[str], list[str]]:
+    """(the source ids of every calibration input, problems). Observation targets name their source per row (the
+    table's `source` column); a target table, the inversion target column and each joint unit or group target
+    declare `source_id` (a publication or dataset id, or a list), which validation.burden requires."""
+    cal = s.raw.get("calibration") or {}
+    tg = cal.get("targets") or {}
+    ids, bad = set(), []
+
+    def need(v, where):
+        got = _ids(v)
+        if got is None:
+            bad.append(f"{where}: the source id (or ids) of the data this target fits")
+        else:
+            ids.update(got)
+    if tg.get("kind") == "observations":
         try:
-            with open(c["path"], newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
-        except (OSError, csv.Error, UnicodeDecodeError):
-            continue
-        for r in refs:
-            v = r["value"]
-            if not v > 0:
-                continue
-            for row in rows:
-                cells = [row.get(k) for k in (c["columns"] if c["columns"] is not None else row)]
-                if (r["group"] == "*" or r["group"] in [str(x) for x in row.values()]) and any(
-                        (_num(x) is not None and abs(_num(x) - v) <= 1e-9 * v) for x in cells):
-                    bad.append(f"validation.burden.csv reference {r['id']}: its value {v:g} repeats a fitted "
-                               f"observation in {os.path.basename(c['path'])}; references validate, they are never "
-                               "fitted")
-                    break
-    return bad
+            with open(s.resolve(tg["csv"]), newline="", encoding="utf-8") as f:
+                ids.update(str(r[tg["source"]]).strip() for r in csv.DictReader(f) if str(r[tg["source"]]).strip())
+        except (OSError, KeyError, csv.Error) as e:
+            bad.append(f"calibration.targets: observation sources unreadable: {e}")
+    elif tg.get("csv"):
+        need(tg.get("source_id"), "calibration.targets.source_id")
+    if cal.get("method") == "emulator_inversion" and cal.get("target_column"):
+        need(cal.get("target_source_id"), "calibration.target_source_id")
+    for n, t in enumerate((cal.get("joint") or {}).get("targets") or []):
+        if isinstance(t, dict) and t.get("kind") in ("unit", "group"):
+            need(t.get("source_id"), f"calibration.joint.targets[{n}].source_id")
+    return sorted(ids), bad
 
 
 def load_references(s) -> tuple[list[dict], list[str]]:
@@ -223,6 +269,10 @@ def load_references(s) -> tuple[list[dict], list[str]]:
             e.append(f"kind {r['kind']!r}: estimated or reported")
         if not str(r["source"] or "").strip():
             e.append("source: the citation")
+        sid = str(r["source_id"] or "").strip()
+        der = [x.strip() for x in str(r["derived_from"] or "").split(";") if x.strip()]
+        if not sid:
+            e.append("source_id: the publication or dataset id (derived_from: its upstream source ids, ; separated)")
         cells = {k: str(r[k] if r[k] is not None else "").strip() for k in ("ratio_low", "ratio_high")}
         unread = [k for k, x in cells.items() if x and _num(x) is None]
         if unread:
@@ -239,11 +289,19 @@ def load_references(s) -> tuple[list[dict], list[str]]:
         refs.append({"id": rid, "group": g, "age_band": band or None, "outcome": r["outcome"],
                      "measure": r["measure"], "per": per if r["measure"] == "rate" else None, "year": yr,
                      "year_gap": gap, "value": val, "lower": lo, "upper": hi, "kind": r["kind"],
-                     "source": r["source"].strip(), "tolerance": {"type": r["tolerance"], "ratio_band": list(band_r)
+                     "source": r["source"].strip(), "source_id": sid, "derived_from": der, "tolerance": {"type": r["tolerance"], "ratio_band": list(band_r)
                                                                   if r["tolerance"] == "ratio" else None}})
     if refs and not any(x["kind"] == "estimated" for x in refs):
         bad.append(f"{P}.csv: no estimated reference (reported values are information only)")
-    bad += _coincident(s, refs)
+    cids, cbad = calibration_source_ids(s)       # Codex r2: declared provenance, never numeric coincidence
+    bad += [f"{P}: every calibration input declares its sources: {x}" for x in cbad]
+    for x in refs:
+        if x["source_id"] in cids:
+            bad.append(f"{P}.csv reference {x['id']}: source_id {x['source_id']} is a calibration source; references "
+                       "validate, they are never fitted")
+        hit = sorted(set(x["derived_from"]) & set(cids))
+        if hit:
+            bad.append(f"{P}.csv reference {x['id']}: derived_from {hit} includes a calibration source")
     return refs, bad
 
 
@@ -422,7 +480,7 @@ def _f(kind, claim, key, declarable):
 
 
 META = ("group", "age_band", "outcome", "measure", "per", "year", "year_gap", "value", "lower", "upper", "kind",
-        "source", "tolerance")
+        "source", "source_id", "derived_from", "tolerance")
 
 
 def findings(raw, data, expected=None) -> list[dict]:
@@ -508,7 +566,7 @@ def results_lines(data) -> list[str]:
     for r in data["references"]:
         k, tol = f"burden.{r['id']}", r["tolerance"]
         unit = f" per {r['per']:g}" if r["measure"] == "rate" else ""
-        L.append(f"| {r['id']} ({r['source']}) | {r['group']} | {r['age_band'] or 'all'} | {r['outcome']}{unit} | "
+        L.append(f"| {r['id']} ({r['source']}; {r['source_id']}) | {r['group']} | {r['age_band'] or 'all'} | {r['outcome']}{unit} | "
                  f"{r['year']:g} | [CLAIM:{k}.model] | [CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] "
                  f"({r['model']['interval_from']}) | [CLAIM:{k}.value] ([CLAIM:{k}.lower] to [CLAIM:{k}.upper]) | "
                  + (f"[CLAIM:{k}.ratio]" if r.get("ratio") is not None else "n/a") + f" | {r['kind']} | "

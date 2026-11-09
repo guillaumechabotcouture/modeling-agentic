@@ -326,6 +326,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += geometry_section[0]                 # the input geometry check and the findings accepted by name
     from toolkit.spec import engine_parameters as PV
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
+    from toolkit.analysis import burden as BV
+    out += BV.sheet_lines(raw, run_dir)                 # F6 S2-5: reference sources the owner attests are independent
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
