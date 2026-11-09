@@ -20,7 +20,10 @@ Types (spec `analysis.decision_tests`):
                        `prior_range_<parameter>`; the spec cannot declare or remove one.
 A test with at least one usable value writes `models/decision_tests/<id>.yaml` in the Phase 49
 result schema (finding, varied, criterion, decision_changes, recommendation.with / without,
-share_units_changed, share_threshold) with `produced_by: harness`. A test with none writes no
+share_units_changed, share_threshold) with `produced_by: harness`. Beside the share, each value and the test
+report what moves (F6 S1-5, toolkit/analysis/moves.py): regret, population whose package changes, dollars moved
+by component and units changing by group; the plan changes on the share, the regret share or the dollars-moved
+share, each against its threshold, and `triggered_by` names which. A test with none writes no
 result file (a declaration citing it is then invalid) and is reported as not run, with why.
 
 Relevance, up front: when a test changes only benefits, and every benefit it changes goes down and
@@ -38,6 +41,7 @@ import numpy as np
 import yaml
 
 from toolkit.alloc import packages as apackages
+from toolkit.analysis import moves as MV
 from toolkit.analysis.artifacts import plain
 from toolkit.engines.benchmark import verified_benchmarks
 
@@ -131,7 +135,7 @@ def prior_range_tests(A) -> list[dict]:
 def _not_run(A, dt, why, extra=None) -> dict:
     return {"status": "not_run", "test_id": dt["id"], "type": dt["type"], "question": dt.get("text", ""),
             "statement": f"This test was not run: {why}.", "reason": why, "can_move_plan": None,
-            "decision_changes": None, "share_units_changed": None, "share_threshold": _threshold(A),
+            "decision_changes": None, "triggered_by": None, "share_units_changed": None, "share_threshold": _threshold(A),
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
@@ -240,13 +244,14 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         sol = A.solve(ben, cost, budget=budget, feas=feas)
         ch = sol["choice"]
         A.guard(f"decision test {dt['id']} at {v}", [plan, ch], events=evs.get(v, []))
-        n_changed = sum(ch[i] != plan[i] for i in A.ids)
-        results.append({"value": v, "units_changed": n_changed, "share_units_changed": n_changed / len(A.ids),
-                        "objective": sol["objective"], "point_plan_objective_under_test":
-                            sum(ben[i][plan[i]] for i in A.ids), "recommendation": A.mix_text(ch),
+        # F6 S1-5: what moves beside the share (regret, population, dollars by component, units by group)
+        # (the point plan judged under the test's costs, feasibility and planning budget: Codex r1 P2-1)
+        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas),
+                        "objective": sol["objective"], "recommendation": A.mix_text(ch),
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
     worst = max(results, key=lambda r: r["share_units_changed"])
-    share = worst["share_units_changed"]
+    th = MV.thresholds(A.spec["analysis"])
+    agg = MV.aggregate(results)       # each criterion's worst value, with its own breakdown (Codex r1 P2-3)
     comps = set(dt.get("components") or [])
     in_draws = sorted(comps & set(uq_data.get("components_in_any_draw_plan") or [])) if comps else None
     in_plan = sum(bool(A.pk[plan[i]] & comps) for i in A.ids) if comps else None
@@ -272,8 +277,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     finding = dt.get("finding") or f"decision_test:{dt['id']}"
     rec = {"statement": stmt + ".", "status": "run", "can_move_plan": can_move, "finding": finding,
            "test_id": dt["id"], "type": t, "question": dt.get("text", ""), "varied": varied,
-           "criterion": f"the package changes in more than {thr:.0%} of units",
-           "decision_changes": bool(share > thr), "share_units_changed": float(share), "share_threshold": thr,
+           "criterion": (f"the package changes in more than {thr:.0%} of units, or keeping the point plan loses more "
+                         f"than {th['regret']:.1%} of the re-optimised objective, or more than {th['dollars']:.0%} of "
+                         "the allocatable budget is reallocated across units and components, or the point plan is "
+                         "not feasible under the test"),
+           **agg, "share_threshold": thr, "regret_threshold": th["regret"], "dollars_threshold": th["dollars"],
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
            "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER}
     if sv:

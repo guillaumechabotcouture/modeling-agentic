@@ -358,6 +358,15 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
+         # F6 S1-5: what moves beside the share, and which criterion changed the plan
+         **{k: (None if x.get(f) is None else 100.0 * x[f]) for k, f in (
+             ("regret_pct", "regret_share"), ("regret_threshold_pct", "regret_threshold"),
+             ("dollars_moved_pct", "dollars_moved_share"), ("dollars_threshold_pct", "dollars_threshold"),
+             ("dollars_reallocated_pct", "dollars_reallocated_share"), ("dollars_share_pct", "dollars_share"),
+             ("population_changed_pct", "population_changed_share"))},
+         **{k: x.get(k) for k in ("regret", "objective_gap", "point_plan_feasible", "dollars_moved",
+                                  "dollars_reallocated", "population_changed", "triggered_by",
+                                  "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
@@ -604,6 +613,7 @@ def _self_test() -> int:
             os.rename(moved, d)
         ok(figs and all(rels) and fk == [],
            f"R12b figure sources are recorded relative to the run dir, and a moved run dir checks clean: {fk[:2]}")
+        _self_test_moves(ok, d, R)
         ok(contract.gate_findings(d) == [], f"R13 the contract checks pass on a harness run: {contract.gate_findings(d)}")
         rel = os.path.join("analysis", "point.yaml")
         with open(os.path.join(d, rel), "a") as f:
@@ -780,6 +790,88 @@ def _self_test() -> int:
     return 0
 
 
+def _self_test_moves(ok, d, R):
+    """F6 S1-5 on the toy: decision tests, stability folds and sensitivity ends report what moves."""
+    import copy
+    import yaml
+    keys = {"regret", "regret_share", "population_changed", "dollars_moved", "dollars_moved_share",
+            "dollars_by_component", "units_changed_by_group", "triggered_by", "decision_changes"}
+    run_ = [x for x in R["decision_tests"] if x.get("status") == "run"]
+    files = [yaml.safe_load(open(os.path.join(d, x["path"]))) for x in run_]
+    ok(run_ and all(keys <= set(f) and {"regret_threshold", "dollars_threshold"} <= set(f)
+                    and isinstance(f["units_changed_by_group"], list) and all(keys <= set(r) for r in f["results"])
+                    for f in files),
+       f"MS1 every decision-test result file and row reports regret, population, dollars by component, units by "
+       f"group and the criterion that triggered: {sorted(keys - set(files[0]) if files else keys)}")
+    art = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+    ok(all({"regret_pct", "dollars_moved_pct", "population_changed", "triggered_by"} <= set(t) for t in art
+           if t["status"] == "run"), "MS2 the decision_tests artifact carries regret, dollars and population")
+    st = R["stability"]
+    ok(all(keys <= set(f) for f in st["folds"]) and {"stable_provision", "stable_absence", "by_component"}
+       <= set(st.get("components") or {}) and "regret_pct_worst_fold" in st["metrics"],
+       f"MS3 stability folds report what moves; stable provision apart from stable absence: {st.get('components')}")
+    ends = [r[e] for r in R["sensitivity"]["rows"] for e in ("low", "high")]
+    ok(ends and all(keys <= set(e) for e in ends), "MS4 each sensitivity end reports what moves and what triggered")
+    cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+    tid = CL._cid(run_[0]["test_id"])
+    need = {f"dt.{tid}.regret_pct", f"dt.{tid}.dollars", f"dt.{tid}.population", "stability.stable_provision",
+            "stability.stable_absence"}
+    ok(need <= cs, f"MS5 claims for regret, dollars, population and stable provision/absence: {sorted(need - cs)}")
+    txt = open(os.path.join(d, "results.md")).read()
+    ok("stable absence" in txt and "moves between components" in txt and "[CLAIM:" not in txt,
+       "MS6 results.md reports dollars moved and stable provision apart from stable absence")
+    figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]
+    e = next((f for f in figs if f["figure"] == "decision_tests"), None)
+    cols = set(next(csv.DictReader(open(os.path.join(d, e["table"]))), {})) if e else set()
+    ok({"regret_pct", "dollars_moved_pct", "triggered_by"} <= cols, f"MS7 the decision-test figure table: {cols}")
+    # a test below the share threshold changes the plan on regret when the regret threshold is low, and says so
+    A = R["_A"]
+    saved = copy.deepcopy(A.spec.raw["analysis"])
+    t = next(x for x in R["decision_tests"] if x.get("test_id") == "fitted_range_eff_a")
+    dt = {"id": t["test_id"], "type": "fitted_range", "parameter": "eff_a", "values": [0.3, 0.7], "automatic": True}
+    z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    try:
+        A.spec.raw["analysis"].update(share_threshold=1.0, regret_threshold=0.0, dollars_threshold=1.0)
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        pos = max(r.get("regret", 0) for r in rec["results"]) > 1e-9
+        ok(pos and rec["decision_changes"] is True and rec["triggered_by"] == ["regret"],
+           f"MS8 a positive regret above its threshold changes the plan on regret alone: {rec.get('triggered_by')}")
+        p = os.path.join(d, "models", "decision_tests", "ms8.yaml")
+        yaml.safe_dump(plain(rec), open(p, "w"), sort_keys=False)
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import mechanism_manifest as MM
+        got, probs = MM.load_test_result(d, "models/decision_tests/ms8.yaml")
+        ok(got is not None and not probs, f"MS9 the Phase 49 loader accepts a verdict set by regret: {probs}")
+        os.remove(p)
+        A.spec.raw["analysis"] = copy.deepcopy(saved)
+        A.set_reserve(0.8)      # enforce: re-optimisations stay within the reserved budget
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        spent = sum(cost0[i][plan[i]] for i in A.ids)
+        ok(all(spent + sum(r["dollars_by_component"].values()) <= A.plan_budget * (1 + 1e-9) for r in rec["results"]),
+           "MS10 with a reserve the re-solved plans' costs (point cost plus dollars by component) stay within it")
+        # Codex r1 P2-1: a smaller envelope makes the point plan unaffordable: a change, never NO_CHANGE
+        A.set_reserve(None)
+        env = {"id": "env_small", "type": "envelope", "values": [0.5 * float(A.budget)], "text": "a smaller envelope"}
+        rec = DT.run_one(A, env, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        r0 = rec["results"][0]
+        ok(r0["point_plan_feasible"] is False and r0["regret"] is None and "infeasible" in rec["triggered_by"]
+           and rec["decision_changes"] is True and r0["objective_gap"] < 0,
+           f"MS11 an envelope the point plan does not fit is a change ({rec.get('triggered_by')})")
+        ok(set(rec.get("worst_by_criterion") or {}) >= {"share", "regret", "dollars", "population"}
+           and all("value" in w for w in rec["worst_by_criterion"].values()),
+           "MS12 the result file names, for each criterion, its worst tested value with its own breakdown")
+    except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+        ok(False, f"MS8-MS12 the criteria on the toy ({type(e).__name__}: {e})")
+    finally:
+        A.spec.raw["analysis"] = saved
+        A.set_reserve(None)
+    es = next((f for f in figs if f["figure"] == "sensitivity"), None)
+    scols = set(next(csv.DictReader(open(os.path.join(d, es["table"]))), {})) if es else set()
+    ok("triggered_by" in scols, f"MS13 the sensitivity figure table names the criterion that changed the plan: {scols}")
+
+
 def _self_test_posterior(ok, q):
     """v2d β: the direct toy panel calibrated by `posterior` (declared priors, joint posterior sample)."""
     import tempfile
@@ -943,22 +1035,28 @@ def _self_test_stability_flagged(ok):
     """Codex r6 P1-3, P2: a flagged unit informs neither the held-out prediction nor the covariate scaling; a fold
     without enough unflagged training units is reported not_run, and the metrics are computed without it."""
     from toolkit.analysis import stability as SB
+    from toolkit.analysis.core import CostTable
+
+    def ct(ids):        # F6 S1-5: costs carry their split by component
+        return CostTable({i: [1.0, 2.0] for i in ids}, {i: [{}, {"c": 2.0}] for i in ids})
 
     class _A:
-        method, theta0 = "emulator_inversion", {}
+        method, theta0, region, budget = "emulator_inversion", {}, None, 10.0
+        pk, alloc = {0: frozenset(), 1: frozenset({"c"})}, {"units": {"populations": {"total": "pop"}}}
 
         def __init__(self, ids, xs, flagged):
             self.ids = list(ids)
-            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i]} for n, i in enumerate(ids)}
-            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}}}
+            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
+            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
+                         "options": {"components": {"c": {}}}}
             self.flagged, self.seen = flagged, {}
 
         def evaluate(self, theta, zh, hid):
             self.seen.update({i: zh[i] for i in hid})
-            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, {i: [1.0, 2.0] for i in hid}
+            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, ct(hid)
 
         def solve(self, ben, cost):
-            return {"choice": {i: 0 for i in self.ids}}
+            return {"choice": {i: 0 for i in self.ids}, "objective": sum(ben[i][0] for i in self.ids)}
 
         def guard(self, *a):
             pass
@@ -966,7 +1064,7 @@ def _self_test_stability_flagged(ok):
     xs = {i: float(k) for k, i in enumerate(ids)}
     z0 = {i: 0.1 * k for k, i in enumerate(ids)}
     ben = {i: [1.0, 0.5] for i in ids}
-    cost = {i: [1.0, 2.0] for i in ids}
+    cost = ct(ids)
     plan = {i: 0 for i in ids}
     xs_out = dict(xs, u11=1000.0)
     with_flag = _A(ids, xs_out, {"u11": {"reason": "toy"}})
