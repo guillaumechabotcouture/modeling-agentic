@@ -14,8 +14,7 @@ Every target carries a measurement model: sampling variance from its own interva
 variance and a model discrepancy variance. No source is ground truth: a target whose total sd is zero is refused.
 A source bias shared by the units of a group (bias_key: one block per source and group) is one latent offset per
 block, profiled like a unit parameter, not added to each target's variance (F6 S2-3; see _bias_witness). The best
-point weights each group of units once. Declared changes between two surveys are compared by group, observed against
-the engine at the best point (_change).
+point weights each group of units once.
 
 Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
 implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
@@ -237,11 +236,9 @@ class Target:
 class Problem:
     """shared: [Param]; unit_param: {name, lo, hi} or None; units: [ids]; features: {unit: [floats]} (each unit the
     same length; may be empty); targets: [Target]; scales: {observable: scale}. groups: a label per unit (figures and
-    the best point's weights). changes (F6 S2-3): [{id, pairs: {unit: (from target id, to target id)}, groups: {unit:
-    label}, weights: {unit: w} or None, mode: block | flag, reason}], the change between two surveys by group."""
+    the best point's weights)."""
 
-    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None,
-                 changes=None):
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None):
         self.shared = list(shared)
         self.unit_param = dict(unit_param) if unit_param else None
         self.units = [str(u) for u in units]
@@ -249,7 +246,6 @@ class Problem:
         self.features = {str(k): [float(x) for x in v] for k, v in (features or {}).items()}
         self.feature_names = list(feature_names or [])
         self.groups = {str(k): str(v) for k, v in (groups or {}).items()}      # a label per unit
-        self.changes = list(changes or [])
         self.scales = {}
         for t in self.targets:
             self.scales.setdefault(t.observable, t.scale)
@@ -308,33 +304,10 @@ class Problem:
                            f"profiled jointly; at most bias_blocks_max {mx}")
         return bad
 
-    def _change_problems(self) -> list:
-        bad, ids = [], {t.id: t for t in self.targets}
-        for n, c in enumerate(self.changes):
-            w = f"change {c.get('id', n) if isinstance(c, dict) else n}"
-            if not (isinstance(c, dict) and isinstance(c.get("pairs"), dict) and c["pairs"]):
-                bad.append(f"{w}: {{id, pairs: {{unit: (from target, to target)}}, groups, weights, mode, reason}}")
-                continue
-            gs, wt = c.get("groups") or {}, c.get("weights")
-            for u, ab in c["pairs"].items():
-                ta, tb = (ids.get(x) for x in ab) if isinstance(ab, (list, tuple)) and len(ab) == 2 else (None, None)
-                if not (ta and tb and ta.kind == tb.kind == "unit" and ta.unit == tb.unit == u and ta.scale == tb.scale
-                        and ta.id != tb.id):
-                    bad.append(f"{w}: unit {u}: needs two different unit targets of the unit on one scale ({ab!r})")
-                if not str(gs.get(u, "")).strip():
-                    bad.append(f"{w}: unit {u} has no group")
-                if wt is not None and not (isinstance(wt.get(u), (int, float)) and math.isfinite(wt[u]) and wt[u] > 0):
-                    bad.append(f"{w}: unit {u}: a weight > 0")
-            if c.get("mode", "block") not in ("block", "flag"):
-                bad.append(f"{w}: mode block or flag")
-            if c.get("mode") == "flag" and not str(c.get("reason") or "").strip():
-                bad.append(f"{w}: a declared change (mode flag) needs its reason")
-        return bad
-
     def problems(self) -> list:
         bad = []
         th = thresholds()["history_matching"]
-        bad += self._bias_problems(int(th["bias_blocks_max"])) + self._change_problems()
+        bad += self._bias_problems(int(th["bias_blocks_max"]))
         for p in self.shared:
             bad += p.problems()
         if len(set(self.names)) != len(self.names):
@@ -1504,63 +1477,6 @@ class HistoryMatch:
             out.update({bk: float(combos[i, j] * self.bsd[bk]) for j, bk in enumerate(blocks)})
         return out
 
-    def _change(self, ver) -> tuple:
-        """F6 S2-3: ([per declared change: the change between its two surveys by group], blocks). Observed: the
-        weighted mean over the group's units of (to - from) on the targets' scale; its sd from each target's sampling
-        sd and the shared offsets of the two sources (one per block, which do not average out). Modelled: the same
-        from the engine's verification runs at the best point; its sd from the emulators' run noise. Statuses:
-        no_clear_change, consistent, wrong_sign (the data show a direction and the model goes the other way beyond
-        noise), not_judged (no verification run). A wrong sign blocks unless declared (mode flag, with its reason);
-        not_judged always blocks (fail closed)."""
-        zc = float(thresholds()["change"]["sign_z"])
-        out, blocks = [], []
-        for c in self.P.changes:
-            byg = {}
-            for u in c["pairs"]:
-                byg.setdefault(str(c["groups"][u]), []).append(u)
-            rows, finds, nj = [], [], []
-            for g, us in sorted(byg.items()):
-                if not ver or any(u not in ver["units"] for u in us):
-                    nj.append(g)
-                    rows.append({"group": g, "units": len(us), "status": "not_judged"})
-                    continue
-                w = np.array([float(c["weights"][u]) if c.get("weights") else 1.0 for u in us])
-                w = w / w.sum()
-                obs, mod, v_obs, v_mod, blk = 0.0, 0.0, 0.0, 0.0, {}
-                for wi, u in zip(w, us):
-                    a, b = (self.tid[x] for x in c["pairs"][u])
-                    sim = {x["target"]: x["simulated"] for x in ver["units"][u]["targets"]}
-                    obs += wi * (b.y - a.y)
-                    mod += wi * float(tr(sim[b.id], b.scale) - tr(sim[a.id], a.scale))
-                    v_obs += wi ** 2 * (a.sd_obs ** 2 + b.sd_obs ** 2)
-                    for t in (a, b):
-                        if t.bias_key is None:
-                            v_obs += wi ** 2 * t.sd_bias ** 2
-                        else:
-                            blk[t.bias_key] = blk.get(t.bias_key, 0.0) + wi
-                        if self.th["include_run_noise"]:
-                            v_mod += wi ** 2 * self.em["unit"][t.observable].tn
-                v_obs += sum(s ** 2 * self.bsd[k] ** 2 for k, s in blk.items())
-                obs, mod = float(obs), float(mod)
-                so, sm = math.sqrt(v_obs), math.sqrt(v_mod)
-                st = ("no_clear_change" if abs(obs) <= zc * so else
-                      "wrong_sign" if mod * np.sign(obs) < -zc * sm else "consistent")
-                row = {"group": g, "units": len(us), "observed": round(obs, 5), "observed_sd": round(so, 5),
-                       "modelled": round(mod, 5), "modelled_noise_sd": round(sm, 5),
-                       "z_difference": round((mod - obs) / math.sqrt(v_obs + v_mod), 3), "status": st}
-                rows.append(row)
-                if st == "wrong_sign":
-                    finds.append(dict(row, **({"reason": c["reason"]} if c.get("mode") == "flag" else {})))
-            out.append({"id": c.get("id"), "mode": c.get("mode", "block"), "sign_z": zc, "groups": rows,
-                        "findings": finds, "not_judged": nj})
-            if finds and c.get("mode", "block") == "block":
-                blocks.append({"code": "change_wrong_sign", "detail": {"change": c.get("id"),
-                                                                       "groups": [f["group"] for f in finds]}})
-            if nj:
-                blocks.append({"code": "change_not_judged", "detail": {"change": c.get("id"), "groups": nj,
-                                                                       "why": "no engine verification run"}})
-        return out, blocks
-
     def report(self, valid) -> dict:
         P, st = self.P, self.state
         C, R = st["C"], st["region"]
@@ -1638,8 +1554,6 @@ class HistoryMatch:
                 units[u]["matched"] = False
             if bad or badt:
                 blocks.append({"code": "verification_failed", "detail": {"units": bad, "targets": badt}})
-        change, cblocks = self._change(ver)
-        blocks += cblocks
         bias = {k: {"offset": float(v[best_c]), "sd": self.bsd[k], "z": round(float(v[best_c]) / self.bsd[k], 4),
                     "units": len({t.unit for t in P.targets if t.bias_key == k}),
                     "offset_verified": ((ver or {}).get("bias") or {}).get(k)}
@@ -1690,7 +1604,7 @@ class HistoryMatch:
                 "units": units, "unmatched": unmatched, "conflicting": conflicting,
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
-                "verification": ver, "bias": bias, "change": change,
+                "verification": ver, "bias": bias,
                 "weighting": {"best_point": self.th.get("best_point_weighting", "per_group"),
                               "bias_grid": len(self.bgrid)},
                 "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
@@ -2304,7 +2218,7 @@ def _self_test() -> int:
            f"HM21 a top-up wave simulates only the units below the run count ({sorted(wave_units)})")
     safe(hm21, "HM21")
 
-    # F6 S2-3: shared offsets per (source, group), group-weighted best point, change between surveys by group
+    # F6 S2-3: shared offsets per (source, group), group-weighted best point
     def gtoy(per, f0, f1, obs, sd=0.03, md=0.02, sd_b=0.0, key=None, shared=None, zr=(-2.0, 2.0)):
         """Units in groups (per: {group: n}); unit targets w0, w1 with logit means f0(u, z, th), f1(u, z, th);
         obs(u, g) gives the two observed logits; key(t, g) the bias block of a target (None: independent)."""
@@ -2365,39 +2279,6 @@ def _self_test() -> int:
            f"(0.5), not at the large group's 0.37 ({e:.3f}, {r['status']})")
     safe(hm27, "HM27")
 
-    def hm28():          # the modelled change between surveys by group, against the observed change
-        f0 = lambda u, z, th: z  # noqa: E731
-        f1 = lambda u, z, th: z - th["d"]  # noqa: E731  -- the model can only fall between the two surveys
-        obs = lambda u, g: (0.0, 0.4 if g == "g2" else -0.3)  # noqa: E731
-        sh = [Param("d", 0.2, 0.4, "uniform", None, "toy")]
-
-        def mk(mode="block", reason=""):
-            P, sim = gtoy({"g0": 6, "g1": 6, "g2": 6}, f0, f1, obs, sd=0.15, md=0.03, shared=sh)
-            P.changes = [{"id": "d01", "pairs": {u: (f"{u}:w0", f"{u}:w1") for u in P.units}, "groups": P.groups,
-                          "weights": None, "mode": mode, "reason": reason}]
-            return P, sim
-        P, sim = mk()
-        r = calibrate(P, sim, seed=6, waves=1, log=q, candidates_log2=9, points_per_unit=12)
-        ch = (r.get("change") or [{}])[0]
-        gs = {x["group"]: x["status"] for x in ch.get("groups") or []}
-        ok(gs == {"g0": "consistent", "g1": "consistent", "g2": "wrong_sign"}
-           and any(b["code"] == "change_wrong_sign" and b["detail"]["groups"] == ["g2"] for b in r["blocks"]),
-           f"HM28a a group whose modelled change goes the wrong way beyond noise is a finding that blocks ({gs}, "
-           f"{[b['code'] for b in r['blocks']]})")
-        P, sim = mk("flag", "toy: declared by the owner")
-        r = calibrate(P, sim, seed=6, waves=1, log=q, candidates_log2=9, points_per_unit=12)
-        ch = (r.get("change") or [{}])[0]
-        ok(not any(b["code"].startswith("change_") for b in r["blocks"]) and ch.get("findings")
-           and all(f["reason"] == "toy: declared by the owner" for f in ch["findings"]),
-           f"HM28b declared (mode flag): the finding is reported with its reason and does not block ({ch.get('findings')})")
-        P, sim = mk()
-        h = HistoryMatch(P, sim, 6, q, candidates_log2=9, points_per_unit=12)
-        h.vth = dict(h.vth, run=False)
-        r = h.run(1)
-        ok(any(b["code"] == "change_not_judged" for b in r["blocks"]),
-           "HM28c without engine verification runs the change cannot be judged: a block, never a pass")
-    safe(hm28, "HM28")
-
     def hm29():          # refusals of the new declarations
         f = lambda u, z, th: z  # noqa: E731
         obs = lambda u, g: (0.0, 0.0)  # noqa: E731
@@ -2417,16 +2298,6 @@ def _self_test() -> int:
             P.targets.append(Target("gg", "group", "w0", 0.5, "logit", sd_obs=0.1, sd_bias=0.1,
                                     weights={P.units[0]: 1.0}, source="t", bias_key="k"))
         cases.append(("a bias block on a group target", c3))
-
-        def c4(P):
-            P.changes = [{"id": "c", "pairs": {P.units[0]: ("nope", f"{P.units[0]}:w1")}, "groups": P.groups,
-                          "weights": None, "mode": "block", "reason": ""}]
-        cases.append(("a change naming an unknown target", c4))
-
-        def c5(P):
-            P.changes = [{"id": "c", "pairs": {P.units[0]: (f"{P.units[0]}:w0", f"{P.units[0]}:w1")},
-                          "groups": P.groups, "weights": None, "mode": "flag", "reason": ""}]
-        cases.append(("a declared (flag) change without a reason", c5))
 
         def c6(P):
             u = P.units[0]

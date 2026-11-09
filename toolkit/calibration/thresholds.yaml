@@ -67,14 +67,6 @@ verification:
   # engine runs per unit at the best shared point: its best value of the unit parameter and values spread over the
   # rest of its non-implausible interval there; the unit passes when the engine matches at one of them
   z_points: 3
-change:
-  # F6 S2-3: the change between two surveys by group (calibration.joint.change), observed against the engine at the
-  # best point. The data show a direction when the group's observed change is beyond sign_z of its sd (sampling sd of
-  # each unit target, and the shared offsets of the two sources, which do not average out over the group's units); the
-  # modelled change has the wrong sign when it is beyond sign_z of its run-noise sd on the other side. 2 is about a
-  # two-sided 95% level. A wrong sign blocks unless the change is declared (mode flag, with a reason); a change that
-  # cannot be judged (no verification runs) always blocks.
-  sign_z: 2.0
 blocking:
   # Units that no point of the region matches block the analysis at the calibration step, before the outcome batch.
   # The harness never pins them at a bound silently; how to treat them is the owner's decision.

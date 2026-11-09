@@ -316,13 +316,8 @@ anchor as if they were independent, and the within-group contrasts that identify
   (b / sd)². Model discrepancy shared within a group makes its units' misfits far from independent, and per-group
   weights are the limit of full within-group correlation. The region does not depend on this weighting; only the
   verification point does.
-- **Change between surveys** (`calibration.joint.change`). This compares the modelled and observed change between
-  two unit targets, by group. The observed sd counts each target's sampling sd and the two sources' offsets, which do
-  not average out over the group. If the data show a direction beyond `change.sign_z` sd, and the engine at the best
-  point goes the other way beyond its run noise, that is a finding. It blocks unless it is declared (mode `flag`, with
-  a reason). A change with no verification runs cannot be judged, and it blocks.
 
-Part 2 (historical and future intervention parameters, and histories anchored to delivery surveys) needs an engine
+The change between surveys by group (a calibration diagnostic with a threshold) follows in S2-3b. Part 2 (historical and future intervention parameters, and histories anchored to delivery surveys) needs an engine
 parameter for past coverage. It follows separately.
 
 ### 5.4 Incremental rebuilds

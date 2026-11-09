@@ -28,9 +28,6 @@ The spec field (signed with the spec; without it nothing changes):
              ci: [lo_col, hi_col], ci_level, weights: <units column>, window, metric, scale, bias_sd, discrepancy_sd,
              source}
           - {id: <benchmark id>, kind: benchmark, discrepancy_sd}   # a fit target of the engine's own pack only
-        change:                       # optional: the change between two unit targets (surveys) by group, observed
-          - {id, from: <unit target id>, to: <unit target id>, by: <units column>, weights: <units column>,
-             mode: block | flag, reason}   # against the engine at the best point; a wrong sign blocks unless flagged
 
 A benchmark the engine's pack holds out (every id not in toolkit/engines/benchmark.py fit_targets) is refused: it
 never enters the fit (the PR #140 rule). Unit and group targets are simulated with the comparator package through
@@ -112,8 +109,7 @@ def spec_problems(spec) -> list[str]:
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
-                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
-                           "change"})
+                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
     sh = j.get("shared")
@@ -251,39 +247,6 @@ def spec_problems(spec) -> list[str]:
                 bad.append(f"{tw}: ci: [lo, hi] columns of the table, or sd")
     if len(set(ids)) != len(ids):
         bad.append(f"{w}.targets: repeated ids")
-    return bad + _change_problems(j.get("change"), tg, cols, raw["decision_units"].get("region"), w)
-
-
-def _change_problems(ch, targets, cols, region, w) -> list:
-    """calibration.joint.change (F6 S2-3): [{id, from, to, by, weights, mode, reason}], the change between two unit
-    targets (two surveys) by group: by a units column (default decision_units.region), weighted by a units column or
-    equally. A wrong sign blocks, unless declared: mode flag with a reason."""
-    if ch is None:
-        return []
-    ww = f"{w}.change"
-    if not isinstance(ch, list):
-        return [f"{ww}: a list of {{id, from, to, by, weights, mode, reason}}"]
-    units_t = {t.get("id"): t for t in targets if isinstance(t, dict) and t.get("kind") == "unit"}
-    bad = []
-    for n, c in enumerate(ch):
-        cw = f"{ww}[{n}]"
-        if not (isinstance(c, dict) and _text(c.get("id"))):
-            bad.append(f"{cw}: {{id, from, to, by, weights, mode, reason}}")
-            continue
-        unk = sorted(set(c) - {"id", "from", "to", "by", "weights", "mode", "reason"})
-        if unk:
-            bad.append(f"{cw}: unknown keys {unk}")
-        a, b = units_t.get(c.get("from")), units_t.get(c.get("to"))
-        if not (a and b and c["from"] != c["to"] and a.get("scale", "logit") == b.get("scale", "logit")):
-            bad.append(f"{cw}: from and to name two unit targets on one scale")
-        if c.get("by", region) not in cols:
-            bad.append(f"{cw}.by: no units column {c.get('by', region)!r} (default decision_units.region)")
-        if "weights" in c and c["weights"] not in cols:
-            bad.append(f"{cw}.weights: no units column {c['weights']!r}")
-        if c.get("mode", "block") not in ("block", "flag"):
-            bad.append(f"{cw}.mode: block or flag")
-        if c.get("mode") == "flag" and not _text(c.get("reason")):
-            bad.append(f"{cw}.reason: a declared change (mode flag) needs its reason")
     return bad
 
 
@@ -600,13 +563,9 @@ def build(spec, units=None) -> tuple:
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
           "scale": cal.get("scale", "log")}
     reg = spec.raw["decision_units"].get("region")
-    changes = [{"id": c["id"], "pairs": {i: (f"{c['from']}:{i}", f"{c['to']}:{i}") for i in ids},
-                "groups": {i: str(rows[i][c.get("by", reg)]) for i in ids},
-                "weights": {i: float(rows[i][c["weights"]]) for i in ids} if c.get("weights") else None,
-                "mode": c.get("mode", "block"), "reason": c.get("reason", "")} for c in j.get("change") or []]
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
-                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None, changes=changes)
+                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None)
     rec = [_observable(r, wins) for r in j.get("record") or []]
     return P, {"windows": wins, "dropped": dropped, "units": ids, "record": rec}
 
@@ -1030,12 +989,6 @@ def summary(rep) -> str:
                  f"(contraction95 {i95.get('contraction95')})")
     if rep["unmatched"] or rep["conflicting"]:
         L.append(f"  unmatched {len(rep['unmatched'])}, conflicting {len(rep['conflicting'])}")
-    for c in rep.get("change") or []:
-        n = {}
-        for g in c["groups"]:
-            n[g["status"]] = n.get(g["status"], 0) + 1
-        L.append(f"  change {c['id']} by group ({c['mode']}): {n}" + (f"; wrong sign in {[f['group'] for f in c['findings']]}"
-                                                                      if c["findings"] else ""))
     for b in rep["blocks"]:
         L.append(f"  block: {b['code']}")
     for s in rep.get("sensitivity") or []:
@@ -1550,7 +1503,7 @@ def _self_test() -> int:
         ok("unmapped:x" in h._inadequate(), "JA14c such a failure blocks the continuation")
     safe(ja14, "JA14")
 
-    def ja15():          # F6 S2-3: a shared offset per (source, group) and the change between surveys, from the spec
+    def ja15():          # F6 S2-3: a shared offset per (source, group), from the spec
         import yaml
         with tempfile.TemporaryDirectory() as d:
             p = _toy_joint(d, group=False)
@@ -1558,25 +1511,17 @@ def _self_test() -> int:
             j = raw["calibration"]["joint"]
             j["targets"][0].update(bias_sd=0.2, bias_by="region")
             j["targets"].append(dict(j["targets"][0], id="unit_t2", window=[2, 3]))
-            j["change"] = [{"id": "c12", "from": "unit_t", "to": "unit_t2", "weights": "pop"}]
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             P, _ = build(schema.load(p))
             u0 = [t for t in P.targets if t.id == "unit_t:0"][0]
-            ch = (getattr(P, "changes", None) or [{}])[0]
-            ok(getattr(u0, "bias_key", None) == "unit_t|r0" and u0.sd_bias == 0.2
-               and ch.get("pairs", {}).get("0") == ("unit_t:0", "unit_t2:0") and ch.get("groups", {}).get("0") == "r0"
-               and ch.get("weights", {}).get("0") == 1000.0 and ch.get("mode") == "block",
-               f"JA15a bias_by gives one offset per source and region; change pairs each unit's two targets "
-               f"({getattr(u0, 'bias_key', None)}, {ch})")
+            ok(getattr(u0, "bias_key", None) == "unit_t|r0" and u0.sd_bias == 0.2,
+               f"JA15a bias_by gives one offset per source and region ({getattr(u0, 'bias_key', None)})")
             bad_cases = [("bias_by names no units column", lambda j: j["targets"][0].update(bias_by="nope")),
                          ("bias_by without a bias sd", lambda j: j["targets"][0].update(bias_sd=0.0)),
                          ("bias_by on a group target", lambda j: j["targets"].append(
                              {"id": "g", "kind": "group", "csv": "x.csv", "value": "v", "weights": "pop", "sd": 0.1,
                               "key": {"csv": "region", "units": "region"}, "window": [1, 2], "metric": "prev",
-                              "source": "t", "bias_sd": 0.1, "bias_by": "region"})),
-                         ("a change from an unknown target", lambda j: j["change"][0].update({"from": "nope"})),
-                         ("a declared change without a reason", lambda j: j["change"][0].update(mode="flag")),
-                         ("a change by a column that is not a units column", lambda j: j["change"][0].update(by="x"))]
+                              "source": "t", "bias_sd": 0.1, "bias_by": "region"}))]
             for why, mut in bad_cases:
                 r2 = yaml.safe_load(open(p))
                 mut(r2["calibration"]["joint"])
@@ -1585,9 +1530,8 @@ def _self_test() -> int:
                 bad = spec_problems(schema.load(p2))
                 ok(bool(bad), f"JA15b refused: {why} ({bad[:2]})")
             rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
-            ok(set(rep.get("bias") or {}) == {f"{tid}|r{k}" for tid in ("unit_t", "unit_t2") for k in range(3)}
-               and len(rep.get("change") or []) == 1 and rep["change"][0]["groups"],
-               f"JA15c the toy run reports each block's offset and the change by region ({summary(rep)})")
+            ok(set(rep.get("bias") or {}) == {f"{tid}|r{k}" for tid in ("unit_t", "unit_t2") for k in range(3)},
+               f"JA15c the toy run reports each block's offset ({summary(rep)})")
     safe(ja15, "JA15")
 
     if fails:
