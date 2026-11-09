@@ -281,6 +281,8 @@ def validate_pending(s) -> list[str]:
             bad.append(f"calibration.targets: {t.get('csv')} unreadable: {e}")
     # uncertainty
     u = r["uncertainty"]
+    if isinstance(u, dict) and "affordability" in u:      # F6 S1-1: no allocation, so no plan cost to afford
+        bad.append("uncertainty.affordability: not supported for an estimates spec (it has no plan to afford)")
     srcs_k = [x.get("kind") for x in (u.get("sources") or []) if isinstance(x, dict)]
     exc = [x for x in (u.get("excluded") or []) if isinstance(x, dict)]
     for k in UQ_KINDS:

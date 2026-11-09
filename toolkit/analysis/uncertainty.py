@@ -161,7 +161,8 @@ def affordability(costs, budget: float, rule: dict | None = None, level: float =
     share = over / c.size
     met = None if not rule else bool(share <= float(rule["max_share_over_budget"]) + 1e-12)
     return {"budget_allocatable": b, "draws": int(c.size), "draws_over_budget": over, "share_over_budget": share,
-            "fixed_plan_cost": q(c, level), "rule": dict(rule) if rule else None, "rule_met": met}
+            "fixed_plan_cost": q(c, level), "per_draw_cost": [float(x) for x in c],
+            "rule": dict(rule) if rule else None, "rule_met": met}
 
 
 def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
@@ -191,7 +192,6 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
-        row["fixed_plan_cost"] = fixed_cost[-1]
         sol = A.solve(ben, cost)
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]])
         opt_vals.append(sol["objective"])

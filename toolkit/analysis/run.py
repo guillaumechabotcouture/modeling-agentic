@@ -450,7 +450,7 @@ def _self_test() -> int:
         rep0 = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
         ok("fixed_plan_cost" not in (rep0.get("scalar_outputs") or {}) and rep0.get("affordability") == af,
            "R5c one cost summary: the report carries affordability, not a second scalar summary (Codex S1-1 P2)")
-        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "claims_spec.yaml"))) or {}).get("claims", [])}
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
         ok("uq.share_over_budget" in cs and (cs.get("uq.fixed_plan_cost.median") or {}).get("interval")
            == R["uncertainty"]["interval"],
            "R5d claims: the share over budget, and cost quantiles labelled with the interval (Codex S1-1 P2)")

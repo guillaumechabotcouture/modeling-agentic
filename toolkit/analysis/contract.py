@@ -52,16 +52,34 @@ def _names_engine(run_dir: str) -> bool:
     return eng is not None and not (eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True))
 
 
-def _affordability(unc: dict) -> list[dict]:
-    """F6 S1-1: the spec's affordability rule, checked on the fixed plan's cost across the uncertainty draws. A rule
-    that is not met is a finding; no rule declared is reported in the artifact and not judged here."""
-    af = unc.get("affordability") or {}
-    if af.get("rule_met") is not False:
+def _affordability(run_dir: str, unc: dict) -> list[dict]:
+    """F6 S1-1: the signed spec's affordability rule, judged here from the artifact's counts (Codex round 1 P1): a
+    declared rule with no result or no draws, another rule in the artifact, a verdict the counts do not support, or a
+    share above the rule is a finding. Without a declared rule the share is reported in the artifact, not judged."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+        rule = ((raw.get("uncertainty") or {}) if isinstance(raw, dict) else {}).get("affordability")
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_affordability", f"{SPEC} unreadable for the affordability rule: {e}",
+                   "affordability")]
+    if not rule:
         return []
-    return [_f("analysis_contract_affordability",
-               f"analysis/uncertainty.yaml: the fixed plan exceeds the allocatable budget in {af.get('draws_over_budget')} "
-               f"of {af.get('draws')} uncertainty draws (share {af.get('share_over_budget'):.3f}); the spec allows at most "
-               f"{(af.get('rule') or {}).get('max_share_over_budget')}", "affordability")]
+    af = unc.get("affordability") or {}
+    F = lambda c: [_f("analysis_contract_affordability", f"analysis/uncertainty.yaml: {c}", "affordability")]  # noqa: E731
+    n, over = af.get("draws"), af.get("draws_over_budget")
+    if not isinstance(n, int) or n <= 0 or not isinstance(over, int) or not 0 <= over <= n:
+        return F(f"the spec declares an affordability rule ({rule}) but the artifact has no usable result "
+                 f"(draws {n!r}, over budget {over!r})")
+    if af.get("rule") != rule:
+        return F(f"the artifact judged the rule {af.get('rule')!r}, the signed spec declares {rule!r}")
+    met = over / n <= float(rule["max_share_over_budget"]) + 1e-12
+    if af.get("rule_met") is not met:
+        return F(f"the artifact's verdict rule_met={af.get('rule_met')!r} does not follow from {over} of {n} draws "
+                 f"over budget against at most {rule['max_share_over_budget']}")
+    if not met:
+        return F(f"the fixed plan exceeds the allocatable budget in {over} of {n} uncertainty draws (share "
+                 f"{over / n:.3f}); the spec allows at most {rule['max_share_over_budget']}")
+    return []
 
 
 def gate_findings(run_dir: str) -> list[dict]:
@@ -173,8 +191,7 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += estimates_test_findings(est_doc[0], est_doc[1], exp_ids if isinstance(exp_ids, list) else [])
     if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
-    if unc_doc is not None:
-        out += _affordability(unc_doc)
+    out += _affordability(run_dir, unc_doc or {})
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
