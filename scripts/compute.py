@@ -2288,21 +2288,30 @@ _FP_HASH_MB = 64           # files up to this size are fingerprinted by content,
 # F6 S1-8: the fingerprint covers code content only. The launch commit stamp changes with every commit (git archive
 # fills it in, .gitattributes export-subst), so with it any launch commit invalidated every stored batch (F5, 2026-11-08).
 _FP_REPO_SKIP = ("scripts/lib/code_commit.txt",)
-# Records the harness writes in the run after its engine batches, which no model reads: the analysis outputs under
-# models/ (toolkit/analysis: run.py, stability.py, claims.py, estimates.py, decision_tests.py), the v1 script outputs
-# there, and the input-check records under data/ (agents/enforcement.py SCRIPT_OUTPUTS). With them a resume after
-# ANALYZE looked stale (F5). An explicit list, never a guess: any other file under models/ or data/ is still hashed.
-# RU13 checks it against toolkit/analysis.
-FP_HARNESS_OUTPUTS = ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml",
-                      "models/eligibility_probe.yaml", "models/model_comparison_formal.yaml",
-                      "data/input_checks.json", "data/geometry_signoff.json")
-FP_HARNESS_DIRS = {"models/decision_tests/": (".yaml",)}     # these file types, directly in the directory
+# The fixed-name analysis outputs the v2 harness writes under models/ after its engine batch (toolkit/analysis run.py,
+# stability.py, claims.py, estimates.py); with them a resume after ANALYZE looked stale (F5). Exact paths, skipped only
+# in a v2 run (its spec, decision_spec.yaml, at the run root): a v1 run hashes everything, and every other file
+# (decision_tests/<id>.yaml included: its names are not fixed) is hashed (Codex P2-9 on #161).
+FP_HARNESS_OUTPUTS = ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml")
+# Dependency manifests at the repo root: a pin change changes what the code computes (Codex P2-8).
+FP_DEP_MANIFESTS = ("requirements.txt", "requirements-cloud.txt", "requirements-agent.txt")
 
 
-def _harness_output(rel: str) -> bool:
-    rel = rel.replace(os.sep, "/")
-    return rel in FP_HARNESS_OUTPUTS or any(rel.startswith(d) and "/" not in rel[len(d):] and rel.endswith(ext)
-                                            for d, ext in FP_HARNESS_DIRS.items())
+def _harness_output(run_dir: str, rel: str) -> bool:
+    return rel.replace(os.sep, "/") in FP_HARNESS_OUTPUTS and os.path.isfile(os.path.join(run_dir, "decision_spec.yaml"))
+
+
+def runtime_versions() -> dict:
+    """The orchestrating interpreter and the numerical packages it has, recorded with each batch (provenance)."""
+    import platform
+    from importlib import metadata
+    got = {"python": platform.python_version()}
+    for pkg in ("numpy", "scipy", "starsim", "sciris", "pandas"):
+        try:
+            got[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            pass
+    return got
 
 
 def fn_id(run_dir: str, fn_spec: str) -> str:
@@ -2320,8 +2329,9 @@ def fn_id(run_dir: str, fn_spec: str) -> str:
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
-    scripts/ and toolkit/ (code content only: never the commit stamp, F6 S1-8), except the harness's own records
-    (FP_HARNESS_OUTPUTS, FP_HARNESS_DIRS) and (outside data/) logs, figures, summaries, the ledger, the
+    scripts/ and toolkit/ (code content only: never the commit stamp, F6 S1-8) and its dependency manifests
+    (FP_DEP_MANIFESTS), except a v2 run's fixed-name analysis outputs (FP_HARNESS_OUTPUTS) and (outside data/) logs,
+    figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
     size and mtime. Any change and earlier rows are not reused. The spec is not in it: what a spec sets reaches a
@@ -2363,7 +2373,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
             in_run = root.startswith(run_dir + os.sep)
             for fn in fns:
                 p = os.path.join(dp, fn)      # S1-8: harness-written analysis outputs (explicit list); the stamp
-                if (_harness_output(os.path.relpath(p, run_dir)) if in_run else
+                if (_harness_output(run_dir, os.path.relpath(p, run_dir)) if in_run else
                         os.path.relpath(p, REPO).replace(os.sep, "/") in _FP_REPO_SKIP):
                     continue
                 is_output = fn + ".summary.json" in names     # another call's results file, any extension
@@ -2373,6 +2383,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
                                                       or (runner and fn in _FP_RUNNER_FILES)):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
+    files.update(os.path.join(REPO, m) for m in FP_DEP_MANIFESTS)     # missing ones are skipped below
     for ln in sorted(links):
         h.update(b"link:" + ln.encode() + b"\0")
     for f in sorted(files):
@@ -2522,6 +2533,11 @@ def _here_spec(rec: dict) -> str:
     return fid or rec["fn"]
 
 
+REUSE_NOTE = ("cache eligibility, conditional on identical inputs: a stored row is reused only for the same params, "
+              "and this check does not generate the next run's inputs; runtime_differs_here compares this "
+              "interpreter's packages with the one that recorded the batch, not the workers'")
+
+
 def reuse_report(run_dir: str) -> dict:
     """Would the code here reuse the stored rows under `run_dir`? For every stored batch (a `<out>.summary.json`, or
     the `<out>.partial.jsonl` an interrupted batch left): the ok rows stored, the rows run_map would keep (same
@@ -2553,10 +2569,12 @@ def reuse_report(run_dir: str) -> dict:
             why = "" if n >= len(stored) else (
                 "code fingerprint differs: code, data or a file under models/ changed"
                 if fp not in {h["code_fp"] for h in heads} else "recorded under another function")
+        rt = heads[0].get("runtime")
         batches.append({"out": os.path.relpath(out, run_dir), "fn": heads[0].get("fn_id") or heads[0]["fn"],
-                        "stored": len(stored), "reusable": n, "why": why})
+                        "stored": len(stored), "eligible": n, "why": why,
+                        "runtime_recorded": rt, "runtime_differs_here": bool(rt) and rt != runtime_versions()})
     return {"run_dir": run_dir, "stored": sum(b["stored"] for b in batches),
-            "reusable": sum(b["reusable"] for b in batches), "batches": batches}
+            "eligible": sum(b["eligible"] for b in batches), "note": REUSE_NOTE, "batches": batches}
 
 
 def run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
@@ -2653,7 +2671,8 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     summary = {**summary, "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
-               "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose")}
+               "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose"),
+               "runtime": runtime_versions()}
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
@@ -5183,10 +5202,11 @@ def main() -> int:
             ap.error("usage: compute.py reuse-check <run_dir> [--expect-all]")
         r = reuse_report(a.run_dir)
         for b in r["batches"]:
-            print(f"{b['out']}: {b['reusable']} of {b['stored']} stored rows reused"
+            print(f"{b['out']}: {b['eligible']} of {b['stored']} stored rows eligible for reuse"
                   + (f" ({b['why']})" if b["why"] else ""), file=sys.stderr)
+        print(f"({REUSE_NOTE})", file=sys.stderr)
         print(json.dumps(r))
-        return 1 if a.expect_all and r["reusable"] < r["stored"] else 0
+        return 1 if a.expect_all and r["eligible"] < r["stored"] else 0
     if a.cmd in ("status", "wait"):
         if not a.run_dir:
             ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")

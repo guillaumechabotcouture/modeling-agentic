@@ -237,6 +237,13 @@ def attach_existing(name, workspace, expected_id):
                                           wait_for_workers=False), expected_id)
 
 
+def task_state(key, dask_scheduler=None):
+    """On the scheduler (client.run_on_scheduler): the state of task `key`, or None if it does not hold it. The
+    launcher's acknowledgement that the scheduler accepted a run (run_cluster.wait_listed)."""
+    ts = dask_scheduler.tasks.get(key) if dask_scheduler is not None else None
+    return getattr(ts, "state", None)
+
+
 class SchedulerInfoUnavailable(RuntimeError):
     """The scheduler's worker table could not be read within the retry bound."""
 
