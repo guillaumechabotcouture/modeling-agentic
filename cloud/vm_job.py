@@ -634,6 +634,20 @@ def cmd_down(a):
 def _self_test() -> int:
     import tempfile
     fails = []
+    try:
+        import no_cloud
+        guarded = no_cloud.active()
+    except ImportError:
+        guarded = False
+    refused = False
+    if guarded:                       # never probed without the guard: unguarded, this would be a real call
+        try:
+            import coiled
+            coiled.list_clusters(workspace="w")
+        except RuntimeError:
+            refused = True
+    if not (guarded and refused):
+        fails.append("G2 vm_job's self-test runs under the shared refusing guard, and a real coiled call is refused")
 
     def ok(cond, msg):
         print(("PASS " if cond else "FAIL ") + msg)
@@ -1571,7 +1585,10 @@ def _self_test_run(ok) -> None:
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
-        return _self_test()
+        sys.path.insert(0, HERE)
+        import no_cloud
+        with no_cloud.refusing():          # no cloud call from a self-test (Codex round 3 on #161)
+            return _self_test()
     argv, command = split_command(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
