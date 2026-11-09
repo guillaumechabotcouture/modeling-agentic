@@ -759,6 +759,7 @@ def _self_test() -> int:
     _self_test_posterior(ok, q)
     _self_test_joint(ok, q)
     _self_test_stability_flagged(ok)
+    _self_test_variants(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -849,6 +850,72 @@ def _self_test_moves(ok, d, R):
     finally:
         A.spec.raw["analysis"] = saved
         A.set_reserve(None)
+
+
+def _self_test_variants(ok, q):
+    """F6 S1-6 on the toy: operational plan variants beside the unconstrained plan, then one of them as the headline."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        r["constraints"]["envelope_usd"] = 32000
+        r["analysis"]["decision_tests"] = []
+        r["analysis"]["plan_variants"] = {"variants": [
+            {"id": "service", "type": "minimum_service", "components": ["a", "b"], "text": "a service in every unit"},
+            {"id": "one_b", "type": "group_rule", "components": ["b"], "by": "region",
+             "text": "one decision on b per region"}]}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"PV-R1 a run with plan variants completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        art = os.path.join(d, "analysis", "plan_variants.yaml")
+        pv = (yaml.safe_load(open(art))["data"] if os.path.exists(art) else {})
+        v = {x["id"]: x for x in pv.get("variants") or []}
+        A = R["_A"]
+        reg = {i: A.by_id[i]["region"] for i in A.ids}
+        sv, ob = v.get("service") or {}, v.get("one_b") or {}
+        ok(pv.get("headline") == "unconstrained" and sv.get("status") == "solved" and sv.get("units_no_package") == 0
+           and sv.get("value_lost", -1) >= -1e-9 and sv.get("cost", 1e9) <= A.budget * (1 + 1e-9)
+           and pv["unconstrained"]["plan"] == R["point"]["plan"],
+           f"PV-R1 minimum service is solved beside the unconstrained (headline) plan: {sv.get('status')}, "
+           f"{sv.get('units_no_package')} unfunded, value lost {sv.get('value_lost')}")
+        ok(ob.get("status") == "solved" and all(len({"b" in A.pk[ob["plan"][i]] for i in A.ids if reg[i] == g}) == 1
+                                                for g in set(reg.values()))
+           and {"dollars_by_component", "dollars_moved", "value_lost_pct", "population_changed"} <= set(ob),
+           f"PV-R2 the group-rule variant takes one decision on b per region, with its value lost and dollars moved")
+        cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        need = {"variant.service.value_lost", "variant.service.value_lost_pct", "variant.service.dollars",
+                "variant.service.no_package", "variant.one_b.value_lost"}
+        txt = open(os.path.join(d, "results.md")).read()
+        ok(need <= cs and "## Plan variants" in txt and "[CLAIM:" not in txt,
+           f"PV-R3 claims and results.md report the variants: {sorted(need - cs)}")
+        ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")
+        _resign(d, lambda x: x["analysis"]["plan_variants"].update(headline="service"))
+        try:
+            R2 = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"PV-R5 a run whose headline is a variant completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        pv2 = yaml.safe_load(open(art))["data"]
+        s2 = {x["id"]: x for x in pv2["variants"]}["service"]
+        ok(pv2["headline"] == "service" and R2["point"]["plan"] == s2["plan"] == sv.get("plan")
+           and R2["point"].get("headline_variant") == "service" and R2["point"]["mix"]["no_package"] == 0
+           and pv2["unconstrained"]["plan"] == R["point"]["plan"],
+           f"PV-R5 headline: <variant> makes the variant's plan the headline; the unconstrained plan is still reported "
+           f"({R2['point'].get('headline_variant')})")
+        A2 = R2["_A"]
+        ok(all(not A2.feas["feasible"][i][A2.comp] for i in A2.ids) and A2.base_feas["feasible"][A2.ids[0]][A2.comp],
+           "PV-R6 with a variant headline every re-optimisation (draws, stability, sensitivity, tests) solves under its "
+           "rule: the analysis's feasibility excludes the comparator package, the unconstrained one is kept")
+        st = R2["stability"]
+        ok(st["components"]["by_component"] and all(x["units_changed"] >= 0 for x in st["folds"])
+           and contract.gate_findings(d) == [],
+           f"PV-R7 the contract checks pass with a variant headline: {contract.gate_findings(d)}")
 
 
 def _self_test_posterior(ok, q):
