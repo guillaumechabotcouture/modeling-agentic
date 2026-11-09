@@ -620,26 +620,25 @@ def _arm_records(pack: dict, runner, vals: dict) -> dict:
     return out
 
 
-def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, workers: int = 1, seeds=None) -> dict:
+def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, workers: int = 1, seeds=None,
+                    evidence=None) -> dict:
     """The run's benchmark pack with the spec values applied under each setting's own parameters (a setting's observed
     conditions win; review round 3, R3-3) and over the engine defaults, stamped by the benchmark runner for the engine
     the arms ran with. `engine` must be the run's engine (it is checked, not used)."""
     from toolkit.engines import benchmark as BM
-    from toolkit.engines.benchmark_sources import check_pack as band_sources
-    bad = band_sources(pack)
-    if bad:                             # F6 S1-2: a band that differs from its source is refused before any run
-        raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = evidence if evidence is not None else load_evidence(_pack_engine(pack), pack=pack)
+    if ev.problems:                      # S1-2b: sources and fitted values in use, before the spec or any arm
+        raise ValueError("benchmark pack: " + "; ".join(ev.problems))
     pe = _check_pack_engine(pack, spec, engine)
-    from toolkit.engines.benchmark_sources import engine_fitted_problems
-    if engine_fitted_problems(pe):
-        raise ValueError("benchmark pack: " + "; ".join(engine_fitted_problems(pe)))
     vals = values(spec)
-    runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
+    runner = BM.Runner(pack, pe, workers, seeds, base_params=vals, evidence=ev)     # the evidence it validated
     out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
     return BM.stamp(dict(out, spec_parameters=vals, arm_engines=_arm_records(pack, runner, vals)), pe)
 
 
-def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None) -> str:
+def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None,
+                         evidence=None) -> str:
     """The harness step: computes the arms at the run's spec values, writes SPEC_BENCH and its harness record
     SPEC_BENCH_RECORD (the file's digest, the spec values, the run's engine identity, and each arm's engine and
     configuration). Returns the file's path."""
@@ -651,7 +650,7 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
     from lib.safe_io import write_nofollow      # the trusted run root; no link followed, atomic publish
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
-    doc = spec_benchmarks(pack, spec.engine(), spec, fitted, workers, seeds)
+    doc = spec_benchmarks(pack, spec.engine(), spec, fitted, workers, seeds, evidence=evidence)
     write_nofollow(run_dir, SPEC_BENCH, yaml.safe_dump(doc, sort_keys=False).encode(), atomic=True)
     path = os.path.join(run_dir, SPEC_BENCH)
     rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
@@ -712,15 +711,9 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
     out = list(doc.get("benchmarks") or [])
-    from toolkit.engines.benchmark_sources import TOY_ENGINE_REFS, pack_evidence_problems
-    try:
-        pack, why = benchmark_pack(engine)
-    except PackError as e:
-        pack, why = None, str(e)
-    if pack is None:          # F6 S1-2: rows are trusted only against the engine's own pack (a self-test toy has none)
-        return (out, None) if _ref_of(spec) in TOY_ENGINE_REFS else ([], f"no benchmark pack to check the rows ({why})")
-    bad = pack_evidence_problems(pack, out, engine)
-    return ([], "; ".join(bad) + f"; {how}") if bad else (out, None)
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(engine, rows=out, partial=True)   # S1-2b: the engine's own pack (a toy may have none)
+    return ([], "; ".join(ev.problems) + f"; {how}") if ev.problems else (ev.rows, None)
 
 
 def rows(spec, engine) -> list[dict]:
@@ -902,18 +895,17 @@ def _cli(argv) -> int:
     ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
-    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
-    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
-    from toolkit.engines.benchmark_sources import fitted_problems
-    if os.path.exists(fp) and fitted_problems(f, pack):      # F6 S1-2: fitted values the pack's bands no longer back
-        print("; ".join(fitted_problems(f, pack)))
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(_pack_engine(pack), pack=pack)     # S1-2b: the full pack's evidence, whatever --only runs
+    if ev.problems:
+        print("; ".join(ev.problems))
         return 2
     if a.only:
         keep = set(a.only.split(","))
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
-    fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
+    fitted = {k: v[2] for k, v in ev.fitted.items()}
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
-    out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds)
+    out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds, evidence=ev)
     print(f"wrote {out} and {SPEC_BENCH_RECORD}")
     return 0
 
@@ -1241,7 +1233,7 @@ def _self_test() -> int:
         from toolkit.engines import benchmark as BM
         pk = yaml.safe_load(open(os.path.join(ROOT, "toolkit", "engines", "malaria", "benchmarks", "pack.yaml")))
         eng = BM.load_engine(pk["engine"], (pk.get("configs") or {}).get(pk.get("default_config")))
-        rn = BM.Runner(pk, eng, 1, [1], base_params={"net_retention_half": 273.75})
+        rn = BM.Runner(pk, eng, 1, [1], base_params={"net_retention_half": 273.75}, mode="fit")   # arm parameters only
         mul = rn._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2]
         coch = rn._arm_jobs("coch_pyr", {"irs_kill": 0.4})[0][2]
         own = pk["settings"]["muleba"]["params"]["net_retention_half"]        # engine v0.9: 841.3 days (v0.8: 949)
@@ -1250,7 +1242,7 @@ def _self_test() -> int:
            f"EP36 the real B15 setting keeps its own observed net retention (Muleba, from its trial) under a spec value; a "
            f"setting without one takes the spec value; fitted values still apply: {mul.get('net_retention_half')}, "
            f"{coch.get('net_retention_half')}")
-        rn0 = BM.Runner(pk, eng, 1, [1])
+        rn0 = BM.Runner(pk, eng, 1, [1], mode="fit")
         ok(rn0._arm_jobs("mul_pyr", {"irs_kill": 0.4})[0][2] == dict(pk["settings"]["muleba"]["params"], irs_kill=0.4),
            "EP37 without spec values the arm parameters are unchanged (the setting's, then the fitted values)")
     guard("EP36-EP37 setting precedence", precedence_cases)

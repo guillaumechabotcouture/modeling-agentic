@@ -136,7 +136,8 @@ class EmulatorModel:
         # Codex P1-6: the design domain. The calibrated attribute and the fitted parameters span their declared
         # design box (calibration.range, engine-card ranges); unit features span what the design points contain.
         self.input_names = ["z"] + self.param_names + list(self.features)
-        fr = {q.name: (q.lo, q.hi) for q in spec.engine().parameters() if q.kind == "fitted"}
+        from toolkit.analysis.batch import fitted_ranges          # S1-2b: through the evidence snapshot
+        fr = {k: (v[0], v[1]) for k, v in fitted_ranges(spec.engine()).items()}
         fr.update({k: (p.lo, p.hi) for k, p in want.items()})
         fr.update({k: tuple(v) for k, v in (design.get("spec_value_ranges") or {}).items()})
         fr.update({k: tuple(v) for k, v in (design.get("design_ranges") or {}).items() if k in fr})   # test values

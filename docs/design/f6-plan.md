@@ -177,9 +177,9 @@ runs for a sample of LGAs at the boundary values.
 | Step | Owner | Target | Status |
 |---|---|---|---|
 | O1–O4 | owner | O3 and O4 this week; O1 and O2 before Stage 2 | O3 answered 2026-11-08: "keep within budget"; the F6 spec will carry an affordability rule (proposed: at most 5% of draws over budget); the optimiser mode that meets it (a budget reserve, `uncertainty.affordability.enforce`) is in #157 (S1-1b) |
-| S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 in review (#154) |
-| S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 merged (#156); S1-5 in review (#162) |
-| S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | S1-3 merged (#159); S1-6 in review |
+| S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 merged (#154); S1-2b merged (#158) |
+| S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 merged (#156); S1-5 merged (#162); S1-7 in review (#160) |
+| S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | S1-3 merged (#159); S1-6 in review (#163); S1-8 merged (#161: launch handover, code-only fingerprint, `reuse-check`; real smoke passed, cases A and B, 2026-11-09) |
 | S2-1 to S2-5 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
