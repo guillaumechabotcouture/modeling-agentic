@@ -14,7 +14,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
-  band_sha256: 9b8694f72ddec571faf3f17dbbeb68169f7fa0693fed69abe07f26eeacc55c11
+  band_sha256: 56ad86a2fcf1b2c80256aceb0e75846c6ad157f15627177f16e03f1c75951994
   computed: 1.3
   reference: 1.3000004960871179
   error_abs: 4.960871178294468e-07
@@ -32,7 +32,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
-  band_sha256: 436c91b995241fe9d642a1fdbee898300cc10d6efce58560c24b724576dda4b3
+  band_sha256: f68e78c07b4e5dbb74f7be63933d4e9d71e49366f6958389eaaf0e7cff25d011
   computed: 2.5
   reference: 2.4999996772739044
   error_abs: 3.2272609562511434e-07
@@ -50,7 +50,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B 274:599
-  band_sha256: e1471c8d906a7dfee78694dc3f4d803f87542675e868d4d79af19176368b01bf
+  band_sha256: e0ccda5e8daaa800f3c58b75bbeb28ba6a9a6e2fc564fc7eb041b181e5fc9cfb
   computed: 0.8
   reference: 0.8000008596511359
   error_abs: 8.596511358316405e-07
@@ -68,7 +68,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack & McKendrick (1927); fixed point
-  band_sha256: 9043264e296344a424ea32af1111784aaed85fa23ec9ce2fa63bee18be6a7706
+  band_sha256: 6e8c0503e317735985391e6d644cc6ac01bfd30a41a74ee5be35206d037ae201
   computed: 0.5828116439806399
   reference: 0.5828116439806399
   error_abs: 0.0
@@ -86,7 +86,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack & McKendrick (1927); fixed point
-  band_sha256: ff2a1355d3786344d71ffff5af0e4533eb3c40ae4d153b620c7fff9226b0c402
+  band_sha256: 36f300950cc9cbac5017691f1712394bc4fe187bfda29eccac21dc19b170ccd8
   computed: 0.9801725977397572
   reference: 0.980172597739757
   error_abs: 2.220446049250313e-16
@@ -104,7 +104,7 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Britton (2013), ch. 1
-  band_sha256: 9decdde7475f7a7292fc5ada492617862d3d267dccc7c8af67a9a8ffef9ffac0
+  band_sha256: e9e54af63aa9948bdfe09aa9b9a1467b746d971ed6fde18b95ee4c2b81743464
   computed: 0.49888865957827905
   reference: 0.4988886595782783
   error_abs: 7.216449660063518e-16
@@ -122,7 +122,7 @@ benchmarks:
   target: null
   band: null
   source: exponential-survival identity
-  band_sha256: 163b05e6eb9f9531296ad6c651db7be886d4b8c60404732bc32117b9ceaf916c
+  band_sha256: 5c1f3173e3c51e0c3fed40ca75d3ecfd5aa63830d10eb96c86e3e05ebe9f4d28
   computed: 0.7968121293623034
   reference: 0.7968121293623036
   error_abs: 2.220446049250313e-16
@@ -141,7 +141,7 @@ benchmarks:
   target: null
   band: null
   source: design note v2d, Codex review finding 2
-  band_sha256: c097660e01d8e0fe02745384ece9f9084a2415b19c95c5136cd541378e8027e7
+  band_sha256: 48f6a47281d61d705bac0e088532b3467cb90f59df15ac00b90a49fc8eb5c656
   computed: 0.8687075595459232
   reference: 0.7968121293623036
   error_abs: 0.07189543018361955
@@ -160,7 +160,7 @@ benchmarks:
   target: null
   band: null
   source: exponential-survival identity
-  band_sha256: ae8000fc0908c4dd486d8b1c6a4891ecfc541e61467db65eef63015d6880d57b
+  band_sha256: 0b6b99d1d4e00e3cdc4a33e3a3e4176426d8073e2a5fe1dcc440fdac7ad76ce8
   computed: 0.7968121293623038
   reference: 0.7968121293623036
   error_abs: 2.220446049250313e-16
@@ -178,7 +178,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: a4e259d649decfce35c8044ce33d9400b27add0b5176ea87ff5d43e0bb1a6893
+  band_sha256: 281a2decf9b5ed9f2070a9f2916e1e46d10dcdff2ba5105c654d023bf5062c62
   computed: 0.5296758273296579
   reference: 0.5296758273296579
   error_abs: 0.0
@@ -196,7 +196,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  band_sha256: e8b9abcb3a122de20a1341456dc3324ad8e06681f8f3c94b40030104c9b2b98a
+  band_sha256: 57d216f1c6593f76d7b220d895946575884fc8acbc4dbf7061e6e5dc5b24d16c
   computed: 0.5296758273296579
   reference: 1.0
   error_abs: 0.4703241726703421
@@ -215,7 +215,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 5bcb5f8b962ce2767c13803da127f1198cffd20f36a640c8b025a4b8afdd4e75
+  band_sha256: 9866580115b0ced5dfefa1d155f6411f6e05cffaa2652fb4071544efd8a4871b
   computed: 0.49256269510491524
   reference: 0.4925626951049153
   error_abs: 5.551115123125783e-17
@@ -234,7 +234,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 85778c66f02ae96404928bf012ce73918046837c50cac890886f1467e464e878
+  band_sha256: 846df1c8167661a8883ad603a82f576340cc508283e95fb8b332050314bc4bad
   computed: 1.294240671755704
   reference: 1.294240671755704
   error_abs: 0.0
@@ -253,7 +253,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 410d86322a3c181c2ba74ef0a523e8496ddae5ed63d300f90e72df2c2ef04ebf
+  band_sha256: e476a3b28026ceaef80569a08393ff7caf8282c07f488f625031a9e1f6f01e5d
   computed: 0.7765444030534224
   reference: 0.7765444030534224
   error_abs: 0.0
@@ -273,7 +273,7 @@ benchmarks:
   target: null
   band: null
   source: identity of the renewal equation in S/N
-  band_sha256: b92e9bf8eed216238e3af456e595c40343c60260b754656b6f6841b700f607b7
+  band_sha256: 62eefa206a871fb87f8b7bc104c114dc5ac037896aab098a6d4030ab5f195c4f
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -292,7 +292,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) Am J Epidemiol 178:1505
-  band_sha256: 4bc772ae1b21fd67c14d828b88376db9b8df29a670b8bc52891c86787c8516af
+  band_sha256: 685f9753455b68c862359ab218ebad3dc2ee38f69134c01431ff449d78c1ca60
   computed: 0.0003043138673866075
   reference: 0.01
   error_abs: 0.009695686132613393
@@ -311,7 +311,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) Am J Epidemiol 178:1505
-  band_sha256: 8d319c4e300392e299f9a5eec28ea2ecaa96b6d3e2703b14285d67d1fc29674f
+  band_sha256: f3b01919f0c3406b370a5a5ceb893ed237e77bd4f7f0575d39f1b14a92dd8856
   computed: 0.9
   reference: 0.9306521739130434
   error_abs: 0.030652173913043423
@@ -330,7 +330,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) Am J Epidemiol 178:1505
-  band_sha256: d1f1e612cfa80e21a4656223e5503531e8f7b945bf85310dd13cc2471df7f652
+  band_sha256: f46c969fa910fdc1d90f42153c7a3dc9add02e59551260004530d4e6c64449dd
   computed: 0.9306521739130434
   reference: 0.99
   error_abs: 0.059347826086956545
@@ -349,7 +349,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) Am J Epidemiol 178:1505, web appendix
-  band_sha256: 2f5e11e2187f9135f561b41f130eb57b343debb37a737a8ae692a58b3f2b7955
+  band_sha256: e47f808e9f37c5f10b83fd5f59ae4233e7e4e6214411ca9c46af26fed78a2bce
   computed: 2.220446049250313e-16
   reference: 0.0
   error_abs: 2.220446049250313e-16
@@ -368,7 +368,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's reference implementation
-  band_sha256: 2f01f3f2ba5d5669ddab23de4d32454c72e58076b9230940d726c5d3c67783e5
+  band_sha256: 94eb54c5701284104e421f4833fd5a96d0905d0d488e18a8dfb657623897c1c5
   computed: 1.649999976568264
   reference: 1.65
   error_abs: 2.3431735884926752e-08
@@ -387,7 +387,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's reference implementation
-  band_sha256: ab6b9ad4d60bae7adca976cb508e5e06febd6192b409327f297864959abf4985
+  band_sha256: f405ff220c695380d76a2ea08bd4a4231f94a7465ec9520514db48dc910d7e0b
   computed: 0.030000000524392244
   reference: 0.03
   error_abs: 5.243922449049698e-10
@@ -405,7 +405,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's reference implementation
-  band_sha256: b0473928a371d80538a06cd68198adae201eb123f991b27ced42819b6c1f71dc
+  band_sha256: 6063da7b30273893f492fc8fe7ec949ffd967da6a6c2823771a6e336c788c780
   computed: 0.5576282312615415
   reference: 0.5576282187178642
   error_abs: 1.2543677319065694e-08
@@ -424,7 +424,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's reference implementation
-  band_sha256: 04ba30dc601dc0f1f92b214d8b5565b54c46a1039372a3c0736acca817e4769b
+  band_sha256: 7a6b7475ee0129f6f5e39b461bbda2b0202a968c74af16ba3a7f7c7b12272ef8
   computed: 1.500182690381747e-11
   reference: 0.0
   error_abs: 1.500182690381747e-11
@@ -442,7 +442,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's reference implementation
-  band_sha256: 9ea91101fa3be9e99b42c25bfa8a2d2227a3776c10f398825b7f9a229fb92a91
+  band_sha256: a4d3d145bff45f5411113368bfb4bedc3e160cb075b21a7b5edc72275b8ce20d
   computed: 0.688225983923731
   reference: 0.6882259839237311
   error_abs: 1.1102230246251565e-16
@@ -461,7 +461,7 @@ benchmarks:
   band: null
   source: Cori et al. (2013) Am J Epidemiol 178:1505, worked examples (1918 pandemic
     influenza, SARS 2003, measles 1861)
-  band_sha256: 48e57946e53c1a497d59fcf33f5381e1d65d1255e593b404a175d496fef93247
+  band_sha256: 135b516497e1e208a60bdf95fa833fd0265be752a7e726da00e93579578e4191
   computed: null
   in_band: false
   status: not_assessable
@@ -556,4 +556,4 @@ summary:
   held_out_total: 25
 engine_version: '0.1'
 fit_rule: null
-wall_s: 2.5
+wall_s: 5.0
