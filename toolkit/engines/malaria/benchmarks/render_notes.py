@@ -214,9 +214,10 @@ def write(path=NOTES) -> None:
     if new is None:
         raise SystemExit("results.yaml missing: run the pack first")
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
-    from toolkit.engines.benchmark_sources import fitted_problems, stale_ids
+    from toolkit.engines.benchmark import load_engine
+    from toolkit.engines.benchmark_sources import load_evidence
     pack = _y(os.path.join(HERE, "pack.yaml")) or {}
-    stale = stale_ids(pack, new.get("benchmarks") or []) + fitted_problems(_y(os.path.join(HERE, "fitted.yaml")), pack)
+    stale = list(load_evidence(load_engine(pack.get("engine")), pack=pack, rows=new.get("benchmarks") or []).problems)
     if stale:                      # F6 S1-2: no verification claim from results the pack's bands no longer back
         raise SystemExit(f"stale benchmark evidence, not rendered: {stale} (refit and re-run, or rescore)")
     block = render(new, _y(os.path.join(HERE, "history", "results_v0.1-spike.yaml")),

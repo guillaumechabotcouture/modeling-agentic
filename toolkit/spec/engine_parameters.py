@@ -625,14 +625,11 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     conditions win; review round 3, R3-3) and over the engine defaults, stamped by the benchmark runner for the engine
     the arms ran with. `engine` must be the run's engine (it is checked, not used)."""
     from toolkit.engines import benchmark as BM
-    from toolkit.engines.benchmark_sources import check_pack as band_sources
-    bad = band_sources(pack)
-    if bad:                             # F6 S1-2: a band that differs from its source is refused before any run
-        raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(_pack_engine(pack), pack=pack)    # S1-2b: sources and fitted values in use, before any arm
+    if ev.problems:
+        raise ValueError("benchmark pack: " + "; ".join(ev.problems))
     pe = _check_pack_engine(pack, spec, engine)
-    from toolkit.engines.benchmark_sources import engine_fitted_problems
-    if engine_fitted_problems(pe):
-        raise ValueError("benchmark pack: " + "; ".join(engine_fitted_problems(pe)))
     vals = values(spec)
     runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
     out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
@@ -712,15 +709,9 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
     out = list(doc.get("benchmarks") or [])
-    from toolkit.engines.benchmark_sources import TOY_ENGINE_REFS, pack_evidence_problems
-    try:
-        pack, why = benchmark_pack(engine)
-    except PackError as e:
-        pack, why = None, str(e)
-    if pack is None:          # F6 S1-2: rows are trusted only against the engine's own pack (a self-test toy has none)
-        return (out, None) if _ref_of(spec) in TOY_ENGINE_REFS else ([], f"no benchmark pack to check the rows ({why})")
-    bad = pack_evidence_problems(pack, out, engine)
-    return ([], "; ".join(bad) + f"; {how}") if bad else (out, None)
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(engine, rows=out)  # S1-2b: against the engine's own pack (a self-test toy may have none)
+    return ([], "; ".join(ev.problems) + f"; {how}") if ev.problems else (ev.rows, None)
 
 
 def rows(spec, engine) -> list[dict]:
@@ -902,16 +893,15 @@ def _cli(argv) -> int:
     ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
-    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
-    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
-    from toolkit.engines.benchmark_sources import fitted_problems
-    if os.path.exists(fp) and fitted_problems(f, pack):      # F6 S1-2: fitted values the pack's bands no longer back
-        print("; ".join(fitted_problems(f, pack)))
+    from toolkit.engines.benchmark_sources import load_evidence
+    ev = load_evidence(_pack_engine(pack), pack=pack)     # S1-2b: the fitted values in use, with current provenance
+    if ev.problems:
+        print("; ".join(ev.problems))
         return 2
     if a.only:
         keep = set(a.only.split(","))
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
-    fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
+    fitted = {k: v[2] for k, v in ev.fitted.items()}
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
     out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds)
     print(f"wrote {out} and {SPEC_BENCH_RECORD}")

@@ -116,8 +116,7 @@ TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rul
 COMPARE_TYPES = ("value", "identity")
 COMPARES = ("eq", "le", "differ")
 STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
-from toolkit.engines.benchmark_sources import (TOY_ENGINE_REFS, band_digest, fit_declarations,  # noqa: E402
-                                             fitted_problems, pack_evidence_problems, stale_ids)
+from toolkit.engines.benchmark_sources import band_digest, fit_declarations, load_evidence  # noqa: E402
 JOINT_RULES = {
     "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
                 "target's log value; infeasible targets dropped; argmin (n out of band, band-scaled squared log "
@@ -540,10 +539,12 @@ def _spread(per) -> dict:
 
 class Runner:
     def __init__(self, pack: dict, engine, workers: int = 1, seeds=None, base_params: dict | None = None):
+        pack = load_evidence(engine, pack=pack).pack        # S1-2b: a validated copy (problems checked below)
         from toolkit.engines.benchmark_sources import check_pack as band_sources
         bad = band_sources(pack)
         if bad:                             # F6 S1-2: no runner scores a band that differs from its source
             raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
+        self._decl = {b["id"]: b for b in pack.get("benchmarks") or []}
         self.pack, self.engine, self.workers = pack, engine, workers
         # values under every setting's own parameters (a spec's engine parameter values, toolkit/spec/
         # engine_parameters.py): they replace engine defaults, never a setting's observed conditions
@@ -677,6 +678,11 @@ class Runner:
         return {a: self.cache[(a, key)] for a in arms}
 
     def evaluate(self, b: dict, fitted: dict) -> dict:
+        cur = self._decl.get(b.get("id") if isinstance(b, dict) else b)
+        if cur is None or (isinstance(b, dict) and b != cur):     # S1-2b: only the validated pack's declarations
+            raise ValueError(f"evaluate: {b.get('id') if isinstance(b, dict) else b} is not the validated pack's "
+                             "declaration")
+        b = cur
         e = b["estimand"]
         if e["type"] in COMPARE_TYPES:
             return self._compare(b, fitted)
@@ -1125,8 +1131,7 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         r = runner.evaluate(b, fitted)
         row = {"id": b["id"], "metric": b["metric"], "role": "fit" if b["id"] in fit_ids else "held_out",
                "target": b.get("target"), "band": b.get("band"), "source": b.get("source", "")}
-        if band_digest(b, pack) is not None:
-            row["band_sha256"] = band_digest(b, pack)
+        row["band_sha256"] = band_digest(b, pack)
         if b.get("requires"):
             row["requires"] = b["requires"]
         if b["id"] in infeasible:
@@ -1197,17 +1202,13 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
         return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
         return [], f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
-    rows = list(doc.get("benchmarks") or [])
     pp = os.path.join(os.path.dirname(path), "pack.yaml")
-    ref = f"{type(engine).__module__}:{type(engine).__name__}"
-    if not os.path.exists(pp):
-        return (rows, None) if ref in TOY_ENGINE_REFS else ([], f"no pack.yaml beside {os.path.basename(path)}")
     try:
-        pack = yaml.safe_load(open(pp))
+        pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
     except (OSError, yaml.YAMLError) as e:
         return [], f"{os.path.basename(pp)} beside the results is unreadable: {e}"
-    bad = pack_evidence_problems(pack if isinstance(pack, dict) else {}, rows, engine)
-    return ([], f"{os.path.basename(path)}: {'; '.join(bad)}") if bad else (rows, None)
+    ev = load_evidence(engine, pack=pack, rows=list(doc.get("benchmarks") or []))
+    return ([], f"{os.path.basename(path)}: {'; '.join(ev.problems)}") if ev.problems else (ev.rows, None)
 
 
 def refusal_share_max(e: dict, pack: dict) -> float:
@@ -1261,11 +1262,13 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
             raise ValueError(f"rescore: the stored results have another {k}")
     cur = {b["id"]: b for b in pack["benchmarks"]}
     old = {b["id"]: b for b in previous_pack["benchmarks"]}
+    ev = load_evidence(engine, pack=pack, rows=[r for r in doc.get("benchmarks") or []
+                                                if (cur.get(r["id"]) or {}).get("estimand", {}).get("type") != "coverage"])
+    if ev.problems:              # S1-2b: only coverage rows are re-scored; any other stale row needs a rerun
+        raise ValueError(f"rescore: {'; '.join(ev.problems)}")
     rows = []
     for r in doc.get("benchmarks") or []:
         b = cur.get(r["id"])
-        if b is not None and band_digest(b, pack) is not None and r.get("band_sha256") != band_digest(b, pack):
-            raise ValueError(f"rescore: rerun required: {r['id']} was scored against another band declaration")
         if b is None or b["estimand"]["type"] != "coverage":
             rows.append(r)
             continue
@@ -1366,9 +1369,9 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
                 raise ValueError(f"merge: {b['id']} was computed for another declaration")
             if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
                 raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
-    stale = stale_ids(pack, [r for r in rows.values() if r["id"] in ids])
-    if stale:
-        raise ValueError(f"merge: rerun required: {', '.join(stale)} (scored against other band declarations)")
+    ev = load_evidence(engine, pack=pack, rows=[r for r in rows.values() if r["id"] in ids])
+    if ev.problems:
+        raise ValueError(f"merge: {'; '.join(ev.problems)}")
     miss = [i for i in ids if i not in rows]
     extra = sorted(set(rows) - set(ids))
     if miss or extra:
@@ -1445,12 +1448,12 @@ def main(argv=None) -> int:
                                    "band_declarations": fit_declarations(pack)}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
-        fp = os.path.join(d, "fitted.yaml")
-        f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
-        if os.path.exists(fp) and fitted_problems(f, full_pack):     # F6 S1-2: never run on stale fitted values
-            print("; ".join(fitted_problems(f, full_pack)))
+        ev = load_evidence(eng, pack=full_pack)      # S1-2b: the fitted values in use, with current provenance
+        if ev.problems:
+            print("; ".join(ev.problems))
             return 2
-        fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
+        f = yaml.safe_load(open(eng.fitted_path)) if ev.fitted_sha256 else {}
+        fitted = {k: v[2] for k, v in ev.fitted.items()}
         out = run_pack(pack, eng, runner, fitted, f)
         out["engine_version"] = eng.describe().version
         out["fit_rule"] = (f.get("fit_rule") or {}).get("version")

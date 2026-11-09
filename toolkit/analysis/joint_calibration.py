@@ -483,11 +483,12 @@ def build(spec, units=None) -> tuple:
     cal = spec.raw["calibration"]
     from toolkit.analysis.batch import fitted_ranges
     dr = PRI.drawn(spec)
-    fr = {p.name: p for p in spec.engine().parameters() if p.kind == "fitted"}
+    eng_ = spec.engine()
+    fitted_ranges(eng_)                          # S1-2b: refuses fitted values without current provenance
+    fr = {p.name: p for p in eng_.parameters() if p.kind == "fitted"}
     shared = [HM.Param(n, dr[n].lo, dr[n].hi, dr[n].dist, dr[n].value, dr[n].source) if n in dr else
               HM.Param(n, fr[n].lo, fr[n].hi, "uniform", fr[n].value, f"engine card fitted range ({fr[n].source})")
               for n in j["shared"]]
-    _ = fitted_ranges
     rows = {str(r[spec.uid]): r for r in spec.units()}
     ids = [i for i in spec.unit_ids() if units is None or i in set(units)]
     missing = sorted(set(units or []) - set(rows))
