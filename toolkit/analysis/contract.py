@@ -91,6 +91,59 @@ def _affordability(run_dir: str, unc: dict) -> list[dict]:
     return []
 
 
+def reserve_findings(rule, point: dict, unc: dict) -> list[dict]:
+    """F6 S1-1b (Codex r1 P2): with `enforce`, point.yaml must carry the reserve the plan was solved in, consistent with
+    the artifacts: the published plan is the reserve's affordable plan; f x budget is the planned budget and the rest
+    is held back; the reserve's draws and seed are the uncertainty step's, which re-optimised at the planned budget;
+    its counts agree with the uncertainty step's affordability; and the affordable plan meets the rule."""
+    if not (isinstance(rule, dict) and rule.get("enforce") is True):
+        return []
+    F = lambda c: [_f("analysis_contract_reserve", f"analysis/point.yaml: {c}", "reserve")]  # noqa: E731
+
+    def num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    rv = (point or {}).get("reserve")
+    if not isinstance(rv, dict):
+        return F("the spec enforces the affordability rule but the point artifact has no reserve record")
+    aff, af_u = rv.get("affordable") or {}, (unc or {}).get("affordability") or {}
+    f, b, bp, held = rv.get("fraction"), rv.get("budget_allocatable"), rv.get("budget_planned"), rv.get("reserve_usd")
+    if not all(num(x) for x in (f, b, bp, held)) or not 0 < f <= 1:
+        return F(f"the reserve's fraction and budgets are not usable ({f!r}, {b!r}, {bp!r}, {held!r})")
+    tol = 1e-9 * max(1.0, abs(b))
+    out = []
+    if aff.get("plan") != point.get("plan"):
+        out += F("the published plan is not the reserve's affordable plan")
+    if num(point.get("budget_allocatable")) and abs(point["budget_allocatable"] - b) > tol:
+        out += F(f"the reserve's allocatable budget {b} is not the point's {point['budget_allocatable']}")
+    if abs(bp - f * b) > tol or abs(held - (b - bp)) > tol:
+        out += F(f"the reserve's arithmetic does not add up: {f} x {b} vs planned {bp}, held back {held}")
+    if rv.get("rule") != rule:
+        out += F(f"the reserve was searched under {rv.get('rule')!r}, the signed spec declares {rule!r}")
+    if rv.get("draws") != unc.get("draws") or rv.get("seed") != unc.get("seed"):
+        out += F(f"the reserve's draws ({rv.get('draws')!r}, seed {rv.get('seed')!r}) are not the uncertainty step's "
+                 f"({unc.get('draws')!r}, seed {unc.get('seed')!r})")
+    if not num(unc.get("budget_planned")) or abs(unc["budget_planned"] - bp) > tol:
+        out += F(f"the uncertainty step re-optimised at {unc.get('budget_planned')!r}, not the planned budget {bp}")
+    if (aff.get("draws_over_budget"), aff.get("share_over_budget")) != (af_u.get("draws_over_budget"),
+                                                                        af_u.get("share_over_budget")):
+        out += F(f"the reserve's count ({aff.get('draws_over_budget')!r} over) disagrees with the uncertainty step's "
+                 f"affordability ({af_u.get('draws_over_budget')!r} over)")
+    sh = aff.get("share_over_budget")
+    if not num(sh) or sh > float(rule["max_share_over_budget"]) + 1e-12:
+        out += F(f"the reserve's affordable plan is over budget in a share {sh!r} of draws; the spec allows at most "
+                 f"{rule['max_share_over_budget']}")
+    return out
+
+
+def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+        rule = ((raw.get("uncertainty") or {}) if isinstance(raw, dict) else {}).get("affordability")
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_reserve", f"{SPEC} unreadable for the affordability rule: {e}", "reserve")]
+    return reserve_findings(rule, point or {}, unc or {})
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -102,7 +155,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc = None, None, None
+    cal_doc, unc_doc, est_doc, pt_doc = None, None, None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -184,6 +237,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             cal_doc = (rel, doc.get("data") or {})
         if kind == "uncertainty":
             unc_doc = doc.get("data") or {}
+        if kind == "point":
+            pt_doc = doc.get("data") or {}
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -201,6 +256,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _affordability(run_dir, unc_doc or {})
+    out += _reserve(run_dir, pt_doc, unc_doc or {})
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
