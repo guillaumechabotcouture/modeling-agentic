@@ -3143,7 +3143,7 @@ def _self_test_s18_smoke_a(ok) -> None:
     import tempfile
     import types
     from unittest import mock
-    M, P = sys.modules[__name__], mock.patch.object
+    M, P, g = sys.modules[__name__], mock.patch.object, globals()
     built, sec_calls = [], []
 
     def no_ctor(**kw):
@@ -3165,7 +3165,7 @@ def _self_test_s18_smoke_a(ok) -> None:
         def run_on_scheduler(self, fn, *a):
             return None
 
-    def go(state, cid_listed=77, recorded=77):
+    def go(state, cid_listed=77, recorded=77, cc=None):
         with tempfile.TemporaryDirectory() as d:
             cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2")
             json.dump({"run": {"name": "lt", "id": recorded}, "invocation": "I", "status": "launched"},
@@ -3178,7 +3178,7 @@ def _self_test_s18_smoke_a(ok) -> None:
                 try:
                     rc = ack_probe(cfg, lister=lambda: listing,
                                    security_fn=lambda cid: sec_calls.append(cid) or ("sec", {"address_to_use": "tls://s:1"}),
-                                   client_cls=FakeClient)
+                                   client_cls=cc or FakeClient)
                 except SystemExit as e:
                     rc = ("exit", str(e.code))
                 except TypeError as e:
@@ -3196,6 +3196,18 @@ def _self_test_s18_smoke_a(ok) -> None:
         rc, out = go(st)
         ok(rc == 0 and sec_calls == [77] and not built and "acknowledged by future finished" in out,
            f"A2 ack-probe connects by the recorded id ({st}) and reports the fast task's acknowledgement: {rc} {out[-160:]!r}")
+    # the rerun of case A: the probe saw the id running, then the cluster stopped while it connected
+    class Lost(FakeClient):
+        def submit(self, fn, pure=False, key=None):
+            raise OSError("ConnectionPool closing")              # distributed's CommClosedError is an OSError
+
+    def timeout_client(*a, **k):
+        raise TimeoutError("Timed out trying to connect to tls://s:1 after 60 s")
+    for cc, what in ((timeout_client, "a connect timeout"), (Lost, "a closed connection pool")):
+        rc, out = go("running", cc=cc)
+        ok(rc == g.get("EXIT_PROBE_LOST", "unset") and rc not in (0, 1) and
+           "the run cluster stopped while ack-probe was connecting: no acknowledgement evidence" in out
+           and "Traceback" not in out, f"A4 {what} while ack-probe connects fails cleanly with its own code: {rc} {out[-200:]!r}")
     # confirm_keeper: a run cluster that has stopped ends the wait at once
     sleeps, reads = [], []
 
