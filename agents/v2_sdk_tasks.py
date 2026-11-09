@@ -121,7 +121,9 @@ interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
-Limitations section that repeats each declaration. Output: manuscript.md and {out} = {{"ok": true}}.""",
+Limitations section that repeats each declaration in full with its required remedy. In both modes the
+report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
+.claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
@@ -407,8 +409,12 @@ class SdkTasks:
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
                                                            settings=_settings_text(), out=OUT), "Make the fix.", owns)
 
-    def write(self, run_dir, mode):
-        return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT), "Write the draft.", OWNS["write"])
+    def write(self, run_dir, mode, feedback=None):
+        fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
+              "uses acceptance language. Rewrite these passages (say what was tested and what is declared), "
+              "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
+        return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
+                             OWNS["write"])
 
 
 def _self_test() -> int:

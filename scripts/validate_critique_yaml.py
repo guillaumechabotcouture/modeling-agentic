@@ -801,6 +801,7 @@ def decide(critiques: dict[str, dict], max_rounds: int,
                     "target_stage": b["target_stage"],
                     "first_seen_round": b["first_seen_round"],
                     "claim": b["claim"],
+                    "fix_requires": b.get("fix_requires"),   # F6 S1-7: the remedy travels with the claim
                     "kind": "critique_blocker",
                     "scope_declarable": True,
                 })
@@ -2849,15 +2850,31 @@ def _apply_done_when(decision: dict, critiques: dict, run_dir: str, max_rounds: 
         decision["done_when_error"] = f"{type(e).__name__}: {e}"
         return decision, {"error": decision["done_when_error"]}
     decision["done_when_status"] = res["status"]
+    # F6 S1-7: passed, failed and not judged are counted apart; an open HIGH whose test is not judged
+    # cannot yield ACCEPT (the v2 machine also requires MEDIUM: stage_machine.require_judged).
+    decision["check_summary"] = done_when.summary(res["status"], required=("HIGH",))
     if not res["resolved"]:
-        return decision, res
+        return _require_judged(decision, max_rounds, current_round), res
     passed = set(res["resolved"])
     decision["unresolved_high"] = [
         b for b in decision.get("unresolved_high") or []
         if not (b.get("kind") == "critique_blocker" and str(b.get("id")) in passed)]
     decision["resolved_by_test"] = sorted(passed)
     _drop_attempts(decision, passed)
-    return _recompute_action(decision, max_rounds, current_round), res
+    return _require_judged(_recompute_action(decision, max_rounds, current_round), max_rounds, current_round), res
+
+
+def _require_judged(decision: dict, max_rounds: int, current_round: int) -> dict:
+    """F6 S1-7: ACCEPT never stands on a required test that is not judged (a backstop: the finding is
+    normally still open and blocks by itself)."""
+    nj = (decision.get("check_summary") or {}).get("required_not_judged") or []
+    if decision.get("action") != "ACCEPT" or not nj:
+        return decision
+    decision.setdefault("accept_blockers", []).append({
+        "reviewer": "done-when", "id": "REQ-NJ", "kind": "required_check_not_judged", "target_stage": "CRITIQUE",
+        "scope_declarable": True, "first_seen_round": current_round,
+        "claim": f"Required test(s) not judged: {', '.join(nj)}. Not judged is not a pass."})
+    return _recompute_action(decision, max_rounds, current_round, "required checks not judged")
 
 
 def _passing_tests(run_dir: str, round_n) -> set:
@@ -4038,7 +4055,7 @@ def _check_persistent_medium_escalation(run_dir: str,
             if persisted < _CRITIQUE_BLOCKER_ESCALATION_THRESHOLD:
                 continue
             blocker_id = blocker.get("id", "<unknown>")
-            short_claim = str(blocker.get("claim") or "").strip().split("\n")[0][:140]
+            short_claim = " ".join(str(blocker.get("claim") or "").split())   # F6 S1-7: in full
             out.append({
                 "kind": f"{blocker_id}_persistent",
                 "severity": "HIGH",

@@ -136,6 +136,13 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _quarantine_report(run_dir: str) -> None:
+    """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
+    a linked report.md is refused, a link at the destination is replaced)."""
+    from lib.safe_io import rename_nofollow
+    rename_nofollow(run_dir, "report.md", "report_withheld.md")
+
+
 def _put(run_dir: str, rel: str, text: str) -> None:
     """A harness file in the run dir, published atomically with no link followed (lib.safe_io; review round 4)."""
     from lib.safe_io import write_nofollow
@@ -253,7 +260,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     import pipeline as P
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
-        "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
+        "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*")
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
@@ -450,7 +457,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
-                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or "")[:300]})
+                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
+                        "fix_requires": _remedy(b)})
     critic_open = {o["id"] for o in out}
     seen = set()
     for v in decision.get("rigor_violations") or []:
@@ -465,8 +473,33 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         seen.add(fid)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
                     "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
-                    "claim": str(v.get("claim") or "")[:300]})
+                    "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
     return out
+
+
+_remedy, short_label = FL.remedy, FL.short_label
+MAX_LANGUAGE_REPAIRS = 2
+
+
+def require_judged(d: dict, opened: list | None = None) -> dict:
+    """F6 S1-7: passed, failed and not-judged tests are counted apart (`check_summary`), and a required
+    test (an open HIGH or MEDIUM finding's) that is not judged cannot yield ACCEPT: the finding is
+    declared (rule 3j), like an open finding with no test the fix loop can work to (rule 3m)."""
+    import done_when as DW
+    summ = DW.summary(d.get("done_when_status") or {}, required=("HIGH", "MEDIUM"))
+    d = dict(d, check_summary=summ)
+    nj = summ["required_not_judged"]
+    if d.get("action") != "ACCEPT" or not nj:
+        return d
+    if opened is not None:
+        have = {o["id"] for o in opened}
+        opened += [{"id": i, "source": "done-when", "severity": (d["done_when_status"].get(i) or {}).get("severity"),
+                    "tested": False, "claim": str((d["done_when_status"].get(i) or {}).get("detail") or ""),
+                    "fix_requires": None} for i in nj if i not in have]
+    d.update(action="DECLARE_SCOPE", rule_matched="3j", declared_open=list(nj),
+             rationale=(f"{len(nj)} required test(s) are not judged ({', '.join(nj)}): not judged is not a pass, "
+                        "so they are declared in the write-up (declared_findings.yaml), not accepted."))
+    return d
 
 
 def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool) -> dict:
@@ -499,8 +532,10 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
     _put(run_dir, DECLARED_FILE, yaml.safe_dump({
         "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
-        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"], "claim": o["claim"]}
-                     for o in opened]}, sort_keys=False))
+        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
+                      "label": short_label(o["claim"]), "claim": o["claim"],
+                      "required_remedy": o.get("fix_requires"), "tested": bool(o.get("tested"))}
+                     for o in opened]}, sort_keys=False, width=10**6))
 
 
 # ---- provenance of inputs
@@ -667,6 +702,30 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     return out
 
 
+def report_acceptance_findings(run_dir: str, write_mode: str | None) -> list[dict]:
+    """F6 S1-7: a declared-scope or not-accepted write-up uses no acceptance language (the terms are in
+    .claude/orchestration/acceptance_language.yaml; the check is scripts/writer_qa.py's). MEDIUM: a
+    write-up fix the loop can make, declared when it cannot."""
+    if write_mode not in ("declared", "not_accepted"):
+        return []
+    try:
+        text = open(os.path.join(run_dir, "manuscript.md")).read()
+    except OSError:
+        return []
+    try:
+        import writer_qa as WQ
+        hits = WQ.acceptance_language_hits(text, "completed_scope_declared" if write_mode == "declared" else "not_accepted")
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        hits = [f"the check could not run ({type(e).__name__}: {e})"]
+    if not hits:
+        return []
+    return [{"kind": "report_acceptance_language", "severity": "MEDIUM", "stage": "WRITE", "target_stage": "WRITE",
+             "key": "acceptance", "scope_declarable": True,
+             "claim": (f"The write-up is {'declared scope' if write_mode == 'declared' else 'not accepted'} but uses "
+                       f"acceptance language ({len(hits)}): " + "; ".join(hits)
+                       + ". Say what was tested and what is declared.")}]
+
+
 _SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}
 
 
@@ -831,6 +890,7 @@ class Machine:
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
+            self._withhold_if_acceptance_language()
             self._finish()
         save_state(self.run_dir, self.st)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
@@ -1241,14 +1301,19 @@ class Machine:
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
+                d = require_judged(d, opened)
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
             if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
                 # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
                 write_declared(self.run_dir, opened, d)
-                if pw and self._has_draft():
-                    render_report(self.run_dir, self.backend)
+            if self.st.v2_rules and pw and d.get("action") and self._has_draft():
+                # The final status heads the report; a not-accepted one records any acceptance language.
+                fst = route_gate(d, pw)[1]
+                render_report(self.run_dir, self.backend, status=fst or "pending")
+                if fst is not None and fst not in ACCEPTED_STATUSES:
+                    d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -1264,6 +1329,21 @@ class Machine:
                         led[fid].blocking = True
                 FL.save(self.run_dir, led)
         nxt, status, mode = route_gate(d, pw)
+        lang = (d or {}).get("report_acceptance_language") or {}
+        if nxt == "FINAL" and lang.get("remaining"):
+            # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
+            # goes through the whole post-write path again (presentation, every post-write check, this gate);
+            # once the repairs are used, the report is withheld.
+            if lang["repairs"] < MAX_LANGUAGE_REPAIRS:
+                self.st.tries["language"] = lang["repairs"] + 1
+                self.st.tries["language_feedback"] = lang["remaining"]
+                self.st.write_mode = lang["mode"]
+                # Quarantined until a repaired draft passes the whole post-write gate.
+                _quarantine_report(self.run_dir)
+                return self._go("WRITE", f"acceptance language in a {lang['mode']} report: the writer repairs it")
+            _quarantine_report(self.run_dir)
+            return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
+                            "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
             n = self.st.tries.get("schema", 0) + 1
             self.st.tries["schema"] = n
@@ -1286,6 +1366,13 @@ class Machine:
         if nxt == "WRITE":
             self.st.write_mode = mode
         return self._go(nxt, why, status)
+
+    def _language_check(self, status: str) -> dict:
+        """F6 S1-7: acceptance language in the whole manuscript of a report the final gate did not accept, with
+        the repairs used so far (MAX_LANGUAGE_REPAIRS at most; each goes back through the post-write path)."""
+        mode = "declared" if status == "completed_scope_declared" else "not_accepted"
+        found = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
+        return {"mode": mode, "repairs": int(self.st.tries.get("language", 0)), "remaining": found}
 
     def h_FIX_LOOP(self):
         v = self._visit()
@@ -1315,7 +1402,9 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
-        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, writeup=True)
+        fb = self.st.tries.pop("language_feedback", None)      # a language repair (F6 S1-7)
+        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
+                         writeup=True)
         if res is None:
             return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
@@ -1341,6 +1430,17 @@ class Machine:
             except (OSError, ValueError):
                 continue
         return None
+
+    def _withhold_if_acceptance_language(self) -> None:
+        """F6 S1-7: whatever path ends the run, a report it did not accept is never left deliverable with
+        acceptance language in it: report.md is moved to report_withheld.md."""
+        rp = os.path.join(self.run_dir, "report.md")
+        if (not self.st.v2_rules or self.st.status in ACCEPTED_STATUSES or not os.path.exists(rp)
+                or not report_acceptance_findings(self.run_dir, "not_accepted")):
+            return
+        _quarantine_report(self.run_dir)
+        if str(self.st.status).startswith("completed"):
+            self.st.status = "completed_no_report"
 
     def _finish(self) -> None:
         meta_p = os.path.join(self.run_dir, "metadata.json")
@@ -1483,9 +1583,33 @@ def _pre_engine_check(spec: dict) -> list[str]:
     return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec]
 
 
-def render_report(run_dir: str, backend=AB) -> str:
-    """report.md = the writer's draft plus the blocks the harness renders from artifacts: the
-    headline numbers, the declared limits (verbatim), and the deliverable file the spec names."""
+ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+STATUS_MARK = "<!-- harness: run status -->"
+
+
+def _status_line(run_dir: str, status: str | None) -> str:
+    """F6 S1-7: the run status, from .claude/orchestration/acceptance_language.yaml (a declared-scope
+    run reads "declared scope, not accepted"). Without a status: the run state's, else the write mode's."""
+    if status is None:
+        try:
+            st = load_state(run_dir)
+        except (OSError, ValueError, TypeError):
+            st = None
+        status = (st.status or {"declared": "completed_scope_declared", "not_accepted": "not_accepted"}.get(
+            st.write_mode or "", "pending")) if st else "pending"
+    try:
+        import writer_qa as WQ
+        lines = WQ.load_acceptance_language()["status_lines"]
+    except Exception:  # noqa: BLE001 -- fail closed: never reads as accepted
+        lines = {}
+    text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"
+    return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
+
+
+def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
+    """report.md = the run status line, the writer's draft, and the blocks the harness renders from
+    artifacts: the headline numbers, the declared limits and open findings (in full, with their
+    required remedy), and the deliverable file the spec names."""
     import yaml
     draft = open(os.path.join(run_dir, "manuscript.md")).read()
     lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
@@ -1508,23 +1632,38 @@ def render_report(run_dir: str, backend=AB) -> str:
               f"Could not be rendered from analysis/engine.yaml: {type(e).__name__}: {e}", ""]
     if sv:
         lines += [""] + sv[:-1]
-    try:
-        decl = (yaml.safe_load(open(os.path.join(run_dir, "scope_declaration.yaml"))) or {}).get("declarations") or []
-    except OSError:
-        decl = []
-    if decl:
-        lines += ["", "## Declared limits (rendered verbatim from scope_declaration.yaml)", ""]
+    decl, sd_find = [], []
+    if os.path.exists(os.path.join(run_dir, "scope_declaration.yaml")):
+        try:   # every shape the gate reads, each entry's full text (lib.scope_declarations)
+            from lib import scope_declarations as SD
+            _doc, decl, sd_find = SD.load(run_dir)
+        except Exception as e:  # noqa: BLE001 -- fail closed: the report says so
+            SD, sd_find = None, [{"claim": f"{type(e).__name__}: {e}"}]
+    if decl or sd_find:
+        lines += ["", "## Declared limits (rendered in full from scope_declaration.yaml)", ""]
+        lines += [f"- scope_declaration.yaml could not be read: {f.get('claim')}" for f in sd_find]
         for e in decl:
-            lines.append(f"- **{e.get('id')}** ({e.get('blocker_id')}): {e.get('why_unresolved', '')} "
-                         f"Impact: {e.get('impact_on_conclusions', '')}")
+            ids = [str(x) for k in SD.STRUCTURED_ID_FIELDS
+                   for x in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)]) if x]
+            text = " ".join(f"{f.replace('_', ' ').capitalize()}: {' '.join(str(e[f]).split())}"
+                            for f in SD.JUSTIFICATION_FIELDS if e.get(f))
+            fix = _remedy(e)
+            lines.append(f"- **{e.get('id') or 'unnamed'}** ({', '.join(ids) or 'no finding named'}): "
+                         f"{text or 'no text given.'}" + (f" Required remedy: {fix}" if fix else ""))
     try:
         dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
     except OSError:
         dec2 = {}
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
-        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']}" for e in dec2["declared"]]
-    _put(run_dir, "report.md", draft.rstrip() + "\n" + "\n".join(lines) + "\n")
+        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
+                  f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    full = head + body + "\n".join(lines) + "\n"
+    _put(run_dir, "report.md", full)
+    # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
+    _write_json(run_dir, "report_render.json", {"report_sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
+                                                "writer_span": [len(head), len(head) + len(body)]})
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
 
@@ -1902,7 +2041,10 @@ def _self_test() -> int:
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
             ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed",
-               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s})")
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s}"
+               + ("" if s == "completed" else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+                  f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
+                  f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
 
@@ -2338,6 +2480,189 @@ def _self_test() -> int:
         ok(rc not in (0, None) and st70 == "awaiting" and rc2 == 0 and _SO.status(d70) == "signed",
            f"T70 stage_machine.py sign --expect-sha256 refuses another spec's sha and signs the shown one "
            f"(rc {rc}, {st70}; rc {rc2}, {_SO.status(d70)})")
+        # T80-T83 (F6 S1-7): declared findings keep their full text and remedy; not judged is not a pass;
+        # a declared-scope report says so and uses no acceptance language. The fixture mimics F5's three
+        # declarations whose claims were cut mid-sentence (D-003, R-001, R-002).
+        import yaml
+        f80 = os.path.join(td, "t80")
+        os.makedirs(f80)
+        longc = {i: (f"{i}: the effect used for this component is a fixed value with no cited source, and the "
+                     "chosen package in each unit depends on it; " * 4 + f"END-{i}.") for i in ("D-003", "R-001", "R-002")}
+        fix = {i: "Replace the fixed value with a sourced range and rerun the decision test; " * 3 + f"FIX-{i}."
+               for i in longc}
+        jd = [{"file": "manuscript.md", "exists": True}, {"judgement": "a sourced range is used"}]
+        for fn, ids in (("critique_domain.yaml", ["D-003"]), ("critique_redteam.yaml", ["R-001", "R-002"])):
+            yaml.safe_dump({"blockers": [{"id": i, "severity": "MEDIUM", "target_stage": "MODEL", "resolved": False,
+                                          "first_seen_round": 1, "claim": longc[i], "fix_requires": fix[i],
+                                          "done_when": jd} for i in ids]}, open(os.path.join(f80, fn), "w"))
+        yaml.safe_dump({"schema_version": 1}, open(os.path.join(f80, AB.SPEC_FILE), "w"))
+        open(os.path.join(f80, "manuscript.md"), "w").write("The plan is described here.\n")
+        try:
+            op80 = open_findings(f80, {"action": "ACCEPT", "rigor_violations": []})
+            g80 = apply_medium_rule({"action": "ACCEPT"}, op80, rounds_remaining=0, budget_ok=True)
+            write_declared(f80, op80, g80)
+            dec80 = yaml.safe_load(open(os.path.join(f80, DECLARED_FILE)))["declared"]
+            ok(g80["action"] == "DECLARE_SCOPE" and len(dec80) == 3
+               and all(e["claim"] == longc[e["id"]] and e.get("required_remedy") == fix[e["id"]]
+                       and 0 < len(e.get("label") or "") <= 160 for e in dec80),
+               f"T80 declared_findings.yaml keeps each full claim and required remedy, with a separate short label "
+               f"({[(e['id'], len(e['claim']), bool(e.get('required_remedy'))) for e in dec80]})")
+            sdc = "SD-1 text: the decision depends on an unsourced effect, " * 8 + "END-SD."
+            yaml.safe_dump({"declarations": [{"id": "SD-1", "blocker_id": "D-003", "claim": sdc,
+                                              "description": "DESC-SD", "fix_requires": "REMEDY-SD"}]},
+                           open(os.path.join(f80, "scope_declaration.yaml"), "w"))
+            render_report(f80, AB, status="completed_scope_declared")
+            rep80 = open(os.path.join(f80, "report.md")).read()
+            ok(all(longc[i] in rep80 and fix[i] in rep80 for i in longc)
+               and all(x in rep80 for x in (sdc, "DESC-SD", "REMEDY-SD"))
+               and os.path.exists(os.path.join(f80, "report_render.json"))
+               and "Run status: declared scope, not accepted" in rep80.split("\n\n")[0],
+               "T81 the report repeats each declared finding and each scope declaration in full with its remedy, "
+               "under a 'declared scope, not accepted' status line, and records its harness blocks")
+        except Exception as e:  # noqa: BLE001 -- the α tests fail, they do not crash the suite
+            ok(False, f"T80/T81 raised {type(e).__name__}: {e}")
+        try:
+            open(os.path.join(f80, "manuscript.md"), "w").write(
+                "<!-- harness: rendered from analysis/analysis.json -->\nThe allocation was accepted and is validated.\n")
+            k82 = [(f["kind"], f["severity"]) for f in report_acceptance_findings(f80, "declared")]
+            ok(("report_acceptance_language", "MEDIUM") in k82 and not report_acceptance_findings(f80, "accepted"),
+               f"T82 acceptance language in a declared-scope write-up is found, behind a forged harness marker too; "
+               f"in an accepted one it is not ({k82})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T82 raised {type(e).__name__}: {e}")
+        try:   # round 3: an indented block marker still ends the negated clause, in the machine's check too
+            hits82 = []
+            for t82 in ("Not run\n  - Validated against trials.\n", "Not accepted\n   ## Validated allocation\n",
+                        "Not tested\n  > Validated by the trial\n"):
+                open(os.path.join(f80, "manuscript.md"), "w").write(t82)
+                hits82.append(bool(report_acceptance_findings(f80, "declared")))
+            ok(all(hits82), f"T82b indented bullets, headings and quotes keep their clause boundary ({hits82})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T82b raised {type(e).__name__}: {e}")
+        try:
+            nj = {"action": "ACCEPT", "rule_matched": 4,
+                  "done_when_status": {"D-009": {"passes": None, "result": "not_judged", "open": True,
+                                                 "severity": "MEDIUM", "detail": "not judged"}}}
+            r83 = require_judged(dict(nj))
+            ok(r83["action"] != "ACCEPT" and r83.get("check_summary", {}).get("not_judged") == 1
+               and "D-009" in json.dumps(r83),
+               f"T83 a required check that is not judged cannot yield ACCEPT ({r83.get('action')})")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"T83 raised {type(e).__name__}: {e}")
+        # T84-T85: a declared report is not delivered with acceptance language: the writer repairs it, or the
+        # report is withheld. The draft is written in accepted mode first (the pre-write gate accepts).
+        nofix84 = {"id": "P-084", "severity": "HIGH", "target_stage": "WRITE", "claim": "cannot fix"}
+        for name, extra, want in (("t84", {"manuscript_repair": "The plan was tested against the trials.\n"},
+                                   "completed_scope_declared"), ("t85", {}, "completed_no_report")):
+            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}},
+                                           "manuscript": "The plan is validated against the trials.\n"}, **extra),
+                               max_rounds=1)
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            rp = os.path.join(d, "report.md")
+            rec = json.load(open(os.path.join(d, "final_gate.json"))) if os.path.exists(os.path.join(d, "final_gate.json")) else {}
+            al = rec.get("report_acceptance_language") or {}
+            if name == "t84":
+                ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
+                   and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
+                   f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
+            else:
+                ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
+                   and al.get("remaining"),
+                   f"T85 an unrepaired declared report is withheld, not delivered ({s}, {al})")
+        # T88 (round 2): a repaired draft goes through the whole post-write gate again: a repair that adds an
+        # unresolved claim reference (non-declarable HIGH) ends RUN_FAILED, not a delivered declared report.
+        # T89: a Markdown soft break inside a negated sentence is not acceptance language (nothing withheld).
+        for name, extra, want in (("t88", {"manuscript": "The plan is validated against the trials.\n",
+                                           "manuscript_repair": "The plan was tested; see [CLAIM:missing_claim].\n"},
+                                   "run_failed"),
+                                  ("t89", {"manuscript": "The model is not yet\nvalidated against the trials.\n"},
+                                   "completed_scope_declared")):
+            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}}}, **extra), max_rounds=1)
+            os.makedirs(os.path.join(d, "models"), exist_ok=True)
+            if not os.path.exists(os.path.join(d, "models", "claims_ledger.yaml")):
+                shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                            os.path.join(d, "models", "claims_ledger.yaml"))
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            if name == "t88":
+                ok(s == want and any(c.endswith(":repair") for c in T.calls),
+                   f"T88 a language repair is re-checked by the full post-write gate ({s})")
+            else:
+                ok(s == want and not any(c.endswith(":repair") for c in T.calls)
+                   and os.path.exists(os.path.join(d, "report.md")),
+                   f"T89 'not yet' + soft break + 'validated' is negated: delivered, no repair ({s})")
+        # T90-T91 (round 3): the rejected report is quarantined before its repair; a repair with no budget or a
+        # failed repair task ends with no deliverable report.md (the rejected one stays in report_withheld.md).
+        from v2_tasks import TaskResult as _TR
+        for name, outcome in (("t90", None), ("t91", _TR(False, None, 0.0, "stub: failed"))):
+            d, T, st = new_run(name, {"critics": {1: {"critique-presentation": [nofix84]}},
+                                      "manuscript": "The plan is validated against the trials.\n"}, max_rounds=1)
+            m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+            real_task = m._task
+
+            def _task(key, name_, *args, _real=real_task, _out=outcome, **kw):
+                if name_ == "write" and len(args) > 2:      # the language repair (feedback given)
+                    return _out
+                return _real(key, name_, *args, **kw)
+            m._task = _task
+            try:
+                s = m.run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            rp, wp = os.path.join(d, "report.md"), os.path.join(d, "report_withheld.md")
+            ok(s == "completed_no_report" and not os.path.exists(rp) and os.path.exists(wp)
+               and "validated" in open(wp).read(),
+               f"T{name[1:]} a repair {'with no budget' if outcome is None else 'that fails'} leaves no deliverable "
+               f"report with acceptance language ({s}, report.md exists: {os.path.exists(rp)})")
+        # T92: the quarantine move goes through lib.safe_io: a planted link at report_withheld.md is replaced,
+        # never written through, and a linked report.md is refused, never moved.
+        d92, o92 = os.path.join(td, "t92"), os.path.join(td, "t92out")
+        os.makedirs(d92)
+        os.makedirs(o92)
+        open(os.path.join(o92, "v"), "w").write("untouched")
+        open(os.path.join(d92, "report.md"), "w").write("rejected report\n")
+        os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report_withheld.md"))
+        try:
+            _quarantine_report(d92)
+            moved = (not os.path.exists(os.path.join(d92, "report.md"))
+                     and not os.path.islink(os.path.join(d92, "report_withheld.md"))
+                     and open(os.path.join(d92, "report_withheld.md")).read() == "rejected report\n")
+            os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report.md"))
+            try:
+                _quarantine_report(d92)
+                refused = False
+            except (ValueError, OSError):
+                refused = True
+        except Exception as e:  # noqa: BLE001
+            moved, refused = f"raised {type(e).__name__}: {e}", False
+        ok(moved is True and refused and open(os.path.join(o92, "v")).read() == "untouched",
+           f"T92 the report quarantine never follows a link ({moved}, refused a linked report: {refused})")
+        # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
+        # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
+        judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",
+                       "done_when": [{"judgement": "the critic reads the caveat"}]}
+        g_ = globals()
+        orig_open = g_["open_findings"]
+        for name, patch, rule in (("t86", None, "3m"), ("t87", lambda rd, dd: [], "3j")):
+            d, T, st = new_run(name, {"critics": {1: {"critique-domain": [judged_only]}}}, max_rounds=1)
+            if patch:
+                g_["open_findings"] = patch
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            finally:
+                g_["open_findings"] = orig_open
+            fg = json.load(open(os.path.join(d, "final_gate.json"))) if os.path.exists(os.path.join(d, "final_gate.json")) else {}
+            ok(s == "completed_scope_declared" and fg.get("rule_matched") == rule
+               and (fg.get("check_summary") or {}).get("required_not_judged") == ["D-086"],
+               f"T{name[1:]} a judgement-only finding at exhaustion is declared by rule {rule}, with the check "
+               f"summary in final_gate.json ({s}, {fg.get('rule_matched')}, {fg.get('check_summary')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
