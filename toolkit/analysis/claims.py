@@ -110,6 +110,8 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
                    _c(f"dt.{tid}.population", "scalar", arts["decision_tests"], f"{f}.population_changed", "people")]
             if d.get("regret_share") is not None:      # undefined when the re-optimised objective is not positive
                 cl.append(_c(f"dt.{tid}.regret_pct", "percentage", arts["decision_tests"], f"{f}.regret_pct", "%"))
+            if d.get("regret") is not None:            # none when every value makes the point plan infeasible
+                cl.append(_c(f"dt.{tid}.regret", "scalar", arts["decision_tests"], f"{f}.regret", A.primary))
             for k, _g in enumerate((d.get("units_changed_by_group") or [])[:GROUPS_SHOWN]):
                 cl.append(_c(f"dt.{tid}.group{k}", "count", arts["decision_tests"],
                              f"{f}.units_changed_by_group[{k}].changed", "units"))
@@ -300,8 +302,11 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
               f"than [CLAIM:dt.{t}.threshold] of units change package, or on regret or dollars moved). "
               + ("At some tested value the point plan is not feasible under the test, so it cannot be kept. "
                  if d.get("point_plan_feasible") is False else "")
-              + (f"Keeping the point plan loses up to [CLAIM:dt.{t}.regret_pct] of the re-optimised objective; "
+              + (f"Keeping the point plan loses up to [CLAIM:dt.{t}.regret_pct] of the re-optimised objective"
                  if d.get("regret_share") is not None else "")
+              + ((" and up to" if d.get("regret_share") is not None else "Keeping the point plan loses up to")
+                 + f" [CLAIM:dt.{t}.regret] {A.primary} (each at its own worst tested value); "
+                 if d.get("regret") is not None else ("; " if d.get("regret_share") is not None else ""))
               + f"up to [CLAIM:dt.{t}.reallocated] is reallocated across units and components and the net change "
               f"between components is up to [CLAIM:dt.{t}.dollars] (each at its own worst tested value), and up to "
               f"[CLAIM:dt.{t}.population] people live in units whose package changes"
