@@ -621,6 +621,98 @@ def _self_test() -> int:
            f"BS53 a configured fitted file that is missing or a dangling link is unusable evidence for an engine with "
            f"fitted parameters; an engine with none is exempt: {res}")
     case("BS53", r3_3)
+
+    # ---- S1-2b: one validated evidence snapshot (Codex round 4 reproductions first)
+    def r4_1():
+        rn = BM.Runner(toy, eng, 1)
+        b0 = toy["benchmarks"][0]
+        try:
+            rn.evaluate(dict(b0, band=[0.2, 0.5]), {})
+            ok(False, "BS54 Runner.evaluate refuses a declaration that is not its validated pack's")
+        except ValueError as ex:
+            ok("validated pack" in str(ex), f"BS54 Runner.evaluate refuses a declaration that is not its validated "
+                                            f"pack's: {ex}")
+        b_ = toy["benchmarks"][0]
+        b_["band"] = [0.2, 0.5]                    # the caller's dict changes after the runner was built
+        try:
+            r = rn.evaluate(rn.pack["benchmarks"][0], {})
+            ok(r["status"] in ("in_band", "out_of_band") and rn.pack["benchmarks"][0]["band"] == [0.3, 0.5],
+               "BS55 the runner scores its own copy of the validated pack, whatever the caller does with its dict")
+        finally:
+            b_["band"] = [0.3, 0.5]
+    case("BS54-55", r4_1)
+
+    def r4_2():
+        from toolkit.engines.contract import ToyEngine
+        b0 = toy["benchmarks"][0]
+        res = BM.stamp(BM.run_pack(toy, eng, BM.Runner(toy, eng, 1), {}), eng)
+        as_value = dict(toy, benchmarks=[dict(b0, estimand={"type": "value", "not_transcribed": "changed type"})])
+        with tempfile.TemporaryDirectory() as d:
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(res, open(rp, "w"))
+            yaml.safe_dump(as_value, open(os.path.join(d, "pack.yaml"), "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+        ok(stale_ids(as_value, res["benchmarks"]) == ["T1"] and rows == [] and "rerun required: T1" in str(why),
+           f"BS56 a change from a sourced to an exempt type makes the stored row stale (every type is digested): {why}")
+        legacy = {"id": "T1", "compare": "eq", "computed": 1.0}
+        ok(stale_ids(as_value, [legacy]) == [] and stale_ids(as_value, [{"id": "T1", "computed": 0.4}]) == ["T1"],
+           "BS57 a stored oracle row from before digests is accepted only with an oracle row's shape")
+    case("BS56-57", r4_2)
+
+    def r4_3():
+        import shutil
+        mdir = os.path.join(root, "malaria", "benchmarks")
+        calls = []
+        orig = BM.run_pack
+        with tempfile.TemporaryDirectory() as d:
+            for f in ("pack.yaml", "equilibration.yaml"):
+                shutil.copy(os.path.join(mdir, f), os.path.join(d, f))
+            try:
+                BM.run_pack = lambda *a, **k: calls.append(1) or {}
+                rc = BM.main([os.path.join(d, "pack.yaml"), "run", "--workers", "1", "--seeds", "1"])
+            finally:
+                BM.run_pack = orig
+        ok(rc == 2 and calls == [], f"BS58 the run CLI on a copied pack with no adjacent fit never runs on fitted values "
+                                    f"without current provenance (rc {rc}, run_pack calls {len(calls)})")
+    case("BS58", r4_3)
+
+    def r4_4():
+        from toolkit.analysis.batch import fitted_ranges
+        from toolkit.engines.malaria.engine import MalariaEngine
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "fitted.yaml")
+            doc = {"parameters": {"cfp_kill": {"value": 0.3, "lo": 0.2, "hi": 0.4},
+                                  "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
+                   "band_declarations": fit_declarations(pk)}
+            yaml.safe_dump(doc, open(fp, "w"))
+            me = MalariaEngine(fitted_path=fp)
+            ok(fitted_ranges(me)["cfp_kill"][2] == 0.3, "BS59 fitted values with current provenance are used")
+            doc["parameters"]["cfp_kill"]["value"] = 0.9            # the file is replaced after the engine cached it
+            yaml.safe_dump(doc, open(fp, "w"))
+            try:
+                fitted_ranges(me)
+                ok(False, "BS60 cached fitted values that differ from their current file are refused")
+            except ValueError as ex:
+                ok("refit required" in str(ex), f"BS60 cached fitted values that differ from their current file are "
+                                                f"refused: {ex}")
+    case("BS59-60", r4_4)
+
+    def r4_5():
+        ev = load_evidence(eng, pack=toy)
+        cp = ev.pack
+        cp["benchmarks"][0]["band"] = [0.0, 9.0]
+        ok(ev.pack["benchmarks"][0]["band"] == [0.3, 0.5] and ev.problems == () and set(ev.fitted) == {"eff_a", "eff_b"},
+           "BS61 the evidence snapshot is immutable: a consumer's copy cannot change it")
+        import inspect
+        from toolkit.analysis import batch as Bt, estimates as ES, run as RUNm
+        src = {n: inspect.getsource(f) for n, f in (("fitted_ranges", Bt.fitted_ranges), ("_run", RUNm._run),
+               ("benchmark_acceptance", ES.benchmark_acceptance), ("verified_benchmarks", BM.verified_benchmarks),
+               ("verified_spec_benchmarks", EP.verified_spec_benchmarks), ("spec_benchmarks", EP.spec_benchmarks),
+               ("merge_results", BM.merge_results), ("rescore_results", BM.rescore_results), ("main", BM.main))}
+        ok(all("load_evidence" in v for v in src.values()) and not any("fitted_problems(" in v or "stale_ids(" in v
+                                                                       for v in src.values()),
+           f"BS62 every consumer reads the one snapshot: {[k for k, v in src.items() if 'load_evidence' not in v]}")
+    case("BS61-62", r4_5)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
