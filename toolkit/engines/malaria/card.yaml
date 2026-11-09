@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.11'
+version: '0.12'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -16,7 +16,8 @@ mechanisms:
   with net non-use'
 - ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)
 - 'SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); case
-  management (effective treatment)'
+  management (effective treatment); v0.12 with cm_target 1: the add-on in declared ages (default 2-59 months) with
+  a linear ramp, severe-care access raised only through cm_severe_link (default 0)'
 - 'delivery period distinct from the outcome window: components act and cost drivers count only in delivery years;
   routine net campaigns after the package''s campaign in every arm (v0.6)'
 - routine SMC in every arm after the delivery period, uncharged (v0.7)
@@ -90,6 +91,11 @@ outputs:
   - smc_doses
   - irs_sprayed
   - treated_all
+  cost_drivers_when:
+    cm_child_years:
+      cm_target: 1.0
+    treated_cm_ages:
+      cm_target: 1.0
   series:
     pfpr_u5:
       label: microscopy prevalence, children 6-59 months (the calibration metric)
@@ -858,9 +864,64 @@ parameters:
   value: 0.15
   kind: scenario
   units: probability
+  lo: 0.0
+  hi: 0.15
+  source: 'enhanced CM: absolute gain in effective treatment, applied to the whole unit in the targeted ages (cm_target
+    1). Within iCCM catchments, children 2-59 months: ACT among confirmed cases +17 points, Oresanya et al. 2019
+    J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6; appropriate treatment +33 points, Isiguzo et al. 2019
+    J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7; home management RR 1.89 (1.60-2.22) on
+    appropriate treatment, Oo et al. 2019 Malar J (PMC6683427). Unit-wide low / central / high 0.03 / 0.07 / 0.15
+    (derived: the catchment gain x an assumed catchment share of 0.2-0.5); 0 is the no-effect scenario. v0.11 and
+    earlier: 0.15 for all ages, attempt 8 value, no source'
+  verified: unverified
+- name: cm_target
+  value: 0.0
+  kind: fixed
+  units: switch
   lo: null
   hi: null
-  source: 'E7 attempt 8 value (models/malaria_abm.py VC), kept (enhanced CM: +0.15 effective treatment)'
+  source: 'v0.12 model switch: 1 = the case-management package (targeted ages, ramp, severe-care link, its cost
+    drivers); 0 = the v0.11 add-on (all ages, from the delivery start, severe-care access raised one for one), kept
+    so earlier results reproduce exactly'
+  verified: unverified
+- name: cm_age_lo_m
+  value: 2.0
+  kind: fixed
+  units: months
+  lo: null
+  hi: null
+  source: iCCM in Nigeria treats children 2-59 months (Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State
+    RAcE, Tables 5-6; Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7)
+  verified: unverified
+- name: cm_age_hi_m
+  value: 60.0
+  kind: fixed
+  units: months
+  lo: null
+  hi: null
+  source: upper end (exclusive) of the iCCM age band, 2-59 months (as cm_age_lo_m); ages 5 and over get no gain
+  verified: unverified
+- name: cm_ramp_years
+  value: 2.5
+  kind: fixed
+  units: years
+  lo: 2.0
+  hi: 3.0
+  source: 'assumption from programme timing: the RAcE endline gains were measured about three years after the start
+    (2014 to February 2017; Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6; Isiguzo
+    et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7), so the gain ramps in linearly
+    over 2-3 years from the delivery start'
+  verified: unverified
+- name: cm_severe_link
+  value: 0.0
+  kind: fixed
+  units: share
+  lo: 0.0
+  hi: 1.0
+  source: 'share of the add-on''s gain in uncomplicated effective treatment that also raises severe-care access;
+    no published estimate was found: Oo et al. 2019 Malar J (PMC6683427) pools no severe-malaria outcome, and iCCM
+    refers severe cases rather than treating them. Default 0 (conservative): the add-on changes deaths only through
+    transmission and post-treatment prophylaxis. 1 = the v0.11 one-for-one link'
   verified: unverified
 - name: cfr_severe_treated
   value: 0.1
