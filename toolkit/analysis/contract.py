@@ -144,7 +144,7 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     return reserve_findings(rule, point or {}, unc or {})
 
 
-def _burden(run_dir: str, data) -> list[dict]:
+def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     """F6 S2-5: the signed spec's validation.burden, judged from the artifact's numbers (toolkit/analysis/burden.py);
     a group outside its tolerance is declarable, every other problem is not (fail closed)."""
     try:
@@ -160,6 +160,15 @@ def _burden(run_dir: str, data) -> list[dict]:
     except Exception as e:  # noqa: BLE001 -- fail closed
         refs, bad = None, [f"{type(e).__name__}: {e}"]
     out = [_f("analysis_contract_burden", f"validation.burden: {b}", "burden") for b in bad]
+    if signed:          # Codex #165 r3: the sign-off binds the reference file's bytes; a replaced file is not signed
+        try:
+            from toolkit.spec import signoff
+            st = signoff.status(run_dir)
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            st = f"unreadable ({type(e).__name__}: {e})"
+        if st != "signed":
+            out.append(_f("analysis_contract_burden", f"the reference file or the spec changed since sign-off "
+                          f"(status {st}): the analysis ran on a signed spec, the inputs now are not", "burden"))
     pv = (data or {}).get("provenance") if isinstance(data, dict) else None
     if data is not None and not (isinstance(pv, dict) and pv.get("independent") is True):
         out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
@@ -286,7 +295,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _reserve(run_dir, pt_doc, unc_doc or {})
     if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
         out += _plan_variants(run_dir, pt_doc, pv_doc)
-    out += _burden(run_dir, bv_doc)
+    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)

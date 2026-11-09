@@ -52,6 +52,42 @@ def _spec_record(run_dir: str) -> dict | None:
         return None
 
 
+def burden_reference(spec_doc) -> str | None:
+    """F6 S2-5: the run-relative path of the spec's validation.burden reference file, or None. Signing binds its bytes
+    as it binds the derivation record (the sheet's sources, the sign-off record, status), since independence from the
+    calibration is attested on what the file declares (Codex #165 r3)."""
+    b = ((spec_doc.get("validation") or {}) if isinstance(spec_doc, dict) else {}).get("burden")
+    c = b.get("csv") if isinstance(b, dict) else None
+    return os.path.normpath(c) if isinstance(c, str) and c else None
+
+
+def _burden_sha(run_dir: str, rel: str) -> str | None:
+    """sha256 of the reference file through a no-follow fd; None when absent; ValueError when unreadable or a link."""
+    try:
+        return _sha_nofollow(run_dir, rel)
+    except OSError as e:
+        raise ValueError(f"{rel}: {e}") from None
+
+
+def burden_changed(run_dir: str, rec: dict) -> list[str]:
+    """The reference file, when the spec declares one and its bytes are not the ones the sign-off recorded (a sign-off
+    that recorded none, an absent or unreadable file: changed, fail closed)."""
+    import yaml
+    try:
+        doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unreadable: changed
+        return [SPEC]
+    rel = burden_reference(doc)
+    if rel is None:
+        return []
+    signed = (rec.get("sha256") or {}).get(rel)
+    try:
+        now = _burden_sha(run_dir, rel)
+    except ValueError:
+        now = None
+    return [] if signed is not None and signed == now else [rel]
+
+
 def status(run_dir: str) -> str:
     path = os.path.join(run_dir, SPEC)
     rec = _spec_record(run_dir)
@@ -59,7 +95,7 @@ def status(run_dir: str) -> str:
         return "changed" if rec is not None else "absent"
     if rec is not None:
         return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) and not derived_changed(run_dir, rec) \
-            else "changed"
+            and not burden_changed(run_dir, rec) else "changed"
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
@@ -131,6 +167,15 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except LinkRefused as e:
         raise ValueError(f"{SPEC}: {e}") from None
     sha = hashlib.sha256(data).hexdigest()
+    import yaml
+    try:
+        doc0 = yaml.safe_load(data.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError):
+        doc0 = {}
+    brel = burden_reference(doc0)      # F6 S2-5: the reference file is bound like the derivation record
+    bsha = _burden_sha(run_dir, brel) if brel else None
+    if brel and bsha is None:
+        raise ValueError(f"{brel} (the validation.burden reference file) does not exist")
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
@@ -152,9 +197,11 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         # it was generated from; it is refused, never skipped
         raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
                          "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
+    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
     if sheet_bytes is not None and (
-            src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")):
-        raise ValueError(f"{SHEET} was generated from another spec or derivation record (it is stale): the sheet is "
+            src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
+            or (brel is not None and src.get("burden_references_sha256") != bsha)):
+        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is stale): the sheet is "
                          "regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
@@ -172,7 +219,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
         # decision_brief.sign freezes the spec's geometry too (#131)
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha={DERIVATIONS_RECORD: dsha}, expect_geometry=geo_expect)
+                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect)
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
@@ -184,7 +231,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{SPEC} does not parse: {e}") from None
     geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: sha, DERIVATIONS_RECORD: dsha},
+              "sha256": {SPEC: sha, **extra},
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     try:
@@ -255,7 +302,13 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         geometry.run(run_dir, spec_doc)
     section = geometry.sheet_section(run_dir)
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section)
+    brel = burden_reference(spec_doc)
+    try:
+        bsha = (_burden_sha(run_dir, brel) or "none") if brel else "none"
+    except ValueError:
+        bsha = "unreadable"
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+                      "burden_references_sha256": bsha,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
