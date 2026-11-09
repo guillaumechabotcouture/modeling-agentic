@@ -111,7 +111,9 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
            "population_changed": pc, "population_changed_share": pc / total_pop if total_pop > 0 else None,
            "dollars_by_component": delta, "dollars_moved": moved, "dollars_moved_share": share(moved),
            "dollars_reallocated": realloc, "dollars_reallocated_share": share(realloc),
-           "dollars_share": share(realloc), "units_changed_by_group": by}
+           # Codex r3 P2-1: the dollars criterion is the larger measure (a reallocation, or new spending from
+           # unspent budget, which dollars reallocated counts only by half)
+           "dollars_share": share(max(moved, realloc)), "units_changed_by_group": by}
     rec["triggered_by"] = (["infeasible"] if why else []) + [k for k in CRITERIA if fires(rec, k, thr[k])]
     rec["decision_changes"] = bool(rec["triggered_by"])
     return rec
@@ -169,21 +171,29 @@ def aggregate(rows: list) -> dict:
     def worst(key):
         c = [r for r in rows if r.get(key) is not None]
         return max(c, key=lambda r: r[key]) if c else None
-    rg = [r for r in rows if "regret" in (r.get("triggered_by") or [])]   # a value that fires on regret comes first
+    rg = [r for r in rows if "regret" in (r.get("triggered_by") or []) and r.get("regret_share") is None]
     w = {"share": worst("share_units_changed"),
-         "regret": (max(rg, key=lambda r: r["regret"]) if rg else worst("regret_share") or worst("regret") or rows[0]),
-         "dollars": worst("dollars_reallocated") or rows[0], "dollars_moved": worst("dollars_moved") or rows[0],
+         "regret": worst("regret_share") or worst("regret") or rows[0],        # the percentage maximum (Codex r3 P2-3)
+         "regret_abs": worst("regret") or rows[0],                            # the absolute maximum
+         "dollars": worst("dollars_share") or rows[0],                        # the dollars criterion
+         "dollars_reallocated": worst("dollars_reallocated") or rows[0], "dollars_moved": worst("dollars_moved") or rows[0],
          "population": worst("population_changed")}
+    if rg:      # a value that fires on regret under a non-positive optimum (no share): its own witness
+        w["regret_nonpositive_optimum"] = max(rg, key=lambda r: r["regret"])
     wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for k, r in w.items()}
     trig = [k for k in ("infeasible",) + CRITERIA if any(k in (r.get("triggered_by") or []) for r in rows)]
     return {"decision_changes": bool(trig), "triggered_by": trig,
             "point_plan_feasible": all(r.get("point_plan_feasible", True) for r in rows),
             "share_units_changed": w["share"]["share_units_changed"],
             "units_changed_by_group": w["share"]["units_changed_by_group"],
-            **{k: w["regret"].get(k) for k in ("regret", "regret_share", "reoptimised_objective", "objective_gap")},
+            "regret_share": w["regret"].get("regret_share"),
+            **{k: w["regret_abs"].get(k) for k in ("regret", "reoptimised_objective", "objective_gap")},
             # Codex r2 P2-3: each dollar measure from its own worst value
-            **{k: w["dollars"].get(k) for k in ("dollars_share", "dollars_reallocated", "dollars_reallocated_share")},
+            "dollars_share": w["dollars"].get("dollars_share"),
+            **{k: w["dollars_reallocated"].get(k) for k in ("dollars_reallocated", "dollars_reallocated_share")},
             **{k: w["dollars_moved"].get(k) for k in ("dollars_moved", "dollars_moved_share", "dollars_by_component")},
+            # every value, so a loader judges each criterion on the value it comes from (Codex r3 P2-2)
+            "results": [dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for r in rows],
             "population_changed": w["population"]["population_changed"],
             "population_changed_share": w["population"]["population_changed_share"], "worst_by_criterion": wb}
 
@@ -306,7 +316,8 @@ def _self_test() -> int:
                dollars_threshold=thr["dollars"])
     ok(e10 is None and doc.get("regret_share") is None and doc.get("decision_changes") is False
        and MM._result_conflicts("t.yaml", doc, "x", None) == []
-       and MM._result_conflicts("t.yaml", dict(doc, reoptimised_objective=None), "x", None) != [],
+       and MM._result_conflicts("t.yaml", dict(doc, reoptimised_objective=None, results=[
+           dict(x, reoptimised_objective=None) for x in doc.get("results") or []]), "x", None) != [],
        f"MV16 zero objective, emitter to loader: an undefined regret share is accepted when the objective and the "
        f"regret say why, refused otherwise ({e10!r})")
     # Codex r1 P2-3: each worst value by criterion carries its own tested value and the matching breakdown
@@ -361,6 +372,34 @@ def _self_test() -> int:
        and w9["dollars"]["value"] == "R" and w9.get("dollars_moved", {}).get("value") == "M"
        and ag9["dollars_by_component"] == {"a": 500.0},
        f"MV20 the two dollar maxima come from different values and each keeps its own ({e12!r}, {list(w9)})")
+    # Codex r3 P2-1: one-sided spending from unspent budget fires on dollars moved (half of it is reallocated)
+    m10, _ = attempt(compare, ids, {"u1": "none", "u2": "none", "u3": "none", "u4": "none"},
+                     {"u1": "a", "u2": "none", "u3": "none", "u4": "none"}, z, {i: {"none": {}, "a": {"a": 60.0},
+                                                                                   "b": {}} for i in ids},
+                     0.0, pop, reg, 1000.0, {"share": 0.9, "regret": 0.9, "dollars": 0.05}, ["a", "b"])
+    m10 = m10 or {}
+    ok(m10.get("dollars_moved") == 60.0 and m10.get("dollars_reallocated") == 30.0
+       and abs(m10.get("dollars_share", 0) - 0.06) < 1e-12 and m10.get("triggered_by") == ["dollars"],
+       f"MV21 the dollars criterion is the larger of dollars moved and dollars reallocated ({m10.get('dollars_share')}, "
+       f"{m10.get('triggered_by')})")
+    # Codex r3 P2-2: one value fires on regret under a zero optimum, another makes the point plan infeasible
+    inf = dict(m8, value=2, point_plan_feasible=False, point_plan_infeasible=["over budget"], regret=None,
+               regret_share=None, triggered_by=["infeasible"], decision_changes=True)
+    ag11, e13 = attempt(aggregate, [dict(m8, value=1), inf])
+    d11 = dict(ag11 or {}, varied="v", criterion="c", share_threshold=0.9, regret_threshold=0.5, dollars_threshold=0.9)
+    ok(e13 is None and d11.get("triggered_by") == ["infeasible", "regret"]
+       and MM._result_conflicts("t.yaml", d11, "x", None) == []
+       and MM._result_conflicts("t.yaml", dict(d11, triggered_by=["infeasible"]), "x", None) != [],
+       f"MV22 mixed feasible and infeasible values: the loader judges each value on its own ({e13!r}, "
+       f"{MM._result_conflicts('t.yaml', d11, 'x', None)[:1]})")
+    # Codex r3 P2-3: the absolute and the percentage regret maxima each keep their own value
+    ga = dict(m or {}, value="A", regret=100.0, regret_share=0.1)
+    gb = dict(m or {}, value="B", regret=1.0, regret_share=0.5)
+    ag12, e14 = attempt(aggregate, [ga, gb])
+    w12 = (ag12 or {}).get("worst_by_criterion") or {}
+    ok(e14 is None and ag12["regret_share"] == 0.5 and ag12["regret"] == 100.0 and w12["regret"]["value"] == "B"
+       and w12.get("regret_abs", {}).get("value") == "A",
+       f"MV23 the percentage and the absolute regret maxima come from their own values ({e14!r}, {list(w12)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
