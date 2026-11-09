@@ -1585,7 +1585,10 @@ def _self_test_run(ok) -> None:
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
-        return _self_test()
+        sys.path.insert(0, HERE)
+        import no_cloud
+        with no_cloud.refusing():          # no cloud call from a self-test (Codex round 3 on #161)
+            return _self_test()
     argv, command = split_command(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)

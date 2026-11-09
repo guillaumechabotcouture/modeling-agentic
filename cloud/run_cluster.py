@@ -13,6 +13,10 @@
     python cloud/run_cluster.py <config.py> keeper            # reconcile, then start missing helpers for the run
                                                               # cluster clusters.json records (after exit 3 or 5)
     python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke)
+    python cloud/run_cluster.py <config.py> smoke-watch --pid P [--minutes 20]
+                                                              # a smoke's wall-clock bound: wait for launcher P and
+                                                              # every cluster of the config's names; past the limit,
+                                                              # stop them by id
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
@@ -133,6 +137,10 @@ class RunConfig:
     overflow_vm_types: tuple = ("Standard_D8s_v5", "Standard_D8as_v5")
     overflow_max: int | None = None
     overflow_hold: str = "30 minutes"          # keep using overflow this long after the last refusal
+    # S1-8: cloud-side lifetimes (a smoke sets them short): main.py is killed past run_timeout_hours (None: no
+    # limit), and a run whose upload failed is held for `collect` at most hold_hours
+    run_timeout_hours: float | None = None
+    hold_hours: float = 24.0
 
     def __post_init__(self):
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
@@ -388,7 +396,9 @@ def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=Non
     fut = client.submit(ws.run_to_disk, label, code, question, main_flags(cfg), keys["ANTHROPIC_API_KEY"],
                         keys.get("OPENAI_API_KEY") if cfg.cross_model else None, list(cfg.labels),
                         cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
-                        workers=[worker], allow_other_workers=False, pure=False, key=key)
+                        workers=[worker], allow_other_workers=False, pure=False, key=key,
+                        run_timeout_s=cfg.run_timeout_hours * 3600 if cfg.run_timeout_hours else None,
+                        hold_s=cfg.hold_hours * 3600)
     fire_and_forget(fut)
     return key, fut
 
@@ -521,7 +531,8 @@ def start_helpers(cfg, compute, cluster_id, clusters: dict, keep_overflow=None, 
         time.sleep(10)
         kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster_id, overflow, record=record)
         time.sleep(30)
-        confirm_keeper(cfg.keeper_name, kc, run_alive=lambda: is_running(cfg.name))
+        confirm_keeper(cfg.keeper_name, kc, run_alive=lambda: is_running(cfg.name), run_id=cluster_id,
+                       overflow_id=(overflow or {}).get("id"))
 
 
 def _outcome(sent: list, acked: list, e: BaseException) -> tuple[int, str]:
@@ -677,6 +688,75 @@ def ack_probe(cfg) -> int:
     return 0 if got else 1
 
 
+def _bounded(fn, *a, timeout_s: float = 60.0):
+    """fn(*a) in a daemon thread; TimeoutError when it has not returned within `timeout_s`."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["v"] = fn(*a)
+        except BaseException as e:  # noqa: BLE001
+            box["e"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} did not return within {timeout_s} s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
+def smoke_watch(cfg, launcher_alive, minutes: float = 20.0, lister=None, stopper=None, clock=None, sleep=None,
+                every_s: float = 30.0, call_timeout_s: float = 60.0) -> dict:
+    """`smoke-watch`: the laptop-side bound of a smoke. Until the wall-clock limit it waits for the launcher to
+    exit and for every live cluster named like this config (the run cluster, its keeper and overflow pool,
+    recorded or not, so a late keeper or one an interrupted constructor left counts too) to stop. Past the limit it
+    stops each such cluster by id. Every API call is bounded (`call_timeout_s`). Only for a config whose names
+    belong to the smoke alone."""
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    stopper = stopper or _stop_id
+    names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
+
+    def live():
+        cs = _bounded(lister, timeout_s=call_timeout_s)
+        items = cs if isinstance(cs, list) else list((cs or {}).values())
+        return {c.get("id"): c.get("name") for c in items if c.get("name") in names and ws.state_of(c) in _ATTACH}
+    deadline = clock() + minutes * 60
+    while clock() < deadline:
+        try:
+            lv = live()
+        except Exception as e:  # noqa: BLE001 — unknown this round; the limit still holds
+            print(f"smoke-watch: listing failed ({type(e).__name__}); retrying", flush=True)
+            lv = None
+        if lv == {} and not launcher_alive():
+            print("smoke-watch: the launcher has exited and no cluster of this config is live", flush=True)
+            return {"clean": True, "stopped": []}
+        sleep(every_s)
+    stopped, end = [], clock() + min(300.0, minutes * 60 / 4)
+    print(f"smoke-watch: limit of {minutes} min reached; stopping by id", flush=True)
+    while clock() < end:
+        try:
+            lv = live()
+        except Exception:  # noqa: BLE001
+            lv = None
+        if lv == {}:
+            break
+        for cid, name in (lv or {}).items():
+            if cid not in stopped:
+                try:
+                    _bounded(stopper, name, cid, timeout_s=call_timeout_s)
+                    stopped.append(cid)
+                except Exception as e:  # noqa: BLE001 — tried again next round
+                    print(f"smoke-watch: stop {name} ({cid}) failed: {type(e).__name__}", flush=True)
+        sleep(every_s)
+    return {"clean": False, "stopped": stopped}
+
+
 def keeper_later(cfg) -> int:
     """`keeper`: the overflow pool and keeper of a launch that ended before starting them (exit 3 or 5), for the run
     cluster clusters.json records, and only while that cluster is the live one of its name."""
@@ -688,10 +768,12 @@ def keeper_later(cfg) -> int:
             raise SystemExit(f"{cfg.name}: clusters.json records run cluster {cid}, the live one is {live}: refusing")
         keep_o = _reconcile(cfg, clusters, "overflow", cfg.overflow_name) if cfg.keeper and cfg.overflow_max else None
         keep_k = _reconcile(cfg, clusters, "keeper", cfg.keeper_name) if cfg.keeper else None
-        if keep_k is not None:            # this launch's keeper: kept only while it holds the pool
+        if keep_k is not None:            # this launch's keeper: kept only while it holds this run and pool
             try:
+                if cfg.overflow_max and keep_o is None:
+                    raise SystemExit("its overflow pool is gone: a new pool needs a new keeper")
                 confirm_keeper(cfg.keeper_name, ws.attach_existing(cfg.keeper_name, WORKSPACE, keep_k),
-                               run_alive=lambda: is_running(cfg.name))
+                               run_alive=lambda: is_running(cfg.name), run_id=cid, overflow_id=keep_o)
             except SystemExit as e:
                 print(f"{cfg.keeper_name} ({keep_k}): this launch's keeper is not holding the pool ({str(e)[:120]}); "
                       "stopping it by id and starting a new one")
@@ -801,9 +883,36 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None):
 
 
 KEEPER_TICK = re.compile(r"\bworkers=\d+ \(overflow \d+\)")   # _keeper_loop's tick line
+KEEPER_FRESH_S = 180.0      # three ticks: a status older than this is not a heartbeat
 
 
-def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None, run_alive=None):
+def keeper_fresh(h: dict, run_id=None, overflow_id=None, max_age_s: float = KEEPER_FRESH_S) -> tuple[bool, str]:
+    """(healthy, why) from worker_side.keeper_health: a tick line with no error or exit after it, a status the
+    keeper wrote at most `max_age_s` ago by its own clock, and, when `run_id` is given, a status for that run
+    cluster and overflow pool (`overflow_id`, None for none). Codex round 3 on #161: any old tick is not enough."""
+    lines = str((h or {}).get("log") or "").strip().splitlines()
+    ticks = [i for i, ln in enumerate(lines) if KEEPER_TICK.search(ln)]
+    if not ticks:
+        return False, (lines[-1:] or ["(empty log)"])[0][:200]
+    bad = [ln for ln in lines[ticks[-1] + 1:] if "keeper error" in ln or "exiting" in ln]
+    if bad:
+        return False, f"after its last tick: {bad[-1][:160]}"
+    st = (h or {}).get("status")
+    if not isinstance(st, dict) or not st.get("updated"):
+        return False, "no status file"
+    age = float(h.get("now") or 0) - float(st["updated"])
+    if age > max_age_s:
+        return False, f"its status is {age:.0f} s old (limit {max_age_s:.0f} s)"
+    if run_id is not None:
+        if st.get("cluster_id") != run_id:
+            return False, f"it holds run cluster {st.get('cluster_id')}, not {run_id}"
+        if (st.get("overflow") or {}).get("id") != overflow_id:
+            return False, f"it drives overflow pool {(st.get('overflow') or {}).get('id')}, not {overflow_id}"
+    return True, lines[ticks[-1]][:200]
+
+
+def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None, run_alive=None,
+                   run_id=None, overflow_id=None):
     """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
     after adapt() and a worker-table read, so it is the evidence the pool is held; a readable
     log alone ("(no log yet)", "keeper error ...; retrying") is not. The keeper cluster's
@@ -822,12 +931,11 @@ def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, s
         try:
             w = sorted(ws.scheduler_workers(client, attempts=3, delay_s=delay_s, min_workers=1, sleep=sleep,
                                             log=print))[0]
-            lines = box[0].run(ws.keeper_log, workers=[w])[w].strip().splitlines()
-            ticks = [ln for ln in lines if KEEPER_TICK.search(ln)]
-            if ticks:
-                print(ticks[-1:], f"(keeper {keeper_name})")
-                return ticks[-1:]
-            last = lines[-1:] or ["(empty log)"]
+            good, why = keeper_fresh(box[0].run(ws.keeper_health, workers=[w])[w], run_id, overflow_id)
+            if good:
+                print([why], f"(keeper {keeper_name})")
+                return [why]
+            last = [why]
         except Exception as e:  # noqa: BLE001 — retried, then reported
             last = [f"{type(e).__name__}: {str(e)[:200]}"]
         if i < attempts - 1:
@@ -1607,6 +1715,8 @@ def _self_test_52(ok) -> None:
             return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
 
         def run(self, fn, workers):
+            if getattr(fn, "__name__", "") == "keeper_health":   # a fresh status beside the log
+                return {w: {"log": self.log, "status": {"updated": 100.0}, "now": 110.0} for w in workers}
             return {w: self.log for w in workers}
 
     table = {"tls://10.0.0.5:1": {"name": "a"}, "tls://10.0.0.6:1": {"name": "b"}}
@@ -1662,7 +1772,7 @@ def _self_test_52(ok) -> None:
     late = FakeClient([{"workers": table}], log="(no log yet)")
     logs = iter(["(no log yet)", "12:00:00 keeper holding x 3..9 {}",
                  "12:00:00 keeper holding x 3..9 {}\n12:01:00 workers=3 (overflow 0) refusals=0 active=primary"])
-    late.run = lambda fn, workers: {w: next(logs) for w in workers}
+    late.run = lambda fn, workers: {w: {"log": next(logs), "status": {"updated": 100.0}, "now": 110.0} for w in workers}
     with contextlib.redirect_stdout(io.StringIO()):
         line = confirm_keeper("x-keeper", types.SimpleNamespace(cluster_id=11, get_client=lambda: late),
                               attempts=4, delay_s=0.0, sleep=lambda s: None)
@@ -3024,14 +3134,8 @@ def _self_test() -> int:
 
 def main(argv) -> int:
     if argv[1:2] == ["--self-test"]:
-        # no cloud call from a self-test: a case that forgets a fake reaches this module, which refuses
-        import types
-        from unittest import mock
-
-        class _NoCloud(types.ModuleType):
-            def __getattr__(self, name):
-                raise RuntimeError(f"self-test reached the real coiled.{name}: every case must use a fake")
-        with mock.patch.dict(sys.modules, {"coiled": _NoCloud("coiled")}):
+        import no_cloud
+        with no_cloud.refusing():          # no cloud call from a self-test (cloud/no_cloud.py)
             return _self_test()
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -3042,6 +3146,17 @@ def main(argv) -> int:
         return keeper_later(cfg)
     elif cmd == "ack-probe":
         return ack_probe(cfg)
+    elif cmd == "smoke-watch":
+        pid = int(rest[rest.index("--pid") + 1])
+        mins = float(rest[rest.index("--minutes") + 1]) if "--minutes" in rest else 20.0
+
+        def alive():
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+        return 0 if smoke_watch(cfg, alive, mins)["clean"] else 1
     elif cmd == "reuse-check":
         if not rest or rest[0].startswith("-"):
             sys.exit(__doc__)
