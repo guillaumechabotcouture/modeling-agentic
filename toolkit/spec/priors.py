@@ -132,8 +132,9 @@ def load_card(engine) -> dict:
         if ps is None:
             out["problems"].append(f"prior_target_not_parameter: engine priors: {name} is not an engine parameter")
             continue
-        if ps.kind != "fixed":
-            out["problems"].append(f"engine priors: {name} is of kind {ps.kind}; only a fixed parameter takes a card prior")
+        if ps.kind not in ("fixed", "scenario"):
+            out["problems"].append(f"engine priors: {name} is of kind {ps.kind}; only a fixed parameter (or a scenario "
+                                   "parameter) takes a card prior")
             continue
         pr, bad = _check_prior(name, d, ps, "engine priors")
         out["problems"] += bad
@@ -248,14 +249,17 @@ def problems(spec) -> list[str]:
                        "parameter, is excluded by name)")
         if not why:
             bad.append(f"uncertainty.excluded: parameter {name} needs a reason")
+    eff = set(drawn(spec))
     for name, q in sorted(scen.items()):
-        # F6 S1-4: a scenario value is a choice, not evidence; it is varied (its range enters the draws, the emulator
-        # design and an automatic decision test) or the spec says by name why it is held fixed
-        if name not in allp and name not in exc:
+        # F6 S1-4: a scenario value is a choice, not evidence; it is drawn (its range enters the draws, the emulator
+        # design and an automatic decision test) or the spec says by name why it is held fixed. A kind-level exclusion
+        # of every prior does not name it (Codex r1 P1)
+        if name not in eff and name not in exc:
             bad.append(f"scenario_without_range: engine parameter {name} is a scenario value ({q.value}) with no "
-                       f"declared range: give it one (uncertainty.priors.{name}: {{dist, range, source}}, or a range on "
-                       f"its engine_parameters value) so the draws vary it and it gets a decision test, or exclude it by "
-                       "name with a reason (uncertainty.excluded)")
+                       f"range the draws use: give it one (uncertainty.priors.{name}: {{dist, range, source}}, a range on "
+                       f"its engine_parameters value, or an engine-card prior) and do not exclude the priors kind, so the "
+                       "draws vary it and it gets a decision test; or exclude it by name with a reason "
+                       "(uncertainty.excluded)")
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
     if spec.raw["calibration"].get("method") in ("likelihood", "posterior") and drawn(spec):
         bad.append(f"uncertainty: {spec.raw['calibration']['method']} calibration does not condition on prior draws (its fit and covariance hold "
