@@ -18,7 +18,9 @@ re-optimised in every draw (package stability). The point plan's cost is recorde
 too (F6 S1-1): costs move with treated cases and unit prices, so a plan within the budget at the
 point values can exceed it in a draw. `affordability` reports the share of draws over the
 allocatable budget and the cost quantiles, and checks the spec's `uncertainty.affordability`
-rule (max_share_over_budget) when one is declared. The interval's label comes from the spec
+rule (max_share_over_budget) when one is declared. With `enforce: true` (S1-1b) the analysis first evaluates these
+draws once (`evaluate_draws`) and `reserve_search` finds the largest budget fraction whose plan meets the rule; run()
+then reads the same evaluations (`pre=`). The interval's label comes from the spec
 (`Spec.uncertainty_scope`): what it covers and what it does not. Writes
 `uncertainty_report.yaml` in the schema of scripts/propagate_uncertainty.py (shared
 summariser), plus the scope and the draw plan: every source drawn or not, every engine
@@ -165,12 +167,129 @@ def affordability(costs, budget: float, rule: dict | None = None, level: float =
             "rule": dict(rule) if rule else None, "rule_met": met}
 
 
-def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
+RESERVE_TOL, RESERVE_FLOOR, RESERVE_GRID, RESERVE_MAX_SOLVES = 0.005, 0.5, 10, 20
+
+
+def _over(c, budget: float) -> bool:
+    return c > float(budget) * (1 + 1e-9)       # affordability()'s tolerance: the solver's relative one
+
+
+def reserve_search(draw_costs, solve, budget: float, max_share: float, tol: float = RESERVE_TOL,
+                   floor: float = RESERVE_FLOOR, max_solves: int = RESERVE_MAX_SOLVES, grid: int = RESERVE_GRID) -> dict:
+    """F6 S1-1b: a plan solved within a budget reserve that meets the affordability rule: its cost exceeds the full
+    `budget` in at most `max_share` of the draws. `draw_costs` holds one cost table {unit: {package: cost}} per
+    uncertainty draw, so a candidate plan's cost in a draw is a sum; `solve(b)` returns the optimum {choice, objective}
+    at budget b (RuntimeError "optimizer status infeasible" counts as not meeting).
+
+    Visits: the unconstrained plan (f = 1); if it fails, a grid of `grid` fractions from `floor` up to 1 (step
+    (1 - floor) / grid); then bisection between the highest grid fraction that meets the rule and the grid point above
+    it, until that bracket is at most `tol` wide or `max_solves` solves are spent. Every solve is a recorded step.
+    Plans at different budgets are not nested, so the share need not fall with f: the result is the BEST VISITED plan
+    that meets the rule (highest objective; ties: the larger fraction), not a proven optimum, and "none_visited_meets"
+    says only that no visited fraction met the rule, not that none exists. `floor_met` reports the floor candidate
+    separately. Returns {feasible, result (unconstrained | best_visited | none_visited_meets), fraction, solution,
+    draws_over_budget, share_over_budget, floor_met, converged, steps, ...}. Bad inputs fail closed (ValueError)."""
+    tabs = list(draw_costs)
+    if not tabs or not all(isinstance(t, dict) and t for t in tabs):
+        raise ValueError("reserve search: one cost table per uncertainty draw is required")
+    if not all(np.isfinite(float(c)) for t in tabs for row in t.values() for c in row.values()):
+        raise ValueError("reserve search: every draw's costs must be finite")
+    if not (0 <= float(max_share) < 1):
+        raise ValueError("reserve search: max_share_over_budget must be in [0, 1)")
+    if not (float(tol) > 0 and 0 < float(floor) <= 1 and int(grid) >= 1 and int(max_solves) >= int(grid) + 2):
+        raise ValueError("reserve search: tolerance > 0, floor in (0, 1], a grid of at least 1 and at least grid + 2 "
+                         "solves are required")
+    nd, steps, sols = len(tabs), [], {}
+
+    def step(f):
+        rec = {"fraction": float(f), "budget": float(f) * float(budget)}
+        try:
+            sol = solve(float(f) * float(budget))
+        except RuntimeError as e:
+            if str(e).strip() != "optimizer status infeasible":
+                raise
+            steps.append(dict(rec, objective=None, draws_over_budget=None, share_over_budget=None, meets=False,
+                              infeasible=True))
+            return False
+        ch = sol["choice"]
+        over = sum(_over(sum(t[i][ch[i]] for i in t), budget) for t in tabs)
+        meets = over / nd <= float(max_share) + 1e-12
+        steps.append(dict(rec, objective=float(sol["objective"]), draws_over_budget=int(over),
+                          share_over_budget=over / nd, meets=bool(meets)))
+        sols[len(steps) - 1] = sol
+        return meets
+
+    base = {"draws": nd, "tolerance": float(tol), "floor": float(floor), "grid": int(grid), "max_solves": int(max_solves)}
+    if step(1.0):
+        s0 = steps[0]
+        return dict(base, feasible=True, result="unconstrained", fraction=1.0, solution=sols[0],
+                    draws_over_budget=s0["draws_over_budget"], share_over_budget=s0["share_over_budget"],
+                    floor_met=None, converged=True, solves=1, steps=steps)
+    fl, g = float(floor), int(grid)
+    pts = [fl + k * (1.0 - fl) / g for k in range(g)] if fl < 1.0 else [1.0]
+    met = [f for f in pts if step(f)]
+    floor_met = bool(steps[1]["meets"])
+    conv = False
+    if met:
+        lo = max(met)
+        hi = next((f for f in pts if f > lo), 1.0)
+        while hi - lo > float(tol) + 1e-12 and len(steps) < int(max_solves):
+            mid = (lo + hi) / 2
+            if step(mid):
+                lo = mid
+            else:
+                hi = mid
+        conv = hi - lo <= float(tol) + 1e-12
+    ok_ = [j for j, s in enumerate(steps) if s["meets"]]
+    if not ok_:
+        return dict(base, feasible=False, result="none_visited_meets", fraction=None, solution=None,
+                    draws_over_budget=None, share_over_budget=None, floor_met=floor_met, converged=False,
+                    solves=len(steps), steps=steps)
+    j = max(ok_, key=lambda k: (steps[k]["objective"], steps[k]["fraction"]))
+    return dict(base, feasible=True, result="best_visited", fraction=steps[j]["fraction"], solution=sols[j],
+                draws_over_budget=steps[j]["draws_over_budget"], share_over_budget=steps[j]["share_over_budget"],
+                floor_met=floor_met, converged=conv, solves=len(steps), steps=steps)
+
+
+def _n_seed(A, draws=None, seed=None):
     sp = A.spec["uncertainty"]
-    nd = int(draws if draws is not None else sp.get("draws", 32))
-    scope = A.spec.uncertainty_scope()
-    D = Drawer(A, seed if seed is not None else sp.get("seed", 42))
+    return int(draws if draws is not None else sp.get("draws", 32)), seed if seed is not None else sp.get("seed", 42)
+
+
+def _draw_rows(A, D, nd):
+    """Each draw's sampled values and evaluation, in draw order (lazily: the emulator error is drawn from the shared
+    stream inside evaluate)."""
+    for _ in range(nd):
+        D.last_clamped = []
+        theta, zs, noise, mult, sampled = D.draw()
+        clamped = list(D.last_clamped)
+        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
+        yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
+               "events": list(A.last_events)}
+
+
+def evaluate_draws(A, draws=None, seed=None) -> dict:
+    """The uncertainty step's draws evaluated once (F6 S1-1b): the same Drawer, seed and number of draws as run(), so
+    run(..., pre=) on the result reads exactly these evaluations."""
+    nd, sd = _n_seed(A, draws, seed)
+    D = Drawer(A, sd)
     D.prepare(nd)
+    return {"draws": nd, "seed": int(sd), "drawer": D, "rows": list(_draw_rows(A, D, nd))}
+
+
+def run(A, plan, headline_name: str, draws=None, seed=None, pre=None) -> dict:
+    sp = A.spec["uncertainty"]
+    nd, sd = _n_seed(A, draws, seed)
+    scope = A.spec.uncertainty_scope()
+    if pre is not None:          # evaluated once beforehand (the reserve search): the same draws, checked
+        if pre["draws"] != nd or pre["seed"] != int(sd) or len(pre["rows"]) != nd:
+            raise ValueError(f"uncertainty: precomputed draws ({pre['draws']}, seed {pre['seed']}) are not this "
+                             f"step's ({nd}, seed {sd})")
+        D, rows = pre["drawer"], pre["rows"]
+    else:
+        D = Drawer(A, sd)
+        D.prepare(nd)
+        rows = _draw_rows(A, D, nd)
     fixed = {o: [] for o in A.outcomes}
     fixed_cost = []
     opt_vals, same = [], np.zeros(len(A.ids))
@@ -178,13 +297,11 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
     corr_any = corr_plan = 0
     clamped_draws = []
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
-    for d in range(nd):
-        D.last_clamped = []
-        theta, zs, noise, mult, sampled = D.draw()
-        if D.last_clamped:
-            clamped_draws.append({"draw": d, "units": len(D.last_clamped), "examples": D.last_clamped[:5]})
-        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
-        corr_any += bool(A.last_events)
+    for d, r in enumerate(rows):
+        sampled, out, ben, cost = r["sampled"], r["out"], r["ben"], r["cost"]
+        if r["clamped"]:
+            clamped_draws.append({"draw": d, "units": len(r["clamped"]), "examples": r["clamped"][:5]})
+        corr_any += bool(r["events"])
         row = {}
         for o in A.outcomes:
             v = sum(out[i]["y"][A.comp][o] - out[i]["y"][plan[i]][o] for i in A.ids)
@@ -193,7 +310,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
         row[headline_name] = row[f"{hl_outcome}_averted"]
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
         sol = A.solve(ben, cost)
-        A.guard(f"uncertainty draw {d}", [plan, sol["choice"]])
+        A.guard(f"uncertainty draw {d}", [plan, sol["choice"]], r["events"])
         opt_vals.append(sol["objective"])
         row["reoptimised_objective"] = sol["objective"]
         same += np.array([sol["choice"][i] == plan[i] for i in A.ids])
@@ -258,6 +375,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None) -> dict:
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
             "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
+    if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
+        data["budget_planned"] = float(A.plan_budget)
     if prov is not None:
         data["draw_provenance"] = prov
     flagged = sorted((getattr(A, "flagged", None) or {}).values(), key=lambda f: str(f["unit"]))
@@ -386,11 +505,99 @@ def _self_test() -> int:
                 ok(False, f"U12 {label} fails closed")
             except ValueError:
                 ok(True, f"U12 {label} fails closed")
+    _self_test_reserve(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_reserve(ok):
+    """F6 S1-1b: the reserve search on synthetic cost tables. Four units, each either nothing (cost 0) or one
+    package costing 10 x the draw's multiplier, benefits 4, 3, 2, 1; the exact optimum at budget b funds the
+    floor(b / 10) best units. Budget 40; multipliers 0.8 ... 2.0: the unconstrained plan (4 units) is over in 5 of 8
+    draws; 3 units are over in 2 of 8 (multipliers 1.5 and 2.0); 2 units in none."""
+    rs = globals().get("reserve_search")
+    ok(callable(rs), "U13 reserve_search() exists")
+    if not callable(rs):
+        return
+    mults = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 2.0]
+    ben = {"u1": 4.0, "u2": 3.0, "u3": 2.0, "u4": 1.0}
+    tables = [{u: {"n": 0.0, "y": 10.0 * m} for u in ben} for m in mults]
+    calls = []
+
+    def solve(b):
+        calls.append(b)
+        k = int(b / 10.0 + 1e-9)
+        top = sorted(ben, key=lambda u: -ben[u])[:k]
+        return {"choice": {u: ("y" if u in top else "n") for u in ben}, "objective": sum(ben[u] for u in top)}
+
+    r = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    st = r.get("steps") or []
+    ok(r.get("feasible") is True and st and st[0]["fraction"] == 1.0 and st[0]["meets"] is False
+       and st[0]["draws_over_budget"] == 5,
+       f"U14 the first step is the unconstrained plan (fraction 1), over budget in 5 of 8 draws: {st[:1]}")
+    ok([round(x["fraction"], 6) for x in st[1:11]] == [round(0.5 + 0.05 * k, 6) for k in range(10)]
+       and r.get("floor_met") is True,
+       f"U14b a coarse grid over [floor, 1) is probed before bisecting (Codex S1-1b P2): "
+       f"{[round(x['fraction'], 3) for x in st[1:11]]}")
+    ok(1.0 - 0.005 <= r.get("fraction", 0) < 1.0 and sum(v == "y" for v in r["solution"]["choice"].values()) == 3
+       and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.25) < 1e-12
+       and r.get("result") == "best_visited",
+       f"U15 the best visited fraction meeting the rule, bisected to the tolerance above the grid (3 units, 2 of 8 "
+       f"over): {r.get('fraction')}, {r.get('draws_over_budget')}, {r.get('result')}")
+    ok(len(calls) == len(st) <= 20 and r.get("converged") is True and abs(r["solution"]["objective"] - 9.0) < 1e-12
+       and all(x["meets"] == (x["share_over_budget"] <= 0.25) for x in st)
+       and all(abs(b - x["fraction"] * 40.0) < 1e-9 for b, x in zip(calls, st)),
+       f"U16 every ILP solve is one recorded step at fraction x budget, within the cap ({len(calls)} solves)")
+    r1 = rs(tables, solve, 40.0, 0.7, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r1["fraction"] == 1.0 and len(r1["steps"]) == 1 and r1["feasible"] and r1.get("result") == "unconstrained",
+       "U17 an unconstrained plan that meets the rule needs no reserve (fraction 1, one solve)")
+    r2 = rs(tables, solve, 40.0, 0.0, tol=0.005, floor=0.8, max_solves=20, grid=10)
+    ok(r2["feasible"] is False and r2.get("solution") is None and r2.get("result") == "none_visited_meets"
+       and r2.get("floor_met") is False and len(r2["steps"]) == 11,
+       f"U18 no visited fraction meets the rule (the unconstrained plan and the grid from the floor): nothing "
+       f"returned, and the result says only what was visited ({r2.get('result')}, {len(r2['steps'])} solves)")
+    r3 = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12, grid=10)
+    ok(len(r3["steps"]) == 12 and r3["converged"] is False and r3["feasible"] and r3["share_over_budget"] <= 0.25,
+       "U19 the solve cap stops the bisection unconverged, at a fraction that meets the rule")
+
+    def infeasible_low(b):
+        if b < 30:
+            raise RuntimeError("optimizer status infeasible")
+        return solve(b)
+    r4 = rs(tables, infeasible_low, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r4["feasible"] is True and r4["steps"][1].get("infeasible") is True and r4.get("floor_met") is False
+       and r4["fraction"] >= 0.95,
+       "U20 the floor candidate failing (the solver proves it infeasible) is not the end: a higher visited fraction "
+       "that meets the rule is kept")
+
+    def non_nested(b):          # Codex S1-1b P2: plans that are not nested in the budget
+        f = b / 40.0
+        k, obj = (1, 1.0) if f < 0.7 else (3, 3.0) if 0.85 <= f < 0.95 else (4, 4.0)
+        top = sorted(ben, key=lambda u: -ben[u])[:k]
+        return {"choice": {u: ("y" if u in top else "n") for u in ben}, "objective": obj}
+    r5 = rs(tables, non_nested, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r5["feasible"] and abs(r5["solution"]["objective"] - 3.0) < 1e-12 and 0.9 <= r5["fraction"] < 0.95,
+       f"U23 a non-nested problem: the grid finds the better plan a plain bisection misses (objective "
+       f"{r5['solution']['objective']} at {r5['fraction']})")
+    for label, args in (("no draws", ([], solve, 40.0, 0.25)), ("a non-finite cost",
+                        ([{u: {"n": 0.0, "y": float("nan")} for u in ben}], solve, 40.0, 0.25)),
+                        ("a share outside [0, 1)", (tables, solve, 40.0, 1.0))):
+        try:
+            rs(*args)
+            ok(False, f"U21 {label} fails closed")
+        except ValueError:
+            ok(True, f"U21 {label} fails closed")
+    for kw in ({"tol": 0.0}, {"floor": 0.0}, {"floor": 1.5}, {"max_solves": 1}, {"max_solves": 5, "grid": 10},
+               {"grid": 0}):
+        try:
+            rs(tables, solve, 40.0, 0.25, **kw)
+            ok(False, f"U22 search settings {kw} are refused")
+        except ValueError:
+            ok(True, f"U22 search settings {kw} are refused")
+
 
 
 if __name__ == "__main__":
