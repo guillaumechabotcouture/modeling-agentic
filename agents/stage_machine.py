@@ -2532,12 +2532,36 @@ def _self_test() -> int:
             al = rec.get("report_acceptance_language") or {}
             if name == "t84":
                 ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
-                   and "validated" not in open(rp).read() and al.get("found") and not al.get("remaining"),
+                   and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
                    f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
                    and al.get("remaining"),
                    f"T85 an unrepaired declared report is withheld, not delivered ({s}, {al})")
+        # T88 (round 2): a repaired draft goes through the whole post-write gate again: a repair that adds an
+        # unresolved claim reference (non-declarable HIGH) ends RUN_FAILED, not a delivered declared report.
+        # T89: a Markdown soft break inside a negated sentence is not acceptance language (nothing withheld).
+        for name, extra, want in (("t88", {"manuscript": "The plan is validated against the trials.\n",
+                                           "manuscript_repair": "The plan was tested; see [CLAIM:missing_claim].\n"},
+                                   "run_failed"),
+                                  ("t89", {"manuscript": "The model is not yet\nvalidated against the trials.\n"},
+                                   "completed_scope_declared")):
+            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}}}, **extra), max_rounds=1)
+            os.makedirs(os.path.join(d, "models"), exist_ok=True)
+            if not os.path.exists(os.path.join(d, "models", "claims_ledger.yaml")):
+                shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                            os.path.join(d, "models", "claims_ledger.yaml"))
+            try:
+                s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+            except Exception as e:  # noqa: BLE001
+                s = f"raised {type(e).__name__}: {e}"
+            if name == "t88":
+                ok(s == want and any(c.endswith(":repair") for c in T.calls),
+                   f"T88 a language repair is re-checked by the full post-write gate ({s})")
+            else:
+                ok(s == want and not any(c.endswith(":repair") for c in T.calls)
+                   and os.path.exists(os.path.join(d, "report.md")),
+                   f"T89 'not yet' + soft break + 'validated' is negated: delivered, no repair ({s})")
         # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
         # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
         judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",

@@ -483,6 +483,23 @@ def _self_test() -> int:
         ok(led["D-003"].claim == longc and led["long_gate"].claim == longc
            and getattr(load(d15)["D-003"], "fix_requires", None) == "use a sourced range",
            "L15 the ledger keeps each finding's full claim and its required remedy")
+        # L16 (round 2): a HIGH critic finding the gate holds open keeps its remedy through sync() and the packet;
+        # a gate-only blocking entry brings its own.
+        d16 = os.path.join(d, "l16")
+        os.makedirs(d16)
+        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-010", "severity": "HIGH", "claim": "c",
+                                                  "fix_requires": "REMEDY-D010"}]},
+                       open(os.path.join(d16, CRITIQUE_FILES["critique-domain"]), "w"))
+        dec16 = {"unresolved_high": [{"reviewer": "critique-domain", "id": "D-010", "claim": "c"},
+                                     {"reviewer": "rigor-artifacts", "kind": "req_x", "claim": "r",
+                                      "fix_requires": "REMEDY-REQ"}]}
+        sync(d16, dec16, 1)
+        led16, _ = sync(d16, dec16, 2)
+        import fix_loop as _FX
+        pk = {f["id"]: f for f in _FX.build_packet(d16, led16, 2, 3, dec16, None)["findings"]}
+        ok(led16["D-010"].fix_requires == "REMEDY-D010" and (pk.get("D-010") or {}).get("fix_requires") == "REMEDY-D010"
+           and (pk.get("req_x") or {}).get("fix_requires") == "REMEDY-REQ",
+           f"L16 remedies survive the gate rows through sync() into the planner packet {pk}")
     # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         open(os.path.join(out, "v"), "w").write("untouched")

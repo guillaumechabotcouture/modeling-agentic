@@ -751,7 +751,8 @@ def _run_self_test() -> int:
             ("no records", {}, over, 3), ("metadata says completed", dict(dec, **{"metadata.json": {"status": "completed"}}), over, 3),
             ("run state accepted, gate declared", dict(dec, **{"run_state.json": {"status": "completed"}}), over, 3),
             ("gate accepted, run state declared", dict(acc, **{"run_state.json": {"status": "completed_scope_declared"}}), over, 3),
-            ("forged harness marker", dec, forged, 1)):
+            ("forged harness marker", dec, forged, 1),
+            ("run state says completed, no gate decision", {"run_state.json": {"status": "completed"}}, over, 3)):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "report.md"), "w").write(text)
             for name, doc in files.items():
@@ -794,6 +795,25 @@ def _run_self_test() -> int:
     except Exception as e:  # noqa: BLE001
         typed = repr(e)
     ok(typed is True, f"T-accept-types: manifest negations, allowed phrases and attributions are strings ({typed})")
+    # Round 2: a gate decision older than the report is not current; run_state.json is protected from agents;
+    # a Markdown soft break does not end a clause, a blank line or a list item does.
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"action": "ACCEPT"}, open(os.path.join(d, "final_gate.json"), "w"))
+        os.utime(os.path.join(d, "final_gate.json"), (1, 1))
+        open(os.path.join(d, "report.md"), "w").write(over)
+        ok(sum(i.kind == "acceptance_language" for i in writer_qa(d).issues) == 3,
+           "T-accept-stale: an ACCEPT older than the report grants no exemption")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from agents import enforcement as _EN
+            why = _EN.protected_reason(os.path.join(d, "run_state.json"), d, None)
+        except Exception as e:  # noqa: BLE001
+            why = None
+        ok(bool(why), "T-accept-protect: agents may not write run_state.json")
+    for text, want in (("The model is not yet\nvalidated.", 0), ("We did not run it.\n\nValidated by the fit.", 1),
+                       ("Not run:\n- validated by the fit", 1)):
+        got = len(acceptance_language_hits(text, "completed_scope_declared"))
+        ok(got == want, f"T-accept-softbreak: {text!r}: {want} hit(s) expected, got {got}")
     with tempfile.TemporaryDirectory() as d:
         bad = os.path.join(d, "m.yaml")
         open(bad, "w").write("terms: [{id: a, pattern: 'a'}]\nstatus_lines: {other: x}\nnegations: [not, no]\n")
