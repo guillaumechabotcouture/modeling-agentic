@@ -467,19 +467,30 @@ def _self_test() -> int:
             complete_run(d, cal=cal)
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_calibration"]
             ok(f and why in f[0]["claim"], f"K11 calibration gated (Codex P1-8): {why}")
-        # F6 S1-1: a plan that fails the spec's affordability rule is a gate finding; no rule, or a met rule, is not
+        # F6 S1-1 (Codex P1): the gate judges the signed spec's rule itself, from the artifact's counts; a declared rule
+        # with no result, another rule in the artifact, or a verdict the counts do not support is a finding
+        spec_text = open(os.path.join(d, SPEC)).read()
         base_u = {"draws": 4, "covers": [], "excludes": [], "label": "", "fixed_plan": {}}
-        for aff, want in (({"draws": 4, "draws_over_budget": 3, "share_over_budget": 0.75, "budget_allocatable": 1.0,
-                            "rule": {"max_share_over_budget": 0.1}, "rule_met": False}, True),
-                          ({"draws": 4, "draws_over_budget": 3, "share_over_budget": 0.75, "budget_allocatable": 1.0,
-                            "rule": None, "rule_met": None}, False),
-                          ({"draws": 4, "draws_over_budget": 0, "share_over_budget": 0.0, "budget_allocatable": 1.0,
-                            "rule": {"max_share_over_budget": 0.1}, "rule_met": True}, False)):
-            complete_run(d, unc=dict(base_u, affordability=aff))
+
+        def aff(over, rule, met, draws=4):
+            return {"draws": draws, "draws_over_budget": over, "share_over_budget": over / draws if draws else 0.0,
+                    "budget_allocatable": 1.0, "rule": rule, "rule_met": met}
+        r01 = {"max_share_over_budget": 0.1}
+        for spec_rule, a_, want, label in (
+                (r01, aff(3, r01, False), True, "rule not met"),
+                (r01, aff(3, {"max_share_over_budget": 0.9}, True), True, "artifact carries a looser rule"),
+                (r01, None, True, "declared rule, no affordability result"),
+                (r01, aff(3, r01, True), True, "verdict the counts do not support"),
+                (r01, aff(0, r01, True, draws=0), True, "declared rule judged on zero draws"),
+                (r01, aff(0, r01, True), False, "rule met"),
+                (None, aff(3, None, None), False, "no rule declared: reported, not judged"),
+                (None, None, False, "no rule declared, older artifact without affordability")):
+            open(os.path.join(d, SPEC), "w").write(spec_text + (yaml.safe_dump({"uncertainty": {"affordability": spec_rule}})
+                                                                if spec_rule else ""))
+            complete_run(d, unc=dict(base_u, **({"affordability": a_} if a_ is not None else {})))
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
-            ok(bool(f) == want and (not f or "3 of 4" in f[0]["claim"]),
-               f"K13 affordability rule {aff['rule']} with share {aff['share_over_budget']}: finding {bool(f)} (want {want})")
-        # engine choice (engine: auto): its hash is in the manifest and in every artifact header
+            ok(bool(f) == want, f"K13 affordability, {label}: finding {bool(f)} (want {want}) {f[:1]}")
+        open(os.path.join(d, SPEC), "w").write(spec_text)
         cp = os.path.join(d, "engine_choice.json")
         json.dump({"engine": {"ref": "x:Y"}, "why": "w"}, open(cp, "w"))
         try:
