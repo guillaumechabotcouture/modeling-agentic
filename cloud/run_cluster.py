@@ -2430,6 +2430,7 @@ def _self_test_s18_r2(ok) -> None:
                 return types.SimpleNamespace(cluster_id=89)
 
             def conf(name, kc, **k):
+                calls.setdefault("conf", []).append({x: k.get(x) for x in ("run_id", "overflow_id")})
                 if not confirm_ok and getattr(kc, "cluster_id", None) != 89:
                     raise SystemExit("not confirmed")
                 return ["tick"]
@@ -2463,6 +2464,163 @@ def _self_test_s18_r2(ok) -> None:
     rc, calls, cl = go(both, {"lt": 77, "lt-overflow": 78, "lt-keeper": 79}, confirm_ok=False)
     ok(rc == 0 and calls["stopped"] == [79] and calls["keeper"] == [(77, 78)],
        f"R9d this launch's keeper that is not holding the pool is stopped by id and restarted: {rc} {calls}")
+    rc, calls, cl = go(both, {"lt": 77, "lt-overflow": 78, "lt-keeper": 79})
+    ok((calls.get("conf") or [{}])[0] == {"run_id": 77, "overflow_id": 78},
+       f"R9e (round 3, P2-1) the kept keeper is confirmed against this run cluster and overflow pool: {calls.get('conf')}")
+    rc, calls, cl = go(both, {"lt": 77, "lt-keeper": 79})
+    ok(rc == 0 and calls["stopped"] == [79] and calls["overflow"] == 1 and calls["keeper"] == [(77, 88)]
+       and cl["keeper"]["id"] == 89 and cl["overflow"]["id"] == 88,
+       f"R9f (round 3, P2-1) the overflow pool is gone but the keeper lives: a new pool, and the keeper (still aimed at "
+       f"the old pool) replaced: {rc} {calls}")
+
+
+def _self_test_s18_r3(ok) -> None:
+    """Codex round 3 on #161: a keeper is healthy only with a fresh heartbeat for this run and overflow pool (P2-2);
+    every self-test entry refuses the real coiled (P2-3); the smoke watch is bounded by the wall clock, bounds every
+    API call and stops only after the launcher has exited and every cluster of the config's names is down (P2-4)."""
+    import types
+    g, M = globals(), sys.modules[__name__]
+    kf = g.get("keeper_fresh")
+    tick = "12:00:00 keeper holding lt 2..3 {}\n12:01:00 workers=2 (overflow 0) refusals=0 active=primary"
+    st = {"updated": 1000.0, "cluster_id": 77, "overflow": {"id": 78}}
+    cases = [("fresh", dict(status=st, now=1060.0, log=tick), True),
+             ("stale", dict(status=st, now=1000.0 + 3600, log=tick), False),
+             ("another run cluster", dict(status=dict(st, cluster_id=5), now=1060.0, log=tick), False),
+             ("another overflow pool", dict(status=dict(st, overflow={"id": 5}), now=1060.0, log=tick), False),
+             ("an error after the tick", dict(status=st, now=1060.0, log=tick + "\n12:01:30 keeper error OSError: x; retrying"), False),
+             ("exited after the tick", dict(status=st, now=1060.0, log=tick + "\n12:02:00 lt is not running; keeper exiting"), False),
+             ("no tick", dict(status=st, now=1060.0, log="12:00:00 keeper holding lt 2..3 {}"), False),
+             ("no status", dict(status=None, now=1060.0, log=tick), False)]
+    for what, h, want in cases:
+        got = kf(h, run_id=77, overflow_id=78) if kf else (None, "")
+        ok(got[0] is want, f"K1 keeper_fresh, {what}: {got}")
+    # confirm_keeper reads the heartbeat through the keeper's own worker and checks the ids
+    table = {"tls://k:1": {}}
+
+    class C:
+        status = "running"
+
+        def __init__(self, h):
+            self.h = h
+
+        def scheduler_info(self):
+            return {"workers": table}
+
+        def run(self, fn, workers):
+            return {w: (self.h if getattr(fn, "__name__", "") == "keeper_health" else self.h["log"]) for w in workers}
+    for h, want in ((dict(status=st, now=1060.0, log=tick), True), (dict(status=dict(st, overflow=None), now=1060.0, log=tick), False)):
+        kc = types.SimpleNamespace(cluster_id=79, get_client=lambda h=h: C(h))
+        try:
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                confirm_keeper("lt-keeper", kc, attempts=1, delay_s=0, sleep=lambda s: None, run_id=77, overflow_id=78)
+            got = True
+        except (SystemExit, TypeError):
+            got = False
+        ok(got is want, f"K2 confirm_keeper needs a fresh heartbeat for run 77 / overflow 78: want {want}, got {got}")
+    # one refusing guard for every self-test entry that can reach the cloud
+    guard = None
+    try:
+        import no_cloud as guard
+    except ImportError:
+        pass
+    ok(guard is not None and guard.active(), "G1 run_cluster's self-test runs under the shared refusing guard (cloud/no_cloud.py)")
+    refused = False
+    if guard is not None and guard.active():                       # never probed without the guard: unguarded, this would be a real call
+        try:
+            import coiled
+            coiled.list_clusters(workspace="w")
+        except RuntimeError:
+            refused = True
+    ok(refused, "G1b a real coiled call from a run_cluster self-test is refused")
+    # the smoke watch
+    sw = g.get("smoke_watch")
+    cfg = RunConfig(name="lt", question_file="q", pipeline="v2")
+
+    class World:
+        def __init__(self, script, launcher_alive_until):
+            self.t, self.script, self.until, self.stopped = 0.0, script, launcher_alive_until, []
+
+        def clock(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += s
+
+        def lister(self):
+            self.t += 7.0                       # each listing takes time: the bound is the clock, not a count
+            live = [c for t0, c in self.script if t0 <= self.t and c["id"] not in self.stopped]
+            return live
+
+        def stop(self, name, cid):
+            self.stopped.append(cid)
+
+        def alive(self):
+            return self.t < self.until
+    run = {"name": "lt", "id": 77, "current_state": {"state": "running"}}
+    keeper = {"name": "lt-keeper", "id": 79, "current_state": {"state": "running"}}
+    other = {"name": "someone-else", "id": 5, "current_state": {"state": "running"}}
+    if sw:
+        # the run cluster stops by itself at t=200, a keeper appears late (t=150) and stops at t=400
+        class W1(World):
+            def lister(self):
+                self.t += 7.0
+                out = [other]
+                if self.t < 200:
+                    out.append(run)
+                if 150 <= self.t < 400:
+                    out.append(keeper)
+                return out
+        w = W1([], 100)
+        r = sw(cfg, w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30)
+        ok(r.get("clean") and not w.stopped and w.t >= 400, f"W1 the watch waits for a late keeper to stop by itself, "
+                                                            f"then ends clean: t={w.t} {r}")
+        w = World([(0, run), (0, keeper), (0, other)], 10 ** 9)
+        r = sw(cfg, w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30)
+        ok(not r.get("clean") and sorted(w.stopped) == [77, 79] and 1200 <= w.t <= 1200 + 300,
+           f"W2 at the wall-clock limit it stops by id every live cluster of the config's names, nothing else: "
+           f"t={w.t} stopped={w.stopped} {r}")
+
+        def hang():
+            import time as _t
+            _t.sleep(5)
+            return []
+        import time as _time
+        t0 = _time.monotonic()
+        r = sw(cfg, lambda: False, minutes=0.01, lister=hang, stopper=lambda n, c: None, every_s=0.1, call_timeout_s=0.5)
+        ok(_time.monotonic() - t0 < 4, f"W3 a hung API call is bounded by its timeout: {_time.monotonic() - t0:.1f}s {r}")
+    else:
+        ok(False, "W1 smoke_watch exists")
+    # the job's cloud-side lifetime: the run's wall time and the hold for collection come from the config
+    sub = []
+    fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append((a, kw)) or "fut")
+    from unittest import mock
+    with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}):
+        try:
+            c2 = RunConfig(name="z", question_file="q", pipeline="v2", run_timeout_hours=0.25, hold_hours=0.1)
+            _submit(c2, fc, "R1", "w", b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
+            got = sub[0][1].get("run_timeout_s"), sub[0][1].get("hold_s")
+        except TypeError as e:
+            got = e
+    ok(got == (900.0, 360.0), f"T1 the run's time limit and collection hold reach run_to_disk: {got}")
+    rm = getattr(ws, "_run_main", None)
+    if rm:
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            t0 = _time.monotonic()
+            with open(os.path.join(d, "log"), "w") as log:
+                rc_ = rm([sys.executable, "-c", "import time; time.sleep(30)"], d, dict(os.environ), log, timeout_s=1)
+            ok(rc_ == "timeout" and _time.monotonic() - t0 < 10, f"T2 main.py past its time limit is killed: {rc_}")
+    else:
+        ok(False, "T2 worker_side._run_main exists")
+    hold = getattr(ws, "_hold", None)
+    clk = [0.0]
+    if hold:
+        with tempfile.TemporaryDirectory() as d:
+            hold(d, 600, sleep=lambda s: clk.__setitem__(0, clk[0] + s), clock=lambda: clk[0])
+        ok(600 <= clk[0] <= 630, f"T3 the hold for collection ends at its bound: {clk[0]}")
+    else:
+        ok(False, "T3 worker_side._hold exists")
 
 
 def _self_test_bwrap(ok) -> None:
@@ -2846,6 +3004,10 @@ def _self_test() -> int:
         _self_test_s18_r2(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"R9: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18_r3(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"K: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
