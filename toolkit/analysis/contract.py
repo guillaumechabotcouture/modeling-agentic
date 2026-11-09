@@ -144,6 +144,17 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     return reserve_findings(rule, point or {}, unc or {})
 
 
+def _burden(run_dir: str, data) -> list[dict]:
+    """F6 S2-5: the signed spec's validation.burden, judged from the artifact's numbers (toolkit/analysis/burden.py);
+    a group outside its tolerance is declarable, every other problem is not (fail closed)."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_burden", f"{SPEC} unreadable for validation.burden: {e}", "burden")]
+    from toolkit.analysis import burden as BV
+    return BV.findings(raw, data)
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -155,7 +166,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc, pt_doc = None, None, None, None
+    cal_doc, unc_doc, est_doc, pt_doc, bv_doc = None, None, None, None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -239,6 +250,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             unc_doc = doc.get("data") or {}
         if kind == "point":
             pt_doc = doc.get("data") or {}
+        if kind == "burden_validation":
+            bv_doc = doc.get("data") or {}
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -257,6 +270,7 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _affordability(run_dir, unc_doc or {})
     out += _reserve(run_dir, pt_doc, unc_doc or {})
+    out += _burden(run_dir, bv_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)

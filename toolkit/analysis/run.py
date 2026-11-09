@@ -334,10 +334,19 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
-    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre)
+    from toolkit.analysis import burden as BV
+    bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
+    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
+               on_draw=bcol.add if bcol else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
+    bvd = None
+    if bcol is not None:        # F6 S2-5: the continuation arm's burden against external estimates
+        bvd = BV.run(A, out0, z0, point, bcol, level=u["data"]["interval"].get("level", 0.95))
+        arts["burden_validation"] = S.write("burden_validation", bvd, BV.PRODUCER,
+                                            [arts["point"], arts["uncertainty"], BV.csv_path(spec)])
+        log(f"burden validation: {bvd['summary']}")
     # ---- stability
     stab = ST.run(A, z0, out0, ben0, cost0, plan)
     arts["stability"] = S.write("stability", stab, ST.PRODUCER, [arts["point"], arts["calibration"]])
@@ -416,13 +425,15 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
-    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy)
+    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, burden=bvd)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
-                                                                          "decision_tests", "calibration")])
+                                                                          "decision_tests", "calibration")
+                                                        + (("burden_validation",) if bvd else ())])
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
-    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else []),
+    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else [])
+                              + (["burden_validation"] if bvd else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")

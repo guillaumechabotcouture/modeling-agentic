@@ -38,7 +38,7 @@ def _c(cid, kind, art, field, units="", **kw):
             "produced_by": "harness", **kw}
 
 
-def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal: dict) -> list[dict]:
+def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal: dict, burden=None) -> list[dict]:
     o = A.primary
     cl = [_c("headline.point", "scalar", arts["point"], f"data.averted.{o}", o),
           _c("headline.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{o}.median", o,
@@ -126,6 +126,9 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
         cl.append(_c("calibration.clamped", "count", arts["calibration"], "data.diagnostics.clamped_units", "units"))
     elif cal.get("method") == "likelihood":
         cl.append(_c("calibration.dispersion", "scalar", arts["calibration"], "data.diagnostics.dispersion"))
+    if burden:      # F6 S2-5: absolute burden against external estimates
+        from toolkit.analysis import burden as BV
+        cl += BV.claims(_c, arts["burden_validation"], burden)
     return cl
 
 
@@ -141,10 +144,10 @@ def _spec_rows(A, claimable=False) -> list[dict]:
     return [r for r in PV.rows(A.spec, A.eng) if not claimable or _claimable(r["name"])]
 
 
-def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc) -> dict:
+def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -> dict:
     B, R = _scripts()
     spec = {"producer": PRODUCER, "produced_by": "harness",
-            "claims": claim_spec(A, arts, point, uq, stab, dts, cal)}
+            "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden)}
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().write_nofollow(run_dir, SPEC_REL.replace(os.sep, "/"),
                               yaml.safe_dump(spec, sort_keys=False, width=120).encode(), atomic=True)
@@ -154,7 +157,7 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc) -> dict:
     if doc.get("unresolved"):
         raise RuntimeError(f"claims ledger: unresolved harness claims {doc['unresolved'][:3]}")
     claims = R.load_claims(os.path.join(run_dir, "models", "claims_ledger.yaml"))
-    text = results_template(A, point, uq, stab, sens, dts, cal, emu_acc)
+    text = results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden)
     rendered, unresolved = R.render_text(text, claims)
     if unresolved:
         raise RuntimeError(f"results.md: unresolved claims {unresolved}")
@@ -180,7 +183,7 @@ def attribute_simplifications(A) -> list[str]:
     return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b), problems=bad)
 
 
-def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
+def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -> str:
     o = A.primary
     s = A.spec
     L = [f"# Results: {s['question'].strip()}", "",
@@ -259,6 +262,9 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
     L += attribute_simplifications(A)
     if emu_acc and not emu_acc.get("direct"):
         L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in emu_acc.items())}.", ""]
+    if burden:
+        from toolkit.analysis import burden as BV
+        L += BV.results_lines(burden)
     L += ["## Allocation stability", ""]
     if stab.get("folds"):
         L += [f"{stab['method']}, {stab['n_folds']} folds. Objective lost when a group's data are withheld (worst "

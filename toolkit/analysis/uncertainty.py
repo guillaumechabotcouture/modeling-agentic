@@ -282,7 +282,8 @@ def evaluate_draws(A, draws=None, seed=None) -> dict:
     return {"draws": nd, "seed": int(sd), "drawer": D, "rows": list(_draw_rows(A, D, nd))}
 
 
-def run(A, plan, headline_name: str, draws=None, seed=None, pre=None) -> dict:
+def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=None) -> dict:
+    """`on_draw(out)`: called with each draw's outcomes (F6 S2-5: the burden references' values)."""
     sp = A.spec["uncertainty"]
     nd, sd = _n_seed(A, draws, seed)
     scope = A.spec.uncertainty_scope()
@@ -308,6 +309,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None) -> dict:
         if r["clamped"]:
             clamped_draws.append({"draw": d, "units": len(r["clamped"]), "examples": r["clamped"][:5]})
         corr_any += bool(r["events"])
+        if on_draw is not None:
+            on_draw(out)
         floors.append(r["floors"])
         row = {}
         for o in A.outcomes:
