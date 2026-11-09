@@ -1813,7 +1813,10 @@ def _self_test_52(ok) -> None:
     comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                  register_compute_tags=lambda c, exclude: used.append(c))
     fake_coiled = types.ModuleType("coiled")
-    fake_coiled.Cluster = lambda **kw: run_cl
+    rc52_made = []
+    fake_coiled.Cluster = lambda **kw: rc52_made.append({"name": kw.get("name"), "id": 12, "tags": kw.get("tags"),
+                                                         "current_state": {"state": "running"}}) or run_cl
+    fake_coiled.list_clusters = lambda workspace: list(rc52_made)
     with tempfile.TemporaryDirectory() as d:
         q = os.path.join(d, "q.txt")
         open(q, "w").write("question")
@@ -2153,7 +2156,14 @@ def _self_test_s18(ok, tb) -> None:
             comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=tags)
             fake_coiled = types.ModuleType("coiled")
-            fake_coiled.Cluster = lambda **kw: types.SimpleNamespace(cluster_id=77, get_client=lambda: client)
+            made = []
+
+            def cluster(**kw):
+                made.append({"name": kw.get("name"), "id": 77, "tags": kw.get("tags"),
+                             "current_state": {"state": "running"}})
+                return types.SimpleNamespace(cluster_id=77, get_client=lambda: client)
+            fake_coiled.Cluster = cluster
+            fake_coiled.list_clusters = lambda workspace: list(made)
             P = mock.patch.object
             with mock.patch.dict(sys.modules, {"coiled": fake_coiled}), \
                     P(M, "is_running", return_value=False), P(M, "live_id", return_value=77), \
@@ -2332,9 +2342,13 @@ def _self_test_s18_r1(ok) -> None:
                     raise OSError(f"disk full writing {cl.get('status')}")
                 return real_write(cfg_, cl, *a, **kw)
 
+            made = []
+
             def cluster(**kw):
                 cl = types.SimpleNamespace(cluster_id=78 if kw.get("name", "").endswith("-overflow") else 77,
                                            get_client=lambda: client)
+                made.append({"name": kw.get("name"), "id": cl.cluster_id, "tags": kw.get("tags"),
+                             "current_state": {"state": "running"}})
                 if kw.get("name", "").endswith("-overflow"):
                     def boom(*a):
                         raise RuntimeError("upload failed")
@@ -2342,7 +2356,7 @@ def _self_test_s18_r1(ok) -> None:
                 return cl
             fake_coiled = types.ModuleType("coiled")
             fake_coiled.Cluster = cluster
-            fake_coiled.list_clusters = lambda workspace: []
+            fake_coiled.list_clusters = lambda workspace: list(made)
             comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=lambda c, exclude: None)
             pats = [P(M, "is_running", return_value=running),
@@ -2643,13 +2657,17 @@ def _self_test_s18_r3(ok) -> None:
         except RuntimeError:
             refused = True
     ok(refused, "G1b a real coiled call from a run_cluster self-test is refused")
-    # the smoke watch
+    # the smoke watch: ownership is the invocation tag; at the limit the launcher is terminated and reaped first
     sw = g.get("smoke_watch")
     cfg = RunConfig(name="lt", question_file="q", pipeline="v2")
+    TAGK = g.get("INVOCATION_TAG", "ma-invocation")
+
+    def cl_(name, cid, inv="INV"):
+        return {"name": name, "id": cid, "tags": {TAGK: inv}, "current_state": {"state": "running"}}
 
     class World:
         def __init__(self, script, launcher_alive_until):
-            self.t, self.script, self.until, self.stopped = 0.0, script, launcher_alive_until, []
+            self.t, self.script, self.until, self.stopped, self.events = 0.0, script, launcher_alive_until, [], []
 
         def clock(self):
             return self.t
@@ -2659,37 +2677,48 @@ def _self_test_s18_r3(ok) -> None:
 
         def lister(self):
             self.t += 7.0                       # each listing takes time: the bound is the clock, not a count
-            live = [c for t0, c in self.script if t0 <= self.t and c["id"] not in self.stopped]
-            return live
+            return [c for t0, c in self.script if t0 <= self.t and c["id"] not in self.stopped]
 
         def stop(self, name, cid):
+            self.events.append(("stop", cid))
             self.stopped.append(cid)
 
         def alive(self):
             return self.t < self.until
-    run = {"name": "lt", "id": 77, "current_state": {"state": "running"}}
-    keeper = {"name": "lt-keeper", "id": 79, "current_state": {"state": "running"}}
-    other = {"name": "someone-else", "id": 5, "current_state": {"state": "running"}}
+
+        def terminate(self):
+            self.events.append(("terminate", None))
+            self.until = -1
+    run, keeper = cl_("lt", 77), cl_("lt-keeper", 79)
+    theirs = cl_("lt", 66, inv="OTHER")             # same name, another invocation's (a race on another machine)
     if sw:
-        # the run cluster stops by itself at t=200, a keeper appears late (t=150) and stops at t=400
         class W1(World):
             def lister(self):
                 self.t += 7.0
-                out = [other]
+                out = [theirs]
                 if self.t < 200:
                     out.append(run)
                 if 150 <= self.t < 400:
                     out.append(keeper)
                 return out
         w = W1([], 100)
-        r = sw(cfg, w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30)
-        ok(r.get("clean") and not w.stopped and w.t >= 400, f"W1 the watch waits for a late keeper to stop by itself, "
-                                                            f"then ends clean: t={w.t} {r}")
-        w = World([(0, run), (0, keeper), (0, other)], 10 ** 9)
-        r = sw(cfg, w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30)
+        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
+               every_s=30, terminate=w.terminate)
+        ok(r.get("clean") and not w.stopped and w.t >= 400,
+           f"W1 the watch waits for a late keeper to stop by itself, then ends clean: t={w.t} {r}")
+        w = World([(0, run), (0, keeper), (0, theirs)], 10 ** 9)
+        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
+               every_s=30, terminate=w.terminate)
         ok(not r.get("clean") and sorted(w.stopped) == [77, 79] and 1200 <= w.t <= 1200 + 300,
-           f"W2 at the wall-clock limit it stops by id every live cluster of the config's names, nothing else: "
+           f"W2 at the wall-clock limit it stops by id every live cluster this invocation tagged, nothing else: "
            f"t={w.t} stopped={w.stopped} {r}")
+        ok(w.events[:1] == [("terminate", None)], f"W4 (round 4) at the limit the launcher is terminated before the "
+                                                  f"sweep: {w.events}")
+        w = World([(0, theirs)], 10 ** 9)
+        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
+               every_s=30, terminate=w.terminate)
+        ok(not w.stopped and ("terminate", None) in w.events,
+           f"W4b another invocation's cluster of the same name is never stopped: {w.events}")
 
         def hang():
             import time as _t
@@ -2697,10 +2726,30 @@ def _self_test_s18_r3(ok) -> None:
             return []
         import time as _time
         t0 = _time.monotonic()
-        r = sw(cfg, lambda: False, minutes=0.01, lister=hang, stopper=lambda n, c: None, every_s=0.1, call_timeout_s=0.5)
+        r = sw(cfg, "INV", lambda: False, minutes=0.01, lister=hang, stopper=lambda n, c: None, every_s=0.1,
+               call_timeout_s=0.5, terminate=lambda: None)
         ok(_time.monotonic() - t0 < 4, f"W3 a hung API call is bounded by its timeout: {_time.monotonic() - t0:.1f}s {r}")
     else:
         ok(False, "W1 smoke_watch exists")
+    # smoke-run owns the launcher process: it can interrupt it on a line, and terminates and reaps it at the limit
+    srun = g.get("smoke_run")
+    if srun:
+        import io
+        import contextlib
+        script = "import time, sys; print('listed S1 (run-S1-1) by the scheduler', flush=True); time.sleep(60)"
+        t0 = _time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = srun(cfg, "INV", [sys.executable, "-c", script], minutes=0.05, interrupt_on="listed S1",
+                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1)
+        ok(r.get("launcher_rc") is not None and r.get("interrupted") and _time.monotonic() - t0 < 20,
+           f"W5 smoke-run interrupts the launcher on its line and reaps it: {r}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = srun(cfg, "INV", [sys.executable, "-c", "import time; time.sleep(60)"], minutes=0.02,
+                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1)
+        ok(r.get("launcher_rc") is not None and not r.get("clean") and _time.monotonic() - t0 < 40,
+           f"W6 (round 4) a launcher still running at the limit is terminated and reaped: {r}")
+    else:
+        ok(False, "W5 smoke_run exists")
     # the job's cloud-side lifetime: the run's wall time and the hold for collection come from the config
     sub = []
     fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append((a, kw)) or "fut")
@@ -2731,6 +2780,94 @@ def _self_test_s18_r3(ok) -> None:
         ok(600 <= clk[0] <= 630, f"T3 the hold for collection ends at its bound: {clk[0]}")
     else:
         ok(False, "T3 worker_side._hold exists")
+
+
+def _self_test_s18_r4(ok) -> None:
+    """Codex round 4 on #161, P1: a cluster is this invocation's only if it created it. Two launchers race on one
+    config name (two machines, two out_dirs): the second one's coiled.Cluster(name=...) attaches to the first one's
+    cluster. Its tags name the first invocation, so the second refuses before any record, never records that id,
+    and gets no cleanup authority; the first proceeds."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+    from unittest import mock
+    M, P, g = sys.modules[__name__], mock.patch.object, globals()
+    TAGK = g.get("INVOCATION_TAG", "ma-invocation")
+    table = {f"tls://10.0.0.{i}:1": {} for i in range(3)}
+    registry = {}                                           # name -> the one cluster Coiled holds for it
+
+    class Client:
+        status = "running"
+
+        def wait_for_workers(self, *a, **kw):
+            pass
+
+        def upload_file(self, *a):
+            pass
+
+        def scheduler_info(self):
+            return {"workers": table}
+
+        def processing(self, workers=None):
+            return {"tls://10.0.0.0:1": ["run-R1-1"]}
+
+        def run_on_scheduler(self, fn, *a):
+            return None
+
+    def cluster(**kw):
+        rec = registry.setdefault(kw["name"], {"name": kw["name"], "id": 100 + len(registry), "tags": kw.get("tags"),
+                                               "current_state": {"state": "running"}, "kw": kw})
+        return types.SimpleNamespace(cluster_id=rec["id"], get_client=lambda: Client())
+    fake = types.ModuleType("coiled")
+    fake.Cluster = cluster
+    fake.list_clusters = lambda workspace: list(registry.values())
+    submits = []
+
+    def go(inv, d):
+        q = os.path.join(d, "q.txt")
+        open(q, "w").write("question")
+        cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
+                        pipeline="v2", cluster_timeout="40 minutes")
+        comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+                                     register_compute_tags=lambda c, exclude: None)
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.dict(os.environ, {"MA_LAUNCH_INVOCATION": inv}), \
+                P(M, "is_running", return_value=False), P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
+                P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
+                P(M, "_compute", return_value=comp), P(M, "live_id", return_value=None), \
+                P(M, "_submit", side_effect=lambda c_, cl, lab, *a, **k: submits.append(inv) or
+                  (k.get("key") or "run-R1-1", types.SimpleNamespace(status="pending"))), \
+                P(M, "_task_key", side_effect=lambda lab: f"run-{lab}-1"), \
+                P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(out):
+            try:
+                rc = launch(cfg)
+            except SystemExit as e:
+                rc = ("exit", str(e.code))
+        cl = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else None
+        return rc, cl
+    with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+        rc_a, cl_a = go("INV-A", da)
+        rc_b, cl_b = go("INV-B", db)
+    kw = registry.get("lt", {}).get("kw", {})
+    ok((kw.get("tags") or {}).get(TAGK) == "INV-A" and kw.get("cluster_timeout") == "40 minutes",
+       f"O1 the run cluster is created with the invocation tag and the config's cluster_timeout: "
+       f"{ {k: kw.get(k) for k in ('tags', 'cluster_timeout', 'idle_timeout')} }")
+    ok(rc_a == 0 and (cl_a or {}).get("invocation") == "INV-A" and (cl_a or {}).get("run", {}).get("id") == 101,
+       f"O2 the launcher that created the cluster records it: {rc_a} {cl_a}")
+    ok(isinstance(rc_b, tuple) and cl_b is None and submits == ["INV-A"] and "INV-A" in rc_b[1],
+       f"O3 the racing launcher attached to the other's cluster: refused, no record with its token, nothing "
+       f"submitted: {rc_b} {cl_b} {submits}")
+    vc = g.get("verify_created")
+    for tags, want in (({TAGK: "INV-A"}, True), ({TAGK: "INV-B"}, False), ({}, False), (None, False)):
+        lst = [{"name": "lt", "id": 5, "tags": tags, "current_state": {"state": "running"}}]
+        try:
+            vc("lt", 5, "INV-A", lister=lambda: lst) if vc else None
+            got = vc is not None
+        except SystemExit:
+            got = False
+        ok(got is want, f"O4 verify_created with tags {tags}: {got}")
 
 
 def _self_test_bwrap(ok) -> None:
@@ -3118,6 +3255,10 @@ def _self_test() -> int:
         _self_test_s18_r3(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"K: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18_r4(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"O: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
