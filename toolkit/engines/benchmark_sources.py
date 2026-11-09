@@ -214,11 +214,34 @@ def band_digest(b: dict, pack: dict) -> str:
         code["calibrator"] = _module_sha("calibrator", str(e["calibrator"].get("fn", "")).split(":")[0])
     from toolkit.engines.benchmark import COMPARE_TYPES
     if e.get("type") in COMPARE_TYPES + ("coverage",):
-        code["observation"] = [_file_sha(f) for f in OBSERVATION_FILES]
+        code["observation"] = [_thresholds_view(f) if os.path.basename(f) == "thresholds.yaml" else _file_sha(f)
+                               for f in OBSERVATION_FILES]
     return _sha({"fields": {k: b.get(k) for k in DIGEST_FIELDS}, "estimand": e, "arms": arms,
                  "settings": sets, "configs": cfgs, "default_config": pack.get("default_config"),
                  "horizon": pack.get("horizon"), "seeds": pack.get("seeds"), "engine": pack.get("engine"),
                  "coverage_scoring": pack.get("coverage_scoring"), "code": code})
+
+
+# the thresholds.yaml sections the oracle and coverage calibrators read (toolkit/analysis/calibration.py `calibration`,
+# toolkit/analysis/estimates.py `estimates`); other sections (decision tests, stability, burden) do not bind evidence
+CALIBRATOR_THRESHOLD_SECTIONS = ("calibration", "estimates")
+
+
+def _thresholds_view(f: str) -> str:
+    """sha256 of the calibrator sections of a thresholds file. A file that does not parse to a mapping is hashed whole
+    (fail closed); a missing file is named as missing."""
+    try:
+        raw = open(f, "rb").read()
+    except OSError:
+        return f"missing:{os.path.basename(f)}"
+    try:
+        import yaml
+        doc = yaml.safe_load(raw)
+    except Exception:  # noqa: BLE001 -- unparsable: the whole file binds
+        doc = None
+    if not isinstance(doc, dict):
+        return hashlib.sha256(raw).hexdigest()
+    return _sha({k: doc.get(k) for k in CALIBRATOR_THRESHOLD_SECTIONS})
 
 
 def _file_sha(f: str) -> str:
@@ -987,6 +1010,20 @@ def _self_test() -> int:
         ok(stale_ids(pc, [good]) == [] and stale_ids(pc, [dict(good, declaration_sha256="x")]) == ["C1"]
            and stale_ids(pc, [dict(good, code_sha256="x")]) == ["C1"],
            "BS70 a coverage row is checked on its own declaration and calibration-code digests too")
+        with tempfile.TemporaryDirectory() as dth:
+            fth = os.path.join(dth, "thresholds.yaml")
+            open(fth, "w").write("calibration: {a: 1}\nestimates: {b: 2}\ndecision_tests: {share_threshold: 0.1}\n")
+            v0 = _thresholds_view(fth)
+            open(fth, "w").write("calibration: {a: 1}\nestimates: {b: 2}\ndecision_tests: {share_threshold: 0.2}\n"
+                                 "burden: {ratio_band: [0.5, 2.0]}\n")
+            v1 = _thresholds_view(fth)
+            open(fth, "w").write("calibration: {a: 3}\nestimates: {b: 2}\n")
+            v2 = _thresholds_view(fth)
+            open(fth, "w").write("not: [a, mapping\n")
+            v3 = _thresholds_view(fth)
+        ok(v0 == v1 and v1 != v2 and v3 not in (v0, v2),
+           "BS77 only the calibrator sections of thresholds.yaml bind evidence: a decision-test or burden threshold "
+           "keeps the digest, a calibration threshold changes it, an unparsable file binds whole")
         val = {"id": "V1", "estimand": {"type": "value", "not_transcribed": "x"}}
         pv = dict(toy, benchmarks=[val])
         with tempfile.TemporaryDirectory() as d:
