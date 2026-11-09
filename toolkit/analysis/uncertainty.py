@@ -514,36 +514,55 @@ def _self_test_reserve(ok):
         top = sorted(ben, key=lambda u: -ben[u])[:k]
         return {"choice": {u: ("y" if u in top else "n") for u in ben}, "objective": sum(ben[u] for u in top)}
 
-    r = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12)
+    r = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
     st = r.get("steps") or []
     ok(r.get("feasible") is True and st and st[0]["fraction"] == 1.0 and st[0]["meets"] is False
        and st[0]["draws_over_budget"] == 5,
        f"U14 the first step is the unconstrained plan (fraction 1), over budget in 5 of 8 draws: {st[:1]}")
+    ok([round(x["fraction"], 6) for x in st[1:11]] == [round(0.5 + 0.05 * k, 6) for k in range(10)]
+       and r.get("floor_met") is True,
+       f"U14b a coarse grid over [floor, 1) is probed before bisecting (Codex S1-1b P2): "
+       f"{[round(x['fraction'], 3) for x in st[1:11]]}")
     ok(1.0 - 0.005 <= r.get("fraction", 0) < 1.0 and sum(v == "y" for v in r["solution"]["choice"].values()) == 3
-       and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.25) < 1e-12,
-       f"U15 bisection to the tolerance finds the largest fraction whose plan meets the rule (3 units, 2 of 8 over): "
-       f"{r.get('fraction')}, {r.get('draws_over_budget')}")
-    ok(len(calls) == len(st) <= 12 and r.get("converged") is True and abs(r["solution"]["objective"] - 9.0) < 1e-12
-       and all(s["meets"] == (s["share_over_budget"] <= 0.25) for s in st)
-       and all(abs(b - s["fraction"] * 40.0) < 1e-9 for b, s in zip(calls, st)),
+       and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.25) < 1e-12
+       and r.get("result") == "best_visited",
+       f"U15 the best visited fraction meeting the rule, bisected to the tolerance above the grid (3 units, 2 of 8 "
+       f"over): {r.get('fraction')}, {r.get('draws_over_budget')}, {r.get('result')}")
+    ok(len(calls) == len(st) <= 20 and r.get("converged") is True and abs(r["solution"]["objective"] - 9.0) < 1e-12
+       and all(x["meets"] == (x["share_over_budget"] <= 0.25) for x in st)
+       and all(abs(b - x["fraction"] * 40.0) < 1e-9 for b, x in zip(calls, st)),
        f"U16 every ILP solve is one recorded step at fraction x budget, within the cap ({len(calls)} solves)")
-    r1 = rs(tables, solve, 40.0, 0.7, tol=0.005, floor=0.5, max_solves=12)
-    ok(r1["fraction"] == 1.0 and len(r1["steps"]) == 1 and r1["feasible"],
+    r1 = rs(tables, solve, 40.0, 0.7, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r1["fraction"] == 1.0 and len(r1["steps"]) == 1 and r1["feasible"] and r1.get("result") == "unconstrained",
        "U17 an unconstrained plan that meets the rule needs no reserve (fraction 1, one solve)")
-    r2 = rs(tables, solve, 40.0, 0.0, tol=0.005, floor=0.8, max_solves=12)
-    ok(r2["feasible"] is False and r2.get("solution") is None and [s["fraction"] for s in r2["steps"]] == [1.0, 0.8],
-       f"U18 no fraction at or above the floor meets the rule: infeasible, nothing returned ({r2['steps']})")
-    r3 = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=3)
-    ok(len(r3["steps"]) == 3 and r3["converged"] is False and r3["feasible"] and r3["share_over_budget"] <= 0.25,
-       "U19 the solve cap stops the search unconverged, at a fraction that meets the rule")
+    r2 = rs(tables, solve, 40.0, 0.0, tol=0.005, floor=0.8, max_solves=20, grid=10)
+    ok(r2["feasible"] is False and r2.get("solution") is None and r2.get("result") == "none_visited_meets"
+       and r2.get("floor_met") is False and len(r2["steps"]) == 11,
+       f"U18 no visited fraction meets the rule (the unconstrained plan and the grid from the floor): nothing "
+       f"returned, and the result says only what was visited ({r2.get('result')}, {len(r2['steps'])} solves)")
+    r3 = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12, grid=10)
+    ok(len(r3["steps"]) == 12 and r3["converged"] is False and r3["feasible"] and r3["share_over_budget"] <= 0.25,
+       "U19 the solve cap stops the bisection unconverged, at a fraction that meets the rule")
 
     def infeasible_low(b):
         if b < 30:
             raise RuntimeError("optimizer status infeasible")
         return solve(b)
-    r4 = rs(tables, infeasible_low, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12)
-    ok(r4["feasible"] is False and r4["steps"][1].get("infeasible") is True,
-       "U20 a budget at which the solver proves no allocation feasible counts as not meeting the rule")
+    r4 = rs(tables, infeasible_low, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r4["feasible"] is True and r4["steps"][1].get("infeasible") is True and r4.get("floor_met") is False
+       and r4["fraction"] >= 0.95,
+       "U20 the floor candidate failing (the solver proves it infeasible) is not the end: a higher visited fraction "
+       "that meets the rule is kept")
+
+    def non_nested(b):          # Codex S1-1b P2: plans that are not nested in the budget
+        f = b / 40.0
+        k, obj = (1, 1.0) if f < 0.7 else (3, 3.0) if 0.85 <= f < 0.95 else (4, 4.0)
+        top = sorted(ben, key=lambda u: -ben[u])[:k]
+        return {"choice": {u: ("y" if u in top else "n") for u in ben}, "objective": obj}
+    r5 = rs(tables, non_nested, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=20, grid=10)
+    ok(r5["feasible"] and abs(r5["solution"]["objective"] - 3.0) < 1e-12 and 0.9 <= r5["fraction"] < 0.95,
+       f"U23 a non-nested problem: the grid finds the better plan a plain bisection misses (objective "
+       f"{r5['solution']['objective']} at {r5['fraction']})")
     for label, args in (("no draws", ([], solve, 40.0, 0.25)), ("a non-finite cost",
                         ([{u: {"n": 0.0, "y": float("nan")} for u in ben}], solve, 40.0, 0.25)),
                         ("a share outside [0, 1)", (tables, solve, 40.0, 1.0))):
@@ -552,7 +571,8 @@ def _self_test_reserve(ok):
             ok(False, f"U21 {label} fails closed")
         except ValueError:
             ok(True, f"U21 {label} fails closed")
-    for kw in ({"tol": 0.0}, {"floor": 0.0}, {"floor": 1.5}, {"max_solves": 1}):
+    for kw in ({"tol": 0.0}, {"floor": 0.0}, {"floor": 1.5}, {"max_solves": 1}, {"max_solves": 5, "grid": 10},
+               {"grid": 0}):
         try:
             rs(tables, solve, 40.0, 0.25, **kw)
             ok(False, f"U22 search settings {kw} are refused")
