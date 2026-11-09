@@ -737,6 +737,7 @@ def _self_test() -> int:
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
+        _self_test_burden_e2e(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -1304,6 +1305,52 @@ def _self_test_draw_floors(ok, A, R):
     finally:
         del A.model.predict
         A.alloc = saved
+
+
+def _self_test_burden_e2e(ok, d, q):
+    """F6 S2-5: validation.burden on the emulator path: each reference against the comparator arm's annual mean, with
+    the draws' interval for all-age references and the point value for an age band; one declarable finding for the
+    group outside tolerance, none for a reported value; results.md, claims and the figure."""
+    import yaml
+    from toolkit.analysis import burden as BV, contract
+    rows = ["A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,",
+            "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,",
+            "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,",
+            "D,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic D,overlap,,",
+            "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,"]
+    open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS)] + rows) + "\n")
+    try:
+        _resign(d, lambda r: r.update(validation={"burden": {"csv": "burden_refs.csv"}}))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE1 a run with validation.burden completes: {type(e).__name__}: {e}")
+        return
+    try:
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except (OSError, TypeError, KeyError) as e:
+        ok(False, f"BE1 the burden_validation artifact is written: {e}")
+        return
+    by = {r["id"]: r for r in bv["references"]}
+    ok({k: r["status"] for k, r in by.items()} == {"A": "within", "B": "outside", "C": "information", "D": "within",
+                                                    "E": "within"} and bv["arm"] == "none",
+       f"BE1 each reference is judged against the comparator arm: { {k: r['status'] for k, r in by.items()} }")
+    pop = sum(float(u["pop"]) for u in R["_A"].spec.units())
+    tot = R["point"]["comparator_total"]["cases"] / 3.0
+    ok(by["A"]["model"]["interval_from"] == "draws" and bv["draws"] == 4 and by["D"]["model"]["interval_from"] == "point"
+       and abs(by["E"]["model"]["point"] - tot) <= 1e-9 * tot
+       and abs(by["D"]["model"]["point"] * pop / 1000 - tot) <= 1e-9 * tot,
+       f"BE2 annual means over the window; draws for all ages, the point value for an age band "
+       f"(E {by['E']['model']['point']:.6g} vs {tot:.6g})")
+    fs = contract.gate_findings(d)
+    ok([(x["kind"], x["key"], x["scope_declarable"]) for x in fs] == [("burden_outside_tolerance", "burden:B", True)],
+       f"BE3 the group outside tolerance is one declarable gate finding; the reported value none: {fs}")
+    res = open(os.path.join(d, "results.md")).read()
+    led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {})
+           .get("claims", [])}
+    figs = {f["figure"] for f in yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]}
+    ok("## Absolute burden against external estimates" in res and "[CLAIM:" not in res and "burden.B.ratio" in led
+       and "burden_validation" in figs and "not computed" in bv["daly_parts"]["statement"],
+       f"BE4 results.md, the claims ledger and the figure carry the comparison ({sorted(figs)[:3]})")
 
 
 def _self_test_floors_e2e(ok, d, q):
