@@ -1192,6 +1192,9 @@ def _self_test() -> int:
             rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
             ok(rep["status"] == "matched" and rep["n_matched"] == 12 and rep["sample"] is not None,
                f"JA4a the toy engine through the analysis batch: every unit matched ({summary(rep)})")
+            ok((rep.get("weighting") or {}).get("best_point") == "per_unit" and not rep.get("bias"),
+               f"JA4d Codex r1 P2-6: a spec without the new options keeps the per-unit best point and no offsets "
+               f"({rep.get('weighting')})")
             ok(os.path.exists(os.path.join(d, OUT_REL, "call1", "results.jsonl")),
                "JA4b the simulations went through the analysis batch (scripts/compute.py), with provenance")
             s = region_sample(rep)
@@ -1509,19 +1512,31 @@ def _self_test() -> int:
             p = _toy_joint(d, group=False)
             raw = yaml.safe_load(open(p))
             j = raw["calibration"]["joint"]
-            j["targets"][0].update(bias_sd=0.2, bias_by="region")
-            j["targets"].append(dict(j["targets"][0], id="unit_t2", window=[2, 3]))
+            j["targets"][0].update(bias_sd=0.2, bias_by="region", bias_source="survey_a")
+            j["targets"].append(dict(j["targets"][0], id="unit_t2", window=[2, 3], bias_source="survey_b"))
+            j["best_point_weighting"] = "per_group"
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
-            P, _ = build(schema.load(p))
-            u0 = [t for t in P.targets if t.id == "unit_t:0"][0]
-            ok(getattr(u0, "bias_key", None) == "unit_t|r0" and u0.sd_bias == 0.2,
-               f"JA15a bias_by gives one offset per source and region ({getattr(u0, 'bias_key', None)})")
+            r3 = yaml.safe_load(open(p))      # Codex r1 P2-4: a second target of the same survey shares its offset
+            r3["calibration"]["joint"]["targets"].append(dict(j["targets"][0], id="unit_t3"))
+            p3 = os.path.join(d, "s3.yaml")
+            yaml.safe_dump(r3, open(p3, "w"), sort_keys=False)
+            P, _ = build(schema.load(p3))
+            key = {t.id: getattr(t, "bias_key", None) for t in P.targets}
+            ok(key.get("unit_t:0") == key.get("unit_t3:0") == "survey_a|r0" and key.get("unit_t2:0") == "survey_b|r0",
+               f"JA15a bias_by with bias_source: one offset per survey and region, shared by the survey's targets "
+               f"({key.get('unit_t:0')}, {key.get('unit_t3:0')}, {key.get('unit_t2:0')})")
             bad_cases = [("bias_by names no units column", lambda j: j["targets"][0].update(bias_by="nope")),
                          ("bias_by without a bias sd", lambda j: j["targets"][0].update(bias_sd=0.0)),
                          ("bias_by on a group target", lambda j: j["targets"].append(
                              {"id": "g", "kind": "group", "csv": "x.csv", "value": "v", "weights": "pop", "sd": 0.1,
                               "key": {"csv": "region", "units": "region"}, "window": [1, 2], "metric": "prev",
-                              "source": "t", "bias_sd": 0.1, "bias_by": "region"}))]
+                              "source": "t", "bias_sd": 0.1, "bias_by": "region"})),
+                         ("one survey with two bias sds", lambda j: j["targets"].append(
+                             dict(j["targets"][0], id="unit_t3", bias_sd=0.3))),
+                         ("one survey grouped by two columns", lambda j: j["targets"].append(
+                             dict(j["targets"][0], id="unit_t3", bias_by="grp"))),
+                         ("bias_source without bias_by", lambda j: j["targets"][0].pop("bias_by")),
+                         ("an unknown best_point_weighting", lambda j: j.update(best_point_weighting="per_x"))]
             for why, mut in bad_cases:
                 r2 = yaml.safe_load(open(p))
                 mut(r2["calibration"]["joint"])
@@ -1530,8 +1545,10 @@ def _self_test() -> int:
                 bad = spec_problems(schema.load(p2))
                 ok(bool(bad), f"JA15b refused: {why} ({bad[:2]})")
             rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
-            ok(set(rep.get("bias") or {}) == {f"{tid}|r{k}" for tid in ("unit_t", "unit_t2") for k in range(3)},
-               f"JA15c the toy run reports each block's offset ({summary(rep)})")
+            ok(set(rep.get("bias") or {}) == {f"{s}|r{k}" for s in ("survey_a", "survey_b") for k in range(3)}
+               and (rep.get("weighting") or {}).get("best_point") == "per_group",
+               f"JA15c the toy run reports each block's offset and uses the signed per_group weighting "
+               f"({rep.get('weighting')}, {summary(rep)})")
     safe(ja15, "JA15")
 
     if fails:

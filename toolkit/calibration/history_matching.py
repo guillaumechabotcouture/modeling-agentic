@@ -2272,11 +2272,16 @@ def _self_test() -> int:
         obs = lambda u, g: (0.1, 0.1 + (0.3 if g == "A" else 0.7))  # noqa: E731
         P, sim = gtoy({"A": 10, "B": 2}, f0, f1, obs, sd=0.15, md=0.0, zr=(-1.0, 1.5),
                       shared=[Param("e", 0.0, 1.0, "uniform", None, "toy")])
-        r = calibrate(P, sim, seed=5, waves=2, log=q, candidates_log2=9, points_per_unit=20)
+        r = calibrate(P, sim, seed=5, waves=2, log=q, candidates_log2=9, points_per_unit=20,
+                      best_point_weighting="per_group")
         e = r["best"]["theta"]["e"]
         ok(r["status"] == "matched" and abs(e - 0.5) < 0.07,
-           f"HM27 a 10-unit group and a 2-unit group that prefer 0.3 and 0.7: the best point sits between them "
-           f"(0.5), not at the large group's 0.37 ({e:.3f}, {r['status']})")
+           f"HM27a per_group: a 10-unit group and a 2-unit group that prefer 0.3 and 0.7: the best point sits between "
+           f"them (0.5), not at the large group's 0.37 ({e:.3f}, {r['status']})")
+        r = calibrate(P, sim, seed=5, waves=2, log=q, candidates_log2=9, points_per_unit=20)
+        e = r["best"]["theta"]["e"]
+        ok(r["weighting"]["best_point"] == "per_unit" and abs(e - 0.367) < 0.07,
+           f"HM27b Codex r1 P2-6: without the option the best point keeps the per-unit rule ({e:.3f})")
     safe(hm27, "HM27")
 
     def hm29():          # refusals of the new declarations
@@ -2327,6 +2332,49 @@ def _self_test() -> int:
            and all(t.bias_key is None for t in P.targets if t.observable == "w1"),
            f"HM30 one block per unit: matched, one offset per group inside its prior ({r['status']}, {b})")
     safe(hm30, "HM30")
+
+    def one_group(ys, sd=0.01, sd_b=0.2, zr=(0.0, 1.0), slope=1.0, extra=()):
+        units = [f"u{i}" for i in range(len(ys))]
+        tg = [Target(f"{u}:x", "unit", "x", y, "identity", sd_obs=sd, sd_bias=sd_b, unit=u, source="toy",
+                     bias_key="s|g") for u, y in zip(units, ys)] + list(extra)
+        P = Problem([], {"name": "z", "lo": zr[0], "hi": zr[1]}, units, tg, groups={u: "g" for u in units})
+
+        def sim(pts):
+            return [{"x": slope * p["z"] + 1e-4 * np.random.default_rng(p["seed"]).normal()} for p in pts]
+        return P, sim
+
+    def hm31():          # Codex r1 P1: the region sample draws the group's offset, then each unit given it
+        P, sim = one_group([0.5] * 4)
+        r = calibrate(P, sim, seed=3, waves=1, log=q, points_per_unit=20)
+        R = np.asarray(r["sample"]["rows"]) if r["sample"] else np.full((2, 4), 0.5)
+        ok(r["status"] == "matched" and R[:, 0].min() < 0.2 and R[:, 0].max() > 0.8,
+           f"HM31a every unit value the offset's prior allows is drawn (support [{R[:, 0].min():.2f}, "
+           f"{R[:, 0].max():.2f}], every z in [0, 1] is compatible)")
+        ratio = float(np.var(R.mean(1)) / max(np.mean(np.var(R, 0)), 1e-12))
+        ok(ratio > 0.8, f"HM31b the units move together with their shared offset: the variance of the group mean is "
+                        f"close to a unit's (ratio {ratio:.2f}; independent draws would give 0.25)")
+    safe(hm31, "HM31")
+
+    def hm32():          # Codex r1 P2-2: a group target is checked while the offset is profiled
+        agg = Target("agg", "group", "x", 0.7, "identity", sd_obs=0.03, weights={f"u{i}": 1.0 for i in range(3)},
+                     source="toy")
+        P, sim = one_group([0.5] * 3, zr=(0.0, 1.5), extra=[agg])
+        r = calibrate(P, sim, seed=4, waves=1, log=q, points_per_unit=20)
+        z = list((r.get("best") or {}).get("z", {}).values())
+        ok(r["status"] == "matched" and z and all(abs(x - 0.7) < 0.08 for x in z),
+           f"HM32 a unit survey at 0.5 and an aggregate at 0.7: an offset near -0.2 fits both, and the aggregate is "
+           f"checked before an offset is chosen ({r['status']}, {r['blocks']}, z {np.round(z, 3)})")
+    safe(hm32, "HM32")
+
+    def hm33():          # Codex r1 P2-3: no common offset exists; grid slack must not certify one
+        P, sim = one_group([0.14, -0.14], sd=0.001, sd_b=1.0, zr=(-1.0, 1.0), slope=0.001)
+        r = calibrate(P, sim, seed=5, waves=1, log=q, points_per_unit=20)
+        ver = (r.get("verification") or {}).get("units") or {}
+        ok(r["blocked"] and set(r["conflicting"] + r["unmatched"]) & {"u0", "u1"},
+           f"HM33a two units whose offsets must be 0.14 and -0.14 conflict ({r['status']}, {r['conflicting']})")
+        ok(ver and not all(v["ok"] for v in ver.values()),
+           f"HM33b the engine verification does not certify a common offset either ({ver})")
+    safe(hm33, "HM33")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
