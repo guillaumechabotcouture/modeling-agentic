@@ -6,32 +6,7 @@ status_group: "F6 Stage 1"
 
 ## Changelog
 
-**One validated snapshot of benchmark evidence (F6 S1-2b, Codex round 4 on #154 and round 1 on #158).** Threat model: stale or changed artifacts and declarations on disk, and code paths that read evidence without the loader. Deliberate in-process mutation by harness code is out of scope. `load_evidence(engine, pack, rows, partial)` in `toolkit/engines/benchmark_sources.py` returns an `Evidence` snapshot: the validated pack, the fitted values the engine actually uses (cached or defaults) with the digest of the file behind them, and the stored rows. It stores deep copies and returns detached ones. Its problems are:
-- an unreadable or empty pack (absence is permitted only for an engine with no rows to check and no fitted values to back);
-- the source check;
-- rows that are missing, or carry no digest or another declaration's digest ("rerun required");
-- fitted values without current provenance ("refit required").
-
-Every estimand type's declaration digest covers its band and source fields, its estimand, arms, settings, configurations, horizon, seeds and engine, the pack's `coverage_scoring`, and the code of its oracle and calibrator modules. There is no legacy acceptance. `Runner` scores only clean evidence and only with its fitted values. Candidate fitted values need the explicit fit mode, used by the fit CLI, joint calibration and the `b15_mechanisms` scan; `reach_check` uses `evaluate_at`. `Runner` keeps its own copy of the validated pack, and `evaluate()` resolves each benchmark by id. `spec_benchmarks` scores with the evidence it validated. Only exact registered self-test toys are exempt; their subclasses are not.
-
-Routed through the snapshot:
-- `Runner` and `run_pack`;
-- `verified_benchmarks`, merge, rescore and the `run` and `fit` CLI;
-- `fitted_ranges`, which covers core, the batch design, joint calibration's `build()` (which now uses the captured values) and the emulator box;
-- the analysis entry;
-- joint calibration's `_benchmarks()`;
-- `spec_benchmarks`, `verified_spec_benchmarks` and the `engine_parameters benchmarks` CLI;
-- estimates acceptance, which reads the snapshot's pack and rows;
-- `render_notes.write()`, which renders the snapshot's rows and checks the fitted file's digest;
-- `b15_mechanisms`.
-
-Not routed:
-- `render_notes.render()`, a formatter of what `write()` passes it;
-- the engines' `describe()`, which reads stored rows for the card (engine directories unchanged, so code fingerprints stay valid);
-- the malaria diagnostic and proof scripts (`runtime`, `guess_sensitivity`, `equilibration`, `restamp_proof`);
-- `spike/`.
-
-Self-tests BS54–BS69 include behavioural bypass tests on self-contained stale fixtures. The stored compartmental and renewal results carry no digests, so they now report rerun required until their packs are rerun. The malaria artifacts report refit and rerun required.
+**One validated snapshot of benchmark evidence (F6 S1-2b, Codex round 4 on #154 and round 1 on #158).** Threat model: stale or changed artifacts and declarations on disk, and code paths that read evidence without the loader; deliberate in-process mutation by harness code is out of scope. `load_evidence(engine, pack, rows, partial)` in `toolkit/engines/benchmark_sources.py` returns an `Evidence` snapshot: the validated pack, the fitted values the engine actually uses (cached or defaults) with the digest of the file behind them, and the stored rows. It stores deep copies and returns detached ones. Its problems are an unreadable or empty pack (absence is permitted only for an engine with no rows to check and no fitted values to back); the source check; missing rows and rows with no digest or another declaration's digest ("rerun required"); and fitted values without current provenance ("refit required"). Every estimand type's declaration digest covers its band and source fields, estimand, arms, settings, configurations, horizon, seeds and engine, the pack's `coverage_scoring`, and the code of its oracle and calibrator modules; there is no legacy acceptance. `Runner` scores only clean evidence and only with its fitted values; candidate fitted values need the explicit fit mode (the fit CLI, joint calibration, the `b15_mechanisms` scan), and `reach_check` uses `evaluate_at`. `Runner` keeps its own copy of the validated pack and `evaluate()` resolves each benchmark by id. `spec_benchmarks` scores with the evidence it validated. Only exact registered self-test toys are exempt, not their subclasses. Routed through the snapshot: `Runner` and `run_pack`; `verified_benchmarks`, merge, rescore and the `run` and `fit` CLI; `fitted_ranges`, and through it core, the batch design, joint calibration's `build()` (which now uses the captured values) and the emulator box; the analysis entry; joint calibration's `_benchmarks()`; `spec_benchmarks`, `verified_spec_benchmarks` and the `engine_parameters benchmarks` CLI; estimates acceptance, which reads the snapshot's pack and rows; `render_notes.write()`, which renders the snapshot's rows and checks the fitted file's digest; and `b15_mechanisms`. Not routed: `render_notes.render()`, a formatter of what `write()` passes it; the engines' `describe()`, which reads stored rows for the card (engine directories unchanged, so code fingerprints stay valid); the malaria diagnostic and proof scripts (`runtime`, `guess_sensitivity`, `equilibration`, `restamp_proof`); and `spike/`. Self-tests BS54–BS69 include behavioural bypass tests on self-contained stale fixtures. The stored compartmental and renewal results carry no digests, so they report rerun required until those packs are rerun. The malaria artifacts report refit and rerun required.
 
 ## Status
 
