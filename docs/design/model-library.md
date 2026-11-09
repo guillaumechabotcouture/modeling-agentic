@@ -301,6 +301,30 @@ scikit-learn: `toolkit/calibration/history_matching.py` (disease-agnostic; thres
 - After the last wave the engine runs at the best point for every unit (verification). The region's shared values
   feed the uncertainty draws (with provenance), and the automatic prior_range tests use the region's ends.
 
+**Error model (F6 S2-3, part 1).** A survey's error is partly shared by the units of a group: one design and fieldwork,
+and one modelled small-area surface. A unit target with `bias_by: <units column>` gets one latent offset per source and
+group, b ~ N(0, bias_sd²): y = f + b + e, with e (sampling and discrepancy) independent per target. The old rule added
+bias_sd² to each target's own variance. That lets every unit use its own offset, so a group's units pull on one survey
+anchor as if they were independent, and the within-group contrasts that identify shared parameters are lost.
+- **Profiling.** The offset is a nuisance parameter, treated like the unit parameter. A shared value is compatible
+  with a group when one offset with |b| / sd within the cutoff leaves every unit matchable by its own parameter. The
+  offset grid has `bias_grid` points, and half a step is allowed as slack, so the grid never rules out a value that a
+  continuous offset would keep. Offsets linked through units are profiled jointly: two surveys of one group give a
+  two-dimensional grid. The witness is the most probable feasible offset. The engine verification re-profiles it on
+  the engine's own runs.
+- **Best point.** Each group counts once: its units' mean squared implausibility. Each offset counts once, as
+  (b / sd)². Model discrepancy shared within a group makes its units' misfits far from independent, and per-group
+  weights are the limit of full within-group correlation. The region does not depend on this weighting; only the
+  verification point does.
+- **Change between surveys** (`calibration.joint.change`). This compares the modelled and observed change between
+  two unit targets, by group. The observed sd counts each target's sampling sd and the two sources' offsets, which do
+  not average out over the group. If the data show a direction beyond `change.sign_z` sd, and the engine at the best
+  point goes the other way beyond its run noise, that is a finding. It blocks unless it is declared (mode `flag`, with
+  a reason). A change with no verification runs cannot be judged, and it blocks.
+
+Part 2 (historical and future intervention parameters, and histories anchored to delivery surveys) needs an engine
+parameter for past coverage. It follows separately.
+
 ### 5.4 Incremental rebuilds
 
 Every step's output is cached under a key made of the hashes of its code, its inputs, the
