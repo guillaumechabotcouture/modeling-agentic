@@ -808,11 +808,30 @@ def _reconcile(cfg, clusters: dict, role: str, name: str):
     return None
 
 
-def ack_probe(cfg) -> int:
+def ack_probe(cfg, lister=None, security_fn=None, client_cls=None) -> int:
     """`ack-probe`: the acknowledgement on a genuinely fast task. Submits worker_side.ack_probe (it returns at
-    once) to the live run cluster, lets it finish, then runs wait_listed and prints what acknowledged it."""
+    once) to the run cluster, lets it finish, then runs wait_listed and prints what acknowledged it. It connects
+    only to the run cluster id clusters.json records, only while the listing shows that id ready or running, with a
+    plain distributed.Client on its scheduler address: never the name-based constructor, which on a stopping
+    cluster creates a new empty one (smoke case A, 2026-11-09: cluster 2351659)."""
     from distributed import fire_and_forget
-    client = attach(cfg.name).get_client()
+    cid = (json.load(open(cfg.clusters_file)).get("run") or {}).get("id")
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    state = next((ws.state_of(c) for c in _items(lister()) if c.get("id") == cid and c.get("name") == cfg.name), None)
+    if cid is None or state not in ("ready", "running"):
+        raise SystemExit(f"{cfg.name}: the recorded run cluster {cid} is {state or 'not listed'}; ack-probe needs it "
+                         "ready or running (it never attaches by name): refusing")
+    if security_fn is None:
+        def security_fn(cluster_id):
+            from coiled.v2.core import CloudV2
+            with CloudV2() as cloud:
+                return cloud.security(cluster_id, workspace=WORKSPACE)
+    sec, info = security_fn(cid)
+    if client_cls is None:
+        from distributed import Client as client_cls
+    client = client_cls(info["address_to_use"], security=sec, timeout="60s")
     key = f"ack-probe-{int(time.time())}"
     fut = client.submit(ws.ack_probe, pure=False, key=key)
     fire_and_forget(fut)
@@ -1084,6 +1103,13 @@ def keeper_fresh(h: dict, run_id=None, overflow_id=None, max_age_s: float = KEEP
     return True, lines[ticks[-1]][:200]
 
 
+def _run_stopped(run_alive) -> bool:
+    try:
+        return run_alive is not None and not run_alive()
+    except Exception:  # noqa: BLE001 — unknown run state: keep waiting, fail as before
+        return False
+
+
 def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, sleep=None, run_alive=None,
                    run_id=None, overflow_id=None):
     """Wait (bounded, doubling backoff) for the keeper's first tick line: it is written only
@@ -1111,16 +1137,15 @@ def confirm_keeper(keeper_name, kc, attempts=8, delay_s=5.0, max_delay_s=60.0, s
             last = [why]
         except Exception as e:  # noqa: BLE001 — retried, then reported
             last = [f"{type(e).__name__}: {str(e)[:200]}"]
+        # A run that ended (or paused) before the keeper's first tick stops its own cluster, and the keeper then
+        # exits by design: nothing is left to hold, so the wait ends at once (smoke case A: about 6 minutes of
+        # retries after the run had stopped) and this is reported, not a launch failure.
+        if _run_stopped(run_alive):
+            break
         if i < attempts - 1:
             sleep(delay)
             delay = min(max_delay_s, delay * 2)
-    # A run that ended (or paused) before the keeper's first tick stops its own cluster, and the keeper then exits
-    # by design: nothing is left to hold, so this is reported, not a launch failure.
-    try:
-        stopped = run_alive is not None and not run_alive()
-    except Exception:  # noqa: BLE001 — unknown run state: fail as before
-        stopped = False
-    if stopped:
+    if _run_stopped(run_alive):
         msg = (f"keeper {keeper_name}: not confirmed, but the run cluster has already stopped (the run ended or paused "
                "before the keeper's first tick), so the keeper exited by design; check `status` before relaunching")
         print(msg)
