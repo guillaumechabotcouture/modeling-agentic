@@ -664,28 +664,30 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         head = ",".join(COLUMNS)
-        good = "a,r0,,cases,count,,1,100,80,130,estimated,synthetic,ratio,,"
+        good = "a,r0,,cases,count,,1,100,80,130,estimated,synthetic,ratio,,,WMR-X,"
 
         def probs(lines, extra=None):
             open(os.path.join(d, "refs.csv"), "w").write("\n".join([head] + lines) + "\n")
             raw = yaml.safe_load(open(p))
             raw["validation"] = {"burden": dict({"csv": "refs.csv"}, **(extra or {}))}
+            raw["calibration"]["target_source_id"] = "SURVEY-T"
             return load_references(schema.Spec(raw, d))[1]
         ok(probs([good]) == [], f"BV11 a valid reference file passes: {probs([good])}")
-        cases = [("missing group", ["a,zz,,cases,count,,1,100,80,130,estimated,s,ratio,,"], "is not a value"),
-                 ("unknown band", ["a,r0,kids,cases,count,,1,100,80,130,estimated,s,ratio,,"], "age_band"),
-                 ("unreported outcome", ["a,r0,,deaths,count,,1,100,80,130,estimated,s,ratio,,"], "outcome"),
-                 ("interval", ["a,r0,,cases,count,,1,100,120,130,estimated,s,ratio,,"], "lower <= value"),
-                 ("kind", ["a,r0,,cases,count,,1,100,80,130,modelled,s,ratio,,"], "kind"),
-                 ("source", ["a,r0,,cases,count,,1,100,80,130,estimated,,ratio,,"], "source"),
-                 ("wide band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,0.01,50"], "ratio band"),
-                 ("year", ["a,r0,,cases,count,,40,100,80,130,estimated,s,ratio,,"], "years from"),
-                 ("rate per", ["a,r0,,cases,rate,,1,100,80,130,estimated,s,ratio,,"], "per > 0"),
-                 ("only reported", ["a,r0,,cases,count,,1,100,80,130,reported,s,ratio,,"], "no estimated"),
+        cases = [("missing group", ["a,zz,,cases,count,,1,100,80,130,estimated,s,ratio,,,WMR-X,"], "is not a value"),
+                 ("unknown band", ["a,r0,kids,cases,count,,1,100,80,130,estimated,s,ratio,,,WMR-X,"], "age_band"),
+                 ("unreported outcome", ["a,r0,,deaths,count,,1,100,80,130,estimated,s,ratio,,,WMR-X,"], "outcome"),
+                 ("interval", ["a,r0,,cases,count,,1,100,120,130,estimated,s,ratio,,,WMR-X,"], "lower <= value"),
+                 ("kind", ["a,r0,,cases,count,,1,100,80,130,modelled,s,ratio,,,WMR-X,"], "kind"),
+                 ("source", ["a,r0,,cases,count,,1,100,80,130,estimated,,ratio,,,WMR-X,"], "source"),
+                 ("wide band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,0.01,50,WMR-X,"], "ratio band"),
+                 ("year", ["a,r0,,cases,count,,40,100,80,130,estimated,s,ratio,,,WMR-X,"], "years from"),
+                 ("rate per", ["a,r0,,cases,rate,,1,100,80,130,estimated,s,ratio,,,WMR-X,"], "per > 0"),
+                 ("only reported", ["a,r0,,cases,count,,1,100,80,130,reported,s,ratio,,,WMR-X,"], "no estimated"),
                  ("duplicate id", [good, good], "unique"),
-                 ("unparsable band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,oops,typo"], "ratio_low"),
-                 ("non-finite band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,NaN,NaN"], "ratio_low"),
-                 ("one bound unparsable", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,0.5,x"], "ratio_high")]
+                 ("unparsable band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,oops,typo,WMR-X,"], "ratio_low"),
+                 ("non-finite band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,NaN,NaN,WMR-X,"], "ratio_low"),
+                 ("no source id", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,,,"], "source_id: the publication"),
+                 ("one bound unparsable", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,0.5,x,WMR-X,"], "ratio_high")]
         for name, lines, needle in cases:
             got = probs(lines)
             ok(any(needle in x for x in got), f"BV12 the reference contract refuses: {name} ({got})")
@@ -721,17 +723,57 @@ def _self_test() -> int:
                               ("the units table", lambda c: None, "units.csv")):
             got = indep(mut, rc)
             ok(any("calibration input" in x for x in got), f"BV17 the reference file is refused as {name}: {got}")
+        # Codex r2: independence is declared provenance (source ids), never numeric equality
         u0 = next(u for u in schema.load(p).units() if u["region"] == "r0")
-        open(os.path.join(d, "coin.csv"), "w").write(head + "\n" + f"a,r0,,cases,count,,1,{u0['tgt']},0,1,"
-                                                     "estimated,s,overlap,,\n")
-        got = indep(lambda c: None, "coin.csv")
-        ok(any("fitted observation" in x for x in got), f"BV17 a reference repeating a fitted target value is refused: {got}")
+
+        def refs_with(sid, der="", value="100", group="r0"):
+            open(os.path.join(d, "src.csv"), "w").write(head + "\n" + f"a,{group},,cases,count,,1,{value},0,1e9,"
+                                                        f"estimated,s,overlap,,,{sid},{der}\n")
+
+        def src_probs(cal_mut=lambda c: c.update(target_source_id="SURVEY-T")):
+            return indep(cal_mut, "src.csv")
+        refs_with("SURVEY-T", value=u0["tgt"])
+        got = src_probs()
+        ok(any("source_id SURVEY-T" in x for x in got),
+           f"BV17 the same source as a calibration target, restated at group level, is refused by source id: {got}")
+        refs_with("WMR-X", "DHS-1;SURVEY-T")
+        got = src_probs()
+        ok(any("derived_from" in x and "SURVEY-T" in x for x in got), f"BV17 a reference derived from it too: {got}")
+        open(os.path.join(d, "panel.csv"), "w").write("unit,year,observed\n0,2019,5\n")
+        refs_with("WMR-X", value="2019", group="*")
+        got = src_probs(lambda c: c.update(target_source_id="SURVEY-T", targets={"csv": "panel.csv", "source_id": "PANEL-1"}))
+        ok(got == [], f"BV17 a value that equals a fitted cell by coincidence (2019) is accepted: {got}")
+        refs_with("WMR-X")
+        got = src_probs(lambda c: None)
+        ok(any("target_source_id" in x for x in got), f"BV17 a calibration target with no declared source id is refused: {got}")
+        open(os.path.join(d, "jt2.csv"), "w").write("k,v\nr0,1\n")
+        got = src_probs(lambda c: c.update(target_source_id="S", joint={"targets": [{"id": "g", "kind": "group",
+                                                                                     "csv": "jt2.csv"}]}))
+        ok(any("joint.targets[0].source_id" in x for x in got), f"BV17 a joint target needs its source id: {got}")
+        refs_with("WMR-X", "JT")
+        got = src_probs(lambda c: c.update(target_source_id="S", joint={"targets": [{"id": "g", "kind": "group",
+                                                                                     "csv": "jt2.csv", "source_id": "JT"}]}))
+        ok(any("JT" in x for x in got), f"BV17 a reference derived from a joint target's source is refused: {got}")
+        open(os.path.join(d, "obs.csv"), "w").write("src,unit\nsero_2019,0\nhh_2020,1\n")
         raw = yaml.safe_load(open(p))
-        raw["validation"] = {"burden": {"csv": "refs.csv"}}
+        raw["calibration"] = {"method": "posterior", "targets": {"kind": "observations", "csv": "obs.csv", "source": "src"}}
+        got, _w = calibration_source_ids(schema.Spec(raw, d))
+        ok({"sero_2019", "hh_2020"} <= set(got), f"BV17 observation targets name their sources in the table: {got}")
+        refs_with("WMR-X", "DHS-1")
+        raw = yaml.safe_load(open(p))
+        raw["validation"] = {"burden": {"csv": "src.csv"}}
+        raw["calibration"]["target_source_id"] = "SURVEY-T"
         pv = provenance(schema.Spec(raw, d))
-        ok(pv.get("sha256") and pv.get("independent") is True
+        ok(pv.get("sha256") and pv.get("independent") is True and pv.get("calibration_source_ids") == ["SURVEY-T"]
+           and pv.get("references") == [{"id": "a", "source_id": "WMR-X", "derived_from": ["DHS-1"]}]
            and any(x["path"].endswith("units.csv") for x in pv.get("calibration_inputs") or []),
-           f"BV17 the artifact's provenance names the reference file and the calibration inputs it is independent of: {pv}")
+           f"BV17 the artifact records the declared provenance: {pv}")
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        from toolkit.spec import signoff
+        sh = signoff.sheet(d)
+        ok("## Burden validation references" in sh and "WMR-X" in sh and "SURVEY-T" in sh and "attest" in sh,
+           "BV22 the sign-off sheet shows each reference's declared sources beside the calibration's, for the owner "
+           "to attest")
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]

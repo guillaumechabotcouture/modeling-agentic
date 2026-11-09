@@ -1324,14 +1324,15 @@ def _self_test_burden_e2e(ok, d, q):
     group outside tolerance, none for a reported value; results.md, claims and the figure."""
     import yaml
     from toolkit.analysis import burden as BV, contract
-    rows = ["A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,",
-            "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,",
-            "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,",
-            "D,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic D,overlap,,",
-            "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,"]
+    rows = ["A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
+            "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
+            "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
+            "D,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic D,overlap,,,REF-D,REF-A",
+            "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,"]
     open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS)] + rows) + "\n")
     try:
-        _resign(d, lambda r: r.update(validation={"burden": {"csv": "burden_refs.csv"}}))
+        _resign(d, lambda r: (r.update(validation={"burden": {"csv": "burden_refs.csv"}}),
+                              r["calibration"].update(target_source_id="TOY-TARGETS")))
         R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
     except Exception as e:  # noqa: BLE001
         ok(False, f"BE1 a run with validation.burden completes: {type(e).__name__}: {e}")
@@ -1363,7 +1364,9 @@ def _self_test_burden_e2e(ok, d, q):
        and "burden_validation" in figs and "not computed" in bv["daly_parts"]["statement"],
        f"BE4 results.md, the claims ledger and the figure carry the comparison ({sorted(figs)[:3]})")
     pv = bv.get("provenance") or {}
-    ok(pv.get("independent") is True and pv.get("csv") == "burden_refs.csv" and pv.get("calibration_inputs"),
+    ok(pv.get("independent") is True and pv.get("csv") == "burden_refs.csv" and pv.get("calibration_inputs")
+       and pv.get("calibration_source_ids") == ["TOY-TARGETS"]
+       and {x["id"]: x["derived_from"] for x in pv.get("references") or []}.get("D") == ["REF-A"],
        f"BE5 the artifact records the reference file's provenance and the calibration inputs it is independent of: {pv}")
     # Codex r1 P2: precomputed draws (the reserve search) reach the hook with their events, so the arm is guarded
     from toolkit.analysis import uncertainty as U
