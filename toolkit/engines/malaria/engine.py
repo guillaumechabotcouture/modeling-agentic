@@ -2438,6 +2438,138 @@ def _self_test_v011(ok, e, unit) -> None:
     case("Q6", q6)
 
 
+def _self_test_v012(ok, e, unit) -> None:
+    """v0.12 (F6 S2-2): case management as an implementable package (ENGINE_NOTES.md, v0.12). With cm_target = 1 the
+    add-on raises effective treatment only in the declared ages (default 2-59 months), ramps in linearly over
+    cm_ramp_years from the delivery start, raises severe-care access only through cm_severe_link (default 0), and the
+    engine reports the children covered and the treated episodes in those ages. cm_target = 0 is the v0.11 add-on."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    new = ("cm_target", "cm_age_lo_m", "cm_age_hi_m", "cm_ramp_years", "cm_severe_link")
+    v11 = {"nets_given", "smc_doses", "irs_sprayed", "treated_all"}
+    drv = {"cm_child_years", "treated_cm_ages"}
+
+    def c0():
+        sp = {p.name: p for p in e.parameters()}
+        want = {"cm_target": 0.0, "cm_age_lo_m": 2.0, "cm_age_hi_m": 60.0, "cm_ramp_years": 2.5, "cm_severe_link": 0.0}
+        got = {k: sp[k].value for k in want if k in sp and sp[k].kind == "fixed"}
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 12) and got == want and set(new) <= POST_FORK,
+           f"C0 engine v0.12: the case-management options are fixed card parameters acting after the fork ({got})")
+        ok("no published" in sp["cm_severe_link"].source and "Oresanya" in sp["cm_add"].source
+           and sp["cm_add"].kind == "scenario" and (sp["cm_add"].lo, sp["cm_add"].hi) == (0.0, 0.15),
+           "C0b cm_add stays a scenario parameter with a sourced range; cm_severe_link says no estimate was found")
+        from toolkit.spec.priors import load_card
+        mc = load_card(e)
+        ok(mc["problems"] == [] and set(new) <= set(mc["fixed"]) and drv <= set(e.describe().outputs["cost_drivers"]),
+           f"C0c priors.yaml gives each new parameter a reason; the card lists the new cost drivers {mc['problems'][:2]}")
+    case("C0", c0)
+
+    def c1():
+        r = [M.cm_ramp(y, 2020.0, 2.0) for y in (2019.0, 2020.0, 2021.0, 2022.0, 2023.0)]
+        ok(r == [0.0, 0.0, 0.5, 1.0, 1.0] and M.cm_ramp(2020.0, 2020.0, 0.0) == 1.0,
+           f"C1 the ramp is linear from the delivery start over cm_ramp_years, 1 after it, a step at 0 years ({r})")
+    case("C1", c1)
+
+    hz = Horizon(2016.0, 2018.0, (2017.0, 2018.0), {"w": [2017.0, 2018.0]})
+    uu = UnitSpec("t", dict(unit.attributes, m0=20.0, itn_hist_years=[], campaign_year=2017.0, cm_ft=0.3))
+    base = {"n_agents": 3000, "burnin_years": 1, "cm_add": 0.3}
+    pk = [Package("none", {}), Package("cm", {"cm": 1})]
+
+    def ratio(o, g, num="treated", den="cases"):
+        return o.per_capita[num][g] / max(o.per_capita[den][g], 1e-12)
+
+    def cfr(P, pt):
+        return (1 - pt) * P["cfr_severe_untreated"] + pt * P["cfr_severe_treated"]
+
+    def c2():
+        P = resolve_params(e, base)
+        o0, o1 = e.run_batch([base] * 2, uu, pk, hz, 5)
+        ok(set(o1.cost_drivers) == v11 and ratio(o1, "15p") > ratio(o0, "15p") + 0.2,
+           f"C2 cm_target absent: the v0.11 add-on (all ages: treated share 15+ {ratio(o0, '15p'):.3f} -> "
+           f"{ratio(o1, '15p'):.3f}; cost drivers {sorted(o1.cost_drivers)})")
+        want = cfr(P, min(1.0, P["severe_access_add"] + 0.6))
+        ok(all(abs(ratio(o1, g, "deaths", "severe") - want) < 1e-6 for g in AGES),
+           "C2b cm_target absent: severe-care access rises one for one with the add-on (v0.11)")
+    case("C2", c2)
+
+    tp = dict(base, cm_target=1, cm_ramp_years=0)
+
+    def c3():
+        P = resolve_params(e, tp)
+        o0, o1 = e.run_batch([tp] * 2, uu, pk, hz, 5)
+        gu5 = ratio(o1, "u5") - ratio(o0, "u5")
+        ok(0.2 < gu5 < 0.32 and all(abs(ratio(o1, g) - ratio(o0, g)) < 0.06 for g in ("5_14", "15p")),
+           f"C3 cm_target 1: the add-on raises effective treatment under 5 only (gain u5 {gu5:.3f}; 5-14 "
+           f"{ratio(o0, '5_14'):.3f} -> {ratio(o1, '5_14'):.3f}; 15+ {ratio(o0, '15p'):.3f} -> {ratio(o1, '15p'):.3f})")
+        want = cfr(P, min(1.0, P["severe_access_add"] + 0.3))
+        ok(all(abs(ratio(o, g, "deaths", "severe") - want) < 1e-6 for o in (o0, o1) for g in AGES),
+           "C3b cm_severe_link 0 (default): severe-care access does not move with the add-on")
+        q = dict(tp, cm_severe_link=1.0)
+        l0, l1 = e.run_batch([q] * 2, uu, pk, hz, 5)
+        ok(ratio(l1, "u5", "deaths", "severe") < want - 0.02 and all(
+            abs(ratio(l1, g, "deaths", "severe") - want) < 1e-6 for g in ("5_14", "15p")),
+           f"C3c cm_severe_link 1: severe-care access rises only in the targeted ages "
+           f"(u5 CFR {ratio(l1, 'u5', 'deaths', 'severe'):.4f} vs {want:.4f})")
+        q2 = dict(tp, cm_age_hi_m=180.0)
+        _, w1 = e.run_batch([q2] * 2, uu, pk, hz, 5)
+        ok(ratio(w1, "5_14") > ratio(o0, "5_14") + 0.15, "C3d the targeted ages come from cm_age_lo_m / cm_age_hi_m")
+    case("C3", c3)
+
+    def c4():
+        o0, full = e.run_batch([tp] * 2, uu, pk, hz, 6)
+        ramp = e.run_batch([dict(tp, cm_ramp_years=1.0)], uu, pk[1], hz, 6)[0]
+        f = (ratio(ramp, "u5") - ratio(o0, "u5")) / max(ratio(full, "u5") - ratio(o0, "u5"), 1e-9)
+        ok(0.3 < f < 0.7, f"C4 a ramp over the whole window gives about half the gain ({f:.3f})")
+    case("C4", c4)
+
+    def c5():
+        o0, o1 = e.run_batch([tp] * 2, uu, pk, hz, 5)
+        z = e.run_batch([dict(tp, cm_add=0.0)], uu, pk[1], hz, 5)[0]
+        sh = o1.meta["age_shares"]["u5"]
+        ok(drv <= set(o0.cost_drivers) and o0.cost_drivers["cm_child_years"] == 0.0
+           and 0.85 * sh < o1.cost_drivers["cm_child_years"] <= sh + 1e-9
+           and o1.cost_drivers["treated_cm_ages"] > o0.cost_drivers["treated_cm_ages"] > 0,
+           f"C5 cost drivers: children 2-59 months covered per person-year {o1.cost_drivers['cm_child_years']:.4f} "
+           f"(u5 share {sh:.4f}; 0 without the add-on) and treated episodes in the targeted ages "
+           f"({o0.cost_drivers.get('treated_cm_ages')} -> {o1.cost_drivers.get('treated_cm_ages')})")
+        ok(z.cost_drivers["cm_child_years"] == o1.cost_drivers["cm_child_years"] and z.per_capita == o0.per_capita,
+           "C5b an add-on with cm_add 0 is still charged for the children it covers and changes no health outcome")
+    case("C5", c5)
+
+    def c6():
+        a = e.run_batch([base, base], uu, pk, hz, 5)
+        b = e.run_batch([dict(base, cm_target=1)] * 2, uu, pk, hz, 5)
+        ok(a[0].per_capita == b[0].per_capita and a[0].windows == b[0].windows
+           and {k: b[0].cost_drivers[k] for k in v11} == a[0].cost_drivers,
+           "C6 without the add-on, cm_target 1 gives the v0.11 outputs exactly (plus the two new cost drivers)")
+        mix = [base, tp, dict(tp, cm_severe_link=0.5)]
+        bm = e.run_batch(mix, uu, pk[1], hz, 5)
+        solo = [e.run(q, uu, pk[1], hz, 5) for q in mix]
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        ok([o.meta["burnin_members"] for o in bm] == [3] * 3 and [strip(o) for o in bm] == [strip(o) for o in solo],
+           "C6b members sharing one burn-in each act with their own case-management options")
+    case("C6", c6)
+
+    def c7():
+        bad = []
+        for over in ({"cm_target": 0.5}, {"cm_age_lo_m": 60.0}, {"cm_age_hi_m": float("nan")}, {"cm_ramp_years": -1.0},
+                     {"cm_severe_link": 1.5}, {"cm_add": 1.2}, {"cm_add": -0.1}):
+            k = next(iter(over))
+            q = dict(tp, n_agents=200, **over) if k != "cm_target" else dict(base, n_agents=200, **over)
+            try:
+                e.run(q, uu, pk[1], hz, 1)
+                bad.append(over)
+            except ValueError as ex:
+                if k not in str(ex):
+                    bad.append((over, str(ex)[:60]))
+        ok(not bad, f"C7 out-of-domain case-management options fail closed, naming the parameter (accepted: {bad})")
+    case("C7", c7)
+
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
