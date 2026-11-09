@@ -497,6 +497,16 @@ def _self_test() -> int:
            and "verified benchmark results" in res["arm_source"],
            "R7 interaction rescale: arms from verified benchmark results, the achieved interaction equals the requested "
            "one, an unreachable value is rejected (Codex P1-12, P1-13)")
+        # F6 S1-4: every fitted engine parameter gets an automatic test at each end of its range; an excluded scenario
+        # parameter is listed as not run, with the spec's reason
+        byid = {t.get("test_id"): t for t in R["decision_tests"]}
+        fa = byid.get("fitted_range_eff_a") or {}
+        ok("fitted_range_eff_b" in byid and fa.get("status") == "run"
+           and [round(r["value"], 9) for r in fa.get("results", [])] == [0.3, 0.7] and fa.get("automatic") is True,
+           f"R7b fitted parameters get automatic tests at their range ends: {sorted(k for k in byid if k)}")
+        sx = byid.get("scenario_excluded_synergy") or {}
+        ok(sx.get("status") == "not_run" and "no interaction" in str(sx.get("reason")),
+           f"R7c an excluded scenario parameter is listed as a test not run, with the spec's reason: {sx}")
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import mechanism_manifest as MM
         if hasattr(MM, "load_test_result"):
@@ -913,7 +923,8 @@ def _self_test_priors(ok, q):
            f"RP4 the emulator-error model and its held-out evidence are in the report: {em and em['sd_common_median']}")
         prt = {x["test_id"]: x for x in R["decision_tests"]}
         t = prt.get("prior_range_dw")
-        ok(set(prt) == {"prior_range_dw", "prior_range_synergy"} and t["automatic"] and t["status"] == "run"
+        ok({k for k in prt if k.startswith("prior_range_")} == {"prior_range_dw", "prior_range_synergy"}
+           and t["automatic"] and t["status"] == "run"
            and [x["value"] for x in t["results"]] == [0.005, 0.02]
            and t["results"][0]["point_plan_objective_under_test"] < t["results"][1]["point_plan_objective_under_test"]
            and os.path.exists(os.path.join(d, t["path"])),
@@ -969,7 +980,8 @@ def _self_test_test_ranges(ok, q):
         r = yaml.safe_load(open(p))
         r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
         r["uncertainty"]["sources"].append({"kind": "emulator"})
-        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"},
+                                        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
         r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
                                             "values": [0.002], "text": "weaker weight, below the prior range"}]
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)

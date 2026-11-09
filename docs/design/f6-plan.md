@@ -174,14 +174,14 @@ runs for a sample of LGAs at the boundary values.
 
 ## 8. Order, owners and dates
 
-| Step | Owner | Target |
-|---|---|---|
-| O1–O4 | owner | O3 and O4 this week; O1 and O2 before Stage 2 |
-| S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 |
-| S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 |
-| S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 |
-| S2-1 to S2-5 | lead and engine agent | dated once O1 and O2 are in |
-| S3, S4 | lead | after Stage 2; cost quoted before launch |
+| Step | Owner | Target | Status |
+|---|---|---|---|
+| O1–O4 | owner | O3 and O4 this week; O1 and O2 before Stage 2 | O3 answered 2026-11-08: "keep within budget"; the F6 spec will carry an affordability rule (proposed: at most 5% of draws over budget) and the optimiser mode that meets it follows S1-1 |
+| S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 in review (#154) |
+| S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 in review (this PR) |
+| S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | not started |
+| S2-1 to S2-5 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
+| S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
 Cost: Stage 1 is laptop and review time. The F6 run needs a full recalibration (the benchmark and error-model changes
 invalidate F5's calibration runs), roughly F5's calibration cost plus the analysis. I will quote it before launch.
