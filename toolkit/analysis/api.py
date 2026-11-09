@@ -106,6 +106,11 @@ def headline(run_dir: str) -> dict:
     fp = u["fixed_plan"][o]
     out.update({f"fixed_plan_{o}_lo": fp["ci_low"], f"fixed_plan_{o}_hi": fp["ci_high"],
                 "cost_allocated": float(p["cost_allocated"])})
+    af = u.get("affordability") or {}
+    if af.get("draws"):        # F6 S1-1: the fixed plan's cost across the draws
+        out.update({"fixed_plan_share_over_budget": float(af["share_over_budget"]),
+                    "fixed_plan_cost_median": float(af["fixed_plan_cost"]["median"]),
+                    "fixed_plan_cost_hi": float(af["fixed_plan_cost"]["ci_high"])})
     try:
         s = read(run_dir, "analysis/stability.yaml")["data"]
         if s["metrics"].get("total_benefit_loss_pct_worst_fold") is not None:

@@ -193,6 +193,10 @@ The owner approved these four items on 2026-11-03 and deferred them until the F5
 | R3 | A direct measure of determinism: the same signed spec run on different seeds and engine stamps, reporting how much the decision changes. In the eval suite, each question runs twice. | Not started |
 | R4 | Freeze the harness's operations code, so that review effort goes into the engine and the evidence. | Not started |
 
+## F6 plan (owner approval to start Stage 1, 2026-11-08)
+
+`f6-plan.md` turns the F5 outcome and an independent GPT-6.1 Sol critique (eight P1 findings, two verified) into a launch checklist, a result checklist, owner inputs O1–O4, Stage 1 harness fixes S1-1 to S1-8 and Stage 2 model and evidence work S2-1 to S2-5. Each later PR updates its row there.
+
 ## Model library (owner approval, 2026-11-05)
 
 The layers (core, engine families, domain packs, questions and runs), the promotion rule (a lesson becomes core only once it has appeared in two disease areas), the parallel tracks and the acceptance criteria for core changes are in `model-library.md`. Its §5 "F6 factory package" is the work before the next Nigeria run, F6; it is not item F6 of workstream F above.

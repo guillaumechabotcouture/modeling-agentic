@@ -76,6 +76,9 @@ docs/design/v2-spec-and-analysis.md §1):
                source: "<citation>", verified: unverified}}
                                            # engine-card priors (the engine's priors.yaml) are drawn without being
                                            # listed (kind `priors`, toolkit/spec/priors.py); the label names them
+      affordability: {max_share_over_budget: 0.1}   # optional (F6 S1-1): the share of draws in which the point plan
+                                           # may cost more than the allocatable budget; above it, a gate finding.
+                                           # Without it the share is reported, not judged
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
@@ -1194,6 +1197,12 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     lvl = u.get("level", 0.95)
     if not (_isnum(lvl) and 0.5 <= lvl < 1):
         bad.append("uncertainty.level: in [0.5, 1)")
+    if "affordability" in u:      # F6 S1-1: the share of draws in which the fixed plan may exceed the budget
+        af = u["affordability"]
+        if not isinstance(af, dict) or set(af) != {"max_share_over_budget"}:
+            bad.append("uncertainty.affordability: a mapping with one key, max_share_over_budget")
+        elif not (_isnum(af["max_share_over_budget"]) and 0 <= af["max_share_over_budget"] < 1):
+            bad.append("uncertainty.affordability.max_share_over_budget: in [0, 1)")
     items = {it.get("id") for it in s.raw["options"].get("cost_items") or []}
     for src in u.get("sources") or []:
         if src.get("kind") == "costs":
@@ -1465,6 +1474,17 @@ def _self_test() -> int:
             "SP7 an envelope below its fixed costs is refused")
         bad(lambda r: r["uncertainty"].update(excluded=[{"kind": "costs", "reason": "toy"}]), "neither declared",
             "SP8 lesson 6: an uncertainty source neither declared nor excluded with a reason is refused")
+        # F6 S1-1: the affordability rule is part of the signed spec; malformed rules are refused
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share_over_budget": 1.5}),
+            "uncertainty.affordability", "SP8c an affordability share outside [0, 1) is refused")
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share": 0.1}), "uncertainty.affordability",
+            "SP8d an affordability rule with an unknown key is refused")
+        bad(lambda r: r["uncertainty"].update(affordability=[0.1]), "uncertainty.affordability",
+            "SP8e an affordability rule that is not a mapping is refused")
+        r_ok = copy.deepcopy(s.raw)
+        r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1}
+        ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
+           "SP8f a well-formed affordability rule validates")
         # a list column whose empty list is written as a declared token (a blank cell is refused as
         # attribute_column_empty, so an empty list needs an explicit marker)
         ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}

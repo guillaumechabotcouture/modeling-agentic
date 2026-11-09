@@ -20,6 +20,7 @@ All HIGH, none scope-declarable; each fails closed (an unreadable file is a find
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -50,6 +51,44 @@ def _names_engine(run_dir: str) -> bool:
     except (OSError, yaml.YAMLError, AttributeError):
         return False
     return eng is not None and not (eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True))
+
+
+def _affordability(run_dir: str, unc: dict) -> list[dict]:
+    """F6 S1-1: the signed spec's affordability rule, judged here from the artifact's counts (Codex round 1 P1): a
+    declared rule with no result or no draws, another rule in the artifact, a verdict the counts do not support, or a
+    share above the rule is a finding. Without a declared rule the share is reported in the artifact, not judged."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+        rule = ((raw.get("uncertainty") or {}) if isinstance(raw, dict) else {}).get("affordability")
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_affordability", f"{SPEC} unreadable for the affordability rule: {e}",
+                   "affordability")]
+    if not rule:
+        return []
+    af = unc.get("affordability")
+    F = lambda c: [_f("analysis_contract_affordability", f"analysis/uncertainty.yaml: {c}", "affordability")]  # noqa: E731
+    if not isinstance(af, dict):
+        return F(f"the spec declares an affordability rule ({rule}) but the artifact has no affordability result")
+    n, over, share = af.get("draws"), af.get("draws_over_budget"), af.get("share_over_budget")
+
+    def count(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+    if not count(n) or n <= 0 or not count(over) or not 0 <= over <= n or n != unc.get("draws"):
+        return F(f"the spec declares an affordability rule ({rule}) but the artifact has no usable result "
+                 f"(draws {n!r} of the artifact's {unc.get('draws')!r}, over budget {over!r})")
+    if not (isinstance(share, (int, float)) and not isinstance(share, bool) and math.isfinite(share)
+            and abs(share - over / n) <= 1e-12):
+        return F(f"the artifact's share over budget {share!r} does not equal {over} of {n} draws")
+    if af.get("rule") != rule:
+        return F(f"the artifact judged the rule {af.get('rule')!r}, the signed spec declares {rule!r}")
+    met = over / n <= float(rule["max_share_over_budget"]) + 1e-12
+    if af.get("rule_met") is not met:
+        return F(f"the artifact's verdict rule_met={af.get('rule_met')!r} does not follow from {over} of {n} draws "
+                 f"over budget against at most {rule['max_share_over_budget']}")
+    if not met:
+        return F(f"the fixed plan exceeds the allocatable budget in {over} of {n} uncertainty draws (share "
+                 f"{over / n:.3f}); the spec allows at most {rule['max_share_over_budget']}")
+    return []
 
 
 def gate_findings(run_dir: str) -> list[dict]:
@@ -161,6 +200,7 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += estimates_test_findings(est_doc[0], est_doc[1], exp_ids if isinstance(exp_ids, list) else [])
     if cal_doc and cal_doc[1].get("method") == "posterior" and unc_doc is not None:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
+    out += _affordability(run_dir, unc_doc or {})
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -384,14 +424,14 @@ def _self_test() -> int:
     def kinds(d):
         return {x["kind"] for x in gate_findings(d)}
 
-    def complete_run(d, cal=None, drop_kind=None, finalize=True):
+    def complete_run(d, cal=None, drop_kind=None, finalize=True, unc=None):
         """A minimal completed run: every expected artifact kind and deliverable role."""
         S = Store(d, sha256(os.path.join(d, SPEC)), True, {"name": "t", "version": "1", "card_sha256": "x"})
         open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
         pay = {"engine": {"card": {}, "parameters": []}, "batch": {"evaluation": "direct"},
                "calibration": cal or {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {}},
                "point": {"plan": {}, "averted": {}, "cost_allocated": 0, "mix": {}, "solver": {}},
-               "uncertainty": {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
+               "uncertainty": unc or {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
                "claims": {"n_claims": 0, "unresolved": []}}
@@ -453,7 +493,40 @@ def _self_test() -> int:
             complete_run(d, cal=cal)
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_calibration"]
             ok(f and why in f[0]["claim"], f"K11 calibration gated (Codex P1-8): {why}")
-        # engine choice (engine: auto): its hash is in the manifest and in every artifact header
+        # F6 S1-1 (Codex P1): the gate judges the signed spec's rule itself, from the artifact's counts; a declared rule
+        # with no result, another rule in the artifact, or a verdict the counts do not support is a finding
+        spec_text = open(os.path.join(d, SPEC)).read()
+        base_u = {"draws": 4, "covers": [], "excludes": [], "label": "", "fixed_plan": {}}
+
+        def aff(over, rule, met, draws=4):
+            return {"draws": draws, "draws_over_budget": over, "share_over_budget": over / draws if draws else 0.0,
+                    "budget_allocatable": 1.0, "rule": rule, "rule_met": met}
+        r01 = {"max_share_over_budget": 0.1}
+        for spec_rule, a_, want, label in (
+                (r01, aff(3, r01, False), True, "rule not met"),
+                (r01, aff(3, {"max_share_over_budget": 0.9}, True), True, "artifact carries a looser rule"),
+                (r01, None, True, "declared rule, no affordability result"),
+                (r01, aff(3, r01, True), True, "verdict the counts do not support"),
+                (r01, aff(0, r01, True, draws=0), True, "declared rule judged on zero draws"),
+                (r01, dict(aff(0, r01, True), share_over_budget=0.75), True, "share inconsistent with the counts"),
+                (r01, dict(aff(0, r01, True), share_over_budget=None), True, "share missing"),
+                (r01, dict(aff(0, r01, True), draws=True), True, "a boolean draw count"),
+                (r01, dict(aff(0, r01, True), draws_over_budget=False), True, "a boolean over-budget count"),
+                (r01, "x", True, "affordability not a mapping"),
+                (r01, aff(0, r01, True), False, "rule met"),
+                (None, aff(3, None, None), False, "no rule declared: reported, not judged"),
+                (None, None, False, "no rule declared, older artifact without affordability")):
+            open(os.path.join(d, SPEC), "w").write(spec_text + (yaml.safe_dump({"uncertainty": {"affordability": spec_rule}})
+                                                                if spec_rule else ""))
+            complete_run(d, unc=dict(base_u, **({"affordability": a_} if a_ is not None else {})))
+            if label == "rule met":      # the artifact's total draws must equal the affordability count
+                complete_run(d, unc=dict(base_u, draws=0, affordability=a_))
+                f0 = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
+                ok(bool(f0), f"K13 affordability: counts on 4 draws in an artifact of 0 draws is a finding {f0[:1]}")
+                complete_run(d, unc=dict(base_u, affordability=a_))
+            f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
+            ok(bool(f) == want, f"K13 affordability, {label}: finding {bool(f)} (want {want}) {f[:1]}")
+        open(os.path.join(d, SPEC), "w").write(spec_text)
         cp = os.path.join(d, "engine_choice.json")
         json.dump({"engine": {"ref": "x:Y"}, "why": "w"}, open(cp, "w"))
         try:

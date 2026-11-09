@@ -447,6 +447,49 @@ def _self_test() -> int:
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
+        af = R["uncertainty"].get("affordability") or {}
+        ok(af.get("draws") == R["uncertainty"]["draws"] and 0.0 <= af.get("share_over_budget", -1) <= 1.0
+           and (af.get("fixed_plan_cost") or {}).get("median") is not None
+           and abs(af.get("budget_allocatable", 0) - 9000) < 1e-6,
+           f"R5b the fixed plan's cost is recorded in every draw and its share over budget reported (F6 S1-1): {af}")
+        rep0 = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        ok("fixed_plan_cost" not in (rep0.get("scalar_outputs") or {}) and rep0.get("affordability") == af,
+           "R5c one cost summary: the report carries affordability, not a second scalar summary (Codex S1-1 P2)")
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        ok("uq.share_over_budget" in cs and (cs.get("uq.fixed_plan_cost.median") or {}).get("interval")
+           == R["uncertainty"]["interval"],
+           "R5d claims: the share over budget, and cost quantiles labelled with the interval (Codex S1-1 P2)")
+        # Codex S1-1 P2: costs that move in each draw (a drawn cost multiplier), checked draw by draw against an
+        # independent replay of the same draws
+        import numpy as np
+        from toolkit.analysis import uncertainty as U
+        A5 = R["_A"]
+        saved = copy.deepcopy(A5.spec.raw["uncertainty"])
+        try:
+            A5.spec.raw["uncertainty"]["sources"] = list(saved["sources"]) + [{"kind": "costs",
+                                                                                "items": {"ca": [0.5, 2.0]}}]
+            A5.spec.raw["uncertainty"]["excluded"] = [x for x in saved.get("excluded") or [] if x.get("kind") != "costs"]
+            A5.spec.raw["uncertainty"]["affordability"] = {"max_share_over_budget": 0.2}
+            u5 = U.run(A5, R["point"]["plan"], "total_dalys_averted", draws=8, seed=3)["data"]["affordability"]
+            D5 = U.Drawer(A5, 3)
+            D5.prepare(8)
+            want = []
+            for _ in range(8):
+                th, zs, noise, mult, _s = D5.draw()
+                _o, _b, c5 = A5.evaluate(th, zs, noise=noise, cost_mult=mult)
+                want.append(sum(c5[i][R["point"]["plan"][i]] for i in A5.ids))
+            n_over = sum(c > A5.budget * (1 + 1e-9) for c in want)
+            fq = u5.get("fixed_plan_cost") or {}
+            ok(abs(fq.get("median", -1) - float(np.median(want))) <= 1e-9 * max(want)
+               and abs(fq.get("ci_high", -1) - float(np.percentile(want, 97.5))) <= 1e-9 * max(want),
+               "R5f the cost quantiles are the replayed draws' own quantiles")
+            ok(u5.get("per_draw_cost") == want and len(set(round(c, 6) for c in want)) > 1
+               and u5["draws_over_budget"] == n_over and u5["rule_met"] == (n_over / 8 <= 0.2)
+               and u5["budget_allocatable"] == A5.budget,
+               f"R5e with drawn cost multipliers each draw's cost equals an independent replay, and the rule is judged "
+               f"on those draws ({u5.get('draws_over_budget')} of 8 over)")
+        finally:
+            A5.spec.raw["uncertainty"] = saved
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
