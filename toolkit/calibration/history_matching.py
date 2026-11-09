@@ -2782,6 +2782,39 @@ def _self_test() -> int:
            f"{r['blocks']}, z {r['best']['z']})")
     safe(hm38, "HM38")
 
+    def hm39():          # Codex r4 P2: contradictory aggregates on one group mean are refused at the candidate
+        units = ["u0", "u1"]
+        tg = [Target(f"{u}:x", "unit", "x", 0.5, "identity", sd_obs=0.3, sd_bias=0.2, unit=u, source="toy",
+                     bias_key="s|g") for u in units]
+        tg += [Target(f"A{n}", "group", "x", v, "identity", sd_obs=0.01, weights={u: 1.0 for u in units}, source="toy")
+               for n, v in ((1, 0.25), (2, 0.75))]
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": z + 1e-4 * rng.normal()})
+        h = HistoryMatch(P, sim, 11, q, points_per_unit=20)
+        r = h.run(1)
+        ok(r["blocked"] and r["region"]["accepted"] == 0 and not h.compatible({}),
+           f"HM39 two group targets of one mean at 0.25 and 0.75 (disjoint bands): no candidate is accepted "
+           f"({r['status']}, accepted {r['region']['accepted']})")
+    safe(hm39, "HM39")
+
+    def hm40():          # Codex r4 P2: an aggregate's reported prediction and implausibility come from one assignment
+        units = ["u0", "u1", "u2"]
+        tg = [Target("u0:x", "unit", "x", 0.5, "identity", sd_obs=0.01, sd_bias=0.2, unit="u0", source="t",
+                     bias_key="s|a"),
+              Target("u1:x", "unit", "x", 0.5, "identity", sd_obs=0.3, unit="u1", source="t"),
+              Target("u2:x", "unit", "x", 0.5, "identity", sd_obs=0.01, sd_bias=0.2, unit="u2", source="t",
+                     bias_key="s|b"),
+              Target("A1", "group", "x", 0.6, "identity", sd_obs=0.005, weights={"u0": 1.0, "u1": 1.0}, source="t"),
+              Target("A2", "group", "x", 0.4, "identity", sd_obs=0.005, weights={"u1": 1.0, "u2": 1.0}, source="t")]
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": z + 1e-4 * rng.normal()})
+        r = calibrate(P, sim, seed=8, waves=1, log=q, points_per_unit=20)
+        t = r["targets"]
+        agree = all(abs(t[k]["modelled_at_best"] - t[k]["value"]) <= t[k]["implausibility_at_best"] * 0.005 * 1.5 +
+                    1e-6 and t[k]["implausibility_at_best"] <= 3 for k in ("A1", "A2"))
+        ok(r["status"] == "matched" and agree,
+           f"HM40 each aggregate's reported prediction lies within its reported implausibility of its target "
+           f"({ {k: (round(t[k]['modelled_at_best'], 4), round(t[k]['implausibility_at_best'], 3)) for k in t} })")
+    safe(hm40, "HM40")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
