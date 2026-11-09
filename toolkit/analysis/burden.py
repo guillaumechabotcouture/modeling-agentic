@@ -432,26 +432,115 @@ def _self_test() -> int:
     ov = dict(ref, tolerance={"type": "overlap", "ratio_band": None})
     ok(compare(ov, 70.0, [60.0, 70.0, 85.0])["status"] == "within" and compare(ov, 70.0, [60.0, 75.0])["status"]
        == "outside", "BV3 interval overlap: the draws' interval meets the reference interval, or not")
-    rp = compare(dict(ref, kind="reported"), 900.0, None)
-    ok(rp["status"] == "information" and findings({"validation": {"burden": {}}}, {"references": [rp]}) == [],
-       "BV4 a reported value is information only: never judged, never a finding")
+    sec = {"validation": {"burden": {"csv": "x.csv"}}}
+    rref = dict(ref, id="p", kind="reported")
+    rp = compare(rref, 900.0, None)
+    ok(rp["status"] == "information" and findings(sec, {"references": [compare(ref, 150.0, None), rp]}, [ref, rref])
+       == [], "BV4 a reported value is information only: never judged, never a finding")
     pt = compare(dict(ref, age_band="u5"), 120.0, None)
     ok(pt["model"]["interval_from"] == "point" and "all-age" in pt["model"]["note"],
        "BV5 an age-banded reference is the point value, with a statement")
-    sec = {"validation": {"burden": {"csv": "x.csv"}}}
-    fo = findings(sec, {"references": [r2, compare(ref, 150.0, None)]})
+    fo = findings(sec, {"references": [r2]}, [ref])
     ok([(x["kind"], x["scope_declarable"], x["key"]) for x in fo] == [("burden_outside_tolerance", True, "burden:r")],
        f"BV6 a group outside tolerance is one declarable finding: {fo}")
-    um = compare(ref, None, None)
-    bad_st = dict(r2, status="within")
-    wide = dict(compare(ref, 150.0, None), tolerance={"type": "ratio", "ratio_band": [0.01, 100.0]})
-    got = {x["kind"]: x["scope_declarable"] for x in findings(sec, {"references": [um]})}
+    got = {x["kind"]: x["scope_declarable"] for x in findings(sec, {"references": [compare(ref, None, None)]}, [ref])}
     ok(got == {"burden_reference_unmatched": False}, f"BV7 an unmatched reference fails closed: {got}")
-    got = [x["kind"] for x in findings(sec, {"references": [bad_st, wide]})]
+    wref = dict(ref, id="w", tolerance={"type": "ratio", "ratio_band": [0.01, 100.0]})
+    got = [x["kind"] for x in findings(sec, {"references": [dict(r2, status="within"), compare(wref, 150.0, None)]},
+                                       [ref, wref])]
     ok(got == ["burden_validation_inconsistent"] * 2,
        f"BV8 a status its numbers do not support, or a band wider than the manifest's, fails closed: {got}")
-    ok([x["kind"] for x in findings(sec, None)] == ["burden_validation_missing"] and findings({}, None) == [],
+    ok([x["kind"] for x in findings(sec, None, [ref])] == ["burden_validation_missing"] and findings({}, None) == [],
        "BV9 a declared check with no artifact fails closed; no declaration, no finding")
+    # Codex r1 P2: the artifact is reconciled with the declared references before any row is judged
+    ok_row = compare(ref, 150.0, None)
+    for name, rows, exp, want in (
+            ("an unrelated row", [ok_row, compare(dict(ref, id="x"), 150.0, None)], [ref], "burden_validation_unexpected"),
+            ("a declared reference missing", [ok_row], [ref, rref], "burden_validation_missing"),
+            ("a reference twice", [ok_row, ok_row], [ref], "burden_validation_unexpected"),
+            ("an unknown kind", [dict(ok_row, kind="modelled")], [ref], "burden_validation_inconsistent"),
+            ("changed metadata", [dict(ok_row, value=140.0)], [ref], "burden_validation_inconsistent"),
+            ("a reported-only artifact", [rp], [rref], "burden_validation_no_estimate"),
+            ("a reported row with no model value", [ok_row, compare(rref, None, None)], [ref, rref],
+             "burden_reference_unmatched")):
+        got = {(x["kind"], x["scope_declarable"]) for x in findings(sec, {"references": rows}, exp)}
+        ok((want, False) in got, f"BV18 the gate refuses {name}: {sorted(got)}")
+    ok([x["kind"] for x in findings(sec, {"references": [ok_row]}, None)] == ["burden_validation_missing"],
+       "BV18 the gate fails closed without the declared references")
+    # Codex r1 P2: corrections on the validation arm stop the analysis, at the point, in every draw and per age band
+    from toolkit.analysis.core import Analysis, AnalysisBlocked
+    clip = [{"unit": "u1", "package": "a", "kind": "reduction_clip"}]
+
+    class _G:
+        comp, ids, outcomes, theta0 = "none", ["u1", "u2"], ["dalys", "deaths"], {}
+        by_id = {"u1": {"g": "g1", "py": 100.0, "po": 300.0}, "u2": {"g": "g2", "py": 50.0, "po": 50.0}}
+        spec = {"decision_units": {"populations": {"young": {"column": "py"}, "old": {"column": "po"}}},
+                "objective": {"horizon": [0, 2]}}
+        plan_corrections, guard = Analysis.plan_corrections, Analysis.guard
+
+    class _M:
+        clip = False
+
+        def __init__(self):
+            self.pops, self.packages, self.last_events = dict(_G.spec["decision_units"]["populations"]), ["none", "a"], []
+
+        def predict(self, zs, theta, ids, noise=None):
+            rate = {"young": {"deaths": 0.01, "dalys": 0.8}, "old": {"deaths": 0.002, "dalys": 0.1}}
+            self.last_events = list(clip) if self.clip else []
+            return {i: {"y": {k: {o: sum(rate[b][o] * _G.by_id[i][pm["column"]] for b, pm in self.pops.items())
+                                  for o in ("deaths", "dalys")} for k in self.packages}} for i in ids}
+    _G.model = _M()
+    col = Collector.__new__(Collector)
+    col.A, col.cfg, col.refs, col.draws = _G, {"arm": "a", "group": "g"}, [], {}
+    try:
+        col.add({}, clip)
+        ok(False, "BV19 a correction on the validation arm in a draw stops the analysis")
+    except AnalysisBlocked:
+        ok(True, "BV19 a correction on the validation arm in a draw stops the analysis")
+    try:
+        guard_point(_G, "a", clip)
+        ok(False, "BV19 a correction on the validation arm at the point stops the analysis")
+    except AnalysisBlocked:
+        ok(True, "BV19 a correction on the validation arm at the point stops the analysis")
+    try:
+        col.add({}, [dict(clip[0], package="b")])
+        guard_point(_G, "a", [dict(clip[0], package="b")])
+        ok(True, "BV19 a correction on another unchosen package does not")
+    except AnalysisBlocked:
+        ok(False, "BV19 a correction on another unchosen package does not")
+    _G.model.clip, pops0 = True, _G.model.pops
+    try:
+        by_population(_G, {}, {}, ["young", "old"], "a")
+        ok(False, "BV19 a correction in the age-band predictions stops the analysis")
+    except AnalysisBlocked:
+        ok(_G.model.pops is pops0 and _G.model.last_events == [],
+           "BV19 a correction in the age-band predictions stops the analysis; the model state is restored")
+    # genuine age separation: two bands with different rates and years of life lost per death
+    _G.model.clip = False
+    bp = by_population(_G, {}, {}, ["young", "old"], "a")
+    full = _G.model.predict({}, {}, _G.ids)
+    cfg = {"arm": "a", "group": "g", "daly_parts": {"yll_per_death": {"young": 60.0, "old": 20.0}}}
+    yr = dict(ref, group="g1", age_band="young", outcome="deaths", measure="rate", per=1000.0)
+    dpa = daly_parts(_G, cfg, "a", full, bp, {"averted": {"dalys": 8.0, "deaths": 0.2}})
+    want = (1.5 * 60 + 0.7 * 20) / 155.0
+    ok(abs(bp["young"]["u1"]["y"]["a"]["deaths"] - 1.0) < 1e-12 and abs(bp["old"]["u1"]["y"]["a"]["deaths"] - 0.6)
+       < 1e-12 and abs(_value(_G, cfg, yr, bp["young"], "a") - 1000 * 0.01 / 2) < 1e-12
+       and abs((dpa["deaths_share_of_dalys"] or 0) - want) < 1e-12
+       and abs((dpa["dalys_averted_per_death_averted"] or 0) - 40) < 1e-9,
+       f"BV20 per-band values and per-band years of life lost ({dpa['deaths_share_of_dalys']} vs {want})")
+    # Codex r1 P3: zero and censored endpoints are drawn, not dropped
+    from toolkit.analysis import figure_style as FS, figures as FG
+
+    class _R:
+        def art(self, k):
+            z = dict(compare(dict(ov, lower=0.0), 0.0, None), id="z")
+            return {"references": [z, compare(ref, 150.0, None)], "summary": {"within": 1}, "window": [0, 1],
+                    "arm": "none"}
+    fz = FG.fig_burden_validation(_R(), FS.setup("light"))
+    zr = next(r for r in fz[3] if r["reference"] == "z")
+    texts = [x.get_text() for a in fz[0].axes for x in a.texts]
+    ok("model 0" in str(zr.get("shown_as")) and "reference lower 0" in str(zr.get("shown_as"))
+       and any(t_.startswith("0") for t_ in texts), f"BV21 zero endpoints are shown at the axis floor: {zr.get('shown_as')}")
     ok(th["widest_ratio_band"][0] <= th["default_ratio_band"][0] <= 1 <= th["default_ratio_band"][1]
        <= th["widest_ratio_band"][1], "BV10 the manifest's default band lies within its widest band")
     # the spec contract on a toy spec
@@ -477,7 +566,10 @@ def _self_test() -> int:
                  ("year", ["a,r0,,cases,count,,40,100,80,130,estimated,s,ratio,,"], "years from"),
                  ("rate per", ["a,r0,,cases,rate,,1,100,80,130,estimated,s,ratio,,"], "per > 0"),
                  ("only reported", ["a,r0,,cases,count,,1,100,80,130,reported,s,ratio,,"], "no estimated"),
-                 ("duplicate id", [good, good], "unique")]
+                 ("duplicate id", [good, good], "unique"),
+                 ("unparsable band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,oops,typo"], "ratio_low"),
+                 ("non-finite band", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,NaN,NaN"], "ratio_low"),
+                 ("one bound unparsable", ["a,r0,,cases,count,,1,100,80,130,estimated,s,ratio,0.5,x"], "ratio_high")]
         for name, lines, needle in cases:
             got = probs(lines)
             ok(any(needle in x for x in got), f"BV12 the reference contract refuses: {name} ({got})")
@@ -494,6 +586,36 @@ def _self_test() -> int:
         ok(any("daly_parts" in x for x in load_references(schema.Spec(raw, d))[1])
            and any("validation.burden" in x for x in schema.validate(schema.Spec(raw, d))),
            "BV15 daly_parts needs positive years of life lost; schema.validate reports the section")
+        # Codex r1 P1: a reference file is never a calibration input, by any name, nor do its rows repeat fitted values
+        import shutil
+        open(os.path.join(d, "refs.csv"), "w").write(head + "\n" + good + "\n")
+        os.symlink(os.path.join(d, "refs.csv"), os.path.join(d, "alias.csv"))
+        shutil.copy(os.path.join(d, "refs.csv"), os.path.join(d, "copy.csv"))
+
+        def indep(cal_mut, ref_csv="refs.csv"):
+            raw = yaml.safe_load(open(p))
+            raw["validation"] = {"burden": {"csv": ref_csv}}
+            cal_mut(raw["calibration"])
+            return load_references(schema.Spec(raw, d))[1]
+        jt = lambda f: lambda c: c.update(joint={"targets": [{"id": "g", "kind": "group", "csv": f}]})  # noqa: E731
+        for name, mut, rc in (("a symlink of the targets file", lambda c: c.update(targets={"csv": "alias.csv"}), "refs.csv"),
+                              ("a copy of the targets file", lambda c: c.update(targets={"csv": "copy.csv"}), "refs.csv"),
+                              ("a joint-calibration group target", jt("refs.csv"), "refs.csv"),
+                              ("an alias of a joint target", jt("alias.csv"), "refs.csv"),
+                              ("the units table", lambda c: None, "units.csv")):
+            got = indep(mut, rc)
+            ok(any("calibration input" in x for x in got), f"BV17 the reference file is refused as {name}: {got}")
+        u0 = next(u for u in schema.load(p).units() if u["region"] == "r0")
+        open(os.path.join(d, "coin.csv"), "w").write(head + "\n" + f"a,r0,,cases,count,,1,{u0['tgt']},0,1,"
+                                                     "estimated,s,overlap,,\n")
+        got = indep(lambda c: None, "coin.csv")
+        ok(any("fitted observation" in x for x in got), f"BV17 a reference repeating a fitted target value is refused: {got}")
+        raw = yaml.safe_load(open(p))
+        raw["validation"] = {"burden": {"csv": "refs.csv"}}
+        pv = provenance(schema.Spec(raw, d))
+        ok(pv.get("sha256") and pv.get("independent") is True
+           and any(x["path"].endswith("units.csv") for x in pv.get("calibration_inputs") or []),
+           f"BV17 the artifact's provenance names the reference file and the calibration inputs it is independent of: {pv}")
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]

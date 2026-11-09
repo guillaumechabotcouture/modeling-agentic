@@ -1362,6 +1362,16 @@ def _self_test_burden_e2e(ok, d, q):
     ok("## Absolute burden against external estimates" in res and "[CLAIM:" not in res and "burden.B.ratio" in led
        and "burden_validation" in figs and "not computed" in bv["daly_parts"]["statement"],
        f"BE4 results.md, the claims ledger and the figure carry the comparison ({sorted(figs)[:3]})")
+    pv = bv.get("provenance") or {}
+    ok(pv.get("independent") is True and pv.get("csv") == "burden_refs.csv" and pv.get("calibration_inputs"),
+       f"BE5 the artifact records the reference file's provenance and the calibration inputs it is independent of: {pv}")
+    # Codex r1 P2: precomputed draws (the reserve search) reach the hook with their events, so the arm is guarded
+    from toolkit.analysis import uncertainty as U
+    A = R["_A"]
+    seen = []
+    U.run(A, R["point"]["plan"], "h", draws=2, seed=5, pre=U.evaluate_draws(A, 2, 5),
+          on_draw=lambda out, events: seen.append((len(out), type(events).__name__)))
+    ok(seen == [(len(A.ids), "list")] * 2, f"BE6 precomputed draws call the hook with outcomes and events: {seen}")
 
 
 def _self_test_floors_e2e(ok, d, q):
