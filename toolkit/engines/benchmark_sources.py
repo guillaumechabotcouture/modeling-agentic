@@ -168,6 +168,7 @@ def _self_test() -> int:
 
     pub = {"lower": 0.30, "upper": 0.67, "level": 0.95, "scale": "ratio", "table": "abstract"}
     good = {"id": "A", "target": 0.45, "band": [0.30, 0.67], "published": pub, "estimand_type": "odds_ratio",
+            "diagnostic": "RDT", "age_band": "not reported",
             "estimand": {"type": "odds_ratio"}}
     ok(check_benchmark(good) == [], "BS1 a band equal to its published interval passes")
     sym = dict(good, band=[0.23, 0.67])
@@ -228,6 +229,7 @@ def _self_test() -> int:
            "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}}},
            "benchmarks": [{"id": "T1", "metric": "a vs none", "target": 0.4, "band": [0.3, 0.5],
                            "published": dict(pub, lower=0.3, upper=0.5), "estimand_type": "risk_ratio",
+                           "diagnostic": "mixed", "age_band": "mixed",
                            "estimand": {"type": "ratio", "num": "a", "den": "none", "value": "per_capita.cases.all"}}],
            "fit": [{"param": "eff_a", "grid": [0.3, 0.5], "targets": ["T1"]}]}
     wide = dict(toy, benchmarks=[dict(toy["benchmarks"][0], band=[0.2, 0.5])])
@@ -255,6 +257,148 @@ def _self_test() -> int:
         EP.benchmark_pack = orig
     ok(jw[0] is None and "do not match their sources" in str(jw[2]) and jo[0] is toy and jo[1] == {"T1"},
        "BS22 joint calibration reads a band as a 95% interval only when it matches its source")
+
+    # ---- review round 1 (Codex, PR #154)
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a case that raises is a failing case
+            ok(False, f"{name} raised {type(ex).__name__}: {ex}")
+
+    eng = BM.load_engine(toy["engine"])
+
+    def r1_1():
+        ok(any("differs from its published" in x for x in BM.validate(wide, eng)),
+           "BS23 validate() itself refuses a band that differs from its source (direct API call)")
+        try:
+            BM.Runner(wide, eng, 1)
+            ok(False, "BS24 Runner() refuses a pack whose band differs from its source")
+        except ValueError as ex:
+            ok("differs from its published" in str(ex), "BS24 Runner() refuses a pack whose band differs from its source")
+    case("BS23-24", r1_1)
+
+    def r1_5():
+        nosrc = {"id": "T5", "target": 0.4, "band": [0.3, 0.5], "estimand": {"type": "ratio"}}
+        ok(check_pack(dict(toy, benchmarks=[nosrc])) == [] and check_pack(dict(toy, engine="pkg.real:Engine",
+                                                                              benchmarks=[nosrc])) != [],
+           f"BS25 the listed toy engines {TOY_ENGINE_REFS} are the only pack-level exemption")
+        ok(check_pack({"benchmarks": [None]}) != [] and check_pack({"benchmarks": [{"id": "x"}]}) != []
+           and check_pack({"benchmarks": [{"id": "x", "estimand": {"type": "new_kind"}}]}) != [],
+           "BS26 a malformed entry, a missing estimand type and an unknown one are findings")
+        ok(set(EXEMPT_TYPES) == {"value", "identity", "coverage", "curve_rules"},
+           f"BS27 the exempt estimand types are listed explicitly: {EXEMPT_TYPES}")
+    case("BS25-27", r1_5)
+
+    def r1_4():
+        o = {"id": "H", "target": 0.5, "band": [0.4, 0.7], "estimand": {"type": "ratio"}, "estimand_type": "hazard_ratio",
+             "band_override": {"band": [0.4, 0.7], "reason": "r"}}
+        ok(any("refused without an estimand_mapping" in x for x in check_benchmark(o)),
+           "BS28 an override does not bypass the estimand check: a hazard ratio still needs a mapping note")
+        ok(any("estimand_type" in x for x in check_benchmark({k: v for k, v in o.items() if k != "estimand_type"})),
+           "BS29 every trial or cost entry declares the estimand its source reports")
+    case("BS28-29", r1_4)
+
+    def r1_3():
+        tr = math.log
+        b90 = dict(good, published=dict(pub, level=0.90))
+        sd = band_sd(b90, tr)
+        ok(abs(sd - (math.log(0.67) - math.log(0.30)) / (2 * 1.6448536)) < 1e-6,
+           f"BS30 the interval sd uses the recorded level (0.90 -> z 1.645): {sd:.4f}")
+        try:
+            band_sd(dict(ovr), tr)
+            ok(False, "BS31 an override band with no stated level has no sd (refused)")
+        except ValueError:
+            ok(True, "BS31 an override band with no stated level has no sd (refused)")
+        import inspect
+        ok("band_sd" in inspect.getsource(JC) and "1.959964" not in inspect.getsource(JC),
+           "BS32 joint calibration computes a benchmark target's sd with band_sd, not a fixed 95% z")
+    case("BS30-32", r1_3)
+
+    def r1_6_7():
+        cost = {"id": "C", "target": 19.0, "band": [1, 105], "estimand": {"type": "cost_per_outcome"},
+                "estimand_type": "cost_per_outcome",
+                "published": {"lower": 1, "upper": 105, "level": 0.95, "scale": "currency_per_outcome",
+                              "table": "abstract", "unit": "USD per DALY averted"}}
+        ok(check_benchmark(cost) == [], "BS33 a published cost interval (currency per outcome) is recorded and derived")
+        ok(check_benchmark(dict(cost, published=dict(cost["published"], scale="ratio"))) != [],
+           "BS34 a ratio scale on a cost benchmark is refused")
+        ok(any("diagnostic" in x for x in check_benchmark({k: v for k, v in good.items() if k != "diagnostic"}))
+           and any("age_band" in x for x in check_benchmark({k: v for k, v in good.items() if k != "age_band"})),
+           "BS35 a published ratio states its diagnostic and age band ('mixed' or 'not reported' when so)")
+    case("BS33-35", r1_6_7)
+
+    def r1_2():
+        with tempfile.TemporaryDirectory() as d:
+            pk_ = dict(toy, benchmarks=toy["benchmarks"])
+            yaml.safe_dump(pk_, open(os.path.join(d, "pack.yaml"), "w"))
+            from toolkit.engines.contract import ToyEngine
+            res = BM.stamp(BM.run_pack(pk_, eng, BM.Runner(pk_, eng, 1), {}), eng)
+            ok(all(r.get("band_sha256") == band_digest(b) for r, b in zip(res["benchmarks"], pk_["benchmarks"])),
+               "BS36 results rows carry the digest of their band declaration")
+            rp = os.path.join(d, "results.yaml")
+            yaml.safe_dump(res, open(rp, "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+            ok(rows and why is None, f"BS37 results whose band declarations match the pack beside them are used ({why})")
+            new = dict(toy["benchmarks"][0], band=[0.35, 0.5], published=dict(toy["benchmarks"][0]["published"], lower=0.35))
+            pk2 = dict(pk_, benchmarks=[new])
+            yaml.safe_dump(pk2, open(os.path.join(d, "pack.yaml"), "w"))
+            rows, why = BM.verified_benchmarks(ToyEngine(results_path=rp))
+            ok(rows == [] and "T1" in str(why), f"BS38 results for another band declaration are refused ({why})")
+            try:
+                BM.merge_results(pk2, [res], eng)
+                ok(False, "BS39 merge refuses rows computed for another band declaration")
+            except ValueError as ex:
+                ok("T1" in str(ex), f"BS39 merge refuses rows computed for another band declaration ({ex})")
+            rs = BM.rescore_results(pk2, res, pk_, eng)
+            r0 = rs["benchmarks"][0]
+            ok(r0["band"] == [0.35, 0.5] and r0["band_sha256"] == band_digest(new) and "rescored_from" in r0
+               and r0["status"] == ("in_band" if 0.35 <= r0["computed"] <= 0.5 else "out_of_band"),
+               "BS40 rescore re-scores a stale row against the new band and marks it rescored")
+            try:
+                BM.rescore_results(pk2, res, pk2, eng)
+                ok(False, "BS41 rescore refuses a row not computed for the stated previous declaration")
+            except ValueError:
+                ok(True, "BS41 rescore refuses a row not computed for the stated previous declaration")
+        fd = {"band_declarations": band_declarations(toy, ["T1"])}
+        ok(fitted_problems(fd, toy) == [] and fitted_problems(fd, pk2) == ["refit required: T1"]
+           and fitted_problems({}, toy) == ["refit required: T1"],
+           "BS42 fitted values bound to their targets' declarations: a changed or missing digest is 'refit required'")
+        mf = yaml.safe_load(open(os.path.join(root, "malaria", "benchmarks", "fitted.yaml")))
+        ok(fitted_problems(mf, pk) == ["refit required: B10, B11, B12, B12b, B12m"],
+           f"BS43 the stored malaria fitted values report refit required: {fitted_problems(mf, pk)}")
+    case("BS36-43", r1_2)
+
+    def r1_2b():
+        from toolkit.analysis import batch as Bt
+
+        class Stale:
+            fitted_path = None
+
+            def parameters(self):
+                return []
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "fitted.yaml")
+            yaml.safe_dump({"parameters": {}, "band_declarations": {"T1": "old"}}, open(fp, "w"))
+            s = Stale()
+            s.fitted_path = fp
+            orig = EP.benchmark_pack
+            try:
+                EP.benchmark_pack = lambda e: (toy, "pack.yaml")
+                probs = engine_fitted_problems(s)
+                try:
+                    Bt.fitted_ranges(s)
+                    raised = False
+                except ValueError as ex:
+                    raised = "refit required: T1" in str(ex)
+            finally:
+                EP.benchmark_pack = orig
+        ok(probs == ["refit required: T1"] and raised,
+           "BS44 an engine whose fitted values are stale: every analysis read of them (fitted_ranges) is refused")
+        import inspect
+        from toolkit.analysis import run as RUNm
+        ok("engine_fitted_problems" in inspect.getsource(RUNm._run),
+           "BS45 the analysis entry blocks on stale fitted values before the joint calibration or the batch")
+    case("BS44-45", r1_2b)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
