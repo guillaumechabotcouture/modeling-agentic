@@ -78,6 +78,10 @@ class Analysis:
         self.joint = None
         self.flagged = {}
         self.last_events = []
+        # F6 S1-1b: with an enforced affordability rule, plans are solved within a reserve (fraction x budget); every
+        # re-optimisation (draws, stability, sensitivity) then compares like with like. `budget` stays the allocatable
+        # envelope that affordability is judged against.
+        self.plan_budget = None
 
     def set_joint(self, rep):
         """The joint calibration (toolkit/analysis/joint_calibration.py): its shared parameters move to the best point
@@ -150,7 +154,9 @@ class Analysis:
             raise AnalysisBlocked(where, hits)
 
     def solve(self, ben, cost, budget=None, feas=None):
-        r = aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp",
+        if budget is None:
+            budget = self.budget if self.plan_budget is None else self.plan_budget
+        r = aopt.solve(ben, cost, feas or self.feas, budget, method="ilp",
                        time_limit=120)
         if r["status"] != "optimal":
             raise RuntimeError(f"optimizer status {r['status']}")

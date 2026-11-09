@@ -81,6 +81,40 @@ def decision_rule(A, out, plan) -> list[dict]:
 
 
 
+def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> dict:
+    """F6 S1-1b: with `uncertainty.affordability.enforce`, the plan solved within a budget reserve. The uncertainty
+    step's draws are evaluated once (same Drawer, seed and number of draws), and toolkit/analysis/uncertainty.py
+    reserve_search bisects on the budget fraction for the largest one whose plan exceeds the allocatable budget in at
+    most max_share_over_budget of those draws. No fraction at or above the floor: AnalysisBlocked (fail closed).
+    Returns {solution, reserve (the point artifact's record), pre (the evaluated draws, for UQ.run)}."""
+    rule = A.spec["uncertainty"]["affordability"]
+    pre = UQ.evaluate_draws(A, draws, seed)
+    fl = UQ.RESERVE_FLOOR if floor is None else float(floor)
+    rs = UQ.reserve_search([r["cost"] for r in pre["rows"]], lambda b: A.solve(ben0, cost0, budget=b), A.budget,
+                           float(rule["max_share_over_budget"]), floor=fl)
+    st = rs["steps"]
+    if not rs["feasible"]:
+        raise AnalysisBlocked("affordability", [dict(s, kind="reserve_step") for s in st], reason=(
+            f"no plan solved at or above the floor of {fl:g} x the allocatable budget meets the affordability rule "
+            f"(at most {rule['max_share_over_budget']} of {pre['draws']} draws over budget): the plan at the floor is "
+            f"over in {st[-1]['draws_over_budget']} draws"))
+    u0, f = st[0], rs["fraction"]
+    obj_u, obj_a = float(sol0["objective"]), float(rs["solution"]["objective"])
+    sol = rs["solution"] if f < 1.0 else sol0
+    plan_cost = lambda s: float(sum(cost0[i][s["choice"][i]] for i in A.ids))  # noqa: E731
+    given = obj_u - obj_a if f < 1.0 else 0.0
+    reserve = {"rule": dict(rule), "outcome": A.primary, "fraction": f, "budget_allocatable": float(A.budget),
+               "budget_planned": f * float(A.budget), "reserve_usd": (1.0 - f) * float(A.budget),
+               "draws": pre["draws"], "seed": pre["seed"],
+               "unconstrained": {"objective": obj_u, "cost": plan_cost(sol0), "plan": dict(sol0["choice"]),
+                                 "draws_over_budget": u0["draws_over_budget"], "share_over_budget": u0["share_over_budget"]},
+               "affordable": {"objective": float(sol["objective"]), "cost": plan_cost(sol),
+                              "draws_over_budget": rs["draws_over_budget"], "share_over_budget": rs["share_over_budget"]},
+               "value_given_up": given, "value_given_up_pct": 100.0 * given / obj_u if obj_u > 0 else None,
+               "search": {k: rs[k] for k in ("tolerance", "floor", "max_solves", "solves", "converged", "steps")}}
+    return {"solution": sol, "reserve": reserve, "pre": pre}
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
@@ -254,8 +288,16 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     events0 = list(A.last_events)
     sol = A.solve(ben0, cost0)
+    reserve = pre = None
+    if (spec["uncertainty"].get("affordability") or {}).get("enforce"):
+        # F6 S1-1b: the headline plan is the one solved within the reserve that meets the affordability rule
+        ap = affordable_plan(A, ben0, cost0, sol, draws=draws)
+        sol, reserve, pre = ap["solution"], ap["reserve"], ap["pre"]
+        A.plan_budget = reserve["budget_planned"]
+        log(f"affordability: plan within {reserve['fraction']:.4f} of the budget ({reserve['reserve_usd']:,.0f} held "
+            f"back), {reserve['value_given_up_pct'] or 0:.2f}% of the objective given up")
     plan = sol["choice"]
-    A.guard("point plan", [plan], events0)   # Codex P1-6; every later evaluation is guarded too (r2 P1-3)
+    A.guard("point plan", [plan] + ([reserve["unconstrained"]["plan"]] if reserve else []), events0)  # Codex P1-6
     on_plan = []
     point = A.summary(plan, out0, cost0)
     from toolkit.engines.contract import engine_identity
@@ -274,11 +316,13 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                "z": z0[i], **({"calibration_flag": A.flagged[i]["reason"],
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
+    if reserve is not None:
+        point["reserve"] = reserve
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
-    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws)
+    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
