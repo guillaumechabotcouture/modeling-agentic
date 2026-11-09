@@ -90,13 +90,14 @@ dose only (Cairns 2022). smc_pe and smc_hi_frac are gone. Not byte-identical whe
 evidence is recomputed (validate_once.sh). Self-tests Q0-Q6 (selftest_late.py).
 
 v0.12 (F6 S2-2): case management as an implementable package (ENGINE_NOTES.md, v0.12), with the fixed parameter
-cm_target = 1. The add-on (`cm` component, effect cm_add) raises effective treatment only in ages [cm_age_lo_m,
-cm_age_hi_m) months (default 2-59 months, the iCCM age band), ramped in linearly over cm_ramp_years from the delivery
-start; severe-care access rises only by cm_severe_link x the add-on's realised gain (default 0: no source gives a
-value). Two cost drivers are added: cm_child_years (child-years in the targeted ages while the package's add-on runs,
-per person; charged even at cm_add 0) and treated_cm_ages (treated episodes in those ages, every arm). With cm_target
-0 (the default) a run is byte-identical to v0.11 (self-test C6; benchmarks/restamp_proof.py). Self-tests C0-C7
-(selftest_late.py).
+cm_target = 1. The add-on (`cm` component; cm_add, the gain inside the iCCM catchment, x cm_catchment_share) raises
+effective treatment only in ages [cm_age_lo_m, cm_age_hi_m) months (default 2-59 months, the iCCM age band), ramped in
+linearly over cm_ramp_years from the delivery start; severe-care access rises only by cm_severe_link x the add-on's
+realised gain (default 0: no source gives a value). Two conditional cost drivers (card outputs.cost_drivers_when):
+cm_child_years (child-years in the catchment, cm_catchment_share x the targeted ages, while the package's add-on runs,
+per person; charged even at cm_add 0; priced by CM_COST_ITEMS, Collins 2014's recurrent total) and treated_cm_ages
+(treated episodes in those ages, every arm). With cm_target 0 (the default) a run is byte-identical to v0.11
+(self-test C6; benchmarks/restamp_proof.py). Self-tests C0-C11 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -130,6 +131,16 @@ VERSION = "0.12"
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
 OO = "Oo et al. 2019 Malar J (PMC6683427)"
+# v0.12 (Codex r1 P2-3): the CM cost recipe. Collins et al. 2014 (Table 3) recurrent cost per child 2-59 months in the
+# catchment per year (2010-2012 US$; 2.07-10.26 across seven countries; central 5) is a total that already includes
+# medicines and supplies (3-26% of it), so it is charged on cm_child_years with no separate ACT / RDT item on the
+# same component; its `includes` make toolkit/alloc/costs.py refuse one (self-test C10). Start-up ($202-352 per CHW)
+# is a per_unit item the spec adds from its CHW count per unit.
+CM_COST_ITEMS = [
+    {"id": "cm_recurrent", "component": "cm", "value": 5.0, "price_year": 2012, "price_rule": "index",
+     "basis": "per_outcome", "outcome": "cm_child_years",
+     "includes": ["management", "supervision", "chw_recurrent", "medicines", "supplies"]},
+]
 # v0.11: SMC sources (ENGINE_NOTES.md, v0.11)
 MC20 = ("Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and "
         "quality in Burkina Faso, Chad, Nigeria, and Togo")
@@ -183,12 +194,17 @@ _PARAMS = [
      "Assumption (Codex r1 P2-5): the ratio of two 30-day clinical PEs is applied as a multiplier on the initial "
      "infection-blocking efficacy, with the same decay and clearance", "unverified"),
     # v0.12: the point value stays 0.15 (v0.11 outputs unchanged); a run sets its own value and range in the spec
-    ("cm_add", 0.15, "scenario", "probability", 0.0, 0.15, "enhanced CM: absolute gain in effective treatment, applied "
-     "to the whole unit in the targeted ages (cm_target 1). Within iCCM catchments, children 2-59 months: ACT among "
-     "confirmed cases +17 points, " + ORESANYA + "; appropriate treatment +33 points, " + ISIGUZO + "; home management "
-     "RR 1.89 (1.60-2.22) on appropriate treatment, " + OO + ". Unit-wide low / central / high 0.03 / 0.07 / 0.15 "
-     "(derived: the catchment gain x an assumed catchment share of 0.2-0.5); 0 is the no-effect scenario. v0.11 and "
-     "earlier: 0.15 for all ages, attempt 8 value, no source", "unverified"),
+    ("cm_add", 0.15, "scenario", "probability", 0.0, 0.40, "enhanced CM, absolute gain in effective treatment. With "
+     "cm_target 1 it is the gain inside the iCCM catchment, children 2-59 months (the unit-wide gain is cm_add x "
+     "cm_catchment_share): ACT among confirmed cases +17 points, " + ORESANYA + "; appropriate treatment of the three "
+     "iCCM illnesses +33 points, " + ISIGUZO + "; home management RR 1.89 (1.60-2.22) on appropriate treatment, " + OO
+     + "; range about +0.15 to +0.40; 0 is the no-effect scenario. v0.11 and cm_target 0: a unit-wide gain for all "
+     "ages, 0.15 (attempt 8 value, no source)", "unverified"),
+    ("cm_catchment_share", 0.3, "fixed", "share", 0.2, 0.5, "share of the unit's children 2-59 months inside the iCCM "
+     "catchment (cm_target 1). It scales the effect (unit-wide gain cm_add x share) and the children charged "
+     "(cm_child_years) alike, because Collins et al. 2014 J Glob Health (iCCM costing tool, Table 3) price per child "
+     "within catchments. Assumption: iCCM in Nigeria serves hard-to-reach communities 5 km or more from a facility "
+     "(" + ORESANYA + "); no unit-level data; 0.2-0.5 assumed", "unverified"),
     ("cm_target", 0.0, "fixed", "switch", None, None, "v0.12 model switch: 1 = the case-management package (targeted "
      "ages, ramp, severe-care link, its cost drivers); 0 = the v0.11 add-on (all ages, from the delivery start, "
      "severe-care access raised one for one), kept so earlier results reproduce exactly", "unverified"),
@@ -1050,7 +1066,7 @@ class MalariaEngine:
             # v0.12: per mean person in the delivery period, as treated_all: child-years in the targeted ages while the
             # package's add-on runs (the per-child cost), and treated episodes in those ages (commodities)
             den = max(dz.acc_cost["pdays_del"] / ndel, 1e-9)
-            cd["cm_child_years"] = float(dz.acc_cm[0] / 365.0 / den)
+            cd["cm_child_years"] = float(dz.acc_cm[0] * P["cm_catchment_share"] / 365.0 / den)   # in the catchment
             cd["treated_cm_ages"] = float(dz.acc_cm[1] / den)
         if capped is None:
             capped = bool(getattr(self, "_access_capped", False))
@@ -2682,7 +2698,7 @@ def _self_test_v012(ok, e, unit) -> None:
                  "basis": "per_outcome", "outcome": "treated_cm", "incremental": True,
                  "includes": ["medicines", "supplies"]}
         bad = C.validate(dict(spec, cost_items=spec["cost_items"] + [extra]))
-        ok(C.validate(spec) == [] and any("includes" in b or "overlap" in b for b in bad)
+        ok(C.validate(spec) == [] and any("double count" in b and "cm_act_rdt" in b for b in bad)
            and all(it["outcome"] == "cm_child_years" for it in CM_COST_ITEMS if it["basis"] == "per_outcome"),
            f"C10 the documented CM cost recipe (Collins 2014 recurrent total, medicines and supplies included) "
            f"validates, and a separate ACT/RDT charge on the same component is refused as a double count ({bad[:1]})")
@@ -2739,6 +2755,10 @@ def write_card(path: str) -> None:
     if os.path.exists(fp):
         f = yaml.safe_load(open(fp)) or {}
         card["fit_rule"] = f.get("fit_rule")
+    card["cm_cost_recipe"] = {"items": CM_COST_ITEMS, "range_per_child_year": [2.0, 5.0, 10.0],
+                              "source": "Collins et al. 2014 J Glob Health, iCCM costing tool, Table 3 (recurrent, "
+                                        "including medicines and supplies; per child 2-59 months within catchments)",
+                              "not_charged_separately": "ACT and RDT per treated episode (inside the recurrent total)"}
     yaml.safe_dump(card, open(path, "w"), sort_keys=False, width=110)
 
 

@@ -1003,11 +1003,16 @@ def _validate(s: Spec) -> list[str]:
     when = card.outputs.get("cost_drivers_when") or {}
     drivers = list(card.outputs.get("cost_drivers", []))
     drivers += [d for d in when if d not in drivers]
-    from toolkit.spec import engine_parameters as PV
-    run_vals = {n: (e or {}).get("value") for n, e in PV.declared(s).items() if isinstance(e, dict)}
-    defaults = {n: p.value for n, p in pnames.items()}
-    for k, m in (an.get("cost_outputs") or {}).items():
-        bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, run_vals, defaults)
+    if when:
+        try:
+            from toolkit.spec import priors as PRI
+            dr = {k: (q.lo, q.hi) for k, q in PRI.drawn(s).items()}
+        except Exception as ex:  # noqa: BLE001 -- fail closed: the draws cannot be read, so the domain is unknown
+            dr, bad = {}, bad + [f"analysis.cost_outputs: the drawn priors could not be read to check conditional "
+                                 f"cost drivers ({type(ex).__name__}: {ex})"]
+        dom = parameter_domain(r, {n: p.value for n, p in pnames.items()}, dr)
+        for k, m in (an.get("cost_outputs") or {}).items():
+            bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, dom)
     cost_outs = an.get("cost_outputs") or {}
     for it in opts.get("cost_items") or []:
         if it.get("basis") == "per_outcome" and it.get("outcome") not in cost_outs:
@@ -1068,20 +1073,45 @@ def labels_problems(raw: dict, labels: dict, pnames=None, card=None) -> list[str
     return bad
 
 
-def conditional_driver_problems(name, driver, when: dict, run_values: dict, defaults: dict) -> list[str]:
-    """F6 S2-2: a cost driver the engine card lists under outputs.cost_drivers_when ({driver: {parameter: value}}) is
-    produced only when each parameter has its stated value in the run (the spec's engine_parameters value, else the
-    engine default); mapping it otherwise is refused here rather than failing inside the analysis."""
+def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
+    """{parameter: [(where, [values])]}: every value the analysis can give an engine parameter: the point value (the
+    spec's engine_parameters value, else the engine default), a range (engine_parameters range, uncertainty.priors
+    range, or a drawn prior's (lo, hi) from `drawn`), and each parameter_value decision test's values."""
+    from toolkit.spec import engine_parameters as PV
+    ep = {n: e for n, e in ((raw or {}).get(PV.FIELD) or {}).items() if isinstance(e, dict)}
+    dom = {}
+    for n, v in defaults.items():
+        dom[n] = [("point value", [ep[n].get("value") if n in ep else v])]
+    for n, e in ep.items():
+        if e.get("range") is not None:
+            dom.setdefault(n, []).append((f"{PV.FIELD}.{n}.range", list(e["range"])))
+    for n, q in (((raw or {}).get("uncertainty") or {}).get("priors") or {}).items():
+        if isinstance(q, dict) and q.get("range") is not None:
+            dom.setdefault(n, []).append((f"uncertainty.priors.{n}.range", list(q["range"])))
+    for n, (lo, hi) in (drawn or {}).items():
+        dom.setdefault(n, []).append((f"the drawn prior on {n}", [lo, hi]))
+    for dt in ((raw or {}).get("analysis") or {}).get("decision_tests") or []:
+        if isinstance(dt, dict) and dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
+            dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
+    return dom
+
+
+def conditional_driver_problems(name, driver, when: dict, domain: dict) -> list[str]:
+    """F6 S2-2 (Codex r1 P2-1): a cost driver the engine card lists under outputs.cost_drivers_when
+    ({driver: {parameter: value}}) is produced only when each parameter has its stated value, so every value the
+    analysis can give it (parameter_domain: the point value, any range, every decision-test value) must equal that
+    value. A range is refused unless both ends equal it (a continuous range reaches fractional switches)."""
     out = []
     for p, v in ((when or {}).get(driver) or {}).items():
-        got = run_values.get(p, defaults.get(p))
-        try:
-            same = float(got) == float(v)
-        except (TypeError, ValueError):
-            same = False
-        if not same:
-            out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} is produced only when {p} = {v:g}; "
-                       f"this run has {p} = {got!r} (set it in engine_parameters)")
+        for where, vals in domain.get(p) or [("point value", [None])]:
+            try:
+                same = bool(vals) and all(float(x) == float(v) for x in vals)
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} is produced only when {p} = "
+                           f"{v:g}, but {where} gives {p} {vals!r}: set {p} to {v:g} in engine_parameters, with no "
+                           "range, prior or decision test that moves it")
     return out
 
 

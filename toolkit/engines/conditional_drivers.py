@@ -20,10 +20,56 @@ import os
 import sys
 
 if __package__:
-    from .contract import ToyEngine, UnitSpec, Package, Horizon, ParamSpec, EngineCard, Outcomes
+    from .contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes
 else:  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from toolkit.engines.contract import ToyEngine, UnitSpec, Package, Horizon, ParamSpec, EngineCard, Outcomes  # noqa: E402
+    from toolkit.engines.contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes  # noqa: E402
+
+
+def structure_problems(engine) -> list[str]:
+    """Problems with the card's outputs.cost_drivers_when (empty when absent)."""
+    out = engine.describe().outputs or {}
+    when = out.get("cost_drivers_when")
+    if when is None:
+        return []
+    if not isinstance(when, dict):
+        return ["outputs.cost_drivers_when: a mapping {driver: {parameter: value}}"]
+    names = {p.name for p in engine.parameters()}
+    plain = set(out.get("cost_drivers") or [])
+    bad = []
+    for d, pred in when.items():
+        w = f"outputs.cost_drivers_when.{d}"
+        if d in plain:
+            bad.append(f"{w}: also listed in outputs.cost_drivers (a driver is conditional or not)")
+        if not isinstance(pred, dict) or not pred:
+            bad.append(f"{w}: a non-empty mapping {{parameter: value}}")
+            continue
+        for p, v in pred.items():
+            if p not in names:
+                bad.append(f"{w}: {p!r} is not an engine parameter")
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                bad.append(f"{w}.{p}: {v!r} is not a finite number")
+    return bad
+
+
+def check(engine, unit, package, horizon, seed: int = 1) -> list[str]:
+    """The conditional-driver contract test (module doc). Returns a list of problems (empty = passes)."""
+    bad = structure_problems(engine)
+    if bad:
+        return bad
+    when = (engine.describe().outputs or {}).get("cost_drivers_when") or {}
+    groups = {}
+    for d, pred in when.items():
+        groups.setdefault(tuple(sorted((p, float(v)) for p, v in pred.items())), []).append(d)
+    for pred, drivers in groups.items():
+        o = engine.run(dict(pred), unit, package, horizon, seed)
+        for d in drivers:
+            v = o.cost_drivers.get(d)
+            if v is None:
+                bad.append(f"conditional cost driver {d} missing under {dict(pred)}")
+            elif isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                bad.append(f"conditional cost driver {d} = {v!r} under {dict(pred)} (must be finite)")
+    return bad
 
 
 def _self_test() -> int:

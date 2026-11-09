@@ -126,6 +126,8 @@ fixed:
   cm_age_hi_m: "programme design: the iCCM age band ends at 59 months (Oresanya 2019, Isiguzo 2019)"
   cm_ramp_years: "the card's range [2, 3] years is an assumption from the RAcE programme timing (endline about three
     years after the start), not a published estimate"
+  cm_catchment_share: "the card's range [0.2, 0.5] is an assumption (no unit-level data on the iCCM catchment); a run
+    sets its value and range through engine_parameters, and it scales the effect and the child-years charged alike"
   cm_severe_link: "no published estimate of the share of an iCCM gain that reaches severe-care access; default 0. A run
     whose plan depends on the add-on gives it a range through engine_parameters, so the draws vary it"
 settings: [n_agents, net_holes, burnin_years, init_eir_per_m0]   # v0.5: numerical settings of the start
