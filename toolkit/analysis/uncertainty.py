@@ -251,6 +251,11 @@ def reserve_search(draw_costs, solve, budget: float, max_share: float, tol: floa
                 floor_met=floor_met, converged=conv, solves=len(steps), steps=steps)
 
 
+def _acosts():
+    from toolkit.alloc import costs
+    return costs
+
+
 def _n_seed(A, draws=None, seed=None):
     sp = A.spec["uncertainty"]
     return int(draws if draws is not None else sp.get("draws", 32)), seed if seed is not None else sp.get("seed", 42)
@@ -265,7 +270,7 @@ def _draw_rows(A, D, nd):
         clamped = list(D.last_clamped)
         out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
         yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
-               "events": list(A.last_events)}
+               "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
 
 
 def evaluate_draws(A, draws=None, seed=None) -> dict:
@@ -296,12 +301,14 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None) -> dict:
     comps_used, outs, samples = set(), [], {}
     corr_any = corr_plan = 0
     clamped_draws = []
+    floors = []          # F6 S1-3: each draw's floored per-outcome increments (also from precomputed draws)
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
     for d, r in enumerate(rows):
         sampled, out, ben, cost = r["sampled"], r["out"], r["ben"], r["cost"]
         if r["clamped"]:
             clamped_draws.append({"draw": d, "units": len(r["clamped"]), "examples": r["clamped"][:5]})
         corr_any += bool(r["events"])
+        floors.append(r["floors"])
         row = {}
         for o in A.outcomes:
             v = sum(out[i]["y"][A.comp][o] - out[i]["y"][plan[i]][o] for i in A.ids)
@@ -374,6 +381,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None) -> dict:
             "model_corrections": {"draws_with_corrections": corr_any, "draws_with_corrections_on_plan": 0},
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
             "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
+            "cost_floors": _acosts().draw_floor_summary(floors),
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
         data["budget_planned"] = float(A.plan_budget)
