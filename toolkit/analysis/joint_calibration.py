@@ -21,11 +21,16 @@ The spec field (signed with the spec; without it nothing changes):
         seed, waves, points_per_unit, shared_points   # optional; defaults in toolkit/calibration/thresholds.yaml
         targets:
           - {id, kind: unit, column, window: [a, b], metric, scale, sd | sd_column | ci_columns: [lo, hi] |
-             n_column, bias_sd, discrepancy_sd, source}
+             n_column, bias_sd, bias_by, discrepancy_sd, source}
+             # bias_by: a units column (e.g. the region); bias_sd is then one offset per source and group, shared
+             # by the group's units, not each unit's own error (F6 S2-3)
           - {id, kind: group, csv, filter: {col: value}, key: {csv: col, units: col}, value, multiplier,
              ci: [lo_col, hi_col], ci_level, weights: <units column>, window, metric, scale, bias_sd, discrepancy_sd,
              source}
           - {id: <benchmark id>, kind: benchmark, discrepancy_sd}   # a fit target of the engine's own pack only
+        change:                       # optional: the change between two unit targets (surveys) by group, observed
+          - {id, from: <unit target id>, to: <unit target id>, by: <units column>, weights: <units column>,
+             mode: block | flag, reason}   # against the engine at the best point; a wrong sign blocks unless flagged
 
 A benchmark the engine's pack holds out (every id not in toolkit/engines/benchmark.py fit_targets) is refused: it
 never enters the fit (the PR #140 rule). Unit and group targets are simulated with the comparator package through
@@ -107,7 +112,8 @@ def spec_problems(spec) -> list[str]:
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
-                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity"})
+                           "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
+                           "change"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
     sh = j.get("shared")
@@ -215,6 +221,13 @@ def spec_problems(spec) -> list[str]:
         for q in ("bias_sd", "sd"):
             if q in t and not (_isnum(t[q]) and t[q] >= 0):
                 bad.append(f"{tw}.{q}: a number >= 0")
+        if "bias_by" in t:          # F6 S2-3: one offset per source and group, shared by the group's units
+            if k != "unit":
+                bad.append(f"{tw}.bias_by: for unit targets (a group target's bias is its own)")
+            elif t["bias_by"] not in cols:
+                bad.append(f"{tw}.bias_by: no units column {t['bias_by']!r}")
+            if not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
+                bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset)")
         if k == "unit":
             c = t.get("column", cal.get("target_column"))
             if c not in cols:
@@ -238,6 +251,39 @@ def spec_problems(spec) -> list[str]:
                 bad.append(f"{tw}: ci: [lo, hi] columns of the table, or sd")
     if len(set(ids)) != len(ids):
         bad.append(f"{w}.targets: repeated ids")
+    return bad + _change_problems(j.get("change"), tg, cols, raw["decision_units"].get("region"), w)
+
+
+def _change_problems(ch, targets, cols, region, w) -> list:
+    """calibration.joint.change (F6 S2-3): [{id, from, to, by, weights, mode, reason}], the change between two unit
+    targets (two surveys) by group: by a units column (default decision_units.region), weighted by a units column or
+    equally. A wrong sign blocks, unless declared: mode flag with a reason."""
+    if ch is None:
+        return []
+    ww = f"{w}.change"
+    if not isinstance(ch, list):
+        return [f"{ww}: a list of {{id, from, to, by, weights, mode, reason}}"]
+    units_t = {t.get("id"): t for t in targets if isinstance(t, dict) and t.get("kind") == "unit"}
+    bad = []
+    for n, c in enumerate(ch):
+        cw = f"{ww}[{n}]"
+        if not (isinstance(c, dict) and _text(c.get("id"))):
+            bad.append(f"{cw}: {{id, from, to, by, weights, mode, reason}}")
+            continue
+        unk = sorted(set(c) - {"id", "from", "to", "by", "weights", "mode", "reason"})
+        if unk:
+            bad.append(f"{cw}: unknown keys {unk}")
+        a, b = units_t.get(c.get("from")), units_t.get(c.get("to"))
+        if not (a and b and c["from"] != c["to"] and a.get("scale", "logit") == b.get("scale", "logit")):
+            bad.append(f"{cw}: from and to name two unit targets on one scale")
+        if c.get("by", region) not in cols:
+            bad.append(f"{cw}.by: no units column {c.get('by', region)!r} (default decision_units.region)")
+        if "weights" in c and c["weights"] not in cols:
+            bad.append(f"{cw}.weights: no units column {c['weights']!r}")
+        if c.get("mode", "block") not in ("block", "flag"):
+            bad.append(f"{cw}.mode: block or flag")
+        if c.get("mode") == "flag" and not _text(c.get("reason")):
+            bad.append(f"{cw}.reason: a declared change (mode flag) needs its reason")
     return bad
 
 
@@ -505,7 +551,8 @@ def build(spec, units=None) -> tuple:
                 v = float(rows[i][col])
                 targets.append(HM.Target(f"{t['id']}:{i}", "unit", _observable(t, wins), v, sc,
                                          sd_obs=_unit_sd(t, rows[i], sc, v), sd_bias=float(t.get("bias_sd", 0.0)),
-                                         sd_md=md, unit=i, source=t["source"]))
+                                         sd_md=md, unit=i, source=t["source"],
+                                         bias_key=f"{t['id']}|{rows[i][t['bias_by']]}" if t.get("bias_by") else None))
         elif t["kind"] == "group":
             sc = t.get("scale", "logit")
             mult = float(t.get("multiplier", 1.0))
@@ -553,9 +600,13 @@ def build(spec, units=None) -> tuple:
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
           "scale": cal.get("scale", "log")}
     reg = spec.raw["decision_units"].get("region")
+    changes = [{"id": c["id"], "pairs": {i: (f"{c['from']}:{i}", f"{c['to']}:{i}") for i in ids},
+                "groups": {i: str(rows[i][c.get("by", reg)]) for i in ids},
+                "weights": {i: float(rows[i][c["weights"]]) for i in ids} if c.get("weights") else None,
+                "mode": c.get("mode", "block"), "reason": c.get("reason", "")} for c in j.get("change") or []]
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
-                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None)
+                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None, changes=changes)
     rec = [_observable(r, wins) for r in j.get("record") or []]
     return P, {"windows": wins, "dropped": dropped, "units": ids, "record": rec}
 
@@ -979,6 +1030,12 @@ def summary(rep) -> str:
                  f"(contraction95 {i95.get('contraction95')})")
     if rep["unmatched"] or rep["conflicting"]:
         L.append(f"  unmatched {len(rep['unmatched'])}, conflicting {len(rep['conflicting'])}")
+    for c in rep.get("change") or []:
+        n = {}
+        for g in c["groups"]:
+            n[g["status"]] = n.get(g["status"], 0) + 1
+        L.append(f"  change {c['id']} by group ({c['mode']}): {n}" + (f"; wrong sign in {[f['group'] for f in c['findings']]}"
+                                                                      if c["findings"] else ""))
     for b in rep["blocks"]:
         L.append(f"  block: {b['code']}")
     for s in rep.get("sensitivity") or []:

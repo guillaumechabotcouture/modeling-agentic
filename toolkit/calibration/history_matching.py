@@ -12,6 +12,10 @@ The problem (disease-agnostic; the harness adapter toolkit/analysis/joint_calibr
                shared  an observed value that depends on the shared parameters only (e.g. a fit benchmark)
 Every target carries a measurement model: sampling variance from its own interval or sample size, a source bias
 variance and a model discrepancy variance. No source is ground truth: a target whose total sd is zero is refused.
+A source bias shared by the units of a group (bias_key: one block per source and group) is one latent offset per
+block, profiled like a unit parameter, not added to each target's variance (F6 S2-3; see _bias_witness). The best
+point weights each group of units once. Declared changes between two surveys are compared by group, observed against
+the engine at the best point (_change).
 
 Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
 implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
@@ -188,10 +192,11 @@ class Param:
 
 class Target:
     """One observed value with its measurement model. `value` is on the natural scale; sd_obs, sd_bias and sd_md are
-    on the target's `scale`."""
+    on the target's `scale`. `bias_key` (unit targets): the block whose one offset (sd sd_bias) every target of the
+    block shares, for example one survey in one group of units (F6 S2-3); without it sd_bias is the target's own."""
 
     def __init__(self, id, kind, observable, value, scale="identity", sd_obs=0.0, sd_bias=0.0, sd_md=0.0,
-                 unit=None, weights=None, source="", depends_on=None):
+                 unit=None, weights=None, source="", depends_on=None, bias_key=None):
         self.id, self.kind, self.observable = str(id), str(kind), str(observable)
         self.value, self.scale = float(value), str(scale)
         self.sd_obs, self.sd_bias, self.sd_md = float(sd_obs), float(sd_bias), float(sd_md)
@@ -201,6 +206,7 @@ class Target:
         # a shared target's declared dependence: the shared parameters its setting uses (None: all of them). The
         # simulation still sets every shared value; only the emulator's inputs are restricted.
         self.depends_on = None if depends_on is None else [str(x) for x in depends_on]
+        self.bias_key = None if bias_key is None else str(bias_key)
 
     @property
     def y(self) -> float:
@@ -210,6 +216,11 @@ class Target:
     def var(self) -> float:
         return self.sd_obs ** 2 + self.sd_bias ** 2 + self.sd_md ** 2
 
+    @property
+    def var_fit(self) -> float:
+        """The variance the target is judged with: a shared offset (bias_key) is profiled, not added."""
+        return self.var - (self.sd_bias ** 2 if self.bias_key is not None else 0.0)
+
     def describe(self) -> dict:
         d = {"id": self.id, "kind": self.kind, "observable": self.observable, "value": self.value,
              "scale": self.scale, "sd_obs": self.sd_obs, "sd_bias": self.sd_bias, "sd_md": self.sd_md,
@@ -218,21 +229,27 @@ class Target:
             d["unit"] = self.unit
         if self.weights is not None:
             d["n_units"] = len(self.weights)
+        if self.bias_key is not None:
+            d["bias_key"] = self.bias_key
         return d
 
 
 class Problem:
     """shared: [Param]; unit_param: {name, lo, hi} or None; units: [ids]; features: {unit: [floats]} (each unit the
-    same length; may be empty); targets: [Target]; scales: {observable: scale}."""
+    same length; may be empty); targets: [Target]; scales: {observable: scale}. groups: a label per unit (figures and
+    the best point's weights). changes (F6 S2-3): [{id, pairs: {unit: (from target id, to target id)}, groups: {unit:
+    label}, weights: {unit: w} or None, mode: block | flag, reason}], the change between two surveys by group."""
 
-    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None):
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None,
+                 changes=None):
         self.shared = list(shared)
         self.unit_param = dict(unit_param) if unit_param else None
         self.units = [str(u) for u in units]
         self.targets = list(targets)
         self.features = {str(k): [float(x) for x in v] for k, v in (features or {}).items()}
         self.feature_names = list(feature_names or [])
-        self.groups = {str(k): str(v) for k, v in (groups or {}).items()}      # a label per unit, figures only
+        self.groups = {str(k): str(v) for k, v in (groups or {}).items()}      # a label per unit
+        self.changes = list(changes or [])
         self.scales = {}
         for t in self.targets:
             self.scales.setdefault(t.observable, t.scale)
@@ -249,9 +266,75 @@ class Problem:
         want = ("unit", "group") if kind == "unit" else ("shared",)
         return sorted({t.observable for t in self.targets if t.kind in want})
 
+    def bias_components(self) -> list:
+        """[(blocks, units)]: bias blocks linked through units with targets in several of them, profiled jointly."""
+        parent = {}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        keys = {u: sorted({t.bias_key for t in self.unit_targets(u) if t.bias_key is not None}) for u in self.units}
+        for ks in keys.values():
+            for k in ks:
+                parent.setdefault(k, k)
+            for k in ks[1:]:
+                parent[find(k)] = find(ks[0])
+        comps = {}
+        for u, ks in keys.items():
+            if ks:
+                c = comps.setdefault(find(ks[0]), (set(), []))
+                c[0].update(ks)
+                c[1].append(u)
+        return [(sorted(b), us) for b, us in comps.values()]
+
+    def _bias_problems(self, mx) -> list:
+        bad, sds = [], {}
+        for t in self.targets:
+            if t.bias_key is None:
+                continue
+            if t.kind != "unit":
+                bad.append(f"target {t.id}: bias_key is for unit targets (one offset shared by a group's units)")
+            elif not (math.isfinite(t.sd_bias) and t.sd_bias > 0):
+                bad.append(f"target {t.id}: bias block {t.bias_key} needs sd_bias > 0")
+            else:
+                sds.setdefault(t.bias_key, set()).add(round(t.sd_bias, 12))
+        bad += [f"bias block {k}: one sd_bias for every target of the block ({sorted(v)})" for k, v in sds.items()
+                if len(v) > 1]
+        for blocks, us in self.bias_components():
+            if len(blocks) > mx:
+                bad.append(f"bias blocks {blocks[:4]}: {len(blocks)} blocks linked through units {us[:3]} would be "
+                           f"profiled jointly; at most bias_blocks_max {mx}")
+        return bad
+
+    def _change_problems(self) -> list:
+        bad, ids = [], {t.id: t for t in self.targets}
+        for n, c in enumerate(self.changes):
+            w = f"change {c.get('id', n) if isinstance(c, dict) else n}"
+            if not (isinstance(c, dict) and isinstance(c.get("pairs"), dict) and c["pairs"]):
+                bad.append(f"{w}: {{id, pairs: {{unit: (from target, to target)}}, groups, weights, mode, reason}}")
+                continue
+            gs, wt = c.get("groups") or {}, c.get("weights")
+            for u, ab in c["pairs"].items():
+                ta, tb = (ids.get(x) for x in ab) if isinstance(ab, (list, tuple)) and len(ab) == 2 else (None, None)
+                if not (ta and tb and ta.kind == tb.kind == "unit" and ta.unit == tb.unit == u and ta.scale == tb.scale
+                        and ta.id != tb.id):
+                    bad.append(f"{w}: unit {u}: needs two different unit targets of the unit on one scale ({ab!r})")
+                if not str(gs.get(u, "")).strip():
+                    bad.append(f"{w}: unit {u} has no group")
+                if wt is not None and not (isinstance(wt.get(u), (int, float)) and math.isfinite(wt[u]) and wt[u] > 0):
+                    bad.append(f"{w}: unit {u}: a weight > 0")
+            if c.get("mode", "block") not in ("block", "flag"):
+                bad.append(f"{w}: mode block or flag")
+            if c.get("mode") == "flag" and not str(c.get("reason") or "").strip():
+                bad.append(f"{w}: a declared change (mode flag) needs its reason")
+        return bad
+
     def problems(self) -> list:
         bad = []
         th = thresholds()["history_matching"]
+        bad += self._bias_problems(int(th["bias_blocks_max"])) + self._change_problems()
         for p in self.shared:
             bad += p.problems()
         if len(set(self.names)) != len(self.names):
@@ -565,6 +648,9 @@ class HistoryMatch:
         self.vth = th["verification"]
         self.bth = th["blocking"]
         self.cut = float(self.th["implausibility_cutoff"])
+        if self.th.get("best_point_weighting", "per_group") not in ("per_group", "per_unit"):
+            raise CalibrationInputError([f"best_point_weighting {self.th['best_point_weighting']!r}: per_group or "
+                                         "per_unit"])
         self.G = int(self.th["z_grid"])
         self.zg = np.linspace(0.0, 1.0, self.G) if problem.unit_param else np.zeros(1)
         self.p = len(problem.shared)
@@ -580,6 +666,13 @@ class HistoryMatch:
         self.top_up = top_up
         self.uobs = problem.observables("unit")
         self.sobs = problem.observables("shared")
+        # F6 S2-3: shared offsets, profiled on a grid in sd units over +-cutoff (half a step allowed as slack)
+        self.bcomp = problem.bias_components()
+        self.bsd = {t.bias_key: t.sd_bias for t in problem.targets if t.kind == "unit" and t.bias_key is not None}
+        nb = int(self.th["bias_grid"])
+        self.bgrid = np.linspace(-self.cut, self.cut, nb)
+        self.bstep = 2 * self.cut / max(nb - 1, 1)
+        self.tid = {t.id: t for t in problem.targets}
         mp = int(self.eth["min_points_per_unit"])
         if problem.units and int(self.th["points_per_unit"]) < mp:     # Codex r1 P2-15
             raise CalibrationInputError([f"points_per_unit {self.th['points_per_unit']} is below the emulator's "
@@ -803,13 +896,14 @@ class HistoryMatch:
         need_g = {u for t in P.targets if t.kind == "group" for u in t.weights}
         S = np.tile(self.zg, N)
         T = np.repeat(C, G, axis=0)
+        bias, alone = self._bias_witness(em, C, S, T) if self.bcomp else ({}, {})
         for u in P.units:
             I = np.zeros(N * G)
             sign = np.zeros(N * G)
             tg = P.unit_targets(u)
             for t in tg:
                 m, v = em["unit"][t.observable].predict(u, S, T, noise=bool(self.th["include_run_noise"]))
-                it = np.abs(m - t.y) / np.sqrt(v + t.var)
+                it = self._impl(t, m, v, np.repeat(bias[t.bias_key], G) if t.bias_key is not None else None)
                 big = it > I
                 sign = np.where(big, np.sign(m - t.y), sign)
                 I = np.maximum(I, it)
@@ -817,6 +911,8 @@ class HistoryMatch:
             g = I.argmin(1)
             ok_ = I <= self.cut
             rec = {"I": I, "ok": ok_, "m": I[np.arange(N), g], "g": g, "sign": sign[np.arange(N), g]}
+            if u in alone:
+                rec["alone"] = alone[u]
             if u in need_g:
                 rec.update(self._group_profile(em, u, S, T, ok_, g, C, gobs))
             units[u] = rec
@@ -827,7 +923,60 @@ class HistoryMatch:
                 shared[t.id] = {"I": np.abs(m - t.y) / np.sqrt(v + t.var), "mean": m}
         if gobs:
             shared.update(self._group_witness(units, N))
-        return {"C": C, "units": units, "targets": shared}
+        return {"C": C, "units": units, "targets": shared, "bias": bias}
+
+    # ---------------------------------------------------------------- shared offsets (F6 S2-3)
+    # A survey's error is partly shared by the units of a group (the same design, fieldwork and model of the small-area
+    # surface): y_ut = f_ut + b_k + e_ut, with b_k ~ N(0, sd_bias^2) one offset per block k (source x group) and e_ut
+    # independent (sampling, discrepancy). Adding sd_bias^2 to every target's own variance instead lets each unit use
+    # its own offset, so a group's units pull on one survey anchor as if independent, and within-group contrasts that
+    # identify shared parameters are lost. Here b_k is a nuisance parameter profiled like the unit parameter: a
+    # candidate is compatible with a block's units when one offset with |b| / sd_bias <= cutoff leaves every unit of
+    # the block matchable by its own parameter (Vernon et al. 2010 treat structured discrepancy the same way: a term
+    # with a prior inside the implausibility). The witness offset is the most probable such value (smallest |b| / sd);
+    # when none exists, the value matching the most units, so the rest are reported as conflicting.
+    def _impl(self, t, m, v, b=None):
+        """|m - (y - b)| / sd: with an offset b, less half the offset grid's step (never stricter than a continuous b)."""
+        if b is None or t.bias_key is None:
+            return np.abs(m - t.y) / np.sqrt(v + t.var_fit)
+        return np.maximum(np.abs(m - t.y + b) - 0.5 * self.bstep * t.sd_bias, 0.0) / np.sqrt(v + t.var_fit)
+
+    def _bias_witness(self, em, C, S, T):
+        """({block: offset per candidate}, {unit: matchable at some offset, per candidate})."""
+        N, G, nb, cut = len(C), len(self.zg), len(self.bgrid), self.cut
+        noise = bool(self.th["include_run_noise"])
+        offs, alone = {}, {}
+        for blocks, us in self.bcomp:
+            k = len(blocks)
+            shape = (N,) + (nb,) * k
+            F, cnt = np.ones(shape, bool), np.zeros(shape, np.int32)
+            for u in us:
+                ind = np.ones((N, G), bool)
+                O = [np.ones((N, G, 1), bool) for _ in blocks]
+                for t in self.P.unit_targets(u):
+                    m, v = em["unit"][t.observable].predict(u, S, T, noise=noise)
+                    m, sd = m.reshape(N, G), np.sqrt(v.reshape(N, G) + t.var_fit)
+                    if t.bias_key is None:
+                        ind &= np.abs(m - t.y) <= cut * sd
+                        continue
+                    j = blocks.index(t.bias_key)
+                    b = self.bgrid * t.sd_bias
+                    O[j] = O[j] & (np.abs(m[..., None] - t.y + b) - 0.5 * self.bstep * t.sd_bias <= cut * sd[..., None])
+                O[0] = O[0] & ind[..., None]
+                if k == 1:
+                    A = O[0].any(1)
+                else:      # some z matches every target: an OR over the z grid of the blocks' joint feasibility
+                    A = np.matmul(O[0].transpose(0, 2, 1).astype(np.float32), O[1].astype(np.float32)) > 0.5
+                A = np.broadcast_to(A, shape)
+                F &= A
+                cnt += A
+                alone[u] = A.reshape(N, -1).any(1)
+            D = sum(np.expand_dims(self.bgrid ** 2, [i for i in range(k) if i != j]) for j in range(k))
+            key = cnt * (k * cut ** 2 + 1.0) - D[None]
+            sub = np.unravel_index(key.reshape(N, -1).argmax(1), (nb,) * k)
+            for j, bk in enumerate(blocks):
+                offs[bk] = self.bgrid[sub[j]] * self.bsd[bk]
+        return offs, alone
 
     # ---------------------------------------------------------------- group targets (Codex r1 P1-1)
     # A group target constrains its units' parameters jointly. For each candidate, each member unit's non-implausible
@@ -927,10 +1076,11 @@ class HistoryMatch:
     def _merge(self, a, b):
         if a is None:
             return b
-        out = {"C": np.vstack([a["C"], b["C"]]), "units": {}, "targets": {}}
+        out = {"C": np.vstack([a["C"], b["C"]]), "units": {}, "targets": {},
+               "bias": {k: np.concatenate([v, b["bias"][k]]) for k, v in a["bias"].items()}}
         for u in a["units"]:
             x, y = a["units"][u], b["units"][u]
-            r = {k: np.concatenate([x[k], y[k]]) for k in ("I", "ok", "m", "g", "sign")}
+            r = {k: np.concatenate([x[k], y[k]]) for k in ("I", "ok", "m", "g", "sign", "alone") if k in x}
             if "sel" in x:
                 r["sel"] = np.concatenate([x["sel"], y["sel"]], axis=1)
                 r["gc"] = {ob: tuple(np.concatenate([x["gc"][ob][i], y["gc"][ob][i]], axis=1) for i in (0, 1, 2))
@@ -955,7 +1105,9 @@ class HistoryMatch:
         matchable = [u for u in self.P.units if (um[u] & okT).any()]
         # Codex r1 P2-6: a unit its own targets can match somewhere, but never where the shared and group targets
         # hold, is not unreachable: it conflicts with those targets (reported apart, blocks the same way)
-        unmatchable = [u for u in self.P.units if not um[u].any()]
+        # a unit in a bias block is unmatchable only when no offset in its prior matches it (alone); matchable at some
+        # offset but never at its block's witness, it conflicts with the other units of its block
+        unmatchable = [u for u in self.P.units if not st["units"][u].get("alone", um[u]).any()]
         shared_conflict = [u for u in self.P.units if u not in matchable and u not in unmatchable]
         if matchable:
             nbad = np.sum([~um[u] for u in matchable], axis=0)
@@ -970,9 +1122,15 @@ class HistoryMatch:
             conflicting = sorted({u for u in matchable if not um[u][region].any()}, key=str)
             if not conflicting:      # different candidates miss different units: every unit missed somewhere
                 conflicting = sorted({u for u in matchable if (~um[u][region]).any()}, key=str)
-        # Codex r5 P1-2: units no value matches do not steer the choice of the best shared point
-        score = sum(st["units"][u]["m"] ** 2 for u in self.P.units if u not in unmatchable) \
-            if [u for u in self.P.units if u not in unmatchable] else np.zeros(N)
+        # Codex r5 P1-2: units no value matches do not steer the choice of the best shared point. F6 S2-3: each group
+        # of units counts once (its units' mean), so a large group does not outweigh small ones by repetition: a
+        # model discrepancy shared within a group (one survey, one climate) makes its units' misfits far from
+        # independent, and per-group weights are the limit of full within-group correlation. Each block's offset
+        # enters once, as its own prior term (b / sd)^2.
+        keep = [u for u in self.P.units if u not in unmatchable]
+        wts = self._unit_weights(keep)
+        score = sum(wts[u] * st["units"][u]["m"] ** 2 for u in keep) if keep else np.zeros(N)
+        score = score + sum((v / self.bsd[k]) ** 2 for k, v in st["bias"].items()) if st.get("bias") else score
         score = score + sum(v["I"] ** 2 for v in st["targets"].values()) if st["targets"] else score
         acc = okT & (nbad == 0)
         share = None
@@ -982,6 +1140,17 @@ class HistoryMatch:
         return {"region": region, "relaxed": relaxed, "matchable": matchable, "unmatchable": unmatchable,
                 "shared_conflict": shared_conflict, "conflicting": conflicting, "okT": okT, "score": score,
                 "share_of_prior": share, "n_sobol": n_sobol}
+
+    def _unit_weights(self, units) -> dict:
+        """{unit: weight in the best point's score}: 1 / (units of its group) with best_point_weighting per_group and
+        group labels; 1 per unit otherwise (a unit without a label is its own group)."""
+        if self.th.get("best_point_weighting", "per_group") != "per_group" or not self.P.groups:
+            return {u: 1.0 for u in units}
+        n = {}
+        for u in units:
+            g = self.P.groups.get(u) or f"\0{u}"
+            n[g] = n.get(g, 0) + 1
+        return {u: 1.0 / n[self.P.groups.get(u) or f"\0{u}"] for u in units}
 
     def _region(self, em):
         n0 = 2 ** int(self.th["candidates_log2"]) if self.p else 1
@@ -1274,6 +1443,8 @@ class HistoryMatch:
         srows = self._run("shared", srows)
         out = {"units": {}, "targets": {}}
         byu = {}
+        b_at = self._verify_offsets(urows)
+        out["bias"] = b_at
         for u in self.P.units:
             best = None
             for r in (x for x in urows if x["unit"] == u):
@@ -1281,7 +1452,7 @@ class HistoryMatch:
                 for tg in self.P.unit_targets(u):
                     noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
                     y = float(tr(r["obs"][tg.observable], tg.scale))
-                    i = abs(y - tg.y) / math.sqrt(noise + tg.var)
+                    i = float(self._impl(tg, y, noise, b_at.get(tg.bias_key)))
                     worst = max(worst, i)
                     rows.append({"target": tg.id, "simulated": r["obs"][tg.observable], "implausibility": round(i, 4)})
                 if best is None or worst < best[0]:
@@ -1308,6 +1479,87 @@ class HistoryMatch:
                 i = abs(float(tr(v, tg.scale)) - tg.y) / math.sqrt(noise + tg.var)
                 out["targets"][tg.id] = {"simulated": v, "implausibility": round(i, 4), "ok": i <= self.cut}
         return out
+
+    def _verify_offsets(self, urows) -> dict:
+        """{block: offset} re-profiled on the engine's runs at the best point, as the unit parameter is: per component,
+        the grid offsets leaving the fewest units unmatched (each unit at its best run), then the smallest worst
+        implausibility, then the smallest |b| / sd."""
+        out = {}
+        for blocks, us in self.bcomp:
+            k = len(blocks)
+            combos = np.array(np.meshgrid(*[self.bgrid] * k, indexing="ij")).reshape(k, -1).T
+            W = []
+            for u in us:
+                best = np.full(len(combos), np.inf)
+                for r in (x for x in urows if x["unit"] == u):
+                    w = np.zeros(len(combos))
+                    for tg in self.P.unit_targets(u):
+                        noise = self.em["unit"][tg.observable].tn if self.th["include_run_noise"] else 0.0
+                        b = None if tg.bias_key is None else combos[:, blocks.index(tg.bias_key)] * tg.sd_bias
+                        w = np.maximum(w, self._impl(tg, float(tr(r["obs"][tg.observable], tg.scale)), noise, b))
+                    best = np.minimum(best, w)
+                W.append(best)
+            W = np.array(W)
+            i = int(np.lexsort(((combos ** 2).sum(1), W.max(0), (W > self.cut).sum(0)))[0])
+            out.update({bk: float(combos[i, j] * self.bsd[bk]) for j, bk in enumerate(blocks)})
+        return out
+
+    def _change(self, ver) -> tuple:
+        """F6 S2-3: ([per declared change: the change between its two surveys by group], blocks). Observed: the
+        weighted mean over the group's units of (to - from) on the targets' scale; its sd from each target's sampling
+        sd and the shared offsets of the two sources (one per block, which do not average out). Modelled: the same
+        from the engine's verification runs at the best point; its sd from the emulators' run noise. Statuses:
+        no_clear_change, consistent, wrong_sign (the data show a direction and the model goes the other way beyond
+        noise), not_judged (no verification run). A wrong sign blocks unless declared (mode flag, with its reason);
+        not_judged always blocks (fail closed)."""
+        zc = float(thresholds()["change"]["sign_z"])
+        out, blocks = [], []
+        for c in self.P.changes:
+            byg = {}
+            for u in c["pairs"]:
+                byg.setdefault(str(c["groups"][u]), []).append(u)
+            rows, finds, nj = [], [], []
+            for g, us in sorted(byg.items()):
+                if not ver or any(u not in ver["units"] for u in us):
+                    nj.append(g)
+                    rows.append({"group": g, "units": len(us), "status": "not_judged"})
+                    continue
+                w = np.array([float(c["weights"][u]) if c.get("weights") else 1.0 for u in us])
+                w = w / w.sum()
+                obs, mod, v_obs, v_mod, blk = 0.0, 0.0, 0.0, 0.0, {}
+                for wi, u in zip(w, us):
+                    a, b = (self.tid[x] for x in c["pairs"][u])
+                    sim = {x["target"]: x["simulated"] for x in ver["units"][u]["targets"]}
+                    obs += wi * (b.y - a.y)
+                    mod += wi * float(tr(sim[b.id], b.scale) - tr(sim[a.id], a.scale))
+                    v_obs += wi ** 2 * (a.sd_obs ** 2 + b.sd_obs ** 2)
+                    for t in (a, b):
+                        if t.bias_key is None:
+                            v_obs += wi ** 2 * t.sd_bias ** 2
+                        else:
+                            blk[t.bias_key] = blk.get(t.bias_key, 0.0) + wi
+                        if self.th["include_run_noise"]:
+                            v_mod += wi ** 2 * self.em["unit"][t.observable].tn
+                v_obs += sum(s ** 2 * self.bsd[k] ** 2 for k, s in blk.items())
+                obs, mod = float(obs), float(mod)
+                so, sm = math.sqrt(v_obs), math.sqrt(v_mod)
+                st = ("no_clear_change" if abs(obs) <= zc * so else
+                      "wrong_sign" if mod * np.sign(obs) < -zc * sm else "consistent")
+                row = {"group": g, "units": len(us), "observed": round(obs, 5), "observed_sd": round(so, 5),
+                       "modelled": round(mod, 5), "modelled_noise_sd": round(sm, 5),
+                       "z_difference": round((mod - obs) / math.sqrt(v_obs + v_mod), 3), "status": st}
+                rows.append(row)
+                if st == "wrong_sign":
+                    finds.append(dict(row, **({"reason": c["reason"]} if c.get("mode") == "flag" else {})))
+            out.append({"id": c.get("id"), "mode": c.get("mode", "block"), "sign_z": zc, "groups": rows,
+                        "findings": finds, "not_judged": nj})
+            if finds and c.get("mode", "block") == "block":
+                blocks.append({"code": "change_wrong_sign", "detail": {"change": c.get("id"),
+                                                                       "groups": [f["group"] for f in finds]}})
+            if nj:
+                blocks.append({"code": "change_not_judged", "detail": {"change": c.get("id"), "groups": nj,
+                                                                       "why": "no engine verification run"}})
+        return out, blocks
 
     def report(self, valid) -> dict:
         P, st = self.P, self.state
@@ -1355,8 +1607,9 @@ class HistoryMatch:
                 for tg in P.unit_targets(u):
                     m, v = self.em["unit"][tg.observable].predict(u, [self.zg[gm]], np.atleast_2d(C[miss]),
                                                                   noise=bool(self.th["include_run_noise"]))
+                    b = st["bias"][tg.bias_key][miss] if tg.bias_key is not None else None
                     misses.append({"target": tg.id, "observed": tg.value, "modelled": float(inv(m[0], tg.scale)),
-                                   "implausibility": round(float(abs(m[0] - tg.y) / math.sqrt(v[0] + tg.var)), 3)})
+                                   "implausibility": round(float(self._impl(tg, m[0], v[0], b)), 3)})
             at_b = [nm for nm, gi in (("lo", 0), ("hi", len(self.zg) - 1)) if len(okR) and okR[:, gi].any()]
             units[u] = {"matched": u not in unmatched and u not in conflicting,
                         "status": "unmatched" if u in unmatched else "conflicts_with_shared_targets"
@@ -1385,6 +1638,12 @@ class HistoryMatch:
                 units[u]["matched"] = False
             if bad or badt:
                 blocks.append({"code": "verification_failed", "detail": {"units": bad, "targets": badt}})
+        change, cblocks = self._change(ver)
+        blocks += cblocks
+        bias = {k: {"offset": float(v[best_c]), "sd": self.bsd[k], "z": round(float(v[best_c]) / self.bsd[k], 4),
+                    "units": len({t.unit for t in P.targets if t.bias_key == k}),
+                    "offset_verified": ((ver or {}).get("bias") or {}).get(k)}
+                for k, v in (st.get("bias") or {}).items()}
         tsum = {}
         for t in P.targets:
             if t.kind in ("shared", "group"):
@@ -1431,7 +1690,10 @@ class HistoryMatch:
                 "units": units, "unmatched": unmatched, "conflicting": conflicting,
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
-                "verification": ver, "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
+                "verification": ver, "bias": bias, "change": change,
+                "weighting": {"best_point": self.th.get("best_point_weighting", "per_group"),
+                              "bias_grid": len(self.bgrid)},
+                "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
                 "emulators": {"unit": {ob: e.hyper for ob, e in self.em["unit"].items()},
                               "shared": {ob: {"kernel": str(e.gp.kernel_)} for ob, e in self.em["shared"].items()}},
                 "thresholds": {"history_matching": self.th, "emulator": self.eth, "blocking": self.bth},
