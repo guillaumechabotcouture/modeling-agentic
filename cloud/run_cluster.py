@@ -1898,7 +1898,8 @@ def _self_test_52(ok) -> None:
                                  register_compute_tags=lambda c, exclude: used.append(c))
     fake_coiled = types.ModuleType("coiled")
     rc52_made = []
-    fake_coiled.Cluster = lambda **kw: rc52_made.append({"name": kw.get("name"), "id": 12, "tags": kw.get("tags"),
+    fake_coiled.Cluster = lambda **kw: rc52_made.append({"name": kw.get("name"), "id": 12,
+                                                         "created": _fake_coiled_event(kw.get("name")),
                                                          "current_state": {"state": "running"}}) or run_cl
     fake_coiled.list_clusters = lambda workspace: list(rc52_made)
     with tempfile.TemporaryDirectory() as d:
@@ -2180,6 +2181,15 @@ def _self_test_attach(ok) -> None:
     _self_test_bwrap(ok)
 
 
+def _fake_coiled_event(name, created=True) -> str:
+    """What coiled.Cluster logs to the "coiled" logger (coiled 1.135.6, v2/cluster.py:1685 / :1688), for fakes."""
+    import logging
+    logging.getLogger("coiled").info(f"Creating Cluster (name: {name}, https://x ). This usually takes 1-2 minutes..."
+                                     if created else f"Attaching to existing cluster (name: {name}, https://x )")
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
 def _self_test_s18(ok, tb) -> None:
     """F6 S1-8 (no Coiled, no network). The F5 resume launch (2026-11-08): the scheduler listed the run after 43 s,
     then the laptop's client lost its connection (`OSError: Timed out trying to connect to tls://...:443 after
@@ -2243,7 +2253,7 @@ def _self_test_s18(ok, tb) -> None:
             made = []
 
             def cluster(**kw):
-                made.append({"name": kw.get("name"), "id": 77, "tags": kw.get("tags"),
+                made.append({"name": kw.get("name"), "id": 77, "created": _fake_coiled_event(kw.get("name")),
                              "current_state": {"state": "running"}})
                 return types.SimpleNamespace(cluster_id=77, get_client=lambda: client)
             fake_coiled.Cluster = cluster
@@ -2431,7 +2441,7 @@ def _self_test_s18_r1(ok) -> None:
             def cluster(**kw):
                 cl = types.SimpleNamespace(cluster_id=78 if kw.get("name", "").endswith("-overflow") else 77,
                                            get_client=lambda: client)
-                made.append({"name": kw.get("name"), "id": cl.cluster_id, "tags": kw.get("tags"),
+                made.append({"name": kw.get("name"), "id": cl.cluster_id, "created": _fake_coiled_event(kw.get("name")),
                              "current_state": {"state": "running"}})
                 if kw.get("name", "").endswith("-overflow"):
                     def boom(*a):
@@ -2741,13 +2751,22 @@ def _self_test_s18_r3(ok) -> None:
         except RuntimeError:
             refused = True
     ok(refused, "G1b a real coiled call from a run_cluster self-test is refused")
-    # the smoke watch: ownership is the invocation tag; at the limit the launcher is terminated and reaped first
+    # the smoke watch: ownership is this invocation's construction journal (ids it created; a construction it began
+    # and never finished: clusters of that name created after it began); at the limit the launcher goes first
+    import datetime as _dt
     sw = g.get("smoke_watch")
     cfg = RunConfig(name="lt", question_file="q", pipeline="v2")
-    TAGK = g.get("INVOCATION_TAG", "ma-invocation")
+    T0 = 1_800_000_000.0                                    # the invocation's constructions began here (epoch)
 
-    def cl_(name, cid, inv="INV"):
-        return {"name": name, "id": cid, "tags": {TAGK: inv}, "current_state": {"state": "running"}}
+    def iso(t):
+        return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).isoformat()
+
+    def cl_(name, cid, created=T0 + 30):
+        return {"name": name, "id": cid, "created": iso(created), "current_state": {"state": "running"}}
+    journal = [{"inv": "INV", "name": "lt", "t": T0, "status": "constructing", "seq": 1},
+               {"inv": "INV", "name": "lt", "id": 77, "status": "created", "seq": 1},
+               {"inv": "INV", "name": "lt-keeper", "t": T0 + 60, "status": "constructing", "seq": 2},
+               {"inv": "INV", "name": "lt-keeper", "id": 79, "status": "created", "seq": 2}]
 
     class World:
         def __init__(self, script, launcher_alive_until):
@@ -2773,8 +2792,8 @@ def _self_test_s18_r3(ok) -> None:
         def terminate(self):
             self.events.append(("terminate", None))
             self.until = -1
-    run, keeper = cl_("lt", 77), cl_("lt-keeper", 79)
-    theirs = cl_("lt", 66, inv="OTHER")             # same name, another invocation's (a race on another machine)
+    run, keeper = cl_("lt", 77), cl_("lt-keeper", 79, T0 + 70)
+    theirs = cl_("lt", 66, created=T0 + 40)          # same name, created by another invocation (another machine)
     if sw:
         class W1(World):
             def lister(self):
@@ -2787,22 +2806,36 @@ def _self_test_s18_r3(ok) -> None:
                 return out
         w = W1([], 100)
         r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate)
+               every_s=30, terminate=w.terminate, journal=journal)
         ok(r.get("clean") and not w.stopped and w.t >= 400,
            f"W1 the watch waits for a late keeper to stop by itself, then ends clean: t={w.t} {r}")
         w = World([(0, run), (0, keeper), (0, theirs)], 10 ** 9)
         r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate)
+               every_s=30, terminate=w.terminate, journal=journal)
         ok(not r.get("clean") and sorted(w.stopped) == [77, 79] and 1200 <= w.t <= 1200 + 300,
-           f"W2 at the wall-clock limit it stops by id every live cluster this invocation tagged, nothing else: "
+           f"W2 at the wall-clock limit it stops by id every cluster this invocation created, nothing else: "
            f"t={w.t} stopped={w.stopped} {r}")
-        ok(w.events[:1] == [("terminate", None)], f"W4 (round 4) at the limit the launcher is terminated before the "
-                                                  f"sweep: {w.events}")
+        ok(w.events[:1] == [("terminate", None)], f"W4 at the limit the launcher is terminated before the sweep: "
+                                                  f"{w.events}")
         w = World([(0, theirs)], 10 ** 9)
         r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate)
+               every_s=30, terminate=w.terminate, journal=journal)
         ok(not w.stopped and ("terminate", None) in w.events,
            f"W4b another invocation's cluster of the same name is never stopped: {w.events}")
+        # a construction interrupted before its outcome was journaled: clusters of that name created after it began
+        pend = journal + [{"inv": "INV", "name": "lt-overflow", "t": T0 + 100, "status": "constructing", "seq": 3}]
+        late, old = cl_("lt-overflow", 80, created=T0 + 110), cl_("lt-overflow", 81, created=T0 - 600)
+        w = World([(0, late), (0, old)], 10 ** 9)
+        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
+               every_s=30, terminate=w.terminate, journal=pend)
+        ok(w.stopped == [80], f"W7 an unfinished construction owns only a cluster of its name created after it began: "
+                              f"{w.stopped}")
+        att = journal + [{"inv": "INV", "name": "lt-overflow", "t": T0 + 100, "status": "constructing", "seq": 3},
+                         {"inv": "INV", "name": "lt-overflow", "id": 80, "status": "attached", "seq": 3}]
+        w = World([(0, late)], 10 ** 9)
+        sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30,
+           terminate=w.terminate, journal=att)
+        ok(not w.stopped, f"W7b a cluster this invocation attached to (not created) is never stopped: {w.stopped}")
 
         def hang():
             import time as _t
@@ -2811,7 +2844,7 @@ def _self_test_s18_r3(ok) -> None:
         import time as _time
         t0 = _time.monotonic()
         r = sw(cfg, "INV", lambda: False, minutes=0.01, lister=hang, stopper=lambda n, c: None, every_s=0.1,
-               call_timeout_s=0.5, terminate=lambda: None)
+               call_timeout_s=0.5, terminate=lambda: None, journal=[])
         ok(_time.monotonic() - t0 < 4, f"W3 a hung API call is bounded by its timeout: {_time.monotonic() - t0:.1f}s {r}")
     else:
         ok(False, "W1 smoke_watch exists")
@@ -2824,12 +2857,12 @@ def _self_test_s18_r3(ok) -> None:
         t0 = _time.monotonic()
         with contextlib.redirect_stdout(io.StringIO()):
             r = srun(cfg, "INV", [sys.executable, "-c", script], minutes=0.05, interrupt_on="listed S1",
-                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1)
+                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1, journal=[])
         ok(r.get("launcher_rc") is not None and r.get("interrupted") and _time.monotonic() - t0 < 20,
            f"W5 smoke-run interrupts the launcher on its line and reaps it: {r}")
         with contextlib.redirect_stdout(io.StringIO()):
             r = srun(cfg, "INV", [sys.executable, "-c", "import time; time.sleep(60)"], minutes=0.02,
-                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1)
+                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1, journal=[])
         ok(r.get("launcher_rc") is not None and not r.get("clean") and _time.monotonic() - t0 < 40,
            f"W6 (round 4) a launcher still running at the limit is terminated and reaped: {r}")
     else:
@@ -2867,19 +2900,19 @@ def _self_test_s18_r3(ok) -> None:
 
 
 def _self_test_s18_r4(ok) -> None:
-    """Codex round 4 on #161, P1: a cluster is this invocation's only if it created it. Two launchers race on one
-    config name (two machines, two out_dirs): the second one's coiled.Cluster(name=...) attaches to the first one's
-    cluster. Its tags name the first invocation, so the second refuses before any record, never records that id,
-    and gets no cleanup authority; the first proceeds."""
+    """Codex round 4 on #161, P1, as rebuilt after the owner's read-only check (2026-11-09: coiled 1.135.6 lists no
+    tags). A cluster is this invocation's only when (a) coiled.Cluster logged that it created it ("Creating Cluster
+    (name: ...)", coiled/v2/cluster.py:1685; "Attaching to existing cluster", :1688, means attached), (b) no live
+    cluster of that name was listed just before the constructor, and (c) its `created` time is no earlier than this
+    invocation's start less 120 s. Two launchers race on one config name on two machines."""
     import contextlib
+    import datetime as _dt
     import io
     import tempfile
     import types
     from unittest import mock
     M, P, g = sys.modules[__name__], mock.patch.object, globals()
-    TAGK = g.get("INVOCATION_TAG", "ma-invocation")
     table = {f"tls://10.0.0.{i}:1": {} for i in range(3)}
-    registry = {}                                           # name -> the one cluster Coiled holds for it
 
     class Client:
         status = "running"
@@ -2899,22 +2932,39 @@ def _self_test_s18_r4(ok) -> None:
         def run_on_scheduler(self, fn, *a):
             return None
 
-    def cluster(**kw):
-        rec = registry.setdefault(kw["name"], {"name": kw["name"], "id": 100 + len(registry), "tags": kw.get("tags"),
-                                               "current_state": {"state": "running"}, "kw": kw})
-        return types.SimpleNamespace(cluster_id=rec["id"], get_client=lambda: Client())
-    fake = types.ModuleType("coiled")
-    fake.Cluster = cluster
-    fake.list_clusters = lambda workspace: list(registry.values())
-    submits = []
+    def world(stale_listing=False, log=True, created_shift_s=0.0):
+        registry, lists_ = {}, [0]
 
-    def go(inv, d):
+        def cluster(**kw):
+            name = kw["name"]
+            if name in registry:                             # Coiled attaches by name
+                if log:
+                    _fake_coiled_event(name, created=False)
+            else:
+                ts = _fake_coiled_event(name) if log else _dt.datetime.now(_dt.timezone.utc).isoformat()
+                if created_shift_s:
+                    ts = (_dt.datetime.fromisoformat(ts) + _dt.timedelta(seconds=created_shift_s)).isoformat()
+                registry[name] = {"name": name, "id": 100 + len(registry), "created": ts,
+                                  "current_state": {"state": "running"}, "kw": kw}
+            return types.SimpleNamespace(cluster_id=registry[name]["id"], get_client=lambda: Client())
+
+        def lister(workspace=None):
+            lists_[0] += 1
+            return [] if stale_listing and lists_[0] == 1 else list(registry.values())
+        fake = types.ModuleType("coiled")
+        fake.Cluster, fake.list_clusters = cluster, lister
+        return fake, registry
+
+    def go(fake, inv, d, submits, ctor_calls=None):
         q = os.path.join(d, "q.txt")
         open(q, "w").write("question")
         cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
                         pipeline="v2", cluster_timeout="40 minutes")
         comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                      register_compute_tags=lambda c, exclude: None)
+        if ctor_calls is not None:
+            real = fake.Cluster
+            fake.Cluster = lambda **kw: ctor_calls.append(kw["name"]) or real(**kw)
         out = io.StringIO()
         with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.dict(os.environ, {"MA_LAUNCH_INVOCATION": inv}), \
                 P(M, "is_running", return_value=False), P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
@@ -2930,28 +2980,42 @@ def _self_test_s18_r4(ok) -> None:
             except SystemExit as e:
                 rc = ("exit", str(e.code))
         cl = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else None
-        return rc, cl
+        jr = g.get("read_journal")
+        return rc, cl, (jr(cfg) if jr else [])
+    # (a) the race the pre-listing cannot see: A creates between B's listing and B's constructor
+    fake, registry = world(stale_listing=True)
+    submits = []
     with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
-        rc_a, cl_a = go("INV-A", da)
-        rc_b, cl_b = go("INV-B", db)
+        rc_a, cl_a, j_a = go(fake, "INV-A", da, submits)
+        fake.list_clusters = (lambda reg: (lambda workspace=None, n=[0]: (n.__setitem__(0, n[0] + 1) or
+                                                                          ([] if n[0] == 1 else list(reg.values())))))(registry)
+        rc_b, cl_b, j_b = go(fake, "INV-B", db, submits)
     kw = registry.get("lt", {}).get("kw", {})
-    ok((kw.get("tags") or {}).get(TAGK) == "INV-A" and kw.get("cluster_timeout") == "40 minutes",
-       f"O1 the run cluster is created with the invocation tag and the config's cluster_timeout: "
-       f"{ {k: kw.get(k) for k in ('tags', 'cluster_timeout', 'idle_timeout')} }")
-    ok(rc_a == 0 and (cl_a or {}).get("invocation") == "INV-A" and (cl_a or {}).get("run", {}).get("id") == registry["lt"]["id"],
-       f"O2 the launcher that created the cluster records it: {rc_a} {cl_a}")
-    ok(isinstance(rc_b, tuple) and cl_b is None and submits == ["INV-A"] and "INV-A" in rc_b[1],
-       f"O3 the racing launcher attached to the other's cluster: refused, no record with its token, nothing "
-       f"submitted: {rc_b} {cl_b} {submits}")
-    vc = g.get("verify_created")
-    for tags, want in (({TAGK: "INV-A"}, True), ({TAGK: "INV-B"}, False), ({}, False), (None, False)):
-        lst = [{"name": "lt", "id": 5, "tags": tags, "current_state": {"state": "running"}}]
-        try:
-            vc("lt", 5, "INV-A", lister=lambda: lst) if vc else None
-            got = vc is not None
-        except SystemExit:
-            got = False
-        ok(got is want, f"O4 verify_created with tags {tags}: {got}")
+    ok((kw.get("tags") or {}).get(INVOCATION_TAG if "INVOCATION_TAG" in g else "ma-invocation") == "INV-A"
+       and kw.get("cluster_timeout") == "40 minutes",
+       f"O1 the run cluster is created with the invocation tag (for people) and the config's cluster_timeout: "
+       f"{ {k: kw.get(k) for k in ('tags', 'cluster_timeout')} }")
+    ok(rc_a == 0 and (cl_a or {}).get("invocation") == "INV-A" and (cl_a or {}).get("run", {}).get("id") == registry["lt"]["id"]
+       and any(e.get("status") == "created" and e.get("id") == registry["lt"]["id"] for e in j_a),
+       f"O2 the launcher whose constructor created the cluster records it, in clusters.json and its journal: {rc_a} {cl_a} {j_a}")
+    ok(isinstance(rc_b, tuple) and cl_b is None and submits == ["INV-A"] and "attached" in rc_b[1]
+       and any(e.get("status") == "attached" for e in j_b) and not any(e.get("status") == "created" for e in j_b),
+       f"O3 the racing launcher's constructor attached (Coiled said so): refused, no record, nothing submitted, "
+       f"journaled as attached: {rc_b} {cl_b} {submits} {j_b}")
+    # (b) the pre-listing sees a live cluster of the name: refused before the constructor is called
+    fake, registry = world()
+    ctor = []
+    with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+        go(fake, "INV-A", da, [])
+        rc_b, cl_b, _ = go(fake, "INV-B", db, [], ctor_calls=ctor)
+    ok(isinstance(rc_b, tuple) and cl_b is None and not ctor,
+       f"O4 a live cluster of the name listed just before the constructor: refused without constructing: {rc_b} {ctor}")
+    # (c) no creation event (any doubt), and (d) a created time before the invocation began (less 120 s)
+    for kwargs, what in ((dict(log=False), "no creation event"), (dict(created_shift_s=-3600), "created an hour before")):
+        fake, registry = world(**kwargs)
+        with tempfile.TemporaryDirectory() as d:
+            rc, cl, j = go(fake, "INV-C", d, [])
+        ok(isinstance(rc, tuple) and cl is None, f"O5 {what}: not this invocation's, refused before any record: {rc} {cl}")
 
 
 def _self_test_bwrap(ok) -> None:
