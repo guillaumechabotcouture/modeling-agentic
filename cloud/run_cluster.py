@@ -1957,7 +1957,7 @@ def _self_test_s18(ok, tb) -> None:
                     P(M, "is_running", return_value=False), P(M, "live_id", return_value=77), \
                     P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
                     P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
-                    P(M, "_compute", return_value=comp), P(M, "_submit", side_effect=lambda c_, cl, lab, *a: (f"run-{lab}-1", types.SimpleNamespace(status="pending"))), \
+                    P(M, "_compute", return_value=comp), P(M, "_submit", side_effect=lambda c_, cl, lab, *a, **k: (f"run-{lab}-1", types.SimpleNamespace(status="pending"))), \
                     P(M, "start_overflow", side_effect=overflow_exc or fake_helper("overflow", "lt-overflow", 78, {"id": 78})), \
                     P(M, "start_keeper", side_effect=fake_helper("keeper", "lt-keeper", 79, types.SimpleNamespace(cluster_id=79))), \
                     P(M, "confirm_keeper", side_effect=keeper_exc or (lambda *a, **k: ["tick"])), \
@@ -2149,7 +2149,7 @@ def _self_test_s18_r1(ok) -> None:
                     P(M, "code_tarball", return_value=(b"", "c0")),
                     P(M, "pipeline_preflight", side_effect=preflight_exc or (lambda *a: "v2")),
                     P(M, "_compute", return_value=comp),
-                    P(M, "_submit", side_effect=lambda c_, cl, lab, *a: (f"run-{lab}-1",
+                    P(M, "_submit", side_effect=lambda c_, cl, lab, *a, **k: (f"run-{lab}-1",
                                                                          types.SimpleNamespace(status=fut_status))),
                     P(M, "start_keeper", return_value=types.SimpleNamespace(cluster_id=79)),
                     P(M, "confirm_keeper", return_value=["tick"]),
@@ -2225,34 +2225,52 @@ def _self_test_s18_r1(ok) -> None:
        f"R6 an unconfirmed R1 leaves R2 assigned and pending, so `relaunch R2` can run: rc={rc} "
        f"{ {k: v.get('submission') for k, v in asg.items()} }")
     rc, cl, asg, out = go(labels=("R1", "R2"), listing=[lists("R1", "R2")])
-    ok(rc == 0 and all(v.get("submission") == "listed" for v in asg.values()), f"R6b both listed: {rc} {asg}")
+    ok(rc == 0 and all(v.get("submission") == "listed" and str(v.get("task_key", "")).startswith(f"run-{k}-")
+                       for k, v in asg.items()), f"R6b both listed, each with its task key: {rc} {asg}")
     # P2-7: a run that finished between polls, and one the scheduler queued
     rc, cl, _, out = go(listing=[{}], fut_status="finished")
     ok(rc == 0, f"R7 a run that finished before the first poll is acknowledged by its future: {rc}")
     rc, cl, _, out = go(listing=[{}], state="queued")
     ok(rc == 0, f"R7b a run the scheduler holds as queued is acknowledged: {rc}")
+    why = []
+    wl = g.get("wait_listed")
+    try:
+        got = wl(Client([{}], None), "k", types.SimpleNamespace(status="finished"), attempts=1, why=why)
+    except TypeError as e:
+        got = e
+    ok(got is True and why == ["future finished"], f"R7d wait_listed reports what acknowledged the run: {got} {why}")
     rc, cl, _, out = go(listing=[{}], state="released")
     ok(rc == 4, f"R7c a released key is not an acknowledgement: {rc}")
 
     # P1-2: relaunch, same boundary and guards
-    def re(submit=None, listing=None, state=None):
+    def re(submit=None, listing=None, state=None, rec=None, vm="none", sched_exc=None, calls=None):
         with tempfile.TemporaryDirectory() as d:
             q = os.path.join(d, "q.txt")
             open(q, "w").write("question")
             cfg = RunConfig(name="lt", question_file=q, labels=("R1", "R2"), out_dir=d, pipeline="v2", tree=d)
-            json.dump({x: {"worker": "tls://10.0.0.0:1", "launch_id": "L", "submission": "pending"}
-                       for x in cfg.labels}, open(cfg.state_file, "w"))
+            json.dump({x: dict({"worker": "tls://10.0.0.0:1", "launch_id": "L", "submission": "pending"},
+                               **(rec or {})) for x in cfg.labels}, open(cfg.state_file, "w"))
             client = Client(listing or [lists("R2")], state)
+            if sched_exc:
+                def rs_(fn, *a):
+                    raise sched_exc
+                client.run_on_scheduler = rs_
+            sub = submit or (lambda c_, cl, lab, *a, **k: (k.get("key") or f"run-{lab}-1",
+                                                           types.SimpleNamespace(status="pending")))
+
+            def submit_(*a, **k):
+                if calls is not None:
+                    calls.append(json.load(open(cfg.state_file))["R2"].get("task_key") == k.get("key") and k.get("key"))
+                return sub(*a, **k)
             rs = types.ModuleType("results_store")
             rs.list_blobs = lambda *a: []
             out = io.StringIO()
             with mock.patch.dict(sys.modules, {"results_store": rs}), \
                     P(M, "attach", return_value=types.SimpleNamespace(get_client=lambda: client)), \
-                    P(M, "_on_worker", return_value={"state": "none"}), \
+                    P(M, "_on_worker", return_value={"state": vm}), \
                     P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
                     P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
-                    P(M, "_submit", side_effect=submit or (lambda c_, cl, lab, *a: (f"run-{lab}-1",
-                                                                                     types.SimpleNamespace(status="pending")))), \
+                    P(M, "_submit", side_effect=submit_), \
                     P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None), \
                     contextlib.redirect_stdout(out):
                 try:
@@ -2262,13 +2280,97 @@ def _self_test_s18_r1(ok) -> None:
                 except BaseException as e:  # noqa: BLE001
                     return ("raised", type(e).__name__)
 
-    def accepted_then_raise(*a):
+    def accepted_then_raise(*a, **k):
         raise RuntimeError("submit raised after the scheduler accepted it")
     ok(re() == 0, f"R2a relaunch of a pending label, listed: exit 0 ({re()})")
     ok(re(submit=accepted_then_raise) == 4, f"R2b relaunch: _submit raising is 'not confirmed', never 1: {re(submit=accepted_then_raise)}")
     ok(re(listing=[KeyError("workers")]) == 4, f"R2c relaunch: a non-connection error while waiting is 4: "
                                                 f"{re(listing=[KeyError('workers')])}")
     ok(re(listing=[KeyboardInterrupt()]) == 4, "R2d relaunch: an interrupt after the submission is 4")
+    # Codex round 2, P2-2: the exact task key is recorded before the submission, and a task the scheduler still holds
+    # (queued, or preparing: no run.log yet, so the VM reads "missing") is never submitted a second time
+    calls = []
+    r = re(calls=calls)
+    ok(r == 0 and calls and calls[0], f"R8 relaunch records the exact task key before it submits: {r} {calls}")
+    sent = {"submission": "sent", "task_key": "run-R2-0"}
+    for st_ in ("processing", "queued", "waiting"):
+        calls = []
+        r = re(rec=sent, vm="missing", state=st_, calls=calls)
+        ok(isinstance(r, tuple) and "run-R2-0" in str(r[1]) and not calls,
+           f"R8b a task still {st_} on the scheduler (no run.log yet) is not relaunched: {r} {calls}")
+    calls = []
+    r = re(rec=sent, vm="missing", state=None, calls=calls, listing=[{}, lists("R2")])
+    ok(r != ("exit", None) and calls, f"R8c a task the scheduler no longer holds may be relaunched: {r} {calls}")
+    calls = []
+    r = re(rec=sent, vm="missing", sched_exc=OSError("lost"), calls=calls)
+    ok(isinstance(r, tuple) and not calls, f"R8d the original task's state cannot be read: refused, not relaunched: {r}")
+    calls = []
+    r = re(rec={"submission": "sent"}, vm="missing", calls=calls)
+    ok(isinstance(r, tuple) and not calls, f"R8e a 'sent' assignment with no recorded key is refused: {r}")
+
+
+def _self_test_s18_r2(ok) -> None:
+    """Codex round 2 on #161, P2-1: `keeper` reconciles the recorded helpers first. A live helper with the recorded id
+    belongs to this launch and is kept (the keeper only once it is confirmed holding the pool); a live helper with
+    another id is an earlier launch's and is stopped by that id; a missing one is started."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+    from unittest import mock
+    M, P = sys.modules[__name__], mock.patch.object
+
+    def go(rec, live, confirm_ok=True):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2", overflow_max=4)
+            json.dump(dict({"run": {"name": "lt", "id": 77}, "launch_id": "L", "invocation": "I",
+                            "status": "submitted_launch_incomplete"}, **rec), open(cfg.clusters_file, "w"))
+            calls = {"stopped": [], "overflow": 0, "keeper": [], "fresh": []}
+
+            def so(cfg_, comp, record=None):
+                calls["overflow"] += 1
+                record("overflow", cfg.overflow_name, 88)
+                return {"name": cfg.overflow_name, "id": 88}
+
+            def sk(cfg_, ao, cid, overflow=None, record=None):
+                calls["keeper"].append((cid, (overflow or {}).get("id")))
+                record("keeper", cfg.keeper_name, 89)
+                return types.SimpleNamespace(cluster_id=89)
+
+            def conf(name, kc, **k):
+                if not confirm_ok and getattr(kc, "cluster_id", None) != 89:
+                    raise SystemExit("not confirmed")
+                return ["tick"]
+            out = io.StringIO()
+            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["a"])), \
+                    P(M, "live_id", side_effect=lambda n: live.get(n)), \
+                    P(M, "start_overflow", side_effect=so), P(M, "start_keeper", side_effect=sk), \
+                    P(M, "confirm_keeper", side_effect=conf), \
+                    P(ws, "attach_existing", side_effect=lambda n, w, cid: types.SimpleNamespace(cluster_id=cid)), \
+                    P(M, "_stop_id", side_effect=lambda n, cid: calls["stopped"].append(cid), create=True), \
+                    P(M, "_fresh", side_effect=lambda n: calls["fresh"].append(n)), \
+                    P(time, "sleep", lambda s: None), contextlib.redirect_stdout(out):
+                try:
+                    rc = keeper_later(cfg)
+                except SystemExit as e:
+                    rc = ("exit", e.code)
+            cl = json.load(open(cfg.clusters_file))
+            return rc, calls, cl
+
+    both = {"overflow": {"name": "lt-overflow", "id": 78}, "keeper": {"name": "lt-keeper", "id": 79}}
+    rc, calls, cl = go(both, {"lt": 77, "lt-overflow": 78, "lt-keeper": 79})
+    ok(rc == 0 and not calls["stopped"] and calls["overflow"] == 0 and not calls["keeper"]
+       and cl["overflow"]["id"] == 78 and cl["keeper"]["id"] == 79,
+       f"R9 healthy helpers of this launch are kept, nothing stopped or recreated: {rc} {calls}")
+    rc, calls, cl = go({"overflow": both["overflow"]}, {"lt": 77, "lt-overflow": 78})
+    ok(rc == 0 and not calls["stopped"] and calls["overflow"] == 0 and calls["keeper"] == [(77, 78)],
+       f"R9b a kept overflow pool is handed to the new keeper: {rc} {calls}")
+    rc, calls, cl = go(both, {"lt": 77, "lt-overflow": 78, "lt-keeper": 95})
+    ok(rc == 0 and calls["stopped"] == [95] and calls["overflow"] == 0 and calls["keeper"] == [(77, 78)],
+       f"R9c a live keeper with another id is an earlier launch's: stopped by that id, then started: {rc} {calls}")
+    rc, calls, cl = go(both, {"lt": 77, "lt-overflow": 78, "lt-keeper": 79}, confirm_ok=False)
+    ok(rc == 0 and calls["stopped"] == [79] and calls["keeper"] == [(77, 78)],
+       f"R9d this launch's keeper that is not holding the pool is stopped by id and restarted: {rc} {calls}")
 
 
 def _self_test_bwrap(ok) -> None:
@@ -2648,6 +2750,10 @@ def _self_test() -> int:
         _self_test_s18_r1(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"R: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18_r2(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"R9: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
