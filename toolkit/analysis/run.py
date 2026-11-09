@@ -454,6 +454,16 @@ def _self_test() -> int:
            and "verified benchmark results" in res["arm_source"],
            "R7 interaction rescale: arms from verified benchmark results, the achieved interaction equals the requested "
            "one, an unreachable value is rejected (Codex P1-12, P1-13)")
+        # F6 S1-4: every fitted engine parameter gets an automatic test at each end of its range; an excluded scenario
+        # parameter is listed as not run, with the spec's reason
+        byid = {t.get("test_id"): t for t in R["decision_tests"]}
+        fa = byid.get("fitted_range_eff_a") or {}
+        ok("fitted_range_eff_b" in byid and fa.get("status") == "run"
+           and [round(r["value"], 9) for r in fa.get("results", [])] == [0.3, 0.7] and fa.get("automatic") is True,
+           f"R7b fitted parameters get automatic tests at their range ends: {sorted(k for k in byid if k)}")
+        sx = byid.get("scenario_excluded_synergy") or {}
+        ok(sx.get("status") == "not_run" and "no interaction" in str(sx.get("reason")),
+           f"R7c an excluded scenario parameter is listed as a test not run, with the spec's reason: {sx}")
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import mechanism_manifest as MM
         if hasattr(MM, "load_test_result"):

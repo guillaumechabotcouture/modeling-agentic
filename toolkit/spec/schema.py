@@ -1465,6 +1465,27 @@ def _self_test() -> int:
             "SP7 an envelope below its fixed costs is refused")
         bad(lambda r: r["uncertainty"].update(excluded=[{"kind": "costs", "reason": "toy"}]), "neither declared",
             "SP8 lesson 6: an uncertainty source neither declared nor excluded with a reason is refused")
+        # F6 S1-4: a scenario engine parameter needs a declared range, or a named exclusion with a reason
+        def without_synergy(r):
+            r["uncertainty"]["excluded"] = [x for x in r["uncertainty"].get("excluded") or []
+                                            if x.get("parameter") != "synergy"]
+            r["uncertainty"].pop("priors", None)
+        r_s = copy.deepcopy(s.raw)
+        without_synergy(r_s)
+        e_s = validate(Spec(r_s, d))
+        ok(any("scenario_without_range" in e and "synergy" in e for e in e_s),
+           f"SP-S14a a scenario parameter with no range and no exclusion is refused: {e_s[:2]}")
+        r_s["uncertainty"]["excluded"].append({"parameter": "synergy", "reason": "toy: no interaction assumed"})
+        e_s = validate(Spec(r_s, d))
+        ok(not [e for e in e_s if "synergy" in e], f"SP-S14b excluded by name with a reason: accepted ({e_s[:2]})")
+        r_s["uncertainty"]["excluded"][-1]["reason"] = " "
+        ok(any("synergy" in e and "reason" in e for e in validate(Spec(r_s, d))),
+           "SP-S14c an exclusion without a reason is refused")
+        r_p = copy.deepcopy(s.raw)
+        without_synergy(r_p)
+        r_p["uncertainty"]["priors"] = {"synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "toy range"}}
+        e_p = validate(Spec(r_p, d))
+        ok(not [e for e in e_p if "synergy" in e], f"SP-S14d a declared range: accepted ({e_p[:2]})")
         # a list column whose empty list is written as a declared token (a blank cell is refused as
         # attribute_column_empty, so an empty list needs an explicit marker)
         ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}
