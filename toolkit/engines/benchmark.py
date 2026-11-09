@@ -116,6 +116,8 @@ TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome", "curve_rul
 COMPARE_TYPES = ("value", "identity")
 COMPARES = ("eq", "le", "differ")
 STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")
+from toolkit.engines.benchmark_sources import (TOY_ENGINE_REFS, band_declarations, band_digest,  # noqa: E402
+                                             engine_fitted_problems, fitted_problems, stale_ids)
 JOINT_RULES = {
     "joint-v1": "LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic surrogate of each "
                 "target's log value; infeasible targets dropped; argmin (n out of band, band-scaled squared log "
@@ -227,7 +229,8 @@ def validate_initialisation(pack: dict, base: str | None = None) -> list[str]:
 
 
 def validate(pack: dict, engine, base: str | None = None) -> list[str]:
-    bad = validate_initialisation(pack, base)
+    from toolkit.engines.benchmark_sources import check_pack as band_sources
+    bad = validate_initialisation(pack, base) + band_sources(pack)     # F6 S1-2: bands from their sources
     specs = {p.name: p for p in engine.parameters()}
     fitted = {k for k, p in specs.items() if p.kind == "fitted"}
     configs = pack.get("configs") or {}
@@ -537,6 +540,10 @@ def _spread(per) -> dict:
 
 class Runner:
     def __init__(self, pack: dict, engine, workers: int = 1, seeds=None, base_params: dict | None = None):
+        from toolkit.engines.benchmark_sources import check_pack as band_sources
+        bad = band_sources(pack)
+        if bad:                             # F6 S1-2: no runner scores a band that differs from its source
+            raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
         self.pack, self.engine, self.workers = pack, engine, workers
         # values under every setting's own parameters (a spec's engine parameter values, toolkit/spec/
         # engine_parameters.py): they replace engine defaults, never a setting's observed conditions
@@ -1118,6 +1125,8 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         r = runner.evaluate(b, fitted)
         row = {"id": b["id"], "metric": b["metric"], "role": "fit" if b["id"] in fit_ids else "held_out",
                "target": b.get("target"), "band": b.get("band"), "source": b.get("source", "")}
+        if band_digest(b) is not None:
+            row["band_sha256"] = band_digest(b)
         if b.get("requires"):
             row["requires"] = b["requires"]
         if b["id"] in infeasible:
@@ -1188,7 +1197,20 @@ def verified_benchmarks(engine) -> tuple[list, str | None]:
         return [], f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
         return [], f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
-    return list(doc.get("benchmarks") or []), None
+    rows = list(doc.get("benchmarks") or [])
+    pp = os.path.join(os.path.dirname(path), "pack.yaml")
+    ref = f"{type(engine).__module__}:{type(engine).__name__}"
+    if not os.path.exists(pp):
+        return (rows, None) if ref in TOY_ENGINE_REFS else ([], f"no pack.yaml beside {os.path.basename(path)}")
+    pack = yaml.safe_load(open(pp)) or {}
+    stale = stale_ids(pack, rows)
+    if stale:
+        return [], (f"{os.path.basename(path)} was scored against other band declarations for {', '.join(stale)}: "
+                    "re-run or rescore the pack")
+    fprob = engine_fitted_problems(engine)
+    if fprob:
+        return [], f"{os.path.basename(path)}: {'; '.join(fprob)}"
+    return rows, None
 
 
 def refusal_share_max(e: dict, pack: dict) -> float:
@@ -1245,6 +1267,9 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
     rows = []
     for r in doc.get("benchmarks") or []:
         b = cur.get(r["id"])
+        if b is not None and band_digest(b) is not None and r.get("band_sha256") != band_digest(b):
+            rows.append(_rescore_band(r, b, old.get(r["id"])))
+            continue
         if b is None or b["estimand"]["type"] != "coverage":
             rows.append(r)
             continue
@@ -1268,6 +1293,13 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
         r["computation_sha256"] = computation_digest(b, pack)
         r["in_band"] = r["status"] == "in_band"
         rows.append(r)
+    if any("rescored_from" in x and x.get("requires") for x in rows):
+        for x in rows:
+            if x.get("requires") and x.get("status") == "not_assessable":
+                x["status"] = "in_band" if x["band"][0] <= x["computed"] <= x["band"][1] else "out_of_band"
+        apply_requires(rows)
+        for x in rows:
+            x["in_band"] = x["status"] == "in_band"
     out = {k: v for k, v in doc.items() if k not in ("producer", "engine_identity", "engine_config_sha256")}
     out["benchmarks"] = rows
     by = {st: sum(x["status"] == st for x in rows) for st in STATUSES}
@@ -1275,6 +1307,22 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
                       "held_out_in_band": sum(x["status"] == "in_band" for x in rows if x["role"] == "held_out"),
                       "held_out_total": sum(x["role"] == "held_out" for x in rows)}
     return stamp(out, engine)
+
+
+def _rescore_band(r: dict, b: dict, bo: dict | None) -> dict:
+    """A stored trial row re-scored against the current band (F6 S1-2), without a re-run: only a ratio row computed for
+    the previous pack's declaration of its case (its digest, or for a row stored before digests, the same band)."""
+    legacy = "band_sha256" not in r and bo is not None and r.get("band") == bo.get("band")
+    if bo is None or not (legacy or r.get("band_sha256") == band_digest(bo)):
+        raise ValueError(f"rescore: {r['id']} was not scored against the previous pack's band declaration")
+    if b["estimand"]["type"] == "cost_per_outcome" or not isinstance(r.get("computed"), (int, float)):
+        raise ValueError(f"rescore: {r['id']}: its band changed and it cannot be re-scored without a re-run")
+    r = dict(r, rescored_from={"band": r.get("band"), "band_sha256": r.get("band_sha256"),
+                               "note": "re-scored against the current band declaration; no new run"})
+    lo, hi = b["band"]
+    r.update(band=list(b["band"]), band_sha256=band_digest(b), in_band=bool(lo <= r["computed"] <= hi))
+    r["status"] = "in_band" if r["in_band"] else "out_of_band"
+    return r
 
 
 def declaration_digest(b: dict, pack: dict | None = None) -> str:
@@ -1345,6 +1393,9 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
                 raise ValueError(f"merge: {b['id']} was computed for another declaration")
             if r.get("code_sha256") != calibrator_code_digest(pack, b["estimand"]):
                 raise ValueError(f"merge: {b['id']} was computed by other calibration, observation or generator code")
+    stale = stale_ids(pack, [r for r in rows.values() if r["id"] in ids])
+    if stale:
+        raise ValueError(f"merge: {', '.join(stale)} scored against other band declarations (re-run or rescore)")
     miss = [i for i in ids if i not in rows]
     extra = sorted(set(rows) - set(ids))
     if miss or extra:
@@ -1381,8 +1432,6 @@ def main(argv=None) -> int:
     pack = yaml.safe_load(open(a.pack))
     eng = load_engine(pack["engine"], (pack.get("configs") or {}).get(pack.get("default_config")))
     bad = validate(pack, eng, base=os.path.dirname(os.path.abspath(a.pack)))
-    from toolkit.engines.benchmark_sources import check_pack as _band_sources
-    bad += _band_sources(pack)          # F6 S1-2: every band equals its published interval or a recorded override
     if bad:
         print("pack invalid:\n  " + "\n  ".join(bad))
         return 2
@@ -1403,6 +1452,7 @@ def main(argv=None) -> int:
         yaml.safe_dump(res, open(path, "w"), sort_keys=False)
         print(f"wrote {path} ({res['summary']['in_band']} of {res['summary']['total']} in band)")
         return 0
+    full_pack = pack
     if a.only:
         keep = set(a.only.split(","))
         unknown = keep - {b["id"] for b in pack["benchmarks"]}
@@ -1418,11 +1468,15 @@ def main(argv=None) -> int:
         path = a.out or os.path.join(d, "fitted.yaml")
         yaml.safe_dump(stamp(dict({"engine": pack["engine"], "engine_version": eng.describe().version,
                                    "fitted_at": time.strftime("%F %T"), "seeds": seeds,
-                                   "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1)}, **out), eng),
+                                   "n_sims": runner.nsims, "wall_s": round(time.time() - t0, 1),
+                                   "band_declarations": band_declarations(pack, fit_targets(pack))}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
         fp = os.path.join(d, "fitted.yaml")
         f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
+        if os.path.exists(fp) and fitted_problems(f, full_pack):     # F6 S1-2: never run on stale fitted values
+            print("; ".join(fitted_problems(f, full_pack)))
+            return 2
         fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
         out = run_pack(pack, eng, runner, fitted, f)
         out["engine_version"] = eng.describe().version

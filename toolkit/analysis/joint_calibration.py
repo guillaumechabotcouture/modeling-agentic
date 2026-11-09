@@ -540,10 +540,14 @@ def build(spec, units=None) -> tuple:
             b = next(x for x in pack["benchmarks"] if x["id"] == t["id"])
             lo, hi = (float(x) for x in b["band"])
             sc = "log" if lo > 0 and float(b["target"]) > 0 else "identity"
-            sd = (float(HM.tr(hi, sc)) - float(HM.tr(lo, sc))) / (2 * 1.959964)
+            from toolkit.engines.benchmark_sources import band_level, band_sd    # F6 S1-2: at the recorded level
+            try:
+                sd = band_sd(b, lambda x: HM.tr(x, sc))
+            except ValueError as e:
+                raise HM.CalibrationInputError([f"benchmark target {t['id']}: {e}"]) from None
             targets.append(HM.Target(t["id"], "shared", f"bench.{t['id']}", float(b["target"]), sc, sd_obs=sd,
-                                     sd_md=md, source=f"engine benchmark pack: {b.get('source', '')} (band as a 95% "
-                                                      "interval)", depends_on=t.get("depends_on")))
+                                     sd_md=md, source=f"engine benchmark pack: {b.get('source', '')} (band as an "
+                                                      f"interval at level {band_level(b)})", depends_on=t.get("depends_on")))
     feats = j.get("features") or []
     F = {i: [_feature(rows[i], f) for f in feats] for i in ids} if feats else {}
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),

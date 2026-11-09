@@ -4,47 +4,54 @@
     python3 -m toolkit.engines.benchmark_sources <pack.yaml>    # exit 1 and list each finding
     python3 toolkit/engines/benchmark_sources.py --self-test
 
-A trial or cost benchmark (estimand type ratio, odds_ratio, interaction_or or cost_per_outcome) records where its band
-comes from, in one of two ways:
+A trial or cost benchmark (estimand type ratio, odds_ratio, interaction_or or cost_per_outcome) declares the estimand its
+source reports and where its band comes from:
 
-    published: {lower, upper, level: 0.95, scale: ratio, table: "<where in the source>"}
-    estimand_type: odds_ratio | risk_ratio | rate_ratio | hazard_ratio     # what the source reports
-    diagnostic: "<as the source states it>"                                 # optional
-    age_band: "<as the source states it>"                                   # optional
-    estimand_mapping: "<why the engine's estimand stands for the published one>"   # when the types differ
+    estimand_type: odds_ratio | risk_ratio | rate_ratio | hazard_ratio | cost_per_outcome     # always
+    estimand_mapping: "<why the engine's estimand stands for the source's>"   # when they do not match
+    published: {lower, upper, level, scale: ratio | currency_per_outcome, table: "<where in the source>", unit}
+    diagnostic, age_band: "<as the source states them; 'mixed' or 'not reported' when so>"   # with a published ratio
 
-or, when the band is not the published interval (no interval is published, or the band is deliberately different):
+or, when the band is not the published interval:
 
-    band_override: {band: [lo, hi], reason: "<why>", status: <optional, e.g. pending_owner_review>}
+    band_override: {band: [lo, hi], reason: "<why>", level: <optional>, status: <optional>}
 
 The band is derived: `band_override.band` when present, else [published.lower, published.upper]. The stored `band`
-field stays in the pack, because the runner, the fit and every reader of results read it there; this check fails on any
-stored band that differs from its derivation, so the stored copy cannot drift from its source. It also fails when:
-- a benchmark of those types has neither `published` nor `band_override` (fail closed);
-- `published` is malformed, or its target lies outside it;
-- the published estimand type does not match the engine estimand's `type` and no `estimand_mapping` explains it
-  (an engine `ratio` stands for a risk or rate ratio; `odds_ratio` and `interaction_or` for an odds ratio; a hazard
-  ratio always needs a mapping note);
-- a `requires` interval on another benchmark differs from that benchmark's published interval.
+field stays in the pack (every reader reads it there); this check fails on any stored band that differs from its
+derivation, on an entry with neither source nor override, on a malformed entry or a missing or unknown estimand type,
+on a source estimand the engine's estimand does not match without a mapping note (override or not), and on a
+`requires` interval that differs from the referenced published interval.
 
-Other estimand types (value, identity, coverage, curve_rules) are oracle or rule checks with no trial interval, and are
-out of scope. Disease-agnostic: nothing here names a disease, trial or intervention.
+Exemptions, listed: the estimand types in EXEMPT_TYPES (oracle or rule checks, no trial interval), and entries with no
+`published` block in a pack whose engine is one of the self-test toys in TOY_ENGINE_REFS (their bands are test fixtures).
+
+Stored evidence is bound to the declarations it was scored against: results rows carry `band_sha256`
+(band_digest), fitted.yaml carries `band_declarations` for its fit targets; `stale_ids`, `fitted_problems` and
+`engine_fitted_problems` report a stale row or "refit required". Disease-agnostic: nothing here names a disease.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import sys
+from statistics import NormalDist
 
 if not __package__:  # run as a file (the self-test runner): make the repository importable
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 SOURCED_TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome")
-ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio")
-# engine estimand type -> published estimand types it stands for without a mapping note
+EXEMPT_TYPES = ("value", "identity", "coverage", "curve_rules")     # oracle and rule checks: no published interval
+TOY_ENGINE_REFS = ("toolkit.engines.contract:ToyEngine", "toolkit.engines.benchmark:SharedStateToy",
+                   "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")
+ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio", "cost_per_outcome")
+# engine estimand type -> source estimand types it stands for without a mapping note
 COMPATIBLE = {"odds_ratio": {"odds_ratio"}, "interaction_or": {"odds_ratio"}, "ratio": {"risk_ratio", "rate_ratio"},
-              "cost_per_outcome": set()}
-SCALES = ("ratio",)
+              "cost_per_outcome": {"cost_per_outcome"}}
+SCALE_OF = {"ratio": "ratio", "odds_ratio": "ratio", "interaction_or": "ratio", "cost_per_outcome": "currency_per_outcome"}
+SCALES = tuple(sorted(set(SCALE_OF.values())))
+DIGEST_FIELDS = ("id", "target", "band", "published", "band_override", "estimand_type", "estimand_mapping", "requires")
 TOL = 1e-9
 
 
@@ -60,7 +67,12 @@ def _text(x) -> bool:
     return isinstance(x, str) and bool(x.strip())
 
 
-def published_problems(p) -> list[str]:
+def _etype(b) -> str | None:
+    e = b.get("estimand") if isinstance(b, dict) else None
+    return e.get("type") if isinstance(e, dict) else None
+
+
+def published_problems(p, etype: str | None = None) -> list[str]:
     if not isinstance(p, dict):
         return ["published must be a mapping {lower, upper, level, scale, table}"]
     bad = []
@@ -68,8 +80,9 @@ def published_problems(p) -> list[str]:
         bad.append("published needs numbers lower <= upper")
     if not (_num(p.get("level")) and 0 < p["level"] < 1):
         bad.append("published.level must be a number in (0, 1), e.g. 0.95")
-    if p.get("scale") not in SCALES:
-        bad.append(f"published.scale must be one of {SCALES}")
+    want = SCALE_OF.get(etype) if etype else None
+    if p.get("scale") not in SCALES or (want and p.get("scale") != want):
+        bad.append(f"published.scale must be {want or SCALES} for an engine {etype!r} estimand")
     if not _text(p.get("table")):
         bad.append("published.table must say where in the source the interval is")
     return bad
@@ -86,30 +99,57 @@ def derive_band(b: dict):
     return None
 
 
+def band_level(b: dict):
+    """The interval level of a benchmark's band: the override's stated level, else the published level, else None."""
+    o = b.get("band_override")
+    if isinstance(o, dict):
+        return o.get("level") if _num(o.get("level")) and 0 < o["level"] < 1 else None
+    p = b.get("published")
+    return p.get("level") if isinstance(p, dict) and not published_problems(p) else None
+
+
+def band_sd(b: dict, tr) -> float:
+    """The sd of a normal whose central interval at the band's level is the band, on the scale `tr`. ValueError when the
+    band has no stated level (an override without one is not an interval)."""
+    lv = band_level(b)
+    if lv is None:
+        raise ValueError(f"{b.get('id')}: band {b.get('band')} has no stated interval level")
+    lo, hi = b["band"]
+    return (float(tr(hi)) - float(tr(lo))) / (2 * NormalDist().inv_cdf(0.5 + lv / 2))
+
+
 def _same(a, b) -> bool:
     return _pair(a) and _pair(b) and abs(a[0] - b[0]) <= TOL and abs(a[1] - b[1]) <= TOL
 
 
-def check_benchmark(b: dict, byid: dict | None = None) -> list[str]:
+def check_benchmark(b, byid: dict | None = None, toy: bool = False) -> list[str]:
+    if not isinstance(b, dict):
+        return [f"benchmark entry {b!r} is not a mapping"]
     bid = b.get("id")
-    e = b.get("estimand") or {}
-    etype = e.get("type")
-    if etype not in SOURCED_TYPES:
+    etype = _etype(b)
+    if etype in EXEMPT_TYPES or (toy and b.get("published") is None):
         return []
-    bad = []
+    if etype not in SOURCED_TYPES:
+        return [f"{bid}: estimand type {etype!r} is neither checked against a source {SOURCED_TYPES} nor exempt "
+                f"{EXEMPT_TYPES}"]
     pub, ovr = b.get("published"), b.get("band_override")
     if pub is None and ovr is None:
         return [f"{bid}: band {b.get('band')} has neither a published interval nor a recorded band_override"]
+    bad = []
+    st = b.get("estimand_type")
+    if st not in ESTIMAND_TYPES:
+        bad.append(f"{bid}: estimand_type {st!r} must be one of {ESTIMAND_TYPES} (the estimand the source reports)")
+    elif st not in COMPATIBLE[etype] and not _text(b.get("estimand_mapping")):
+        bad.append(f"{bid}: the source reports a {st} but the engine computes {etype!r}; refused without an "
+                   "estimand_mapping note")
     if pub is not None:
-        bad += [f"{bid}: {x}" for x in published_problems(pub)]
-        if not published_problems(pub) and _num(b.get("target")) and not (pub["lower"] <= b["target"] <= pub["upper"]):
+        pp = published_problems(pub, etype)
+        bad += [f"{bid}: {x}" for x in pp]
+        if not pp and _num(b.get("target")) and not (pub["lower"] <= b["target"] <= pub["upper"]):
             bad.append(f"{bid}: target {b['target']} is outside the published interval [{pub['lower']}, {pub['upper']}]")
-        st = b.get("estimand_type")
-        if st not in ESTIMAND_TYPES:
-            bad.append(f"{bid}: estimand_type {st!r} must be one of {ESTIMAND_TYPES} when a published interval is given")
-        elif st not in COMPATIBLE.get(etype, set()) and not _text(b.get("estimand_mapping")):
-            bad.append(f"{bid}: the source reports a {st} but the engine computes {etype!r}; refused without an "
-                       "estimand_mapping note")
+        if SCALE_OF[etype] == "ratio":
+            bad += [f"{bid}: a published ratio states its {k} ('mixed' or 'not reported' when so)"
+                    for k in ("diagnostic", "age_band") if not _text(b.get(k))]
     if ovr is not None:
         if not (isinstance(ovr, dict) and _pair(ovr.get("band"))):
             bad.append(f"{bid}: band_override needs band: [lo, hi]")
@@ -126,17 +166,66 @@ def check_benchmark(b: dict, byid: dict | None = None) -> list[str]:
     return bad
 
 
-def check_pack(pack: dict) -> list[str]:
-    bs = [b for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)]
-    if not isinstance((pack or {}).get("benchmarks"), list):
+def check_pack(pack) -> list[str]:
+    if not isinstance(pack, dict) or not isinstance(pack.get("benchmarks"), list):
         return ["pack has no benchmarks list"]
-    byid = {b.get("id"): b for b in bs}
-    return [x for b in bs for x in check_benchmark(b, byid)]
+    toy = pack.get("engine") in TOY_ENGINE_REFS
+    byid = {b.get("id"): b for b in pack["benchmarks"] if isinstance(b, dict)}
+    return [x for b in pack["benchmarks"] for x in check_benchmark(b, byid, toy)]
 
 
 def failing_ids(pack: dict) -> set:
     bs = {b.get("id"): b for b in pack.get("benchmarks") or []}
     return {bid for bid, b in bs.items() if check_benchmark(b, bs)}
+
+
+# ---- stored evidence bound to the declarations it was scored against
+def band_digest(b: dict) -> str | None:
+    """sha256 of a trial or cost benchmark's band declaration; None for an exempt type."""
+    if _etype(b) not in SOURCED_TYPES:
+        return None
+    return hashlib.sha256(json.dumps({k: b.get(k) for k in DIGEST_FIELDS}, sort_keys=True,
+                                     default=str).encode()).hexdigest()
+
+
+def band_declarations(pack: dict, ids=None) -> dict:
+    """{id: band_digest} of the pack's trial and cost benchmarks (only `ids` when given)."""
+    return {b["id"]: band_digest(b) for b in pack.get("benchmarks") or []
+            if band_digest(b) is not None and (ids is None or b["id"] in ids)}
+
+
+def stale_ids(pack: dict, rows: list) -> list:
+    """Ids of stored trial or cost rows not scored against the pack's current declaration (or not in the pack)."""
+    cur = {b["id"]: b for b in pack.get("benchmarks") or []}
+    out = []
+    for r in rows:
+        b = cur.get(r.get("id"))
+        if b is None or (band_digest(b) is not None and r.get("band_sha256") != band_digest(b)):
+            out.append(r.get("id"))
+    return out
+
+
+def fitted_problems(fitted: dict, pack: dict) -> list[str]:
+    """["refit required: <ids>"] when fitted values were fitted against other declarations of the pack's fit targets
+    (or carry none); else []."""
+    from toolkit.engines.benchmark import fit_targets
+    want = band_declarations(pack, fit_targets(pack))
+    have = (fitted or {}).get("band_declarations") or {}
+    ids = sorted(k for k, v in want.items() if have.get(k) != v)
+    return [f"refit required: {', '.join(ids)}"] if ids else []
+
+
+def engine_fitted_problems(engine) -> list[str]:
+    """fitted_problems for an engine's own fitted file (`fitted_path`) against its own pack; [] when it has none."""
+    import yaml
+    fp = getattr(engine, "fitted_path", None)
+    if not fp or not os.path.exists(fp):
+        return []
+    from toolkit.spec import engine_parameters as EP
+    pack, _ = EP.benchmark_pack(engine)
+    if pack is None:
+        return []
+    return fitted_problems(yaml.safe_load(open(fp)) or {}, pack)
 
 
 def main(argv=None) -> int:

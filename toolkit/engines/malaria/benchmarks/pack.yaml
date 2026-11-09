@@ -146,7 +146,8 @@ benchmarks:
   - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)", target: 0.83,
      band: [0.71, 0.98], source: "C21 Pryce 2018 Cochrane CD000363.pub3",
      published: {lower: 0.71, upper: 0.98, level: 0.95, scale: ratio, table: "abstract; Analysis 1.6 (ITN vs no nets, P. falciparum prevalence, 6 trials)"},
-     estimand_type: risk_ratio,
+     estimand_type: risk_ratio, diagnostic: "not reported in the abstract (varies by trial)",
+     age_band: "mixed: 0-59 months, 15 and under, under 10, all ages (2 trials); one trial not identified",
      estimand: {type: ratio, num: coch_pyr, den: coch_none,
                 values: [{path: windows.m12.pfpr_lt5, weight: 1, label: "Halbluetzel 1996 (0-59 months)"},
                          {path: windows.m12.pfpr_le15, weight: 1, label: "Moyou-Somo 1995 (15 and under)"},
@@ -157,7 +158,8 @@ benchmarks:
   - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.48, 0.64],
      source: "C22 Pryce 2018",
      published: {lower: 0.48, upper: 0.64, level: 0.95, scale: ratio, table: "abstract; Analysis 1.2 (ITN vs no nets, uncomplicated P. falciparum episodes, 5 trials)"},
-     estimand_type: rate_ratio,
+     estimand_type: rate_ratio, diagnostic: "not reported in the abstract (varies by trial)",
+     age_band: "not reported in the abstract (varies by trial)",
      estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
   # v0.2 basis fix: the trial's 0.37 and 0.40 are PBO LLIN alone vs standard LLIN (Table 2; the factorial model
   # has an interaction term, so its main-effect ORs equal the single-arm comparisons). v0.1 pooled over IRS arms.
@@ -184,7 +186,7 @@ benchmarks:
   - {id: B11, metric: "Dual-AI vs pyrethroid nets, incidence HR 0-24 m (engine: rate ratio)", target: 0.54, band: [0.42, 0.70],
      source: "C20 Accrombessi 2023 Lancet (PMID 36706778)",
      published: {lower: 0.42, upper: 0.7, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr-pyrethroid LLIN vs pyrethroid-only, 2 years"},
-     estimand_type: hazard_ratio, age_band: "cohort of children about 6 months to 10 years",
+     estimand_type: hazard_ratio, diagnostic: "not reported in the abstract", age_band: "cohort of children about 6 months to 10 years",
      estimand_mapping: "the trial reports a hazard ratio of malaria case incidence over 2 years of cohort follow-up;
        the engine compares the arms' under-5 incidence rates over the same 24 months, read as a rate ratio that
        stands for the hazard ratio",
@@ -193,6 +195,7 @@ benchmarks:
      source: "C23 Pryce 2022 Cochrane CD012688.pub3",
      published: {lower: 0.42, upper: 0.88, level: 0.95, scale: ratio, table: "abstract; Summary of findings 1; Analysis 1.5 (4 cRCTs, Corbel 2012 excluded)"},
      estimand_type: risk_ratio, diagnostic: "blood smear or RDT",
+     age_band: "not reported for the pooled prevalence analysis",
      estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m12.pfpr_6m14y}}
   - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.61, 1.23],
      source: "C23 Pryce 2022",
@@ -232,22 +235,33 @@ benchmarks:
   # child-season / 4 cycles / 0.88 mean cycle coverage = $1.128 per delivered dose.
   - {id: B17, metric: "SMC $ per DALY averted (reference setting)", target: 38.37, band: [7.67, 191.9],
      source: "C28 Gilmartin 2021",
-     band_override: {band: [7.67, 191.9], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     band_override: {band: [7.67, 191.9], status: pending_source_check,
+       reason: "the band is the target divided and multiplied by 5; the source's own interval was not checked
+         against it in F6 S1-2 (trial benchmarks only)"},
+     estimand_type: cost_per_outcome,
      estimand: {type: cost_per_outcome, num: ce_smc, den: ce_none,
      value: per_capita_all.dalys, costs: {smc_doses: 1.128}}}
   - {id: B18, metric: "ITN vs none $ per DALY averted (reference setting)", target: 44.51, band: [8.90, 222.6],
      source: "C29 Conteh 2021",
-     band_override: {band: [8.90, 222.6], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     band_override: {band: [8.90, 222.6], status: pending_source_check,
+       reason: "the band is the target divided and multiplied by 5; the source's own interval was not checked
+         against it in F6 S1-2 (trial benchmarks only)"},
+     estimand_type: cost_per_outcome,
      estimand: {type: cost_per_outcome, num: ce_pyr, den: ce_none,
      value: per_capita_all.dalys, costs: {nets_given: 1.618}}}
   - {id: B19, metric: "IRS vs none $ per DALY averted (reference setting)", target: 25.16, band: [5.03, 125.8],
      source: "C29 Conteh 2021",
-     band_override: {band: [5.03, 125.8], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     band_override: {band: [5.03, 125.8], status: pending_source_check,
+       reason: "the band is the target divided and multiplied by 5; the source's own interval was not checked
+         against it in F6 S1-2 (trial benchmarks only)"},
+     estimand_type: cost_per_outcome,
      estimand: {type: cost_per_outcome, num: ce_irs, den: ce_none,
      value: per_capita_all.dalys, costs: {irs_sprayed: 10.32}}}
   - {id: B20, metric: "Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)", target: 19.0,
-     band: [3.8, 95.0], source: "C19 Mosha 2022",
-     band_override: {band: [3.8, 95.0], reason: "no published interval: the band is the target divided and multiplied by 5"},
+     band: [1.0, 105.0], source: "C19 Mosha 2022",
+     published: {lower: 1.0, upper: 105.0, level: 0.95, scale: currency_per_outcome, unit: "USD per DALY averted",
+                 table: "abstract, Findings: chlorfenapyr LLIN, public-provider perspective, 2 years (95% UI)"},
+     estimand_type: cost_per_outcome,
      estimand: {type: cost_per_outcome, num: cer_dual, den: cer_pyr,
      value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
 

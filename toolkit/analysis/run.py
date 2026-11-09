@@ -116,6 +116,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S = Store(run_dir, spec.sha256, st == "signed", _engine_info(eng), spec.settings_sha256,
               spec.engine_choice_sha256)
     holder["S"] = S
+    from toolkit.engines.benchmark_sources import engine_fitted_problems
+    stale = engine_fitted_problems(eng)          # F6 S1-2: never an analysis on fitted values the pack no longer backs
+    if stale:
+        raise AnalysisBlocked("fitted_values", [], reason="; ".join(stale))
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
@@ -375,7 +379,7 @@ def _toy_pack() -> dict:
             "arms": {"none": {"setting": "s", "package": {}}, "a": {"setting": "s", "package": {"a": 1}},
                      "b": {"setting": "s", "package": {"b": 1}}, "ab": {"setting": "s", "package": {"a": 1, "b": 1}}},
             "benchmarks": [{"id": "T2", "metric": "interaction", "target": 1.0, "band": [0.8, 1.25],
-                            "band_override": {"band": [0.8, 1.25], "reason": "self-test toy: no published source"},
+                            "band_override": {"band": [0.8, 1.25], "level": 0.95, "reason": "self-test toy: no published source"},
                             "estimand": {"type": "interaction_or", "a11": "ab", "a10": "a", "a01": "b", "a00": "none",
                                          "value": "windows.w.prev"}}]}
 
@@ -591,6 +595,25 @@ def _self_test() -> int:
                "R23 a correction bearing on the plan blocks the run before anything is published (Codex P1-6)")
         finally:
             EmulatorModel.predict = orig
+        # F6 S1-2: fitted values fitted against other band declarations of the engine's pack block the analysis
+        from toolkit.engines.contract import ToyEngine
+        from toolkit.spec import engine_parameters as EPm
+        fpath = os.path.join(d, "stale_fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(fpath, "w"))
+        stale_pack = dict(_toy_pack(), fit_joint={"targets": ["T2"]})
+        orig_bp = EPm.benchmark_pack
+        try:
+            ToyEngine.fitted_path = fpath
+            EPm.benchmark_pack = lambda e: (stale_pack, "pack.yaml")
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            ok(False, "R23b stale fitted values block the analysis")
+        except AnalysisBlocked as e:
+            blk = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "fitted_values" and blk["reason"] == "refit required: T2",
+               f"R23b stale fitted values block the analysis before the joint calibration or batch: {blk['reason']}")
+        finally:
+            del ToyEngine.fitted_path
+            EPm.benchmark_pack = orig_bp
         _self_test_round2(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)

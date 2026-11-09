@@ -890,11 +890,15 @@ def _cli(argv) -> int:
     ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
+    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
+    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
+    from toolkit.engines.benchmark_sources import fitted_problems
+    if os.path.exists(fp) and fitted_problems(f, pack):      # F6 S1-2: fitted values the pack's bands no longer back
+        print("; ".join(fitted_problems(f, pack)))
+        return 2
     if a.only:
         keep = set(a.only.split(","))
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
-    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
-    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
     fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
     out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds)
