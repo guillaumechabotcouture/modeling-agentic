@@ -233,7 +233,8 @@ def _factor(it: dict, prices: dict):
 
 
 PER = {"per_person": "per person", "per_eligible": "per eligible person", "per_reached": "per person reached",
-       "per_commodity": "per person covered", "fixed": "fixed", "per_outcome": "per outcome"}
+       "per_commodity": "per person covered", "fixed": "per unit receiving it", "per_unit": "per unit receiving it",
+       "per_outcome": "per outcome"}
 
 
 def _cost_items(opts: dict) -> list:
@@ -270,7 +271,7 @@ def _cost_items(opts: dict) -> list:
                     "extra": extra, "factor": f, "base_value": base, "per_person": per, "per_label": PER.get(basis, basis),
                     "why_no_per_person": None if per is not None else
                     ("priced per outcome (a model output)" if basis == "per_outcome" else "a fixed amount"
-                     if basis == "fixed" else "the price year has no index entry" if f is None else "not computable")})
+                     if basis in ("fixed", "per_unit") else "the price year has no index entry" if f is None else "not computable")})
     return out
 
 

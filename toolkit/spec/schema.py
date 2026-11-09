@@ -38,7 +38,15 @@ docs/design/v2-spec-and-analysis.md §1):
                                        # plan can afford (cost lower bound above the envelope in every unit)
       engine_map: {c1: {engine_component: value}}
       prices: {...}
-      cost_items: [...]
+      cost_items:                          # toolkit/alloc/costs.py validates them (fail closed)
+        - {id, component, value, price_year, price_rule, basis, includes: [parts the price covers], ...}
+                                       # basis: per_person | per_eligible | per_reached | per_commodity | per_outcome
+                                       # | per_unit (F6 S1-3): a fixed amount per unit whose package has the
+                                       # component (setup, supervision, capacity), whatever its population; `fixed`
+                                       # is its older name. Two items of one component whose includes overlap are
+                                       # refused unless one states not_double_counted: {<other id>: "<reason>"}.
+                                       # Incremental per_outcome costs floored at zero are counted in
+                                       # analysis/point.yaml cost_floors and stated in results.md.
     objective:
       outcome: dalys                       # an engine per-capita output
       sense: avert                         # benefit = comparator outcome - package outcome

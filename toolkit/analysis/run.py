@@ -296,6 +296,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- point and optimum
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     events0 = list(A.last_events)
+    from toolkit.alloc import costs as acosts
+    floors0 = acosts.floor_report(A.last_cost_floors, A.alloc)     # F6 S1-3: reported, never read as a real cost
     sol = A.solve(ben0, cost0)
     reserve = pre = None
     if (spec["uncertainty"].get("affordability") or {}).get("enforce"):
@@ -325,6 +327,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                "z": z0[i], **({"calibration_flag": A.flagged[i]["reason"],
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
+    point["cost_floors"] = floors0
     if reserve is not None:
         point["reserve"] = reserve
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])

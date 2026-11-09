@@ -41,19 +41,32 @@ sections of the template spec):
         price_year: 2021
         price_rule: index                 # index: base-currency index; local_index: through the local currency
                                           # (source-year rate, local inflation, base-year rate); as_published
-        basis: per_eligible               # per_person | per_eligible | per_reached | per_commodity | fixed
+        basis: per_eligible               # per_person | per_eligible | per_reached | per_commodity | per_unit
                                           # | per_outcome (a model output: outcome: <name>, incremental:
                                           #   true for the package minus the package without this component)
+                                          # per_unit (F6 S1-3; `fixed` is the older name): a fixed amount per
+                                          #   unit whose package has the component (setup, supervision,
+                                          #   capacity), whatever its population
         times: 4                          # e.g. cycles per year
         years: 3                          # charged per year over the window (default 1: once)
         share: 1.0                        # share of the basis population charged (e.g. sprayed structures)
         includes: [drug, delivery]        # what the value covers: two items of one component may not overlap
+        not_double_counted:               # optional: why an overlap with another item of the component is
+          other_item_id: "<reason>"       #   not a double count (a reason of at least 10 characters)
         people_per_commodity: 1.8         # per_commodity only
+
+Floored increments: an incremental per_outcome cost is floored at zero when the
+package has less of the outcome than the package without the component (prevention
+in the package removes cases). `cost_matrix(..., floors=[])` records each one and
+`floor_report()` counts them as units x packages, with a statement that they are
+floors, not costs or savings.
 
 Validation (fail closed, before computing):
 - unknown components and missing population fields;
 - an index price rule without index entries for its price year and the base year;
-- two items of one component whose `includes` overlap (a double count);
+- two items of one component whose `includes` overlap (a double count), unless
+  one of them states why under `not_double_counted: {<other id>: <reason>}`;
+- a per_unit item charged on a population (it is charged once per unit);
 - for a targeted component (one with an eligible population), any
   population-based cost charged on another population, whatever its basis,
   unless the item gives `charged_beyond_eligible: <reason>`; so a targeted
@@ -75,7 +88,9 @@ import tempfile
 
 import yaml
 
-BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "fixed", "per_outcome")
+BASES = ("per_person", "per_eligible", "per_reached", "per_commodity", "per_unit", "fixed", "per_outcome")
+PER_UNIT = ("per_unit", "fixed")     # F6 S1-3: a fixed amount per unit receiving the component (`fixed`: older name)
+MIN_REASON = 10
 RULES = ("index", "local_index", "as_published")
 
 
@@ -190,6 +205,9 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
                 errs.append(f"cost_items.{iid}: per_outcome needs `outcome: <model output name>`")
             if it.get("population") is not None:
                 errs.append(f"cost_items.{iid}: per_outcome is charged on a model output, not a population")
+        if basis in PER_UNIT and it.get("population") is not None:
+            errs.append(f"cost_items.{iid}: {basis} is charged once per unit receiving {c}, not on a population; "
+                        "drop `population`, or use per_person")
         if basis == "per_commodity" and not (_num(it.get("people_per_commodity")) or 0) > 0:
             errs.append(f"cost_items.{iid}: per_commodity needs people_per_commodity > 0")
         for k in ("times", "years", "share"):
@@ -198,11 +216,33 @@ def validate(spec: dict, unit_fields: set[str] | None = None) -> list[str]:
         if not isinstance(it.get("includes"), list) or not it["includes"]:
             errs.append(f"cost_items.{iid}: includes must list what the value covers (e.g. [drug, delivery])")
     for c, its in by_comp.items():
+        overlaps = set()
         for a, b in itertools.combinations(its, 2):
             both = sorted(set(map(str, a.get("includes") or [])) & set(map(str, b.get("includes") or [])))
-            if both:
-                errs.append(f"cost_items.{a.get('id')} and {b.get('id')} both include {', '.join(both)} for {c}: "
-                            "a double count")
+            if not both:
+                continue
+            ia, ib = str(a.get("id")), str(b.get("id"))
+            overlaps |= {(ia, ib), (ib, ia)}
+            why = [str((x.get("not_double_counted") or {}).get(o) or "").strip()
+                   for x, o in ((a, ib), (b, ia)) if isinstance(x.get("not_double_counted"), dict)]
+            if not any(len(w) >= MIN_REASON for w in why):
+                errs.append(f"cost_items.{ia} and {ib} both include {', '.join(both)} for {c}: a double count; "
+                            f"remove the part from one item, or state under `not_double_counted: {{{ib}: <reason>}}` "
+                            f"in {ia} why the two prices do not cover the same thing")
+        for it in its:
+            ndc = it.get("not_double_counted")
+            if ndc is None:
+                continue
+            if not isinstance(ndc, dict):
+                errs.append(f"cost_items.{it.get('id')}: not_double_counted must map another item's id to a reason")
+                continue
+            for o, w in ndc.items():
+                if (str(it.get("id")), str(o)) not in overlaps:
+                    errs.append(f"cost_items.{it.get('id')}: not_double_counted names {o}, which is not an item of {c} "
+                                "whose includes overlap this one's")
+                elif len(str(w or "").strip()) < MIN_REASON:
+                    errs.append(f"cost_items.{it.get('id')}: not_double_counted.{o} needs a reason of at least "
+                                f"{MIN_REASON} characters")
     used = set().union(*pk.values()) if pk else set()
     for c in sorted(used - set(by_comp)):
         if not str((comps.get(c) or {}).get("cost_free") or "").strip():
@@ -223,9 +263,11 @@ def _factor(it: dict, prices: dict) -> float:
     return idx[b] / idx[py]
 
 
-def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None) -> float:
+def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None,
+              floors: list | None = None) -> float:
     """One item's cost for one unit over the window, in base-year prices. A per_outcome item
-    needs the package and `outcome(unit, package) -> {name: value}` (the run's model)."""
+    needs the package and `outcome(unit, package) -> {name: value}` (the run's model). An
+    incremental increment below zero is floored, and recorded in `floors` when given."""
     comps, pops = spec["components"], spec["units"]["populations"]
     cd = comps[it["component"]] or {}
     basis = it["basis"]
@@ -245,9 +287,12 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             b = _num(outcome(unit, base).get(it["outcome"]))
             if b is None:
                 raise ValueError(f"outcome {it['outcome']} for package {base} is not a number")
+            if v - b < 0 and floors is not None:
+                floors.append({"unit": str(unit.get(spec["units"]["id"])), "package": package, "item": it["id"],
+                               "increment": v - b})
             v = max(v - b, 0.0)
         q = v
-    elif basis == "fixed":
+    elif basis in PER_UNIT:
         q = 1.0
     else:
         pop_name = cd["eligible"] if basis in ("per_eligible", "per_reached") else it.get("population", "total")
@@ -260,9 +305,10 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             * float(it.get("times", 1.0)) * float(it.get("years", 1.0)))
 
 
-def cost_matrix(spec: dict, units: list[dict], outcome=None) -> dict:
+def cost_matrix(spec: dict, units: list[dict], outcome=None, floors: list | None = None) -> dict:
     """{unit_id: {package: {"total": $, "items": {item_id: $}}}} in base-year prices.
-    `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items."""
+    `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items;
+    `floors`, a list, receives each incremental per_outcome cost floored at zero."""
     errs = validate(spec, set(units[0]) if units else None)
     if errs:
         raise ValueError("invalid cost spec: " + "; ".join(errs))
@@ -288,10 +334,28 @@ def cost_matrix(spec: dict, units: list[dict], outcome=None) -> dict:
                      if it["component"] in cs}
             for it in out_items:
                 if it["component"] in cs:
-                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk)
+                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk, floors)
             row[name] = {"total": sum(items.values()), "items": items}
         out[str(u[uid])] = row
     return out
+
+
+def floor_report(floors: list, spec: dict | None = None) -> dict:
+    """Floored per-outcome increments as units x packages (F6 S1-3), with a statement for readers. `items`: the
+    spec's incremental per_outcome items (the ones a floor can apply to)."""
+    items = sorted(str(it["id"]) for it in (spec or {}).get("cost_items") or []
+                   if it.get("basis") == "per_outcome" and it.get("incremental"))
+    pairs = {(f["unit"], f["package"]) for f in floors}
+    by_item: dict = {}
+    for f in floors:
+        by_item.setdefault(f["item"], set()).add((f["unit"], f["package"]))
+    n = len(pairs)
+    return {"items": items, "n_unit_packages": n, "by_item": {k: len(v) for k, v in sorted(by_item.items())},
+            # number-free, so results.md can carry it beside the count's claim
+            "statement": ("In each of these combinations the package has less of the outcome than the same package "
+                          "without the component, so the increment is below zero and is charged as nothing. These "
+                          "are floors, not a cost or a saving." if n else
+                          "No per-outcome cost increment was floored at zero.")}
 
 
 def load_units(spec: dict, base_dir: str, csv_path: str | None = None) -> list[dict]:

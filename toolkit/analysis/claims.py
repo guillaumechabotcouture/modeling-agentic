@@ -63,6 +63,9 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
         if point["reserve"].get("value_given_up_pct") is not None:      # undefined when the objective is not positive
             cl.append(_c("reserve.value_given_up_pct", "percentage", arts["point"], "data.reserve.value_given_up_pct",
                          "%"))
+    if (point.get("cost_floors") or {}).get("items"):     # F6 S1-3: incremental per-outcome costs floored at zero
+        cl.append(_c("cost.floored_unit_packages", "count", arts["point"], "data.cost_floors.n_unit_packages",
+                     "unit x package combinations"))
     for oc in A.outcomes[1:]:
         cl.append(_c(f"averted.{oc}.point", "scalar", arts["point"], f"data.averted.{oc}", oc))
         cl.append(_c(f"averted.{oc}.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{oc}.median", oc,
@@ -165,6 +168,10 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc) -> str:
     L += [f"| {c} | [CLAIM:mix.{c}] |" for c in s["options"]["components"]]
     L += ["", "| Package | Units |", "|---|---|"]
     L += [f"| {k} | {v} |" for k, v in sorted(point["packages"].items(), key=lambda kv: -kv[1])]
+    fl = point.get("cost_floors") or {}
+    if fl.get("items"):
+        L += ["", f"Per-outcome cost increments ({', '.join(fl['items'])}) floored at zero: "
+              f"[CLAIM:cost.floored_unit_packages] unit x package combinations. {fl['statement']}"]
     rule = point.get("rule") or []
     if rule:
         L += ["", "### Decision rule", "",
