@@ -2612,6 +2612,29 @@ def _self_test() -> int:
                and "validated" in open(wp).read(),
                f"T{name[1:]} a repair {'with no budget' if outcome is None else 'that fails'} leaves no deliverable "
                f"report with acceptance language ({s}, report.md exists: {os.path.exists(rp)})")
+        # T92: the quarantine move goes through lib.safe_io: a planted link at report_withheld.md is replaced,
+        # never written through, and a linked report.md is refused, never moved.
+        d92, o92 = os.path.join(td, "t92"), os.path.join(td, "t92out")
+        os.makedirs(d92)
+        os.makedirs(o92)
+        open(os.path.join(o92, "v"), "w").write("untouched")
+        open(os.path.join(d92, "report.md"), "w").write("rejected report\n")
+        os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report_withheld.md"))
+        try:
+            _quarantine_report(d92)
+            moved = (not os.path.exists(os.path.join(d92, "report.md"))
+                     and not os.path.islink(os.path.join(d92, "report_withheld.md"))
+                     and open(os.path.join(d92, "report_withheld.md")).read() == "rejected report\n")
+            os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report.md"))
+            try:
+                _quarantine_report(d92)
+                refused = False
+            except (ValueError, OSError):
+                refused = True
+        except Exception as e:  # noqa: BLE001
+            moved, refused = f"raised {type(e).__name__}: {e}", False
+        ok(moved is True and refused and open(os.path.join(o92, "v")).read() == "untouched",
+           f"T92 the report quarantine never follows a link ({moved}, refused a linked report: {refused})")
         # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
         # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
         judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",
