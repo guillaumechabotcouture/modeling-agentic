@@ -499,12 +499,22 @@ def _self_test() -> int:
                 (r01, None, True, "declared rule, no affordability result"),
                 (r01, aff(3, r01, True), True, "verdict the counts do not support"),
                 (r01, aff(0, r01, True, draws=0), True, "declared rule judged on zero draws"),
+                (r01, dict(aff(0, r01, True), share_over_budget=0.75), True, "share inconsistent with the counts"),
+                (r01, dict(aff(0, r01, True), share_over_budget=None), True, "share missing"),
+                (r01, dict(aff(0, r01, True), draws=True), True, "a boolean draw count"),
+                (r01, dict(aff(0, r01, True), draws_over_budget=False), True, "a boolean over-budget count"),
+                (r01, "x", True, "affordability not a mapping"),
                 (r01, aff(0, r01, True), False, "rule met"),
                 (None, aff(3, None, None), False, "no rule declared: reported, not judged"),
                 (None, None, False, "no rule declared, older artifact without affordability")):
             open(os.path.join(d, SPEC), "w").write(spec_text + (yaml.safe_dump({"uncertainty": {"affordability": spec_rule}})
                                                                 if spec_rule else ""))
             complete_run(d, unc=dict(base_u, **({"affordability": a_} if a_ is not None else {})))
+            if label == "rule met":      # the artifact's total draws must equal the affordability count
+                complete_run(d, unc=dict(base_u, draws=0, affordability=a_))
+                f0 = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
+                ok(bool(f0), f"K13 affordability: counts on 4 draws in an artifact of 0 draws is a finding {f0[:1]}")
+                complete_run(d, unc=dict(base_u, affordability=a_))
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
             ok(bool(f) == want, f"K13 affordability, {label}: finding {bool(f)} (want {want}) {f[:1]}")
         open(os.path.join(d, SPEC), "w").write(spec_text)

@@ -456,6 +456,7 @@ def _self_test() -> int:
            "R5d claims: the share over budget, and cost quantiles labelled with the interval (Codex S1-1 P2)")
         # Codex S1-1 P2: costs that move in each draw (a drawn cost multiplier), checked draw by draw against an
         # independent replay of the same draws
+        import numpy as np
         from toolkit.analysis import uncertainty as U
         A5 = R["_A"]
         saved = copy.deepcopy(A5.spec.raw["uncertainty"])
@@ -473,6 +474,10 @@ def _self_test() -> int:
                 _o, _b, c5 = A5.evaluate(th, zs, noise=noise, cost_mult=mult)
                 want.append(sum(c5[i][R["point"]["plan"][i]] for i in A5.ids))
             n_over = sum(c > A5.budget * (1 + 1e-9) for c in want)
+            fq = u5.get("fixed_plan_cost") or {}
+            ok(abs(fq.get("median", -1) - float(np.median(want))) <= 1e-9 * max(want)
+               and abs(fq.get("ci_high", -1) - float(np.percentile(want, 97.5))) <= 1e-9 * max(want),
+               "R5f the cost quantiles are the replayed draws' own quantiles")
             ok(u5.get("per_draw_cost") == want and len(set(round(c, 6) for c in want)) > 1
                and u5["draws_over_budget"] == n_over and u5["rule_met"] == (n_over / 8 <= 0.2)
                and u5["budget_allocatable"] == A5.budget,

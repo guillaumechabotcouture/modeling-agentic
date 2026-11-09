@@ -378,6 +378,8 @@ def _self_test() -> int:
            "U10 share 0.5 against a rule of at most 0.5: met")
         ok(aff([100.0 * (1 + 1e-12)], 100.0, None, 0.95)["draws_over_budget"] == 0,
            "U11 a cost equal to the budget up to rounding is not over budget")
+        ok(aff([2e-10], 1e-10, None, 0.95)["draws_over_budget"] == 1,
+           "U11b the tolerance is relative to the budget, as the solver's (no absolute floor): 2e-10 is over 1e-10")
         for label, v in (("no draws", []), ("a non-finite cost", [90.0, float("nan")])):
             try:
                 aff(v, 100.0, None, 0.95)
