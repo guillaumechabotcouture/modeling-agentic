@@ -384,14 +384,14 @@ def _self_test() -> int:
     def kinds(d):
         return {x["kind"] for x in gate_findings(d)}
 
-    def complete_run(d, cal=None, drop_kind=None, finalize=True):
+    def complete_run(d, cal=None, drop_kind=None, finalize=True, unc=None):
         """A minimal completed run: every expected artifact kind and deliverable role."""
         S = Store(d, sha256(os.path.join(d, SPEC)), True, {"name": "t", "version": "1", "card_sha256": "x"})
         open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
         pay = {"engine": {"card": {}, "parameters": []}, "batch": {"evaluation": "direct"},
                "calibration": cal or {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {}},
                "point": {"plan": {}, "averted": {}, "cost_allocated": 0, "mix": {}, "solver": {}},
-               "uncertainty": {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
+               "uncertainty": unc or {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
                "claims": {"n_claims": 0, "unresolved": []}}
@@ -453,6 +453,18 @@ def _self_test() -> int:
             complete_run(d, cal=cal)
             f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_calibration"]
             ok(f and why in f[0]["claim"], f"K11 calibration gated (Codex P1-8): {why}")
+        # F6 S1-1: a plan that fails the spec's affordability rule is a gate finding; no rule, or a met rule, is not
+        base_u = {"draws": 4, "covers": [], "excludes": [], "label": "", "fixed_plan": {}}
+        for aff, want in (({"draws": 4, "draws_over_budget": 3, "share_over_budget": 0.75, "budget_allocatable": 1.0,
+                            "rule": {"max_share_over_budget": 0.1}, "rule_met": False}, True),
+                          ({"draws": 4, "draws_over_budget": 3, "share_over_budget": 0.75, "budget_allocatable": 1.0,
+                            "rule": None, "rule_met": None}, False),
+                          ({"draws": 4, "draws_over_budget": 0, "share_over_budget": 0.0, "budget_allocatable": 1.0,
+                            "rule": {"max_share_over_budget": 0.1}, "rule_met": True}, False)):
+            complete_run(d, unc=dict(base_u, affordability=aff))
+            f = [x for x in gate_findings(d) if x["kind"] == "analysis_contract_affordability"]
+            ok(bool(f) == want and (not f or "3 of 4" in f[0]["claim"]),
+               f"K13 affordability rule {aff['rule']} with share {aff['share_over_budget']}: finding {bool(f)} (want {want})")
         # engine choice (engine: auto): its hash is in the manifest and in every artifact header
         cp = os.path.join(d, "engine_choice.json")
         json.dump({"engine": {"ref": "x:Y"}, "why": "w"}, open(cp, "w"))

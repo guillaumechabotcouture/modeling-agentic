@@ -1465,6 +1465,17 @@ def _self_test() -> int:
             "SP7 an envelope below its fixed costs is refused")
         bad(lambda r: r["uncertainty"].update(excluded=[{"kind": "costs", "reason": "toy"}]), "neither declared",
             "SP8 lesson 6: an uncertainty source neither declared nor excluded with a reason is refused")
+        # F6 S1-1: the affordability rule is part of the signed spec; malformed rules are refused
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share_over_budget": 1.5}),
+            "uncertainty.affordability", "SP8c an affordability share outside [0, 1) is refused")
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share": 0.1}), "uncertainty.affordability",
+            "SP8d an affordability rule with an unknown key is refused")
+        bad(lambda r: r["uncertainty"].update(affordability=[0.1]), "uncertainty.affordability",
+            "SP8e an affordability rule that is not a mapping is refused")
+        r_ok = copy.deepcopy(s.raw)
+        r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1}
+        ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
+           "SP8f a well-formed affordability rule validates")
         # a list column whose empty list is written as a declared token (a blank cell is refused as
         # attribute_column_empty, so an empty list needs an explicit marker)
         ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}

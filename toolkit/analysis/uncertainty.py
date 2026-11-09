@@ -336,6 +336,29 @@ def _self_test() -> int:
             p = write_report(os.path.realpath(d), rep)
             ok((yaml.safe_load(open(p)) or {}).get("scalar_outputs", {}).get("a", {}).get("n") == 4000,
                "U5 write_report publishes uncertainty_report.yaml, which reads back")
+    # F6 S1-1: the fixed plan's cost across the draws against the allocatable budget
+    aff = globals().get("affordability")
+    ok(callable(aff), "U6 affordability() exists")
+    if callable(aff):
+        r = aff([90.0, 110.0, 120.0, 95.0], 100.0, None, 0.9)
+        ok(r["draws"] == 4 and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.5) < 1e-12
+           and r["rule_met"] is None and r["budget_allocatable"] == 100.0,
+           f"U7 two of four draws over budget, share 0.5; no rule declared: rule_met is None ({r})")
+        fc = r.get("fixed_plan_cost") or {}
+        ok(fc.get("level") == 0.9 and fc.get("ci_low") <= fc.get("median") <= fc.get("ci_high"),
+           "U8 the fixed plan's cost quantiles at the declared level")
+        ok(aff([90.0, 110.0, 120.0, 95.0], 100.0, {"max_share_over_budget": 0.1}, 0.95)["rule_met"] is False,
+           "U9 share 0.5 against a rule of at most 0.1: the rule is not met")
+        ok(aff([90.0, 110.0, 120.0, 95.0], 100.0, {"max_share_over_budget": 0.5}, 0.95)["rule_met"] is True,
+           "U10 share 0.5 against a rule of at most 0.5: met")
+        ok(aff([100.0 * (1 + 1e-12)], 100.0, None, 0.95)["draws_over_budget"] == 0,
+           "U11 a cost equal to the budget up to rounding is not over budget")
+        for label, v in (("no draws", []), ("a non-finite cost", [90.0, float("nan")])):
+            try:
+                aff(v, 100.0, None, 0.95)
+                ok(False, f"U12 {label} fails closed")
+            except ValueError:
+                ok(True, f"U12 {label} fails closed")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

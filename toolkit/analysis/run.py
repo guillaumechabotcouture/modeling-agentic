@@ -442,6 +442,11 @@ def _self_test() -> int:
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
+        af = R["uncertainty"].get("affordability") or {}
+        ok(af.get("draws") == R["uncertainty"]["draws"] and 0.0 <= af.get("share_over_budget", -1) <= 1.0
+           and (af.get("fixed_plan_cost") or {}).get("median") is not None
+           and abs(af.get("budget_allocatable", 0) - 9000) < 1e-6,
+           f"R5b the fixed plan's cost is recorded in every draw and its share over budget reported (F6 S1-1): {af}")
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
