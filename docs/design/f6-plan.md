@@ -177,7 +177,7 @@ runs for a sample of LGAs at the boundary values.
 | Step | Owner | Target |
 |---|---|---|
 | O1, O2, O4 | owner | O4 this week; O1 and O2 before Stage 2 |
-| O3 | owner | decided: keep within budget. The harness mode that meets the rule (a budget reserve, `uncertainty.affordability.enforce`) is in PR-PENDING (S1-1b); the owner sets `max_share_over_budget` at sign-off |
+| O3 | owner | decided: keep within budget. The harness mode that meets the rule (a budget reserve, `uncertainty.affordability.enforce`) is in #157 (S1-1b); the owner sets `max_share_over_budget` at sign-off |
 | S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 |
 | S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 |
 | S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 |
