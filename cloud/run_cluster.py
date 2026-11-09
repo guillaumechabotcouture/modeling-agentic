@@ -13,10 +13,10 @@
     python cloud/run_cluster.py <config.py> keeper            # reconcile, then start missing helpers for the run
                                                               # cluster clusters.json records (after exit 3 or 5)
     python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke)
-    python cloud/run_cluster.py <config.py> smoke-watch --pid P [--minutes 20]
-                                                              # a smoke's wall-clock bound: wait for launcher P and
-                                                              # every cluster of the config's names; past the limit,
-                                                              # stop them by id
+    python cloud/run_cluster.py <config.py> smoke-run [--minutes 20] [--interrupt-on TEXT]
+                                                              # a smoke: `launch` as a child under a wall-clock bound;
+                                                              # waits for it and every cluster it tagged; at the limit
+                                                              # terminates and reaps it, then stops them by id
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
@@ -46,7 +46,9 @@ error as a failed launch shut the clusters down). `clusters.json` names every cl
 id, the launch time, a `status` and this invocation's token, from the moment the run cluster exists. The token
 is the first line printed (`invocation <token>`), or MA_LAUNCH_INVOCATION when the watchdog sets it. One launch,
 `keeper` or `relaunch` of a config runs at a time (a lock in its out_dir); a refusal (already running, preflight,
-lock held) writes no record, so an earlier launch's record stays as it was.
+lock held) writes no record, so an earlier launch's record stays as it was. Every cluster is created with the
+Coiled tag ma-invocation=<token> (and the config's cluster_timeout); a constructor that attached to a cluster
+another invocation created (another machine's launch of the config) is refused before any record.
   0 launched: every run listed by the scheduler, overflow pool and keeper confirmed (status "launched").
   1 failed: this invocation submitted nothing. Stopping clusters is authorized only by a clusters.json whose
     `invocation` is this invocation's token and whose status is "failed"; then stop the ids it names. Any other
@@ -141,6 +143,9 @@ class RunConfig:
     # limit), and a run whose upload failed is held for `collect` at most hold_hours
     run_timeout_hours: float | None = None
     hold_hours: float = 24.0
+    # Coiled's cluster_timeout (coiled.Cluster(cluster_timeout=...), "40 minutes"): a cluster is shut down that long
+    # after it starts, busy or not. "" for none (a real run's length is not known in advance)
+    cluster_timeout: str = ""
 
     def __post_init__(self):
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
@@ -384,6 +389,38 @@ def launch_record(cfg, worker, commit, launch_id, cluster_id, code, pipeline) ->
 
 # ---- commands ---------------------------------------------------------------------------
 
+INVOCATION_TAG = "ma-invocation"     # Coiled cluster tag: the invocation that created the cluster (round 4, P1)
+
+
+def _lifetime(cfg, inv) -> dict:
+    """Constructor arguments every cluster of a launch gets: its invocation tag, and Coiled's cluster_timeout."""
+    return {"tags": {INVOCATION_TAG: inv}, **({"cluster_timeout": cfg.cluster_timeout} if cfg.cluster_timeout else {})}
+
+
+def _tag_of(rec: dict):
+    tags = rec.get("tags")
+    if isinstance(tags, list):           # the API may give [{"key": k, "value": v}]
+        tags = {t.get("key"): t.get("value") for t in tags if isinstance(t, dict)}
+    return tags.get(INVOCATION_TAG) if isinstance(tags, dict) else None
+
+
+def verify_created(name, cid, inv, lister=None) -> None:
+    """coiled.Cluster(name=...) attaches to a live cluster of that name instead of creating one (another launcher,
+    on another machine, may have created it since this one checked). A cluster is this invocation's only when its
+    tag names this invocation; otherwise this invocation refuses before recording the id anywhere, so it holds no
+    cleanup authority over it (Codex round 4, P1)."""
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    cs = lister()
+    items = cs if isinstance(cs, list) else list((cs or {}).values())
+    owner = next((_tag_of(c) for c in items if c.get("id") == cid), None)
+    if owner != inv:
+        raise SystemExit(f"{name} ({cid}) is tagged {INVOCATION_TAG}={owner}, not this invocation's {inv}: this "
+                         "invocation attached to a cluster it did not create (another launch of this config?); "
+                         "refusing, with nothing recorded and nothing to clean up")
+
+
 def _task_key(label) -> str:
     return f"run-{label}-{int(time.time())}"
 
@@ -525,11 +562,13 @@ def start_helpers(cfg, compute, cluster_id, clusters: dict, keep_overflow=None, 
         write_clusters(cfg, clusters)
     overflow = None
     if cfg.keeper and cfg.overflow_max:
-        overflow = _overflow_info(cfg, keep_overflow) if keep_overflow else start_overflow(cfg, compute, record=record)
+        overflow = (_overflow_info(cfg, keep_overflow) if keep_overflow
+                    else start_overflow(cfg, compute, record=record, inv=clusters.get("invocation")))
         overflow["primary_vm_types"] = list(compute.WORKER_VM_TYPES)
     if cfg.keeper and not keep_keeper:
         time.sleep(10)
-        kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster_id, overflow, record=record)
+        kc = start_keeper(cfg, adapt_options(cfg, compute.ADAPT_OPTIONS), cluster_id, overflow, record=record,
+                          inv=clusters.get("invocation"))
         time.sleep(30)
         confirm_keeper(cfg.keeper_name, kc, run_alive=lambda: is_running(cfg.name), run_id=cluster_id,
                        overflow_id=(overflow or {}).get("id"))
@@ -591,7 +630,8 @@ def _launch_locked(cfg, inv) -> int:
         worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix,
                  **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False)
+        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv))
+    verify_created(cfg.name, cluster.cluster_id, inv)      # created by this invocation, or refused before any record
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     # S1-8: recorded once the run cluster exists, before any submission or acknowledgement wait; this invocation's
     # record replaces the previous launch's (no cluster of the name was live, and the config lock is held)
@@ -708,13 +748,13 @@ def _bounded(fn, *a, timeout_s: float = 60.0):
     return box.get("v")
 
 
-def smoke_watch(cfg, launcher_alive, minutes: float = 20.0, lister=None, stopper=None, clock=None, sleep=None,
-                every_s: float = 30.0, call_timeout_s: float = 60.0) -> dict:
-    """`smoke-watch`: the laptop-side bound of a smoke. Until the wall-clock limit it waits for the launcher to
-    exit and for every live cluster named like this config (the run cluster, its keeper and overflow pool,
-    recorded or not, so a late keeper or one an interrupted constructor left counts too) to stop. Past the limit it
-    stops each such cluster by id. Every API call is bounded (`call_timeout_s`). Only for a config whose names
-    belong to the smoke alone."""
+def smoke_watch(cfg, inv, launcher_alive, minutes: float = 20.0, lister=None, stopper=None, clock=None, sleep=None,
+                every_s: float = 30.0, call_timeout_s: float = 60.0, terminate=None) -> dict:
+    """A smoke's laptop-side bound. The clusters it owns are those of the config's names that carry this
+    invocation's tag (created by it, recorded or not: a late keeper, or one an interrupted constructor left).
+    Until the wall-clock limit it waits for the launcher to exit and for every owned cluster to stop. At the limit
+    it terminates the launcher first (`terminate`, which reaps it), then stops every owned cluster by id. Every API
+    call is bounded (`call_timeout_s`)."""
     clock, sleep = clock or time.monotonic, sleep or time.sleep
     if lister is None:
         import coiled
@@ -725,7 +765,8 @@ def smoke_watch(cfg, launcher_alive, minutes: float = 20.0, lister=None, stopper
     def live():
         cs = _bounded(lister, timeout_s=call_timeout_s)
         items = cs if isinstance(cs, list) else list((cs or {}).values())
-        return {c.get("id"): c.get("name") for c in items if c.get("name") in names and ws.state_of(c) in _ATTACH}
+        return {c.get("id"): c.get("name") for c in items
+                if c.get("name") in names and _tag_of(c) == inv and ws.state_of(c) in _ATTACH}
     deadline = clock() + minutes * 60
     while clock() < deadline:
         try:
@@ -734,11 +775,16 @@ def smoke_watch(cfg, launcher_alive, minutes: float = 20.0, lister=None, stopper
             print(f"smoke-watch: listing failed ({type(e).__name__}); retrying", flush=True)
             lv = None
         if lv == {} and not launcher_alive():
-            print("smoke-watch: the launcher has exited and no cluster of this config is live", flush=True)
+            print("smoke-watch: the launcher has exited and no cluster of this invocation is live", flush=True)
             return {"clean": True, "stopped": []}
         sleep(every_s)
+    print(f"smoke-watch: limit of {minutes} min reached; terminating the launcher, then stopping by id", flush=True)
+    if terminate is not None:
+        try:
+            terminate()                 # no new cluster can appear after this
+        except Exception as e:  # noqa: BLE001
+            print(f"smoke-watch: terminating the launcher failed: {type(e).__name__}", flush=True)
     stopped, end = [], clock() + min(300.0, minutes * 60 / 4)
-    print(f"smoke-watch: limit of {minutes} min reached; stopping by id", flush=True)
     while clock() < end:
         try:
             lv = live()
@@ -755,6 +801,39 @@ def smoke_watch(cfg, launcher_alive, minutes: float = 20.0, lister=None, stopper
                     print(f"smoke-watch: stop {name} ({cid}) failed: {type(e).__name__}", flush=True)
         sleep(every_s)
     return {"clean": False, "stopped": stopped}
+
+
+def smoke_run(cfg, inv, cmd, minutes: float = 20.0, interrupt_on: str | None = None, **watch) -> dict:
+    """`smoke-run`: run the launcher `cmd` as this process's child under MA_LAUNCH_INVOCATION=`inv`, echo its
+    output, send it SIGINT once on the first line containing `interrupt_on` (the smoke's lost-connection case), and
+    watch it with smoke_watch; at the limit the child is terminated (then killed) and reaped before the sweep."""
+    import signal
+    import threading
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            env={**os.environ, "MA_LAUNCH_INVOCATION": inv})
+    sent = []
+
+    def pump():
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if interrupt_on and not sent and interrupt_on in line:
+                sent.append(line.strip())
+                proc.send_signal(signal.SIGINT)
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+
+    def terminate():
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        proc.wait()
+    r = smoke_watch(cfg, inv, lambda: proc.poll() is None, minutes, terminate=terminate, **watch)
+    terminate()
+    reader.join(5)
+    return {**r, "launcher_rc": proc.returncode, "interrupted": bool(sent)}
 
 
 def keeper_later(cfg) -> int:
@@ -831,7 +910,7 @@ def _fresh(name):
     raise SystemExit(f"{name} did not stop; start it later (the pool keeps its floor)")
 
 
-def start_overflow(cfg, compute, record=None) -> dict:
+def start_overflow(cfg, compute, record=None, inv=None) -> dict:
     """The quota-fallback pool: a scheduler-only cluster of other VM families, created
     here (so it gets this launch's software environment) and scaled by the keeper. Its
     idle timeout outlasts the keeper; the keeper deletes it on exit."""
@@ -842,7 +921,10 @@ def start_overflow(cfg, compute, record=None) -> dict:
         worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
         worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix, **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False)
+        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False,
+        **(_lifetime(cfg, inv) if inv else {}))
+    if inv:
+        verify_created(cfg.overflow_name, oc.cluster_id, inv)
     if record:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
     oc.get_client().upload_file(os.path.join(HERE, "worker_side.py"))
@@ -857,7 +939,7 @@ def _overflow_info(cfg, oid) -> dict:
             "scale_down_s": seconds(cfg.scale_down_after), "hours": cfg.keeper_hours}
 
 
-def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None):
+def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None, inv=None):
     import coiled
     import dask
     from distributed import fire_and_forget
@@ -867,7 +949,9 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None):
     _fresh(cfg.keeper_name)
     kc = coiled.Cluster(name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2,
                         worker_memory="8 GiB", scheduler_cpu=2, spot_policy="on-demand",
-                        idle_timeout="30 minutes", shutdown_on_close=False)
+                        idle_timeout="30 minutes", shutdown_on_close=False, **(_lifetime(cfg, inv) if inv else {}))
+    if inv:
+        verify_created(cfg.keeper_name, kc.cluster_id, inv)
     if record:
         record("keeper", cfg.keeper_name, kc.cluster_id)         # before anything that can fail (Codex P2-5)
     c = kc.get_client()
@@ -2543,12 +2627,12 @@ def _self_test_s18_r2(ok) -> None:
                             "status": "submitted_launch_incomplete"}, **rec), open(cfg.clusters_file, "w"))
             calls = {"stopped": [], "overflow": 0, "keeper": [], "fresh": []}
 
-            def so(cfg_, comp, record=None):
+            def so(cfg_, comp, record=None, **k):
                 calls["overflow"] += 1
                 record("overflow", cfg.overflow_name, 88)
                 return {"name": cfg.overflow_name, "id": 88}
 
-            def sk(cfg_, ao, cid, overflow=None, record=None):
+            def sk(cfg_, ao, cid, overflow=None, record=None, **k):
                 calls["keeper"].append((cid, (overflow or {}).get("id")))
                 record("keeper", cfg.keeper_name, 89)
                 return types.SimpleNamespace(cluster_id=89)
@@ -2854,7 +2938,7 @@ def _self_test_s18_r4(ok) -> None:
     ok((kw.get("tags") or {}).get(TAGK) == "INV-A" and kw.get("cluster_timeout") == "40 minutes",
        f"O1 the run cluster is created with the invocation tag and the config's cluster_timeout: "
        f"{ {k: kw.get(k) for k in ('tags', 'cluster_timeout', 'idle_timeout')} }")
-    ok(rc_a == 0 and (cl_a or {}).get("invocation") == "INV-A" and (cl_a or {}).get("run", {}).get("id") == 101,
+    ok(rc_a == 0 and (cl_a or {}).get("invocation") == "INV-A" and (cl_a or {}).get("run", {}).get("id") == registry["lt"]["id"],
        f"O2 the launcher that created the cluster records it: {rc_a} {cl_a}")
     ok(isinstance(rc_b, tuple) and cl_b is None and submits == ["INV-A"] and "INV-A" in rc_b[1],
        f"O3 the racing launcher attached to the other's cluster: refused, no record with its token, nothing "
@@ -3287,17 +3371,14 @@ def main(argv) -> int:
         return keeper_later(cfg)
     elif cmd == "ack-probe":
         return ack_probe(cfg)
-    elif cmd == "smoke-watch":
-        pid = int(rest[rest.index("--pid") + 1])
+    elif cmd == "smoke-run":
         mins = float(rest[rest.index("--minutes") + 1]) if "--minutes" in rest else 20.0
-
-        def alive():
-            try:
-                os.kill(pid, 0)
-                return True
-            except OSError:
-                return False
-        return 0 if smoke_watch(cfg, alive, mins)["clean"] else 1
+        stop_on = rest[rest.index("--interrupt-on") + 1] if "--interrupt-on" in rest else None
+        inv = _invocation()
+        print(f"smoke-run invocation {inv}", flush=True)
+        r = smoke_run(cfg, inv, [sys.executable, os.path.abspath(__file__), argv[1], "launch"], mins, stop_on)
+        print(f"smoke-run: {json.dumps(r)}", flush=True)
+        return 0 if r["clean"] else 1
     elif cmd == "reuse-check":
         if not rest or rest[0].startswith("-"):
             sys.exit(__doc__)
