@@ -1462,6 +1462,18 @@ def _self_test_burden_e2e(ok, d, q):
     U.run(A, R["point"]["plan"], "h", draws=2, seed=5, pre=U.evaluate_draws(A, 2, 5),
           on_draw=lambda out, events: seen.append((len(out), type(events).__name__)))
     ok(seen == [(len(A.ids), "list")] * 2, f"BE6 precomputed draws call the hook with outcomes and events: {seen}")
+    # Codex r3 P1: a reference file replaced after the run fails the gate closed (the sign-off no longer covers it)
+    rp_ = os.path.join(d, "burden_refs.csv")
+    good = open(rp_).read()
+    open(rp_, "w").write(good.replace("1e12,1e11,1e13", "84,40,200"))
+    try:
+        fs = contract.gate_findings(d)
+    finally:
+        open(rp_, "w").write(good)
+    ok(any(x["kind"] == "analysis_contract_burden" and "sign-off" in x["claim"] and not x["scope_declarable"]
+           for x in fs) and signoff.status(d) == "signed",
+       f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
+       f"{sorted({x['kind'] for x in fs})}")
 
 
 def _self_test_floors_e2e(ok, d, q):

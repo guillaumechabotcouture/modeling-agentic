@@ -832,6 +832,39 @@ def _self_test() -> int:
         ok("## Burden validation references" in sh and "WMR-X" in sh and "SURVEY-T" in sh and "attest" in sh,
            "BV22 the sign-off sheet shows each reference's declared sources beside the calibration's, for the owner "
            "to attest")
+        # Codex r3 P1: the sheet's machine-readable sources and the sign-off record bind the reference file's bytes
+        import hashlib
+        rp_ = os.path.join(d, "src.csv")
+        sha = lambda: hashlib.sha256(open(rp_, "rb").read()).hexdigest()  # noqa: E731
+        good_bytes = open(rp_, "rb").read()
+        signoff.write_sheet(d)
+        src_ = signoff.sheet_sources(open(os.path.join(d, signoff.SHEET)).read()) or {}
+        ok(src_.get("burden_references_sha256") == sha(),
+           f"BV23 the sheet's sources record the reference file's full sha256: {src_.get('burden_references_sha256')}")
+        open(rp_, "wb").write(good_bytes.replace(b"WMR-X", b"WMR-Y"))
+        try:
+            signoff.sign(d, "lead", note="self-test")
+            ok(False, "BV23 a reference file changed after the sheet was shown is refused at signing (stale sheet)")
+        except ValueError as e:
+            ok("stale" in str(e) or "reference" in str(e),
+               f"BV23 a reference file changed after the sheet was shown is refused at signing (stale sheet): {e}")
+        open(rp_, "wb").write(good_bytes)
+        try:
+            signoff.write_sheet(d)
+            rec = signoff.sign(d, "lead", note="self-test")
+            ok((rec.get("sha256") or {}).get("src.csv") == sha() and signoff.status(d) == "signed",
+               f"BV24 the sign-off record binds the reference file's sha256: {rec.get('sha256')}")
+        except ValueError as e:
+            ok(False, f"BV24 the sign-off record binds the reference file's sha256: {e}")
+        open(rp_, "wb").write(good_bytes.replace(b"WMR-X", b"WMR-Z"))
+        st_after = signoff.status(d)
+        open(rp_, "wb").write(good_bytes)
+        os.remove(rp_)
+        st_gone = signoff.status(d)
+        open(rp_, "wb").write(good_bytes)
+        ok(st_after == "changed" and st_gone == "changed" and signoff.status(d) == "signed",
+           f"BV25 a reference file changed or removed after signing leaves the spec unsigned ({st_after}, {st_gone}); "
+           "restored, it is signed again")
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]
