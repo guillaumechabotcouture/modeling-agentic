@@ -2653,25 +2653,34 @@ def _self_test_v012(ok, e, unit) -> None:
     # Codex r1 P3: deterministic, hand-counted boundary cases of the pure functions Malaria.step and
     # CaseManagement.step use
     def c8():
+        # Codex r2 P2-1: signatures (age, ft, within-catchment gain, catchment share, ages); share 1 here
         a = np.array([0.0, 60.8, 60.84, 1000.0, 1824.9, 1825.0, 4000.0])       # 2 months = 60.833 d, 60 = 1825 d
-        pft, in_t = M.cm_treat_prob(a, 0.3, 0.2, 2.0, 60.0)
+        pft, in_t = M.cm_treat_prob(a, 0.3, 0.2, 1.0, 2.0, 60.0)
         ok(in_t.tolist() == [False, False, True, True, True, False, False]
            and np.allclose(pft, [0.3, 0.3, 0.5, 0.5, 0.5, 0.3, 0.3], atol=1e-15),
            f"C8 the gain starts at exactly 2 months and stops at exactly 60 months ({in_t.tolist()})")
         days = np.arange(0.0, 2000.0)                                          # one child ageing day by day
-        ok(int(M.cm_treat_prob(days, 0.3, 0.2, 2.0, 60.0)[1].sum()) == 1825 - 61,
+        ok(int(M.cm_treat_prob(days, 0.3, 0.2, 1.0, 2.0, 60.0)[1].sum()) == 1825 - 61,
            "C8b a child ageing from birth gets the gain on days 61-1824 of life only (1,764 days, hand count)")
-        ok(float(M.cm_treat_prob(np.array([100.0]), 0.9, 0.2, 2.0, 60.0)[0][0]) == 0.95,
+        ok(float(M.cm_treat_prob(np.array([100.0]), 0.9, 0.2, 1.0, 2.0, 60.0)[0][0]) == 0.95,
            "C8c effective treatment is capped at 0.95")
-        sv = M.cm_severe_access(0.25, 0.3, 1.0, np.array([0.3, 0.5]))
-        sat = [float(M.cm_severe_access(0.25, 0.7, k, np.array([0.9]))[0]) for k in (1.0, 0.5, 0.2)]
+        sv = [float(M.cm_severe_access(0.25, 0.3, 1.0, g, 1.0)) for g in (0.0, 0.2)]
+        sat = [float(M.cm_severe_access(0.25, 0.7, k, 0.2, 1.0)) for k in (1.0, 0.5, 0.2)]
         ok(np.allclose(sv, [0.55, 0.75], atol=1e-15) and sat[:2] == [1.0, 1.0] and abs(sat[2] - 0.99) < 1e-12,
-           f"C8d severe-care access = access + cm_ft + link x gain, saturating at 1 ({sv.tolist()}, {sat})")
-        g = [M.cm_gain_at(y, 0.3, 0.5, 2020.0, 2021.0, 2.5, True) for y in (2019.9, 2020.0, 2020.5, 2020.999, 2021.0)]
-        ok(np.allclose(g, [0.0, 0.0, 0.03, 0.3 * 0.5 * 0.999 / 2.5, 0.0], atol=1e-12)
-           and M.cm_gain_at(2020.5, 0.3, 0.5, 2020.0, 2021.0, 2.5, False) == 0.0
-           and abs(M.cm_gain_at(2023.0, 0.3, 0.5, 2020.0, None, 2.5, True) - 0.15) < 1e-15,
+           f"C8d severe-care access = access + cm_ft + link x gain, saturating at 1 ({sv}, {sat})")
+        g = [M.cm_gain_at(y, 0.3, 2020.0, 2021.0, 2.5, True) for y in (2019.9, 2020.0, 2020.5, 2020.999, 2021.0)]
+        ok(np.allclose(g, [0.0, 0.0, 0.06, 0.3 * 0.999 / 2.5, 0.0], atol=1e-12)
+           and M.cm_gain_at(2020.5, 0.3, 2020.0, 2021.0, 2.5, False) == 0.0
+           and abs(M.cm_gain_at(2023.0, 0.3, 2020.0, None, 2.5, True) - 0.3) < 1e-15,
            f"C8e delivery stopping before the ramp completes ends the gain at the stop; no package, no gain ({g})")
+        # Codex r2 P2-1: partial coverage caps inside the catchment first, then weights by the share
+        t = float(M.cm_treat_prob(np.array([100.0]), 0.8, 0.4, 0.3, 2.0, 60.0)[0][0])
+        sc = float(M.cm_severe_access(0.25, 0.7, 1.0, 0.2, 0.3))
+        ok(abs(t - 0.845) < 1e-12 and abs(sc - (0.7 * 0.95 + 0.3 * 1.0)) < 1e-12,
+           f"C8f partial coverage: treatment 0.7 x 0.8 + 0.3 x min(0.95, 0.8 + 0.4) = 0.845 ({t:.4f}); severe-care "
+           f"access 0.7 x 0.95 + 0.3 x min(1, 1.15) = 0.965 ({sc:.4f}); capping after averaging gives 0.92 and 1")
+        ok(float(M.cm_treat_prob(np.array([100.0]), 0.3, 0.0, 0.3, 2.0, 60.0)[0][0]) == 0.3,
+           "C8g a zero gain leaves treatment at cm_ft exactly")
     case("C8", c8)
 
     def c9():

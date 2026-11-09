@@ -20,10 +20,10 @@ import os
 import sys
 
 if __package__:
-    from .contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes
+    from .contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes, resolve_params
 else:  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from toolkit.engines.contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes  # noqa: E402
+    from toolkit.engines.contract import ToyEngine, UnitSpec, Package, Horizon, EngineCard, Outcomes, resolve_params  # noqa: E402
 
 
 def structure_problems(engine) -> list[str]:
@@ -72,6 +72,31 @@ def check(engine, unit, package, horizon, seed: int = 1) -> list[str]:
     return bad
 
 
+class ToyConditionalEngine(ToyEngine):
+    """Self-test fixture (here and in toolkit/spec/schema.py): the contract's toy engine with one conditional cost
+    driver, extra_doses, under the predicate `when` (default {"noise": 1.0}; noise is a fixed parameter). run() adds
+    `value` (None: omits it) when the resolved parameters meet the predicate."""
+
+    def __init__(self, results_path: str | None = None, when: dict | None = None, value: float | None = 2.0):
+        super().__init__(results_path)
+        self.when = {"extra_doses": {"noise": 1.0}} if when is None else when
+        self.value = value
+
+    def describe(self) -> EngineCard:
+        c = super().describe()
+        c.outputs = dict(c.outputs, cost_drivers_when=self.when)
+        return c
+
+    def run(self, params, unit, package, horizon, seed) -> Outcomes:
+        o = super().run(params, unit, package, horizon, seed)
+        P = resolve_params(self, params)
+        pred = (self.when or {}).get("extra_doses") if isinstance(self.when, dict) else None
+        if isinstance(pred, dict) and self.value is not None and all(
+                isinstance(v, (int, float)) and P.get(k) == float(v) for k, v in pred.items()):
+            o.cost_drivers["extra_doses"] = self.value
+        return o
+
+
 def _self_test() -> int:
     fails = []
 
@@ -80,38 +105,24 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
-    class Cond(ToyEngine):
-        when = {"extra_doses": {"synergy": 1.0}}
-        value = 2.0                      # what run() returns for the driver when synergy is 1 (None: omitted)
-
-        def describe(self) -> EngineCard:
-            c = super().describe()
-            c.outputs = dict(c.outputs, cost_drivers_when=self.when)
-            return c
-
-        def run(self, params, unit, package, horizon, seed) -> Outcomes:
-            o = super().run(params, unit, package, horizon, seed)
-            if float((params or {}).get("synergy", 0.0)) == 1.0 and self.value is not None:
-                o.cost_drivers["extra_doses"] = self.value
-            return o
-
+    Cond = ToyConditionalEngine
     u, pk, h = UnitSpec("u1", {"x": 0.5}), Package("ab", {"a": 1, "b": 1}), Horizon(0, 3, (0, 3), {"w": [1, 2]})
     ok(check(Cond(), u, pk, h) == [], "CD1 a conditional driver produced under its predicate passes")
-    miss, nan = Cond(), Cond()
-    miss.value, nan.value = None, float("nan")
-    ok(any("extra_doses" in s and "missing" in s for s in check(miss, u, pk, h))
-       and any("extra_doses" in s for s in check(nan, u, pk, h)),
+    ok(any("extra_doses" in s and "missing" in s for s in check(Cond(value=None), u, pk, h))
+       and any("extra_doses" in s for s in check(Cond(value=float("nan")), u, pk, h)),
        "CD2 a conditional driver missing, or not finite, under its activating configuration fails")
-    shapes = ({"extra_doses": {"nope": 1.0}}, {"extra_doses": {}}, {"extra_doses": {"synergy": "on"}},
-              ["extra_doses"], {"a_doses": {"synergy": 1.0}})
-    got = []
-    for w in shapes:
-        bad = Cond()
-        bad.when = w
-        got.append(bool(check(bad, u, pk, h)))
+    shapes = ({"extra_doses": {"nope": 1.0}}, {"extra_doses": {}}, {"extra_doses": {"noise": "on"}},
+              ["extra_doses"], {"a_doses": {"noise": 1.0}})
+    got = [bool(check(Cond(when=w), u, pk, h)) for w in shapes]
     ok(all(got), f"CD3 a malformed declaration fails: unknown parameter, empty or non-numeric predicate, not a "
                  f"mapping, a name also listed unconditionally ({got})")
     ok(check(ToyEngine(), u, pk, h) == [], "CD4 an engine with no conditional drivers passes")
+    # Codex r2 P2-2: a predicate may name only a fixed (structural) parameter; fitted, calibrated and scenario
+    # parameters are varied by the analysis, so the driver would disappear inside their domains
+    fit = check(Cond(when={"extra_doses": {"eff_a": 0.5}}), u, pk, h)
+    scen = check(Cond(when={"extra_doses": {"synergy": 0.0}}), u, pk, h)
+    ok(any("eff_a" in s and "fixed" in s for s in fit) and any("synergy" in s and "fixed" in s for s in scen),
+       f"CD5 a predicate on a fitted or scenario parameter is refused ({fit[:1]}, {scen[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -1551,6 +1551,17 @@ def _self_test() -> int:
         s = load(p)
         ok(validate(s) == [], f"SP1 a well-formed toy spec validates: {validate(s)}")
 
+        # Codex r2 P2-2 (integrated): the toy spec draws the fitted parameters (uncertainty source engine_parameters)
+        def cd_errs(when):
+            r = copy.deepcopy(s.raw)
+            r["engine"] = {"ref": "toolkit.engines.conditional_drivers:ToyConditionalEngine", "config": {"when": when}}
+            r["analysis"]["cost_outputs"] = {"extra": {"cost_driver": "extra_doses"}}
+            return [x for x in validate(Spec(r, d)) if "extra_doses" in x]
+        e_fit, e_fix = cd_errs({"extra_doses": {"eff_a": 0.5}}), cd_errs({"extra_doses": {"noise": 0.0}})
+        ok(any("fixed" in x and "eff_a" in x for x in e_fit) and e_fix == [],
+           f"SP-CD3 with fitted-parameter uncertainty on, a conditional driver whose predicate names a fitted parameter "
+           f"is refused; one on a fixed parameter at its value is accepted ({e_fit[:1]}, {e_fix[:1]})")
+
         def bad(mut, needle, label):
             r = copy.deepcopy(s.raw)
             mut(r)
