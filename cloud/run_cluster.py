@@ -3107,6 +3107,89 @@ def _self_test_s18_r4(ok) -> None:
         ok(isinstance(rc, tuple) and cl is None, f"O5 {what}: not this invocation's, refused before any record: {rc} {cl}")
 
 
+def _self_test_s18_smoke_a(ok) -> None:
+    """From smoke case A (2026-11-09, 9f7a787). (1) The run finished in under a minute; `ack-probe` then attached by
+    name to the stopping run cluster, and Coiled created a new empty s18-smoke-gcc (2351659), which it shut down:
+    ack-probe now connects only to the recorded run cluster id, only while the listing shows it ready or running,
+    and never through the name-based constructor. (2) The launcher retried the keeper's worker table for about
+    6 minutes after the run cluster had stopped: confirm_keeper stops at once when the run is no longer alive."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+    from unittest import mock
+    M, P = sys.modules[__name__], mock.patch.object
+    built, sec_calls = [], []
+
+    def no_ctor(**kw):
+        built.append(kw)
+        raise AssertionError("the name-based constructor was called")
+    fake = types.ModuleType("coiled")
+    fake.Cluster = no_ctor
+
+    class FakeClient:
+        def __init__(self, address, security=None, timeout=None):
+            self.address = address
+
+        def submit(self, fn, pure=False, key=None):
+            return types.SimpleNamespace(status="finished", key=key)
+
+        def processing(self):
+            return {}
+
+        def run_on_scheduler(self, fn, *a):
+            return None
+
+    def go(state, cid_listed=77, recorded=77):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2")
+            json.dump({"run": {"name": "lt", "id": recorded}, "invocation": "I", "status": "launched"},
+                      open(cfg.clusters_file, "w"))
+            listing = [{"name": "lt", "id": cid_listed, "current_state": {"state": state}}]
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"coiled": fake,
+                                               "distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                    P(time, "sleep", lambda s: None), contextlib.redirect_stdout(out):
+                try:
+                    rc = ack_probe(cfg, lister=lambda: listing,
+                                   security_fn=lambda cid: sec_calls.append(cid) or ("sec", {"address_to_use": "tls://s:1"}),
+                                   client_cls=FakeClient)
+                except SystemExit as e:
+                    rc = ("exit", str(e.code))
+                except TypeError as e:
+                    rc = ("typeerror", str(e))
+            return rc, out.getvalue()
+    for st in ("stopping", "stopped", "pending"):
+        rc, out = go(st)
+        ok(isinstance(rc, tuple) and rc[0] == "exit" and "77" in rc[1] and not built and not sec_calls,
+           f"A1 ack-probe refuses a run cluster that is {st}, without the name-based constructor: {rc} {built} {sec_calls}")
+    rc, out = go("running", cid_listed=99)
+    ok(isinstance(rc, tuple) and rc[0] == "exit" and not built and not sec_calls,
+       f"A1b a live cluster of the name with another id is not the recorded one: refused: {rc}")
+    for st in ("ready", "running"):
+        sec_calls.clear()
+        rc, out = go(st)
+        ok(rc == 0 and sec_calls == [77] and not built and "acknowledged by future finished" in out,
+           f"A2 ack-probe connects by the recorded id ({st}) and reports the fast task's acknowledgement: {rc} {out[-160:]!r}")
+    # confirm_keeper: a run cluster that has stopped ends the wait at once
+    sleeps, reads = [], []
+
+    class Closed:
+        status = "closed"
+
+        def scheduler_info(self):
+            reads.append(1)
+            return {}
+    kc = types.SimpleNamespace(cluster_id=9, get_client=lambda: Closed())
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            got = confirm_keeper("lt-keeper", kc, attempts=8, delay_s=5.0, sleep=sleeps.append, run_alive=lambda: False)
+        except SystemExit as e:
+            got = e
+    ok(isinstance(got, list) and "stopped" in got[0] and sum(sleeps) <= 15,
+       f"A3 confirm_keeper stops waiting as soon as the run cluster has stopped (slept {sum(sleeps)} s): {got}")
+
+
 def _self_test_bwrap(ok) -> None:
     """RC61: the agent VM's best-effort bubblewrap install (worker_side.ensure_bwrap), shell calls stubbed."""
     from types import SimpleNamespace as NS
@@ -3496,6 +3579,10 @@ def _self_test() -> int:
         _self_test_s18_r4(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"O: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18_smoke_a(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"A: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
