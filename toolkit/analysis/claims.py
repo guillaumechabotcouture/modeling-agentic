@@ -17,6 +17,7 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/claims.py"
 SPEC_REL = os.path.join("models", "claims_spec.yaml")
+GROUPS_LISTED = 40      # results.md lists at most this many groups' choices for a group-rule variant
 GROUPS_SHOWN = 3        # results.md names the groups with the most units changing package in each decision test
 
 
@@ -194,6 +195,8 @@ def variant_claims(A, arts, pv) -> list[dict]:
                 _c(f"{c}.units_changed", "count", arts["plan_variants"], f"{f}.units_changed", "units")]
         if v.get("value_lost_pct") is not None:      # undefined when the unconstrained objective is not positive
             out.append(_c(f"{c}.value_lost_pct", "percentage", arts["plan_variants"], f"{f}.value_lost_pct", "%"))
+        if v.get("group_choices") is not None:
+            out.append(_c(f"{c}.groups_none", "count", arts["plan_variants"], f"{f}.groups_none", "groups"))
     if pv:
         out.append(_c("variant.unconstrained.no_package", "count", arts["plan_variants"],
                       "data.unconstrained.units_no_package", "units"))
@@ -221,6 +224,16 @@ def variants_markdown(A, pv) -> str:
         L.append(f"| {v['id']} | {v['text']} | [CLAIM:{c}.value_lost] | "
                  + (f"[CLAIM:{c}.value_lost_pct]" if v.get("value_lost_pct") is not None else "n/a")
                  + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.reallocated] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
+    for v in pv["variants"]:        # Codex S1-6 r1 P3: what a group rule allows, and what each group chose
+        if v.get("status") != "solved" or v.get("group_choices") is None:
+            continue
+        ch = v["group_choices"]
+        L += ["", f"{v['id']}: one decision per {v['by']} on {', '.join(v['components'])}; "
+              + ("every group must provide one of them (provide: true). " if v.get("provide") else
+                 "a group may share no provision (none); to require provision, set provide: true. ")
+              + f"Groups choosing none: [CLAIM:variant.{v['id']}.groups_none]. Choices: "
+              + "; ".join(f"{g}: {k}" for g, k in list(ch.items())[:GROUPS_LISTED])
+              + (" ..." if len(ch) > GROUPS_LISTED else "") + " (all in the plan_variants artifact)."]
     return "\n".join(L) + "\n"
 
 

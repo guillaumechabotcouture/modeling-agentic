@@ -40,7 +40,6 @@ import os
 import numpy as np
 import yaml
 
-from toolkit.alloc import packages as apackages
 from toolkit.analysis import moves as MV
 from toolkit.analysis.artifacts import plain
 from toolkit.engines.benchmark import verified_benchmarks
@@ -209,7 +208,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             lowers.append(same_cost and _lowers_only_unchosen(ben0, ben, plan))
             cases.append((v, ben, cost, None, None))
     elif t == "group_rule":
-        a = copy.deepcopy(A.alloc)
+        from toolkit.analysis import variants as V
+        a = copy.deepcopy(V.base_alloc(A))        # the signed rules; a headline variant's rule is joined below
         rules = dict(a.get("group_rules") or {})
         if dt.get("add"):
             add = dict(dt["add"])
@@ -221,8 +221,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         a["group_rules"] = rules
         if not rules:
             a.pop("group_rules")
-        from toolkit.analysis import variants as V
-        feas = V.carry(A, apackages.feasibility(a, A.spec.units()))      # F6 S1-6: a variant headline's rule holds
+        feas = V.carry(A, a)      # F6 S1-6: a headline variant's rule, which the test can neither replace nor remove
         cases = [("with" if dt.get("add") else "without", ben0, cost0, None, feas)]
         lowers = [False]
     elif t == "envelope":

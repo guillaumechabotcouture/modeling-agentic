@@ -6,7 +6,10 @@ Spec `analysis.plan_variants`:
                                    # every unit receives at least one of `components` (default: any component)
       - {id: one_choice_per_group, type: group_rule, components: [c1, c2], by: <unit column>, text: "..."}
                                    # one decision per group for those components (toolkit/alloc group_rules,
-                                   # rule same_choice)
+                                   # rule same_choice, under a collision-safe id beside the signed rules). "none"
+                                   # is one of the choices: a group may share no provision. `provide: true` adds
+                                   # minimum service on the same components, so every group provides one; each
+                                   # group's choice is reported (group_choices, groups_none)
     headline: service_everywhere   # optional: the headline plan is this variant's (default: the unconstrained plan)
 Each variant is solved on the point benefits and costs within the headline plan's budget (the reserved budget when
 uncertainty.affordability.enforce is set) and reported with its value lost against the unconstrained plan (absolute
@@ -66,7 +69,9 @@ def validate(raw: dict, cols) -> list[str]:
         txt = str(v.get("text") or "")
         if not txt.strip() or any(ch.isdigit() for ch in txt):
             bad.append(f"plan variant {i}: text (what the rule means, in words, no numbers)")
-        for k in sorted(set(v) - {"id", "type", "components", "by", "text"}):
+        if "provide" in v and (v["type"] != "group_rule" or not isinstance(v["provide"], bool)):
+            bad.append(f"plan variant {i}: provide (true or false) applies to a group_rule only")
+        for k in sorted(set(v) - {"id", "type", "components", "by", "text", "provide"}):
             bad.append(f"plan variant {i}: unknown key {k}")
     for k in sorted(set(pv) - {"variants", "headline"}):
         bad.append(f"analysis.plan_variants: unknown key {k}")
@@ -91,17 +96,33 @@ def restrict(feas: dict, pk: dict, comps) -> dict:
     return out
 
 
-def feasibility(A, v: dict) -> tuple[dict, dict]:
-    """(alloc, feasibility) of variant `v` on top of the unconstrained alloc spec."""
-    a = copy.deepcopy(getattr(A, "base_alloc", None) or A.alloc)
+def rule_id(rules: dict, vid: str) -> str:
+    """A group-rule id for variant `vid` that no rule in `rules` (signed, or a decision test's) already has."""
+    base, n = f"__plan_variant__{vid}", 1
+    k = base
+    while k in rules:
+        n += 1
+        k = f"{base}_{n}"
+    return k
+
+
+def on_alloc(A, v: dict, alloc: dict) -> tuple[dict, dict]:
+    """(alloc, feasibility) of variant `v` added to `alloc`: its group rule under a collision-safe id beside every
+    rule already there (never replacing one), its minimum service (or `provide: true`) as a restriction."""
+    a = copy.deepcopy(alloc)
     if v["type"] == "group_rule":
         a["group_rules"] = dict(a.get("group_rules") or {})
-        a["group_rules"][f"variant_{v['id']}"] = {"components": list(v["components"]), "by": v["by"],
-                                                  "rule": "same_choice"}
+        a["group_rules"][rule_id(a["group_rules"], v["id"])] = {"components": list(v["components"]), "by": v["by"],
+                                                               "rule": "same_choice"}
     feas = apackages.feasibility(a, A.spec.units())
-    if v["type"] == "minimum_service":
+    if v["type"] == "minimum_service" or v.get("provide"):
         feas = restrict(feas, A.pk, v.get("components") or list(A.spec["options"]["components"]))
     return a, feas
+
+
+def feasibility(A, v: dict) -> tuple[dict, dict]:
+    """(alloc, feasibility) of variant `v` on top of the unconstrained alloc spec."""
+    return on_alloc(A, v, getattr(A, "base_alloc", None) or A.alloc)
 
 
 def apply_headline(A) -> str | None:
@@ -119,33 +140,77 @@ def apply_headline(A) -> str | None:
     return hid
 
 
-def carry(A, feas: dict) -> dict:
-    """A feasibility built from A.alloc (a group-rule decision test) with a minimum-service headline's rule applied
-    too (a group-rule headline is already in A.alloc)."""
+def carry(A, alloc: dict) -> dict:
+    """The feasibility of a decision test's alloc spec (built from the unconstrained one) with the headline variant's
+    rule joined to it: added after the test's own rules under a collision-safe id, so a test can neither replace nor
+    remove it (Codex S1-6 r1 P2-3). Without a headline variant: the test's feasibility."""
     hid = getattr(A, "headline_variant", None)
     v = next((x for x in config(A.spec.raw).get("variants") or [] if x["id"] == hid), None)
-    if v is None or v["type"] != "minimum_service":
-        return feas
-    return restrict(feas, A.pk, v.get("components") or list(A.spec["options"]["components"]))
+    return apackages.feasibility(alloc, A.spec.units()) if v is None else on_alloc(A, v, alloc)[1]
+
+
+def base_alloc(A) -> dict:
+    """The unconstrained (signed) alloc spec, before any headline variant."""
+    return getattr(A, "base_alloc", None) or A.alloc
 
 
 def contract_findings(raw: dict, point: dict, pv) -> list[str]:
-    raise NotImplementedError
+    """The spec's plan variants, point.yaml's headline_variant, the plan_variants artifact and the headline plan agree
+    (Codex S1-6 r1 P2-4). [] when they do."""
+    cfg = config(raw)
+    hv = cfg.get("headline")
+    out = []
+    if (point or {}).get("headline_variant") != hv:
+        out.append(f"point.yaml headline_variant {(point or {}).get('headline_variant')!r} is not the spec's headline "
+                   f"{hv!r}")
+    if not cfg:
+        if pv is not None:
+            out.append("a plan_variants artifact, but the spec asks for no plan variants")
+        return out
+    if not isinstance(pv, dict):
+        return out + ["the spec asks for plan variants, and the run has no plan_variants artifact"]
+    if pv.get("headline") != (hv or "unconstrained"):
+        out.append(f"the plan_variants artifact's headline {pv.get('headline')!r} is not the spec's {hv or 'unconstrained'!r}")
+    got = [x.get("id") for x in pv.get("variants") or [] if isinstance(x, dict)]
+    if got != [v["id"] for v in cfg.get("variants") or []]:
+        out.append(f"the plan_variants artifact's variants {got} are not the spec's")
+    bad = [x.get("id") for x in pv.get("variants") or [] if not isinstance(x, dict)
+           or x.get("status") not in ("solved", "not_solved")]
+    if bad:
+        out.append(f"plan variants {bad}: status is neither solved nor not_solved")
+    if hv is not None:
+        h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
+        if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
+            out.append(f"the headline plan is not the solved plan of variant {hv}")
+    return out
 
 
-def run(A, ben0, cost0, plan) -> dict | None:
+def group_choices(A, v: dict, plan: dict) -> dict:
+    """{group: the class it selected for the rule's components}; "none" (a shared absence) is a valid choice."""
+    cs = set(v["components"])
+    out = {}
+    for i in A.ids:
+        out.setdefault(str(A.by_id[i][v["by"]]), set()).add("+".join(sorted(A.pk[plan[i]] & cs)) or "none")
+    return {g: "/".join(sorted(c)) for g, c in sorted(out.items())}
+
+
+def run(A, ben0, cost0, plan, events=None) -> dict | None:
     """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
-    headline plan's budget (A.solve: the reserve when enforced). None when the spec asks for none."""
+    headline plan's budget (A.solve: the reserve when enforced), each guarded against the point evaluation's model
+    corrections `events` (Codex S1-6 r1 P1-1). None when the spec asks for none."""
     from toolkit.analysis import moves as MV
     cfg = config(A.spec.raw)
     if not cfg:
         return None
+    ev = list(events or [])
     u = A.solve(ben0, cost0, feas=getattr(A, "base_feas", None) or A.feas)
     up, uo = u["choice"], float(u["objective"])
+    A.guard("plan variants: the unconstrained plan", [up], events=ev)
 
-    def row(p, obj):
+    def row(p, obj):        # no package: no component (the comparator package may hold some; Codex S1-6 r1 P2-5)
         return {"objective": obj, "cost": float(sum(cost0[i][p[i]] for i in A.ids)),
-                "units_no_package": sum(p[i] == A.comp for i in A.ids), "recommendation": A.mix_text(p)}
+                "units_no_package": sum(not A.pk[p[i]] for i in A.ids),
+                "units_on_comparator": sum(p[i] == A.comp for i in A.ids), "recommendation": A.mix_text(p)}
     out = {"headline": cfg.get("headline") or "unconstrained", "outcome": A.primary,
            "unconstrained": dict(row(up, uo), plan=dict(up)), "variants": []}
     for v in cfg["variants"]:
@@ -158,7 +223,7 @@ def run(A, ben0, cost0, plan) -> dict | None:
             out["variants"].append(dict(rec, status="not_solved", reason=str(e)))
             continue
         vp, vo = sol["choice"], float(sol["objective"])
-        A.guard(f"plan variant {v['id']}", [vp])
+        A.guard(f"plan variant {v['id']}", [vp], events=ev)
         m = MV.summarise(A, up, vp, ben0, cost0, vo, feas=getattr(A, "base_feas", None) or A.feas)
         lost = uo - vo
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
@@ -167,6 +232,10 @@ def run(A, ben0, cost0, plan) -> dict | None:
                                         "population_changed_share", "dollars_by_component", "dollars_moved",
                                         "dollars_moved_share", "dollars_reallocated", "dollars_reallocated_share",
                                         "units_changed_by_group")})
+        if v["type"] == "group_rule":       # each group's choice; a shared "none" is allowed unless provide: true
+            rec["group_choices"] = group_choices(A, v, vp)
+            rec["groups_none"] = sum(c == "none" for c in rec["group_choices"].values())
+            rec["provide"] = bool(v.get("provide"))
         out["variants"].append(rec)
     hv = cfg.get("headline")
     if hv is not None:

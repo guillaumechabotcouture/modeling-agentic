@@ -203,13 +203,14 @@ class Analysis:
         for i in self.ids:
             for c in self.pk[plan[i]]:
                 mix[c] += 1
-        mix["no_package"] = sum(plan[i] == self.comp for i in self.ids)
+        mix["no_package"] = sum(not self.pk[plan[i]] for i in self.ids)     # no component (F6 S1-6 r1 P2-5)
         packages = {}
         for i in self.ids:
             packages[plan[i]] = packages.get(plan[i], 0) + 1
         spent = sum(cost[i][plan[i]] for i in self.ids)
         return {"averted": averted, "averted_discounted_objective": self.dfac * averted[self.primary],
                 "comparator_total": base, "mix": mix, "packages": packages, "cost_allocated": spent,
+                "units_on_comparator": sum(plan[i] == self.comp for i in self.ids),
                 "budget_allocatable": self.budget, "discount_factor": self.dfac,
                 "cost_per_outcome_averted": spent / averted[self.primary] if averted[self.primary] > 0 else None}
 
