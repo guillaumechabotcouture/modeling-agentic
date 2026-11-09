@@ -800,6 +800,19 @@ def _self_test() -> int:
         w(d, "models/suff.yaml", {"varied": "mix", "criterion": "c", "decision_changes": False,
                                   "share_units_changed": 0.8, "share_threshold": 10})
         ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7c a percentage threshold is invalid")
+        # F6 S1-5: a verdict may also be set by regret or dollars moved, each checked against its own threshold
+        mv = {"varied": "mix", "criterion": "c", "decision_changes": True, "share_units_changed": 0.03,
+              "share_threshold": 0.1, "regret_share": 0.02, "regret_threshold": 0.01, "triggered_by": ["regret"]}
+        w(d, "models/suff.yaml", mv)
+        ok("mechanism_manifest_invalid" not in kinds(gate_findings(d, 2, P)),
+           "MM7d a verdict set by regret, below the share threshold, is consistent")
+        w(d, "models/suff.yaml", dict(mv, decision_changes=False))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7e regret above its threshold, no change")
+        w(d, "models/suff.yaml", dict(mv, triggered_by=["dollars"]))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)), "MM7f triggered_by its numbers contradict")
+        w(d, "models/suff.yaml", dict(mv, dollars_moved_share=0.3))
+        ok("mechanism_manifest_invalid" in kinds(gate_findings(d, 2, P)),
+           "MM7g dollars moved without its threshold fails closed")
         w(d, "models/model.py", "def mix_effect(u):\n    return u\n")
         w(d, PATH, {"mechanisms": [{"id": "subgroup_mix", "status": "modelled",
                                     "code_ref": "models/model.py::mix_effect"}]})

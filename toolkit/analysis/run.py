@@ -600,6 +600,7 @@ def _self_test() -> int:
             os.rename(moved, d)
         ok(figs and all(rels) and fk == [],
            f"R12b figure sources are recorded relative to the run dir, and a moved run dir checks clean: {fk[:2]}")
+        _self_test_moves(ok, d, R)
         ok(contract.gate_findings(d) == [], f"R13 the contract checks pass on a harness run: {contract.gate_findings(d)}")
         rel = os.path.join("analysis", "point.yaml")
         with open(os.path.join(d, rel), "a") as f:
@@ -773,6 +774,74 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_moves(ok, d, R):
+    """F6 S1-5 on the toy: decision tests, stability folds and sensitivity ends report what moves."""
+    import copy
+    import yaml
+    keys = {"regret", "regret_share", "population_changed", "dollars_moved", "dollars_moved_share",
+            "dollars_by_component", "units_changed_by_group", "triggered_by", "decision_changes"}
+    run_ = [x for x in R["decision_tests"] if x.get("status") == "run"]
+    files = [yaml.safe_load(open(os.path.join(d, x["path"]))) for x in run_]
+    ok(run_ and all(keys <= set(f) and {"regret_threshold", "dollars_threshold"} <= set(f)
+                    and isinstance(f["units_changed_by_group"], list) and all(keys <= set(r) for r in f["results"])
+                    for f in files),
+       f"MS1 every decision-test result file and row reports regret, population, dollars by component, units by "
+       f"group and the criterion that triggered: {sorted(keys - set(files[0]) if files else keys)}")
+    art = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+    ok(all({"regret_pct", "dollars_moved_pct", "population_changed", "triggered_by"} <= set(t) for t in art
+           if t["status"] == "run"), "MS2 the decision_tests artifact carries regret, dollars and population")
+    st = R["stability"]
+    ok(all(keys <= set(f) for f in st["folds"]) and {"stable_provision", "stable_absence", "by_component"}
+       <= set(st.get("components") or {}) and "regret_pct_worst_fold" in st["metrics"],
+       f"MS3 stability folds report what moves; stable provision apart from stable absence: {st.get('components')}")
+    ends = [r[e] for r in R["sensitivity"]["rows"] for e in ("low", "high")]
+    ok(ends and all(keys <= set(e) for e in ends), "MS4 each sensitivity end reports what moves and what triggered")
+    cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+    tid = CL._cid(run_[0]["test_id"])
+    need = {f"dt.{tid}.regret_pct", f"dt.{tid}.dollars", f"dt.{tid}.population", "stability.stable_provision",
+            "stability.stable_absence"}
+    ok(need <= cs, f"MS5 claims for regret, dollars, population and stable provision/absence: {sorted(need - cs)}")
+    txt = open(os.path.join(d, "results.md")).read()
+    ok("stable absence" in txt and "moves between components" in txt and "[CLAIM:" not in txt,
+       "MS6 results.md reports dollars moved and stable provision apart from stable absence")
+    figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]
+    e = next((f for f in figs if f["figure"] == "decision_tests"), None)
+    cols = set(next(csv.DictReader(open(os.path.join(d, e["table"]))), {})) if e else set()
+    ok({"regret_pct", "dollars_moved_pct", "triggered_by"} <= cols, f"MS7 the decision-test figure table: {cols}")
+    # a test below the share threshold changes the plan on regret when the regret threshold is low, and says so
+    A = R["_A"]
+    saved = copy.deepcopy(A.spec.raw["analysis"])
+    t = next(x for x in R["decision_tests"] if x.get("test_id") == "fitted_range_eff_a")
+    dt = {"id": t["test_id"], "type": "fitted_range", "parameter": "eff_a", "values": [0.3, 0.7], "automatic": True}
+    z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    try:
+        A.spec.raw["analysis"].update(share_threshold=1.0, regret_threshold=0.0, dollars_threshold=1.0)
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        pos = max(r.get("regret", 0) for r in rec["results"]) > 1e-9
+        ok(pos and rec["decision_changes"] is True and rec["triggered_by"] == ["regret"],
+           f"MS8 a positive regret above its threshold changes the plan on regret alone: {rec.get('triggered_by')}")
+        p = os.path.join(d, "models", "decision_tests", "ms8.yaml")
+        yaml.safe_dump(plain(rec), open(p, "w"), sort_keys=False)
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import mechanism_manifest as MM
+        got, probs = MM.load_test_result(d, "models/decision_tests/ms8.yaml")
+        ok(got is not None and not probs, f"MS9 the Phase 49 loader accepts a verdict set by regret: {probs}")
+        os.remove(p)
+        A.spec.raw["analysis"] = copy.deepcopy(saved)
+        A.set_reserve(0.8)      # enforce: re-optimisations stay within the reserved budget
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        spent = sum(cost0[i][plan[i]] for i in A.ids)
+        ok(all(spent + sum(r["dollars_by_component"].values()) <= A.plan_budget * (1 + 1e-9) for r in rec["results"]),
+           "MS10 with a reserve the re-solved plans' costs (point cost plus dollars by component) stay within it")
+    except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+        ok(False, f"MS8-MS10 the regret criterion on the toy ({type(e).__name__}: {e})")
+    finally:
+        A.spec.raw["analysis"] = saved
+        A.set_reserve(None)
 
 
 def _self_test_posterior(ok, q):
