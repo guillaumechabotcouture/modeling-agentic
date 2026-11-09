@@ -2655,6 +2655,80 @@ def _self_test() -> int:
            f"({r['status']}, {comp})")
     safe(hm34, "HM34")
 
+    def custom(units, tg, f, zr=(0.0, 1.0), noise=1e-4):
+        """A problem with no shared parameters; f(unit, z, rng) gives each run's observables."""
+        P = Problem([], {"name": "z", "lo": zr[0], "hi": zr[1]}, units, tg, groups={u: "g" for u in units})
+
+        def sim(pts):
+            return [f(p["unit"], p["z"], np.random.default_rng(p["seed"])) for p in pts]
+        return P, sim
+
+    def rows_of(r):
+        return np.asarray(r["sample"]["rows"]) if r.get("sample") else np.zeros((0, 3))
+
+    def hm35():          # Codex r3 P1-1: the returned rows themselves meet a tight aggregate (no jitter breaks it)
+        units = ["u0", "u1"]
+        tg = [Target(f"{u}:x", "unit", "x", 0.5, "identity", sd_obs=0.3, sd_bias=0.2, unit=u, source="toy",
+                     bias_key="s|g") for u in units]
+        tg.append(Target("agg", "group", "x", 0.5, "identity", sd_obs=1e-4, weights={u: 1.0 for u in units},
+                         source="toy"))
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": z + 1e-4 * rng.normal()})
+        r = calibrate(P, sim, seed=7, waves=1, log=q, points_per_unit=20)
+        R = rows_of(r)
+        bad = float(np.mean(np.abs(R.mean(1) - 0.5) > 0.01)) if len(R) else 1.0
+        ok(r["status"] == "matched" and bad < 0.02, f"HM35 the region rows meet the tight aggregate (share outside "
+                                                     f"its band {bad:.3f}; {r['status']})")
+    safe(hm35, "HM35")
+
+    def hm36():          # Codex r3 P1-2: aggregates (u0, u1) and (u1, u2) with offsets on u0 and u2 share u1
+        units = ["u0", "u1", "u2"]
+        tg = [Target("u0:x", "unit", "x", 0.5, "identity", sd_obs=0.01, sd_bias=0.2, unit="u0", source="t",
+                     bias_key="s|a"),
+              Target("u1:x", "unit", "x", 0.5, "identity", sd_obs=0.3, unit="u1", source="t"),
+              Target("u2:x", "unit", "x", 0.5, "identity", sd_obs=0.01, sd_bias=0.2, unit="u2", source="t",
+                     bias_key="s|b"),
+              Target("A1", "group", "x", 0.6, "identity", sd_obs=0.005, weights={"u0": 1.0, "u1": 1.0}, source="t"),
+              Target("A2", "group", "x", 0.4, "identity", sd_obs=0.005, weights={"u1": 1.0, "u2": 1.0}, source="t")]
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": z + 1e-4 * rng.normal()})
+        r = calibrate(P, sim, seed=8, waves=1, log=q, points_per_unit=20)
+        R = rows_of(r)
+        comps = r.get("bias_components") or []
+        bad = float(np.mean((np.abs(R[:, :2].mean(1) - 0.6) > 0.02) | (np.abs(R[:, 1:].mean(1) - 0.4) > 0.02))) \
+            if len(R) else 1.0
+        ok(r["status"] == "matched" and len(comps) == 1 and comps[0]["units"] == 3 and bad < 0.02,
+           f"HM36 one component through the shared member; its rows meet both aggregates (share outside {bad:.3f}; "
+           f"{r['status']}, {comps})")
+    safe(hm36, "HM36")
+
+    def hm37():          # Codex r3 P2-3: run noise enters aggregate checks in profiling, sampling and verification
+        units = ["u0", "u1"]
+        tg = [Target(f"{u}:x", "unit", "x", 0.5, "identity", sd_obs=0.3, sd_bias=0.2, unit=u, source="toy",
+                     bias_key="s|g") for u in units]
+        tg.append(Target("agg", "group", "x", 0.6, "identity", sd_obs=0.01, weights={u: 1.0 for u in units},
+                         source="toy"))
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": 0.5 + 0.1 * rng.normal()})
+        r = calibrate(P, sim, seed=9, waves=1, log=q, points_per_unit=30)
+        vt = ((r.get("verification") or {}).get("targets") or {}).get("agg") or {}
+        ok(r["status"] == "matched" and r["region"]["accepted"] > 0 and not (r["sample"] or {}).get(
+            "offset_draws", {}).get("failed") and vt.get("ok"),
+           f"HM37 an aggregate 1.4 run-noise sds away is kept by profiling, sampling and verification alike "
+           f"({r['status']}, {r['blocks']}, verified {vt})")
+    safe(hm37, "HM37")
+
+    def hm38():          # Codex r3 P2-4: the verification point is one offset with a jointly feasible assignment
+        units = ["u0", "u1"]
+        tg = [Target(f"{u}:x", "unit", "x", 0.5, "identity", sd_obs=0.01, sd_bias=0.2, unit=u, source="toy",
+                     bias_key="s|g") for u in units]
+        tg.append(Target("grp", "group", "y", 0.3, "identity", sd_obs=0.1, weights={u: 1.0 for u in units},
+                         source="toy"))
+        P, sim = custom(units, tg, lambda u, z, rng: {"x": z + 1e-4 * rng.normal(),
+                                                      "y": (z if u == "u0" else 1 - z) + 1e-4 * rng.normal()})
+        r = calibrate(P, sim, seed=10, waves=1, log=q, points_per_unit=20)
+        ok(r["status"] == "matched" and not any(b["code"] == "verification_failed" for b in r["blocks"]),
+           f"HM38 the verification point takes one offset and unit values feasible together under it ({r['status']}, "
+           f"{r['blocks']}, z {r['best']['z']})")
+    safe(hm38, "HM38")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
