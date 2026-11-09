@@ -361,6 +361,34 @@ def _self_test() -> int:
        and w9["dollars"]["value"] == "R" and w9.get("dollars_moved", {}).get("value") == "M"
        and ag9["dollars_by_component"] == {"a": 500.0},
        f"MV20 the two dollar maxima come from different values and each keeps its own ({e12!r}, {list(w9)})")
+    # Codex r3 P2-1: one-sided spending from unspent budget fires on dollars moved (half of it is reallocated)
+    m10, _ = attempt(compare, ids, {"u1": "none", "u2": "none", "u3": "none", "u4": "none"},
+                     {"u1": "a", "u2": "none", "u3": "none", "u4": "none"}, z, {i: {"none": {}, "a": {"a": 60.0},
+                                                                                   "b": {}} for i in ids},
+                     0.0, pop, reg, 1000.0, {"share": 0.9, "regret": 0.9, "dollars": 0.05}, ["a", "b"])
+    m10 = m10 or {}
+    ok(m10.get("dollars_moved") == 60.0 and m10.get("dollars_reallocated") == 30.0
+       and abs(m10.get("dollars_share", 0) - 0.06) < 1e-12 and m10.get("triggered_by") == ["dollars"],
+       f"MV21 the dollars criterion is the larger of dollars moved and dollars reallocated ({m10.get('dollars_share')}, "
+       f"{m10.get('triggered_by')})")
+    # Codex r3 P2-2: one value fires on regret under a zero optimum, another makes the point plan infeasible
+    inf = dict(m8, value=2, point_plan_feasible=False, point_plan_infeasible=["over budget"], regret=None,
+               regret_share=None, triggered_by=["infeasible"], decision_changes=True)
+    ag11, e13 = attempt(aggregate, [dict(m8, value=1), inf])
+    d11 = dict(ag11 or {}, varied="v", criterion="c", share_threshold=0.9, regret_threshold=0.5, dollars_threshold=0.9)
+    ok(e13 is None and d11.get("triggered_by") == ["infeasible", "regret"]
+       and MM._result_conflicts("t.yaml", d11, "x", None) == []
+       and MM._result_conflicts("t.yaml", dict(d11, triggered_by=["infeasible"]), "x", None) != [],
+       f"MV22 mixed feasible and infeasible values: the loader judges each value on its own ({e13!r}, "
+       f"{MM._result_conflicts('t.yaml', d11, 'x', None)[:1]})")
+    # Codex r3 P2-3: the absolute and the percentage regret maxima each keep their own value
+    ga = dict(m or {}, value="A", regret=100.0, regret_share=0.1)
+    gb = dict(m or {}, value="B", regret=1.0, regret_share=0.5)
+    ag12, e14 = attempt(aggregate, [ga, gb])
+    w12 = (ag12 or {}).get("worst_by_criterion") or {}
+    ok(e14 is None and ag12["regret_share"] == 0.5 and ag12["regret"] == 100.0 and w12["regret"]["value"] == "B"
+       and w12.get("regret_abs", {}).get("value") == "A",
+       f"MV23 the percentage and the absolute regret maxima come from their own values ({e14!r}, {list(w12)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
