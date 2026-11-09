@@ -305,6 +305,41 @@ def _self_test() -> int:
        and abs(m7.get("dollars_share", 0) - 0.1) < 1e-12 and m7.get("triggered_by") == ["dollars"],
        f"MV18 dollars reallocated between units inside one component trigger the dollars criterion "
        f"({m7.get('dollars_moved')}, {m7.get('dollars_reallocated')}, {m7.get('triggered_by')})")
+    # Codex r2 P2-1: a positive regret under a non-positive optimum is a change (any regret above the tolerance)
+    pz = {"u1": "a", "u2": "none", "u3": "none", "u4": "none"}
+    bz = {i: {"none": 0.0, "a": -100.0 if i == "u1" else 0.0, "b": 0.0} for i in ids}
+    cz = {"u1": "none", "u2": "none", "u3": "none", "u4": "none"}
+    m8, _ = attempt(compare, ids, pz, cz, bz, cc, 0.0, pop, reg, 1000.0, {"share": 0.9, "regret": 0.5, "dollars": 0.9},
+                    ["a", "b"])
+    m8 = m8 or {}
+    ag8, _ = attempt(aggregate, [dict(m8, value=1)])
+    d8 = dict(ag8 or {}, varied="v", criterion="c", share_threshold=0.9, regret_threshold=0.5, dollars_threshold=0.9)
+    ok(m8.get("regret") == 100.0 and m8.get("regret_share") is None and m8.get("triggered_by") == ["regret"]
+       and d8.get("decision_changes") is True and MM._result_conflicts("t.yaml", d8, "x", None) == []
+       and MM._result_conflicts("t.yaml", dict(d8, decision_changes=False, triggered_by=[]), "x", None) != [],
+       f"MV16b a regret above the tolerance under a non-positive optimum changes the plan, emitter to loader "
+       f"({m8.get('regret')}, {m8.get('triggered_by')})")
+    # Codex r2 P2-2: a reciprocal swap of equal-cost packages between units moves the whole programme
+    sw = {"u1": {"none": {}, "a": {"a": 600.0}, "b": {"b": 600.0}}, "u2": {"none": {}, "a": {"a": 600.0}, "b": {"b": 600.0}}}
+    m9, _ = attempt(compare, ["u1", "u2"], {"u1": "a", "u2": "b"}, {"u1": "b", "u2": "a"},
+                    {"u1": {"a": 1.0, "b": 1.0, "none": 0}, "u2": {"a": 1.0, "b": 1.0, "none": 0}}, sw, 2.0,
+                    {"u1": 1.0, "u2": 1.0}, None, 1200.0, {"share": 1.0, "regret": 0.5, "dollars": 0.05}, ["a", "b"])
+    m9 = m9 or {}
+    ok(m9.get("dollars_moved") == 0.0 and m9.get("dollars_reallocated") == 1200.0 and m9.get("dollars_share") == 1.0
+       and m9.get("triggered_by") == ["dollars"],
+       f"MV19 dollars reallocated over unit x component: a reciprocal swap moves the programme "
+       f"({m9.get('dollars_moved')}, {m9.get('dollars_reallocated')}, {m9.get('triggered_by')})")
+    # Codex r2 P2-3: each dollar measure keeps its own maximum, tested value and breakdown
+    ra = dict(m or {}, value="R", dollars_moved=0.0, dollars_reallocated=490.0, dollars_share=0.49,
+              dollars_by_component={"a": 0.0})
+    rb = dict(m or {}, value="M", dollars_moved=500.0, dollars_reallocated=5.0, dollars_share=0.005,
+              dollars_by_component={"a": 500.0})
+    ag9, e12 = attempt(aggregate, [ra, rb])
+    w9 = (ag9 or {}).get("worst_by_criterion") or {}
+    ok(e12 is None and ag9["dollars_reallocated"] == 490.0 and ag9["dollars_moved"] == 500.0
+       and w9["dollars"]["value"] == "R" and w9.get("dollars_moved", {}).get("value") == "M"
+       and ag9["dollars_by_component"] == {"a": 500.0},
+       f"MV20 the two dollar maxima come from different values and each keeps its own ({e12!r}, {list(w9)})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
