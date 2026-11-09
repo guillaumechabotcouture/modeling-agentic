@@ -47,8 +47,11 @@ id, the launch time, a `status` and this invocation's token, from the moment the
 is the first line printed (`invocation <token>`), or MA_LAUNCH_INVOCATION when the watchdog sets it. One launch,
 `keeper` or `relaunch` of a config runs at a time (a lock in its out_dir); a refusal (already running, preflight,
 lock held) writes no record, so an earlier launch's record stays as it was. Every cluster is created with the
-Coiled tag ma-invocation=<token> (and the config's cluster_timeout); a constructor that attached to a cluster
-another invocation created (another machine's launch of the config) is refused before any record.
+Coiled tag ma-invocation=<token> (for people: Coiled does not list tags) and the config's cluster_timeout. A
+cluster is this invocation's only when no live one of its name was listed just before the constructor, Coiled
+logged that it created it (not "Attaching to existing cluster"), and its created time is no earlier than the
+construction's start less 120 s; otherwise it is refused before any record (out_dir/constructions.jsonl keeps
+each construction's start and outcome).
   0 launched: every run listed by the scheduler, overflow pool and keeper confirmed (status "launched").
   1 failed: this invocation submitted nothing. Stopping clusters is authorized only by a clusters.json whose
     `invocation` is this invocation's token and whose status is "failed"; then stop the ids it names. Any other
@@ -397,28 +400,122 @@ def _lifetime(cfg, inv) -> dict:
     return {"tags": {INVOCATION_TAG: inv}, **({"cluster_timeout": cfg.cluster_timeout} if cfg.cluster_timeout else {})}
 
 
-def _tag_of(rec: dict):
-    tags = rec.get("tags")
-    if isinstance(tags, list):           # the API may give [{"key": k, "value": v}]
-        tags = {t.get("key"): t.get("value") for t in tags if isinstance(t, dict)}
-    return tags.get(INVOCATION_TAG) if isinstance(tags, dict) else None
+OWN_SKEW_S = 120.0                    # clock skew allowed between this machine and Coiled's `created` time
+JOURNAL = "constructions.jsonl"       # in the config's out_dir: every cluster construction this machine began
+_CREATED, _ATTACHED = "Creating Cluster (name: {}, ", "Attaching to existing cluster (name: {}, "
 
 
-def verify_created(name, cid, inv, lister=None) -> None:
-    """coiled.Cluster(name=...) attaches to a live cluster of that name instead of creating one (another launcher,
-    on another machine, may have created it since this one checked). A cluster is this invocation's only when its
-    tag names this invocation; otherwise this invocation refuses before recording the id anywhere, so it holds no
-    cleanup authority over it (Codex round 4, P1)."""
+def _items(cs) -> list:
+    return cs if isinstance(cs, list) else list((cs or {}).values())
+
+
+def _ts(v):
+    """An ISO time from the Coiled API as epoch seconds (UTC when it has no zone), or None."""
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+def read_journal(cfg) -> list:
+    try:
+        with open(os.path.join(cfg.out_dir, JOURNAL)) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _journal(cfg, entry: dict) -> None:
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    with open(os.path.join(cfg.out_dir, JOURNAL), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+@contextlib.contextmanager
+def _coiled_events():
+    """The messages coiled.Cluster logs to the "coiled" logger while it runs. coiled 1.135.6 keeps "created or
+    attached" in a local (v2/cluster.py:1672 `cluster_created = not cluster_existed`) and reports it only by
+    logging "Creating Cluster (name: ...)" (v2/cluster.py:1685) or "Attaching to existing cluster (name: ...)"
+    (v2/cluster.py:1688); no attribute or return value carries it."""
+    import logging
+
+    class H(logging.Handler):
+        def emit(self, record):
+            try:
+                got.append(record.getMessage())
+            except Exception:  # noqa: BLE001
+                pass
+    got, lg, h = [], logging.getLogger("coiled"), H(level=logging.INFO)
+    old = lg.level
+    if old == logging.NOTSET or old > logging.INFO:
+        lg.setLevel(logging.INFO)
+    lg.addHandler(h)
+    try:
+        yield got
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)
+
+
+def _construct(cfg, name, inv, ctor, lister=None):
+    """Build a cluster that is this invocation's, or refuse before its id is recorded anywhere (Codex round 4, P1;
+    the owner's check, 2026-11-09: coiled 1.135.6 lists no tags, so a tag cannot be read back). coiled.Cluster(name=...)
+    attaches to a live cluster of that name instead of creating one (another launcher, on another machine, may have
+    created it). Ours only if all three hold, any doubt meaning not ours: no live cluster of the name is listed just
+    before the constructor; Coiled logged that it created it (_coiled_events); and its `created` time is no earlier
+    than this construction's start less OWN_SKEW_S. The journal records the start and the outcome, so `smoke-run`
+    owns what this invocation created, and a construction that never finished."""
+    import secrets
     if lister is None:
         import coiled
         lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
-    cs = lister()
-    items = cs if isinstance(cs, list) else list((cs or {}).values())
-    owner = next((_tag_of(c) for c in items if c.get("id") == cid), None)
-    if owner != inv:
-        raise SystemExit(f"{name} ({cid}) is tagged {INVOCATION_TAG}={owner}, not this invocation's {inv}: this "
-                         "invocation attached to a cluster it did not create (another launch of this config?); "
-                         "refusing, with nothing recorded and nothing to clean up")
+    live = sorted(c.get("id") for c in _items(lister())
+                  if c.get("name") == name and ws.state_of(c) not in ("stopped", "error"))
+    if live:
+        raise SystemExit(f"{name}: a cluster of this name is live or stopping ({live}) just before the constructor; "
+                         "not creating it; refusing, with nothing recorded")
+    seq, t0 = secrets.token_hex(4), time.time()
+    _journal(cfg, {"inv": inv, "name": name, "t": t0, "status": "constructing", "seq": seq})
+    with _coiled_events() as ev:
+        cl = ctor()
+    cid = getattr(cl, "cluster_id", None)
+    attached = any(m.startswith(_ATTACHED.format(name)) or m.startswith(f"Using existing cluster: '{name} ") for m in ev)
+    created = any(m.startswith(_CREATED.format(name)) for m in ev)
+    rec = next((c for c in _items(lister()) if c.get("id") == cid), None) if cid is not None else None
+    ts = _ts((rec or {}).get("created"))
+    why = ("Coiled attached to an existing cluster" if attached else "Coiled logged no creation" if not created
+           else "the listing shows no created time" if ts is None
+           else f"created {t0 - ts:.0f} s before this construction began" if ts < t0 - OWN_SKEW_S else None)
+    _journal(cfg, {"inv": inv, "name": name, "id": cid, "seq": seq, "why": why,
+                   "status": "created" if why is None else "attached" if attached else "unknown"})
+    if why:
+        raise SystemExit(f"{name} ({cid}): not created by this invocation ({why}); refusing, with nothing recorded "
+                         "and nothing to clean up")
+    return cl
+
+
+def owned_clusters(cfg, inv, items, journal) -> dict:
+    """{id: name} of the listed live clusters of this config's names that are this invocation's: the ids its
+    journal says it created, and, for a construction it began and never finished (interrupted), a cluster of that
+    name created after it began (less OWN_SKEW_S). An id it attached to is never ours."""
+    names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
+    mine = [e for e in journal if e.get("inv") == inv]
+    done = {e.get("seq"): e for e in mine if e.get("status") in ("created", "attached", "unknown")}
+    ids = {e.get("id") for e in done.values() if e["status"] == "created"}
+    never = {e.get("id") for e in done.values() if e["status"] != "created"}
+    pending = [e for e in mine if e.get("status") == "constructing" and e.get("seq") not in done]
+    out = {}
+    for c in items:
+        cid, name = c.get("id"), c.get("name")
+        if name not in names or ws.state_of(c) not in _ATTACH or cid in never:
+            continue
+        ts = _ts(c.get("created"))
+        if cid in ids or (ts is not None and any(p.get("name") == name and ts >= float(p.get("t", 0)) - OWN_SKEW_S
+                                                  for p in pending)):
+            out[cid] = name
+    return out
 
 
 def _task_key(label) -> str:
@@ -625,13 +722,12 @@ def _launch_locked(cfg, inv) -> int:
     keys = read_keys()
     compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
-    cluster = coiled.Cluster(
+    cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
         name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=compute.WORKER_VM_TYPES,
         worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix,
                  **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv))
-    verify_created(cfg.name, cluster.cluster_id, inv)      # created by this invocation, or refused before any record
+        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv)))
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     # S1-8: recorded once the run cluster exists, before any submission or acknowledgement wait; this invocation's
     # record replaces the previous launch's (no cluster of the name was live, and the config lock is held)
@@ -749,9 +845,9 @@ def _bounded(fn, *a, timeout_s: float = 60.0):
 
 
 def smoke_watch(cfg, inv, launcher_alive, minutes: float = 20.0, lister=None, stopper=None, clock=None, sleep=None,
-                every_s: float = 30.0, call_timeout_s: float = 60.0, terminate=None) -> dict:
-    """A smoke's laptop-side bound. The clusters it owns are those of the config's names that carry this
-    invocation's tag (created by it, recorded or not: a late keeper, or one an interrupted constructor left).
+                every_s: float = 30.0, call_timeout_s: float = 60.0, terminate=None, journal=None) -> dict:
+    """A smoke's laptop-side bound. The clusters it owns are this invocation's by its construction journal
+    (owned_clusters: what it created, and what a construction it began and never finished created).
     Until the wall-clock limit it waits for the launcher to exit and for every owned cluster to stop. At the limit
     it terminates the launcher first (`terminate`, which reaps it), then stops every owned cluster by id. Every API
     call is bounded (`call_timeout_s`)."""
@@ -760,13 +856,10 @@ def smoke_watch(cfg, inv, launcher_alive, minutes: float = 20.0, lister=None, st
         import coiled
         lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
     stopper = stopper or _stop_id
-    names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
 
     def live():
-        cs = _bounded(lister, timeout_s=call_timeout_s)
-        items = cs if isinstance(cs, list) else list((cs or {}).values())
-        return {c.get("id"): c.get("name") for c in items
-                if c.get("name") in names and _tag_of(c) == inv and ws.state_of(c) in _ATTACH}
+        items = _items(_bounded(lister, timeout_s=call_timeout_s))
+        return owned_clusters(cfg, inv, items, journal if journal is not None else read_journal(cfg))
     deadline = clock() + minutes * 60
     while clock() < deadline:
         try:
@@ -916,15 +1009,13 @@ def start_overflow(cfg, compute, record=None, inv=None) -> dict:
     idle timeout outlasts the keeper; the keeper deletes it on exit."""
     import coiled
     _fresh(cfg.overflow_name)
-    oc = coiled.Cluster(
+    oc = _construct(cfg, cfg.overflow_name, inv, lambda: coiled.Cluster(
         name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=list(cfg.overflow_vm_types),
         worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
         worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix, **cfg.compute_env},
         spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False,
-        **(_lifetime(cfg, inv) if inv else {}))
-    if inv:
-        verify_created(cfg.overflow_name, oc.cluster_id, inv)
+        **_lifetime(cfg, inv)))
     if record:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
     oc.get_client().upload_file(os.path.join(HERE, "worker_side.py"))
@@ -947,11 +1038,9 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None, inv=No
     # An earlier launch's keeper (still polling, or stopping) must not be reused:
     # its task would hold the old cluster id and exit, leaving this pool unscaled.
     _fresh(cfg.keeper_name)
-    kc = coiled.Cluster(name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2,
-                        worker_memory="8 GiB", scheduler_cpu=2, spot_policy="on-demand",
-                        idle_timeout="30 minutes", shutdown_on_close=False, **(_lifetime(cfg, inv) if inv else {}))
-    if inv:
-        verify_created(cfg.keeper_name, kc.cluster_id, inv)
+    kc = _construct(cfg, cfg.keeper_name, inv, lambda: coiled.Cluster(
+        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2, worker_memory="8 GiB", scheduler_cpu=2,
+        spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
     if record:
         record("keeper", cfg.keeper_name, kc.cluster_id)         # before anything that can fail (Codex P2-5)
     c = kc.get_client()
