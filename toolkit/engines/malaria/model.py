@@ -31,6 +31,13 @@ smc_adh, every reached child's blood-stage infection is cleared, and new infecti
 protection smc_protection (E0 exp(-(t/L)^k ln2), Burgert 2022 Table 1), E0 x smc_partial after the day-1 dose only.
 v0.3-v0.10 cleared, then protected at a flat smc_pe for 28 days, with two access groups (smc_hi_frac).
 
+v0.12: case management as a package (ENGINE_NOTES.md, v0.12), with cm_target = 1. The add-on raises effective
+treatment of clinical episodes only in ages [cm_age_lo_m, cm_age_hi_m) months (default 2-59 months), ramped in
+linearly over cm_ramp_years from its start (cm_ramp). Severe-care access is severe_access_add + the unit's effective
+treatment, plus cm_severe_link x the add-on's realised gain in a person's ages (default 0). The cost drivers count
+children in the targeted ages while the add-on runs and treated episodes in those ages. cm_target = 0 (the default)
+is the v0.11 add-on: all ages, from its start, severe-care access raised one for one.
+
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
   z_hh   household latent; a person's net-use latent is
@@ -161,6 +168,9 @@ class Malaria(ss.Disease):
         # v0.6: treatments and person-days in the delivery period (the treatment cost driver); the same terms in the
         # same order as acc['treated'] and pdays_all, so they are equal when the delivery period is the window
         self.acc_del_treated, self.acc_cost['pdays_del'] = np.zeros(3), 0.0
+        # v0.12 (cm_target = 1): the add-on's state, set by CaseManagement each step, and its cost drivers in the
+        # delivery period (child-days in the targeted ages while the add-on runs; treated episodes in those ages)
+        self.cm_on, self.cm_gain, self.acc_cm = False, 0.0, np.zeros(2)
         sel = (age_d > 18 * 365) & (age_d < 25 * 365)
         self.ic20 = float(self.IC[u][sel].mean()) if sel.any() else 0.0
         self.iv20 = float(self.IV[u][sel].mean()) if sel.any() else 0.0
@@ -327,7 +337,14 @@ class Malaria(ss.Disease):
         fv = 1 - (1 - G['fv0']) / (1 + (a_i / G['av']) ** G['gv'])
         theta = G['th0'] * (G['th1'] + (1 - G['th1']) / (1 + fv * ((self.IV[ui] + ivm) / G['IV0']) ** G['kv']))
         clin = self.rs.random(len(ui)) < phi
-        treat = clin & (self.rs.random(len(ui)) < p.ft)
+        tgt = bool(P.get('cm_target', 0.0))
+        if tgt:     # v0.12: the add-on's gain only in the targeted ages (the same draws as v0.11)
+            lo_d, hi_d = P['cm_age_lo_m'] * DAYS_PER_MONTH, P['cm_age_hi_m'] * DAYS_PER_MONTH
+            in_t = (a_i >= lo_d) & (a_i < hi_d)
+            pft = np.where(in_t, min(0.95, p.ft + self.cm_gain), p.ft)
+            treat = clin & (self.rs.random(len(ui)) < pft)
+        else:
+            treat = clin & (self.rs.random(len(ui)) < p.ft)
         st[newinf] = np.where(clin, np.where(treat, T_, D_), A_)
         rnd = self.rs.random(n)
         old = ~newinf
@@ -370,18 +387,27 @@ class Malaria(ss.Disease):
             agi = ag[newinf]
             pt = min(1.0, P['severe_access_add'] + p.ft)
             cfr = (1 - pt) * P['cfr_severe_untreated'] + pt * P['cfr_severe_treated']
+            cfr_i = None
+            if tgt and self.cm_gain > 0 and P['cm_severe_link'] > 0:
+                # v0.12: severe-care access rises only through the declared link, by a person's realised gain
+                pti = np.minimum(1.0, P['severe_access_add'] + p.ft + P['cm_severe_link'] * (pft - p.ft))
+                cfr_i = (1 - pti) * P['cfr_severe_untreated'] + pti * P['cfr_severe_treated']
             for g in range(3):
                 m = agi == g
                 self.acc['cases'][g] += clin[m].sum()
                 self.acc['treated'][g] += treat[m].sum()
                 self.acc['severe'][g] += theta[m].sum()
-                self.acc['deaths'][g] += theta[m].sum() * cfr
+                self.acc['deaths'][g] += theta[m].sum() * cfr if cfr_i is None else (theta[m] * cfr_i[m]).sum()
                 self.acc['pdays'][g] += (ag == g).sum()
             self.acc_cost['pdays_all'] += n
             if self.in_delivery():         # the delivery period lies inside the window (the engine checks it)
                 for g in range(3):
                     self.acc_del_treated[g] += treat[agi == g].sum()
                 self.acc_cost['pdays_del'] += n
+                if tgt:
+                    if self.cm_on:
+                        self.acc_cm[0] += ((age_d >= lo_d) & (age_d < hi_d)).sum()
+                    self.acc_cm[1] += (treat & in_t).sum()
 
     def _detect(self, age_d):
         fd = 1 - (1 - G['fd0']) / (1 + (age_d / G['ad']) ** G['gd'])
@@ -575,13 +601,58 @@ class SMCDelivery(ss.Intervention):
             dz.smc_eff[got] = np.where(full, self.e0, self.e0 * self.partial)
 
 
+CM_PARAM_NAMES = ("cm_target", "cm_age_lo_m", "cm_age_hi_m", "cm_ramp_years", "cm_severe_link")
+DAYS_PER_MONTH = 365.0 / 12.0        # ages are kept in days of 365 per year (age_d = age x 365)
+
+
+def cm_ramp(yr, start, years) -> float:
+    """v0.12: the share of the add-on's gain in effect at decimal year `yr`: linear from 0 at `start` to 1 at
+    start + years, 1 after; a step (1 from `start`) when years is 0."""
+    if years <= 0:
+        return 1.0
+    return float(min(1.0, max(0.0, (yr - start) / years)))
+
+
+def cm_check(P: dict) -> None:
+    """v0.12: the case-management options' domains; a value outside fails closed (ValueError naming the parameter).
+    With cm_target 0 (the v0.11 add-on) only the switch is checked."""
+    def num(k):
+        v = P[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)) or not np.isfinite(v):
+            raise ValueError(f"{k} must be a finite number (got {v!r})")
+        return float(v)
+    if P.get("cm_target", 0.0) not in (0.0, 1.0):
+        raise ValueError(f"cm_target must be 0 (the v0.11 add-on) or 1 (got {P['cm_target']!r})")
+    if not P.get("cm_target", 0.0):
+        return
+    lo, hi = P["cm_age_lo_m"], P["cm_age_hi_m"]
+    if not (np.isfinite(lo) and np.isfinite(hi) and 0.0 <= lo < hi):
+        raise ValueError(f"cm_age_lo_m and cm_age_hi_m must be finite with 0 <= cm_age_lo_m < cm_age_hi_m (months; "
+                         f"got {lo!r}, {hi!r})")
+    if not num("cm_ramp_years") >= 0.0:
+        raise ValueError(f"cm_ramp_years must be >= 0 (got {P['cm_ramp_years']!r})")
+    for k, top in (("cm_severe_link", 1.0), ("cm_add", 0.95)):
+        if not 0.0 <= num(k) <= top:
+            raise ValueError(f"{k} must be in [0, {top:g}] (got {P[k]!r})")
+
+
 class CaseManagement(ss.Intervention):
-    """Effective treatment probability of clinical episodes; `add` from `start` until `stop` (v0.6; None: no end)."""
+    """Effective treatment probability of clinical episodes; `add` from `start` until `stop` (v0.6; None: no end).
+    v0.12: with cm_target = 1 the unit's level `base` applies to every age and the add-on's gain, `add` x cm_ramp, to
+    the targeted ages only (Malaria.step); `pkg` (set by the engine) says the package has the add-on, whose cost
+    drivers count even at add 0."""
     def __init__(self, base=0.3, add=0.0, start=2024.0, stop=None, name=None):
         super().__init__(name=name)
         self.base, self.add, self.start, self.stop = base, add, start, stop
+        self.pkg = False
 
     def step(self):
         yr = float(self.sim.t.yearvec[self.ti])
         on = yr >= self.start and (self.stop is None or yr < self.stop)
-        self.sim.diseases.malaria.pars.ft = min(0.95, self.base + (self.add if on else 0.0))
+        dz = self.sim.diseases.malaria
+        if not dz.P.get("cm_target", 0.0):
+            dz.pars.ft = min(0.95, self.base + (self.add if on else 0.0))
+            return
+        dz.pars.ft = min(0.95, self.base)
+        dz.cm_on = bool(on and self.pkg)
+        dz.cm_gain = self.add * cm_ramp(yr, self.start, dz.P["cm_ramp_years"]) if dz.cm_on else 0.0

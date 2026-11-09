@@ -88,6 +88,15 @@ with probability smc_adh (Table 16) and is cleared of blood-stage infection, and
 E0 exp(-(t/L)^k ln2) from the dose (smc_e0, smc_half, smc_k; Burgert 2022 Table 1), E0 x smc_partial after the day-1
 dose only (Cairns 2022). smc_pe and smc_hi_frac are gone. Not byte-identical where SMC acts, so the benchmark
 evidence is recomputed (validate_once.sh). Self-tests Q0-Q6 (selftest_late.py).
+
+v0.12 (F6 S2-2): case management as an implementable package (ENGINE_NOTES.md, v0.12), with the fixed parameter
+cm_target = 1. The add-on (`cm` component, effect cm_add) raises effective treatment only in ages [cm_age_lo_m,
+cm_age_hi_m) months (default 2-59 months, the iCCM age band), ramped in linearly over cm_ramp_years from the delivery
+start; severe-care access rises only by cm_severe_link x the add-on's realised gain (default 0: no source gives a
+value). Two cost drivers are added: cm_child_years (child-years in the targeted ages while the package's add-on runs,
+per person; charged even at cm_add 0) and treated_cm_ages (treated episodes in those ages, every arm). With cm_target
+0 (the default) a run is byte-identical to v0.11 (self-test C6; benchmarks/restamp_proof.py). Self-tests C0-C7
+(selftest_late.py).
 """
 from __future__ import annotations
 
@@ -116,7 +125,11 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.11"
+VERSION = "0.12"
+# v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
+ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
+ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
+OO = "Oo et al. 2019 Malar J (PMC6683427)"
 # v0.11: SMC sources (ENGINE_NOTES.md, v0.11)
 MC20 = ("Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and "
         "quality in Burkina Faso, Chad, Nigeria, and Togo")
@@ -169,7 +182,28 @@ _PARAMS = [
      "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7. "
      "Assumption (Codex r1 P2-5): the ratio of two 30-day clinical PEs is applied as a multiplier on the initial "
      "infection-blocking efficacy, with the same decay and clearance", "unverified"),
-    ("cm_add", 0.15, "scenario", "probability", None, None, A8 + " (enhanced CM: +0.15 effective treatment)", "unverified"),
+    # v0.12: the point value stays 0.15 (v0.11 outputs unchanged); a run sets its own value and range in the spec
+    ("cm_add", 0.15, "scenario", "probability", 0.0, 0.15, "enhanced CM: absolute gain in effective treatment, applied "
+     "to the whole unit in the targeted ages (cm_target 1). Within iCCM catchments, children 2-59 months: ACT among "
+     "confirmed cases +17 points, " + ORESANYA + "; appropriate treatment +33 points, " + ISIGUZO + "; home management "
+     "RR 1.89 (1.60-2.22) on appropriate treatment, " + OO + ". Unit-wide low / central / high 0.03 / 0.07 / 0.15 "
+     "(derived: the catchment gain x an assumed catchment share of 0.2-0.5); 0 is the no-effect scenario. v0.11 and "
+     "earlier: 0.15 for all ages, attempt 8 value, no source", "unverified"),
+    ("cm_target", 0.0, "fixed", "switch", None, None, "v0.12 model switch: 1 = the case-management package (targeted "
+     "ages, ramp, severe-care link, its cost drivers); 0 = the v0.11 add-on (all ages, from the delivery start, "
+     "severe-care access raised one for one), kept so earlier results reproduce exactly", "unverified"),
+    ("cm_age_lo_m", 2.0, "fixed", "months", None, None, "iCCM in Nigeria treats children 2-59 months (" + ORESANYA
+     + "; " + ISIGUZO + ")", "unverified"),
+    ("cm_age_hi_m", 60.0, "fixed", "months", None, None, "upper end (exclusive) of the iCCM age band, 2-59 months "
+     "(as cm_age_lo_m); ages 5 and over get no gain", "unverified"),
+    ("cm_ramp_years", 2.5, "fixed", "years", 2.0, 3.0, "assumption from programme timing: the RAcE endline gains "
+     "were measured about three years after the start (2014 to February 2017; " + ORESANYA + "; " + ISIGUZO + "), so "
+     "the gain ramps in linearly over 2-3 years from the delivery start", "unverified"),
+    ("cm_severe_link", 0.0, "fixed", "share", 0.0, 1.0, "share of the add-on's gain in uncomplicated effective "
+     "treatment that also raises severe-care access; no published estimate was found: " + OO + " pools no "
+     "severe-malaria outcome, and iCCM refers severe cases rather than treating them. Default 0 (conservative): the "
+     "add-on changes deaths only through transmission and post-treatment prophylaxis. 1 = the v0.11 one-for-one link",
+     "unverified"),
     ("cfr_severe_treated", 0.10, "fixed", "probability", None, None, "AQUAMAT (attempt 8 C48)", "unverified"),
     ("cfr_severe_untreated", 0.30, "fixed", "probability", None, None, "assumption (attempt 8 C49)", "unverified"),
     ("severe_access_add", 0.25, "fixed", "probability", None, None, A8 + " (severe-care access above CM)", "unverified"),
@@ -200,6 +234,7 @@ MIN_START_YEAR = 1900.0
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
 POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC_PARAM_NAMES, "cm_add",
+                       *M.CM_PARAM_NAMES,
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
@@ -425,7 +460,8 @@ class MalariaEngine:
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
                 "SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); "
-                "case management (effective treatment)",
+                "case management (effective treatment); v0.12 with cm_target 1: the add-on in declared ages (default "
+                "2-59 months) with a linear ramp, severe-care access raised only through cm_severe_link (default 0)",
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "routine SMC in every arm after the delivery period, uncharged (v0.7)",
@@ -457,7 +493,9 @@ class MalariaEngine:
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
-                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
+                     # v0.12: the last two only with cm_target 1 (an analysis that maps one fails closed otherwise)
+                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all", "cm_child_years",
+                                      "treated_cm_ages"],
                      "series": {k: dict(v) for k, v in SERIES.items()}},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
@@ -615,7 +653,8 @@ class MalariaEngine:
     def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
         """The package's component settings and the decimal years at which they first act (from delivery_plan)."""
         dp = self.delivery_plan(a, components, horizon)
-        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "net": dp["net"], "smc": dp["smc"],
+        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "cm_on": dp["cm"]["on"], "net": dp["net"],
+                "smc": dp["smc"],
                 "irs": dp["irs"], "events": dp["fork_events"]}
 
     def schedule(self, params, unit: UnitSpec, package: Package, horizon: Horizon) -> list:
@@ -710,6 +749,7 @@ class MalariaEngine:
                              f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
                              "so the population would not grow: shorten the burn-in or move the horizon")
         M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
+        M.cm_check(P)                                # v0.12: and the case-management options
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
@@ -763,6 +803,7 @@ class MalariaEngine:
         if dz is not None:
             dz.P = dict(P)
         itv["cm"].add = float(cfg["cm_add"])
+        itv["cm"].pkg = bool(cfg.get("cm_on", False))    # v0.12: the package has the add-on (its cost drivers)
         net, smc, irs = itv["itn_new"], itv["smc"], itv["irs"]
         net.years = list(cfg["net"]["years"]) if cfg["net"] else []
         net.code = V.NET_CODE[cfg["net"]["net_type"]] if cfg["net"] else V.NET_CODE["pyr"]
@@ -893,6 +934,7 @@ class MalariaEngine:
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
             M.smc_check(P)          # v0.11: every member, not only the one whose parameters build the shared burn-in
+            M.cm_check(P)           # v0.12: likewise
             a = dict(u.attributes)
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
@@ -1003,6 +1045,12 @@ class MalariaEngine:
         tot_treated = float(dz.acc_del_treated.sum() / max(dz.acc_cost["pdays_del"] / ndel, 1e-9))
         cd = {"nets_given": float(dz.acc_cost["nets_given"]), "smc_doses": float(dz.acc_cost["smc_doses"]),
               "irs_sprayed": float(dz.acc_cost["irs_sprayed"]), "treated_all": tot_treated}
+        if P.get("cm_target"):
+            # v0.12: per mean person in the delivery period, as treated_all: child-years in the targeted ages while the
+            # package's add-on runs (the per-child cost), and treated episodes in those ages (commodities)
+            den = max(dz.acc_cost["pdays_del"] / ndel, 1e-9)
+            cd["cm_child_years"] = float(dz.acc_cm[0] / 365.0 / den)
+            cd["treated_cm_ages"] = float(dz.acc_cm[1] / den)
         if capped is None:
             capped = bool(getattr(self, "_access_capped", False))
         return Outcomes(per_capita=pc, windows=wins, cost_drivers=cd,
