@@ -3157,6 +3157,10 @@ def _self_test() -> int:
         _self_test_infra(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"IR: {type(e).__name__}: {e}")
+    try:
+        _self_test_s18(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RU: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3202,6 +3206,109 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_s18(ok) -> None:
+    """F6 S1-8: the fingerprint covers code content only. The launch commit stamp, harness-written analysis outputs
+    under models/ and the spec do not change it; code, data and any unknown file under models/ still do; a stored
+    batch is found again from another tree, and `reuse_report` says how many stored rows would be reused."""
+    import re as _re
+    import shutil
+    import subprocess as _sp
+    import tempfile
+    from unittest import mock
+    g = globals()
+    rep = g.get("reuse_report") or (lambda rd: {})
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo_a, rd = os.path.join(td, "repo_a"), os.path.join(td, "run")
+
+        def w(root, rel, txt, mode="w"):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), mode).write(txt)
+        w(repo_a, "scripts/lib/code_commit.txt", "0" * 40 + "\n")
+        w(repo_a, "scripts/lib/helper.py", "X = 1\n")
+        w(repo_a, "toolkit/eng/m.py", "def f(p):\n    return {'y': 2 * p['x']}\n")
+        w(rd, "models/fn.py", "def f(p):\n    return {'y': p['x']}\n")
+        w(rd, "data/inputs/units.csv", "u,a\n1,2\n")
+        with mock.patch.dict(g, {"REPO": repo_a}):
+            def fp():
+                return code_fingerprint(rd, "models/fn.py::f")
+            fp0 = fp()
+            w(repo_a, "scripts/lib/code_commit.txt", "1" * 40 + "\n")
+            ok(fp() == fp0, "RU1 a new launch commit (scripts/lib/code_commit.txt, export-subst) keeps the fingerprint")
+            w(repo_a, "scripts/lib/helper.py", "X = 2\n")
+            fp1 = fp()
+            ok(fp1 != fp0, "RU2 a change to repo code still changes the fingerprint")
+            for rel in ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml",
+                        "models/decision_tests/DT1.yaml", "decision_spec.yaml", "analysis/point.json"):
+                w(rd, rel, "written: 1\n")
+            ok(fp() == fp1, "RU3 harness-written analysis outputs under models/ and the spec keep the fingerprint")
+            w(rd, "models/decision_tests/DT1.yaml", "written: 2\n")
+            ok(fp() == fp1, "RU3b a rewritten decision test keeps the fingerprint")
+            for rel in ("models/notes.yaml", "models/decision_tests/helper.py", "models/ext/claims_spec.yaml"):
+                w(rd, rel, "x = 1\n")
+                fpx = fp()
+                ok(fpx != fp1, f"RU4 fail closed: an unknown file under models/ ({rel}) still changes the fingerprint")
+                fp1 = fpx
+            w(rd, "data/inputs/units.csv", "u,a\n1,3\n")
+            ok(fp() != fp1, "RU5 a changed input under data/ still changes the fingerprint")
+            out = os.path.join(rd, "models", "batch.jsonl")
+            _, s1 = run_map(rd, os.path.join(repo_a, "toolkit", "eng", "m.py") + "::f", [{"x": i} for i in range(3)],
+                            out, backend="local", max_workers=1, ledger=False)
+            ok(s1.get("computed") == 3, f"RU6 setup: the first batch computes 3 rows ({s1.get('computed')})")
+            r = rep(rd)
+            ok(r.get("stored") == 3 and r.get("reusable") == 3,
+               f"RU7 reuse_report: every stored row would be reused with unchanged code ({r})")
+        # each launch extracts its code to a new temporary directory, and a resume tree is a copy of the run
+        repo_b, rd_b = os.path.join(td, "repo_b"), os.path.join(td, "run_b")
+        shutil.copytree(repo_a, repo_b)
+        shutil.copytree(rd, rd_b)
+        w(repo_b, "scripts/lib/code_commit.txt", "2" * 40 + "\n")
+        with mock.patch.dict(g, {"REPO": repo_b}):
+            r = rep(rd_b)
+            ok(r.get("stored") == 3 and r.get("reusable") == 3,
+               f"RU8 another tree at another commit, the run dir moved: every stored row would be reused ({r})")
+            _, s2 = run_map(rd_b, os.path.join(repo_b, "toolkit", "eng", "m.py") + "::f", [{"x": i} for i in range(4)],
+                            os.path.join(rd_b, "models", "batch.jsonl"), backend="local", max_workers=1, ledger=False)
+            ok(s2.get("computed") == 1 and s2.get("reused") == 3,
+               f"RU9 run_map from another tree reuses the stored rows and computes only the new one: "
+               f"{s2.get('computed')} computed, {s2.get('reused')} reused")
+            w(repo_b, "toolkit/eng/m.py", "# changed\n", "a")
+            r = rep(rd_b)
+            ok(r.get("stored") == 4 and r.get("reusable") == 0 and all(b.get("why") for b in r.get("batches") or [{}]),
+               f"RU10 changed engine code: nothing would be reused, and the report says why ({r})")
+        # the CLI a launcher runs locally, from the tree it would ship
+        rd_c = os.path.join(td, "run_c")
+        w(rd_c, "models/fn.py", "def f(p):\n    return {'y': p['x']}\n")
+        run_map(rd_c, "models/fn.py::f", [{"x": 1}, {"x": 2}], os.path.join(rd_c, "models", "b.jsonl"),
+                backend="local", max_workers=1, ledger=False)
+        cmd = [sys.executable, os.path.abspath(__file__), "reuse-check", rd_c]
+        cli = _sp.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            got = json.loads(cli.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            got = {}
+        ok(cli.returncode == 0 and got.get("stored") == 2 and got.get("reusable") == 2,
+           f"RU11 `compute.py reuse-check <run_dir>` prints the counts as JSON: rc={cli.returncode} {got} "
+           f"{cli.stderr[-200:]}")
+        w(rd_c, "models/fn.py", "# changed\n", "a")
+        cli = _sp.run(cmd + ["--expect-all"], capture_output=True, text=True, timeout=120)
+        ok(cli.returncode == 1, f"RU12 `reuse-check --expect-all` exits 1 when a stored row would be recomputed "
+                                f"(rc={cli.returncode})")
+    # the explicit list covers every models/ path toolkit/analysis names (a drift check, not a guess)
+    lits = set()
+    for f in sorted(os.listdir(os.path.join(REPO, "toolkit", "analysis"))):
+        if f.endswith(".py"):
+            src = open(os.path.join(REPO, "toolkit", "analysis", f)).read()
+            lits |= {"models/" + x for x in _re.findall(r"[\"']models/([A-Za-z0-9_.]+/?)", src)}
+            lits |= {"models/" + x + ("/" if not x.endswith((".yaml", ".json")) else "")
+                     for x in _re.findall(r"os\.path\.join\(\"models\", \"([A-Za-z0-9_.]+)\"", src)}
+    known = tuple(g.get("FP_HARNESS_OUTPUTS", ())) + tuple(g.get("FP_HARNESS_DIRS", {}))
+    miss = sorted(x for x in lits if x not in known and x.removeprefix("models/") not in _FP_RUNNER_FILES
+                  and not x.startswith("models/compute_ledger.json"))
+    ok(lits and not miss and "models/decision_tests/" in g.get("FP_HARNESS_DIRS", {}),
+       f"RU13 every models/ path toolkit/analysis writes is on the harness-output list: missing {miss}")
 
 
 def _self_test_wall(ok) -> None:

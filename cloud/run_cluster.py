@@ -1617,6 +1617,175 @@ def _self_test_attach(ok) -> None:
     _self_test_bwrap(ok)
 
 
+def _self_test_s18(ok, tb) -> None:
+    """F6 S1-8 (no Coiled, no network). The F5 resume launch (2026-11-08): the scheduler listed the run after 43 s,
+    then the laptop's client lost its connection (`OSError: Timed out trying to connect to tls://...:443 after
+    30 s`); the launch raised, a watchdog read that as a failed launch and shut the clusters down, though the run
+    kept going. clusters.json had not been written."""
+    import contextlib
+    import io
+    import tempfile
+    import types
+    from unittest import mock
+    g, M = globals(), sys.modules[__name__]
+    table = {f"tls://10.0.0.{i}:1": {} for i in range(3)}
+    lost = OSError("Timed out trying to connect to tls://10.1.2.3:443 after 30 s")
+    listed = {"tls://10.0.0.0:1": ["run-R1-1"]}
+
+    class Client:
+        def __init__(self, listing, cf):
+            self.status, self.listing, self.cf, self.seen = "running", list(listing), cf, []
+
+        def wait_for_workers(self, *a, **kw):
+            pass
+
+        def upload_file(self, *a):
+            pass
+
+        def scheduler_info(self):
+            return {"workers": table}
+
+        def processing(self, workers=None):
+            self.seen.append(json.load(open(self.cf)) if os.path.exists(self.cf) else None)
+            step = self.listing.pop(0) if len(self.listing) > 1 else self.listing[0]
+            if isinstance(step, BaseException):
+                raise step
+            return step
+
+    def go(listing, keeper=True, overflow_exc=None, tags_exc=None, keeper_exc=None):
+        with tempfile.TemporaryDirectory() as d:
+            q = os.path.join(d, "q.txt")
+            open(q, "w").write("question")
+            cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=keeper,
+                            overflow_max=4 if keeper else 0, pipeline="v2")
+            client = Client(listing, cfg.clusters_file)
+            stops = []
+
+            def tags(c, exclude):
+                if tags_exc:
+                    raise tags_exc
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+                                         register_compute_tags=tags)
+            fake_coiled = types.ModuleType("coiled")
+            fake_coiled.Cluster = lambda **kw: types.SimpleNamespace(cluster_id=77, get_client=lambda: client)
+            P = mock.patch.object
+            with mock.patch.dict(sys.modules, {"coiled": fake_coiled}), \
+                    P(M, "is_running", return_value=False), P(M, "live_id", return_value=77), \
+                    P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
+                    P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
+                    P(M, "_compute", return_value=comp), P(M, "_submit", side_effect=lambda c_, cl, lab, *a: f"run-{lab}-1"), \
+                    P(M, "start_overflow", side_effect=overflow_exc or (lambda *a: {"id": 78})), \
+                    P(M, "start_keeper", return_value=types.SimpleNamespace(cluster_id=79)), \
+                    P(M, "confirm_keeper", side_effect=keeper_exc or (lambda *a, **k: ["tick"])), \
+                    P(M, "shutdown", side_effect=lambda c_: stops.append("shutdown")), \
+                    P(M, "attach", side_effect=lambda n: stops.append(n)), \
+                    P(eval_paths, "archive_sha256", return_value="0"), P(time, "sleep", lambda s: None):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    try:
+                        rc = launch(cfg)
+                    except SystemExit as e:
+                        rc = ("exit", e.code)
+                    except Exception as e:  # noqa: BLE001
+                        rc = ("raised", type(e).__name__)
+            cl = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else {}
+            return rc, cl, client.seen, stops, out.getvalue()
+
+    codes = {k: g.get(k) for k in ("EXIT_LAUNCHED", "EXIT_FAILED", "EXIT_SUBMITTED_LOST", "EXIT_UNCONFIRMED",
+                                   "EXIT_INCOMPLETE")}
+    ok(codes == {"EXIT_LAUNCHED": 0, "EXIT_FAILED": 1, "EXIT_SUBMITTED_LOST": 3, "EXIT_UNCONFIRMED": 4,
+                 "EXIT_INCOMPLETE": 5}, f"LR0 the launch exit codes are named: {codes}")
+    rc, cl, seen, stops, out = go([{}, listed], overflow_exc=lost)
+    ok(rc == 3 and not stops, f"LR1 replay F5: listed, then the connection drops: 'submitted, connection lost' "
+                              f"(exit 3), nothing shut down: rc={rc} stops={stops}")
+    ok(cl.get("status") == "submitted_connection_lost" and "do not shut" in out.lower() and "status" in out,
+       f"LR1b the handover is recorded in clusters.json and says how to attach later: {cl.get('status')} {out[-300:]!r}")
+    ok(seen and seen[0] and (seen[0].get("run") or {}).get("id") == 77 and seen[0].get("launch_id")
+       and seen[0].get("launched_utc"), f"LR2 clusters.json names the run cluster, launch id and time before the "
+                                        f"acknowledgement wait: {seen[:1]}")
+    rc, cl, seen, stops, out = go([lost])
+    ok(rc == 4 and not stops and cl.get("status") == "submitted_unconfirmed",
+       f"LR3 the connection drops before the scheduler lists the run: 'submitted, not confirmed' (exit 4), nothing "
+       f"shut down: rc={rc} {cl.get('status')} stops={stops}")
+    rc, cl, seen, stops, out = go([{}], keeper=False)
+    ok(rc == 4 and not stops, f"LR3b connected, but never listed within the bound: exit 4, nothing shut down: rc={rc}")
+    rc, cl, seen, stops, out = go([listed], tags_exc=RuntimeError("tags"))
+    ok(isinstance(rc, tuple) and (cl.get("run") or {}).get("id") == 77 and cl.get("status") == "failed",
+       f"LR4 a failure before any submission is a failed launch, and clusters.json names what to stop by id: "
+       f"rc={rc} {cl}")
+    rc, cl, seen, stops, out = go([listed], keeper_exc=SystemExit("keeper not confirmed"))
+    ok(rc == 5 and not stops and cl.get("status") == "submitted_launch_incomplete",
+       f"LR5 acknowledged, then a later step fails: 'submitted, launch incomplete' (exit 5), not a failed launch: "
+       f"rc={rc} {cl.get('status')}")
+    rc, cl, seen, stops, out = go([{}, {}, listed])
+    ok(rc == 0 and cl.get("status") == "launched" and (cl.get("keeper") or {}).get("id") == 79
+       and (cl.get("overflow") or {}).get("id") == 78, f"LR6 a clean launch exits 0 with every cluster recorded: rc={rc} {cl}")
+    doc = __doc__ or ""
+    ok("Exit codes" in doc and all(f"  {n} " in doc for n in (0, 1, 3, 4, 5)) and "connection lost" in doc,
+       "LR7 the module doc lists the launch exit codes for an external watchdog")
+    with tempfile.TemporaryDirectory() as d:
+        cf = os.path.join(d, "c.py")
+        open(cf, "w").write("from run_cluster import RunConfig\nCONFIG = RunConfig(name='z', question_file='q')\n")
+        with mock.patch.object(M, "launch", return_value=3):
+            ok(main(["x", cf, "launch"]) == 3, "LR8 main returns launch's exit code")
+    # the real _submit hands back the key the scheduler will list
+    sub = []
+    fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append(kw) or "fut")
+    with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}):
+        cfg = RunConfig(name="z", question_file="q", pipeline="v2")
+        key = _submit(cfg, fc, "R1", "w", b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
+    ok(sub and key == sub[0].get("key") and str(key).startswith("run-R1-"), f"LR9 _submit returns its task key: {key}")
+    wl = g.get("wait_listed")
+    if wl:
+        sl = []
+        c = Client([{}, {}, listed], "/nonexistent/clusters.json")
+        ok(wl(c, "run-R1-1", attempts=5, delay_s=5.0, sleep=sl.append) is True and sl == [5.0, 5.0],
+           f"LR10 wait_listed polls the scheduler until it lists the key: {sl}")
+        ok(wl(Client([{}], "/nonexistent/clusters.json"), "run-R1-1", attempts=3, delay_s=0, sleep=sl.append) is False,
+           "LR10b a key never listed within the bound is not acknowledged")
+        try:
+            wl(Client([lost], "/nonexistent/clusters.json"), "run-R1-1", attempts=3, delay_s=0, sleep=sl.append)
+            ok(False, "LR10c a lost connection while waiting is raised to the caller")
+        except OSError:
+            ok(True, "LR10c a lost connection while waiting is raised to the caller")
+    else:
+        ok(False, "LR10 wait_listed exists")
+    # attach later: start the keeper for the recorded run cluster
+    kl = g.get("keeper_later")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2", overflow_max=0)
+        json.dump({"run": {"name": "lt", "id": 77}, "launch_id": "L", "status": "submitted_connection_lost"},
+                  open(cfg.clusters_file, "w"))
+        P = mock.patch.object
+        refused = None
+        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=[])), \
+                P(M, "start_keeper", return_value=types.SimpleNamespace(cluster_id=79)) as sk, \
+                P(M, "confirm_keeper", return_value=["tick"]), P(time, "sleep", lambda s: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with P(M, "live_id", return_value=77):
+                rc = kl(cfg) if kl else None
+            cl = json.load(open(cfg.clusters_file))
+            started = sk.call_args[0][2] if sk.call_args else None
+            with P(M, "live_id", return_value=99):
+                try:
+                    kl(cfg) if kl else None
+                except SystemExit as e:
+                    refused = str(e)
+    ok(rc == 0 and (cl.get("keeper") or {}).get("id") == 79 and started == 77,
+       f"LR11 `keeper` starts the keeper for the recorded run cluster later: rc={rc} {cl}")
+    ok(refused and "77" in refused, f"LR11b `keeper` refuses when the live run cluster is not the recorded one: {refused}")
+    # would this reuse? the shipped compute.py answers, from the exact tarball
+    rcheck = g.get("reuse_check")
+    stub = (b"import json, os, sys\nprint('noise')\nprint(json.dumps({'argv': sys.argv[1:], 'here': __file__, "
+            b"'stored': 5, 'reusable': 4}))\n")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = RunConfig(name="z", question_file="q", pipeline="v2")
+        r = rcheck(cfg, d, code=tb({"scripts/compute.py": stub})) if rcheck else {}
+    ok(r.get("stored") == 5 and r.get("reusable") == 4 and r.get("argv", [None])[:2] == ["reuse-check", d]
+       and not str(r.get("here", "")).startswith(os.path.dirname(HERE)),
+       f"LR12 reuse_check runs the tarball's own compute.py reuse-check on the run dir: {r}")
+
+
 def _self_test_bwrap(ok) -> None:
     """RC61: the agent VM's best-effort bubblewrap install (worker_side.ensure_bwrap), shell calls stubbed."""
     from types import SimpleNamespace as NS
@@ -1986,6 +2155,10 @@ def _self_test() -> int:
     _self_test_attach(ok)
     _self_test_sign(ok)
     _self_test_pipeline(ok, tb)
+    try:
+        _self_test_s18(ok, tb)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"LR: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
