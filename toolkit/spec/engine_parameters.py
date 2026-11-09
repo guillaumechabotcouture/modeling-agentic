@@ -941,6 +941,10 @@ def _self_test() -> int:
                          "config": {"log": True}}     # logs only where the self-test registered a root (EP10-EP19)
         if entries:
             raw[FIELD] = entries
+            # a ranged spec value replaces the toy's named exclusion of that parameter (F6 S1-4)
+            raw["uncertainty"]["excluded"] = [x for x in raw["uncertainty"].get("excluded") or []
+                                              if not (isinstance(entries.get(x.get("parameter")), dict)
+                                                      and entries[x.get("parameter")].get("range") is not None)]
         return raw
 
     # ------------------------------------------------------------ schema

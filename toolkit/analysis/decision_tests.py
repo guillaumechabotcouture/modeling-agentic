@@ -83,6 +83,8 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
 
 
 PRIOR_RANGE_PREFIX = "prior_range_"
+FITTED_RANGE_PREFIX = "fitted_range_"
+SCENARIO_EXCLUDED_PREFIX = "scenario_excluded_"
 
 
 def prior_range_tests(A) -> list[dict]:
@@ -99,6 +101,26 @@ def prior_range_tests(A) -> list[dict]:
             t.update(values=[float(r[0]), float(r[1])], joint=True,
                      text=f"Does the plan change when {t['parameter']} is at either end of its jointly calibrated "
                           "range?")
+    # F6 S1-4: every fitted engine parameter the draws vary that is not a prior gets the same test at each end of its
+    # range (of its jointly calibrated range when it has one); an excluded scenario parameter is listed, not run
+    have = {t["parameter"] for t in out}
+    for k in sorted(A.fr):
+        if k in have or k in A.pr:
+            continue
+        lo, hi = (jr[k] if k in jr else A.fr[k][:2])
+        out.append({"id": f"{FITTED_RANGE_PREFIX}{k}", "type": "fitted_range", "parameter": k,
+                    "values": [float(lo), float(hi)], "automatic": True, "joint": k in jr,
+                    "finding": f"decision_test:{FITTED_RANGE_PREFIX}{k}",
+                    "text": f"Does the plan change when the fitted parameter {k} is at either end of its "
+                            f"{'jointly calibrated' if k in jr else 'fitted'} range?"})
+    from toolkit.spec import priors as PRI
+    exc = PRI.excluded_parameters(A.spec.raw["uncertainty"])
+    for q_ in A.eng.parameters():
+        if q_.kind == "scenario" and q_.name in exc and q_.name not in A.pr:
+            out.append({"id": f"{SCENARIO_EXCLUDED_PREFIX}{q_.name}", "type": "scenario_excluded", "parameter": q_.name,
+                        "values": [], "automatic": True, "reason": exc[q_.name],
+                        "finding": f"decision_test:{SCENARIO_EXCLUDED_PREFIX}{q_.name}",
+                        "text": f"Does the plan change with the scenario value {q_.name}?"})
     if A.method == "posterior":
         # v2d §3.2: a calibration parameter the data do not determine (prior-dominated or partly identified) gets the
         # same automatic test; the calibration is redone with the parameter held at each end of its declared range
@@ -124,14 +146,19 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         if r.get("not_run"):
             return _not_run(A, dt, r["not_run"], r.get("info"))
         varied, cases, lowers, extra, rejected = r["varied"], r["cases"], r["lowers"], r["extra"], r["rejected"]
-    elif t in ("parameter_value", "prior_range"):
+    elif t == "scenario_excluded":
+        return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
+                        {"parameter": dt["parameter"]})
+    elif t in ("parameter_value", "prior_range", "fitted_range"):
         p = dt["parameter"]
         if A.model.kind == "emulator" and p not in A.dr and p not in getattr(A.model, "spec_names", ()) \
                 and not p.startswith("z:"):
             return _not_run(A, dt, f"{p} is not an emulator input; it needs engine runs (direct evaluation), or a "
                                    "published prior so it enters the emulator design")
         varied = (f"engine parameter {p} set to each end of its declared prior range ({dt.get('source')})"
-                  if t == "prior_range" else f"engine parameter {p} set to each tested value")
+                  if t == "prior_range" else
+                  f"fitted engine parameter {p} set to each end of its {'jointly calibrated' if dt.get('joint') else 'fitted'}"
+                  " range" if t == "fitted_range" else f"engine parameter {p} set to each tested value")
         cases, lowers = [], []
         vals = list(dt["values"])
         from toolkit.spec import engine_parameters as PV
