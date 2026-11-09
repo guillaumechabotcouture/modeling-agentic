@@ -1493,6 +1493,46 @@ def _self_test() -> int:
         ok("unmapped:x" in h._inadequate(), "JA14c such a failure blocks the continuation")
     safe(ja14, "JA14")
 
+    def ja15():          # F6 S2-3: a shared offset per (source, group) and the change between surveys, from the spec
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d, group=False)
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            j["targets"][0].update(bias_sd=0.2, bias_by="region")
+            j["targets"].append(dict(j["targets"][0], id="unit_t2", window=[2, 3]))
+            j["change"] = [{"id": "c12", "from": "unit_t", "to": "unit_t2", "weights": "pop"}]
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            P, _ = build(schema.load(p))
+            u0 = [t for t in P.targets if t.id == "unit_t:0"][0]
+            ch = (getattr(P, "changes", None) or [{}])[0]
+            ok(getattr(u0, "bias_key", None) == "unit_t|r0" and u0.sd_bias == 0.2
+               and ch.get("pairs", {}).get("0") == ("unit_t:0", "unit_t2:0") and ch.get("groups", {}).get("0") == "r0"
+               and ch.get("weights", {}).get("0") == 1000.0 and ch.get("mode") == "block",
+               f"JA15a bias_by gives one offset per source and region; change pairs each unit's two targets "
+               f"({getattr(u0, 'bias_key', None)}, {ch})")
+            bad_cases = [("bias_by names no units column", lambda j: j["targets"][0].update(bias_by="nope")),
+                         ("bias_by without a bias sd", lambda j: j["targets"][0].update(bias_sd=0.0)),
+                         ("bias_by on a group target", lambda j: j["targets"].append(
+                             {"id": "g", "kind": "group", "csv": "x.csv", "value": "v", "weights": "pop", "sd": 0.1,
+                              "key": {"csv": "region", "units": "region"}, "window": [1, 2], "metric": "prev",
+                              "source": "t", "bias_sd": 0.1, "bias_by": "region"})),
+                         ("a change from an unknown target", lambda j: j["change"][0].update({"from": "nope"})),
+                         ("a declared change without a reason", lambda j: j["change"][0].update(mode="flag")),
+                         ("a change by a column that is not a units column", lambda j: j["change"][0].update(by="x"))]
+            for why, mut in bad_cases:
+                r2 = yaml.safe_load(open(p))
+                mut(r2["calibration"]["joint"])
+                p2 = os.path.join(d, "s2.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                bad = spec_problems(schema.load(p2))
+                ok(bool(bad), f"JA15b refused: {why} ({bad[:2]})")
+            rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
+            ok(set(rep.get("bias") or {}) == {f"{tid}|r{k}" for tid in ("unit_t", "unit_t2") for k in range(3)}
+               and len(rep.get("change") or []) == 1 and rep["change"][0]["groups"],
+               f"JA15c the toy run reports each block's offset and the change by region ({summary(rep)})")
+    safe(ja15, "JA15")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -2042,6 +2042,147 @@ def _self_test() -> int:
            f"HM21 a top-up wave simulates only the units below the run count ({sorted(wave_units)})")
     safe(hm21, "HM21")
 
+    # F6 S2-3: shared offsets per (source, group), group-weighted best point, change between surveys by group
+    def gtoy(per, f0, f1, obs, sd=0.03, md=0.02, sd_b=0.0, key=None, shared=None, zr=(-2.0, 2.0)):
+        """Units in groups (per: {group: n}); unit targets w0, w1 with logit means f0(u, z, th), f1(u, z, th);
+        obs(u, g) gives the two observed logits; key(t, g) the bias block of a target (None: independent)."""
+        units, grp, tg = [], {}, []
+        for g, n in per.items():
+            for i in range(n):
+                u = f"{g}u{i}"
+                units.append(u)
+                grp[u] = g
+        for u in units:
+            for ob, y in zip(("w0", "w1"), obs(u, grp[u])):
+                kw = {"bias_key": key(ob, grp[u])} if key else {}
+                tg.append(Target(f"{u}:{ob}", "unit", ob, _expit(y), "logit", sd_obs=sd, sd_bias=sd_b, sd_md=md,
+                                 unit=u, source="toy", **kw))
+        P = Problem(shared or [Param("e", 0.0, 1.2, "uniform", None, "toy")], {"name": "z", "lo": zr[0], "hi": zr[1]},
+                    units, tg, features={u: [float(units.index(u) % 2)] for u in units}, groups=grp)
+
+        def sim(pts):
+            return [{ob: _expit(fn(p["unit"], p["z"], p["theta"]) + np.random.default_rng(p["seed"]).normal(0, 0.02))
+                     for ob, fn in (("w0", f0), ("w1", f1))} for p in pts]
+        return P, sim
+
+    def hm26():          # a shared survey offset per group: independent errors give the wrong compatible region
+        off = {"g0": (0.35, -0.3), "g1": (-0.3, 0.35), "g2": (0.2, 0.4), "g3": (-0.4, 0.1)}
+        tr_ = lambda u: float(int(u[-1]) % 2)  # noqa: E731  -- treated units alternate within each group
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z - 3.0 * th["e"] * tr_(u)  # noqa: E731
+        obs = lambda u, g: (0.2 + off[g][0], 0.2 - 1.8 * tr_(u) + off[g][1])  # noqa: E731  -- truth e = 0.6
+        per = {g: 6 for g in off}
+        Ps, ss = gtoy(per, f0, f1, obs, sd_b=0.3, key=lambda ob, g: f"{ob}|{g}")
+        Pi, si = gtoy(per, f0, f1, obs, sd_b=0.3)
+        hs = HistoryMatch(Ps, ss, 11, q, candidates_log2=9, points_per_unit=10)
+        rs = hs.run(2)
+        hi_ = HistoryMatch(Pi, si, 11, q, candidates_log2=9, points_per_unit=10)
+        ri = hi_.run(2)
+        ok(rs["status"] == "matched" and hs.compatible({"e": 0.6}) and not hs.compatible({"e": 0.9}),
+           f"HM26a one offset per (source, group): the truth is compatible, a value the within-group contrast rules "
+           f"out is not ({rs['status']}, {rs['blocks']}, region {rs['region']['ranges']})")
+        ok(hi_.compatible({"e": 0.9}) and ri["region"]["contraction"]["e"] + 0.25 < rs["region"]["contraction"]["e"],
+           f"HM26b the same bias sd added to each target independently keeps the wrong value and a wider region "
+           f"({ri['region']['ranges']} vs {rs['region']['ranges']})")
+        b = rs.get("bias") or {}
+        ok(set(b) == {f"{ob}|{g}" for ob in ("w0", "w1") for g in off}
+           and all(abs(v["z"]) <= rs["cutoff"] + 1e-9 and v["sd"] == 0.3 for v in b.values()),
+           f"HM26c the report gives each block's offset at the best point, inside its prior ({b})")
+    safe(hm26, "HM26")
+
+    def hm27():          # the best point weights each group once, not each of its units
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.1, 0.1 + (0.3 if g == "A" else 0.7))  # noqa: E731
+        P, sim = gtoy({"A": 10, "B": 2}, f0, f1, obs, sd=0.15, md=0.0, zr=(-1.0, 1.5),
+                      shared=[Param("e", 0.0, 1.0, "uniform", None, "toy")])
+        r = calibrate(P, sim, seed=5, waves=2, log=q, candidates_log2=9, points_per_unit=20)
+        e = r["best"]["theta"]["e"]
+        ok(r["status"] == "matched" and abs(e - 0.5) < 0.07,
+           f"HM27 a 10-unit group and a 2-unit group that prefer 0.3 and 0.7: the best point sits between them "
+           f"(0.5), not at the large group's 0.37 ({e:.3f}, {r['status']})")
+    safe(hm27, "HM27")
+
+    def hm28():          # the modelled change between surveys by group, against the observed change
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z - th["d"]  # noqa: E731  -- the model can only fall between the two surveys
+        obs = lambda u, g: (0.0, 0.4 if g == "g2" else -0.3)  # noqa: E731
+        sh = [Param("d", 0.2, 0.4, "uniform", None, "toy")]
+
+        def mk(mode="block", reason=""):
+            P, sim = gtoy({"g0": 6, "g1": 6, "g2": 6}, f0, f1, obs, sd=0.15, md=0.03, shared=sh)
+            P.changes = [{"id": "d01", "pairs": {u: (f"{u}:w0", f"{u}:w1") for u in P.units}, "groups": P.groups,
+                          "weights": None, "mode": mode, "reason": reason}]
+            return P, sim
+        P, sim = mk()
+        r = calibrate(P, sim, seed=6, waves=1, log=q, candidates_log2=9, points_per_unit=12)
+        ch = (r.get("change") or [{}])[0]
+        gs = {x["group"]: x["status"] for x in ch.get("groups") or []}
+        ok(gs == {"g0": "consistent", "g1": "consistent", "g2": "wrong_sign"}
+           and any(b["code"] == "change_wrong_sign" and b["detail"]["groups"] == ["g2"] for b in r["blocks"]),
+           f"HM28a a group whose modelled change goes the wrong way beyond noise is a finding that blocks ({gs}, "
+           f"{[b['code'] for b in r['blocks']]})")
+        P, sim = mk("flag", "toy: declared by the owner")
+        r = calibrate(P, sim, seed=6, waves=1, log=q, candidates_log2=9, points_per_unit=12)
+        ch = (r.get("change") or [{}])[0]
+        ok(not any(b["code"].startswith("change_") for b in r["blocks"]) and ch.get("findings")
+           and all(f["reason"] == "toy: declared by the owner" for f in ch["findings"]),
+           f"HM28b declared (mode flag): the finding is reported with its reason and does not block ({ch.get('findings')})")
+        P, sim = mk()
+        h = HistoryMatch(P, sim, 6, q, candidates_log2=9, points_per_unit=12)
+        h.vth = dict(h.vth, run=False)
+        r = h.run(1)
+        ok(any(b["code"] == "change_not_judged" for b in r["blocks"]),
+           "HM28c without engine verification runs the change cannot be judged: a block, never a pass")
+    safe(hm28, "HM28")
+
+    def hm29():          # refusals of the new declarations
+        f = lambda u, z, th: z  # noqa: E731
+        obs = lambda u, g: (0.0, 0.0)  # noqa: E731
+        cases = []
+
+        def c1(P):           # a bias block without a bias sd
+            for t in P.targets:
+                t.bias_key, t.sd_bias = f"{t.observable}|x", 0.0
+        cases.append(("a bias block with no bias sd", c1))
+
+        def c2(P):           # two sds in one block
+            for n, t in enumerate(P.targets):
+                t.bias_key, t.sd_bias = "one", 0.1 + 0.1 * (n % 2)
+        cases.append(("one block with two bias sds", c2))
+
+        def c3(P):
+            P.targets.append(Target("gg", "group", "w0", 0.5, "logit", sd_obs=0.1, sd_bias=0.1,
+                                    weights={P.units[0]: 1.0}, source="t", bias_key="k"))
+        cases.append(("a bias block on a group target", c3))
+
+        def c4(P):
+            P.changes = [{"id": "c", "pairs": {P.units[0]: ("nope", f"{P.units[0]}:w1")}, "groups": P.groups,
+                          "weights": None, "mode": "block", "reason": ""}]
+        cases.append(("a change naming an unknown target", c4))
+
+        def c5(P):
+            P.changes = [{"id": "c", "pairs": {P.units[0]: (f"{P.units[0]}:w0", f"{P.units[0]}:w1")},
+                          "groups": P.groups, "weights": None, "mode": "flag", "reason": ""}]
+        cases.append(("a declared (flag) change without a reason", c5))
+
+        def c6(P):
+            u = P.units[0]
+            for n, t in enumerate(P.unit_targets(u)):
+                t.bias_key, t.sd_bias = f"k{n}", 0.1
+            P.targets += [Target(f"{u}:x{n}", "unit", "w0", 0.5, "logit", sd_obs=0.1, sd_bias=0.1, unit=u, source="t",
+                                 bias_key=f"x{n}") for n in range(3)]
+        cases.append(("more bias blocks linked by units than bias_blocks_max", c6))
+        for why, mut in cases:
+            P, sim = gtoy({"g0": 3}, f, f, obs)
+            mut(P)
+            try:
+                HistoryMatch(P, sim, log=q, points_per_unit=6)
+                ok(False, f"HM29 refused: {why}")
+            except (CalibrationInputError, TypeError, AttributeError) as e:
+                ok(isinstance(e, CalibrationInputError), f"HM29 refused: {why}")
+    safe(hm29, "HM29")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
