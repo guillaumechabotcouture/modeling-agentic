@@ -462,8 +462,16 @@ def _record(run_dir: str, name: str) -> Optional[dict]:
 def run_status(run_dir: str) -> Optional[str]:
     """The run's status from the harness's own records: the final gate's decision (final_gate.json) and
     the v2 machine's state (run_state.json). metadata.json is not read: agents can edit it. Records that
-    disagree on acceptance are `records_conflict` (not accepted); a run still in progress is `pending`."""
+    disagree on acceptance are `records_conflict` (not accepted); a run still in progress is `pending`.
+    Only a current gate decision counts: none, or one older than report.md, is `no_gate_decision`."""
     g, rs = _record(run_dir, "final_gate.json"), _record(run_dir, "run_state.json")
+    try:
+        stale = os.path.getmtime(os.path.join(run_dir, "final_gate.json")) < os.path.getmtime(
+            os.path.join(run_dir, "report.md"))
+    except OSError:
+        stale = g is None
+    if g is None or stale:
+        return "no_gate_decision"
     action = (g or {}).get("action")
     by_gate = {"ACCEPT": "completed", "DECLARE_SCOPE": "completed_scope_declared"}.get(action) or (
         "not_accepted" if g is not None else None)
@@ -502,6 +510,9 @@ def acceptance_language_hits(text: str, status: Optional[str], manifest: Optiona
     att = "|".join(re.escape(a) for a in m.get("attributions") or [])
     if att:   # a quotation attributed to a critic or reviewer is their words, not the report's claim
         text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
+    # A Markdown soft break (one newline inside a paragraph) is a space; a blank line, a heading, a list
+    # item, a quote or a table row still starts a new clause.
+    text = re.sub(r"(?<!\n)\n(?![\n#>|*+-]|\s*\d+[.)]\s)", " ", text)
     negs = {n.lower() for n in m.get("negations") or []}
     win = int(m.get("negation_window", 3))
     out = []

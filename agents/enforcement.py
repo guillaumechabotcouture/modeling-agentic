@@ -71,6 +71,7 @@ SCRIPT_OUTPUTS = (
     "models/claims_ledger.yaml",      # Phase 22 γ: scripts/build_claims_ledger.py
     "claims_ledger.yaml",
     "report.md",          # produced by scripts/render_claims.py
+    "run_state.json",      # F6 S1-7: the v2 machine's state; its status grants the acceptance-language exemption
     "report_render.json",  # F6 S1-7: the harness's record of the blocks it rendered into report.md
     "report_withheld.md",
     # benchmark arms at a spec's engine parameter values, and the harness record that verifies them

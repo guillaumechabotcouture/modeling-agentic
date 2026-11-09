@@ -243,7 +243,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                              owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                              scope_declarable=b.get("scope_declarable") is not False,
                              first_seen_round=b.get("first_seen_round", round_n), last_seen_round=round_n,
-                             claim=str(b.get("claim") or ""))
+                             claim=str(b.get("claim") or ""), fix_requires=remedy(b))
         if b.get("owner_signoff"):
             rows[kind].resolution_type = "owner_decision"
     for f in rows.values():
@@ -258,7 +258,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 id=str(b["id"]), kind="critique_blocker", severity="HIGH", source=str(b.get("reviewer")),
                 owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 first_seen_round=b.get("first_seen_round"), last_seen_round=round_n,
-                claim=str(b.get("claim") or ""))).blocking = True
+                claim=str(b.get("claim") or ""), fix_requires=remedy(b))).blocking = True
     return list(rows.values()), problems
 
 
@@ -341,7 +341,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         # keep identity and history; refresh what the source now says
         for k in ("severity", "claim", "fix_requires", "owner_state", "owner_state_known", "target_stage", "instances",
                   "scope_declarable", "last_seen_round"):
-            setattr(old, k, getattr(new, k))
+            if not (k == "fix_requires" and new.fix_requires is None):   # a gate row without one keeps the remedy
+                setattr(old, k, getattr(new, k))
         if not new.source.startswith("critique"):
             old.blocking = new.blocking
         if new.done_when is not None:

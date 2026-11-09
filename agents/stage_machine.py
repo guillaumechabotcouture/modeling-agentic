@@ -1305,7 +1305,7 @@ class Machine:
                 fst = route_gate(d, pw)[1]
                 render_report(self.run_dir, self.backend, status=fst or "pending")
                 if fst is not None and fst not in ACCEPTED_STATUSES:
-                    d["report_acceptance_language"] = self._repair_language(fst)
+                    d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw:
@@ -1321,8 +1321,16 @@ class Machine:
                         led[fid].blocking = True
                 FL.save(self.run_dir, led)
         nxt, status, mode = route_gate(d, pw)
-        if nxt == "FINAL" and ((d or {}).get("report_acceptance_language") or {}).get("remaining"):
-            # Not delivered with acceptance language in place (F6 S1-7): the report is withheld.
+        lang = (d or {}).get("report_acceptance_language") or {}
+        if nxt == "FINAL" and lang.get("remaining"):
+            # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
+            # goes through the whole post-write path again (presentation, every post-write check, this gate);
+            # once the repairs are used, the report is withheld.
+            if lang["repairs"] < MAX_LANGUAGE_REPAIRS:
+                self.st.tries["language"] = lang["repairs"] + 1
+                self.st.tries["language_feedback"] = lang["remaining"]
+                self.st.write_mode = lang["mode"]
+                return self._go("WRITE", f"acceptance language in a {lang['mode']} report: the writer repairs it")
             os.replace(os.path.join(self.run_dir, "report.md"), os.path.join(self.run_dir, "report_withheld.md"))
             return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
                             "completed_no_report")
@@ -1349,21 +1357,12 @@ class Machine:
             self.st.write_mode = mode
         return self._go(nxt, why, status)
 
-    def _repair_language(self, status: str) -> dict:
-        """F6 S1-7: a report the final gate did not accept is not delivered with acceptance language. The
-        writer repairs it (at most MAX_LANGUAGE_REPAIRS times); each repair is re-rendered and re-checked."""
+    def _language_check(self, status: str) -> dict:
+        """F6 S1-7: acceptance language in the whole manuscript of a report the final gate did not accept, with
+        the repairs used so far (MAX_LANGUAGE_REPAIRS at most; each goes back through the post-write path)."""
         mode = "declared" if status == "completed_scope_declared" else "not_accepted"
         found = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
-        rec = {"found": found, "repairs": 0, "remaining": found}
-        while rec["remaining"] and rec["repairs"] < MAX_LANGUAGE_REPAIRS:
-            rec["repairs"] += 1
-            res = self._task(f"GATE#{self._visit()}:language_repair{rec['repairs']}", "write", self.run_dir, mode,
-                             rec["remaining"], writeup=True)
-            if res is None or not res.ok or not self._has_draft():
-                break
-            render_report(self.run_dir, self.backend, status=status)
-            rec["remaining"] = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
-        return rec
+        return {"mode": mode, "repairs": int(self.st.tries.get("language", 0)), "remaining": found}
 
     def h_FIX_LOOP(self):
         v = self._visit()
@@ -1393,7 +1392,9 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
-        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, writeup=True)
+        fb = self.st.tries.pop("language_feedback", None)      # a language repair (F6 S1-7)
+        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
+                         writeup=True)
         if res is None:
             return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
