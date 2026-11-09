@@ -999,7 +999,15 @@ def _validate(s: Spec) -> list[str]:
     if r["comparator"].get("package") not in pk:
         bad.append(f"comparator: package {r['comparator'].get('package')!r} is not a package")
     an = r["analysis"]
-    drivers = card.outputs.get("cost_drivers", [])
+    # F6 S2-2: cost_drivers_when names drivers an engine produces only under a parameter setting
+    when = card.outputs.get("cost_drivers_when") or {}
+    drivers = list(card.outputs.get("cost_drivers", []))
+    drivers += [d for d in when if d not in drivers]
+    from toolkit.spec import engine_parameters as PV
+    run_vals = {n: (e or {}).get("value") for n, e in PV.declared(s).items() if isinstance(e, dict)}
+    defaults = {n: p.value for n, p in pnames.items()}
+    for k, m in (an.get("cost_outputs") or {}).items():
+        bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, run_vals, defaults)
     cost_outs = an.get("cost_outputs") or {}
     for it in opts.get("cost_items") or []:
         if it.get("basis") == "per_outcome" and it.get("outcome") not in cost_outs:
@@ -1058,6 +1066,23 @@ def labels_problems(raw: dict, labels: dict, pnames=None, card=None) -> list[str
         if k in labels and not (isinstance(labels[k], str) and labels[k].strip()):
             bad.append(f"labels.{k}: a non-empty string")
     return bad
+
+
+def conditional_driver_problems(name, driver, when: dict, run_values: dict, defaults: dict) -> list[str]:
+    """F6 S2-2: a cost driver the engine card lists under outputs.cost_drivers_when ({driver: {parameter: value}}) is
+    produced only when each parameter has its stated value in the run (the spec's engine_parameters value, else the
+    engine default); mapping it otherwise is refused here rather than failing inside the analysis."""
+    out = []
+    for p, v in ((when or {}).get(driver) or {}).items():
+        got = run_values.get(p, defaults.get(p))
+        try:
+            same = float(got) == float(v)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} is produced only when {p} = {v:g}; "
+                       f"this run has {p} = {got!r} (set it in engine_parameters)")
+    return out
 
 
 def _validate_calibration(s, card, pnames, cols) -> list[str]:
@@ -1470,6 +1495,14 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    # F6 S2-2: a cost driver an engine produces only under a parameter setting (outputs.cost_drivers_when)
+    when = {"c_kids": {"switch": 1.0}}
+    ok(conditional_driver_problems("kids", "c_kids", when, {}, {"switch": 0.0})
+       and "switch" in conditional_driver_problems("kids", "c_kids", when, {}, {"switch": 0.0})[0]
+       and conditional_driver_problems("kids", "c_kids", when, {"switch": 1}, {"switch": 0.0}) == []
+       and conditional_driver_problems("t", "treated", when, {}, {"switch": 0.0}) == [],
+       "SP-CD1 a conditional cost driver is refused unless the run sets its parameter (engine_parameters) to the "
+       "stated value; an unconditional driver is never refused")
     with tempfile.TemporaryDirectory() as d:
         p = toy_spec(d)
         s = load(p)

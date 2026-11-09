@@ -493,9 +493,10 @@ class MalariaEngine:
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
-                     # v0.12: the last two only with cm_target 1 (an analysis that maps one fails closed otherwise)
-                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all", "cm_child_years",
-                                      "treated_cm_ages"],
+                     "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
+                     # v0.12: produced only with cm_target 1; the spec validator refuses a mapping to one otherwise
+                     "cost_drivers_when": {"cm_child_years": {"cm_target": 1.0},
+                                           "treated_cm_ages": {"cm_target": 1.0}},
                      "series": {k: dict(v) for k, v in SERIES.items()}},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
@@ -2512,8 +2513,11 @@ def _self_test_v012(ok, e, unit) -> None:
            "C0b cm_add stays a scenario parameter with a sourced range; cm_severe_link says no estimate was found")
         from toolkit.spec.priors import load_card
         mc = load_card(e)
-        ok(mc["problems"] == [] and set(new) <= set(mc["fixed"]) and drv <= set(e.describe().outputs["cost_drivers"]),
-           f"C0c priors.yaml gives each new parameter a reason; the card lists the new cost drivers {mc['problems'][:2]}")
+        outs = e.describe().outputs
+        ok(mc["problems"] == [] and set(new) <= set(mc["fixed"]) and not drv & set(outs["cost_drivers"])
+           and outs.get("cost_drivers_when") == {d: {"cm_target": 1.0} for d in sorted(drv)},
+           f"C0c priors.yaml gives each new parameter a reason; the card lists the new cost drivers as produced only "
+           f"with cm_target 1 (cost_drivers_when; the contract test checks cost_drivers in every run) {mc['problems'][:2]}")
     case("C0", c0)
 
     def c1():
