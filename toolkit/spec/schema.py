@@ -1485,6 +1485,15 @@ def _self_test() -> int:
         r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1}
         ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
            "SP8f a well-formed affordability rule validates")
+        # F6 S1-1b: `enforce` asks the analysis for a plan that meets the rule (a budget reserve)
+        bad(lambda r: r["uncertainty"].update(affordability={"enforce": True}), "uncertainty.affordability",
+            "SP8g enforce without max_share_over_budget is refused")
+        bad(lambda r: r["uncertainty"].update(affordability={"max_share_over_budget": 0.1, "enforce": "yes"}),
+            "uncertainty.affordability.enforce", "SP8h a non-boolean enforce is refused")
+        for en in (True, False):
+            r_ok["uncertainty"]["affordability"] = {"max_share_over_budget": 0.1, "enforce": en}
+            ok(not [e for e in validate(Spec(r_ok, d)) if "affordability" in e],
+               f"SP8i an affordability rule with enforce: {en} validates")
         # a list column whose empty list is written as a declared token (a blank cell is refused as
         # attribute_column_empty, so an empty list needs an explicit marker)
         ea = {"yrs": {"column": "yrs", "split": " ", "empty": "none"}}

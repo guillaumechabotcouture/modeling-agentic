@@ -386,11 +386,79 @@ def _self_test() -> int:
                 ok(False, f"U12 {label} fails closed")
             except ValueError:
                 ok(True, f"U12 {label} fails closed")
+    _self_test_reserve(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_reserve(ok):
+    """F6 S1-1b: the reserve search on synthetic cost tables. Four units, each either nothing (cost 0) or one
+    package costing 10 x the draw's multiplier, benefits 4, 3, 2, 1; the exact optimum at budget b funds the
+    floor(b / 10) best units. Budget 40; multipliers 0.8 ... 2.0: the unconstrained plan (4 units) is over in 5 of 8
+    draws; 3 units are over in 2 of 8 (multipliers 1.5 and 2.0); 2 units in none."""
+    rs = globals().get("reserve_search")
+    ok(callable(rs), "U13 reserve_search() exists")
+    if not callable(rs):
+        return
+    mults = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 2.0]
+    ben = {"u1": 4.0, "u2": 3.0, "u3": 2.0, "u4": 1.0}
+    tables = [{u: {"n": 0.0, "y": 10.0 * m} for u in ben} for m in mults]
+    calls = []
+
+    def solve(b):
+        calls.append(b)
+        k = int(b / 10.0 + 1e-9)
+        top = sorted(ben, key=lambda u: -ben[u])[:k]
+        return {"choice": {u: ("y" if u in top else "n") for u in ben}, "objective": sum(ben[u] for u in top)}
+
+    r = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12)
+    st = r.get("steps") or []
+    ok(r.get("feasible") is True and st and st[0]["fraction"] == 1.0 and st[0]["meets"] is False
+       and st[0]["draws_over_budget"] == 5,
+       f"U14 the first step is the unconstrained plan (fraction 1), over budget in 5 of 8 draws: {st[:1]}")
+    ok(1.0 - 0.005 <= r.get("fraction", 0) < 1.0 and sum(v == "y" for v in r["solution"]["choice"].values()) == 3
+       and r["draws_over_budget"] == 2 and abs(r["share_over_budget"] - 0.25) < 1e-12,
+       f"U15 bisection to the tolerance finds the largest fraction whose plan meets the rule (3 units, 2 of 8 over): "
+       f"{r.get('fraction')}, {r.get('draws_over_budget')}")
+    ok(len(calls) == len(st) <= 12 and r.get("converged") is True and abs(r["solution"]["objective"] - 9.0) < 1e-12
+       and all(s["meets"] == (s["share_over_budget"] <= 0.25) for s in st)
+       and all(abs(b - s["fraction"] * 40.0) < 1e-9 for b, s in zip(calls, st)),
+       f"U16 every ILP solve is one recorded step at fraction x budget, within the cap ({len(calls)} solves)")
+    r1 = rs(tables, solve, 40.0, 0.7, tol=0.005, floor=0.5, max_solves=12)
+    ok(r1["fraction"] == 1.0 and len(r1["steps"]) == 1 and r1["feasible"],
+       "U17 an unconstrained plan that meets the rule needs no reserve (fraction 1, one solve)")
+    r2 = rs(tables, solve, 40.0, 0.0, tol=0.005, floor=0.8, max_solves=12)
+    ok(r2["feasible"] is False and r2.get("solution") is None and [s["fraction"] for s in r2["steps"]] == [1.0, 0.8],
+       f"U18 no fraction at or above the floor meets the rule: infeasible, nothing returned ({r2['steps']})")
+    r3 = rs(tables, solve, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=3)
+    ok(len(r3["steps"]) == 3 and r3["converged"] is False and r3["feasible"] and r3["share_over_budget"] <= 0.25,
+       "U19 the solve cap stops the search unconverged, at a fraction that meets the rule")
+
+    def infeasible_low(b):
+        if b < 30:
+            raise RuntimeError("optimizer status infeasible")
+        return solve(b)
+    r4 = rs(tables, infeasible_low, 40.0, 0.25, tol=0.005, floor=0.5, max_solves=12)
+    ok(r4["feasible"] is False and r4["steps"][1].get("infeasible") is True,
+       "U20 a budget at which the solver proves no allocation feasible counts as not meeting the rule")
+    for label, args in (("no draws", ([], solve, 40.0, 0.25)), ("a non-finite cost",
+                        ([{u: {"n": 0.0, "y": float("nan")} for u in ben}], solve, 40.0, 0.25)),
+                        ("a share outside [0, 1)", (tables, solve, 40.0, 1.0))):
+        try:
+            rs(*args)
+            ok(False, f"U21 {label} fails closed")
+        except ValueError:
+            ok(True, f"U21 {label} fails closed")
+    for kw in ({"tol": 0.0}, {"floor": 0.0}, {"floor": 1.5}, {"max_solves": 1}):
+        try:
+            rs(tables, solve, 40.0, 0.25, **kw)
+            ok(False, f"U22 search settings {kw} are refused")
+        except ValueError:
+            ok(True, f"U22 search settings {kw} are refused")
+
 
 
 if __name__ == "__main__":
