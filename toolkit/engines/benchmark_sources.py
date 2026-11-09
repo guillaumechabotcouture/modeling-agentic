@@ -293,16 +293,23 @@ class Evidence:
     """An immutable, validated snapshot of one engine's benchmark evidence: the pack's declarations, the fitted values
     the engine actually uses with the digest of the file that backs them, and (when loaded) the stored result rows.
     `problems` lists every reason the evidence cannot be used; `require()` raises them. Accessors return copies."""
-    __slots__ = ("_pack", "_rows", "_fitted", "fitted_sha256", "decl_problems", "fit_problems", "toy",
+    __slots__ = ("_pack", "_rows", "_fitted", "_fitted_doc", "fitted_sha256", "decl_problems", "fit_problems", "toy",
                  "engine_identity")
 
     def __init__(self, pack, rows, fitted, fitted_sha256, decl_problems, fit_problems=(), toy=False,
-                 engine_identity=None):
+                 engine_identity=None, fitted_doc=None):
         import copy
         for k, v in (("_pack", copy.deepcopy(pack)), ("_rows", copy.deepcopy(rows)), ("_fitted", dict(fitted)),
-                     ("fitted_sha256", fitted_sha256), ("decl_problems", tuple(decl_problems)),
-                     ("fit_problems", tuple(fit_problems)), ("toy", toy), ("engine_identity", engine_identity)):
+                     ("_fitted_doc", copy.deepcopy(fitted_doc)), ("fitted_sha256", fitted_sha256),
+                     ("decl_problems", tuple(decl_problems)), ("fit_problems", tuple(fit_problems)), ("toy", toy),
+                     ("engine_identity", engine_identity)):
             object.__setattr__(self, k, v)
+
+    @property
+    def fitted_doc(self):
+        """A detached copy of the fitted document parsed from the bytes `fitted_sha256` hashes (None without one)."""
+        import copy
+        return copy.deepcopy(self._fitted_doc)
 
     @property
     def problems(self) -> tuple:
@@ -342,17 +349,18 @@ def _fitted_in_use(engine, pack, toy: bool) -> tuple:
     eff = {p.name: (p.lo, p.hi, p.value) for p in engine.parameters() if getattr(p, "kind", None) == "fitted"}
     fp = getattr(engine, "fitted_path", None)
     if not eff or (toy and not fp):
-        return eff, None, []
+        return eff, None, [], None
     if not fp or not os.path.isfile(fp):          # none configured, missing, or a dangling link
-        return eff, None, [f"refit required: no fitted values file backs the engine's fitted parameters ({fp})"]
+        return eff, None, [f"refit required: no fitted values file backs the engine's fitted parameters ({fp})"], None
     if pack is None:
-        return eff, None, [f"refit required: fitted values {fp} have no readable benchmark pack to be checked against"]
+        return eff, None, [f"refit required: fitted values {fp} have no readable benchmark pack to be checked "
+                           "against"], None
     try:
         raw = open(fp, "rb").read()
         doc = yaml.safe_load(raw) or {}
     except (OSError, yaml.YAMLError) as e:
-        return eff, None, [f"refit required: fitted values {fp} are unreadable ({e})"]
-    probs = fitted_problems(doc, pack)
+        return eff, None, [f"refit required: fitted values {fp} are unreadable ({e})"], None
+    probs = fitted_problems(doc, pack) + _fit_context_problems(doc, engine)
     fparams = doc.get("parameters") or {}
 
     def same(x, y):
@@ -363,7 +371,26 @@ def _fitted_in_use(engine, pack, toy: bool) -> tuple:
     if diff:
         probs.append(f"refit required: the fitted values in use for {', '.join(diff)} are not {os.path.basename(fp)}'s "
                      "(cached before the file changed, or engine defaults)")
-    return eff, hashlib.sha256(raw).hexdigest(), probs
+    return eff, hashlib.sha256(raw).hexdigest(), probs, doc
+
+
+def _fit_context_problems(doc: dict, engine) -> list[str]:
+    """The fitting context (which engine the fit ran on) must be the current engine: the runner's stamp, and the same
+    engine name, version, code and configured structure (and constructor configuration, when the engine has one).
+    The stamp's params_sha256 is the pre-fit parameter identity, not part of the context, and is not compared."""
+    from toolkit.engines import contract as C
+    from toolkit.engines.benchmark import PRODUCER, config_digest
+    if doc.get("producer") != PRODUCER:
+        return [f"refit required: the fitted values were not written by {PRODUCER} (no fitting context)"]
+    try:
+        cur = C.engine_identity(engine)
+    except Exception as e:  # noqa: BLE001 -- no identity: the fitting context cannot be verified
+        return [f"refit required: the engine's identity cannot be computed to check the fitting context ({e})"]
+    st = doc.get("engine_identity") or {}
+    off = [k for k in ("name", "version", "code_sha256", "config_sha256") if st.get(k) != cur.get(k)]
+    if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
+        off.append("engine_config_sha256")
+    return [f"refit required: the fit ran on another engine revision ({', '.join(off)} differ)"] if off else []
 
 
 def load_evidence(engine, pack: dict | None = None, rows: list | None = None, partial: bool = False) -> Evidence:
@@ -404,12 +431,12 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
         stale = stale_ids(pack or {}, rows) + ([] if partial else [i for i in ids if i not in {r["id"] for r in rows}])
         if stale:
             probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
-    fitted, fsha, fprobs = _fitted_in_use(engine, pack, toy)
+    fitted, fsha, fprobs, fdoc = _fitted_in_use(engine, pack, toy)
     try:
         ident = engine_identity(engine)
     except Exception:  # noqa: BLE001 -- an object without the contract's describe(): no identity to bind
         ident = None
-    return Evidence(pack or {}, list(rows or []), fitted, fsha, probs, fprobs, toy, ident)
+    return Evidence(pack or {}, list(rows or []), fitted, fsha, probs, fprobs, toy, ident, fdoc)
 
 
 def main(argv=None) -> int:

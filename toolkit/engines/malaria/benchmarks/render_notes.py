@@ -214,7 +214,6 @@ def validated_inputs(here: str = HERE) -> tuple:
     the engine identity and fitted values the snapshot captured (verified_results), and the fitted document parsed
     from the bytes whose digest the snapshot recorded (None for an engine without a fitted file)."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
-    import hashlib
     from toolkit.engines.benchmark import load_engine, verified_results
     from toolkit.engines.benchmark_sources import load_evidence
     pack = _y(os.path.join(here, "pack.yaml")) or {}
@@ -223,12 +222,7 @@ def validated_inputs(here: str = HERE) -> tuple:
     doc, why = verified_results(eng)
     if doc is None or ev.problems:
         raise SystemExit(f"stale benchmark evidence, not rendered: {why or list(ev.problems)} (refit and re-run)")
-    if not ev.fitted_sha256:
-        return doc, None
-    raw = open(eng.fitted_path, "rb").read()
-    if hashlib.sha256(raw).hexdigest() != ev.fitted_sha256:
-        raise SystemExit("fitted.yaml changed after the evidence was loaded: not rendered")
-    return doc, yaml.safe_load(raw)
+    return doc, ev.fitted_doc                 # parsed from the bytes the snapshot hashed
 
 
 def write(path=NOTES) -> None:

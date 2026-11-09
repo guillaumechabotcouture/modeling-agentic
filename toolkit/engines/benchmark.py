@@ -1506,7 +1506,7 @@ def main(argv=None) -> int:
                                    "band_declarations": fit_declarations(pack)}, **out), eng),
                        open(path, "w"), sort_keys=False)
     else:
-        f = yaml.safe_load(open(eng.fitted_path)) if ev.fitted_sha256 else {}
+        f = ev.fitted_doc or {}                  # S1-2b: the captured fitted document (reach_check's ranges too)
         fitted = {k: v[2] for k, v in ev.fitted.items()}
         out = run_pack(pack, eng, runner, fitted, f)
         out["engine_version"] = eng.describe().version
