@@ -470,6 +470,31 @@ def _self_test() -> int:
         ok(schema.validate(s2) == [] and list(drawn(s2)) == ["synergy"] and P2["label_fixed"]["named"] == ["dw"]
            and drawn(s2)["synergy"].origin == "spec",
            f"PR14 a scenario parameter with a spec range is drawn; one excluded by name is fixed and named: {P2['label_fixed']}")
+        # F6 S1-4 (Codex r1): a scenario parameter must be drawn, or excluded by name; a kind-level exclusion of every
+        # prior does not satisfy the rule (it would be fixed with no decision test); a card prior may cover it
+        for how, mut in (("a spec range", lambda x: x["uncertainty"].update(
+                              priors={"synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "spec citation"}})),
+                         ("a ranged spec value", lambda x: x.update(engine_parameters={"synergy": {
+                              "value": 0.05, "range": [0.0, 0.1], "dist": "uniform", "source": "s", "reason": "r",
+                              "basis": "owner_judgement"}}))):
+            r3 = copy.deepcopy(r)
+            r3["uncertainty"]["excluded"] = [x for x in r3["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
+            mut(r3)
+            r3["uncertainty"]["excluded"].append({"kind": "priors", "reason": "owner: no priors this run"})
+            e3 = schema.validate(schema.Spec(r3, d))
+            ok(any("scenario_without_range" in e and "synergy" in e for e in e3),
+               f"PR-S14a {how} under a kind-level priors exclusion does not satisfy the scenario rule: {e3[:2]}")
+        pp4 = os.path.join(d, "toy_priors_scen.yaml")
+        yaml.safe_dump({"priors": {"dw": {"dist": "triangular", "range": [0.005, 0.02], "source": "toy citation"},
+                                   "synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "card citation"}},
+                        "fixed": {"base": "toy: no range", "k": "toy: no range"}, "settings": ["noise"]}, open(pp4, "w"))
+        r4 = copy.deepcopy(r)
+        r4["engine"]["config"]["priors_path"] = pp4
+        r4["uncertainty"]["excluded"] = [x for x in r4["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
+        s4 = schema.Spec(r4, d)
+        e4 = schema.validate(s4)
+        ok(not e4 and "synergy" in drawn(s4) and drawn(s4)["synergy"].origin == "engine_card",
+           f"PR-S14b an engine-card prior on a scenario parameter is accepted and drawn: {e4[:2]}")
         r3 = copy.deepcopy(r)
         r3["uncertainty"]["excluded"].append({"kind": "priors", "reason": "reproduce the spike batch"})
         ok(drawn(schema.Spec(r3, d)) == {} and {x["kind"]: x["status"] for x in plan(schema.Spec(r3, d))["sources"]}["priors"]
