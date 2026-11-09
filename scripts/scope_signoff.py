@@ -240,7 +240,7 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
         elif status in ("exempt", "invalid"):
             t["detail"] = detail
         decls.append({"id": str(e.get("id") or ""), "test": t,
-                      "text": {f: str(e.get(f))[:1200] for f in sd.JUSTIFICATION_FIELDS if e.get(f)}})
+                      "text": {f: str(e.get(f)) for f in sd.JUSTIFICATION_FIELDS if e.get(f)}})
     # Codex review (#85): the evidence is part of what the owner approves. The finding's own
     # result (its claim: observed values, metrics; for a persistence escalation the base
     # finding's), each declaration and the decision-test files' contents.
@@ -250,7 +250,7 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
                                     "sources": src,
                                     "entries": sorted(cover, key=lambda e: str(e.get("id"))),
                                     "tests": tests}, sort_keys=True, default=str).encode()).hexdigest()[:16]
-    return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or "")[:600],
+    return {"finding": ident, "kind": v.get("kind"), "reason": reason, "claim": str(v.get("claim") or ""),
             "declarations": decls, "declared": bool(cover), "fingerprint": fp}
 
 
@@ -682,6 +682,9 @@ def _self_test() -> int:
             gate_findings(d, 6, c2)
             ok(c[0]["owner_item"]["fingerprint"] != c2[0]["owner_item"]["fingerprint"],
                "SO28 a changed source analysis (same summary claim) is a new item")
+            c3 = [dict(sa, claim="UNSTABLE: " + "the package flips in this unit; " * 40)]   # F6 S1-7
+            gate_findings(d, 6, c3)
+            ok(c3[0]["owner_item"]["claim"] == c3[0]["claim"], "SO28b the owner is shown the finding's full claim")
             # SO29 (#4): owner items in accept blockers make a signable request, once each.
             it = c2[0]["owner_item"]
             p0 = record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": it}],
