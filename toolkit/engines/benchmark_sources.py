@@ -836,9 +836,9 @@ def _self_test() -> int:
         from toolkit.engines.malaria.engine import MalariaEngine
         with tempfile.TemporaryDirectory() as d:
             fp = os.path.join(d, "fitted.yaml")
-            doc = {"parameters": {"cfp_kill": {"value": 0.3, "lo": 0.2, "hi": 0.4},
-                                  "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
-                   "band_declarations": fit_declarations(pk)}
+            doc = BM.stamp({"parameters": {"cfp_kill": {"value": 0.3, "lo": 0.2, "hi": 0.4},
+                                           "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
+                            "band_declarations": fit_declarations(pk)}, MalariaEngine())
             yaml.safe_dump(doc, open(fp, "w"))
             me = MalariaEngine(fitted_path=fp)
             ok(fitted_ranges(me)["cfp_kill"][2] == 0.3, "BS59 fitted values with current provenance are used")
@@ -888,9 +888,9 @@ def _self_test() -> int:
                "BS63 fitting runs in its own explicit mode, with candidate fitted values")
             e2 = FittedToy()
             fp2 = os.path.join(d, "current.yaml")
-            yaml.safe_dump({"parameters": {k: {"value": v[2], "lo": v[0], "hi": v[1]}
-                                           for k, v in load_evidence(eng, pack=toy).fitted.items()},
-                            "band_declarations": fit_declarations(ftoy)}, open(fp2, "w"))
+            yaml.safe_dump(BM.stamp({"parameters": {k: {"value": v[2], "lo": v[0], "hi": v[1]}
+                                                    for k, v in load_evidence(eng, pack=toy).fitted.items()},
+                                     "band_declarations": fit_declarations(ftoy)}, FittedToy()), open(fp2, "w"))
             e2.fitted_path = fp2
             rn = BM.Runner(ftoy, e2, 1)
             try:
@@ -1015,6 +1015,92 @@ def _self_test() -> int:
         ok(clean and refused, "BS73 render_notes renders only a results envelope validated against the engine "
                               "identity and fitted values it captured, with the validated fitted document")
     case("BS73", c3)
+
+    # ---- S1-2b final Codex round (#158)
+    from toolkit.engines.malaria.engine import MalariaEngine as _ME
+
+    def mal_fit(path, pack_, cfp=0.3):
+        doc = BM.stamp({"parameters": {"cfp_kill": {"value": cfp, "lo": 0.2, "hi": 0.4},
+                                       "irs_kill": {"value": 0.4, "lo": 0.3, "hi": 0.5}},
+                        "band_declarations": fit_declarations(pack_)}, _ME())
+        yaml.safe_dump(doc, open(path, "w"))
+        return doc
+
+    def d1():
+        from toolkit.engines import contract as C
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "fitted.yaml")
+            mal_fit(fp, pk)
+            me = _ME(fitted_path=fp)
+            clean = load_evidence(me, pack=pk).problems
+            orig = C.code_fingerprint
+            try:
+                C.code_fingerprint = lambda e: "the engine file changed"
+                moved = load_evidence(me, pack=pk).problems
+            finally:
+                C.code_fingerprint = orig
+            raw = yaml.safe_load(open(fp))
+            raw.pop("producer")
+            yaml.safe_dump(raw, open(fp, "w"))
+            nop = load_evidence(_ME(fitted_path=fp), pack=pk).problems
+        ok(clean == () and any("refit required" in x and "engine" in x for x in moved)
+           and any("refit required" in x for x in nop),
+           f"BS74 a fit made under another engine revision (only the engine file changed), or without the runner's "
+           f"stamp, is refit required: {moved} | {nop}")
+    case("BS74", d1)
+
+    def d2():
+        import shutil
+        mdir = os.path.join(root, "malaria", "benchmarks")
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(os.path.join(mdir, "equilibration.yaml"), os.path.join(d, "equilibration.yaml"))
+            fp = os.path.join(d, "fit", "fitted.yaml")
+            os.makedirs(os.path.dirname(fp))
+            p2 = dict(pk, configs={"here": {"fitted_path": fp}}, default_config="here")
+            mal_fit(fp, p2)
+            yaml.safe_dump(p2, open(os.path.join(d, "pack.yaml"), "w"))
+            orig_le, orig_rp = BM.load_evidence, BM.run_pack
+
+            def le(*a, **k):                     # the fit file is replaced right after the snapshot is taken
+                ev = orig_le(*a, **k)
+                raw = yaml.safe_load(open(fp))
+                raw["parameters"]["cfp_kill"]["lo"] = 0.29
+                yaml.safe_dump(raw, open(fp, "w"))
+                return ev
+            try:
+                BM.load_evidence = le
+                BM.run_pack = lambda pack, engine, runner, fitted, fit_info=None: got.update(fit_info=fit_info) or {}
+                BM.main([os.path.join(d, "pack.yaml"), "run", "--workers", "1", "--seeds", "1"])
+            finally:
+                BM.load_evidence, BM.run_pack = orig_le, orig_rp
+        lo = (((got.get("fit_info") or {}).get("parameters") or {}).get("cfp_kill") or {}).get("lo")
+        ok(lo == 0.2, f"BS75 the run CLI passes the captured fitted document (ranges for reach_check), not a reread: "
+                      f"lo {lo}")
+    case("BS75", d2)
+
+    def d3():
+        from toolkit.engines.malaria.benchmarks import render_notes as RN
+        with tempfile.TemporaryDirectory() as d:
+            fp, rp = os.path.join(d, "fitted.yaml"), os.path.join(d, "results.yaml")
+            p2 = dict(pk, configs={"here": {"fitted_path": fp, "results_path": rp}}, default_config="here")
+            yaml.safe_dump(p2, open(os.path.join(d, "pack.yaml"), "w"))
+            mal_fit(fp, p2, cfp=0.3)
+            me = _ME(fitted_path=fp, results_path=rp)
+            rows = [{"id": b["id"], "status": "in_band", "computed": 1.0, "band_sha256": band_digest(b, p2)}
+                    for b in p2["benchmarks"]]
+            yaml.safe_dump(BM.stamp({"benchmarks": rows, "engine_version": "x"}, me), open(rp, "w"))
+            doc, fdoc = RN.validated_inputs(d)
+            clean = fdoc["parameters"]["cfp_kill"]["value"] == 0.3 and len(doc["benchmarks"]) == len(rows)
+            mal_fit(fp, p2, cfp=0.35)            # a valid fit replaces it; the old results envelope stays
+            try:
+                RN.validated_inputs(d)
+                refused = False
+            except SystemExit as ex:
+                refused = "engine identity" in str(ex)
+        ok(clean and refused, "BS76 render_notes rejects an old results envelope after a valid fit replaced the one "
+                              "it was computed with")
+    case("BS76", d3)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
