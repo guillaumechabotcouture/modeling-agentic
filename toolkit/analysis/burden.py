@@ -84,6 +84,74 @@ def _band_ok(lo, hi, th) -> bool:
     return lo is not None and hi is not None and w[0] <= lo <= 1.0 <= hi <= w[1]
 
 
+def calibration_inputs(s) -> list[dict]:
+    """[{path, columns}]: every file whose values a calibration fits. Target tables (calibration.targets, each
+    calibration.joint target with a csv) are fitted whole (columns None); the units table holds the inversion target
+    column and the joint unit targets' columns (the table itself is listed even with none)."""
+    cal = s.raw.get("calibration") or {}
+    joint = [t for t in ((cal.get("joint") or {}).get("targets") or []) if isinstance(t, dict)]
+    out = [{"path": s.resolve(c), "columns": None} for c in
+           [(cal.get("targets") or {}).get("csv")] + [t.get("csv") for t in joint] if isinstance(c, str) and c]
+    cols = [cal.get("target_column")]
+    for t in joint:
+        if t.get("kind") == "unit":
+            cols += [t.get("column", cal.get("target_column")), t.get("sd_column"), t.get("n_column")]
+            cols += list(t.get("ci_columns") or [])
+    out.append({"path": s.resolve(s["decision_units"]["csv"]), "columns": [c for c in cols if isinstance(c, str)]})
+    return out
+
+
+def _identity(path):
+    """(realpath, (device, inode), sha256) of a file, or None when it cannot be read."""
+    import hashlib
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            return os.path.realpath(path), (st.st_dev, st.st_ino), hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _same_file(a, b) -> bool:
+    return bool(a and b and (a[0] == b[0] or a[1] == b[1] or a[2] == b[2]))
+
+
+def provenance(s) -> dict:
+    """The reference file's identity and the calibration inputs it was checked to be independent of."""
+    path = csv_path(s)
+    me = _identity(path)
+    ins = [(c["path"], _identity(c["path"])) for c in calibration_inputs(s)]
+    rel = lambda q: os.path.relpath(q, s.base) if os.path.isabs(q) else q  # noqa: E731
+    return {"csv": config(s)["csv"], "realpath": me[0] if me else None, "sha256": me[2] if me else None,
+            "calibration_inputs": [{"path": rel(q), "sha256": i[2] if i else None} for q, i in ins],
+            "independent": bool(me) and not any(_same_file(me, i) for _q, i in ins)}
+
+
+def _coincident(s, refs) -> list[str]:
+    """References whose value repeats a fitted observation: a value (> 0) in a calibration input's fitted cells, in a
+    row that names the reference's group (any row for *)."""
+    bad = []
+    for c in calibration_inputs(s):
+        try:
+            with open(c["path"], newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except (OSError, csv.Error, UnicodeDecodeError):
+            continue
+        for r in refs:
+            v = r["value"]
+            if not v > 0:
+                continue
+            for row in rows:
+                cells = [row.get(k) for k in (c["columns"] if c["columns"] is not None else row)]
+                if (r["group"] == "*" or r["group"] in [str(x) for x in row.values()]) and any(
+                        (_num(x) is not None and abs(_num(x) - v) <= 1e-9 * v) for x in cells):
+                    bad.append(f"validation.burden.csv reference {r['id']}: its value {v:g} repeats a fitted "
+                               f"observation in {os.path.basename(c['path'])}; references validate, they are never "
+                               "fitted")
+                    break
+    return bad
+
+
 def load_references(s) -> tuple[list[dict], list[str]]:
     """(references, problems) for the spec's validation.burden: its keys and the reference CSV contract."""
     v = s.raw.get("validation")
@@ -112,9 +180,11 @@ def load_references(s) -> tuple[list[dict], list[str]]:
     if not isinstance(cfg["csv"], str) or not cfg["csv"]:
         return [], bad + [f"{P}.csv: the reference estimates file"]
     path = s.resolve(cfg["csv"])
-    tg = ((s.raw.get("calibration") or {}).get("targets") or {}).get("csv")
-    if tg and os.path.abspath(s.resolve(tg)) == os.path.abspath(path):
-        bad.append(f"{P}.csv: the calibration targets file; references validate, they are never fitted")
+    me = _identity(path)
+    for c in calibration_inputs(s):
+        if _same_file(me, _identity(c["path"])):
+            bad.append(f"{P}.csv: the same file as the calibration input {os.path.basename(c['path'])} (by path, "
+                       "inode or content); references validate, they are never fitted")
     try:
         with open(path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
@@ -153,7 +223,11 @@ def load_references(s) -> tuple[list[dict], list[str]]:
             e.append(f"kind {r['kind']!r}: estimated or reported")
         if not str(r["source"] or "").strip():
             e.append("source: the citation")
-        rlo, rhi = _num(r["ratio_low"]), _num(r["ratio_high"])
+        cells = {k: str(r[k] if r[k] is not None else "").strip() for k in ("ratio_low", "ratio_high")}
+        unread = [k for k, x in cells.items() if x and _num(x) is None]
+        if unread:
+            e.append(f"{', '.join(unread)}: blank (the manifest default) or a finite number")
+        rlo, rhi = (None if not cells[k] else _num(cells[k]) for k in ("ratio_low", "ratio_high"))
         band_r = _band(rlo, rhi, th)
         if r["tolerance"] not in TOLERANCES:
             e.append(f"tolerance {r['tolerance']!r}: ratio or overlap")
@@ -169,6 +243,7 @@ def load_references(s) -> tuple[list[dict], list[str]]:
                                                                   if r["tolerance"] == "ratio" else None}})
     if refs and not any(x["kind"] == "estimated" for x in refs):
         bad.append(f"{P}.csv: no estimated reference (reported values are information only)")
+    bad += _coincident(s, refs)
     return refs, bad
 
 
@@ -201,18 +276,26 @@ def _value(A, cfg, ref, out, arm):
     return tot
 
 
+def guard_point(A, arm, events, where="burden validation arm") -> None:
+    """Model corrections (extrapolation, clips, floors) on the validation arm stop the analysis, as they do on the
+    plan and the comparator (core.Analysis.guard): the arm is a plan with every unit on it."""
+    A.guard(where, [{i: arm for i in A.ids}], list(events or []))
+
+
 def by_population(A, theta, zs, bands, arm) -> dict:
     """{population group: outcomes of that group alone} at the given values: the outcome model predicts one population
     group at a time (its other groups and packages left out), then is restored."""
-    m, res = A.model, {}
+    m, res, ev = A.model, {}, []
     saved = (m.pops, m.packages, list(getattr(m, "last_events", []) or []))
     try:
         for b in bands:
             m.pops = {b: A.spec["decision_units"]["populations"][b]}
             m.packages = list(dict.fromkeys([A.comp, arm]))
             res[b] = m.predict(zs, theta, A.ids)
+            ev += list(getattr(m, "last_events", []) or [])        # read before the state is restored
     finally:
         m.pops, m.packages, m.last_events = saved
+    guard_point(A, arm, ev, "burden validation arm (age-band predictions)")
     return res
 
 
@@ -226,7 +309,10 @@ class Collector:
             raise ValueError("validation.burden: " + "; ".join(bad))
         self.draws = {r["id"]: [] for r in self.refs if not r["age_band"]}
 
-    def add(self, out):
+    def add(self, out, events=()):
+        n = getattr(self, "n", 0)
+        self.n = n + 1
+        guard_point(self.A, self.cfg["arm"], events, f"burden validation arm, uncertainty draw {n}")
         for r in self.refs:
             if r["id"] in self.draws:
                 self.draws[r["id"]].append(_value(self.A, self.cfg, r, out, self.cfg["arm"]))
@@ -236,11 +322,13 @@ def verdict(row, th=None) -> str:
     """The status a row's numbers support (the contract re-judges every row with this)."""
     th = th or thresholds()
     m, tol = row.get("model") or {}, row.get("tolerance") or {}
-    if row.get("kind") == "reported":
-        return "information"
     p, lo, hi = _num(m.get("point")), _num(m.get("low")), _num(m.get("high"))
     if p is None or lo is None or hi is None:
         return "unmatched"
+    if row.get("kind") not in KINDS:
+        return "invalid"
+    if row.get("kind") == "reported":
+        return "information"
     if tol.get("type") == "ratio":
         b = tol.get("ratio_band") or [None, None]
         v = _num(row.get("value"))
@@ -307,9 +395,10 @@ def daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
     return res
 
 
-def run(A, out0, z0, point, col: Collector, level=0.95) -> dict:
-    """The burden_validation artifact's payload."""
+def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
+    """The burden_validation artifact's payload. `events0`: the point evaluation's model corrections."""
     cfg, arm, refs = col.cfg, col.cfg["arm"], col.refs
+    guard_point(A, arm, events0)
     yp = (cfg["daly_parts"] or {}).get("yll_per_death") or {}
     bands = sorted({r["age_band"] for r in refs if r["age_band"]} | ({b for b in yp if b != "all"}))
     by_pop = by_population(A, A.theta0, z0, bands, arm) if bands else {}
@@ -320,6 +409,7 @@ def run(A, out0, z0, point, col: Collector, level=0.95) -> dict:
     t0, t1 = A.spec["objective"]["horizon"]
     cnt = {s: sum(x["status"] == s for x in rows) for s in STATUSES}
     return {"arm": arm, "group_column": cfg["group"], "window": [t0, t1], "csv": cfg["csv"],
+            "provenance": provenance(A.spec),
             "draws": max((len(v) for v in col.draws.values()), default=0), "references": rows,
             "summary": dict(cnt, n=len(rows)), "daly_parts": daly_parts(A, cfg, arm, out0, by_pop, point),
             "statement": f"the {arm} arm's annual mean over {t0:g}-{t1:g} against each reference's year"}
@@ -331,20 +421,45 @@ def _f(kind, claim, key, declarable):
             "key": key, "scope_declarable": declarable, "source": PRODUCER}
 
 
-def findings(raw, data) -> list[dict]:
-    """Gate findings: a group outside its tolerance is declarable (the gap is declared with its decision test); a
-    missing artifact, an unmatched reference or a status its numbers do not support is not (fail closed)."""
+META = ("group", "age_band", "outcome", "measure", "per", "year", "year_gap", "value", "lower", "upper", "kind",
+        "source", "tolerance")
+
+
+def findings(raw, data, expected=None) -> list[dict]:
+    """Gate findings. `expected`: the declared references (load_references of the signed spec). The artifact must hold
+    each of them exactly once with its declared metadata, and at least one estimated row. A group outside its
+    tolerance is declarable (the gap is declared with its decision test); a missing artifact or reference, an
+    unrelated or repeated row, changed metadata, an unmatched reference or a status its numbers do not support is not
+    (fail closed)."""
     if section(raw) is None:
         return []
     F = "analysis/burden_validation.yaml"
     rows = (data or {}).get("references") if isinstance(data, dict) else None
-    if not isinstance(rows, list) or not rows:
-        return [_f("burden_validation_missing", f"the spec declares validation.burden but {F} has no references",
+    if expected is None or not isinstance(rows, list) or not rows:
+        return [_f("burden_validation_missing", f"the spec declares validation.burden but {F} has no references"
+                   if expected is not None else "the declared references could not be read to check " + F,
                    "burden_validation", False)]
+    exp = {r["id"]: r for r in expected}
+    ids = [str(r.get("id")) if isinstance(r, dict) else None for r in rows]
     out, th = [], thresholds()
+    out += [_f("burden_validation_missing", f"{F}: declared reference {i} is not in the artifact", f"burden:{i}", False)
+            for i in sorted(set(exp) - set(ids))]
+    extra = sorted({str(i) for i in ids if i not in exp or ids.count(i) > 1})
+    out += [_f("burden_validation_unexpected", f"{F}: row {i} is not a declared reference, or appears twice",
+               f"burden:{i}", False) for i in extra]
+    if not any(isinstance(r, dict) and r.get("kind") == "estimated" for r in rows):
+        out.append(_f("burden_validation_no_estimate", f"{F}: no estimated reference (reported values are information "
+                      "only, so nothing was validated)", "burden_validation", False))
     for r in rows:
-        rid = str((r or {}).get("id"))
-        want = verdict(r or {}, th)
+        rid = str((r or {}).get("id")) if isinstance(r, dict) else None
+        if rid is None or rid in extra or rid not in exp:
+            continue
+        diff = [k for k in META if r.get(k) != exp[rid].get(k)]
+        if diff:
+            out.append(_f("burden_validation_inconsistent", f"{F}: reference {rid} differs from the declared file in "
+                          f"{diff}", f"burden:{rid}", False))
+            continue
+        want = verdict(r, th)
         if r.get("status") != want or want == "invalid":
             out.append(_f("burden_validation_inconsistent", f"{F}: reference {rid} has status {r.get('status')!r}; "
                           f"its numbers give {want!r}", f"burden:{rid}", False))
@@ -477,6 +592,7 @@ def _self_test() -> int:
         spec = {"decision_units": {"populations": {"young": {"column": "py"}, "old": {"column": "po"}}},
                 "objective": {"horizon": [0, 2]}}
         plan_corrections, guard = Analysis.plan_corrections, Analysis.guard
+    _G = _G()
 
     class _M:
         clip = False

@@ -343,7 +343,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
     bvd = None
     if bcol is not None:        # F6 S2-5: the continuation arm's burden against external estimates
-        bvd = BV.run(A, out0, z0, point, bcol, level=u["data"]["interval"].get("level", 0.95))
+        bvd = BV.run(A, out0, z0, point, bcol, level=u["data"]["interval"].get("level", 0.95), events0=events0)
         arts["burden_validation"] = S.write("burden_validation", bvd, BV.PRODUCER,
                                             [arts["point"], arts["uncertainty"], BV.csv_path(spec)])
         log(f"burden validation: {bvd['summary']}")

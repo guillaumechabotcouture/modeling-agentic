@@ -1028,29 +1028,46 @@ def fig_burden_validation(R, t):
     h = fig.get_figheight()
     ax = fig.add_axes([0.34, 0.75 / h, 0.5, _top(fig, 0.6) - 0.75 / h])
     FS.style(ax, t, grid="x")
-    rows, xs = [], [1.0]
-    for y, r in enumerate(refs[::-1]):
+    rows, xs, rats = [], [1.0], []
+    names = (("point", "model"), ("low", "model low"), ("high", "model high"))
+    for r in refs[::-1]:        # ratios first: a zero endpoint (ratio 0) is drawn at the axis floor, never dropped
         v, m = float(r["value"]), r.get("model") or {}
-        rat = (lambda x: None if x is None or v <= 0 or x <= 0 else float(x) / v)  # noqa: E731
-        p, lo, hi = rat(m.get("point")), rat(m.get("low")), rat(m.get("high"))
-        rl, rh = rat(r["lower"]), rat(r["upper"])
-        if rl and rh:
-            ax.barh(y, rh - rl, left=rl, height=0.5, color=t["neutral"])
-        if p:
-            ax.plot([lo or p, hi or p], [y, y], color=t["ink"], lw=1.2)
-            ax.plot([p], [y], "o", ms=5, color=t["cat"][1] if r["status"] == "outside" else t["cat"][0])
+        rat = (lambda x: None if x is None or v <= 0 else float(x) / v)  # noqa: E731
+        e = {k: rat(m.get(k)) for k, _ in names}
+        e.update(rl=rat(r["lower"]), rh=rat(r["upper"]))
+        rats.append(e)
+        xs += [x for x in list(e.values()) + list((r.get("tolerance") or {}).get("ratio_band") or ()) if x]
+    floor = min(xs) / 3.0
+    for y, (r, e) in enumerate(zip(refs[::-1], rats)):
+        v, m = float(r["value"]), r.get("model") or {}
+        at = lambda x: floor if x == 0 else x  # noqa: E731
+        zero = [lab for k, lab in names if e[k] == 0] + [lab for k, lab in (("rl", "reference lower"),
+                                                                          ("rh", "reference upper")) if e[k] == 0]
+        if v <= 0:
+            ax.text(floor, y, f"0 reference value; model {FS.fmt(m.get('point'))}", va="center", fontsize=7,
+                    color=t["ink2"])
+        if e["rl"] is not None and e["rh"] is not None:
+            ax.barh(y, at(e["rh"]) - at(e["rl"]), left=at(e["rl"]), height=0.5, color=t["neutral"])
+        if e["point"] is not None:
+            ax.plot([at(e["low"] if e["low"] is not None else e["point"]),
+                     at(e["high"] if e["high"] is not None else e["point"])], [y, y], color=t["ink"], lw=1.2)
+            ax.plot([at(e["point"])], [y], "<" if e["point"] == 0 else "o", ms=5,
+                    color=t["cat"][1] if r["status"] == "outside" else t["cat"][0])
+        if zero:
+            ax.text(floor, y + 0.28, "0 (" + ", ".join(zero) + ": at the axis floor)", fontsize=6.5, color=t["ink2"])
         b = (r.get("tolerance") or {}).get("ratio_band")
         for x in b or []:
             ax.plot([x, x], [y - 0.3, y + 0.3], color=t["ink2"], lw=1)
-        xs += [x for x in (p, lo, hi, rl, rh) + tuple(b or ()) if x]
         ax.text(1.02, y, r["status"], transform=ax.get_yaxis_transform(), va="center", fontsize=7.5, color=t["ink"])
         rows.append({"reference": r["id"], "group": r["group"], "age_band": r.get("age_band") or "all",
                      "outcome": r["outcome"], "year": r["year"], "kind": r["kind"], "model": m.get("point"),
                      "model_low": m.get("low"), "model_high": m.get("high"), "value": v, "lower": r["lower"],
-                     "upper": r["upper"], "ratio": r.get("ratio"), "status": r["status"], "source": r["source"]})
+                     "upper": r["upper"], "ratio": r.get("ratio"), "status": r["status"], "source": r["source"],
+                     "shown_as": ("; ".join(f"{z} 0 at the axis floor" for z in zero)
+                                  + ("; reference value 0: no ratio" if v <= 0 else "")) or None})
     ax.axvline(1.0, color=t["ink2"], lw=0.8)
     ax.set_xscale("log")
-    ax.set_xlim(min(xs) / 1.5, max(xs) * 1.5)
+    ax.set_xlim(floor / 1.5, max(xs) * 1.5)
     FS.set_axis_format(ax, "x", "number")
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_yticks(range(len(refs)))
@@ -1063,7 +1080,7 @@ def fig_burden_validation(R, t):
              + (f", {sm['information']} reported (information)" if sm.get("information") else ""))
     cap = (f"The {bv.get('arm')} arm's annual mean over {w0}-{w1} divided by each reference value; grey bar: the "
            "reference interval; line: the model interval (draws, or the point value for an age band); ticks: the "
-           "ratio tolerance.")
+           "ratio tolerance; zero endpoints sit at the axis floor, labelled.")
     return fig, title, cap, rows, "absolute burden against external estimates"
 
 
