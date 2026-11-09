@@ -180,7 +180,7 @@ runs for a sample of LGAs at the boundary values.
 | S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 in review (#154) |
 | S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 merged (#156); S1-5 in review (#162) |
 | S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | S1-3 merged (#159); S1-8 in review (#161: launch handover, code-only fingerprint, `reuse-check`; real smoke passed, cases A and B, 2026-11-09); S1-6 not started |
-| S2-2 case management | engine agent | PR by 2026-11-10 | in review (engine v0.12: age-targeted add-on with a ramp, `cm_severe_link` default 0, CM cost drivers; byte-identical to v0.11 when `cm_target` is 0) |
+| S2-2 case management | engine agent | PR by 2026-11-10 | #167 in review, Codex round 1 fixed (engine v0.12: age-targeted add-on with a ramp, `cm_severe_link` default 0, one `cm_catchment_share` for effect and cost, Collins recurrent total with no separate commodity charge; byte-identical to v0.11 when `cm_target` is 0). O2 decided: CM is an allocatable package |
 | S2-1, S2-3 to S2-5 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 

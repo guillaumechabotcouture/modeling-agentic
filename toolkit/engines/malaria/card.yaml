@@ -865,14 +865,26 @@ parameters:
   kind: scenario
   units: probability
   lo: 0.0
-  hi: 0.15
-  source: 'enhanced CM: absolute gain in effective treatment, applied to the whole unit in the targeted ages (cm_target
-    1). Within iCCM catchments, children 2-59 months: ACT among confirmed cases +17 points, Oresanya et al. 2019
-    J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6; appropriate treatment +33 points, Isiguzo et al. 2019
-    J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7; home management RR 1.89 (1.60-2.22) on
-    appropriate treatment, Oo et al. 2019 Malar J (PMC6683427). Unit-wide low / central / high 0.03 / 0.07 / 0.15
-    (derived: the catchment gain x an assumed catchment share of 0.2-0.5); 0 is the no-effect scenario. v0.11 and
-    earlier: 0.15 for all ages, attempt 8 value, no source'
+  hi: 0.4
+  source: 'enhanced CM, absolute gain in effective treatment. With cm_target 1 it is the gain inside the iCCM catchment,
+    children 2-59 months (the unit-wide gain is cm_add x cm_catchment_share): ACT among confirmed cases +17 points,
+    Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6; appropriate treatment of the
+    three iCCM illnesses +33 points, Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State
+    RAcE, Table 7; home management RR 1.89 (1.60-2.22) on appropriate treatment, Oo et al. 2019 Malar J (PMC6683427);
+    range about +0.15 to +0.40; 0 is the no-effect scenario. v0.11 and cm_target 0: a unit-wide gain for all ages,
+    0.15 (attempt 8 value, no source)'
+  verified: unverified
+- name: cm_catchment_share
+  value: 0.3
+  kind: fixed
+  units: share
+  lo: 0.2
+  hi: 0.5
+  source: 'share of the unit''s children 2-59 months inside the iCCM catchment (cm_target 1). It scales the effect
+    (unit-wide gain cm_add x share) and the children charged (cm_child_years) alike, because Collins et al. 2014
+    J Glob Health (iCCM costing tool, Table 3) price per child within catchments. Assumption: iCCM in Nigeria serves
+    hard-to-reach communities 5 km or more from a facility (Oresanya et al. 2019 J Glob Health (PMC6594663), Niger
+    State RAcE, Tables 5-6); no unit-level data; 0.2-0.5 assumed'
   verified: unverified
 - name: cm_target
   value: 0.0
@@ -1213,3 +1225,25 @@ fit_rule:
   - B12
   - B12b
   - B12m
+cm_cost_recipe:
+  items:
+  - id: cm_recurrent
+    component: cm
+    value: 5.0
+    price_year: 2012
+    price_rule: index
+    basis: per_outcome
+    outcome: cm_child_years
+    includes:
+    - management
+    - supervision
+    - chw_recurrent
+    - medicines
+    - supplies
+  range_per_child_year:
+  - 2.0
+  - 5.0
+  - 10.0
+  source: Collins et al. 2014 J Glob Health, iCCM costing tool, Table 3 (recurrent, including medicines and supplies;
+    per child 2-59 months within catchments)
+  not_charged_separately: ACT and RDT per treated episode (inside the recurrent total)
