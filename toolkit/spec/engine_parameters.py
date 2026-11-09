@@ -625,7 +625,14 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     conditions win; review round 3, R3-3) and over the engine defaults, stamped by the benchmark runner for the engine
     the arms ran with. `engine` must be the run's engine (it is checked, not used)."""
     from toolkit.engines import benchmark as BM
+    from toolkit.engines.benchmark_sources import check_pack as band_sources
+    bad = band_sources(pack)
+    if bad:                             # F6 S1-2: a band that differs from its source is refused before any run
+        raise ValueError("benchmark pack: bands do not match their sources (" + "; ".join(bad) + ")")
     pe = _check_pack_engine(pack, spec, engine)
+    from toolkit.engines.benchmark_sources import engine_fitted_problems
+    if engine_fitted_problems(pe):
+        raise ValueError("benchmark pack: " + "; ".join(engine_fitted_problems(pe)))
     vals = values(spec)
     runner = BM.Runner(pack, pe, workers, seeds, base_params=vals)
     out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
@@ -704,7 +711,16 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
-    return list(doc.get("benchmarks") or []), None
+    out = list(doc.get("benchmarks") or [])
+    from toolkit.engines.benchmark_sources import TOY_ENGINE_REFS, pack_evidence_problems
+    try:
+        pack, why = benchmark_pack(engine)
+    except PackError as e:
+        pack, why = None, str(e)
+    if pack is None:          # F6 S1-2: rows are trusted only against the engine's own pack (a self-test toy has none)
+        return (out, None) if _ref_of(spec) in TOY_ENGINE_REFS else ([], f"no benchmark pack to check the rows ({why})")
+    bad = pack_evidence_problems(pack, out, engine)
+    return ([], "; ".join(bad) + f"; {how}") if bad else (out, None)
 
 
 def rows(spec, engine) -> list[dict]:
@@ -886,11 +902,15 @@ def _cli(argv) -> int:
     ap.add_argument("--seeds", type=int, default=0, help="the first K seeds of the pack (0 = all)")
     a = ap.parse_args(argv)
     pack = yaml.safe_load(open(a.pack))
+    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
+    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
+    from toolkit.engines.benchmark_sources import fitted_problems
+    if os.path.exists(fp) and fitted_problems(f, pack):      # F6 S1-2: fitted values the pack's bands no longer back
+        print("; ".join(fitted_problems(f, pack)))
+        return 2
     if a.only:
         keep = set(a.only.split(","))
         pack = dict(pack, benchmarks=[b for b in pack["benchmarks"] if b["id"] in keep])
-    fp = os.path.join(os.path.dirname(os.path.abspath(a.pack)), "fitted.yaml")
-    f = yaml.safe_load(open(fp)) if os.path.exists(fp) else {}
     fitted = {k: v["value"] for k, v in (f.get("parameters") or {}).items()}
     seeds = pack["seeds"][:a.seeds] if a.seeds else pack["seeds"]
     out = write_spec_benchmarks(a.run_dir, pack, fitted, a.workers, seeds)
@@ -1149,6 +1169,35 @@ def _self_test() -> int:
                and all(x.get("engine_identity") == engine_identity(A.eng) for x in arms.values()),
                f"EP32 the harness step writes the file under analysis/ with a record of its digest and of the engine and "
                f"configuration each arm ran with: {sorted(arms)}")
+            # F6 S1-2 (Codex r2 P1-3): the reader and the producer check band declarations and fitted provenance
+            from toolkit.engines.contract import ToyEngine
+            sp_ = schema.load(p)
+            tp = RUN._toy_pack()
+            moved = dict(tp, benchmarks=[dict(tp["benchmarks"][0], band=[0.7, 1.25],
+                                              band_override=dict(tp["benchmarks"][0]["band_override"], band=[0.7, 1.25]))])
+            stale_f = os.path.join(d, "stale_fitted.yaml")
+            yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(stale_f, "w"))
+            got0 = EPm.verified_spec_benchmarks(A.eng, sp_)
+            orig_bp = EPm.benchmark_pack
+            try:
+                EPm.benchmark_pack = lambda e: (moved, "pack.yaml")
+                got1 = EPm.verified_spec_benchmarks(A.eng, sp_)
+                EPm.benchmark_pack = lambda e: (dict(tp, fit_joint={"targets": ["T2"]}), "pack.yaml")
+                ToyEngine.fitted_path = stale_f
+                got2 = EPm.verified_spec_benchmarks(A.eng, sp_)
+                try:
+                    EPm.spec_benchmarks(tp, A.eng, sp_)
+                    got3 = "accepted"
+                except ValueError as e:
+                    got3 = str(e)
+            finally:
+                EPm.benchmark_pack = orig_bp
+                if "fitted_path" in vars(ToyEngine):
+                    del ToyEngine.fitted_path
+            ok(got0[0] and got1[0] == [] and "rerun required: T2" in str(got1[1]) and got2[0] == []
+               and "refit required: T2" in str(got2[1]) and "refit required: T2" in got3,
+               f"EP32b verified_spec_benchmarks refuses rows for another band declaration and stale fitted values, and "
+               f"spec_benchmarks refuses stale fitted values: {got1[1]} | {got2[1]} | {got3}")
             doc = yaml.safe_load(open(path))
             b = {x["id"]: x for x in doc["benchmarks"]}["T2"]
             arm = {k: math.exp(sum(math.log(x[k]) for x in b["arm_or"]) / len(b["arm_or"])) for k in ("a11", "a10", "a01")}

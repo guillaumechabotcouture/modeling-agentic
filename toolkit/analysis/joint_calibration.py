@@ -84,6 +84,10 @@ def _benchmarks(eng):
     pack, why = PV.benchmark_pack(eng)
     if pack is None:
         return None, set(), why
+    from toolkit.engines.benchmark_sources import check_pack as band_sources
+    bad = band_sources(pack)            # F6 S1-2: a band read as a 95% interval must be its source's interval
+    if bad:
+        return None, set(), "the engine's benchmark bands do not match their sources: " + "; ".join(bad)
     return pack, BM.fit_targets(pack), None
 
 
@@ -134,8 +138,8 @@ def spec_problems(spec) -> list[str]:
         except Exception as e:  # noqa: BLE001 -- the priors' own check names it
             dr = {}
             bad.append(f"{w}: the priors cannot be read ({e})")
-        from toolkit.analysis.batch import fitted_ranges
-        fr = fitted_ranges(eng)
+        # names only: whether the fitted values are current is the analysis entry's check (a blocked run, F6 S1-2)
+        fr = {p.name for p in eng.parameters() if p.kind == "fitted"}
         for s in sh:
             if s not in dr and s not in fr:
                 bad.append(f"{w}.shared: {s} is not a prior the uncertainty draws vary (an engine-card prior, an "
@@ -530,14 +534,20 @@ def build(spec, units=None) -> tuple:
                                          weights={i: float(rows[i][t["weights"]]) for i in members},
                                          source=t["source"]))
         else:
-            pack, fit, _ = _benchmarks(spec.engine())
+            pack, fit, why = _benchmarks(spec.engine())
+            if pack is None:
+                raise HM.CalibrationInputError([f"benchmark target {t['id']}: no usable engine pack ({why})"])
             b = next(x for x in pack["benchmarks"] if x["id"] == t["id"])
             lo, hi = (float(x) for x in b["band"])
             sc = "log" if lo > 0 and float(b["target"]) > 0 else "identity"
-            sd = (float(HM.tr(hi, sc)) - float(HM.tr(lo, sc))) / (2 * 1.959964)
+            from toolkit.engines.benchmark_sources import band_level, band_sd    # F6 S1-2: at the recorded level
+            try:
+                sd = band_sd(b, lambda x: HM.tr(x, sc))
+            except ValueError as e:
+                raise HM.CalibrationInputError([f"benchmark target {t['id']}: {e}"]) from None
             targets.append(HM.Target(t["id"], "shared", f"bench.{t['id']}", float(b["target"]), sc, sd_obs=sd,
-                                     sd_md=md, source=f"engine benchmark pack: {b.get('source', '')} (band as a 95% "
-                                                      "interval)", depends_on=t.get("depends_on")))
+                                     sd_md=md, source=f"engine benchmark pack: {b.get('source', '')} (band as an "
+                                                      f"interval at level {band_level(b)})", depends_on=t.get("depends_on")))
     feats = j.get("features") or []
     F = {i: [_feature(rows[i], f) for f in feats] for i in ids} if feats else {}
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
