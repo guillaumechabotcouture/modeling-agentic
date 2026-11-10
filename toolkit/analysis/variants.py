@@ -61,14 +61,25 @@ def fixed_variants(raw: dict) -> list[dict]:
     return [v for v in config(raw).get("variants") or [] if isinstance(v, dict) and v.get("type") == "fixed_plan"]
 
 
-def _package_problems(col: str, units, pk, uid) -> list[str]:
-    """A fixed plan's column: every unit's cell a known, non-empty package id."""
+def _package_problems(cells: dict, pk, options=None) -> list[str]:
+    """A fixed plan's column ({unit id: cell}): every cell a known, non-empty package id. A generated package that
+    `within_envelope` pruning dropped (it costs more than the envelope in every unit) has no outcomes in the analysis:
+    it is refused with why (Codex S2-6 r1 P1-1)."""
     out = []
-    empty = [str(u.get(uid)) for u in units if not str(u.get(col) or "").strip()]
-    unknown = sorted({str(u[col]).strip() for u in units if str(u.get(col) or "").strip()
-                      and str(u[col]).strip() not in pk})
+    empty = [str(u) for u, c in cells.items() if not str(c or "").strip()]
+    unknown = sorted({str(c).strip() for c in cells.values() if str(c or "").strip() and str(c).strip() not in pk})
+    p = (options or {}).get("packages")
+    pruned = []
+    if unknown and isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True:
+        from toolkit.alloc import costs as acosts
+        pruned = [x for x in unknown if x in acosts.packages(options)]
+        unknown = [x for x in unknown if x not in pruned]
     if empty:
         out.append(f"{len(empty)} units have no package id (e.g. {empty[:5]}); give the comparator's id for none")
+    if pruned:
+        out.append(f"packages {pruned[:5]} were dropped by options.packages.within_envelope (each costs more than the "
+                   "envelope in every unit), so the analysis has no outcomes for them; set within_envelope: false to "
+                   "evaluate this plan")
     if unknown:
         out.append(f"package ids {unknown[:5]} are not packages of options.packages {sorted(pk)[:8]}")
     return out
@@ -97,7 +108,8 @@ def validate(raw: dict, cols, units=None, pk=None, uid=None) -> list[str]:
             if v.get("column") not in cols:
                 bad.append(f"plan variant {i}: column {v.get('column')!r} is not a column of the units table")
             elif units is not None and pk is not None:
-                bad += [f"plan variant {i}: {m}" for m in _package_problems(v["column"], units, pk, uid)]
+                bad += [f"plan variant {i}: {m}" for m in _package_problems(
+                    {u.get(uid): u.get(v["column"]) for u in units}, pk, raw.get("options"))]
         cs = v.get("components")
         if v["type"] != "fixed_plan" and (cs is not None or v["type"] == "group_rule") and not (
                 isinstance(cs, list) and cs and all(c in comps for c in cs)):
@@ -246,7 +258,7 @@ def given_plan(A, v: dict) -> dict:
     fails closed (ValueError)."""
     if any(v["column"] not in A.by_id[i] for i in A.ids):
         raise ValueError(f"plan variant {v['id']}: no column {v['column']!r} in the units table")
-    bad = _package_problems(v["column"], [dict(A.by_id[i], __id=i) for i in A.ids], A.pk, "__id")
+    bad = _package_problems({i: A.by_id[i][v["column"]] for i in A.ids}, A.pk, A.spec.raw.get("options"))
     if bad:
         raise ValueError(f"plan variant {v['id']}: " + "; ".join(bad))
     return {i: str(A.by_id[i][v["column"]]).strip() for i in A.ids}

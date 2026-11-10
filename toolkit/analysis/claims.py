@@ -224,8 +224,8 @@ def variants_markdown(A, pv) -> str:
         return ""
     hv = pv["headline"]
     L = ["", "## Plan variants", "",
-         "Each rule variant is solved, and each fixed plan evaluated as given, on the point outcomes and costs "
-         "within the same budget as the headline plan, and "
+         "Each rule variant is solved on the point outcomes and costs within the same budget as the headline plan; "
+         "each fixed plan is evaluated as given on the same outcomes and costs, whatever it costs. Each is "
          "compared with the unconstrained plan (units with no package there: [CLAIM:variant.unconstrained.no_package]). "
          + ("The headline plan is the unconstrained plan." if hv == "unconstrained" else
             f"The headline plan is the variant {hv}, as the spec states (analysis.plan_variants.headline)."), "",
