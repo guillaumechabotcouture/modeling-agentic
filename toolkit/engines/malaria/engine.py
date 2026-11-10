@@ -3079,6 +3079,12 @@ def _self_test_v014(ok, e, unit) -> None:
         ok(e._burnin_key(P0, a, f6) == e._burnin_key(P1, a, f6) == e._burnin_key(P1, a)
            and e._burnin_key(P0, a, hl) != e._burnin_key(P1, a, hl),
            "W5c the F6 draft's horizon (window [2024, 2029.25], delivery [2024, 2027]) keeps the v0.13 burn-in key")
+        # Codex P3: each case-fatality parameter alone separates the key
+        ok(all(e._burnin_key(P0, a, hl) != e._burnin_key(dict(P0, **{k: P0[k] * 0.5 + 0.03}), a, hl)
+               and e._burnin_key(P0, a, he) == e._burnin_key(dict(P0, **{k: P0[k] * 0.5 + 0.03}), a, he)
+               for k in ("cfr_severe_untreated", "cfr_severe_treated", "severe_access_add")),
+           "W5d each of cfr_severe_untreated, cfr_severe_treated and severe_access_add alone separates the key under "
+           "the condition, and none does otherwise")
     case("W5", w5)
 
 
