@@ -918,6 +918,16 @@ def _self_test() -> int:
                   and r[4].leftovers == [] and r[1][-1] == ("list",))(
              scenario(1, lambda cfg: record(cfg, status="failed", roles=("run",)))))
 
+    # Codex round 3: after the last collect attempt, the cap and --max-hours are checked once more
+    fail6 = lambda cfg: {"status": [(0, status_text(cfg, {"A": "done:None", "B": "done:None"}))],  # noqa: E731
+                         "collect": [(None, "TimeoutError: collect did not return within 1800 s")]}
+    case("LW18a", "six 30-minute collect failures, credits cross the cap during the sixth: exit 3 with the stops",
+         lambda: (lambda r: r[0] == EXIT_CAP and runs(r[1]).count("collect") == 6
+                  and sorted(stops(r[1])) == [100, 101, 102])(scenario(0, record, fail6, api=_GrowingAt(7))))
+    case("LW18b", "--max-hours passed during the sixth collect attempt: exit 6, nothing stopped",
+         lambda: (lambda r: r[0] == EXIT_LIMIT and runs(r[1]).count("collect") == 6 and stops(r[1]) == [])(
+             scenario(0, record, fail6, retry_s=600.0, max_hours=3300 / 3600)))
+
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed: {', '.join(fails)}")
         return 1
@@ -1008,6 +1018,18 @@ class _Growing(_Billed):
     def billing(self, start, end):
         self.n += 1
         self.credits = 0.0 if self.n == 1 else 700.0
+        return super().billing(start, end)
+
+
+class _GrowingAt(_Billed):
+    """Billed credits that pass the cap from the n-th billing reading on."""
+    def __init__(self, n):
+        super().__init__(0.0)
+        self.n, self.k = n, 0
+
+    def billing(self, start, end):
+        self.k += 1
+        self.credits = 700.0 if self.k >= self.n else 0.0
         return super().billing(start, end)
 
 

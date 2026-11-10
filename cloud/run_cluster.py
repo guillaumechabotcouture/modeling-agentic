@@ -2293,6 +2293,17 @@ def _self_test_attach(ok) -> None:
         ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
                                                      "wait_for_workers": False}],
            f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
+        # Codex round 3 (P2-b): an attach refusal leaves the overflow pool unavailable for the tick; the keeper goes on
+        fake.Cluster = lambda **kw: Cl(_id=9, **kw)
+        listed[:] = [{"name": "n-overflow", "id": 9, "current_state": {"state": "running"},
+                      "created": "2020-01-01T00:00:00Z"}]   # another invocation's: refused, left alone
+        ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
+        try:
+            got, step = ov.attach(), ov.step(None, None, 4, 1, None, time.time())
+            ok(got == (None, None) and step.get("unavailable") and step["desired"] == 0 and step["scale_to"] is None
+               and not step["join"] and ov.cl is None, f"RC60g an overflow attach refusal: unavailable this tick: {step}")
+        except BaseException as e:  # noqa: BLE001 — SystemExit would end the keeper
+            ok(False, f"RC60g an overflow attach refusal must not end the keeper: {type(e).__name__}: {e}")
     finally:
         if saved is None:
             sys.modules.pop("coiled", None)
