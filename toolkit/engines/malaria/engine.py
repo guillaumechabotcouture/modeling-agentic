@@ -111,7 +111,7 @@ v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, so a burden
 For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are the expected severe episodes and
 deaths of the window's new infections per person of the group, over its mean population in the window:
 the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
-v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W2 (selftest_late.py).
+v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W4 (selftest_late.py).
 """
 from __future__ import annotations
 

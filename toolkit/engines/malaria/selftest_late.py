@@ -6,7 +6,7 @@
 engine.py --self-test runs M1-M21 and the v0.5-v0.7 sections. This module runs the v0.8 figure hooks (S0-S15),
 the v0.9 net survival (N0-N7), the v0.10 past SMC and per-campaign net types (H0-H7) and the v0.11 SMC
 mechanism (Q0-Q6) and the v0.12 case-management package (C0-C11) and the v0.13 past SMC
-coverage (HC0-HC7) and the v0.14 window metrics for severe cases and deaths (W0-W2). The sections are defined
+coverage (HC0-HC7) and the v0.14 window metrics for severe cases and deaths (W0-W4). The sections are defined
 in engine.py, beside the code they test; they are split across two processes only so that each one stays well
 inside CI's per-test time limit (scripts/self_tests.py discovers and runs both modules).
 """
