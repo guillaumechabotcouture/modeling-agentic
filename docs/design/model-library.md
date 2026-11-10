@@ -301,6 +301,61 @@ scikit-learn: `toolkit/calibration/history_matching.py` (disease-agnostic; thres
 - After the last wave the engine runs at the best point for every unit (verification). The region's shared values
   feed the uncertainty draws (with provenance), and the automatic prior_range tests use the region's ends.
 
+**Error model (F6 S2-3, part 1).** A survey's error is partly shared by the units of a group: one design and fieldwork,
+and one modelled small-area surface. A unit target with `bias_by: <units column>` gets one latent offset per source and
+group, b ~ N(0, bias_sd²): y = f + b + e, with e (sampling and discrepancy) independent per target. `bias_source` names
+the survey (default: the target id), so two targets from one survey share one offset per group. At most one survey
+per unit may carry an offset; a second is refused (declare it as a group target, an aggregate over the group's
+units). The old rule added bias_sd² to each target's own variance. That lets every unit use its own offset, so a
+group's units pull on one survey anchor as if they were independent, and the within-group contrasts that identify
+shared parameters are lost.
+- **Exact feasible offsets.** At a candidate and a grid value g of a unit's parameter, every target of the unit holds
+  on one closed interval of its block's offset: [y − m(g) − 3 sd(g), y − m(g) + 3 sd(g)], inside ±3 bias_sd. The unit's
+  feasible offsets are the union of those intervals over g, in closed form and exact on the grid, as the unit
+  parameter is. A block's feasible set is the intersection of its units' unions, computed by a sweep over the interval
+  ends.
+- **Components.** Units, their blocks and every member of every group target are joined transitively, including
+  members without an offset and group targets connected only through a shared member. A 2018 state aggregate over a
+  state's units and the state's 2021 offset are one component, and an aggregate over several groups joins them. Each
+  unit belongs to one component, so a row draws it once. Group-target checks include the members' emulator sds
+  (perfectly correlated) and their run noise (independent), as the group-target scoring and the verification do.
+- **Offset draws.** Offsets are drawn from their prior restricted to each block's exact set, by inverse cdf over its
+  intervals. Each proposal also draws one unit assignment under its offset (each unit uniform over its matching
+  values), and it is kept only when that one assignment meets every group target of the component. The group targets
+  are judged and reported at the kept assignment with the least worst implausibility, never clipped.
+  - Proposals start at `bias_draws` (64) per candidate and double while none is kept, up to `bias_draws_max` (1,024).
+  - A component is infeasible at a candidate only when a block's set is empty or nothing is kept at the maximum. The
+    report records the count reached (`bias_components`).
+  - Each unit's matching grid values at a candidate are those that fit at one of the kept draws.
+- **Region sample.** Each row draws a fresh offset from the restricted prior, then each unit's parameter uniformly over
+  its matching values at that offset, redrawn together until the group targets hold. The values of a component with
+  group targets are kept as drawn (no jitter), so the returned rows meet them. There is no fixed witness. A row that
+  never holds, or an acceptance rate over the region below `bias_accept_min`, blocks the calibration
+  (`offset_sampling_low_acceptance`).
+- **Engine verification.** The verification point of a component with group targets is built from joint draws at the
+  best candidate. It takes the draw whose worst unit misfit at its own offset is least, then puts each unit at its best
+  value under that offset when every group target still holds there (else the draw's own values). That gives one
+  offset and one assignment, feasible together. The engine verification then solves the common offset exactly from
+  the engine's own runs, with the same sweep.
+- **Not marginal implausibility.** Profiling is a feasibility rule. A single target may sit up to 3 (sd_e + sd_b)
+  from the model, where integrating the offset out (marginal Gaussian implausibility) allows 3 √(sd_e² + sd_b²). It is
+  stricter on contrasts between units of one group. Vernon et al. (2010, Bayesian Analysis 5:619) treat structured
+  discrepancy through the covariance instead. A simulation of one group of n units at the truth (200,000 draws,
+  sd_b / sd_e of 0.5, 1 and 3) compares the two rules:
+  - The profiled rule keeps the truth in 99.9–100% of draws for n = 1 to 6, and 99.4% for n = 24.
+  - The marginal rule keeps it in 94.0–99.7%.
+  - For a contrast of 4 sd_e between two halves of a 6-unit group, the profiled rule keeps 30–62% of draws, against
+    4–93% for the marginal rule. The marginal rule keeps most of them when the offset sd is large.
+- **Best point.** By default the score sums the units, as before. A spec may choose
+  `calibration.joint.best_point_weighting: per_group`: each group then counts once (its units' mean squared
+  implausibility). This is a chosen balancing rule, so a large group does not
+  outweigh small ones by repetition; it is not derived from a likelihood. The region does not depend on it; only the
+  verification point does.
+
+The change between surveys by group (a calibration diagnostic with a threshold) follows in S2-3b. Part 2 (historical
+and future intervention parameters, and histories anchored to delivery surveys) needs an engine parameter for past
+coverage. It follows separately.
+
 ### 5.4 Incremental rebuilds
 
 Every step's output is cached under a key made of the hashes of its code, its inputs, the
