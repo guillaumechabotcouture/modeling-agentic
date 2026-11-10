@@ -313,7 +313,12 @@ def feeding(b, has_net, n_defl, n_kill, n_fed, irs_det, irs_kill, divert=0.0):
 
 def cycle(b, w0, y, w, z, tau1=0.69, tau2=2.31):
     """Feeding-cycle summary for one species given person weights w0 (biting
-    heterogeneity x age): (f, mu). Le Menach 2007 / Griffin 2010 form."""
+    heterogeneity x age): (f, mu, W). Le Menach 2007 / Griffin 2010 form.
+    W (W-bar) is the mean probability that a feeding attempt ends in a blood meal the
+    mosquito survives (on an animal, or on person i with probability w_i). With
+    pi_i = w0_i / sum(w0), one mosquito bites person i at the rate f Q0 pi_i y_i / W and
+    takes blood meals it survives from person i at the rate f Q0 pi_i w_i / W (Griffin
+    2010 Protocol S2); the sum of the second is f Q, Q = 1 - (1 - Q0) / W."""
     sw = w0.sum()
     Q0 = b["Q0"]
     W = 1 - Q0 + Q0 * (w0 * w).sum() / sw
@@ -322,7 +327,7 @@ def cycle(b, w0, y, w, z, tau1=0.69, tau2=2.31):
     p10, p2 = np.exp(-b["mu0"] * tau1), np.exp(-b["mu0"] * tau2)
     p1 = W * p10 / (1 - Z * p10)
     mu = -f * np.log(p1 * p2)
-    return f, mu
+    return f, mu, W
 
 
 def _self_test() -> int:
@@ -384,7 +389,7 @@ def _self_test() -> int:
     ok(y1[0] > y0[0] and z1[0] < z0[0] and abs((y1 - y0)[0] - b["phi_I"] * dS[0]) < 1e-12,
        "V14 IRS-deterred mosquitoes diverted outdoors feed instead of retrying (and escape the net)")
     w0 = np.ones(4)
-    f, mu = cycle(b, w0, np.ones(4), np.ones(4), np.zeros(4))
+    f, mu, _ = cycle(b, w0, np.ones(4), np.ones(4), np.zeros(4))
     ok(abs(mu - b["mu0"]) < 1e-9, "V15 without interventions the cycle reproduces baseline mortality")
     # v0.15 (F6 engine review, finding 1): cycle also returns W-bar, the mean probability that a feeding attempt ends
     # in a blood meal the mosquito survives. The biting rates on humans carry 1/W-bar (Griffin 2010 Protocol S2)

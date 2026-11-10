@@ -46,6 +46,13 @@ smc_hist_cov), apart from smc_cov, which the package's and routine SMC keep. The
 smc_rho are shared, so the same children tend to be missed in past and future rounds. smc_rounds_pmf gives the
 beta-binomial shares of rounds received, which links a survey's per-cycle and all-cycle coverage.
 
+v0.15 (F6 engine review, finding 1): the biting rates carry the 1 / W-bar term of the feeding-cycle model (Griffin
+2010 Protocol S2; ENGINE_NOTES.md, v0.15). With pi_i a person's share of bites and W-bar the mean probability that a
+feeding attempt ends in a blood meal the mosquito survives (vector.cycle), the EIR on person i per infectious mosquito
+per person is f Q0 pi_i y_i / W-bar, and the force of infection on mosquitoes is f Q0 sum(pi_i w_i c_i) / W-bar.
+v0.2-v0.14 used f Q0 pi_i y_i and f Q0 sum(pi_i y_i c_i): the same without vector control (W-bar = 1), too low under
+nets or IRS (W-bar 0.5-0.8 at 40-70% net use).
+
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
   z_hh   household latent; a person's net-use latent is
@@ -316,8 +323,10 @@ class Malaria(ss.Disease):
         for (name, share, b), mo in zip(self.mix, self.mos):
             n_defl, n_kill, n_fed = V.itn_effect(net_type, self.res[name], net_age, P, b["complex"])
             y, w, z = V.feeding(b, hn, n_defl, n_kill, n_fed, irs_det, irs_kill, P["irs_divert"])
-            f, mu = V.cycle(b, w0, y, w, z, G['tau1'], G['tau2'])
-            lam_m = f * b['Q0'] * (w0 * y * c).sum() / sw
+            f, mu, W = V.cycle(b, w0, y, w, z, G['tau1'], G['tau2'])
+            # v0.15: both rates carry 1 / W-bar (Griffin 2010 Protocol S2), and a mosquito is infected by the bites
+            # it survives (w), a person by every bite (y). v0.2-v0.14 had f Q0 pi y for both
+            lam_m = f * b['Q0'] * (w0 * w * c).sum() / sw / W
             beta = b['mu0'] * p.M0 * share * s_t
             surv = np.exp(-mu)
             newE = mo['S'] * (1 - np.exp(-lam_m))
@@ -326,7 +335,7 @@ class Malaria(ss.Disease):
             mo['q'][k] = newE
             mo['S'] = (mo['S'] - newE) * surv + beta
             mo['I'] = mo['I'] * surv + emerge
-            eir_i += mo['I'] * f * b['Q0'] * n / sw * w0 * y
+            eir_i += mo['I'] * f * b['Q0'] * n / sw * w0 * y / W
         # human infection
         bitten = self.rs.random(n) < 1 - np.exp(-eir_i)
         self._boost('IB', 'lb', u, bitten, ti, G['ub'])

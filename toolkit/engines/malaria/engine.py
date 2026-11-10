@@ -112,6 +112,13 @@ For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are t
 deaths of the window's new infections per person of the group, over its mean population in the window:
 the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
 v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W4 (selftest_late.py).
+
+v0.15 (F6 engine review, finding 1): the biting rates carry the 1 / W-bar term of the feeding-cycle model (Griffin
+2010 Protocol S2): bites on person i per infectious mosquito f Q0 pi_i y_i / W-bar, force of infection on mosquitoes
+f Q0 sum(pi_i w_i c_i) / W-bar (model.py; ENGINE_NOTES.md, v0.15). v0.2-v0.14 left out 1 / W-bar and weighted the
+mosquito side by y. Without vector control the rates are the same (W-bar = 1); under nets or IRS every output
+changes, so the stored benchmark evidence and fitted values are v0.14's until the pack is refitted. No parameter is
+added or removed. Self-tests BR0-BR4 (selftest_late.py) and V29-V30 (vector.py).
 """
 from __future__ import annotations
 
@@ -140,7 +147,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.14"
+VERSION = "0.15"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -496,7 +503,9 @@ class MalariaEngine:
             name="malaria-starsim", version=VERSION,
             mechanisms=[
                 "Griffin-lite human natural history and immunity (fixed: " + GRIFFIN + ")",
-                "species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed)",
+                "species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed); feeding cycle "
+                "under vector control with biting rates f Q0 pi y / W-bar on people and f Q0 sum(pi w c) / W-bar on "
+                "mosquitoes (Griffin 2010 Protocol S2; v0.15)",
                 "ITN: repeating, killing and feeding per attempt from published hut-trial relationships by bioassay "
                 "mortality and species complex, pyrethroid and PBO, with resistance-dependent decay (" + V.CHURCHER_SOURCE
                 + "); dual-AI adds a fitted chlorfenapyr kill",
