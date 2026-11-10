@@ -728,6 +728,28 @@ def _self_test() -> int:
            f"DW25 the summary counts passed, failed and not judged separately, and names the open ones: {sm}")
         ok(load_registry(dj)["tests"]["D-003"]["claim"] == long_claim,
            "DW26 the registry keeps the finding's full claim")
+        # DW27-DW30 (project review A5): a critic that leaves out an open finding whose test never passed does not
+        # close it. Round 2's critique lists none of round 1's findings.
+        rd = run(dj, {"critique-domain": {"blockers": []}}, 2, record=False)
+        dropped = sorted(x["id"] for x in rd.get("dropped") or [])
+        gd = [g for g in gate_findings(rd) if g["kind"] == "done_when_dropped"]
+        ok(dropped == ["D-003", "D-005"] and {(g["id"], g["severity"]) for g in gd} == {("D-003", "HIGH"),
+                                                                                       ("D-005", "MEDIUM")},
+           f"DW27 an open finding left out of the critique, whose test never passed, still blocks at its severity: "
+           f"{dropped}, {gd}")
+        ok(summary(rd["status"]).get("required_not_judged") == ["D-003"],
+           f"DW28 a left-out finding whose test is not judged still counts as open and not judged: "
+           f"{summary(rd['status'])}")
+        ok("D-004" not in dropped, "DW29 a left-out finding whose test passes is not reopened")
+        rx = run(dj, {"critique-domain": {"blockers": []}}, 2, record=False, exclude={"D-003"})
+        cw = {"critique-domain": {"blockers": [dict(cj["critique-domain"]["blockers"][2],
+                                                    done_when_withdrawn="replaced by D-006")]}}
+        run(dj, cw, 2)
+        rw = run(dj, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in rx.get("dropped") or []] == ["D-005"]
+           and [x["id"] for x in rw.get("dropped") or []] == ["D-003"],
+           f"DW30 a finding outside the brief or withdrawn with a reason is not reopened: {rx.get('dropped')}, "
+           f"{rw.get('dropped')}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
