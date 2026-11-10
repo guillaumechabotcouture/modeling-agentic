@@ -914,10 +914,11 @@ class HistoryMatch:
                 shared[t.id] = {"I": np.abs(m - t.y) / np.sqrt(v + t.var), "mean": m}
         if gobs:
             shared.update(self._group_witness(units, N))
-        for comp, o in zip(self.bcomp, boff):     # a component's group targets hold where it has a kept draw (its
-            for t in comp["aggs"]:               # exact joint check), and fail where it has none
-                shared[t.id]["I"] = np.where(o["reason"] > 0, np.maximum(shared[t.id]["I"], self.cut + 1.0),
-                                             np.minimum(shared[t.id]["I"], self.cut))
+        for comp, o in zip(self.bcomp, boff):     # Codex r4: a component's group targets are judged, and reported, at
+            for t in comp["aggs"]:               # its coherent assignment with the least worst implausibility
+                tried = np.isfinite(o["aggI"][t.id])         # (a candidate without proposals: a block's set is empty)
+                shared[t.id]["I"] = np.where(tried, o["aggI"][t.id], np.maximum(shared[t.id]["I"], self.cut + 1.0))
+                shared[t.id]["mean"] = np.where(tried, o["aggM"][t.id], shared[t.id]["mean"])
         return {"C": C, "units": units, "targets": shared, "boff": boff}
 
     # ---------------------------------------------------------------- shared offsets (F6 S2-3, Codex r2)
@@ -929,8 +930,8 @@ class HistoryMatch:
     # the grid, as the unit parameter is). A block's feasible set is the intersection over its units of those unions
     # (a sweep over the interval ends). Components join blocks through every group target with a member in a block.
     # Offsets are drawn from their prior restricted to each block's exact set (inverse cdf over its intervals) and
-    # kept when every group target of the component is reachable: accepted draws are draws from the prior restricted
-    # to the component's feasible set. Proposals double from bias_draws up to bias_draws_max while none is accepted;
+    # kept when one unit assignment drawn under each (each unit uniform over its matching values) meets every group
+    # target of the component (Codex r4); the group targets are reported at that coherent assignment. Proposals double from bias_draws up to bias_draws_max while none is accepted;
     # a component is infeasible at a candidate only when a block's set is empty or none was accepted at the maximum.
     def _impl(self, t, m, v, b=None):
         """|m - (y - b)| / sd: a target judged at its block's offset b (exact)."""
@@ -1008,42 +1009,47 @@ class HistoryMatch:
             out[i] = np.clip(x, lo[i, j], hi[i, j])
         return out
 
-    def _agg_ok(self, comp, ivs, gp, B, rows, g=None):
-        """Every group target of the component at offsets B ({block: (R, D)}) for candidate rows: reachable from
-        its members' matching values (the range of the weighted mean; members' emulator sds added as perfectly
-        correlated and their run noise as independent, as _group_terms and the verification), or, with g ({unit:
-        grid index (R,)}), at those values. (R, D) or (R,)."""
-        shape = (len(rows),) if g is not None else next(iter(B.values())).shape
-        ok = np.ones(shape, bool)
+    def _agg_I(self, comp, gp, rows, g):
+        """Every group target of the component at the unit values g ({unit: grid index (R,)}) for candidate rows:
+        (the worst implausibility (R,), {target: (implausibility, transformed weighted mean) (R,)}); members' emulator
+        sds added as perfectly correlated and their run noise as independent, as _group_terms and the verification."""
+        n = len(rows)
+        worst, per = np.zeros(n), {}
         for gt in comp["aggs"]:
-            ws, lo, hi, sdg, vn = sum(gt.weights.values()), 0.0, 0.0, 0.0, 0.0
+            ws, val, sdg, vn = sum(gt.weights.values()), 0.0, 0.0, 0.0
             for u, w in gt.weights.items():
                 nat, sdn, nz = (x[rows] for x in gp[(gt.id, u)])
-                if g is not None:
-                    i_ = (np.arange(len(rows)), g[u])
-                    lo, hi, sdg = lo + w / ws * nat[i_], hi + w / ws * nat[i_], sdg + w / ws * sdn[i_]
-                    vn = vn + (w / ws) ** 2 * nz[i_]
-                    continue
-                iv = ivs[u]
-                if isinstance(iv, tuple):
-                    b = B[self.ublock[u]][..., None]
-                    mk = (iv[0][rows][:, None, :] <= b) & (b <= iv[1][rows][:, None, :])
-                else:
-                    mk = np.broadcast_to(iv[rows][:, None, :], shape + (len(self.zg),))
-                lo = lo + w / ws * np.where(mk, nat[:, None, :], np.inf).min(-1)
-                hi = hi + w / ws * np.where(mk, nat[:, None, :], -np.inf).max(-1)
-                sdg = sdg + w / ws * np.where(mk, sdn[:, None, :], 0.0).max(-1)
-                vn = vn + (w / ws) ** 2 * np.where(mk, nz[:, None, :], 0.0).max(-1)
-            fin = np.isfinite(lo) & np.isfinite(hi)
-            near = np.clip(gt.y, tr(np.where(fin, lo, 0.5), gt.scale), tr(np.where(fin, hi, 0.5), gt.scale))
-            d = 1.0 / np.maximum(np.abs(dinv(near, gt.scale)), 1e-12)
-            ok &= fin & (np.abs(gt.y - near) <= self.cut * np.sqrt(gt.var + (d * sdg) ** 2 + d ** 2 * vn))
-        return ok
+                i_ = (np.arange(n), g[u])
+                val, sdg, vn = val + w / ws * nat[i_], sdg + w / ws * sdn[i_], vn + (w / ws) ** 2 * nz[i_]
+            yb = tr(val, gt.scale)
+            d = 1.0 / np.maximum(np.abs(dinv(yb, gt.scale)), 1e-12)
+            I = np.abs(yb - gt.y) / np.sqrt(gt.var + (d * sdg) ** 2 + d ** 2 * vn)
+            per[gt.id] = (I, yb)
+            worst = np.maximum(worst, I)
+        return worst, per
+
+    def _assign(self, comp, ivs, b, rr, rng):
+        """One unit assignment per proposal: each unit uniform over its matching grid values at the proposal's
+        offset ({block: (R,)}). ({unit: masks (R, G)}, {unit: grid index (R,)}, every unit has one (R,))."""
+        m_, g_, has = {}, {}, np.ones(len(rr), bool)
+        for u in comp["units"]:
+            iv = ivs[u]
+            if isinstance(iv, tuple):
+                bb = b[self.ublock[u]][:, None]
+                m_[u] = (iv[0][rr] <= bb) & (bb <= iv[1][rr])
+            else:
+                m_[u] = iv[rr]
+            g_[u] = np.argmax(m_[u] * rng.uniform(0.01, 1.0, m_[u].shape), 1)
+            has &= m_[u].any(1)
+        return m_, g_, has
 
     def _offsets(self, em, C, S, T):
         """Per component: {b: {block: accepted draws (N, bias_draws)}, valid, proposed (the count reached), accepted,
         reason (0 feasible, 1 a block's set is empty, 2 none accepted at bias_draws_max), rep: {block: a point covered
-        by the most units}}; {unit: matchable at some offset}; the predictions of the components' units."""
+        by the most units}, aggI, aggM: {group target: implausibility and transformed prediction at the coherent
+        assignment with the least worst implausibility}}; {unit: matchable at some offset}; the predictions of the
+        components' units. A proposal (an offset with one unit assignment drawn under it) is accepted only when that
+        one assignment meets every group target of the component (Codex r4)."""
         N, D0, Dmax = len(C), int(self.th["bias_draws"]), int(self.th["bias_draws_max"])
         rng = np.random.default_rng([self.seed, len(self.waves), 41, N])
         out, alone, pls = [], {}, {}
@@ -1056,13 +1062,27 @@ class HistoryMatch:
             ne = np.all([segs[k][2].any(1) for k in comp["blocks"]], 0)
             o = {"b": {k: np.full((N, D0), np.nan) for k in comp["blocks"]}, "valid": np.zeros((N, D0), bool),
                  "proposed": np.zeros(N, int), "accepted": np.zeros(N, int),
-                 "rep": {k: np.where(np.isfinite(segs[k][4]), segs[k][4], 0.0) for k in comp["blocks"]}}
+                 "rep": {k: np.where(np.isfinite(segs[k][4]), segs[k][4], 0.0) for k in comp["blocks"]},
+                 "aggI": {t.id: np.full(N, np.inf) for t in comp["aggs"]},
+                 "aggM": {t.id: np.zeros(N) for t in comp["aggs"]}, "bestw": np.full(N, np.inf)}
             todo, D = ne.copy(), D0
             while todo.any() and D <= Dmax:
                 rows = np.flatnonzero(todo)
                 B = {k: self._draw_seg(*(x[rows] for x in segs[k][:3]), self.bsd[k], D, rng) for k in comp["blocks"]}
-                ok = self._agg_ok(comp, ivs, gp, B, rows) if comp["aggs"] else np.ones((len(rows), D), bool)
-                ok &= np.all([np.isfinite(B[k]) for k in B], 0)
+                ok = np.all([np.isfinite(B[k]) for k in B], 0)
+                if comp["aggs"]:
+                    rr = np.repeat(rows, D)
+                    _, g_, has = self._assign(comp, ivs, {k: v.reshape(-1) for k, v in B.items()}, rr, rng)
+                    w_, per = self._agg_I(comp, gp, rr, g_)
+                    w_ = np.where(has & ok.reshape(-1), w_, np.inf).reshape(len(rows), D)
+                    ok &= w_ <= self.cut
+                    jj = w_.argmin(1)
+                    bw = w_[np.arange(len(rows)), jj]
+                    keep = bw < o["bestw"][rows]
+                    idx = (np.arange(len(rows)) * D + jj)[keep]
+                    for t in comp["aggs"]:
+                        o["aggI"][t.id][rows[keep]], o["aggM"][t.id][rows[keep]] = per[t.id][0][idx], per[t.id][1][idx]
+                    o["bestw"][rows[keep]] = bw[keep]
                 first = np.argsort(~ok, axis=1, kind="stable")[:, :D0]       # the first accepted, in order
                 for k in B:
                     o["b"][k][rows] = np.take_along_axis(B[k], first, 1)
@@ -1130,18 +1150,9 @@ class HistoryMatch:
                 rr = np.repeat(rows, K)
                 b = {k: self._draw_seg(*(x[rows] for x in segs[k][:3]), self.bsd[k], K, rng).reshape(-1)
                      for k in comp["blocks"]}
-                m_, g_ = {}, {}
-                for u in comp["units"]:
-                    iv = ivs[u]
-                    if isinstance(iv, tuple):
-                        bb = b[self.ublock[u]][:, None]
-                        m_[u] = (iv[0][rr] <= bb) & (bb <= iv[1][rr])
-                    else:
-                        m_[u] = iv[rr]
-                    g_[u] = np.argmax(m_[u] * rng.uniform(0.01, 1.0, m_[u].shape), 1)
-                okr = self._agg_ok(comp, ivs, gp, b, rr, g_) if comp["aggs"] else np.ones(len(rr), bool)
-                okr = (np.asarray(okr).reshape(len(rr)) & np.all([m_[u].any(1) for u in comp["units"]], 0)
-                       ).reshape(len(rows), K)
+                m_, g_, has = self._assign(comp, ivs, b, rr, rng)
+                okr = (self._agg_I(comp, gp, rr, g_)[0] <= self.cut if comp["aggs"] else np.ones(len(rr), bool))
+                okr = (okr & has).reshape(len(rows), K)
                 hit = okr.any(1)
                 j = (np.arange(len(rows)) * K + okr.argmax(1))[hit]
                 for u in comp["units"]:
@@ -1176,7 +1187,7 @@ class HistoryMatch:
                     I = np.maximum(I, np.abs(m[0] - t.y + (b[self.ublock[u]][0] if t.bias_key is not None else 0))
                                    / sd[0])
                 g[u] = np.array([int(I.argmin())])
-            ok = bool(np.asarray(self._agg_ok(comp, ivs, gp, b, np.array([0]), g)).all())
+            ok = bool(self._agg_I(comp, gp, np.array([0]), g)[0][0] <= self.cut)
             out.update({u: int(g[u][0]) if ok else int(zd[u][1][i]) for u in comp["units"]})
         return out
 

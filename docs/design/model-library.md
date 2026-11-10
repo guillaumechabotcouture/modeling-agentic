@@ -320,8 +320,9 @@ shared parameters are lost.
   unit belongs to one component, so a row draws it once. Group-target checks include the members' emulator sds
   (perfectly correlated) and their run noise (independent), as the group-target scoring and the verification do.
 - **Offset draws.** Offsets are drawn from their prior restricted to each block's exact set, by inverse cdf over its
-  intervals. A draw is kept when every group target of the component is reachable from its members' matching values.
-  Kept draws are draws from the prior restricted to the component's feasible set.
+  intervals. Each proposal also draws one unit assignment under its offset (each unit uniform over its matching
+  values), and it is kept only when that one assignment meets every group target of the component. The group targets
+  are judged and reported at the kept assignment with the least worst implausibility, never clipped.
   - Proposals start at `bias_draws` (64) per candidate and double while none is kept, up to `bias_draws_max` (1,024).
   - A component is infeasible at a candidate only when a block's set is empty or nothing is kept at the maximum. The
     report records the count reached (`bias_components`).

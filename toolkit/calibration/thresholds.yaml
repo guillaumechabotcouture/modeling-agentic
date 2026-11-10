@@ -32,8 +32,8 @@ history_matching:
   # F6 S2-3: a survey's error shared by the units of a group. A unit target with a bias_key (one per survey and
   # group; at most one per unit) does not add its sd_bias to its own variance; the block has one latent offset
   # b ~ N(0, sd_bias^2), and the targets are judged at y - b. Each unit's feasible offsets are exact intervals; a
-  # block's set is their intersection; offsets are drawn from the prior restricted to it and kept when the
-  # component's group targets are reachable. bias_draws proposals per candidate, doubled while none is accepted up
+  # block's set is their intersection; offsets are drawn from the prior restricted to it, each with one unit
+  # assignment under it, and kept when that assignment meets every group target. bias_draws proposals per candidate, doubled while none is accepted up
   # to bias_draws_max; only then is a component infeasible there (recorded with the count reached). The region sample
   # draws a fresh offset per row, redrawn with its units' values (up to bias_draws_max times) until the group targets
   # hold. bias_accept_min: an acceptance rate over the region's candidates below it blocks
