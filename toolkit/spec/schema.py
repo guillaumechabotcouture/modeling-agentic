@@ -95,6 +95,9 @@ docs/design/v2-spec-and-analysis.md §1):
     analysis:
       evaluation: emulator | direct        # an emulator for slow engines, the engine itself for cheap ones
       emulator: {points, holdout_share, seed, features, design_seed}
+                                           # features: [column | {attribute, encoding[, value][, empty]}]: emulator
+                                           # inputs from unit columns or encoded engine unit attributes
+                                           # (toolkit/analysis/features.py, F6 S2-4)
       cost_outputs: {treated: {cost_driver: treated_all}}    # per_outcome cost items <- engine cost drivers
       diagnostics: {name: {window: cal, metric: m, summary: [max, median]}}
       stability: {holdout_group: col, covariates: [..]}
@@ -1317,7 +1320,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         em = an.get("emulator") or {}
         if not (isinstance(em.get("points"), int) and em["points"] >= 8):
             bad.append("analysis.emulator.points: an integer >= 8")
-        bad += [f"analysis.emulator.features: no column {f}" for f in em.get("features") or [] if f not in cols]
+        from toolkit.analysis import features as FT      # F6 S2-4: columns, or encoded engine unit attributes
+        bad += FT.problems(s, cols)
     from toolkit.analysis import variants as _V      # F6 S1-6: operational plan variants
     bad += _V.validate(s.raw, cols, s.units(), pk, s.uid)
     for name, d in (an.get("diagnostics") or {}).items():

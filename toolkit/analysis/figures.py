@@ -715,7 +715,16 @@ def fig_design_coverage(R, t):
         raise Missing("the design has no points")
     cal = R.opt("calibration") or {}
     uz = {i: (v or {}).get("z") for i, v in (cal.get("units") or {}).items()}
-    feats = list(((R.spec.get("analysis") or {}).get("emulator") or {}).get("features") or [])
+    from toolkit.analysis import features as FT        # F6 S2-4: columns or encoded engine unit attributes
+    from toolkit.spec.schema import Spec
+    feats = [FT.name(f) for f in FT.declared(R.spec)]
+    fspec = Spec(R.spec, "")
+
+    def fval(u, k):
+        try:
+            return _num_or_none(FT.vector(fspec, R.by_id[u])[k]) if u in R.by_id else None
+        except (ValueError, TypeError, KeyError):
+            return None
     names = sorted({k for p in pts for k in (p.get("theta") or {})})
     panels = [("z", "calibrated attribute (design scale)")] + [("f", f) for f in feats] + [("p", n) for n in names]
     ncol = 3
@@ -733,8 +742,8 @@ def fig_design_coverage(R, t):
             uv = [v for v in uz.values() if v is not None]
             label_u = "units (fitted)"
         elif kind == "f":
-            dv = [_num_or_none(R.by_id.get(u, {}).get(name)) for u in dunits]
-            uv = [_num_or_none(R.by_id[i].get(name)) for i in R.ids]
+            dv = [fval(u, feats.index(name)) for u in dunits]
+            uv = [fval(i, feats.index(name)) for i in R.ids]
             label_u = "units"
         else:
             dv = [(p.get("theta") or {}).get(name) for p in pts]
