@@ -278,13 +278,14 @@ def variants_markdown(A, pv) -> str:
                  else f" {str(v.get('uncertainty_note') or '').capitalize()}.")]
         ss = v.get("same_spend") or {}      # review A2: equal spend, so the allocation alone differs
         L += ["", f"{v['id']} at the same spend: " + (
-            f"the best plan under the signed constraints that costs no more than {v['id']} ([CLAIM:{c}.cost]), solved "
-            f"on the same outcomes and costs, averts [CLAIM:{c}.same_spend_gain] more {A.primary} than {v['id']}"
+            f"the best plan under the signed constraints with its spending capped at {v['id']}'s cost "
+            f"([CLAIM:{c}.cost]; it may spend less), solved on the same outcomes and costs, averts "
+            f"[CLAIM:{c}.same_spend_gain] more {A.primary} (undiscounted) than {v['id']}"
             + (f" ([CLAIM:{c}.same_spend_gain_pct] of that plan's {A.primary} averted)"
                if ss.get("value_gain_pct") is not None else "")
             + f". The value lost above compares with the unconstrained plan at the headline budget, so it mixes a "
-            f"different allocation with a different spend; this comparison holds the spend fixed (negative when "
-            f"{v['id']} breaks the signed constraints)." if ss.get("status") == "solved" else
+            f"different allocation with a different spend; this comparison holds the spending cap fixed. A plan that "
+            f"breaks the signed constraints can give a negative gain here." if ss.get("status") == "solved" else
             f"no plan under the signed constraints is feasible at its cost ({ss.get('reason', 'no same-spend record')}).")]
     for v in pv["variants"]:        # Codex S1-6 r1 P3: what a group rule allows, and what each group chose
         if v.get("status") != "solved" or v.get("group_choices") is None:

@@ -371,7 +371,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
     # ---- plan variants (F6 S1-6), on the point tables within the headline plan's budget
-    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"])   # guarded by the point corrections
+    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"], out0)   # guarded by the point corrections
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity

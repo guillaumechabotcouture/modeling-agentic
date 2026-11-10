@@ -36,6 +36,7 @@ as failing it, not re-solved.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import sys
@@ -341,10 +342,13 @@ def solved_plans(A, ben0, cost0) -> dict:
     return out
 
 
-def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events) -> dict:
+def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events, out=None) -> dict:
     """Review A2: the optimum re-solved on the same point tables and the unconstrained (signed) feasibility `feas`,
-    with the budget set to fixed plan `fp`'s own cost `spend`, guarded as every other solve; what moves from the given
-    plan to it. Not solved (with why) when no plan is feasible at that spend; any other solver error raises."""
+    with the spending cap set to fixed plan `fp`'s own cost `spend`, guarded as every other solve; what moves from
+    the given plan to it. `value_gain` is in undiscounted primary outcomes averted (from the point outcomes `out`;
+    without them, the benefits over the discount factor, which is how they are built); `objective_gain` is the
+    objective difference (discounted). Not solved (with why) when no plan is feasible at that spend; any other solver
+    error raises."""
     from toolkit.analysis import moves as MV
     try:
         s = A.solve(ben0, cost0, budget=spend, feas=feas)
@@ -355,36 +359,63 @@ def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events) -> dict:
     sp, so = dict(s["choice"]), float(s["objective"])
     A.guard(f"plan variant {vid}: the optimum at its cost", [sp], events=events)
     m = MV.summarise(A, fp, sp, ben0, cost0, so, budget=spend, feas=feas)
+    if out is not None:
+        av = lambda p: float(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][p[i]][A.primary] for i in A.ids))  # noqa: E731
+    else:
+        av = lambda p: float(sum(ben0[i][p[i]] for i in A.ids)) / float(getattr(A, "dfac", 1.0))  # noqa: E731
+    a1, a0 = av(sp), av(fp)
     return {"status": "solved", "budget": spend, "objective": so, "cost": float(sum(cost0[i][sp[i]] for i in A.ids)),
-            "value_gain": so - fo, "value_gain_pct": 100.0 * (so - fo) / so if so > 0 else None,
-            **{k: m[k] for k in MOVES}, "plan": sp}
+            "objective_gain": so - fo, "averted": a1, "given_averted": a0, "value_gain": a1 - a0,
+            "value_gain_pct": 100.0 * (a1 - a0) / a1 if a1 > 0 else None, **{k: m[k] for k in MOVES}, "plan": sp}
 
 
 def _same_spend_findings(x: dict) -> list[str]:
-    """A fixed plan's same-spend block is present and agrees with its record. [] when it does."""
+    """A fixed plan's same-spend block is present and agrees with its record (Codex r1 P2-2, P2-3): its budget is the
+    plan's cost; not solved only when the plan itself breaks the signed constraints (otherwise it is a feasible plan
+    at that budget); a solved block's plan covers the plan's units with package ids, within the budget, its gains
+    recomputed. Every number must be finite: a bad field is a finding, never an exception. [] when it agrees."""
     s, vid = x.get("same_spend"), x.get("id")
     if not isinstance(s, dict) or s.get("status") not in ("solved", "not_solved"):
         return [f"fixed plan {vid}: no same-spend comparison (status solved or not_solved)"]
+    if not (_fin(s.get("budget")) and _fin(x.get("cost")) and _close(s["budget"], x["cost"])):
+        return [f"fixed plan {vid}: the same-spend budget {s.get('budget')!r} is not the plan's cost {x.get('cost')!r}"]
     if s["status"] == "not_solved":
-        return [] if s.get("reason") else [f"fixed plan {vid}: a same-spend comparison not solved, without why"]
-    if not all(_num(s, k) for k in ("budget", "objective", "cost", "value_gain")) or not isinstance(s.get("plan"), dict):
-        return [f"fixed plan {vid}: the same-spend comparison has no budget, objective, cost, value gain or plan"]
-    tol = lambda a, b: abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))  # noqa: E731
+        if not s.get("reason"):
+            return [f"fixed plan {vid}: a same-spend comparison not solved, without why"]
+        if x.get("units_ineligible") == 0 and not x.get("constraints_broken"):
+            return [f"fixed plan {vid}: the same-spend comparison is not solved, but the plan itself is feasible "
+                    "under the signed constraints at that budget"]
+        return []
+    keys = ("objective", "cost", "objective_gain", "averted", "given_averted", "value_gain")
+    bad = [k for k in keys if not _fin(s.get(k))] + (["value_gain_pct"] if s.get("value_gain_pct") is not None
+                                                    and not _fin(s["value_gain_pct"]) else [])
+    if bad or not _fin(x.get("objective")):
+        return [f"fixed plan {vid}: the same-spend comparison's {bad or ['plan objective']} are not finite numbers"]
+    sp, fp = s.get("plan"), x.get("plan")
     out = []
-    if not _num(x, "cost") or not tol(s["budget"], x["cost"]) or s["cost"] > s["budget"] * (1 + 1e-9) + 1e-9:
-        out.append(f"fixed plan {vid}: the same-spend budget {s['budget']} is not the plan's cost {x.get('cost')}, "
-                   f"or the same-spend optimum costs more ({s['cost']})")
-    if not _num(x, "objective") or not tol(s["value_gain"], s["objective"] - float(x["objective"])):
-        out.append(f"fixed plan {vid}: the same-spend value gain {s['value_gain']} is not its objective minus the "
-                   f"plan's ({s['objective']} - {x.get('objective')})")
-    pct = 100.0 * s["value_gain"] / s["objective"] if s["objective"] > 0 else None
-    if (pct is None) != (s.get("value_gain_pct") is None) or (pct is not None and not tol(pct, s["value_gain_pct"])):
+    if not (isinstance(sp, dict) and isinstance(fp, dict) and set(sp) == set(fp)
+            and all(isinstance(p, str) and p.strip() for p in sp.values())):
+        out.append(f"fixed plan {vid}: the same-spend plan does not give each of the plan's units a package id")
+    if s["cost"] > s["budget"] * (1 + 1e-9) + 1e-9:
+        out.append(f"fixed plan {vid}: the same-spend optimum costs {s['cost']}, above its budget {s['budget']}")
+    if not _close(s["objective_gain"], s["objective"] - float(x["objective"])):
+        out.append(f"fixed plan {vid}: the same-spend objective gain {s['objective_gain']} is not its objective minus "
+                   f"the plan's ({s['objective']} - {x['objective']})")
+    if not _close(s["value_gain"], s["averted"] - s["given_averted"]):
+        out.append(f"fixed plan {vid}: the same-spend value gain {s['value_gain']} is not its outcomes averted minus "
+                   f"the plan's ({s['averted']} - {s['given_averted']})")
+    pct = 100.0 * s["value_gain"] / s["averted"] if s["averted"] > 0 else None
+    if (pct is None) != (s.get("value_gain_pct") is None) or (pct is not None and not _close(pct, s["value_gain_pct"])):
         out.append(f"fixed plan {vid}: the same-spend value gain share {s.get('value_gain_pct')} is not {pct}")
     return out
 
 
-def _num(x: dict, k: str) -> bool:
-    return isinstance(x.get(k), (int, float)) and not isinstance(x.get(k), bool)
+def _fin(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _close(a, b) -> bool:
+    return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))
 
 
 class Draws:
@@ -422,11 +453,12 @@ class Draws:
                 "affordability": UQ.affordability(self.cost[k], self.A.budget, rule, lvl)}
 
 
-def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | None:
+def run(A, ben0, cost0, plan, events=None, draws=None, interval=None, outcomes=None) -> dict | None:
     """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
     headline plan's budget (A.solve: the reserve when enforced), each guarded against the point evaluation's model
     corrections `events` (Codex S1-6 r1 P1-1); every fixed plan evaluated as given, with its draws from `draws` (a
-    Draws fed by the uncertainty step; None: the point estimate only). None when the spec asks for none."""
+    Draws fed by the uncertainty step; None: the point estimate only); `outcomes`, the point outcomes, give the
+    same-spend gain in undiscounted outcomes. None when the spec asks for none."""
     from toolkit.analysis import moves as MV
     cfg = config(A.spec.raw)
     if not cfg:
@@ -453,7 +485,7 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
             m = MV.summarise(A, up, fp, ben0, cost0, fo, feas=bf)
             r, drawn = row(fp, fo), draws is not None and draws.n > 0      # no draws: the point estimate only
             rec.update(r, status="evaluated", column=v["column"], plan=dict(fp), value_lost=uo - fo,
-                       same_spend=same_spend(A, v["id"], fp, fo, r["cost"], ben0, cost0, bf, ev),
+                       same_spend=same_spend(A, v["id"], fp, fo, r["cost"], ben0, cost0, bf, ev, outcomes),
                        value_lost_pct=100.0 * (uo - fo) / uo if uo > 0 else None, **{k: m[k] for k in MOVES},
                        budget_allocatable=float(A.budget), cost_minus_budget=r["cost"] - float(A.budget),
                        within_budget=r["cost"] <= float(A.budget) * (1 + 1e-9), **eligibility(A, fp, bf),
