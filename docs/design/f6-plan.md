@@ -180,7 +180,8 @@ runs for a sample of LGAs at the boundary values.
 | S1-1 affordability, S1-2 benchmark bands | lead | PRs by 2026-11-11 | S1-1 merged (#155); S1-2 merged (#154); S1-2b merged (#158) |
 | S1-4, S1-5, S1-7 | lead | PRs by 2026-11-14 | S1-4 merged (#156); S1-5 merged (#162); S1-7 in review (#160) |
 | S1-3, S1-6, S1-8 | lead | PRs by 2026-11-16 | S1-3 merged (#159); S1-6 merged (#163); S1-8 merged (#161: launch handover, code-only fingerprint, `reuse-check`; real smoke passed, cases A and B, 2026-11-09) |
-| S2-1 to S2-5 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
+| S2-1 to S2-4 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
+| S2-5 absolute burden validation | lead | PR by 2026-11-11 | in review (#165: `validation.burden`, `analysis/burden_validation.yaml`); the Nigeria reference file (estimated state cases and deaths with intervals) is built outside the repository before the F6 spec is signed |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
 Cost: Stage 1 is laptop and review time. The F6 run needs a full recalibration (the benchmark and error-model changes

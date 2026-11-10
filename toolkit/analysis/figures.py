@@ -38,7 +38,7 @@ TIERS = {
     "data_model": ("data_coverage", "unit_attributes", "parameters", "calibration_fit", "design_coverage",
                    "sensitivity", "calibration_region", "calibration_top_pairs", "calibration_optical_depth",
                    "calibration_unit_fit", "calibration_residuals", "calibration_transmission",
-                   "calibration_bound_share", "calibration_waves"),
+                   "calibration_bound_share", "calibration_waves", "burden_validation"),
     "simulation": ("timeline", "trajectories", "burn_in", "seasonality", "stochastic_noise"),
 }
 DECISION_SETS = {
@@ -1014,6 +1014,74 @@ def fig_decision_tests(R, t):
            "filled bars change the plan, on the share or (named at right) on regret or dollars moved between "
            "components; the table gives all three.")
     return fig, title, cap, rows, "decision tests: does the plan change?"
+
+
+def fig_burden_validation(R, t):
+    """F6 S2-5: each external reference against the model, as the ratio model / reference value (log axis): the grey
+    bar is the reference interval, the dot and line the model value and its interval, the ticks a ratio tolerance."""
+    bv = R.art("burden_validation")
+    refs = bv.get("references") or []
+    if not refs:
+        raise Missing("analysis/burden_validation.yaml has no references")
+    from matplotlib.ticker import NullFormatter
+    fig = _fig(t, 7.8, 0.36 * len(refs) + 1.5)
+    h = fig.get_figheight()
+    ax = fig.add_axes([0.34, 0.75 / h, 0.5, _top(fig, 0.6) - 0.75 / h])
+    FS.style(ax, t, grid="x")
+    rows, xs, rats = [], [1.0], []
+    names = (("point", "model"), ("low", "model low"), ("high", "model high"))
+    for r in refs[::-1]:        # ratios first: a zero endpoint (ratio 0) is drawn at the axis floor, never dropped
+        v, m = float(r["value"]), r.get("model") or {}
+        rat = (lambda x: None if x is None or v <= 0 else float(x) / v)  # noqa: E731
+        e = {k: rat(m.get(k)) for k, _ in names}
+        e.update(rl=rat(r["lower"]), rh=rat(r["upper"]))
+        rats.append(e)
+        xs += [x for x in list(e.values()) + list((r.get("tolerance") or {}).get("ratio_band") or ()) if x]
+    floor = min(xs) / 3.0
+    for y, (r, e) in enumerate(zip(refs[::-1], rats)):
+        v, m = float(r["value"]), r.get("model") or {}
+        at = lambda x: floor if x == 0 else x  # noqa: E731
+        zero = [lab for k, lab in names if e[k] == 0] + [lab for k, lab in (("rl", "reference lower"),
+                                                                          ("rh", "reference upper")) if e[k] == 0]
+        if v <= 0:
+            ax.text(floor, y, f"0 reference value; model {FS.fmt(m.get('point'))}", va="center", fontsize=7,
+                    color=t["ink2"])
+        if e["rl"] is not None and e["rh"] is not None:
+            ax.barh(y, at(e["rh"]) - at(e["rl"]), left=at(e["rl"]), height=0.5, color=t["neutral"])
+        if e["point"] is not None:
+            ax.plot([at(e["low"] if e["low"] is not None else e["point"]),
+                     at(e["high"] if e["high"] is not None else e["point"])], [y, y], color=t["ink"], lw=1.2)
+            ax.plot([at(e["point"])], [y], "<" if e["point"] == 0 else "o", ms=5,
+                    color=t["cat"][1] if r["status"] == "outside" else t["cat"][0])
+        if zero:
+            ax.text(floor, y + 0.28, "0 (" + ", ".join(zero) + ": at the axis floor)", fontsize=6.5, color=t["ink2"])
+        b = (r.get("tolerance") or {}).get("ratio_band")
+        for x in b or []:
+            ax.plot([x, x], [y - 0.3, y + 0.3], color=t["ink2"], lw=1)
+        ax.text(1.02, y, r["status"], transform=ax.get_yaxis_transform(), va="center", fontsize=7.5, color=t["ink"])
+        rows.append({"reference": r["id"], "group": r["group"], "age_band": r.get("age_band") or "all",
+                     "outcome": r["outcome"], "year": r["year"], "kind": r["kind"], "model": m.get("point"),
+                     "model_low": m.get("low"), "model_high": m.get("high"), "value": v, "lower": r["lower"],
+                     "upper": r["upper"], "ratio": r.get("ratio"), "status": r["status"], "source": r["source"],
+                     "shown_as": ("; ".join(f"{z} 0 at the axis floor" for z in zero)
+                                  + ("; reference value 0: no ratio" if v <= 0 else "")) or None})
+    ax.axvline(1.0, color=t["ink2"], lw=0.8)
+    ax.set_xscale("log")
+    ax.set_xlim(floor / 1.5, max(xs) * 1.5)
+    FS.set_axis_format(ax, "x", "number")
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.set_yticks(range(len(refs)))
+    ax.set_yticklabels([_clip(f"{r['id']}: {r['outcome']}, {r['group']}" + (f", {r['age_band']}" if r.get("age_band")
+                                                                          else ""), 40) for r in refs[::-1]], fontsize=7.5)
+    ax.set_xlabel("model / reference value (log scale; 1 = equal)", fontsize=8)
+    sm = bv.get("summary") or {}
+    w0, w1 = bv.get("window") or ["?", "?"]
+    title = (f"Burden against external estimates: {sm.get('within', 0)} within, {sm.get('outside', 0)} outside"
+             + (f", {sm['information']} reported (information)" if sm.get("information") else ""))
+    cap = (f"The {bv.get('arm')} arm's annual mean over {w0}-{w1} divided by each reference value; grey bar: the "
+           "reference interval; line: the model interval (draws, or the point value for an age band); ticks: the "
+           "ratio tolerance; zero endpoints sit at the axis floor, labelled.")
+    return fig, title, cap, rows, "absolute burden against external estimates"
 
 
 def fig_comparison(R, t):
@@ -2038,7 +2106,8 @@ FUNCS = {"data_coverage": fig_data_coverage, "unit_attributes": fig_unit_attribu
          "headline": fig_headline, "allocation_map": fig_allocation, "stability_map": fig_stability,
          "burden_map": fig_burden, "calibration_fit": fig_calibration, "frontier": fig_frontier,
          "dollars": fig_dollars, "cost_per_outcome": fig_cost_per_outcome, "sensitivity": fig_sensitivity,
-         "timeline": fig_timeline, "trajectories": fig_trajectories}
+         "timeline": fig_timeline, "trajectories": fig_trajectories,
+         "burden_validation": fig_burden_validation}
 
 
 def _joint_figure(name):
