@@ -81,8 +81,12 @@ def calibrated_value(spec, z: float) -> float:
 
 
 def windows(spec) -> dict:
-    cal = spec["calibration"]
-    return {CAL_WINDOW: list(cal["window"])} if cal.get("method") == "emulator_inversion" else {}
+    """The engine's named windows: the calibration window (emulator inversion) and, only when the spec declares one,
+    the burden validation's model window (F6 S2-5b), so other specs' job hashes stay."""
+    from toolkit.analysis import burden as BV
+    cal, mw = spec["calibration"], BV.model_window(spec)
+    out = {CAL_WINDOW: list(cal["window"])} if cal.get("method") == "emulator_inversion" else {}
+    return dict(out, **({BV.WINDOW: mw["window"]} if mw else {}))
 
 
 def design(spec) -> tuple[dict, list[dict]]:

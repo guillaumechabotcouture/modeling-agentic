@@ -11,6 +11,10 @@ Spec (optional section; checked by toolkit/spec/schema.py, no values in code):
         group: region                     # the units-table column the references' groups name (default: the region)
         arm: none                         # the continuation package (default: the comparator)
         daly_parts: {dalys: dalys, deaths: deaths, yll_per_death: {<population group> | all: <number | parameter>}}
+        window: [2019, 2024]              # optional (S2-5b): the years the model value is averaged over (default: the
+                                          # decision window); inside the simulated horizon
+        window_metrics: {cases: <metric>} # with window: per outcome, the engine window metric that gives it per person
+                                          # over a named window (all ages); every reference's outcome needs one
 
 Reference CSV contract (COLUMNS): id; group (a value of the group column, or * for every unit); age_band (blank: all
 ages, or a decision_units.populations key); outcome (one the spec reports); measure (count | rate, per `per` people of
@@ -18,7 +22,10 @@ the band); year (within max_year_gap of the decision window); value, lower, uppe
 upper); kind (estimated | reported: reported values are shown for information only, never judged or fitted); source
 (the citation); tolerance (ratio: model / value inside [ratio_low, ratio_high], blank for the manifest default and
 never wider than its widest band | overlap: the model interval meets [lower, upper]); source_id (the publication or
-dataset) and derived_from (its upstream source ids, ; separated, may be empty).
+dataset) and derived_from (its upstream source ids, ; separated, may be empty). Optional columns (S2-5b): role (blank
+or checked | report_only: computed and reported beside the checked rows, never a finding) and interval (blank or
+published | none: no interval is published, lower and upper are left blank, and the row is judged on its ratio band
+alone; overlap needs a published interval).
 
 Independence is declared, not inferred: every calibration input names its source ids (observation targets per row in
 their `source` column; `calibration.targets.source_id`, `calibration.target_source_id` for the inversion target column,
@@ -27,8 +34,11 @@ refused. The reference file may not be a calibration input by path, inode or con
 declared sources, so the owner attests independence; the artifact records them.
 
 The model value is the arm's annual mean over the decision window (window total / window years), summed over the
-group's units. Its interval comes from the uncertainty draws for all-age references; an age-banded reference is the
-point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
+group's units. With `window`, it is the arm's mean over that window instead: the harness adds it to the engine's named
+windows (Horizon.windows, `WINDOW`) in the same runs, so each run returns the engine's window metrics for one more
+window and no run is added; on the emulator path one more GP per mapped outcome is fitted (a new window changes the
+batch's job hashes, so a batch computed without it is not reused). Its interval comes from the uncertainty draws for
+all-age references; an age-banded reference is the point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
 """
 from __future__ import annotations
 
@@ -45,12 +55,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 PRODUCER = "toolkit/analysis/burden.py"
-KEYS = {"csv", "group", "arm", "daly_parts"}
+KEYS = {"csv", "group", "arm", "daly_parts", "window", "window_metrics"}
 COLUMNS = ("id", "group", "age_band", "outcome", "measure", "per", "year", "value", "lower", "upper", "kind", "source",
            "tolerance", "ratio_low", "ratio_high", "source_id", "derived_from")
 KINDS = ("estimated", "reported")
 TOLERANCES = ("ratio", "overlap")
 STATUSES = ("within", "outside", "information", "unmatched")
+OPTIONAL = {"role": ("checked", "report_only"), "interval": ("published", "none")}    # S2-5b: blank = the first
+WINDOW = "burden_validation"        # the engine's named window for validation.burden.window
 
 
 def thresholds() -> dict:
@@ -74,7 +86,18 @@ def _num(x):
 def config(s) -> dict:
     b = section(s.raw) or {}
     return {"csv": b.get("csv"), "group": b.get("group") or s["decision_units"].get("region"),
-            "arm": b.get("arm") or s.comparator, "daly_parts": b.get("daly_parts")}
+            "arm": b.get("arm") or s.comparator, "daly_parts": b.get("daly_parts"), "window": b.get("window"),
+            "window_metrics": b.get("window_metrics")}
+
+
+def model_window(s) -> dict | None:
+    """{window, metrics, arm} when validation.burden declares a well-formed model window, else None (validation
+    refuses a malformed one before any run)."""
+    b = section(getattr(s, "raw", None))
+    w, m = (b.get("window"), b.get("window_metrics")) if isinstance(b, dict) else (None, None)
+    if not (isinstance(w, list) and len(w) == 2 and all(_num(x) is not None for x in w) and isinstance(m, dict) and m):
+        return None
+    return {"window": [float(x) for x in w], "metrics": dict(m), "arm": config(s)["arm"]}
 
 
 def csv_path(s) -> str:
@@ -178,6 +201,11 @@ def sheet_lines(raw, run_dir, data=None) -> list[str]:
         pv, (refs, bad) = provenance(sp, data), load_references(sp, data)
     except Exception as e:  # noqa: BLE001 -- the sheet says so rather than omitting the section
         return out + [f"Unreadable: {type(e).__name__}: {e}", ""]
+    mw = model_window(sp)
+    if mw:
+        out += [f"Model values are the arm's mean over {mw['window'][0]:g}-{mw['window'][1]:g}, from the engine window "
+                f"metrics {', '.join(f'{o} <- {m}' for o, m in mw['metrics'].items())} (per person over the window).",
+                ""]
     out += [f"Signing attests that no reference below comes from, or is derived from, a source the calibration fits "
             f"(calibration sources: {', '.join(pv['calibration_source_ids']) or 'none declared'}). Reference file "
             f"`{pv['csv']}` (sha256 `{(pv['sha256'] or 'unreadable')[:16]}`).", "",
@@ -272,6 +300,20 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
     groups = {str(u.get(cfg["group"])) for u in units} if cfg["group"] and cfg["group"] in units[0] else set()
     outs = s.outcomes()
     t0, t1 = (float(x) for x in s["objective"]["horizon"])
+    mw, wm = None, cfg["window_metrics"]
+    if cfg["window"] is not None or wm is not None:       # S2-5b: the model window and its window metrics
+        h0, h1 = float(s["horizon"]["start"]), float(s["horizon"]["stop"])
+        w = [_num(x) for x in (cfg["window"] if isinstance(cfg["window"], list) and len(cfg["window"]) == 2
+                               else [None])]
+        if None in w or not h0 <= w[0] < w[1] <= h1:
+            bad.append(f"{P}.window: [start, end], start < end, inside the simulated horizon {h0:g}-{h1:g}")
+        else:
+            mw, (t0, t1) = w, w
+        wn = s.engine().describe().outputs.get("windows", [])
+        if not (isinstance(wm, dict) and wm and all(o in outs and m in wn for o, m in wm.items())):
+            bad.append(f"{P}.window_metrics: with window, {{reported outcome: an engine window metric {wn} giving "
+                       "it per person over the window}")
+            wm = {}
     refs, seen = [], set()
     for n, r in enumerate(rows, 2):
         e = []
@@ -284,6 +326,10 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             e.append(f"group {g!r} is not a value of {cfg['group']} (or *): no unit to compare")
         if band and band not in pops:
             e.append(f"age_band {band!r} is not a decision_units.populations group")
+        if mw and band:
+            e.append("age_band: a model window compares all ages (window metrics are per person, all ages)")
+        if mw and wm and r["outcome"] not in wm:
+            e.append(f"outcome {r['outcome']!r} has no window_metrics entry for the model window")
         if r["outcome"] not in outs:
             e.append(f"outcome {r['outcome']!r} is not reported by the spec {outs}")
         per = _num(r["per"])
@@ -292,10 +338,18 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
         yr = _num(r["year"])
         gap = None if yr is None else max(t0 - yr, yr - t1, 0.0)
         if gap is None or gap > float(th["max_year_gap"]):
-            e.append(f"year {r['year']!r}: more than {th['max_year_gap']} years from the decision window {t0:g}-{t1:g}")
+            e.append(f"year {r['year']!r}: more than {th['max_year_gap']} years from the "
+                     f"{'model' if mw else 'decision'} window {t0:g}-{t1:g}")
+        opt = {k: str(r.get(k) or "").strip() or v[0] for k, v in OPTIONAL.items()}
+        e += [f"{k} {opt[k]!r}: blank, or one of {', '.join(v)}" for k, v in OPTIONAL.items() if opt[k] not in v]
         val, lo, hi = _num(r["value"]), _num(r["lower"]), _num(r["upper"])
-        if None in (val, lo, hi) or not 0 <= lo <= val <= hi:
-            e.append("value, lower, upper: finite, >= 0, lower <= value <= upper")
+        if opt["interval"] == "none":           # S2-5b: no published interval; lower and upper stay blank
+            if str(r["lower"] or "").strip() or str(r["upper"] or "").strip() or val is None or val < 0:
+                e.append("interval none: lower and upper blank (no published interval), value finite and >= 0")
+            if r["tolerance"] == "overlap":
+                e.append("tolerance overlap needs a published interval; use ratio")
+        elif None in (val, lo, hi) or not 0 <= lo <= val <= hi:
+            e.append("value, lower, upper: finite, >= 0, lower <= value <= upper (or interval none, bounds blank)")
         if r["kind"] not in KINDS:
             e.append(f"kind {r['kind']!r}: estimated or reported")
         if not str(r["source"] or "").strip():
@@ -319,11 +373,12 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             continue
         refs.append({"id": rid, "group": g, "age_band": band or None, "outcome": r["outcome"],
                      "measure": r["measure"], "per": per if r["measure"] == "rate" else None, "year": yr,
-                     "year_gap": gap, "value": val, "lower": lo, "upper": hi, "kind": r["kind"],
+                     "year_gap": gap, "value": val, "lower": lo, "upper": hi, "kind": r["kind"], **opt, "window": mw,
                      "source": r["source"].strip(), "source_id": sid, "derived_from": der, "tolerance": {"type": r["tolerance"], "ratio_band": list(band_r)
                                                                   if r["tolerance"] == "ratio" else None}})
-    if refs and not any(x["kind"] == "estimated" for x in refs):
-        bad.append(f"{P}.csv: no estimated reference (reported values are information only)")
+    if refs and not any(x["kind"] == "estimated" and x["role"] == "checked" for x in refs):
+        bad.append(f"{P}.csv: no estimated reference among the checked rows (reported values and report-only rows "
+                   "are never judged)")
     cids, cbad = calibration_source_ids(s)       # Codex r2: declared provenance, never numeric coincidence
     bad += [f"{P}: every calibration input declares its sources: {x}" for x in cbad]
     for x in refs:
@@ -354,11 +409,18 @@ def _pop(A, ids, band) -> float:
 
 def _value(A, cfg, ref, out, arm):
     """The arm's annual mean over the window for the reference's group (a rate per `per` people of its band), or None
-    when no unit (or no population) matches."""
+    when no unit (or no population, or no model-window output) matches. With a model window (S2-5b) the window is
+    the reference's, and the totals are the model's `burden` outputs (window metric x population)."""
     ids = _members(A, cfg, ref["group"])
-    tot = sum(out[i]["y"][arm][ref["outcome"]] for i in ids) / _years(A)
     if not ids:
         return None
+    if ref.get("window"):
+        try:
+            tot = sum(float(out[i]["burden"][arm][ref["outcome"]]) for i in ids) / (ref["window"][1] - ref["window"][0])
+        except (KeyError, TypeError, ValueError):
+            return None
+    else:
+        tot = sum(out[i]["y"][arm][ref["outcome"]] for i in ids) / _years(A)
     if ref["measure"] == "rate":
         p = _pop(A, ids, ref["age_band"])
         return tot * ref["per"] / p if p > 0 else None
@@ -426,7 +488,10 @@ def verdict(row, th=None) -> str:
             return "invalid"
         return "within" if b[0] <= p / v <= b[1] else "outside"
     if tol.get("type") == "overlap":
-        return "within" if lo <= row["upper"] and hi >= row["lower"] else "outside"
+        rl, rh = _num(row.get("lower")), _num(row.get("upper"))
+        if rl is None or rh is None or row.get("interval", "published") != "published":
+            return "invalid"           # S2-5b: overlap needs a published interval
+        return "within" if lo <= rh and hi >= rl else "outside"
     return "invalid"
 
 
@@ -445,8 +510,8 @@ def compare(ref, point, draws, level=0.95) -> dict:
                            "interval_from": "draws" if ok and draws else "point", "note": src})
     v = ref["value"]
     row["ratio"] = point / v if ok and v > 0 else None
-    row["ratio_interval"] = [point / ref["upper"] if ok and ref["upper"] > 0 else None,
-                             point / ref["lower"] if ok and ref["lower"] > 0 else None]
+    row["ratio_interval"] = [point / ref["upper"] if ok and (ref["upper"] or 0) > 0 else None,
+                             point / ref["lower"] if ok and (ref["lower"] or 0) > 0 else None]
     row["status"] = verdict(row)
     return row
 
@@ -496,9 +561,13 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
     for r in refs:
         out = by_pop[r["age_band"]] if r["age_band"] else out0
         rows.append(compare(r, _value(A, cfg, r, out, arm), col.draws.get(r["id"]) or None, level))
-    t0, t1 = A.spec["objective"]["horizon"]
+    mw = model_window(A.spec)
+    t0, t1 = mw["window"] if mw else A.spec["objective"]["horizon"]
     cnt = {s: sum(x["status"] == s for x in rows) for s in STATUSES}
+    cnt["report_only"] = sum(x["role"] == "report_only" for x in rows)
     return {"arm": arm, "group_column": cfg["group"], "window": [t0, t1], "csv": cfg["csv"],
+            "window_from": "validation.burden.window" if mw else "the decision window",
+            "window_metrics": mw["metrics"] if mw else None,
             "provenance": provenance(A.spec, col.data),
             "draws": max((len(v) for v in col.draws.values()), default=0), "references": rows,
             "summary": dict(cnt, n=len(rows)), "daly_parts": daly_parts(A, cfg, arm, out0, by_pop, point),
@@ -512,7 +581,8 @@ def _f(kind, claim, key, declarable):
 
 
 META = ("group", "age_band", "outcome", "measure", "per", "year", "year_gap", "value", "lower", "upper", "kind",
-        "source", "source_id", "derived_from", "tolerance")
+        "source", "source_id", "derived_from", "tolerance", "role", "interval", "window")
+META_DEFAULT = {"role": "checked", "interval": "published", "window": None}     # S2-5b: artifacts written before it
 
 
 def findings(raw, data, expected=None) -> list[dict]:
@@ -537,14 +607,15 @@ def findings(raw, data, expected=None) -> list[dict]:
     extra = sorted({str(i) for i in ids if i not in exp or ids.count(i) > 1})
     out += [_f("burden_validation_unexpected", f"{F}: row {i} is not a declared reference, or appears twice",
                f"burden:{i}", False) for i in extra]
-    if not any(isinstance(r, dict) and r.get("kind") == "estimated" for r in rows):
-        out.append(_f("burden_validation_no_estimate", f"{F}: no estimated reference (reported values are information "
-                      "only, so nothing was validated)", "burden_validation", False))
+    if not any(isinstance(r, dict) and r.get("kind") == "estimated" and r.get("role", "checked") == "checked"
+               for r in rows):
+        out.append(_f("burden_validation_no_estimate", f"{F}: no checked estimated reference (reported values and "
+                      "report-only rows are never judged, so nothing was validated)", "burden_validation", False))
     for r in rows:
         rid = str((r or {}).get("id")) if isinstance(r, dict) else None
         if rid is None or rid in extra or rid not in exp:
             continue
-        diff = [k for k in META if r.get(k) != exp[rid].get(k)]
+        diff = [k for k in META if r.get(k, META_DEFAULT.get(k)) != exp[rid].get(k, META_DEFAULT.get(k))]
         if diff:
             out.append(_f("burden_validation_inconsistent", f"{F}: reference {rid} differs from the declared file in "
                           f"{diff}", f"burden:{rid}", False))
@@ -556,13 +627,14 @@ def findings(raw, data, expected=None) -> list[dict]:
         elif want == "unmatched":
             out.append(_f("burden_reference_unmatched", f"{F}: reference {rid} ({r.get('group')}) has no model value",
                           f"burden:{rid}", False))
-        elif want == "outside":
+        elif want == "outside" and r.get("role", "checked") == "checked":     # S2-5b: report-only rows never are
             m = r["model"]
+            iv = (f"{r['lower']:.4g}-{r['upper']:.4g}" if r.get("interval", "published") == "published"
+                  else "no published interval")
             out.append(_f("burden_outside_tolerance", (
                 f"{r['outcome']} in {r['group']}{' ages ' + r['age_band'] if r.get('age_band') else ''}: model "
                 f"{m['point']:.4g} ({m['low']:.4g}-{m['high']:.4g}) against the {r['kind']} {r['value']:.4g} "
-                f"({r['lower']:.4g}-{r['upper']:.4g}, {r['source']}); outside its {r['tolerance']['type']} tolerance"),
-                f"burden:{rid}", True))
+                f"({iv}, {r['source']}); outside its {r['tolerance']['type']} tolerance"), f"burden:{rid}", True))
     return out
 
 
@@ -575,9 +647,10 @@ def claims(c, art, data) -> list[dict]:
                c(f"{k}.model_low", "scalar", art, f"{f}.model.low", r["outcome"]),
                c(f"{k}.model_high", "scalar", art, f"{f}.model.high", r["outcome"]),
                c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
-               c(f"{k}.lower", "scalar", art, f"{f}.lower", r["outcome"]),
-               c(f"{k}.upper", "scalar", art, f"{f}.upper", r["outcome"]),
-               c(f"{k}.status", "label", art, f"{f}.status")]
+               c(f"{k}.status", "label", art, f"{f}.status"), c(f"{k}.role", "label", art, f"{f}.role")]
+        if r.get("interval", "published") == "published":
+            cl += [c(f"{k}.lower", "scalar", art, f"{f}.lower", r["outcome"]),
+                   c(f"{k}.upper", "scalar", art, f"{f}.upper", r["outcome"])]
         if r.get("ratio") is not None:
             cl.append(c(f"{k}.ratio", "scalar", art, f"{f}.ratio", "ratio"))
     dp = data["daly_parts"]
@@ -591,8 +664,11 @@ def results_lines(data) -> list[str]:
     t0, t1 = data["window"]
     L = ["## Absolute burden against external estimates", "",
          f"The {data['arm']} arm's annual mean over {t0:g}-{t1:g}, by {data['group_column']}, against each reference "
-         f"for its year (`validation.burden`). Within: {data['summary']['within']}; outside: "
-         f"{data['summary']['outside']}; reported values shown for information only: {data['summary']['information']}.",
+         f"for its year (`validation.burden`; the window is {data.get('window_from', 'the decision window')}). "
+         f"Within: {data['summary']['within']}; outside: {data['summary']['outside']}; reported values shown for "
+         f"information only: {data['summary']['information']}. Rows marked report only are computed and shown "
+         f"beside the checked rows and are never a finding: "
+         f"{', '.join(r['id'] for r in data['references'] if r.get('role') == 'report_only') or 'none'}.",
          "", "| Reference | Group | Ages | Outcome | Year | Model | Model interval | Reference (interval) | Ratio | Kind "
          "| Tolerance | Status |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in data["references"]:
@@ -600,12 +676,18 @@ def results_lines(data) -> list[str]:
         unit = f" per {r['per']:g}" if r["measure"] == "rate" else ""
         L.append(f"| {r['id']} ({r['source']}; {r['source_id']}) | {r['group']} | {r['age_band'] or 'all'} | {r['outcome']}{unit} | "
                  f"{r['year']:g} | [CLAIM:{k}.model] | [CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] "
-                 f"({r['model']['interval_from']}) | [CLAIM:{k}.value] ([CLAIM:{k}.lower] to [CLAIM:{k}.upper]) | "
+                 f"({r['model']['interval_from']}) | [CLAIM:{k}.value] "
+                 + (f"([CLAIM:{k}.lower] to [CLAIM:{k}.upper])" if r.get("interval", "published") == "published"
+                    else "(no published interval)") + " | "
                  + (f"[CLAIM:{k}.ratio]" if r.get("ratio") is not None else "n/a") + f" | {r['kind']} | "
                  + (f"ratio {tol['ratio_band'][0]:g} to {tol['ratio_band'][1]:g}" if tol["type"] == "ratio"
-                    else "intervals overlap") + f" | [CLAIM:{k}.status] |")
+                    else "intervals overlap") + f" | [CLAIM:{k}.status]"
+                 + (" (report only)" if r.get("role") == "report_only" else "") + " |")
     pts = sorted({r["model"]["note"] for r in data["references"] if r["model"]["interval_from"] == "point"})
     L += [""] + [f"Model interval from {p}." for p in pts]
+    if data.get("window_metrics"):
+        L.append("Model values over the window are the engine's window metrics (per person over the window, times "
+                 "the population): " + ", ".join(f"{o} from {m}" for o, m in data["window_metrics"].items()) + ".")
     dp = data["daly_parts"]
     s = []
     if dp.get("deaths_share_of_dalys") is not None:
@@ -1044,11 +1126,14 @@ def _self_test_s25b(ok, th):
             return sp
         row = lambda yr=1, rest="estimated,s,ratio,,,WMR-X,,,", band="", lo="80,130": (  # noqa: E731
             f"a,*,{band},cases,count,,{yr},100,{lo},{rest}")
-        sw, s0 = spec([row()], W), spec([row()], {})
-        (rw, bw), (r0, b0) = load_references(sw), load_references(s0)
+        sw = spec([row()], W)
+        rw, bw = load_references(sw)
+        s0 = spec([row(9)], {})
+        r0, b0 = load_references(s0)
         ok(bw == [] and rw[0].get("window") == [0.0, 2.0] and B.windows(sw).get(WINDOW) == [0.0, 2.0],
            f"BV30 a model window inside the horizon validates and reaches the engine windows: {bw}")
-        ok(any("years from" in x for x in b0) and any("years from" in x for x in load_references(spec([row(9)], W))[1]),
+        ok(any("years from" in x for x in load_references(spec([row()], {}))[1])
+           and any("years from" in x for x in load_references(spec([row(9)], W))[1]),
            "BV30 the year gap is measured from the model window when one is declared, else the decision window")
         for name, blk, lines, needle in (
                 ("a window outside the horizon", dict(W, window=[-1, 2]), [row()], "window"),
@@ -1062,7 +1147,7 @@ def _self_test_s25b(ok, th):
                 ("bounds with the flag none", {}, [row(9, "estimated,s,ratio,,,WMR-X,,,none")], "interval"),
                 ("overlap with no published interval", {}, [row(9, "estimated,s,overlap,,,WMR-X,,,none", lo=",")],
                  "overlap"),
-                ("only report-only rows", {}, [row(9, "estimated,s,ratio,,,WMR-X,,report_only,")], "no checked")):
+                ("only report-only rows", {}, [row(9, "estimated,s,ratio,,,WMR-X,,report_only,")], "checked rows")):
             got = load_references(spec(lines, blk))[1]
             ok(any(needle in x for x in got), f"BV31 the contract refuses {name}: {got}")
         # the arm's past (1 per person-year) differs from its future (3): the model value is the past window's mean

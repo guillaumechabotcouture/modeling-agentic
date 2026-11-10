@@ -1058,7 +1058,8 @@ def fig_burden_validation(R, t):
         b = (r.get("tolerance") or {}).get("ratio_band")
         for x in b or []:
             ax.plot([x, x], [y - 0.3, y + 0.3], color=t["ink2"], lw=1)
-        ax.text(1.02, y, r["status"], transform=ax.get_yaxis_transform(), va="center", fontsize=7.5, color=t["ink"])
+        ax.text(1.02, y, r["status"] + (" (report only)" if r.get("role") == "report_only" else ""),
+                transform=ax.get_yaxis_transform(), va="center", fontsize=7.5, color=t["ink"])
         rows.append({"reference": r["id"], "group": r["group"], "age_band": r.get("age_band") or "all",
                      "outcome": r["outcome"], "year": r["year"], "kind": r["kind"], "model": m.get("point"),
                      "model_low": m.get("low"), "model_high": m.get("high"), "value": v, "lower": r["lower"],
