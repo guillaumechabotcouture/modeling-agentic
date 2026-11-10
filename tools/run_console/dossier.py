@@ -1102,7 +1102,8 @@ def _node(node: str, tail: str):
         "globalThis.setTimeout = () => 0;\nglobalThis.fetch = () => new Promise(() => {});\n")
     js = open(os.path.join(HERE, "run_console.js"), encoding="utf-8").read() + "\n" + open(JS, encoding="utf-8").read()
     glossary = json.dumps({k: {"text": v[0], "source": v[1]} for k, v in RC.GLOSSARY.items()})
-    return subprocess.run([node, "-e", stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n" + tail],
+    # on stdin, not as a `-e` argument: Linux caps one argument at 128 KiB and the page scripts are near it
+    return subprocess.run([node, "-"], input=stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n" + tail,
                           capture_output=True, text=True, timeout=60)
 
 
