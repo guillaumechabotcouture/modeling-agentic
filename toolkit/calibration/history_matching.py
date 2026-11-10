@@ -3089,6 +3089,23 @@ def _self_test() -> int:
             ok(any("change" in b for b in P.problems()), f"HM43e refused: {why} ({P.problems()})")
     safe(hm43, "HM43")
 
+    def hm44():          # Codex r1 P2-1, P2-6: group run noise on the aggregate's scale; ratio and text on one scale
+        g = lambda i, ob, ws: Target(i, "group", ob, 5.0, "log", sd_obs=0.01, weights=ws, source="t")  # noqa: E731
+        ws = {"u0": 1.0, "u1": 1.0}
+        tg = {"A": g("A", "w0", ws), "B": g("B", "w1", ws)}
+        y = {("u0", "w0"): math.log(1.0), ("u1", "w0"): math.log(9.0), ("u0", "w1"): math.log(9.0),
+             ("u1", "w1"): math.log(1.0)}
+        v = change_run_var([{"from": "A", "to": "B", "w": 1.0}], tg, {"w0": 0.01, "w1": 0.01}, {("w0", "w1"): 0.0}, y)
+        ok(abs(v - 0.0128) < 1e-4, f"HM44a members' paired noise through the log aggregate (0.0128, got {v:.5f})")
+        L = lambda i, ob, u, x: Target(i, "unit", ob, x, "log", sd_obs=0.01, unit=u, source="t")  # noqa: E731
+        tl = {"a0": L("a0", "w0", "u0", 1.0), "b0": L("b0", "w1", "u0", 2.0), "a1": L("a1", "w0", "u1", 100.0),
+              "b1": L("b1", "w1", "u1", 50.0)}
+        terms = [{"from": "a0", "to": "b0", "w": 0.5}, {"from": "a1", "to": "b1", "w": 0.5}]
+        x = change_stats(terms, tl, {k: math.log(t.value) for k, t in tl.items()}, 0.0, z_max=3.0)
+        ok(x["ratio"] is not None and abs(x["ratio"] - 1.0) < 1e-9 and "within its error" not in x["text"],
+           f"HM44b a natural-scale change of -24.5 is not called within its error of zero ({x.get('text')})")
+    safe(hm44, "HM44")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

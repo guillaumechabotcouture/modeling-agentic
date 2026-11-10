@@ -1797,6 +1797,34 @@ def _self_test() -> int:
            f"JA17d not computable is recorded; a finding only when the spec asks for the diagnostic ({f0}, {f1})")
     safe(ja17, "JA17")
 
+    def ja18():          # Codex r1 P2-2 to P2-5: groups, weights and gate arithmetic, fail closed
+        class T_:
+            def __init__(self, i):
+                self.id, self.kind = i, "group"
+        j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
+                          "key": {"csv": "g", "units": "g"}, "weights": "pop"},
+                         {"id": "b", "kind": "group", "survey": "s", "window": [2, 3], "metric": "m",
+                          "key": {"csv": "g", "units": "g"}, "weights": "pop"}]}
+        rows = {"1": {"g": "G", "pop": "1"}, "2": {"g": "H", "pop": "1"}}
+        got = {c.get("group"): c for c in change_pairs(j, rows, ["1", "2"], [T_("a:G"), T_("b:G")], None)}
+        ok(set(got) == {"G", "H"} and "not_computable" in got["H"],
+           f"JA18a a group of the units table absent from both rounds is not computable, not dropped ({got})")
+        ju = {"targets": [{"id": "a", "kind": "unit", "survey": "s", "window": [1, 2], "metric": "m", "column": "x"},
+                          {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "y"}],
+              "changes": {"weights": "pop", "by": "g"}}
+        for bad_w in ("nan", "-5"):
+            rows = {"1": {"g": "G", "pop": "1"}, "2": {"g": "G", "pop": bad_w}}
+            got = change_pairs(ju, rows, ["1", "2"], [], None)
+            ok(len(got) == 1 and "not_computable" in got[0], f"JA18b a weight of {bad_w} is not computable ({got})")
+        pair = {"id": "p", "survey": "s", "group": "G", "from": "a", "to": "b", "observed": 0.0, "modelled": 10.0,
+                "difference": 0.0, "sd": 0.1, "z": 0.0, "flagged": False, "text": "t"}
+        raw = {"calibration": {"joint": {"changes": {}}}}
+        f1 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [pair]}})
+        f2 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": []}})
+        ok(len(f1) == 1 and not f1[0]["scope_declarable"] and len(f2) == 1 and not f2[0]["scope_declarable"],
+           f"JA18c a difference that is not modelled - observed, and an empty record, are findings ({f1}, {f2})")
+    safe(ja18, "JA18")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
