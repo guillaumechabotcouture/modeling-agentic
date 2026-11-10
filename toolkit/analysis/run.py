@@ -1298,7 +1298,7 @@ def _self_test_priors(ok, q):
            f"{rec['statement']}")
         err = M.error
         npk = len(M.packages) - 1
-        red = [c for c in (err.cols if err else []) if len(c) == 3 and c[0] != "bw"]
+        red = [c for c in (err.cols if err else []) if len(c) == 3]
         ok(err is not None and len(red) == len(M.pops) * len(M.outcomes) * npk and {c[1] for c in red} == set(M.outcomes)
            and {c for c in err.cols if c[:2] == ("emu", "base")} == {("emu", "base", P, o) for P in M.pops
                                                                     for o in M.outcomes}
@@ -1565,7 +1565,7 @@ def _self_test_burden_e2e(ok, d, q):
     a, b, c = (M.predict(zs, A.theta0, A.ids, noise=None if s is None else np.random.default_rng(s))
                for s in (1, 2, None))
     w = lambda o: [o[i]["burden"]["none"]["cases"] for i in A.ids]  # noqa: E731
-    ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("bw", "cases", "all") in M.error.col,
+    ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("emu", "bw", "cases", "all") in M.error.col,
        "BE9 a draw with the emulator error moves the window values (a column of the error model)")
     saved = M.pops          # Codex S2-5b r3 P1: by_population() predicts with a subset of the population groups
     try:

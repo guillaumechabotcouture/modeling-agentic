@@ -670,6 +670,12 @@ def _self_test() -> int:
         ok(False, "ME9 two residual columns with one key are refused")
     except ValueError:
         ok(True, "ME9 two residual columns with one key are refused")
+    # ME10 Codex r2: a population group named bw is a reduction column, never a burden-window one
+    s10 = EmulatorError([("bw", "o", "k"), ("emu", "base", "bw", "o"), ("emu", "bw", "o", "bw")],
+                        [[0, 0, 1], [1, 2, 0], [2, 4, 1]]).summary()
+    ok(s10["columns_by_quantity"] == {"reduction": 1, "comparator": 1, "burden_window": 1}
+       and abs(s10["comparator_reduction_corr_median"] - 1) < 1e-12,
+       f"ME10 every quantity has its own key namespace, whatever the group names ({s10['columns_by_quantity']})")
     _self_test_emulator(ok)
     # MD1-MD2: the direct model batches an engine that declares batch_equals_run, with the same outcomes
     import tempfile
