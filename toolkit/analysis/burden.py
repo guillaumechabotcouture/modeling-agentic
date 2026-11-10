@@ -1088,6 +1088,10 @@ def _self_test() -> int:
                     {"averted": {"dalys": 90.0, "deaths": 3.0}})
     ok(abs(dp["deaths_share_of_dalys"] - 0.5) < 1e-12 and abs(dp["dalys_averted_per_death_averted"] - 30) < 1e-12,
        f"BV16 share of DALYs from deaths and DALYs averted per death averted: {dp}")
+    dpw = daly_parts(_A, {"daly_parts": {"yll_per_death": {"all": "le"}}, "window": [0, 2]}, "none", out, {},
+                     {"averted": {"dalys": 90.0, "deaths": 3.0}})
+    ok("decision window" in dpw["statement"] and "not the model window" in dpw["statement"],
+       f"BV38 (Codex S2-5b r2 P2) with a model window the DALY parts say they are over the decision window: {dpw}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1106,7 +1110,7 @@ class _StepEngine:
     def describe(self):
         from toolkit.engines.contract import EngineCard
         return EngineCard("step", "1", ["step rate"], {"a": [0, 1], "b": [0, 1]}, {"x": "unused"},
-                          {"per_capita": ["cases", "dalys"], "windows": ["events"], "cost_drivers": []}, ["all"], {})
+                          {"per_capita": ["cases", "dalys"], "windows": ["events", "events2"], "cost_drivers": []}, ["all"], {})
 
     def parameters(self):
         return []
@@ -1115,7 +1119,7 @@ class _StepEngine:
         from toolkit.engines.contract import Outcomes
         v = self._f(*horizon.window)
         return Outcomes({"cases": {"all": v}, "dalys": {"all": v}},
-                        {n: {"events": self._f(*w)} for n, w in (horizon.windows or {}).items()}, {},
+                        {n: {"events": self._f(*w), "events2": 2 * self._f(*w)} for n, w in (horizon.windows or {}).items()}, {},
                         {"age_shares": {"all": 1.0}})
 
 
@@ -1181,6 +1185,24 @@ def _self_test_s25b(ok, th):
            f"mean ({v0})")
         ok(_value(A, config(sw), rw[0], {i: {"y": out[i]["y"]} for i in A.ids}, "none") is None,
            "BV29 a windowed reference with no window output has no model value (fails closed as unmatched)")
+        # Codex S2-5b r2 P1: an all-ages window metric only with one population group spanning the engine's ages;
+        # else one metric per population group, weighted by that group's population (as the decision window is)
+        two = {"a": {"column": "pop", "age_groups": ["all"]}, "b": {"column": "elig", "age_groups": ["all"]}}
+        raw0["decision_units"]["populations"] = two
+        s2 = spec([row()], W)
+        b_str = load_references(s2)[1]
+        s2 = spec([row()], dict(W, window_metrics={"cases": {"a": "events", "b": "events2"}}))
+        r2, b_map = load_references(s2)
+        bad_map = load_references(spec([row()], dict(W, window_metrics={"cases": {"a": "events"}})))[1]
+        o2 = DirectModel(s2).predict(None, {}, A.ids)
+        A2 = types.SimpleNamespace(spec=s2, ids=A.ids, by_id=A.by_id)
+        v2 = _value(A2, config(s2), r2[0], o2, "none") if r2 else None
+        want2 = sum(float(u["pop"]) + 2 * float(u["elig"]) for u in sw.units())
+        ok(any("window_metrics" in x for x in b_str) and b_map == [] and any("window_metrics" in x for x in bad_map)
+           and v2 is not None and abs(v2 - want2) < 1e-9 * want2,
+           f"BV37 several population groups need a window metric each, weighted by their populations ({v2} vs "
+           f"{want2}): {b_str[:1]} {bad_map[:1]}")
+        raw0["decision_units"]["populations"] = rawT["decision_units"]["populations"]
         # Codex S2-5b r1 P1-2: the artifact's arm, window and window metrics are the signed spec's
         good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": "events"}}
         bf = [block_findings(sw, dict(good, **x)) for x in ({}, {"arm": "a"}, {"window": [8, 10]},
