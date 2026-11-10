@@ -1281,6 +1281,18 @@ def _self_test_s25b(ok, th):
         ok([x["kind"] for x in findings(sec, {"references": [dict(rows[0], role="checked"), rows[1]]}, refs)]
            == ["burden_validation_inconsistent", "burden_outside_tolerance"],
            "BV32 an artifact that changes a row's role is inconsistent")
+        um = compare(by["a"], None, None)
+        fu = findings(sec, {"references": [um, rows[1]]}, refs)
+        fc = findings(sec, {"references": [dict(um, role="checked", status="unmatched"), rows[1]]},
+                      [dict(by["a"], role="checked"), by["b"]])
+        du = {"window": [8, 10], "arm": "none", "group_column": "region", "references": [um, rows[1]],
+              "summary": {"within": 0, "outside": 1, "information": 0, "unmatched": 1, "n": 2},
+              "daly_parts": {"statement": "x"}}
+        ok(um["status"] == "unmatched" and [x["key"] for x in fu] == ["burden:b"]
+           and "burden_reference_unmatched" in {x["kind"] for x in fc}
+           and "no model value (unmatched): a" in "\n".join(results_lines(du)),
+           f"BV40 (Codex #173 P2) an unmatched report-only row is recorded, never a finding; a checked one still "
+           f"blocks: {[x['kind'] for x in fu]}")
         data = {"window": [8, 10], "arm": "none", "group_column": "region", "references": rows,
                 "summary": {"within": 0, "outside": 2, "information": 0, "unmatched": 0, "n": 2},
                 "daly_parts": {"statement": "x"}}
