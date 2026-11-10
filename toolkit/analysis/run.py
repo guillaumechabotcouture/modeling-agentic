@@ -335,6 +335,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
         point["headline_variant"] = A.headline_variant
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
+    bnd = None
+    if model.kind == "emulator":      # F6 S2-4b: the emulator's order near package switches, against engine runs
+        from toolkit.analysis import boundary as BD
+        bnd = BD.run(A, plan, z0, out0, ben0, cost0, design["horizon"], run_dir, compute_kw=kw, log=log)
+        arts["emulator_boundary"] = S.write("emulator_boundary", bnd, BD.PRODUCER, [arts["point"]] + (
+            [os.path.join(run_dir, BD.OUT_REL)] if bnd["units"] else []))
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
@@ -435,7 +441,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
-    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, pv=pv, burden=bvd)
+    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
+                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
@@ -443,7 +450,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
-    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else [])
+    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
+                              + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
@@ -527,6 +535,42 @@ def _self_test() -> int:
         from toolkit.engines.contract import engine_identity as _eid
         ok(pt.get("engine_identity") == _eid(spec.engine()),
            "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
+        # F6 S2-4b: ranking near package switches, against engine runs at the calibrated values
+        from toolkit.analysis import contract
+        bd = yaml.safe_load(open(os.path.join(d, R["artifacts"]["emulator_boundary"])))["data"]
+        ok(bd["status"] == "judged" and 0 < bd["units"] <= 20 and bd["units"] == len(bd["rows"])
+           and bd["matched"] == sum(r["match"] for r in bd["rows"])
+           and os.path.exists(os.path.join(d, "analysis", "boundary", "results.jsonl"))
+           and "Ranking near package switches" in open(os.path.join(d, "results.md")).read()
+           and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
+                    and f["kind"] != "emulator_boundary_ranking"],
+           f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
+        from toolkit.analysis.model import DirectModel
+        Ab, r0 = R["_A"], bd["rows"][0]
+        zb = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        saved_m = Ab.model
+        try:
+            Ab.model = DirectModel(Ab.spec, log=q)
+            _o, bb, cb = Ab.evaluate(Ab.theta0, zb, ids=[r0["unit"]])
+        finally:
+            Ab.model = saved_m
+        want = [bb[r0["unit"]][k] / cb[r0["unit"]][k] for k in (r0["chosen"], r0["runner_up"])]
+        got = [r0["engine"]["ratio_chosen"], r0["engine"]["ratio_runner_up"]]
+        ok(all(abs(g / w - 1) < 1e-9 for g, w in zip(got, want)),
+           f"BD-R2 the engine side equals the engine evaluated directly at the calibrated values ({got} vs {want})")
+        import shutil                     # Codex r1 P1-2: the signed evaluation mode requires the artifact
+        d3 = os.path.join(d, "..", os.path.basename(d) + "_nobd")
+        shutil.copytree(d, d3)
+        try:
+            mp3 = os.path.join(d3, "analysis", "manifest.json")
+            man3 = json.load(open(mp3))
+            man3["artifacts"] = {k: v for k, v in man3["artifacts"].items() if v.get("kind") != "emulator_boundary"}
+            man3["expected"]["kinds"] = [k for k in man3["expected"]["kinds"] if k != "emulator_boundary"]
+            json.dump(man3, open(mp3, "w"))
+            ok("emulator_boundary" in {f.get("key") for f in contract.gate_findings(d3)},
+               "BD-R3 an emulator-path run without the boundary artifact is a finding, whatever its manifest expects")
+        finally:
+            shutil.rmtree(d3, ignore_errors=True)
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
