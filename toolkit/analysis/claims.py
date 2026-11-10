@@ -204,14 +204,14 @@ def variant_claims(A, arts, pv) -> list[dict]:
             out += [_c(f"{c}.cost", "currency", arts["plan_variants"], f"{f}.cost", "USD"),
                     _c(f"{c}.budget_difference", "currency", arts["plan_variants"], f"{f}.cost_minus_budget", "USD"),
                     _c(f"{c}.ineligible", "count", arts["plan_variants"], f"{f}.units_ineligible", "units")]
-            un = v.get("uncertainty")
-            if un:
-                out += [_c(f"{c}.averted_median", "scalar", arts["plan_variants"],
-                           f"{f}.uncertainty.averted.{A.primary}.median", A.primary, interval=un["interval"]),
-                        _c(f"{c}.cost_median", "currency", arts["plan_variants"],
-                           f"{f}.uncertainty.affordability.fixed_plan_cost.median", "USD", interval=un["interval"]),
-                        _c(f"{c}.draws_over_budget", "count", arts["plan_variants"],
-                           f"{f}.uncertainty.affordability.draws_over_budget", "draws")]
+        un = v.get("uncertainty")       # a fixed plan's, and each solved variant's, outcome and cost over the draws
+        if un:
+            out += [_c(f"{c}.averted_median", "scalar", arts["plan_variants"],
+                       f"{f}.uncertainty.averted.{A.primary}.median", A.primary, interval=un["interval"]),
+                    _c(f"{c}.cost_median", "currency", arts["plan_variants"],
+                       f"{f}.uncertainty.affordability.fixed_plan_cost.median", "USD", interval=un["interval"]),
+                    _c(f"{c}.draws_over_budget", "count", arts["plan_variants"],
+                       f"{f}.uncertainty.affordability.draws_over_budget", "draws")]
     if pv:
         out.append(_c("variant.unconstrained.no_package", "count", arts["plan_variants"],
                       "data.unconstrained.units_no_package", "units"))
@@ -240,6 +240,18 @@ def variants_markdown(A, pv) -> str:
         L.append(f"| {v['id']} | {v['text']} | [CLAIM:{c}.value_lost] | "
                  + (f"[CLAIM:{c}.value_lost_pct]" if v.get("value_lost_pct") is not None else "n/a")
                  + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.reallocated] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
+    for v in pv["variants"]:        # each solved variant's cost over the uncertainty draws, against the budget
+        af = (v.get("uncertainty") or {}).get("affordability") or {}
+        if v.get("status") != "solved" or not af:
+            continue
+        c, rule = f"variant.{v['id']}", af.get("rule") or {}
+        L += ["", f"{v['id']} over the uncertainty draws: {A.primary} averted [CLAIM:{c}.averted_median], cost "
+              f"[CLAIM:{c}.cost_median], draws over budget [CLAIM:{c}.draws_over_budget] of {af.get('draws')}."
+              + ("" if af.get("rule_met") is None else
+                 f" The spec allows a plan to be over budget in at most {rule.get('max_share_over_budget')} of the "
+                 "draws: " + ("this variant meets that rule." if af["rule_met"] else
+                              "this variant does not meet that rule. It was solved within the budget planned for the "
+                              "headline plan and was not re-solved with a larger reserve."))]
     for v in pv["variants"]:        # F6 S2-6: a plan given in full, evaluated as given
         if v.get("status") != "evaluated":
             continue
