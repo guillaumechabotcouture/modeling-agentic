@@ -428,13 +428,16 @@ def _self_test() -> int:
         """Fake `run_cluster.py <cfg> <cmd>`: responses per command, each a (rc, out) or a callable."""
         def __init__(self, script, log):
             self.script, self.log, self.envs = {k: list(v) for k, v in script.items()}, log, []
+            self.tails, self.timeouts = [], []
 
-        def __call__(self, tail, env=None):
+        def __call__(self, tail, env=None, timeout=None):
             self.log.append(("run", tail[0]))
             self.envs.append(dict(env or {}))
+            self.tails.append(list(tail))
+            self.timeouts.append((tail[0], timeout))
             seq = self.script.get(tail[0]) or [(0, "")]
             r = seq.pop(0) if len(seq) > 1 else seq[0]
-            return r() if callable(r) else r
+            return r(tail) if callable(r) else r
 
     Api = lambda cfg, log, live=None: _FakeApi().bind(cfg, log, live or {})  # noqa: E731
 
@@ -451,7 +454,9 @@ def _self_test() -> int:
                   open(cfg.state_file, "w"))
 
     def collected(cfg, labels=None):
-        def go():
+        def go(tail):
+            if "--no-shutdown" not in tail:     # P1-1: `collect` without it shuts the clusters down by name
+                raise AssertionError(f"collect called without --no-shutdown: {tail}")
             for lb in labels or cfg.labels:
                 os.makedirs(os.path.join(cfg.out_dir, lb), exist_ok=True)
                 json.dump({"launch_id": "L1"}, open(os.path.join(cfg.out_dir, lb, "result.json"), "w"))
@@ -460,27 +465,33 @@ def _self_test() -> int:
 
     def watch(cfg, runner, api, **kw):
         clock, sleep = fake_time()
-        return Watch(cfg, "cfg.py", TOKEN, runner, api, clock, sleep, retry_s=1.0, **kw)
+        kw.setdefault("retry_s", 1.0)
+        return Watch(cfg, "cfg.py", TOKEN, runner, api, clock, sleep, **kw)
 
-    def scenario(launch_rc, rec, script=None, live=None, name="cfg-x", labels=("A", "B"), **kw):
-        """A full run of the watchdog against fakes: (exit code, call log, cfg, runner)."""
+    def scenario(launch_rc, rec, script=None, live=None, name="cfg-x", labels=("A", "B"), journal=(), **kw):
+        """A full run of the watchdog against fakes: (exit code, call log, cfg, runner, watch)."""
         tmp = tempfile.mkdtemp()
         cfg = cfg_of(tmp, name=name, labels=labels)
         log = []
         r = rec(cfg) if callable(rec) else rec
 
-        def launch():
+        def launch(tail):
             if r is not None:
                 write_record(cfg, r)
             write_assign(cfg)
-            return launch_rc, f"invocation {TOKEN}\n"
+            with open(os.path.join(cfg.out_dir, rc.JOURNAL), "a") as f:
+                for e in journal:
+                    f.write(json.dumps(e) + "\n")
+            return (None, "TimeoutError: launch did not return") if launch_rc is None else \
+                (launch_rc, f"invocation {TOKEN}\n")
         sc = {"launch": [launch], **(script(cfg) if script else {})}
         runner = Runner(sc, log)
         live = live if live is not None else ({v["id"]: v["name"] for v in r.values() if isinstance(v, dict)}
                                               if r else {})
         api = kw.pop("api", None)
         api = api.bind(cfg, log, live) if api is not None else Api(cfg, log, live=live)
-        return watch(cfg, runner, api, **kw).run(), log, cfg, runner
+        w = watch(cfg, runner, api, **kw)
+        return w.run(), log, cfg, runner, w
 
     def done_script(cfg):
         return {"status": [(0, status_text(cfg, {lb: "done" for lb in cfg.labels}))], "collect": [collected(cfg)]}
@@ -552,12 +563,13 @@ def _self_test() -> int:
     case("LW2f", "a collected copy from an earlier launch (other launch_id) does not count",
          lambda: (lambda r: r[0] == EXIT_UNCONFIRMED)(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done", "B": "done"}))],
-                                              "collect": [lambda: (collected(cfg)(), [json.dump(
+                                              "collect": [lambda t: (collected(cfg)(t), [json.dump(
                                                   {"launch_id": "L0"}, open(os.path.join(cfg.out_dir, lb,
                                                                                          "result.json"), "w"))
                                                   for lb in cfg.labels], (0, ""))[-1]]})))
-    case("LW2g", "run cluster stopped by itself: collect from storage, confirm, exit 0; never `shutdown` by name",
-         lambda: (lambda r: r[0] == EXIT_DONE and "shutdown" not in runs(r[1]) and "collect" in runs(r[1]))(
+    case("LW2g", "run cluster stopped by itself: collect --no-shutdown, confirm, exit 0; never `shutdown` by name",
+         lambda: (lambda r: r[0] == EXIT_DONE and "shutdown" not in runs(r[1]) and "collect" in runs(r[1])
+                  and all("--no-shutdown" in t for t in r[3].tails if t[0] == "collect"))(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {}, cluster="stopped"))],
                                               "collect": [collected(cfg)]}, live={})))
     case("LW2h", "collected but a cluster stays live after the stop requests: exit 5",
@@ -566,7 +578,7 @@ def _self_test() -> int:
 
     # 3. credit cap
     case("LW3a", "projected_credits: billed plus live instances x hours x rate",
-         lambda: abs(projected_credits(100.0, ["run", "keeper"], {"run": 4, "keeper": 2}, 2.0, 8.0) - 196.0) < 1e-9)
+         lambda: abs(projected_credits(100.0, [4, 2], 2.0, 8.0) - 196.0) < 1e-9)
     case("LW3b", "at the cap: a collect is attempted, then every live recorded cluster is stopped by id, exit 3",
          lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102]
                   and r[1].index(("run", "collect")) < r[1].index(next(x for x in r[1] if x[0] == "stop")))(
@@ -575,24 +587,6 @@ def _self_test() -> int:
                       api=_Billed(700.0))))
     case("LW3c", "below the cap the watch goes on (billing by recorded id only)",
          lambda: (lambda r: r[0] == EXIT_DONE)(scenario(0, record, done_script, cap=650.0, api=_Billed(10.0))))
-
-    # 4. stray sweep
-    t0 = rc._ts("2026-11-10T00:00:00Z")
-    items = [{"name": "n", "id": 1, "current_state": {"state": "running"}, "created": "2026-11-10T00:05:00Z"},
-             {"name": "n", "id": 2, "current_state": {"state": "running"}, "created": "2026-11-10T00:05:00Z"},
-             {"name": "n", "id": 3, "current_state": {"state": "running"}, "created": "2026-11-09T23:00:00Z"},
-             {"name": "n", "id": 4, "current_state": {"state": "stopped"}, "created": "2026-11-10T00:05:00Z"},
-             {"name": "other", "id": 5, "current_state": {"state": "running"}, "created": "2026-11-10T00:05:00Z"},
-             {"name": "n", "id": 6, "current_state": {"state": "running"}, "created": "garbage"}]
-    case("LW4a", "strays: live, this launch's name, unrecorded, created after the launch; nothing else",
-         lambda: strays(items, {"n"}, {2}, t0) == [("n", 1)])
-    case("LW4b", "watch: a stray is stopped by id only on its second sighting; recorded ids are not",
-         lambda: (lambda r: 999 in stops(r[1]) and r[1].index(("run", "status")) < r[1].index(("stop", 999))
-                  < r[1].index(("run", "collect")) and runs(r[1]).count("status") == 3)(
-             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"})),
-                                                         (0, status_text(cfg, {"A": "running", "B": "running"})),
-                                                         (0, status_text(cfg, {"A": "done", "B": "done"}))],
-                                              "collect": [collected(cfg)]}, api=_Stray())))
 
     # 5. cloud-side limits
     case("LW5a", "refuse a config with run_timeout_hours None or cluster_timeout empty; the override allows it",
@@ -651,6 +645,112 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_DONE and stops(r[1]) == [100, 101, 102])(
              scenario(0, record, done_script, name="other-run", labels=("X1", "X2", "X3"))))
 
+    # Codex round 1 on the launch watch
+    # P1-2: a stray is stopped only when this invocation's construction journal names its id
+    J = [{"inv": TOKEN, "name": "n", "id": 1, "status": "created", "seq": "a"},
+         {"inv": "other", "name": "n", "id": 8, "status": "created", "seq": "b"},
+         {"inv": TOKEN, "name": "n", "id": 7, "status": "attached", "seq": "c"},
+         {"inv": TOKEN, "name": "n", "status": "constructing", "seq": "d", "t": 0}]
+    run_ = lambda i, n="n", st="running": {"name": n, "id": i, "current_state": {"state": st},  # noqa: E731
+                                           "created": "2026-11-10T00:05:00Z"}
+    items = [run_(1), run_(2), run_(4, st="stopped"), run_(5, "other"), run_(7), run_(8)]
+    case("LW9a", "journal_ids: only ids this token's journal records as created",
+         lambda: journal_ids(J, TOKEN) == {1})
+    case("LW9b", "strays: journal-attributed -> stop; same name, unattributed -> report only; recorded/stopped/other "
+         "names -> neither", lambda: strays(items, {"n"}, {2}, {1}) == {"stop": [("n", 1)], "report": [("n", 7),
+                                                                                                        ("n", 8)]})
+    case("LW9c", "watch: a journal-attributed stray is stopped by id on its second sighting",
+         lambda: (lambda r: 999 in stops(r[1]) and r[1].index(("run", "status")) < r[1].index(("stop", 999))
+                  < r[1].index(("run", "collect")))(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"})),
+                                                         (0, status_text(cfg, {"A": "running", "B": "running"})),
+                                                         (0, status_text(cfg, {"A": "done", "B": "done"}))],
+                                              "collect": [collected(cfg)]}, api=_Stray(),
+                      journal=[{"inv": TOKEN, "name": "k", "id": 999, "status": "created", "seq": "x"}])))
+    case("LW9d", "a later cluster of the run's name from another invocation is never stopped (sweep, stop_all)",
+         lambda: (lambda r: r[0] == EXIT_DONE and 888 not in stops(r[1]) and stops(r[1]) == [100, 101, 102])(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"})),
+                                                         (0, status_text(cfg, {"A": "running", "B": "running"})),
+                                                         (0, status_text(cfg, {"A": "done", "B": "done"}))],
+                                              "collect": [collected(cfg)]}, api=_Foreign(),
+                      journal=[{"inv": "other", "name": "x", "id": 888, "status": "created", "seq": "y"}])))
+    case("LW9e", "at the cap the foreign cluster is not stopped either",
+         lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102])(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"}))]},
+                      api=_Foreign(700.0))))
+
+    # P1-3: live instance counts from the Coiled API, else the configured maximum (never compute_start)
+    det = {"scheduler": {"current_state": {"state": "started"}},
+           "workers": [{"current_state": {"state": "ready"}}, {"current_state": {"state": "started"}},
+                       {"current_state": {"state": "stopped"}}]}
+    case("LW10a", "instance_count: the live scheduler and workers of a cluster's details; unreadable -> None",
+         lambda: instance_count(det) == 3 and instance_count(None) is None and instance_count({"workers": "x"}) is None)
+
+    def credits_case(counts, want):
+        tmp, log = tempfile.mkdtemp(), []
+        cfg = cfg_of(tmp, compute_start=5, compute_max=24)
+        rec = record(cfg)
+        api = _Counted(counts).bind(cfg, log, {v["id"]: v["name"] for v in recorded(rec).values()})
+        w = watch(cfg, Runner({}, log), api)
+        return w.credits(rec, api.list_clusters()) == want
+    case("LW10b", "credits: an autoscaled run cluster's live count from the API (12), overflow at its maximum",
+         lambda: credits_case({100: 12, 102: 2}, round((12 + 25 + 2) * 8 / 6, 1)))
+    case("LW10c", "credits: no count from the API -> configured maxima (1+labels+compute_max, 1+overflow_max, 2)",
+         lambda: credits_case({}, round((27 + 25 + 2) * 8 / 6, 1)))
+
+    # P1-4: the emergency collect at the cap is one bounded attempt; cap and limit checked between collect retries
+    case("LW11a", "at the cap: one collect with the short deadline, then the stops even when it times out",
+         lambda: (lambda r: r[0] == EXIT_CAP and runs(r[1]).count("collect") == 1
+                  and ("collect", 600.0) in r[3].timeouts and sorted(stops(r[1])) == [100, 101, 102])(
+             scenario(0, record, lambda cfg: {"collect": [(None, "TimeoutError: collect")]}, api=_Billed(700.0))))
+    case("LW11b", "the cap is reached between collect retries: exit 3 with the stops, retries cut short",
+         lambda: (lambda r: r[0] == EXIT_CAP and runs(r[1]).count("collect") < 6 and stops(r[1]))(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done:None", "B": "done:None"}))],
+                                              "collect": [(0, "A: still running")]}, api=_Growing())))
+    case("LW11c", "--max-hours is reached between collect retries: exit 6, nothing stopped",
+         lambda: (lambda r: r[0] == EXIT_LIMIT and stops(r[1]) == [] and runs(r[1]).count("collect") < 6)(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done:None", "B": "done:None"}))],
+                                              "collect": [(0, "A: still running")]}, max_hours=0.1, retry_s=600.0)))
+
+    # P2-5: a relaunch counts only when accepted (exit 0 or 4); bounded attempts
+    miss = lambda cfg: {"status": [(0, status_text(cfg, {"A": "missing", "B": "running"}))]}  # noqa: E731
+    case("LW12a", "relaunch refused, then accepted: two attempts, then exit 2",
+         lambda: (lambda r: r[0] == EXIT_NEVER_RAN and runs(r[1]).count("relaunch") == 2 and stops(r[1]) == [])(
+             scenario(0, record, lambda cfg: {**miss(cfg), "relaunch": [(2, "refusing: queued"), (0, "")]})))
+    case("LW12b", "relaunch never accepted (network, refused): bounded at 3 attempts, then exit 2",
+         lambda: (lambda r: r[0] == EXIT_NEVER_RAN and runs(r[1]).count("relaunch") == 3 and stops(r[1]) == [])(
+             scenario(0, record, lambda cfg: {**miss(cfg), "relaunch": [(2, "refusing: still running")]},
+                      relaunch_attempts=3)))
+
+    # P2-6: the launch has a deadline; past it, it is treated as exit 4
+    case("LW13a", "launch past its deadline: watched like exit 4 (nothing stopped before collect)",
+         lambda: (lambda r: r[0] == EXIT_DONE and ("launch", 2700.0) in r[3].timeouts
+                  and r[1].index(("run", "collect")) < r[1].index(("stop", 100)))(
+             scenario(None, record, done_script)))
+
+    def deadline_case():
+        import time as _t
+        run = shell_runner("cfg.py", prefix=[sys.executable, "-c",
+                                             "import time; print('hello', flush=True); time.sleep(60)"])
+        t0 = _t.time()
+        code, out = run(["launch"], None, timeout=1.0)
+        return code is None and "hello" in out and _t.time() - t0 < 20
+    case("LW13b", "shell_runner: a launch past its deadline is terminated and reaped, its output kept", deadline_case)
+
+    # P2-7: before an exit that leaves clusters up, every live cluster of the launch's names and its ownership
+    case("LW14a", "exit 4: leftovers listed as recorded / journal / unknown; nothing extra stopped",
+         lambda: (lambda r: r[0] == EXIT_UNCONFIRMED and stops(r[1]) == []
+                  and sorted(r[4].leftovers) == sorted([(r[2].name, 100, "recorded"), (r[2].overflow_name, 101,
+                                                        "recorded"), (r[2].keeper_name, 102, "recorded"),
+                                                        (r[2].keeper_name, 999, "journal"), (r[2].name, 888, "unknown")]))(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done:None", "B": "done:None"}))],
+                                              "collect": [(0, "A: still running")]}, api=_Both(),
+                      journal=[{"inv": TOKEN, "name": "k", "id": 999, "status": "created", "seq": "x"}])))
+    case("LW14b", "exits 2 and 6 also report the leftovers",
+         lambda: all(r[4].leftovers for r in (scenario(0, record, miss),
+                                               scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError")]},
+                                                        max_hours=0.5))))
+
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed: {', '.join(fails)}")
         return 1
@@ -680,6 +780,9 @@ class _FakeApi:
         self.log.append(("billing",))
         return []
 
+    def instances(self, cid):
+        return None
+
 
 class _Sticky(_FakeApi):
     def stop(self, name, cid, why):
@@ -700,6 +803,43 @@ class _Billed(_FakeApi):
 class _Stray(_FakeApi):
     def bind(self, cfg, log, live):
         return super().bind(cfg, log, {**live, 999: cfg.keeper_name})   # created 00:00:05, after the launch
+
+
+class _Foreign(_Billed):
+    """A later cluster of the run's own name, created after the launch by another invocation."""
+    def __init__(self, credits=0.0):
+        super().__init__(credits)
+
+    def bind(self, cfg, log, live):
+        return super().bind(cfg, log, {**live, 888: cfg.name})
+
+
+class _Both(_FakeApi):
+    def bind(self, cfg, log, live):
+        return super().bind(cfg, log, {**live, 888: cfg.name, 999: cfg.keeper_name})
+
+
+class _Counted(_FakeApi):
+    def __init__(self, counts):
+        super().__init__()
+        self.counts = counts
+
+    def instances(self, cid):
+        if cid not in self.counts:
+            raise OSError("cluster details unavailable")
+        return self.counts[cid]
+
+
+class _Growing(_Billed):
+    """Billed credits that pass the cap after the first reading."""
+    def __init__(self):
+        super().__init__(0.0)
+        self.n = 0
+
+    def billing(self, start, end):
+        self.n += 1
+        self.credits = 0.0 if self.n == 1 else 700.0
+        return super().billing(start, end)
 
 
 class _Failing(_FakeApi):

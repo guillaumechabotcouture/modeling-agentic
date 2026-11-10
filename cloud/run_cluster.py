@@ -3432,6 +3432,28 @@ def _self_test_pipeline(ok, tb) -> None:
        "RP14 the launch commit is read from the archive itself (the commit that ships, not HEAD later)")
 
 
+def _self_test_collect_no_shutdown(ok) -> None:
+    """Codex round 1 on the launch watch (P1-1): `collect --no-shutdown` leaves stopping to the caller (the watch
+    stops by verified id); plain `collect` still shuts down once every run is collected, as before."""
+    import tempfile
+    from unittest import mock
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='cn', question_file='q', labels=('A',), out_dir={tmp!r}, "
+                          f"tree={os.path.dirname(HERE)!r})\n")
+    json.dump({"A": {"launch_id": "L1", "worker": "w"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    for extra, want, cid in (([], 1, "CN1 `collect` shuts down after collecting every run (default, unchanged)"),
+                             (["--no-shutdown"], 0, "CN2 `collect --no-shutdown` collects and never shuts down")):
+        downs = []
+        with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True,
+                                         "collect_from_storage": lambda *a, **k: {"exit_code": 0, "duration_s": 1},
+                                         "shutdown": lambda c: downs.append(c.name)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc_ = main(["run_cluster.py", path, "collect", *extra])
+        ok(rc_ == 0 and len(downs) == want, cid)
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3627,6 +3649,10 @@ def _self_test() -> int:
         _self_test_s18_smoke_a(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"A: {type(e).__name__}: {e}")
+    try:
+        _self_test_collect_no_shutdown(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CN: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
