@@ -702,10 +702,10 @@ def claims(c, art, data) -> list[dict]:
     cl = []
     for j, r in enumerate(data["references"]):
         f, k = f"data.references[{j}]", f"burden.{r['id']}"
-        cl += [c(f"{k}.model", "scalar", art, f"{f}.model.point", r["outcome"]),
-               c(f"{k}.model_low", "scalar", art, f"{f}.model.low", r["outcome"]),
-               c(f"{k}.model_high", "scalar", art, f"{f}.model.high", r["outcome"]),
-               c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
+        m = r.get("model") or {}       # Codex S2-5c P2: no claim for a missing model value or interval
+        cl += [c(f"{k}.{n}", "scalar", art, f"{f}.model.{q}", r["outcome"])
+               for n, q in (("model", "point"), ("model_low", "low"), ("model_high", "high")) if m.get(q) is not None]
+        cl += [c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
                c(f"{k}.status", "label", art, f"{f}.status"), c(f"{k}.role", "label", art, f"{f}.role")]
         if r.get("interval", "published") == "published":
             cl += [c(f"{k}.lower", "scalar", art, f"{f}.lower", r["outcome"]),
@@ -734,8 +734,10 @@ def results_lines(data) -> list[str]:
         k, tol = f"burden.{r['id']}", r["tolerance"]
         unit = f" per {r['per']:g}" if r["measure"] == "rate" else ""
         L.append(f"| {r['id']} ({r['source']}; {r['source_id']}) | {r['group']} | {r['age_band'] or 'all'} | {r['outcome']}{unit} | "
-                 f"{r['year']:g} | [CLAIM:{k}.model] | [CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] "
-                 f"({r['model']['interval_from']}) | [CLAIM:{k}.value] "
+                 f"{r['year']:g} | " + (f"[CLAIM:{k}.model]" if r["model"].get("point") is not None else "n/a")
+                 + " | " + (f"[CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] ({r['model']['interval_from']})"
+                            if None not in (r["model"].get("low"), r["model"].get("high")) else "no model interval")
+                 + f" | [CLAIM:{k}.value] "
                  + (f"([CLAIM:{k}.lower] to [CLAIM:{k}.upper])" if r.get("interval", "published") == "published"
                     else "(no published interval)") + " | "
                  + (f"[CLAIM:{k}.ratio]" if r.get("ratio") is not None else "n/a") + f" | {r['kind']} | "
