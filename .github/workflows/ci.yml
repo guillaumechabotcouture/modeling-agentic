@@ -52,7 +52,7 @@ jobs:
       - name: Self-tests, shard ${{ matrix.shard }} of 4 (every module with --self-test, found by scripts/self_tests.py)
         # --per-test-timeout: a hung self-test is killed with its process group, named, and failed;
         # the others still run (the job timeout above would cancel the whole step with no name).
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 900 --shard ${{ matrix.shard }}/4
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 1800 --shard ${{ matrix.shard }}/4
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"

@@ -126,13 +126,13 @@ def discover(repo: str = REPO):
     return classify(tracked_files(repo), file_has_marker(repo))
 
 
-PER_TEST_TIMEOUT_S = 15 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
+PER_TEST_TIMEOUT_S = 30 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
 
-# Seconds each slow self-test took on a CI runner (run 42734450748, 2026-11-10), for balancing shards only: a stale
+# Seconds each slow self-test took on a CI runner (run 42734450748, 2026-11-10; selftest_late.py from #179), for balancing shards only: a stale
 # or missing entry changes how evenly the shards finish, never which self-tests run. Others count DEFAULT_WEIGHT_S.
 WEIGHTS_S = {
     "agents/stage_machine.py": 511, "toolkit/engines/malaria/engine.py": 345,
-    "toolkit/engines/malaria/selftest_late.py": 288, "toolkit/analysis/observed_targets.py": 280,
+    "toolkit/engines/malaria/selftest_late.py": 870, "toolkit/analysis/observed_targets.py": 280,
     "toolkit/analysis/estimates.py": 272, "cloud/vm_job.py": 239, "scripts/compute.py": 237,
     "toolkit/analysis/calibration.py": 182, "toolkit/analysis/run.py": 176,
     "toolkit/calibration/history_matching.py": 81, "toolkit/analysis/joint_calibration.py": 46,
