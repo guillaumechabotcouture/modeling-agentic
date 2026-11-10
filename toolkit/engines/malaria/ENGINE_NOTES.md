@@ -1,12 +1,17 @@
-# Malaria engine v0.13: benchmark notes
+# Malaria engine v0.14: benchmark notes
 
-Engine `malaria-starsim` v0.13 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.14 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.14 numbers are v0.13's.** v0.14 adds window metrics for severe cases and deaths (section below), and changes no output v0.13 reports.
+- **Proof.** `benchmarks/restamp_proof.py` compared v0.13 (origin/v2 at 59471d5; the engine code is that of #172) and v0.14 (tree at 20fbb16). It found 24 of 24 cases identical, with the eight added window metrics left out of the new side only.
+- **Run.** It ran locally (Python 3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v014-2`).
+- **Evidence.** The identity fields of the four evidence files were then re-stamped. Their `validate_once.sh` confirmation is pending.
 
 **v0.13 numbers are v0.12's.** v0.13 adds a past SMC coverage, `smc_hist_cov` (section below). It acts only when a unit sets it, and the pack and the evidence do not. `benchmarks/restamp_proof.py` compared v0.12 (origin/v2 at 8bccb68; the engine code is that of #167) and v0.13 (tree at 5c68f6f) and found 24 of 24 cases identical: the 14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and 5 pinned scenarios, including the new `past_smc_v013` (past SMC in the burn-in and after the horizon start, `smc_hist_cov` absent, `[]` and `None`). The proof ran locally (Python 3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v013-3`). The identity fields of the four evidence files were then re-stamped; their `validate_once.sh` confirmation is pending. The evidence is stale for the F6 S1-2 reasons named below, as at v0.12.
 
@@ -81,6 +86,42 @@ with a delivery period, routine nets and SMC, boundary dates and heterogeneous b
 Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
+
+## v0.14 scope: severe cases and deaths as window metrics (F6 S2-5b; written with the v0.14 code)
+
+**Why.** The burden check (`validation.burden`, F6 S2-5b, `toolkit/analysis/burden.py`) can compare a past window,
+for example [2019, 2024], through engine window metrics per person of each population group. Up to v0.13 the engine
+reported only clinical cases per named window (`inc_all`, `inc_u5`). Severe cases and deaths were counted only over
+the decision window (`per_capita`). F6's burden reference is under-5 malaria deaths before GC7, so the check could
+not run.
+
+**New window metrics.** For every named window, eight metrics are added: `severe_u5`, `severe_5_14`, `severe_15p`, `severe_all`, `deaths_u5`, `deaths_5_14`, `deaths_15p`, `deaths_all`. Each one is the window's total over the group's mean population in the window:
+- the total of expected severe episodes (or deaths) of the new infections in that age group, per day;
+- the mean population is the group's person-days in the window divided by the window's days;
+- `_all` uses every age.
+
+These metrics are counted the same way as the decision window's `per_capita` severe and deaths. A named window equal to the decision window gives `per_capita` exactly (self-test W1c).
+
+**How deaths are counted (unchanged by v0.14).** These are expected values, not draws:
+- Each new infection has a probability of severe disease θ, which falls with the person's severe-disease immunity (Griffin et al. 2010, PLoS Med; Griffin 2014, Nat Commun: θ0, θ1, IV0, κv and the age factor fv).
+- A severe episode dies with the case fatality (1 − p) × `cfr_severe_untreated` + p × `cfr_severe_treated`. Here p = min(1, `severe_access_add` + the unit's effective treatment); with `cm_target` 1 it is the v0.12 person-level link.
+- The parameters `cfr_severe_treated` 0.10 (AQUAMAT), `cfr_severe_untreated` 0.30 and `severe_access_add` 0.25 keep their card sources. They are marked unverified, as before.
+- An infection's severe outcome and death are attributed to the day of infection and the age group at that day, as `per_capita` does.
+
+**Metrics per age group.** A spec with several population groups maps each group to one metric (`burden.py` refuses one metric for several groups). The engine's age groups (u5, 5_14, 15p) each have one, and `_all` serves a spec with one all-ages group. Clinical cases still have only `inc_u5` and `inc_all`.
+
+**Byte identity.** The daily values are computed from quantities the step already has, with no random draw. They are stored apart from the daily records that the start-state hash covers. The decision window's accumulators add the same stored values, so every v0.13 output is unchanged. `benchmarks/restamp_proof.py` compares v0.13 and v0.14 on every output. Only the eight added window metrics are left out of the new side, and only inside `windows` (`ADDED_WINDOW_METRICS`, self-test RP3b).
+
+**Tests (written first; `selftest_late.py`, section `_self_test_v014`).**
+- W0: the card lists the eight metrics.
+- W1: run A counts 2015 as its decision window; run B counts 2017 and names 2015 as a past window. B's past-window metrics equal A's `per_capita` for each group, and `_all` equals the age-share-weighted sum. The sims are identical because no package acts.
+- W2: the same with the case-management severe-care link, and a half window holds part of the deaths.
+- W3 (Codex round 1, P1): members that share a burn-in and history (they differ only in parameters that act after the fork, such as the case fatalities) each get their own past-window deaths, in either batch order. The shared days were counted with the first member's case fatality. The engine records each day's effective treatment and recounts those days with the member's own `cfr_severe_*` and `severe_access_add`. It uses the same expression and precision as the step, so a member's own days are unchanged. Days with the v0.12 severe-care link are never shared: the link acts only after the fork.
+- W4 (Codex round 1, P2): a window that the simulated days do not cover gives NaN for the new metrics, not 0. That is a window starting before the sim, ending after it, or empty. A window inside the burn-in is covered.
+
+**Open item found in review (not changed, to keep v0.13 outputs identical).** The decision window's `per_capita` deaths have the same shared-day issue when the delivery period starts after the window start. The fork is then at the delivery start, so the window days before it are counted with the first member's case fatality. It affects batches whose members differ in `cfr_severe_*` or `severe_access_add` with such a horizon. A fix changes v0.13 outputs, so it belongs in a version that recomputes the evidence.
+
+**What this does not do.** It adds no clinical-case metrics per age group beyond `inc_u5` and `inc_all`. Deaths are expected values from the severe-disease model, not counts from a separate mortality model. S2-5 is the place to check them against the references.
 
 ## v0.13 scope: past SMC coverage apart from future coverage (F6 S2-3 part 2, critique C3; written with the v0.13 code)
 

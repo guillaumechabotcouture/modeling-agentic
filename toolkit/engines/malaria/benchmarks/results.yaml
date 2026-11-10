@@ -1,10 +1,10 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.13'
-  code_sha256: 2310408557d9d9dd70db1e8673af2e1b71c3aabdb4115f88266bf6204e76dad7
+  version: '0.14'
+  code_sha256: ad7cb4c24d9e72ea40cd2761c3f7bde219e258c716dc6142122acd208a05d708
   params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-  config_sha256: f582a35071dd288069a265401d672aac33b85fab1a1aedeb60b832030f620619
+  config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 benchmarks:
 - id: B7
   metric: ITN (pyrethroid) vs none, prevalence RR at 12 m (trials' own age bands)
@@ -665,7 +665,7 @@ summary:
     band_mis_based: 0
   held_out_in_band: 9
   held_out_total: 12
-engine_version: '0.13'
+engine_version: '0.14'
 fit_rule: joint-v1
 wall_s: 2832.9
 restamped:
@@ -730,8 +730,17 @@ restamped:
     not_repeated: calibration-grid runs (same code path at other attribute values)
     compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
       dicts exactly
-  old_engine_version: '0.12'
-  proof_script_commit: 4f0f9609a89ee448e4f6ae20ae924b0b417c3b3f
+    added_window_metrics:
+    - severe_u5
+    - severe_5_14
+    - severe_15p
+    - severe_all
+    - deaths_u5
+    - deaths_5_14
+    - deaths_15p
+    - deaths_all
+  old_engine_version: '0.13'
+  proof_script_commit: 0d6d1f73696fb27ef0a9c3314327c04230998e47
   note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
     on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
     is pending.
@@ -740,11 +749,86 @@ restamped:
     evidence: null
   old_identity:
     name: malaria-starsim
-    version: '0.12'
-    code_sha256: defb2d87b65f8210f7f04ec413687eaaf50104f3637975556d4e3cce675abbd5
+    version: '0.13'
+    code_sha256: 2310408557d9d9dd70db1e8673af2e1b71c3aabdb4115f88266bf6204e76dad7
     params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-    config_sha256: 04b9eedeaec5d5f1bce0674f816a6f5890dd1fa751368bd61cfb440256a33398
+    config_sha256: f582a35071dd288069a265401d672aac33b85fab1a1aedeb60b832030f620619
   previous:
+  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+    proof_identical: true
+    scope:
+      pack_settings:
+      - benin
+      - ce_ref
+      - ce_res
+      - cochrane_itn
+      - eir_1
+      - eir_10
+      - eir_100
+      - eir_3
+      - eir_30
+      - eir_300
+      - irs_added
+      - misungwi
+      - muleba
+      - sahel_smc
+      pack_arms: every arm of each setting, in one run_batch per setting and seed
+      seeds:
+      - 11
+      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
+        guess sensitivity the card's 4000
+      burnin_years: the card's (50), the pack's own
+      evidence_cases:
+      - - equilibration
+        - - 3.5
+          - base
+          - burnin_years: 50
+          - 1
+      - - equilibration
+        - - 28.0
+          - doubled
+          - burnin_years: 100
+          - 1
+      - - equilibration
+        - - 9.0
+          - guess_hi
+          - burnin_years: 50
+            init_eir_per_m0: 2.4
+          - 2
+      - - guess_sensitivity
+        - - 3.5
+          - x1
+          - 1
+          - 50
+      - - guess_sensitivity
+        - - 28.0
+          - x0.25
+          - 2
+          - 50
+      scenarios:
+        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+        heterogeneous: 5 members, seed 23, delivery None
+        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
+        past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
+      not_repeated: calibration-grid runs (same code path at other attribute values)
+      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+        dicts exactly
+    old_engine_version: '0.12'
+    proof_script_commit: 4f0f9609a89ee448e4f6ae20ae924b0b417c3b3f
+    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
+      below is pending.
+    confirmation:
+      validate_once: pending
+      evidence: null
+    old_identity:
+      name: malaria-starsim
+      version: '0.12'
+      code_sha256: defb2d87b65f8210f7f04ec413687eaaf50104f3637975556d4e3cce675abbd5
+      params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
+      config_sha256: 04b9eedeaec5d5f1bce0674f816a6f5890dd1fa751368bd61cfb440256a33398
   - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
     proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
     proof_identical: true
