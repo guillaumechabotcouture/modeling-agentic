@@ -756,9 +756,10 @@ def _self_test() -> int:
         dropped = sorted(x["id"] for x in rd.get("dropped") or [])
         gd = [g for g in gate_findings(rd) if g["kind"] == "done_when_dropped"]
         ok(dropped == ["D-003", "D-005"] and {(g["id"], g["severity"]) for g in gd} == {("D-003", "HIGH"),
-                                                                                       ("D-005", "MEDIUM")},
-           f"DW27 an open finding left out of the critique, whose test never passed, still blocks at its severity: "
-           f"{dropped}, {gd}")
+                                                                                       ("D-005", "HIGH")}
+           and any("MEDIUM" in g["claim"] for g in gd if g["id"] == "D-005"),
+           f"DW27 an open finding left out of the critique, whose test never passed, blocks as HIGH (as a regression "
+           f"does), naming its own severity: {dropped}, {gd}")
         ok(summary(rd["status"]).get("required_not_judged") == ["D-003"],
            f"DW28 a left-out finding whose test is not judged still counts as open and not judged: "
            f"{summary(rd['status'])}")
@@ -788,6 +789,39 @@ def _self_test() -> int:
         ok([x["id"] for x in r31["dropped"]] == ["D-011"] and not r31["status"]["D-010"]["open"],
            f"DW31 a judgement the critic resolved stays resolved when left out; a failing runnable test does not: "
            f"{[x['id'] for x in r31['dropped']]}")
+        # DW32-DW35 (Codex r1 on A5)
+        dm = os.path.join(d, "s32")
+        os.makedirs(dm)
+        cm = {"critique-domain": {"blockers": [
+            {"id": "D-020", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"file": "no.csv", "exists": True}},
+            {"id": "D-021", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"file": "no.csv", "exists": True}},
+            {"id": "D-022", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "no.csv", "exists": True}}]}}
+        run(dm, cm, 1)
+        run(dm, cm, 2, exclude={"D-020"})                                   # P1-1: tied to no brief item in round 2
+        low = {"critique-domain": {"blockers": [dict(cm["critique-domain"]["blockers"][1], severity="LOW")]}}
+        r32 = run(dm, low, 3, record=False)                                 # P1-2: D-021 still listed, now LOW
+        ok([x["id"] for x in r32["dropped"]] == ["D-022"],
+           f"DW32 a finding classified outside the brief, or still listed at LOW, is not dropped: "
+           f"{[x['id'] for x in r32['dropped']]}")
+        g33 = [g for g in gate_findings(run(dm, {"critique-domain": {"blockers": []}}, 3, record=False))
+               if g["kind"] == "done_when_dropped"]
+        import stall_rule as _sr
+        ok(sorted(_sr.finding_key(g) for g in g33) == ["D-021", "D-022"] and all(g.get("done_when") for g in g33),
+           f"DW33 each dropped finding keeps its own key (one ledger row each) and its test: "
+           f"{[(_sr.finding_key(g), bool(g.get('done_when'))) for g in g33]}")
+        dl = os.path.join(d, "s34")
+        os.makedirs(dl)
+        ck2 = {"critique-domain": {"blockers": [dict(b, resolved=True) for b in ck["critique-domain"]["blockers"]]}}
+        run(dl, ck2, 2)
+        legacy = load_registry(dl)
+        for t in legacy["tests"].values():
+            t.pop("critic_resolved_round", None)                            # P1-4: written before this field existed
+        _save(dl, legacy)
+        r34 = run(dl, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in r34["dropped"]] == ["D-011"],
+           f"DW34 a registry written before critic_resolved_round does not reopen a judgement; a failing runnable "
+           f"test still stays open: {[x['id'] for x in r34['dropped']]}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
