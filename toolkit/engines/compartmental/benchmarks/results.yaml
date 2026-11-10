@@ -13,7 +13,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  band_sha256: 1e4413b613701763b2460c2f7a2bd5763c5eec5e746fd8dc0bbc8c513967fcb2
+  band_sha256: 939ef567a0b9a73f0509bcfb8e2c7547e5e35b2f2314b0a44f7918e356a7a5ed
   computed: 0.5828116449805854
   reference: 0.58281164498064
   error_abs: 5.46229728115577e-14
@@ -32,7 +32,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  band_sha256: 5b7830ae759bc4b3de9690b38be600bf536342c35b0cf58b6e5846c07dbb139a
+  band_sha256: 61d4cb3e666b62b4fef297089b3aa404fdeb9c764e1fda5481d828ab6107e3d0
   computed: 0.7968121303622717
   reference: 0.7968121303623036
   error_abs: 3.186340080674199e-14
@@ -51,7 +51,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  band_sha256: 0e4b386b06034b142d813bf64669d59b307b76fde19093025981a100f286882a
+  band_sha256: 35081d926b7f89ef0173a1fd035eb56f46b584b9d98a2da1e2ebc324f1a10cd0
   computed: 0.9801725987397542
   reference: 0.9801725987397569
   error_abs: 2.7755575615628914e-15
@@ -70,7 +70,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  band_sha256: 1d6e7680b22ff607a9f22fb85f74042468bb285e1bafa348aafe7cfabbeda0d4
+  band_sha256: 906d86e32d0175110bc77ed9f9f2cd67e2dba61dd5a7fc386f037c3da03a6bcb
   computed: 0.9999938553345866
   reference: 0.9999938553345865
   error_abs: 1.1102230246251565e-16
@@ -89,7 +89,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  band_sha256: 1dd4a866b33198fba51a3fcf5b802224830050cac40ef1267d30a5eaf4cc181c
+  band_sha256: 70a3c93668f0f5c89e801ce465f8826f858d0eeb8e23ad2513a8bb2ef022380a
   computed: 0.9999999847700162
   reference: 0.9999999847700161
   error_abs: 1.1102230246251565e-16
@@ -108,7 +108,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  band_sha256: 7d45ec5f77d1daa4826b409bc5f484d6bc326ec009ce5479a7bf00b336a75ee3
+  band_sha256: dc635015f5c909eea659f6548a32827f73f1c8ed41dee9c842b32a3420e9c460
   computed: 1.999999043325724e-09
   reference: 2.0e-09
   error_abs: 9.56674276233652e-16
@@ -127,7 +127,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem; Lambert W
-  band_sha256: 4eb9580d3b4b31fa5f1b3ef7f0103afe65cffd419ec2162d0a84d757ac725b99
+  band_sha256: 15922f4712ce5e19729d8fc07fff8520e895b4426a3d916bd75d9a5f28dfe5d2
   computed: 0.019736509118963255
   reference: 0.01973650911894509
   error_abs: 1.8166024240429124e-14
@@ -147,7 +147,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  band_sha256: 6023d581a1a36561782d535e0fd4703e643d817bbdfdd48426a0955fc15f66d7
+  band_sha256: f282a20fa0b057101fe914511cbcb51952e8e4f833a1672c668aedec6d1e28ea
   computed: 0.019736509118963255
   reference: 0.02
   error_abs: 0.0002634908810367452
@@ -167,7 +167,7 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
-  band_sha256: 4b72fa00758c944a9a6fbb415958750fa4d0ae9feff5f2d46025ed1d92f1bd16
+  band_sha256: 7144a2013212e103e250b1a39025256a4377fc17cc557cef7b69d7e96e196029
   computed: 5.10702591327572e-15
   reference:
   - 0.4638279198514076
@@ -194,7 +194,7 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  band_sha256: 677c1c1bddea12217c5387c30d9f1ac232dc3ead04f3cbe73d74055010dac2f2
+  band_sha256: 843712a1da985aa3429d00a5806cdb73fe35899aa83080a6a25f9f95e453ccb5
   computed: 0.29140582193402026
   reference: 0.29140582193290576
   error_abs: 1.1144973832699634e-12
@@ -213,7 +213,7 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  band_sha256: 9a3cfc69d1793c1e3cacb88d34fd5cd7c90d211725f87e40feb52abc1c562e74
+  band_sha256: d653655b6d9627b8baf845bdabe5e1b823516cf8a2edf7680955b7b4080387c2
   computed: 0.5828116438680405
   reference: 0.5828116438658115
   error_abs: 2.2289947665399268e-12
@@ -232,7 +232,7 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  band_sha256: a1c741992a6d072828f66e2197ea63c906e45373618578479e1122f6f67ef19f
+  band_sha256: 8c393377995007ebdc1372bd09e4612623a2c224e887b0500fd415d65851f82e
   computed: 9.999406755745053e-12
   reference: 0.0
   error_abs: 9.999406755745053e-12
@@ -252,7 +252,7 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Metz (1990)
-  band_sha256: c2f54621c4a578acd4bc456425cf4b0325b21bec7a1e5ec1839cfb916250e3fa
+  band_sha256: ecf02848a169b8910fe3a8bf54f896468b6c2d9bc2ab0fed15ae05bcab29b334
   computed: 3.2204801174856823
   reference: 3.22048005763425
   error_abs: 5.985143225473166e-08
@@ -272,7 +272,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
-  band_sha256: f812ad01af88985a89850c224b5398375aabbefe7d2c1a35fe4e42a86893fe67
+  band_sha256: f280fbd24c627e6a0cd561877f73253994b3ebabbc945ff8ada123019bf3d9be
   computed: 2.6900703886667543e-13
   reference:
   - 0.7968128145862968
@@ -298,7 +298,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  band_sha256: ffadaf66c8869b9ad339fd0435166e95e21cdf7e6e47a808095bd3711290f311
+  band_sha256: 13fcf8c8e4e2b79b5c412a0a8ef5ddbfe5d9ac9940e7a124d2248f4f1ece98fc
   computed: 6.772360450213455e-15
   reference:
   - 0.33869912292631776
@@ -324,7 +324,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  band_sha256: 3c11cd4d08b29b65ba7343ae240eac4b5e5303983efac013f2d6fa590f6fa117
+  band_sha256: 86eefdd75f4cf9089d0033c0890511d0dfc448ae70a3b0568a10e09085b7ab69
   computed: 1.0802470029602773e-13
   reference:
   - 0.9192900487786672
@@ -354,7 +354,7 @@ benchmarks:
   target: null
   band: null
   source: "exponential-survival identity (\xA71.1)"
-  band_sha256: 0d00d5c406403b1caba9a7bc8cc3504f079399703ba0444315c096c680c91d1d
+  band_sha256: 20054bd5c1a9b4bf77bb53eba5e7e9069712cbc14af50b7e4cb882fa91ad6c80
   computed: 0.7968121303622778
   reference: 0.7968121303622717
   error_abs: 6.106226635438361e-15
@@ -373,7 +373,7 @@ benchmarks:
   target: null
   band: null
   source: engine stop rule
-  band_sha256: d665f5cf0171543d38982ca0a774756004794905ac34217be9b30601ff2ba81d
+  band_sha256: 81527656a063ce1d6237b9e33a3b6ff2e80e8e1e4a0012587214d8acc1092c29
   computed: 1.0
   reference: 1.0
   error_abs: 0.0
@@ -392,7 +392,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  band_sha256: d953bb49e724e2bfb260e2c73da2c6672a4461a08c16f794539bae512e001b1d
+  band_sha256: 4123516e901d764653081ae4a615ab728fac3a9afedbf5b3f426c79defe87c14
   computed: 0.7968121300200206
   reference: 0.79681213002002
   error_abs: 5.551115123125783e-16
@@ -411,7 +411,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  band_sha256: dd080511dac575494b6b8f8988a97ea9abde72a976332c2f68c3c1abe9b9a8ce
+  band_sha256: 9766eb338166c87ada9bc94405784143e424c5b40c88ed968a63696a2a448284
   computed: 0.5000000000000009
   reference: 0.5
   error_abs: 8.881784197001252e-16
@@ -431,7 +431,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  band_sha256: 7205ac70128897c9b9d173be6e7482301b8da6b5a4350b753844423f051d51f9
+  band_sha256: 0ddd346c15d780e55f78b1dbbc1274a4b387df6977414e3c47ad5c74a11194ad
   computed: 1.2212453270876722e-15
   reference: 0.0
   error_abs: 1.2212453270876722e-15
@@ -451,7 +451,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
-  band_sha256: 7a44d823bfcfb6ef5c9e16ab55af91da1a82ab3dafa3e13286489c53defbb2ab
+  band_sha256: 5a962a9298179da4bcc6099b14c9e5299d6e9e5b98b4f5fc88ac9c58530a5925
   computed: 0.8926447536092091
   reference: 0.8926447536092056
   error_abs: 3.552713678800501e-15
@@ -471,7 +471,7 @@ benchmarks:
   target: null
   band: null
   source: "design note \xA71.1 (importation: branching)"
-  band_sha256: e66a441a245b749987c90d08cbd7a2b361ac4007370d1ee2f0fedc56c60a8f66
+  band_sha256: 3991657f32c2ff220b32150f1870c00a1f587c6c2279c540ffaa7b9ae357c7e8
   computed: 0.634909570819514
   reference: 0.6349095708197771
   error_abs: 2.630118345336996e-13
@@ -491,7 +491,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B
-  band_sha256: 735c755c9c5f0c0bf8e7180bf84abd01bad1652a79dc4ee631c2b2b5d4eb2dd3
+  band_sha256: a7eab13a7dd9f94baf782c76d56ce2e6411e54550f750dd0288c6178fd0e6f8b
   computed: 2.0
   reference: 1.9999994730362805
   error_abs: 5.269637195493004e-07
@@ -511,7 +511,7 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Britton (2013), ch. 1
-  band_sha256: 5d9a8f61bdaf5ab52005f05202eb03bf45f0b9075747d2a2bea9404d811401b5
+  band_sha256: fe1de35671ab071ace143ce66cbe2b22e5c271640e133479188c7523ed9bd98d
   computed: 0.7968121303623035
   reference: 0.7968121303623036
   error_abs: 1.1102230246251565e-16
@@ -530,7 +530,7 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Britton (2013), ch. 1
-  band_sha256: 3632ac58f90f70ec642215ba4eff3d88b9f567e51d87a2d051dfed2ba2bc4101
+  band_sha256: 8797f886e623e1b35ba6b9aacd4e344925e8d97d25bdcca51b388c4e8199623e
   computed: 0.7968121303623035
   reference: 0.7968121303623036
   error_abs: 1.1102230246251565e-16
@@ -550,7 +550,7 @@ benchmarks:
   target: null
   band: null
   source: Codex review finding 2 (design note)
-  band_sha256: bf3715c730c0871e5c0ecbbe621bb681a74930d77fbb0e774dbaa93415c5ddd3
+  band_sha256: 83b53806283794f6817e207af02e2cfe5513b239af1c4c85cefd16a71de6fe33
   computed: 0.8687075605459232
   reference: 0.7968121303623036
   error_abs: 0.07189543018361966
@@ -568,7 +568,7 @@ benchmarks:
   target: null
   band: null
   source: Codex review finding 2 (design note)
-  band_sha256: 6093be386e49af28105d73fdae944c2bfa187fb67153d0d3be6addaf625a7972
+  band_sha256: 4e70afcf1d4f4dc0c3b37a3af89493dffca0e7f881813bcee97971bffa9ca318
   computed: 0.8687075605459232
   reference: 0.8687
   error_abs: 7.560545923213091e-06
@@ -586,7 +586,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 1146deb05299e4dfcec28acbc4fcfec219344cc571c5ec538443de625e23781d
+  band_sha256: b8850f095e28ecbb312564812942488055d39d230e11c6244bdbe68144b58e54
   computed: 0.40637573927539355
   reference: 0.40637573927539355
   error_abs: 0.0
@@ -605,7 +605,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: dd5a40057cd231a8a75ba2736d6aee7af53063e5ee2ebbf061029e2d24108fcc
+  band_sha256: 5ab1b61f6d0fdac608b1922a779ebcdfb5848a1e725e889118a2bd0109b3593b
   computed: 0.40637573927539355
   reference: 1.0
   error_abs: 0.5936242607246065
@@ -625,7 +625,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 2b098ef78599934f54d30abdac18b0071cc0a2b0e52c333eb21c1e7e107f643d
+  band_sha256: 5fd35e1a9fcd36f18b252faa7fc3556c75d421e9be60d9d6d88211701c1ff0bd
   computed: 0.7957646538280179
   reference: 0.795764653828018
   error_abs: 1.1102230246251565e-16
@@ -644,7 +644,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 0d87fa917f28d4c221ec3005f36e15bf8792263562a9752e97cbf2697abaaa2c
+  band_sha256: 7dd1fbfec4473861608eba447ed73afe8fc3603113521892883cc9afc8d78ca9
   computed: 0.18088388276987707
   reference: 0.18088388276987707
   error_abs: 0.0
@@ -663,7 +663,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 432656e87b8e5472bbe8e5189285c139b43883359411c6623a6dac5ff4f85eba
+  band_sha256: f06b711e5d733741fbf0814a90e78cf9173aa3e6a38a78fb3d49dd0c5249e2ff
   computed: 0.2999505999572497
   reference: 0.2999505999572497
   error_abs: 0.0
@@ -683,7 +683,7 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  band_sha256: 0e88091b9da118a8481c0c126471065263a084b7fb5f1a631aa49ce44f492690
+  band_sha256: 898b2a0bfa5b305c99777105c54f0ed15764d0cf69d1904ccdede3a5c1397a5b
   computed: 1.8184719730900294
   reference: 1.8
   error_abs: 0.018471973090029348
@@ -702,7 +702,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 7beab681855db235880de0b00b6f60a6ff717e20b0158442b69914a0d02988a3
+  band_sha256: 1b059a57c8d74b66c8b73c704bbdfd713fbddef3d74a74eb1b16b57ad11af0d8
   computed: 0.10105
   reference: 0.10105
   error_abs: 0.0
@@ -720,7 +720,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 421b1ca9cc7e4f89f859dec09b9cc9fd1ff9a5874919c204f6f48eb6615da515
+  band_sha256: 5e3931ac54fd9495df3918748fae82f5ab90da87b06abba0b7d497a1d73dc82c
   computed: 0.31999999999999995
   reference: 0.32
   error_abs: 5.551115123125783e-17
@@ -738,7 +738,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 607021224b075eab0e3035871180e69821b3601954da312c7ecc79de9a9501ef
+  band_sha256: 5c1a27d39023e7acf3d789333e8cd6bbf56b00295fc0285fe38a1568e2b4129f
   computed: 0.1495
   reference: 0.1495
   error_abs: 0.0
@@ -756,7 +756,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 062a2ce2145a3d5b35c9ed580c95430db2eacfa84eaf4fa19b2136ee20b7b4e0
+  band_sha256: bba7e5e208e0e67d714affee7d1bcb59e17e7fa489878ee5d66879c433218b2a
   computed: 0.33375000000000005
   reference: 0.33375
   error_abs: 5.551115123125783e-17
@@ -774,7 +774,7 @@ benchmarks:
   target: null
   band: null
   source: spec declaration
-  band_sha256: 4fb9055fe4e9a11db5aefe46ef81af06dd1574dc50d39423f830401d51863641
+  band_sha256: cc0676fd98ae09647cac0301ca2dbe3811dff56aea7cfcda52101e7a22d7cc20
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -793,7 +793,7 @@ benchmarks:
   target: null
   band: null
   source: structural
-  band_sha256: a3a23fb676e4b94d62338756e169a7399a91e0119e190f48d7e6aaf7938dc9ae
+  band_sha256: 152b3bacd6e1a18195a07f82fba90325ceb1b9cb026f27e80939c57961988da4
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -812,7 +812,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: 260e67fd9c1d56689ee91068c150865c66c40245b8af062c7422dfeeea2ed32a
+  band_sha256: dc08bc64102c3d35f7e7435e7ba072225b41f69947e1bd3ca91bcd0eb0e6f138
   computed: 0.6333333333333333
   reference: 0.6333333333333333
   error_abs: 0.0
@@ -831,7 +831,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: c199d817305d693a554be26c416aafb3ceee432cc1287a184506e1529f22edb6
+  band_sha256: 80028dfa631062c753152b29e22a26ef616f09e190f5e22230f2bdd5aff3c669
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -849,7 +849,7 @@ benchmarks:
   target: null
   band: null
   source: identity
-  band_sha256: f90f7176920c3504c73295ec633fccd4def1008d5cbfaca714bbfc36de514b37
+  band_sha256: 0205efcd7a397df7590c76d941f1ce94e3d08ea73a8b6be458fb2b9d113b6081
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -868,7 +868,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 5377ab68ce5d5bc1b8e6d97fee51b5e7e21a78bfd1c39bf9bf864d67e9129663
+  band_sha256: 93e9a6d9553c548e929df106f890a44fd458349e6a519111605f39b22b9ef303
   computed: 0.8380952380952381
   reference: 0.8380952380952381
   error_abs: 0.0
@@ -886,7 +886,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: 2cc0f0aa18f8465246377832b544bc2b2d83312a6ef66ef0d166e76c496630ce
+  band_sha256: 0b5f75f402e1738b200bf760e1db2b71f14d0434273c8454b6c9e4fc2beee180
   computed: 0.6709999999999999
   reference: 0.671
   error_abs: 1.1102230246251565e-16
@@ -904,7 +904,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: e1c29d6a44bd6ed20b3efbe5133bbf6b6a0c7f1baf70323a2739029d6337a1e8
+  band_sha256: e9575f3c6c8a9ab432203a72f7538139fd82f6b717c925e2e73748f1f18b75a9
   computed: 0.7600000000000001
   reference: 0.76
   error_abs: 1.1102230246251565e-16
@@ -922,7 +922,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: f66e728214a21247815b824b1fdf60d6646f43c2efbdda813f410c9e855ef69c
+  band_sha256: 920a8fd7ea2fa5fd4d44e3c9f26d6cad4aecff1aecc6f1e7695d5f4e39dad159
   computed: 0.7368576777701836
   reference: 0.7368576777701836
   error_abs: 0.0
@@ -940,7 +940,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: c73684b769023c9fbac21e4d6375e14eaa19a236ca5b867feb369feac131ba1d
+  band_sha256: 764607653e66ac5eec74281228f50b754ffc78284d4f4d70e5eecbc36e5b2864
   computed: 100.0
   reference: 100.0
   error_abs: 0.0
@@ -958,7 +958,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: cb27ef9bc87868d1109f7dab126a6cbd8e34047e338f86196a5c2a90a57da6bc
+  band_sha256: abd85ea45206dde8d4baee3a8f2e6d267359ffe98feed058f7738a3994980aaa
   computed: 0.6719999999999999
   reference: 0.672
   error_abs: 1.1102230246251565e-16
@@ -976,7 +976,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: d152bd0340c254d801621744e5142758041cc97323f455755152ac294518da90
+  band_sha256: 976f18cf6e8aaf93a152dc6f91fe3d9d2017ec60e1930cfabd84eac17d7e58bc
   computed: 1.14
   reference: 1.14
   error_abs: 0.0
@@ -994,7 +994,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
-  band_sha256: c254a335c673ee51fc57a58e2d55f87d37f9c265733f10d302d0566ab450e5c8
+  band_sha256: c080f75b4778528e23c490a17b381a5b9f4c14010286f95d5c132db916c45bf2
   computed: 0.8
   reference: 0.8
   error_abs: 0.0
@@ -1015,7 +1015,7 @@ benchmarks:
   band: null
   source: the pack's ODE; Ma & Earn (2006) Bull Math Biol (final size independent
     of the latent period)
-  band_sha256: e4db3966594c111962477276aa729d39614bdfe303e67a2547334c0ccad0b8e8
+  band_sha256: e58af9370ee484d45f088e0895be2e355e924e9b90d1db66e6d941f6edae843b
   computed: 1.0835776720341528e-13
   reference:
   - 0.9192900487786672
@@ -1045,7 +1045,7 @@ benchmarks:
   target: null
   band: null
   source: identity (v0.2)
-  band_sha256: 75fd1b7a40402a1ecff292c07dddd08644ae20e262073b178040ff9e028218b0
+  band_sha256: 8d332cca135b3e82cb3195b99b25ee8b044cf01080adadf8d7fcd9f5b6ca5d07
   computed: 0.0
   reference:
   - 0.9192900487786224
@@ -1077,7 +1077,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B, eq. for SEIR with exponential periods
-  band_sha256: de68d826b06297566e74997212a7a66fc9e170128708104f28752c19097c823b
+  band_sha256: fd0433dc435d39be11e44910fec02e389595eedca653d76f6d1775e0b5810745
   computed: 1.7902707711849164
   reference: 1.8
   error_abs: 0.009729228815083646
@@ -1098,7 +1098,7 @@ benchmarks:
   band: null
   source: 'multigroup herd-immunity threshold: rho(diag(s) K) < 1 (Diekmann, Heesterbeek
     & Metz 1990)'
-  band_sha256: 909a01faa046cf89813c9e53f41d7b350626d1a295da9525fb552731b291e4e8
+  band_sha256: 16d68dd1748ad515adb721bb88ac93297731d277d7e165c99edce095ec4aa4fc
   computed: 0.9673873676413498
   reference: 0.97
   error_abs: 0.0026126323586501687
@@ -1118,7 +1118,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  band_sha256: 85bfc1e0fca644f9a7b754e507a44048b27381e2b411c62d827e7f42a6618450
+  band_sha256: 49778ee0d779c286d1b5597ef91e8b17f182f6629b24534c14efa5a50f86193c
   computed: 3.0351514495426206e-08
   reference: 1.0e-07
   error_abs: 6.96484855045738e-08
@@ -1138,7 +1138,7 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  band_sha256: aa954a1d44551449f0ed37bab7dc5055160de58c4b3c2f5b02791f3c5d0086b7
+  band_sha256: ed5ccc1d28bbdfc96912aa91738a981e1af9fe66d86d35f4af50793baf2ddca8
   computed: 0.01
   reference: 0.08799592746032008
   error_abs: 0.07799592746032008
@@ -1157,7 +1157,7 @@ benchmarks:
   target: null
   band: null
   source: identity (v0.2 component timing)
-  band_sha256: 052d2b5606385d77228ce8412c121e0d6156188bfa91e679e31012c48164eba4
+  band_sha256: de80dc5ebdc5ea3cddb21fbb27a052634d1e3f718245da7212aa045657834d09
   computed: 0.7968121334428566
   reference: 0.7968121334428567
   error_abs: 1.1102230246251565e-16
@@ -1177,7 +1177,7 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006); Andreasen (2011)
-  band_sha256: a658650365c6176769c1a67e7b6a60af7d7ac66238b625b2a9ea4d109ab5b542
+  band_sha256: e957c6384af1497e0c723244267b1de2fb55f3726111de11d776472c4a821948
   computed: 3.3306690738754696e-15
   reference:
   - 0.0
@@ -1209,7 +1209,7 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006); Andreasen (2011)
-  band_sha256: bd668230f4e299eeb23124db941a07ea6c4b4770ab755437066bf42ffef6f252
+  band_sha256: ccee0598095ee47f8f63546bc2f37049ee55185a9d611c5a56239b33bfc03d44
   computed: 2.3314683517128287e-15
   reference:
   - 0.0
@@ -1243,7 +1243,7 @@ benchmarks:
   band: null
   source: "exponential-survival identity: the final size does not depend on the generation\
     \ interval (design note \xA71.1)"
-  band_sha256: 01c86f9f9e6571c1d29860a3f08f102f780ac8e546dba44660d27946500ca150
+  band_sha256: 9e0dc4de8c7dd7a5ba4be2d9a2bb104ba3b6ff005aa86becf5a7322517741b6a
   computed: 9.631184738623233e-15
   reference:
   - 0.05892676388821895
@@ -1274,7 +1274,7 @@ benchmarks:
   target: null
   band: null
   source: identity (figures-hooks/1)
-  band_sha256: 76d328f059c6bb947183f956d867ceb196b782b594ae24fd07620d66651101bf
+  band_sha256: 2cad051a8542013daae9cbf039827b2cdba813248e6866d00683082161cad371
   computed: 2.220446049250313e-16
   reference: 0.0
   error_abs: 2.220446049250313e-16
@@ -1293,7 +1293,7 @@ benchmarks:
   band: null
   source: 'candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006)
     AJE'
-  band_sha256: 82904083a1d282e6672d1ee8fd33d9713701e0097e1b35975adf12ec104ee573
+  band_sha256: 3f122ace0808af1a4220ec1f08bfd126e64112f67ae0d1b1ba812629e22c6bab
   computed: null
   in_band: false
   status: not_assessable
@@ -1305,7 +1305,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) AJE worked examples
-  band_sha256: aaa2e1a61bae4ac4d03f6e888ba59ef7caa848ccd3b9fe3868895312e0b1456f
+  band_sha256: 3c1f53941086b6ce474b1d0d9e32b7e83cd818e2d833e18ae98190e880b516a5
   computed: null
   in_band: false
   status: not_assessable
@@ -1997,4 +1997,4 @@ summary:
   held_out_total: 64
 engine_version: '0.2'
 fit_rule: null
-wall_s: 115.7
+wall_s: 121.6

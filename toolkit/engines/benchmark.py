@@ -1354,16 +1354,22 @@ def rescore_results(pack: dict, doc: dict, previous_pack: dict, engine) -> dict:
     return stamp(out, engine)
 
 
+def _bs_thresholds_view(path):
+    from toolkit.engines.benchmark_sources import _thresholds_view
+    return _thresholds_view(path)
+
+
 def declaration_digest(b: dict, pack: dict | None = None) -> str:
     """sha256 of a case's declaration with the named configurations it uses resolved (Codex r2-4), plus the analysis
-    thresholds file (the calibrator's floors and class thresholds)."""
+    thresholds file's calibrator sections (benchmark_sources.CALIBRATOR_THRESHOLD_SECTIONS); other sections, such as
+    decision-test or burden thresholds, do not bind the evidence."""
     import hashlib
     import json
     cfgs = (pack or {}).get("configs") or {}
     used = sorted({v for v in _walk_values(b) if isinstance(v, str) and v in cfgs})
     th = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis", "thresholds.yaml")
     doc = {"case": b, "configs": {c: cfgs[c] for c in used},
-           "thresholds": open(th).read() if os.path.exists(th) else None}
+           "thresholds": _bs_thresholds_view(th) if os.path.exists(th) else None}
     return hashlib.sha256(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()
 
 
