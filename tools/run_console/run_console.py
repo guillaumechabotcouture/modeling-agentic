@@ -3022,11 +3022,67 @@ def _self_test() -> int:
         _self_test_review4(ok, tr4)
     with tempfile.TemporaryDirectory() as tr5:
         _self_test_review5(ok, tr5)
+    _self_test_ux(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_ux(ok) -> None:
+    """RU1-RU5: the UX review of 2026-11-10 (the stream opens on a summary, cards are grouped, a refresh keeps the
+    reader's place). RU1-RU3 run the page script in node with a stub DOM; skipped when node is not installed."""
+    src = _page_sources()
+    js = open(os.path.join(os.path.dirname(HTML), "run_console.js"), encoding="utf-8").read()
+    stub = ("const _h = { get: (t, k) => k === Symbol.iterator ? function* () {} : k === Symbol.toPrimitive ? "
+            "() => '' : k === 'forEach' ? () => {} : k === 'search' ? '' : k === 'content' ? 'tok' : P, "
+            "set: () => true, apply: () => P };\nconst P = new Proxy(function () {}, _h);\n"
+            "globalThis.document = P; globalThis.window = P; globalThis.location = { search: '' };\n"
+            "globalThis.matchMedia = () => ({ matches: false }); globalThis.setInterval = () => 0; "
+            "globalThis.setTimeout = () => 0;\nglobalThis.fetch = () => new Promise(() => {});\n")
+    glossary = json.dumps({k: {"text": v[0], "source": v[1]} for k, v in GLOSSARY.items()})
+    cards = ([{"kind": "stage", "at": 1, "title": "SPEC -> SIGN"}, {"kind": "stage", "at": 2, "title": "SIGN -> EVIDENCE"},
+              {"kind": "blocker", "round": 1, "blocker_id": "D-001", "severity": "HIGH", "claim": "c1"},
+              {"kind": "stage", "at": 3, "title": "CRITIQUE -> GATE"},
+              {"kind": "blocker", "round": 1, "blocker_id": "D-002", "severity": "LOW", "claim": "c2", "resolved": True}]
+             + [{"kind": "figure", "at": 4, "path": f"figures/f{i}.png"} for i in range(3)]
+             + [{"kind": "decision_test", "test_id": f"t{i}", "state": st} for i, st in enumerate(("changed", "same"))]
+             + [{"kind": "gate", "at": 5, "title": "Gate round 1: ACCEPT", "action": "ACCEPT",
+                 "done_when": [{"passes": True}, {"passes": False}, {"passes": None}]}])
+    node = shutil.which("node")
+    if not node:
+        ok(True, "RU1-RU3 skipped: node is not installed")
+    else:
+        def run(extra, tail):
+            r = {"cards": cards + extra, "state": {}, "docs": {"results.md": 1},
+                 "headline": "The plan averts " + "x" * 300 + " cut"}
+            p = subprocess.run([node, "-e", stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n"
+                                f"S.run = {json.dumps(r)};\n" + tail], capture_output=True, text=True, timeout=60)
+            return p.stdout if p.returncode == 0 else "node failed: " + p.stderr[-300:]
+        out = run([], "process.stdout.write(JSON.stringify(streamItems().map((x) => [x.kind, (x.rows || []).length])));")
+        ok(out == json.dumps([["stage_run", 2], ["blocker_table", 2], ["stage_run", 1], ["figure_run", 3],
+                              ["dt_table", 2], ["gate", 0]], separators=(",", ":")),
+           f"RU1 the stream groups stage lines, a round's blockers, figures and decision tests into one item each ({out[:200]})")
+        out = run([], "process.stdout.write(standing());")
+        want = ("Where this run stands", ">No.<", "1 pass, 1 fail, 1 unknown", "1 open ", "1 resolved",
+                "1 of 2 change the plan", "3 from the analysis", "results.md", " …<")
+        ok(all(w in out for w in want) and "xxx cut" not in out,
+           f"RU2 the summary card says whether the owner is needed, then gate, critique, decision tests, figures and "
+           f"documents, and marks a headline the server cut ({[w for w in want if w not in out]})")
+        out = run([{"kind": "decision_needed", "title": "Your decision needed: sign the spec"}],
+                  "process.stdout.write(standing());")
+        ok('class="nd yes">Yes: sign the spec.' in out and 'data-ck="need"' in out,
+           f"RU3 an open decision is the first row of the summary card, with a jump to its card ({out[:160]})")
+    body = src[src.index("function renderStream"):][:2500]
+    ok("standing() + summaryBlock()" in body and "sig === S.sig" in body and "[data-k]" in body,
+       "RU4 the stream opens on the summary card; an unchanged refresh leaves the page as it is, a changed one "
+       "re-opens the rows the reader had open")
+    chat = src[src.index("function renderChatSpend"):][:1800]
+    ok('<details class="fold"' in src[src.index("function gateCard"):][:3500] and "Record" in chat
+       and "function setHash" in src and "replaceState" in src,
+       "RU5 the gate's done-when table is folded under its counts; with chat off Record is the composer's action; "
+       "the address carries the run and the view")
 
 
 def _page_sources() -> str:
