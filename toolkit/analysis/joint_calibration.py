@@ -626,16 +626,16 @@ def _num(x):
 
 def _round_mismatch(a, b, col=None):
     """Why two rounds of one survey cannot be compared (their definitions differ), or None."""
-    if a["kind"] != b["kind"]:
+    if a["kind"] != b["kind"] and {a["kind"], b["kind"]} != {"unit", "group"}:
         return f"definitions differ: {a['id']} is a {a['kind']} target, {b['id']} a {b['kind']} target"
     for q, dflt in (("metric", None), ("scale", "logit")):
         if a.get(q, dflt) != b.get(q, dflt):
             return f"definitions differ: {q} {a.get(q, dflt)!r} and {b.get(q, dflt)!r}"
     if [float(x) for x in a["window"]] == [float(x) for x in b["window"]]:
         return "the two rounds have the same window"
-    if a["kind"] == "unit" and a.get("column", col) == b.get("column", col):
+    if a["kind"] == b["kind"] == "unit" and a.get("column", col) == b.get("column", col):
         return f"the two rounds read one column ({a.get('column', col)})"
-    if a["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
+    if a["kind"] == b["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
             (b.get("key") or {}).get("units"), b.get("weights")):
         return "definitions differ: the rounds aggregate over different groupings or weights"
     return None
@@ -644,7 +644,9 @@ def _round_mismatch(a, b, col=None):
 def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
     """F6 S2-3b: each pair of rounds of one survey (targets with the same survey, by window), one entry per group:
     unit rounds by the group column (changes.by, the survey's bias_by, else the region), each unit weighted (changes.
-    weights, else equally); group rounds by their group. What cannot be compared is an entry with its reason."""
+    weights, else equally); group rounds by their group. S2-3c: a group round and a unit round pair per group of the
+    group round, the unit round aggregated with the group round's own weights. What cannot be compared is an entry with
+    its reason."""
     ch = j.get("changes") or {}
     rho = float(ch.get("sampling_correlation", 0.0))
     series = {}
@@ -664,6 +666,9 @@ def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
             for b in ts[n + 1:]:
                 base = {"id": f"{s}:{a['id']}->{b['id']}", "survey": s, "from": a["id"], "to": b["id"]}
                 why = _round_mismatch(a, b, default_column)
+                if not why and a["kind"] != b["kind"]:
+                    out += _mixed_pairs(base, a, b, ch, rows, reg, built, rho)
+                    continue
                 by = ch.get("by") or a.get("bias_by") or reg if a["kind"] == "unit" else (a.get("key") or {}).get("units")
                 if why or not by:
                     out.append(dict(base, not_computable=why or "no group column (changes.by, bias_by or the region)"))
@@ -691,6 +696,38 @@ def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
                                                            f"{' or '.join(t['id'] for t, q in ((a, ga), (b, gb)) if g not in q)}"
                                                            " (not in its table, or not every unit of the group is "
                                                            "calibrated)"))
+    return out
+
+
+def _mixed_pairs(base, a, b, ch, rows, reg, built, rho) -> list:
+    """F6 S2-3c: a group round minus (or from) a unit round of one survey, per group of the group round: the unit
+    round aggregated with the group round's own weights (the group target's members and weights, as built), so
+    the change is the group observation against the same aggregate of the unit observations."""
+    gt, ut = (a, b) if a["kind"] == "group" else (b, a)
+    gs, us = ("from", "to") if gt is a else ("to", "from")
+    gby, uby = (gt.get("key") or {}).get("units"), ch.get("by") or ut.get("bias_by") or reg
+    if uby != gby or ut.get("bias_by") not in (None, gby):      # the offsets' grouping too, whatever changes.by says
+        uby = ut.get("bias_by") if ut.get("bias_by") not in (None, gby) else uby
+        return [dict(base, not_computable=f"the groups do not match: the unit round {ut['id']} is grouped by {uby}, the "
+                                          f"group round {gt['id']} by {gby}")]
+    notes = ([f"the unit round is aggregated with the group round's weights ({gt.get('weights')}), not changes.weights "
+              f"({ch['weights']})"] if ch.get("weights") and ch["weights"] != gt.get("weights") else []) + (
+        [f"changes.sampling_correlation ({rho:g}) does not apply: the group round's and the unit round's sampling "
+         "errors are combined as independent"] if rho else [])
+    note, rho = "; ".join(notes) or None, 0.0
+    gg = {str(getattr(v, "group", "")): v for v in built.values() if v.kind == "group"
+          and getattr(v, "spec_id", None) == gt["id"]}
+    out = []
+    for g in sorted(set(gg) | {str(r.get(gby)) for r in rows.values()}):
+        e = dict(base, id=f"{base['id']}:{g}", group=g, by=gby, **({"note": note} if note else {}))
+        T = gg.get(g)
+        ws = (T.weights or {}) if T is not None else {}
+        tot = sum(ws.values())
+        why = (f"group {g} has no value in round {gt['id']} (not in its table, or not every unit of the group is "
+               "calibrated)" if T is None else None if all(math.isfinite(v) and v >= 0 for v in ws.values())
+               and tot > 0 else f"group {g}: the group round's weights are not finite, negative or all zero")
+        out.append(dict(e, not_computable=why) if why else dict(e, rho=rho, terms=[{gs: T.id, "w": 1.0}] + [
+            {us: f"{ut['id']}:{u}", "w": q / tot} for u, q in ws.items() if q > 0]))
     return out
 
 
@@ -1932,6 +1969,83 @@ def _self_test() -> int:
         ok(f0 == [] and any(f["kind"] == "calibration_change_inconsistent" for f in f1),
            f"JA20b errors near 1e-5 with the sd inflated by 10% are caught; the exact record is not ({f0}, {f1})")
     safe(ja20, "JA20")
+
+    def ja21():          # F6 S2-3c: a group round (own CI) and a unit round (shared offset) of one survey
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+            with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]) + ["tgt2", "w2"])
+                w.writeheader()
+                w.writerows([dict(r, tgt2=f"{float(r['tgt']) * 0.8:.5f}", w2=str(1 + n % 2)) for n, r in enumerate(rows)])
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            j["targets"][1]["survey"] = "s"
+            j["targets"].append(dict(j["targets"][0], id="unit_late", column="tgt2", window=[2, 3], bias_sd=0.3,
+                                     bias_by="region", bias_source="s"))
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            P, _ = build(spec)
+            ch = {c["group"]: c for c in P.changes if c.get("survey") == "s" and "group" in c}
+            pop = {r["id"]: float(r["pop"]) for r in rows}
+            t0 = (ch.get("r0") or {}).get("terms") or []
+            uw = {x["to"].split(":")[1]: x["w"] for x in t0 if "to" in x}
+            ok(set(ch) == {"r0", "r1", "r2"} and [x.get("from") for x in t0 if "from" in x] == ["region_t:r0"]
+               and abs(sum(uw.values()) - 1) < 1e-9 and len(uw) == 4
+               and abs(uw[min(uw)] / uw[max(uw)] - pop[min(uw)] / pop[max(uw)]) < 1e-9,
+               f"JA21a the group round minus the unit round aggregated by the group round's weights, per group ({ch})")
+            r2 = yaml.safe_load(open(p))
+            r2["calibration"]["joint"]["changes"] = {"weights": "w2"}
+            p2 = os.path.join(d, "s2.yaml")
+            yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+            c2 = [c for c in build(schema.load(p2))[0].changes if c.get("group") == "r0"][0]
+            uw2 = {x["to"].split(":")[1]: x["w"] for x in c2.get("terms") or [] if "to" in x}
+            ok(uw2 == uw and "pop" in c2.get("note", "") and "w2" in c2.get("note", ""),
+               f"JA21b weights that differ between the rounds: the group round's, stated ({c2.get('note')})")
+            r3 = yaml.safe_load(open(p))
+            r3["calibration"]["joint"]["targets"][-1]["bias_by"] = "grp"
+            yaml.safe_dump(r3, open(p2, "w"), sort_keys=False)
+            c3 = [c for c in build(schema.load(p2))[0].changes if c.get("survey") == "s"]
+            ok(c3 and all("not_computable" in c and "group" in c["not_computable"] for c in c3),
+               f"JA21c rounds grouped by different columns are not computable ({c3})")
+            rep = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            sc = {x["id"]: x for x in (rep.get("survey_changes") or {}).get("pairs") or []}
+            got = [x for x in sc.values() if x.get("survey") == "s" and "z" in x]
+            ok(len(got) == 3 and all(x["sd_parts"]["offset"] >= 0.3 - 1e-9 for x in got)
+               and expected_change_ids(spec) == set(sc),
+               f"JA21d the toy run computes each group's mixed change, the offset in full; the gate's rebuild agrees "
+               f"({[(k, x.get('z'), x.get('not_computable')) for k, x in sc.items()]})")
+    safe(ja21, "JA21")
+
+    def ja22():          # Codex r1 P2-1: changes.by cannot hide a unit round whose offsets are grouped otherwise
+        class T_:
+            def __init__(self, i, g):
+                self.id, self.kind, self.spec_id, self.group, self.weights = i, "group", "a", g, {"1": 1.0, "2": 1.0}
+        j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
+                          "key": {"csv": "region", "units": "region"}, "weights": "pop"},
+                         {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "x",
+                          "bias_by": "district", "bias_sd": 0.3}],
+             "changes": {"by": "region"}}
+        rows = {"1": {"region": "R", "district": "D0", "pop": "1"}, "2": {"region": "R", "district": "D1", "pop": "1"}}
+        got = change_pairs(j, rows, ["1", "2"], [T_("a:R", "R")], None)
+        ok(len(got) == 1 and "groups do not match" in got[0].get("not_computable", ""),
+           f"JA22 a unit round with offsets by district against a group round by region is not computable, whatever "
+           f"changes.by says ({got})")
+    safe(ja22, "JA22")
+
+    def ja23():          # Codex r2 P1: changes.sampling_correlation on a mixed pair: independent, and said so
+        class T_:
+            def __init__(self, i, g):
+                self.id, self.kind, self.spec_id, self.group, self.weights = i, "group", "a", g, {"1": 1.0}
+        j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
+                          "key": {"csv": "region", "units": "region"}, "weights": "pop"},
+                         {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "x"}],
+             "changes": {"sampling_correlation": 0.5}}
+        got = change_pairs(j, {"1": {"region": "R", "pop": "1"}}, ["1"], [T_("a:R", "R")], "region")
+        ok(len(got) == 1 and got[0].get("rho") == 0.0 and "independent" in got[0].get("note", ""),
+           f"JA23 a mixed pair combines the rounds' sampling errors as independent and states it ({got})")
+    safe(ja23, "JA23")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
