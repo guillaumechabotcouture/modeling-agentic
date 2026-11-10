@@ -265,7 +265,7 @@ class EmulatorModel:
         tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
         for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
-            cols.append(("bw", o, P))
+            cols.append(("emu", "bw", o, P))
             res.append(self.T[("bw", o, P)][ho] - self.gps[("bw", o, P)].predict(Xh))
         for P in self.pops:    # F6 S2-4: the comparator burden and every cost output too, from the same points
             for o in self.outcomes:
@@ -359,7 +359,7 @@ class EmulatorModel:
             if P not in self.pops:          # by_population(): a prediction for some groups only (Codex r3 P1)
                 continue
             e = self.gps[("bw", o, P)].predict(X)
-            e = np.exp(e + E[:, self.error.col[("bw", o, P)]] if E is not None else e)
+            e = np.exp(e + E[:, self.error.col[("emu", "bw", o, P)]] if E is not None else e)
             col = self.pops[P]["column"]
             for j in range(n):
                 b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
@@ -393,8 +393,7 @@ class EmulatorError:
         self.cols = list(cols)
         self.col = {c: j for j, c in enumerate(self.cols)}
         if len(self.col) != len(self.cols):
-            raise ValueError("emulator error: two residual columns share a key (a population group named bw whose "
-                             "package and outcome names match a burden-window column?)")
+            raise ValueError("emulator error: two residual columns share a key")
         self.R = np.asarray(R, float)
         self.H = self.R.shape[0]
         self.m = self.R.mean(0)
@@ -418,8 +417,7 @@ class EmulatorError:
             C = np.corrcoef(live.T)
             corr = float(np.median(C[~np.eye(C.shape[0], dtype=bool)]))
         def kind(c):
-            return {"base": "comparator", "cost": "cost"}[c[1]] if len(c) == 4 else \
-                "burden_window" if c[0] == "bw" else "reduction"
+            return {"base": "comparator", "cost": "cost", "bw": "burden_window"}[c[1]] if len(c) == 4 else "reduction"
         by_q = {}
         for c in self.cols:
             by_q[kind(c)] = by_q.get(kind(c), 0) + 1
