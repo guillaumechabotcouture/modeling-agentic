@@ -325,14 +325,20 @@ def _self_test() -> int:
              "empty": dict(bad, rows=[], units=0, matched=0, status="not_judged"),
              "ratio": dict(good, rows=[dict(good["rows"][0], emulator={"ratio_chosen": inf, "ratio_runner_up": 1.0})]
                           + good["rows"][1:])}
-    got = {k: [x["kind"] for x in findings(v, pr)] for k, v in cases.items()}
-    ok(findings(good, pr) == [] and [x["kind"] for x in findings(bad, pr)] == ["emulator_boundary_ranking"]
-       and findings(bad, pr)[0]["scope_declarable"]
+    ex = {u: ["a", "b"] for u in br}               # the gate's own expectation: plan units, feasible packages
+    omit = {u: e for u, e in bad["table"].items() if u != u0}       # Codex r2 P1: a failing unit dropped everywhere
+    cases.update(omit=dict(bad, table=omit, rows=bad["rows"][1:] + [], units=K - 1, matched=0),
+                 emptytab=dict(bad, table={}, rows=[], units=0, matched=0, status="not_judged"),
+                 nopkg=dict(good, table=dict(good["table"], **{u0: {"plan": "a", "ratios": {"a": 1.0}}})))
+    got = {k: [x["kind"] for x in findings(v, pr, ex)] for k, v in cases.items()}
+    ok(findings(good, pr, ex) == [] and [x["kind"] for x in findings(bad, pr, ex)] == ["emulator_boundary_ranking"]
+       and findings(bad, pr, ex)[0]["scope_declarable"]
        and all(v == ["emulator_boundary_inconsistent"] for v in got.values())
-       and [x["kind"] for x in findings(good, dict(pr, **{u0: "b"}))] == ["emulator_boundary_inconsistent"]
-       and [x["kind"] for x in findings(good, None)] == ["emulator_boundary_inconsistent"]
-       and [x["kind"] for x in findings({"units": 1}, pr)] == ["emulator_boundary_unreadable"]
-       and findings(summarise([], real, {}, 0), {}) == [],
+       and [x["kind"] for x in findings(good, dict(pr, **{u0: "b"}), ex)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings(good, None, ex)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings(good, pr, None)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings({"units": 1}, pr, ex)] == ["emulator_boundary_unreadable"]
+       and findings(summarise([], real, {}, 0), {}, {}) == [],
        f"BD4 the gate rebuilds the candidates from the recorded ratio table and the point plan: below the share is "
        f"declarable; duplicated, dropped, emptied or edited rows, another plan, or an unreadable artifact are not; "
        f"an empty table is not judged, no finding (Codex r1 P1-3): {got}")
