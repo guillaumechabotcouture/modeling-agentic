@@ -41,6 +41,11 @@ children in the catchment (cm_catchment_share x the targeted ages) while the add
 targeted ages. cm_target = 0 (the default)
 is the v0.11 add-on: all ages, from its start, severe-care access raised one for one.
 
+v0.13 (F6 S2-3 part 2): past SMC rounds may have their own mean per-round reach (SMCDelivery `covs`, from the unit's
+smc_hist_cov), apart from smc_cov, which the package's and routine SMC keep. The child's persistent latent and
+smc_rho are shared, so the same children tend to be missed in past and future rounds. smc_rounds_pmf gives the
+beta-binomial shares of rounds received, which links a survey's per-cycle and all-cycle coverage.
+
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:
   z_hh   household latent; a person's net-use latent is
@@ -542,6 +547,31 @@ def smc_protection(dt_days, e0, half, k):
     return np.where(dt >= 0.0, np.asarray(e0, float) * np.exp(-(x ** float(k)) * LN2), 0.0)
 
 
+def smc_rounds_pmf(mean, rho, n) -> list:
+    """v0.13: the share of children reached in 0..n of n rounds when each child's per-round reach is the beta
+    propensity of smc_propensity (mean `mean`, intra-child correlation `rho`): the beta-binomial pmf. Its last entry
+    is the all-rounds share that coverage surveys report beside the per-cycle mean. rho = 0 gives the binomial.
+    Rising-factorial ratios, each bounded, so neither limit of rho needs a special case (Codex r1 and r2 P3).
+    Outside smc_cov's and smc_rho's domains, or with n not a whole number >= 0, it fails closed (Codex r1 P2)."""
+    from math import comb, isfinite, prod
+
+    def num(x):
+        return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, (bool, np.bool_)) \
+            and isfinite(float(x))
+    if not num(mean) or not 0.0 < float(mean) <= 1.0:
+        raise ValueError(f"smc_rounds_pmf: mean {mean!r} must be in (0, 1]")
+    if not num(rho) or not 0.0 <= float(rho) < 1.0:
+        raise ValueError(f"smc_rounds_pmf: rho {rho!r} must be in [0, 1)")
+    if not num(n) or float(n) != int(float(n)) or int(float(n)) < 0:
+        raise ValueError(f"smc_rounds_pmf: n {n!r} must be a whole number of rounds >= 0")
+    m, n, r = float(mean), int(float(n)), float(rho)
+    # each factor (a + i) / (a + b + i) with a = m s, b = (1 - m) s, s = 1/rho - 1, multiplied through by rho: bounded
+    # by n, so no overflow near rho 1 (Codex r2 P3) and exact at rho 0
+    return [comb(n, k) * prod((m * (1.0 - r) + i * r) / ((1.0 - r) + i * r) for i in range(k))
+            * prod(((1.0 - m) * (1.0 - r) + j * r) / ((1.0 - r) + (k + j) * r) for j in range(n - k))
+            for k in range(n + 1)]
+
+
 def smc_propensity(u, mean, rho):
     """v0.11: a child's per-round SMC reach probability from its uniform latent u: the u-quantile of a beta with mean
     `mean` and intra-child correlation `rho` (a = mean s, b = (1 - mean) s, s = 1/rho - 1), so the rounds a child is
@@ -565,15 +595,20 @@ class SMCDelivery(ss.Intervention):
     v0.7: `count` False never adds doses to the cost driver (routine SMC); `after` / `before` keep only the rounds
     at decimal times after <= t < before (None: no bound).
     v0.10: `times` (optional) gives the rounds' decimal times directly (past SMC, whose rounds per year may differ);
-    None: the rounds are the month starts of `months` in `years`."""
+    None: the rounds are the month starts of `months` in `years`.
+    v0.13: `covs` (optional, one per entry of `times`) gives each round its own mean reach in place of `cov` (past
+    SMC with smc_hist_cov); None: every round at `cov`, as in v0.12."""
     def __init__(self, years=(), months=(7, 8, 9, 10), P=None, name=None, count=True, after=None, before=None,
-                 times=None):
+                 times=None, covs=None):
         super().__init__(name=name)
         self.years, self.months = list(years), list(months)
         self.set_smc(P if P is not None else dict(smc_cov=0.796, smc_rho=0.417, smc_adh=0.944, smc_e0=1.0,
                                                   smc_partial=0.910))
         self.count, self.after, self.before = count, after, before
         self.times = None if times is None else [float(t) for t in times]
+        if covs is not None and (self.times is None or len(covs) != len(self.times)):
+            raise ValueError("SMCDelivery: covs needs one mean reach per entry of times")
+        self.covs = None if covs is None else [float(c) for c in covs]
 
     def set_smc(self, P: dict) -> None:
         """The delivery's reach and dose parameters from an engine parameter dict."""
@@ -594,7 +629,12 @@ class SMCDelivery(ss.Intervention):
             u = self.sim.people.auids
             a = self.sim.people.age[u]
             e = u[(a >= 0.25) & (a < 5)]
-            pi = smc_propensity(dz.prop_smc[e], self.cov, self.rho)
+            cov = self.cov
+            if self.covs is not None:          # v0.13: this round's own mean reach (past SMC, smc_hist_cov)
+                if not hasattr(self, '_cov_ti'):
+                    self._cov_ti = {s: c for t, c in zip(self.times, self.covs) for s in _event_tis(self.sim, [t])}
+                cov = self._cov_ti[self.ti]
+            pi = smc_propensity(dz.prop_smc[e], cov, self.rho)
             got = e[dz.rs.random(len(e)) < pi]
             full = dz.rs.random(len(got)) < self.adh
             if self.count and dz.in_delivery():

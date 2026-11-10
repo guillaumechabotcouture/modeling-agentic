@@ -1523,6 +1523,52 @@ def _self_test_burden_e2e(ok, d, q):
            for x in fs) and signoff.status(d) == "signed",
        f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
        f"{sorted({x['kind'] for x in fs})}")
+    # F6 S2-5b: a model window on the emulator path; a report-only row with no published interval
+    from toolkit.engines.contract import ToyEngine, UnitSpec, Package
+    open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
+                                    "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,",
+                                    "X,r0,,cases,count,,2,1,,,estimated,synthetic X,ratio,,,REF-X,,report_only,none"])
+                         + "\n")
+    try:
+        _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev"}))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE8 a run with a model window completes: {type(e).__name__}: {e}")
+        return
+    A, by = R["_A"], {r["id"]: r for r in bv["references"]}
+    h = A.spec.horizon({BV.WINDOW: [1, 2]})
+    want = sum(ToyEngine().run(A.theta0, UnitSpec(i, {"x": R["point"]["per_unit"][i]["z"]}), Package("none", {}), h,
+                               1).windows[BV.WINDOW]["prev"] * float(A.by_id[i]["pop"]) for i in A.ids)
+    dec = R["point"]["comparator_total"]["cases"] / 3.0
+    got = by["W"]["model"]["point"]
+    ok(abs(got - want) <= 0.05 * want and abs(got - dec) > 0.1 * dec and bv["window"] == [1.0, 2.0]
+       and by["W"]["model"]["interval_from"] == "draws",
+       f"BE8 the model value is the arm's window metric over the model window ({got:.6g} vs engine {want:.6g}; "
+       f"decision-window mean {dec:.6g}), with the draws' interval")
+    fs = contract.gate_findings(d)
+    res = open(os.path.join(d, "results.md")).read()
+    ok(by["X"]["status"] == "outside" and not [x for x in fs if x["key"] == "burden:X"] and "no published interval"
+       in res and "report only" in res, f"BE8 a report-only row is reported, never a finding: {fs}")
+    # Codex S2-5b r1 P2: the emulator error reaches the window values as it reaches the reductions
+    import numpy as np
+    M, zs = R["_model"], {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    a, b, c = (M.predict(zs, A.theta0, A.ids, noise=None if s is None else np.random.default_rng(s))
+               for s in (1, 2, None))
+    w = lambda o: [o[i]["burden"]["none"]["cases"] for i in A.ids]  # noqa: E731
+    ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("bw", "cases", "all") in M.error.col,
+       "BE9 a draw with the emulator error moves the window values (a column of the error model)")
+    saved = M.pops          # Codex S2-5b r3 P1: by_population() predicts with a subset of the population groups
+    try:
+        M.pops = {}
+        got = M.predict(zs, A.theta0, A.ids)
+        err = None
+    except Exception as e:  # noqa: BLE001
+        got, err = None, e
+    finally:
+        M.pops = saved
+    ok(err is None and all("burden" not in got[i] for i in A.ids),
+       f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
 
 
 def _self_test_floors_e2e(ok, d, q):

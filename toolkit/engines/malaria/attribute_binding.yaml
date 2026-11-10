@@ -57,6 +57,9 @@ attribute_binding:
   smc_hist_rounds:
     default: "the number of the unit's SMC months"
     meaning: "each past SMC year had a round in every one of the unit's SMC months (v0.10)"
+  smc_hist_cov:
+    default: "smc_cov"
+    meaning: "past SMC rounds reach children at the engine parameter smc_cov, the coverage the package's SMC uses (v0.12 and earlier): a calibration that fits the history can then move the future coverage"
   hist_net_by_year:
     default: none
     meaning: "every past net campaign distributed the net type hist_net (v0.10)"

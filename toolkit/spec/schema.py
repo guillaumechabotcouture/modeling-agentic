@@ -102,7 +102,7 @@ docs/design/v2-spec-and-analysis.md §1):
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
-      burden: {csv, group, arm, daly_parts}   # toolkit/analysis/burden.py (reference contract and tolerances)
+      burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv
