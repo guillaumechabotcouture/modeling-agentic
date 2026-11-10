@@ -3031,7 +3031,7 @@ def _self_test() -> int:
 
 
 def _self_test_ux(ok) -> None:
-    """RU1-RU5: the UX review of 2026-11-10 (the stream opens on a summary, cards are grouped, a refresh keeps the
+    """RU1-RU6: the UX review of 2026-11-10 (the stream opens on a summary, cards are grouped, a refresh keeps the
     reader's place). RU1-RU3 run the page script in node with a stub DOM; skipped when node is not installed."""
     src = _page_sources()
     js = open(os.path.join(os.path.dirname(HTML), "run_console.js"), encoding="utf-8").read()
@@ -3057,8 +3057,8 @@ def _self_test_ux(ok) -> None:
         def run(extra, tail):
             r = {"cards": cards + extra, "state": {}, "docs": {"results.md": 1},
                  "headline": "The plan averts " + "x" * 300 + " cut"}
-            p = subprocess.run([node, "-e", stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n"
-                                f"S.run = {json.dumps(r)};\n" + tail], capture_output=True, text=True, timeout=60)
+            p = subprocess.run([node, "-"], input=stub + js + f"\nS.meta = {{ glossary: {glossary} }};\n"
+                               f"S.run = {json.dumps(r)};\n" + tail, capture_output=True, text=True, timeout=60)
             return p.stdout if p.returncode == 0 else "node failed: " + p.stderr[-300:]
         out = run([], "process.stdout.write(JSON.stringify(streamItems().map((x) => [x.kind, (x.rows || []).length])));")
         ok(out == json.dumps([["stage_run", 2], ["blocker_table", 2], ["stage_run", 1], ["figure_run", 3],
@@ -3083,6 +3083,11 @@ def _self_test_ux(ok) -> None:
        and "function setHash" in src and "replaceState" in src,
        "RU5 the gate's done-when table is folded under its counts; with chat off Record is the composer's action; "
        "the address carries the run and the view")
+    here = os.path.dirname(os.path.abspath(__file__))
+    tests = "".join(open(os.path.join(here, n), encoding="utf-8").read() for n in ("run_console.py", "dossier.py"))
+    ok('"-e", ' + "stub + js" not in tests,
+       "RU6 the self-tests give node the page scripts on stdin, not as one argument (Linux caps an argument at "
+       "128 KiB; DS4 failed in CI with 'Argument list too long' once the scripts grew past it)")
 
 
 def _page_sources() -> str:
