@@ -618,6 +618,61 @@ def _self_test_fixed(ok, attempt):
     _, e12 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D3, {"level": 0.9})
     ok(isinstance(e12, RuntimeError) and "nets" in str(e12),
        f"PV33 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
+    # Codex r1 on A6. P1: a variant left out of the draws (its pre-draw solve failed) and solved later is refused.
+    D4, _ = attempt(g_("Draws"), A, {})
+    for t in tabs:
+        attempt(lambda *a: D4.add(*a), out, [], t)
+    _, e13 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D4, {"level": 0.9})
+    ok(isinstance(e13, RuntimeError) and "nets" in str(e13),
+       f"PV34 a solved variant the draws did not follow fails closed, not published without its uncertainty ({e13!r})")
+    # P2: package-specific draw costs and outcomes; the variant's quantiles are its own plan's, not the headline's
+    from toolkit.analysis.core import q as _q
+    mult = ({"none": 1, "n1": 0.5, "n2": 2.0, "s": 1.0}, {"none": 1, "n1": 2.0, "n2": 0.5, "s": 1.5})
+    tabs2 = [{i: {k: m[k] * cost[i][k] for k in A.pk} for i in A.ids} for m in mult]
+    outs2 = [{i: {"y": {k: {"dalys": 10.0 - f * ben[i][k]} for k in A.pk}} for i in A.ids} for f in (1.0, 3.0)]
+    sp5 = solved_plans(A, ben, cost)
+    D5 = Draws(A, sp5)
+    for o_, t in zip(outs2, tabs2):
+        D5.add(o_, [], t)
+    hp5 = A.solve(ben, cost)["choice"]
+    r14, e14 = attempt(run, A, ben, cost, hp5, [], D5, {"level": 0.9})
+    n14 = {x["id"]: x for x in (r14 or {}).get("variants", [])}.get("nets") or {}
+    vp = n14.get("plan") or {}
+    want_c = [sum(t[i][vp[i]] for i in A.ids) for t in tabs2] if vp else []
+    head_c = [sum(t[i][hp5[i]] for i in A.ids) for t in tabs2]
+    want_y = [sum(o_[i]["y"]["none"]["dalys"] - o_[i]["y"][vp[i]]["dalys"] for i in A.ids) for o_ in outs2] if vp else []
+    u14 = n14.get("uncertainty") or {}
+    a14 = u14.get("affordability") or {}
+    ok(e14 is None and vp != dict(hp5) and want_c != head_c
+       and a14.get("per_draw_cost") == want_c and a14.get("fixed_plan_cost") == _q(want_c, 0.9)
+       and u14.get("averted", {}).get("dalys") == _q(want_y, 0.9)
+       and a14.get("draws_over_budget") == sum(c > A.budget * (1 + 1e-9) for c in want_c),
+       f"PV35 a solved variant's draw costs and outcomes are its own plan's, package by package ({e14!r}, "
+       f"{a14.get('per_draw_cost')} vs {want_c}, headline {head_c})")
+    # P2: the contract checks the affordability record against its own draws and the spec's rule
+    pt14 = {"headline_variant": None, "plan": dict(hp5)}
+    c0 = contract_findings(A.spec.raw, pt14, r14) if r14 else ["no record"]
+    bad_recs = []
+    for mutate in (lambda a, u: a.update(rule_met=not a["rule_met"]),
+                   lambda a, u: a.update(draws_over_budget=a["draws_over_budget"] + 1),
+                   lambda a, u: a.update(rule={"max_share_over_budget": 0.99}),
+                   lambda a, u: a.update(budget_allocatable=a["budget_allocatable"] * 2),
+                   lambda a, u: u.update(draws=u["draws"] + 1),
+                   lambda a, u: u.pop("affordability")):
+        rr = copy.deepcopy(r14 or {})
+        nr = next((x for x in rr.get("variants", []) if x.get("id") == "nets"), None)
+        if nr and nr.get("uncertainty"):
+            mutate(nr["uncertainty"].get("affordability", {}), nr["uncertainty"])
+        bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    rr = copy.deepcopy(r14 or {})
+    for x in rr.get("variants", []):
+        if x.get("id") == "nets":
+            x.pop("uncertainty", None)
+    bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    ok(c0 == [] and all(bad_recs),
+       f"PV36 a consistent record passes (rule not met included); a verdict, count, rule, budget or draw count that "
+       f"contradicts the draws, or a solved variant missing its draws, is a contract finding ({c0}, "
+       f"{[len(b) for b in bad_recs]})")
     del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
