@@ -2925,6 +2925,19 @@ def _self_test_v013(ok, e, unit) -> None:
         b = MM.smc_rounds_pmf(0.6, 0.0, 3)
         ok(all(abs(x - comb(3, i) * 0.6 ** i * 0.4 ** (3 - i)) < 1e-12 for i, x in enumerate(b)),
            "HC7b smc_rho 0 gives the binomial")
+        # Codex r1 P2: outside the propensity's domain the shares fail closed (no negative or partial distribution)
+        for args, label in (((1.2, 0.4, 4), "mean above 1"), ((0.0, 0.4, 4), "mean 0"), ((0.6, -0.1, 4), "rho < 0"),
+                            ((0.6, 1.0, 4), "rho 1"), ((0.6, 0.4, 2.9), "fractional rounds"), ((0.6, 0.4, -1), "n < 0"),
+                            ((float("nan"), 0.4, 4), "NaN mean"), ((0.6, 0.4, True), "boolean rounds")):
+            try:
+                MM.smc_rounds_pmf(*args)
+                ok(False, f"HC7c smc_rounds_pmf: {label} fails closed")
+            except ValueError:
+                ok(True, f"HC7c smc_rounds_pmf: {label} fails closed")
+        # Codex r1 P3: no cancellation just above the independent limit
+        s = sum(MM.smc_rounds_pmf(0.6, 1e-9, 4))
+        ok(abs(s - 1.0) < 1e-12 and abs(MM.smc_rounds_pmf(1.0, 0.4, 3)[-1] - 1.0) < 1e-12,
+           f"HC7d the shares sum to 1 near smc_rho 0 ({s!r}) and mean 1 reaches every child in every round")
     case("HC7", hc7)
 
 

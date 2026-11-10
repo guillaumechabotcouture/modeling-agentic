@@ -80,6 +80,72 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.13 scope: past SMC coverage apart from future coverage (F6 S2-3 part 2, critique C3; written with the v0.13 code)
+
+**Why.** From v0.10 to v0.12, past SMC rounds (`smc_hist_years`, `smc_hist_rounds`) reached children at the engine
+parameter `smc_cov`, the same coverage the package's SMC uses. A calibration that fits the history can then move
+`smc_cov`, and the allocation inherits that value for the future (F6 plan, critique C3: "intervention coverage
+absorbs history errors").
+
+**New unit attribute.** It is optional, with a default declared in `attribute_binding.yaml`.
+
+| Attribute | Format | Default | Meaning |
+|---|---|---|---|
+| `smc_hist_cov` | one share in (0, 1] for every past year, or a list with one per entry of `smc_hist_years`; units-table column: `{column: c}` for one number, or `{column, split: " ", empty: "none"}` with cells `0.62 0.81` or `none` | `smc_cov` | the mean per-round reach of the past SMC rounds of that year, among children 3–59 months |
+
+The package's SMC and routine SMC keep `smc_cov`. `smc_rho`, `smc_adh` and the protection parameters are shared by
+past and future rounds, and so is each child's persistent latent: with a lower past mean the same children are still
+the ones most often missed.
+
+**The standard model it follows.**
+
+| Part | v0.13 | Standard model it follows, or why it departs | Sources |
+|---|---|---|---|
+| Past and future coverage are separate inputs | Past rounds take their coverage from `smc_hist_cov`, from the delivery surveys of those years; the decision's rounds take `smc_cov`. | The national Nigeria EMOD model sets historical SMC (2013–2019) from post-campaign coverage surveys, and future scenarios from the plan (2019 levels in business as usual, 80% in the plan scenarios). | Ozodiegwu et al. 2023 Malar J (PMC10130303), Methods (SMC) and Fig. 5 |
+| What the input measures | The mean reach per round (per cycle) in a year. | The same model is parameterised per round ("SMC coverage per cycle, averaged across all four cycles"), with coverage "semi-correlated between rounds". Coverage surveys report per-cycle coverage and the number of cycles received. | Ozodiegwu 2023; Malaria Consortium 2021, Table 21 (v0.11) |
+| Per-cycle and all-cycle shares | One input, the per-cycle mean. The all-cycle share follows from it and `smc_rho` through the beta-binomial of v0.11: `model.smc_rounds_pmf(mean, smc_rho, n)[-1]`. At 0.796 and 0.417 with four rounds it is 0.601, against the 60.2% observed in Nigeria in 2020. | Ozodiegwu 2023 also uses the all-four-rounds share in 2018–2019 to set the size of its high-access group. In this engine the equivalent would be a second input per year, the heterogeneity (`smc_rho`) of past rounds. v0.13 does not add it: the all-cycle share is a check of `smc_rho` against each survey, not a second input. This is the simplest form the sources support. | Ozodiegwu 2023; Malaria Consortium 2021, Table 21 |
+
+**Burn-in sharing.** With past SMC, the SMC parameters stay in the burn-in key as in v0.10–v0.12. With
+`smc_hist_cov` given, the past rounds do not read `smc_cov`, so `smc_cov` leaves the key: parameter sets that
+differ only in the future coverage share one burn-in and one history. `smc_hist_cov` is a unit attribute, so it is
+part of the key.
+
+**Fail closed.** The engine refuses (ValueError, before any sim is built, and on the sim path):
+- a value outside (0, 1], NaN, a boolean or a string;
+- a list of another length than `smc_hist_years` (also a non-empty list without past years), or a list with a
+  missing value;
+- a mapping.
+
+A number given without past years is accepted and changes nothing, as `smc_hist_rounds` is.
+
+**Back-compatibility.** With `smc_hist_cov` absent, `None` or `[]`, the sim has the v0.12 interventions and gives
+byte-identical outcomes, cost drivers and meta (self-test HC3). The same holds when it equals `smc_cov`.
+`benchmarks/restamp_proof.py` compares v0.12 and v0.13 on the pack, the evidence cases, the pinned scenarios, and a
+new scenario `past_smc_v013`: past SMC in the burn-in and after the horizon start, with `smc_hist_cov` absent, and
+one member giving it as `[]`.
+
+**Tests (written first; `selftest_late.py`, section `_self_test_v013`).**
+- HC0: the card and the binding.
+- HC1: one share, or one per year, follows its year; the schedule does not change.
+- HC2: the fail-closed forms above.
+- HC3: byte identity to v0.12.
+- HC4: with `smc_hist_cov`, changing `smc_cov` (0.5 or 0.95) leaves the monthly series identical before the
+  delivery start, and changes them after it; the members share one burn-in and each equals its own run.
+- HC5: in the sim, past rounds reach `smc_hist_cov` year by year (0.35 and 0.9), and the package's rounds reach
+  `smc_cov` (0.7) whatever the past coverage.
+- HC6: the burn-in key.
+- HC7: `smc_rounds_pmf` against the v0.11 fit to Table 21, and the binomial at `smc_rho` 0.
+
+The history still changes the future through the state it leaves: the immunity and the infections at the delivery
+start. HC5 shows that the coverage of the future rounds does not change.
+
+**What this does not do (open items).**
+- The data side, done outside the repository: per-unit past coverage from the state-year delivery surveys, and the
+  calibration's use of it (S2-3: the history anchored to delivery surveys).
+- One share per year, not per round. A survey that reports coverage by cycle within a year is averaged.
+- No separate heterogeneity for past rounds. If a survey's all-cycle share is far from the one `smc_rho` predicts,
+  that is a reason to add one.
+
 ## v0.12 scope: case management as an implementable package (F6 S2-2; written with the v0.12 code)
 
 **Why.** In the F5 Nigeria run the case-management add-on `cm_add` was a fixed +0.15 to effective treatment, with no
