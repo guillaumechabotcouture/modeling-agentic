@@ -72,6 +72,14 @@ verification:
   # engine runs per unit at the best shared point: its best value of the unit parameter and values spread over the
   # rest of its non-implausible interval there; the unit passes when the engine matches at one of them
   z_points: 3
+survey_changes:
+  # F6 S2-3b: the change between two rounds of one survey, by group, at the calibrated point (a diagnostic; a flagged
+  # group is a declarable gate finding). z = (modelled change - observed change) / sd, with sd from the rounds' sampling
+  # errors as declared, the source offsets (a block both rounds share cancels) and the modelled change's paired run
+  # noise. A group is flagged when |z| exceeds z_max. 3 is the calibration's own cutoff: Pukelsheim's three-sigma rule
+  # (at least 95% of any unimodal distribution lies within 3 sd; Pukelsheim 1994 Am Stat 48:88), as used for
+  # implausibility (Vernon et al. 2010 Bayesian Anal 5:619).
+  z_max: 3.0
 blocking:
   # Units that no point of the region matches block the analysis at the calibration step, before the outcome batch.
   # The harness never pins them at a bound silently; how to treat them is the owner's decision.

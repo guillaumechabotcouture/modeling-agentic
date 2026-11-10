@@ -17,6 +17,9 @@ block (at most one per unit), not added to each target's variance (F6 S2-3; see 
 is a feasibility rule, not marginal Gaussian implausibility: a target alone may sit up to cutoff (sd_e + sd_bias)
 away (each bound at the cutoff), where integrating the offset out gives cutoff sqrt(sd_e^2 + sd_bias^2); it is
 stricter on contrasts within a block. A spec may weight each group once in the best point (best_point_weighting).
+Survey changes (F6 S2-3b, a diagnostic): Problem.changes pairs two rounds of one survey over one group's targets; the
+report gives the observed and modelled change, their signed difference and z against survey_changes.z_max
+(change_stats; the region's modelled change from the emulators). A shared offset cancels in a same-survey change.
 
 Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
 implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
@@ -240,8 +243,12 @@ class Problem:
     same length; may be empty); targets: [Target]; scales: {observable: scale}. groups: a label per unit (figures and
     the best point's weights)."""
 
-    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None):
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None,
+                 changes=None):
         self.shared = list(shared)
+        # F6 S2-3b: [{id, survey, from, to, group, rho, terms: [{from: target id, to: target id, w}]}], or an entry
+        # {id, ..., not_computable: reason} (the adapter pairs the rounds and names what cannot be compared)
+        self.changes = [dict(c) for c in changes or []]
         self.unit_param = dict(unit_param) if unit_param else None
         self.units = [str(u) for u in units]
         self.targets = list(targets)
@@ -317,10 +324,39 @@ class Problem:
                 if len(v) > 1]
         return bad
 
+    def _change_problems(self) -> list:
+        bad, tid = [], {t.id: t for t in self.targets}
+        ids = [c.get("id") for c in self.changes]
+        if len(set(ids)) != len(ids):
+            bad.append("changes: repeated ids")
+        for n, c in enumerate(self.changes):
+            w = f"change {c.get('id', n)}"
+            if "not_computable" in c:
+                if not str(c["not_computable"] or "").strip():
+                    bad.append(f"{w}: a not-computable entry states its reason")
+                continue
+            if not (isinstance(c.get("terms"), list) and c["terms"]):
+                bad.append(f"{w}: terms [{{from, to, w}}] or a not_computable reason")
+                continue
+            r = c.get("rho", 0.0)
+            if not (isinstance(r, (int, float)) and -1.0 <= r <= 1.0):
+                bad.append(f"{w}: rho {r!r} must lie in [-1, 1]")
+            for x in c["terms"]:
+                a, b = tid.get(x.get("from")), tid.get(x.get("to"))
+                if a is None or b is None:
+                    bad.append(f"{w}: {x.get('from')} -> {x.get('to')} names an unknown target")
+                elif a.kind != b.kind or a.kind not in ("unit", "group") or a.unit != b.unit:
+                    bad.append(f"{w}: {a.id} -> {b.id}: two unit targets of one unit, or two group targets")
+                elif a.observable == b.observable or a.scale != b.scale:
+                    bad.append(f"{w}: {a.id} -> {b.id}: two rounds (observables) on one scale")
+                elif not (isinstance(x.get("w"), (int, float)) and math.isfinite(x["w"]) and x["w"] > 0):
+                    bad.append(f"{w}: {a.id} -> {b.id}: weight must be > 0")
+        return bad
+
     def problems(self) -> list:
         bad = []
         th = thresholds()["history_matching"]
-        bad += self._bias_problems()
+        bad += self._bias_problems() + self._change_problems()
         for p in self.shared:
             bad += p.problems()
         if len(set(self.names)) != len(self.names):
@@ -549,6 +585,51 @@ class SharedEmulator:
         if not noise:
             v = np.maximum(v - self.tn, 1e-12)
         return m, v
+
+
+def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
+    """F6 S2-3b: the change between two rounds over one group's terms [{from, to, w}] (target ids; w a unit's share of
+    the group). Observed and modelled change on the targets' scale (sum of w (to - from)); z = (modelled - observed) / sd.
+    sd: the rounds' sampling errors (correlation rho, as declared), the source offsets with signed coefficients (a block
+    both rounds share cancels, offsets of different sources add) and `run_var`, the modelled change's run noise (paired:
+    one trajectory gives both rounds). Model discrepancy is left out: it is declared per target as a level error, and
+    the change is the check the levels cannot make. Not computable: a missing modelled value, or no declared error."""
+    obs = mod = obs_n = mod_n = vs = vo = 0.0
+    coef, bsd = {}, {}
+    for x in terms:
+        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
+        ma, mb = modelled.get(a.id), modelled.get(b.id)
+        if ma is None or mb is None:
+            return {"not_computable": f"no modelled value at the calibrated point for {a.id if ma is None else b.id}"}
+        obs += w * (b.y - a.y)
+        mod += w * (mb - ma)
+        obs_n += w * (b.value - a.value)
+        mod_n += w * (float(inv(mb, b.scale)) - float(inv(ma, a.scale)))
+        vs += w * w * (a.sd_obs ** 2 + b.sd_obs ** 2 - 2.0 * rho * a.sd_obs * b.sd_obs)
+        for t, sg in ((a, -1.0), (b, 1.0)):
+            if t.bias_key is None:
+                vo += (w * t.sd_bias) ** 2
+            else:
+                coef[t.bias_key] = coef.get(t.bias_key, 0.0) + sg * w
+                bsd[t.bias_key] = t.sd_bias
+    vo += sum((c * bsd[k]) ** 2 for k, c in coef.items() if abs(c) > 1e-12)
+    vs, run_var = max(vs, 0.0), max(float(run_var), 0.0)
+    sd = math.sqrt(vs + vo + run_var)
+    if not sd > 1e-12:
+        return {"not_computable": "the change has no declared error (no sampling error, and the survey's offset cancels)"}
+    z = (mod - obs) / sd
+    so = math.sqrt(vs + vo)
+    ratio = mod_n / obs_n if so > 0 and abs(obs) >= so and obs_n != 0 else None
+    word = "decline" if obs_n < 0 else "rise"
+    nums = f"({mod_n:+.3g} against {obs_n:+.3g} observed)"
+    text = (f"the observed change ({obs_n:+.3g}) is within its error of zero; the model's change is {mod_n:+.3g}"
+            if ratio is None else f"the model's change has the opposite sign of the observed one {nums}" if ratio < 0
+            else f"the model's {word} is {100 * (1 - ratio):.0f}% smaller than observed {nums}" if ratio < 1
+            else f"the model's {word} is {100 * (ratio - 1):.0f}% larger than observed {nums}")
+    return {"observed": obs, "modelled": mod, "observed_natural": obs_n, "modelled_natural": mod_n,
+            "difference": mod - obs, "sd": sd, "sd_parts": {"sampling": math.sqrt(vs), "offset": math.sqrt(vo),
+                                                            "run": math.sqrt(run_var)},
+            "z": z, "flagged": bool(abs(z) > z_max), "ratio": ratio, "text": text}
 
 
 def standardised_errors(sim, mean, var) -> np.ndarray:
@@ -1882,6 +1963,7 @@ class HistoryMatch:
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
                 "verification": ver, "bias": bias, "bias_components": bcomp,
+                "survey_changes": self._survey_changes(ver, best_c, zbest, smp),
                 "weighting": {"best_point": self.th.get("best_point_weighting", "per_unit"),
                               "bias_draws": int(self.th["bias_draws"])},
                 "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
@@ -1889,6 +1971,101 @@ class HistoryMatch:
                               "shared": {ob: {"kernel": str(e.gp.kernel_)} for ob, e in self.em["shared"].items()}},
                 "thresholds": {"history_matching": self.th, "emulator": self.eth, "blocking": self.bth},
                 "sample": smp}
+
+    # ----------------------------------------------------------------------- survey changes (F6 S2-3b)
+    def _pair_noise(self, oa, ob) -> float:
+        """The run-noise variance of ob - oa within one run: the nugget of an emulator of the paired difference itself,
+        so the covariance of the two windows of one trajectory is in it (Var(b) + Var(a) - 2 Cov(a, b))."""
+        cache = self.__dict__.setdefault("_pair_tn", {})
+        if (oa, ob) not in cache:
+            rows = [r for r in self.data.unit if oa in r["obs"] and ob in r["obs"]]
+            S = np.array([r["s"] for r in rows])
+            T = np.array([r["t"] for r in rows]).reshape(len(rows), self.p)
+            d = tr([r["obs"][ob] for r in rows], self.P.scales[ob]) - tr([r["obs"][oa] for r in rows], self.P.scales[oa])
+            em = UnitEmulator(self.p, self.P.features, float(self.eth["ridge"])).fit([r["unit"] for r in rows], S, T, d)
+            cache[(oa, ob)] = float(em.tn)
+        return cache[(oa, ob)]
+
+    def _change_run_var(self, terms) -> float:
+        """The modelled change's run noise over the terms: paired within each unit; a group target's members are
+        independent runs, each counted with its weight on the aggregate's scale (a linear approximation)."""
+        if not self.th["include_run_noise"]:
+            return 0.0
+        v = 0.0
+        for x in terms:
+            a, b, w = self.tid[x["from"]], self.tid[x["to"]], float(x["w"])
+            ta, tb = self.em["unit"][a.observable].tn, self.em["unit"][b.observable].tn
+            c = 0.5 * (ta + tb - self._pair_noise(a.observable, b.observable))
+            if a.kind == "unit":
+                v += w * w * (ta + tb - 2.0 * c)
+                continue
+            sa, sb = sum(a.weights.values()), sum(b.weights.values())
+            for u in set(a.weights) | set(b.weights):
+                wa, wb = a.weights.get(u, 0.0) / sa, b.weights.get(u, 0.0) / sb
+                v += w * w * (wb * wb * tb + wa * wa * ta - 2.0 * wa * wb * c)
+        return max(v, 0.0)
+
+    def _change_modelled(self, tid, ver, best_c, zbest):
+        """A target's modelled value on its scale at the best point: the engine's verification run, else the emulator."""
+        t = self.tid[tid]
+        if ver is not None:
+            if t.kind == "unit":
+                row = next((x for x in (ver["units"].get(t.unit) or {}).get("targets") or [] if x["target"] == tid), None)
+                v = None if row is None else row["simulated"]
+            else:
+                v = (ver["targets"].get(tid) or {}).get("simulated")
+            return None if v is None else float(tr(v, t.scale))
+        if t.kind == "unit":
+            return float(self.em["unit"][t.observable].predict(t.unit, [self.zg[zbest[t.unit]]], np.atleast_2d(
+                self.state["C"][best_c]).reshape(1, self.p), noise=False)[0][0])
+        return float(self.state["targets"][tid]["mean"][best_c])
+
+    def _region_change(self, terms, smp):
+        """The modelled change over the region sample's rows (emulator means): its 2.5%, 50% and 97.5% points."""
+        R, col = np.asarray(smp["rows"], float), {n: i for i, n in enumerate(smp["names"])}
+        T = np.column_stack([(R[:, j] - p.lo) / (p.hi - p.lo) for j, p in enumerate(self.P.shared)]) if self.p else \
+            np.zeros((len(R), 0))
+        lo, hi = self.P.unit_param["lo"], self.P.unit_param["hi"]
+        cache = {}
+
+        def mean(u, ob):
+            if (u, ob) not in cache:
+                cache[(u, ob)] = self.em["unit"][ob].predict(u, (R[:, col[f"z:{u}"]] - lo) / (hi - lo), T, noise=False)[0]
+            return cache[(u, ob)]
+
+        def val(tid):
+            t = self.tid[tid]
+            if t.kind == "unit":
+                return mean(t.unit, t.observable)
+            ws = sum(t.weights.values())
+            return tr(sum(w / ws * inv(mean(u, t.observable), t.scale) for u, w in t.weights.items()), t.scale)
+        D = sum(float(x["w"]) * (val(x["to"]) - val(x["from"])) for x in terms)
+        return [float(v) for v in np.percentile(D, [2.5, 50, 97.5])]
+
+    def _survey_changes(self, ver, best_c, zbest, smp) -> dict:
+        """Each declared change pair at the best point (change_stats), with its modelled range over the region."""
+        zmax = float(thresholds()["survey_changes"]["z_max"])
+        pairs = []
+        for c in self.P.changes:
+            base = {k: c[k] for k in ("id", "survey", "from", "to", "group", "by") if k in c}
+            if "not_computable" in c:
+                pairs.append(dict(base, not_computable=str(c["not_computable"])))
+                continue
+            mod = {x[k]: self._change_modelled(x[k], ver, best_c, zbest) for x in c["terms"] for k in ("from", "to")}
+            st = change_stats(c["terms"], self.tid, mod, self._change_run_var(c["terms"]), float(c.get("rho", 0.0)),
+                              zmax)
+            if "z" in st:
+                st["basis"] = "engine verification at the best point" if ver else "emulator mean at the best point"
+                if smp and self.P.unit_param:
+                    st["modelled_region"] = dict(zip(("q025", "median", "q975"), self._region_change(c["terms"], smp)))
+            pairs.append(dict(base, n_terms=len(c["terms"]), rho=float(c.get("rho", 0.0)), **st))
+        comp = [p for p in pairs if "z" in p]
+        return {"status": "computed" if comp else "not_computable", "z_max": zmax,
+                **({} if comp else {"reason": "; ".join(sorted({p["not_computable"] for p in pairs}))
+                                    or "no change pairs are declared"}),
+                "statistic": "z = (modelled change - observed change) / sd on the targets' scale; sd from sampling "
+                             "(as declared), offsets (shared ones cancel) and paired run noise, not discrepancy",
+                "pairs": pairs, "flagged": [p["id"] for p in comp if p["flagged"]]}
 
     def sample(self, n: int, seed: int | None = None) -> dict:
         """n rows over the region: shared values drawn from the accepted candidates by prior weight, each unit's

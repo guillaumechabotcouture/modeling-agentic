@@ -20,9 +20,17 @@ The spec field (signed with the spec; without it nothing changes):
         discrepancy_sd: 0.1           # model discrepancy sd of every target on its scale (a target may override)
         seed, waves, points_per_unit, shared_points   # optional; defaults in toolkit/calibration/thresholds.yaml
         best_point_weighting: per_unit | per_group    # optional (default per_unit): per_group counts each group once
+        changes: {by, weights, sampling_correlation}  # optional (F6 S2-3b): how the change between two rounds of one
+                                      # survey is compared by group: by a units column (default the survey's bias_by,
+                                      # else decision_units.region), units weighted by a column (default equally),
+                                      # the rounds' sampling errors correlated as declared (default 0). Declaring it
+                                      # makes a pair that cannot be computed a gate finding; without it the pairs are
+                                      # still computed and recorded
         targets:
           - {id, kind: unit, column, window: [a, b], metric, scale, sd | sd_column | ci_columns: [lo, hi] |
              n_column, bias_sd, bias_by, bias_source, discrepancy_sd, source}
+             # survey: the survey a round belongs to (default bias_source when bias_by is set); its rounds are
+             # paired by group (F6 S2-3b, survey_changes in the artifact)
              # bias_by: a units column (e.g. the region); bias_sd is then one offset per survey (bias_source,
              # default the target id) and group, shared by the group's units and the survey's targets (F6 S2-3)
           - {id, kind: group, csv, filter: {col: value}, key: {csv: col, units: col}, value, multiplier,
@@ -111,9 +119,17 @@ def spec_problems(spec) -> list[str]:
         bad.append(f"{w}: needs analysis.evaluation emulator")
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
                            "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
-                           "best_point_weighting"})
+                           "best_point_weighting", "changes"})
     if unk:
         bad.append(f"{w}: unknown keys {unk}")
+    ch = j.get("changes")
+    if ch is not None:
+        if not (isinstance(ch, dict) and set(ch) <= {"by", "weights", "sampling_correlation"}):
+            bad.append(f"{w}.changes: a mapping {{by, weights, sampling_correlation}}")
+        else:
+            rho = ch.get("sampling_correlation", 0.0)
+            if not (_isnum(rho) and -1.0 <= rho <= 1.0):
+                bad.append(f"{w}.changes.sampling_correlation: a number in [-1, 1]")
     if j.get("best_point_weighting", "per_unit") not in ("per_unit", "per_group"):
         bad.append(f"{w}.best_point_weighting: per_unit (the default) or per_group")
     sh = j.get("shared")
@@ -131,6 +147,9 @@ def spec_problems(spec) -> list[str]:
         cols = set(spec.units()[0]) if spec.units() else set()
     except (OSError, KeyError) as e:
         return bad + [f"{w}: the units table is unreadable ({e})"]
+    for q in ("by", "weights"):
+        if isinstance(ch, dict) and q in ch and ch[q] not in cols:
+            bad.append(f"{w}.changes.{q}: no units column {ch[q]!r}")
     for f in j.get("features") or []:
         c = f if isinstance(f, str) else (f.get("column") if isinstance(f, dict) else None)
         if c not in cols:
@@ -236,6 +255,8 @@ def spec_problems(spec) -> list[str]:
                 bad.append(f"{tw}: survey {src!r} is declared with two bias_sd or bias_by values ({other})")
         elif "bias_source" in t:
             bad.append(f"{tw}.bias_source: needs bias_by")
+        if "survey" in t and not _text(t["survey"]):
+            bad.append(f"{tw}.survey: the survey's name (text)")
         if k == "unit":
             c = t.get("column", cal.get("target_column"))
             if c not in cols:
@@ -583,9 +604,119 @@ def build(spec, units=None) -> tuple:
     reg = spec.raw["decision_units"].get("region")
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
-                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None)
+                   groups={i: rows[i].get(reg, "") for i in ids} if reg else None,
+                   changes=change_pairs(j, rows, ids, targets, reg))
     rec = [_observable(r, wins) for r in j.get("record") or []]
     return P, {"windows": wins, "dropped": dropped, "units": ids, "record": rec}
+
+
+# --------------------------------------------------------------------------- survey changes (F6 S2-3b)
+def _survey(t):
+    return t.get("survey") or (t.get("bias_source", t["id"]) if t.get("bias_by") else None)
+
+
+def _round_mismatch(a, b):
+    """Why two rounds of one survey cannot be compared (their definitions differ), or None."""
+    if a["kind"] != b["kind"]:
+        return f"definitions differ: {a['id']} is a {a['kind']} target, {b['id']} a {b['kind']} target"
+    for q, dflt in (("metric", None), ("scale", "logit")):
+        if a.get(q, dflt) != b.get(q, dflt):
+            return f"definitions differ: {q} {a.get(q, dflt)!r} and {b.get(q, dflt)!r}"
+    if [float(x) for x in a["window"]] == [float(x) for x in b["window"]]:
+        return "the two rounds have the same window"
+    if a["kind"] == "unit" and a.get("column") == b.get("column"):
+        return f"the two rounds read one column ({a.get('column')})"
+    if a["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
+            (b.get("key") or {}).get("units"), b.get("weights")):
+        return "definitions differ: the rounds aggregate over different groupings or weights"
+    return None
+
+
+def change_pairs(j, rows, ids, targets, reg) -> list:
+    """F6 S2-3b: each pair of rounds of one survey (targets with the same survey, by window), one entry per group:
+    unit rounds by the group column (changes.by, the survey's bias_by, else the region), each unit weighted (changes.
+    weights, else equally); group rounds by their group. What cannot be compared is an entry with its reason."""
+    ch = j.get("changes") or {}
+    rho = float(ch.get("sampling_correlation", 0.0))
+    series = {}
+    for t in j["targets"]:
+        if t["kind"] in ("unit", "group") and _survey(t):
+            series.setdefault(_survey(t), []).append(t)
+    if not series:
+        return [{"id": "*", "not_computable": "no unit or group target names its survey (survey, or bias_source with "
+                                              "bias_by), so no rounds can be paired"}]
+    built = {tg.id: tg for tg in targets}
+    out = []
+    for s, ts in sorted(series.items()):
+        ts = sorted(ts, key=lambda t: float(t["window"][0]))
+        if len(ts) < 2:
+            out.append({"id": s, "survey": s, "not_computable": f"a single round ({ts[0]['id']})"})
+        for n, a in enumerate(ts):
+            for b in ts[n + 1:]:
+                base = {"id": f"{s}:{a['id']}->{b['id']}", "survey": s, "from": a["id"], "to": b["id"]}
+                why = _round_mismatch(a, b)
+                by = ch.get("by") or a.get("bias_by") or reg if a["kind"] == "unit" else (a.get("key") or {}).get("units")
+                if why or not by:
+                    out.append(dict(base, not_computable=why or "no group column (changes.by, bias_by or the region)"))
+                    continue
+                if a["kind"] == "unit":
+                    grp = {}
+                    for i in ids:
+                        grp.setdefault(str(rows[i][by]), []).append(i)
+                    for g, us in sorted(grp.items()):
+                        wt = {i: float(rows[i][ch["weights"]]) if ch.get("weights") else 1.0 for i in us}
+                        tot = sum(v for v in wt.values() if v > 0)
+                        e = dict(base, id=f"{base['id']}:{g}", group=g, by=by)
+                        out.append(dict(e, rho=rho, terms=[{"from": f"{a['id']}:{i}", "to": f"{b['id']}:{i}",
+                                                            "w": wt[i] / tot} for i in us if wt[i] > 0])
+                                   if tot > 0 else dict(e, not_computable="the group's units have no positive weight"))
+                    continue
+                ga, gb = ({k[len(t["id"]) + 1:]: k for k, v in built.items() if v.kind == "group"
+                           and k.startswith(t["id"] + ":")} for t in (a, b))
+                for g in sorted(set(ga) | set(gb)):
+                    e = dict(base, id=f"{base['id']}:{g}", group=g, by=by)
+                    out.append(dict(e, rho=rho, terms=[{"from": ga[g], "to": gb[g], "w": 1.0}]) if g in ga and g in gb
+                               else dict(e, not_computable=f"group {g} has no value in round {b['id'] if g in ga else a['id']}"
+                                                           " (not in its table, or not every unit of the group is "
+                                                           "calibrated)"))
+    return out
+
+
+def _cf(kind, claim, key, declarable):
+    return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
+            "key": key, "scope_declarable": declarable, "source": PRODUCER}
+
+
+def change_findings(raw, data) -> list:
+    """Gate findings of the survey-change diagnostic in analysis/joint_calibration.yaml (F6 S2-3b). A flagged group is
+    declarable (the gap is declared with its reason); a missing or malformed record, another threshold, or a flag its
+    numbers do not give is not (fail closed). A pair that cannot be computed is a finding only when the spec asks for
+    the diagnostic (calibration.joint.changes); it is recorded either way."""
+    F = "analysis/joint_calibration.yaml"
+    sc = data.get("survey_changes") if isinstance(data, dict) else None
+    zmax = float(HM.thresholds()["survey_changes"]["z_max"])
+    if not (isinstance(sc, dict) and isinstance(sc.get("pairs"), list) and sc.get("z_max") == zmax):
+        return [_cf("calibration_change_unrecorded", f"{F} records no survey-change diagnostic at the threshold "
+                    f"z_max {zmax:g} (survey_changes)", "survey_changes", False)]
+    asked = isinstance(raw, dict) and ((raw.get("calibration") or {}).get(FIELD) or {}).get("changes") is not None
+    out = []
+    for p in sc["pairs"]:
+        pid = str(p.get("id")) if isinstance(p, dict) else "?"
+        if isinstance(p, dict) and _text(p.get("not_computable")):
+            if asked:
+                out.append(_cf("calibration_change_not_computable", f"survey change {pid}: not computable: "
+                                                                    f"{p['not_computable']}", f"change:{pid}", True))
+            continue
+        z, d, sd = (p.get(k) for k in ("z", "difference", "sd")) if isinstance(p, dict) else (None,) * 3
+        if not (_isnum(z) and _isnum(d) and _isnum(sd) and sd > 0 and abs(z - d / sd) <= 1e-6 * max(1.0, abs(z))
+                and p.get("flagged") is (abs(z) > zmax)):
+            out.append(_cf("calibration_change_inconsistent", f"{F}: survey change {pid}: its flag or z does not follow "
+                                                              "from its numbers", f"change:{pid}", False))
+        elif p["flagged"]:
+            out.append(_cf("calibration_change_discrepancy", (
+                f"survey {p.get('survey')}, {p.get('from')} to {p.get('to')}, group {p.get('group')}: {p.get('text')} "
+                f"(z {z:+.2f}; flagged beyond {zmax:g})"), f"change:{pid}", True))
+    return out
 
 
 # --------------------------------------------------------------------------- simulation
