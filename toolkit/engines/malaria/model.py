@@ -171,6 +171,9 @@ class Malaria(ss.Disease):
         self.mos = [dict(S=M * sh * 0.97, I=M * sh * 0.03, q=np.zeros(G['eip'])) for _, sh, _ in self.mix]
         n = len(self.timevec)
         self.daily = {k: np.zeros(n) for k in DAILY}
+        # v0.14: per age group (AGES order) and day, expected severe episodes, expected deaths and people: the window
+        # metrics severe_<g> and deaths_<g>. Kept apart from `daily`, which the start-state hash covers
+        self.wdaily = {k: np.zeros((3, n)) for k in ('severe', 'deaths', 'pop')}
         self.acc = {k: np.zeros(3) for k in ('cases', 'severe', 'deaths', 'pdays', 'treated')}
         self.acc_cost = dict(smc_doses=0.0, irs_sprayed=0.0, nets_given=0.0, pdays_all=0.0)
         # v0.6: treatments and person-days in the delivery period (the treatment cost driver); the same terms in the
@@ -389,24 +392,32 @@ class Malaria(ss.Disease):
         if self._month() in p.smc_months:
             e = (age_d >= 91) & (age_d < 5 * 365)
             dd['inc_u5_smc'][ti] = clin[(a_i >= 91) & (a_i < 5 * 365)].sum() / max(e.sum(), 1)
+        # v0.14: expected severe episodes and deaths of today's new infections, and people, by age group, every day
+        # (no random draw), for the window metrics; the decision window's accumulators add the same values
+        ag = np.where(age_d < 5 * 365, 0, np.where(age_d < 15 * 365, 1, 2))
+        agi = ag[newinf]
+        pt = min(1.0, P['severe_access_add'] + p.ft)
+        cfr = (1 - pt) * P['cfr_severe_untreated'] + pt * P['cfr_severe_treated']
+        cfr_i = None
+        if tgt and self.cm_gain > 0 and P['cm_severe_link'] > 0:
+            # v0.12: severe-care access rises only through the declared link, in the targeted ages
+            pti = np.where(in_t, cm_severe_access(P['severe_access_add'], p.ft, P['cm_severe_link'], self.cm_gain,
+                                                  P['cm_catchment_share']), pt)
+            cfr_i = (1 - pti) * P['cfr_severe_untreated'] + pti * P['cfr_severe_treated']
+        wd = self.wdaily
+        for g in range(3):
+            m = agi == g
+            wd['severe'][g, ti] = theta[m].sum()
+            wd['deaths'][g, ti] = theta[m].sum() * cfr if cfr_i is None else (theta[m] * cfr_i[m]).sum()
+            wd['pop'][g, ti] = (ag == g).sum()
         if self.in_window():
-            ag = np.where(age_d < 5 * 365, 0, np.where(age_d < 15 * 365, 1, 2))
-            agi = ag[newinf]
-            pt = min(1.0, P['severe_access_add'] + p.ft)
-            cfr = (1 - pt) * P['cfr_severe_untreated'] + pt * P['cfr_severe_treated']
-            cfr_i = None
-            if tgt and self.cm_gain > 0 and P['cm_severe_link'] > 0:
-                # v0.12: severe-care access rises only through the declared link, in the targeted ages
-                pti = np.where(in_t, cm_severe_access(P['severe_access_add'], p.ft, P['cm_severe_link'], self.cm_gain,
-                                                      P['cm_catchment_share']), pt)
-                cfr_i = (1 - pti) * P['cfr_severe_untreated'] + pti * P['cfr_severe_treated']
             for g in range(3):
                 m = agi == g
                 self.acc['cases'][g] += clin[m].sum()
                 self.acc['treated'][g] += treat[m].sum()
-                self.acc['severe'][g] += theta[m].sum()
-                self.acc['deaths'][g] += theta[m].sum() * cfr if cfr_i is None else (theta[m] * cfr_i[m]).sum()
-                self.acc['pdays'][g] += (ag == g).sum()
+                self.acc['severe'][g] += wd['severe'][g, ti]
+                self.acc['deaths'][g] += wd['deaths'][g, ti]
+                self.acc['pdays'][g] += wd['pop'][g, ti]
             self.acc_cost['pdays_all'] += n
             if self.in_delivery():         # the delivery period lies inside the window (the engine checks it)
                 for g in range(3):

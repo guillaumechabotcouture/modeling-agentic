@@ -106,6 +106,12 @@ rounds; the package's and routine SMC keep the parameter smc_cov. With it, smc_c
 the burn-in key, so a calibration can fit the history without moving the coverage the allocation uses. smc_rho and the
 child's persistent latent are shared by past and future rounds. Absent or empty, a run is byte-identical to v0.12
 (self-test HC3; benchmarks/restamp_proof.py). Self-tests HC0-HC7 (selftest_late.py).
+
+v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, so a burden check can compare a past window.
+For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are the expected severe episodes and
+deaths of the window's new clinical infections per person of the group, over its mean population in the window:
+the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
+v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W2 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -134,7 +140,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.13"
+VERSION = "0.14"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -536,7 +542,8 @@ class MalariaEngine:
                                     "years from itn_hist_years; others hist_net (default none)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
-                                                      "net_use", "net_access"],
+                                                      "net_use", "net_access"]
+                     + [f"{k}_{g}" for k in ("severe", "deaths") for g in AGES + ["all"]],    # v0.14
                      "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
                      # v0.12: produced only with cm_target 1; the spec validator refuses a mapping to one otherwise
                      "cost_drivers_when": {"cm_child_years": {"cm_target": 1.0},
@@ -1021,7 +1028,7 @@ class MalariaEngine:
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
                 try:
-                    dz.daily, dz.mos = {}, []
+                    dz.daily, dz.mos, dz.wdaily = {}, [], {}
                     s.shrink(size_limit=None, die=False)   # Starsim keeps finished sims alive: drop their people and loop
                 except Exception:  # noqa: BLE001 -- best effort; the outcomes are already computed
                     pass
@@ -1088,6 +1095,14 @@ class MalariaEngine:
                 "inc_all": float(d["inc_all"][sel].sum()), "inc_u5_smc": float(d["inc_u5_smc"][sel].sum()),
                 "eir_annual": float(d["eir"][sel].sum() / dur),
                 "net_use": float(d["net_use"][sel].mean()), "net_access": float(d["net_access"][sel].mean())})
+            # v0.14: severe episodes and deaths per person of each age group (and of all ages) over the window,
+            # counted as the per-capita outcomes are: the window's total over the group's mean population in it
+            nd, wd = max(int(sel.sum()), 1), dz.wdaily
+            for k in ("severe", "deaths"):
+                tot, pop = wd[k][:, sel].sum(axis=1), wd["pop"][:, sel].sum(axis=1) / nd
+                for i, g in enumerate(AGES):
+                    wins[name][f"{k}_{g}"] = float(tot[i] / pop[i]) if pop[i] > 0 else 0.0
+                wins[name][f"{k}_all"] = float(tot.sum() / pop.sum()) if pop.sum() > 0 else 0.0
         # v0.6: treatments in the delivery period per mean person in it (the add-on and its funding end there); the
         # delivery accumulators equal the window ones when the period is the window
         d0, d1 = delivery_period(horizon)
