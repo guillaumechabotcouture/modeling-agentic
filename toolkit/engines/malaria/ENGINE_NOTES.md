@@ -134,7 +134,9 @@ one member giving it as `[]`.
 - HC5: in the sim, past rounds reach `smc_hist_cov` year by year (0.35 and 0.9), and the package's rounds reach
   `smc_cov` (0.7) whatever the past coverage.
 - HC6: the burn-in key.
-- HC7: `smc_rounds_pmf` against the v0.11 fit to Table 21, and the binomial at `smc_rho` 0.
+- HC7: `smc_rounds_pmf` against the v0.11 fit to Table 21, and the binomial at `smc_rho` 0; HC7c–d (Codex round
+  1): it fails closed outside the domains of `smc_cov` and `smc_rho` or with a round count that is not a whole number
+  ≥ 0, and its shares sum to 1 just above `smc_rho` 0.
 
 The history still changes the future through the state it leaves: the immunity and the infections at the delivery
 start. HC5 shows that the coverage of the future rounds does not change.

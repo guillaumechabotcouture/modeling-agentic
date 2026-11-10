@@ -2938,6 +2938,12 @@ def _self_test_v013(ok, e, unit) -> None:
         s = sum(MM.smc_rounds_pmf(0.6, 1e-9, 4))
         ok(abs(s - 1.0) < 1e-12 and abs(MM.smc_rounds_pmf(1.0, 0.4, 3)[-1] - 1.0) < 1e-12,
            f"HC7d the shares sum to 1 near smc_rho 0 ({s!r}) and mean 1 reaches every child in every round")
+        # Codex r2 P3: no overflow near smc_rho 1 with many rounds
+        from math import nextafter
+        hi = MM.smc_rounds_pmf(0.6, nextafter(1.0, 0.0), 20)
+        ok(all(np.isfinite(hi)) and abs(sum(hi) - 1.0) < 1e-9 and abs(hi[-1] - 0.6) < 1e-6 and abs(hi[0] - 0.4) < 1e-6,
+           f"HC7e near smc_rho 1 the shares stay finite and approach all-or-none (0.4 none, 0.6 all: "
+           f"{hi[0]:.6f}, {hi[-1]:.6f})")
     case("HC7", hc7)
 
 
