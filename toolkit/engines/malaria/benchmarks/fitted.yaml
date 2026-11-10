@@ -1,12 +1,12 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.11'
-  code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
-  params_sha256: 507912ed97660d905d0cfa2ed2e898383a3debc37858c68be18ddaa18d6ecfbb
-  config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3
+  version: '0.12'
+  code_sha256: defb2d87b65f8210f7f04ec413687eaaf50104f3637975556d4e3cce675abbd5
+  params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
+  config_sha256: 04b9eedeaec5d5f1bce0674f816a6f5890dd1fa751368bd61cfb440256a33398
 engine: toolkit.engines.malaria.engine:MalariaEngine
-engine_version: '0.11'
+engine_version: '0.12'
 fitted_at: '2026-11-05 17:51:22'
 seeds:
 - 11
@@ -309,3 +309,78 @@ design:
     - 0.3173
     - 0.6717
     - 0.4097
+restamped:
+  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+  proof_identical: true
+  scope:
+    pack_settings:
+    - benin
+    - ce_ref
+    - ce_res
+    - cochrane_itn
+    - eir_1
+    - eir_10
+    - eir_100
+    - eir_3
+    - eir_30
+    - eir_300
+    - irs_added
+    - misungwi
+    - muleba
+    - sahel_smc
+    pack_arms: every arm of each setting, in one run_batch per setting and seed
+    seeds:
+    - 11
+    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
+      sensitivity the card's 4000
+    burnin_years: the card's (50), the pack's own
+    evidence_cases:
+    - - equilibration
+      - - 3.5
+        - base
+        - burnin_years: 50
+        - 1
+    - - equilibration
+      - - 28.0
+        - doubled
+        - burnin_years: 100
+        - 1
+    - - equilibration
+      - - 9.0
+        - guess_hi
+        - burnin_years: 50
+          init_eir_per_m0: 2.4
+        - 2
+    - - guess_sensitivity
+      - - 3.5
+        - x1
+        - 1
+        - 50
+    - - guess_sensitivity
+      - - 28.0
+        - x0.25
+        - 2
+        - 50
+    scenarios:
+      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+      heterogeneous: 5 members, seed 23, delivery None
+      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
+    not_repeated: calibration-grid runs (same code path at other attribute values)
+    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+      dicts exactly
+  old_engine_version: '0.11'
+  proof_script_commit: 1b0c74ff6aa4a0a0aab3f83f56f247642abaef1d
+  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
+    is pending.
+  confirmation:
+    validate_once: pending
+    evidence: null
+  old_identity:
+    name: malaria-starsim
+    version: '0.11'
+    code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
+    params_sha256: 507912ed97660d905d0cfa2ed2e898383a3debc37858c68be18ddaa18d6ecfbb
+    config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3

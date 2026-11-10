@@ -88,6 +88,16 @@ with probability smc_adh (Table 16) and is cleared of blood-stage infection, and
 E0 exp(-(t/L)^k ln2) from the dose (smc_e0, smc_half, smc_k; Burgert 2022 Table 1), E0 x smc_partial after the day-1
 dose only (Cairns 2022). smc_pe and smc_hi_frac are gone. Not byte-identical where SMC acts, so the benchmark
 evidence is recomputed (validate_once.sh). Self-tests Q0-Q6 (selftest_late.py).
+
+v0.12 (F6 S2-2): case management as an implementable package (ENGINE_NOTES.md, v0.12), with the fixed parameter
+cm_target = 1. The add-on (`cm` component; cm_add, the gain inside the iCCM catchment, x cm_catchment_share) raises
+effective treatment only in ages [cm_age_lo_m, cm_age_hi_m) months (default 2-59 months, the iCCM age band), ramped in
+linearly over cm_ramp_years from the delivery start; severe-care access rises only by cm_severe_link x the add-on's
+realised gain (default 0: no source gives a value). Two conditional cost drivers (card outputs.cost_drivers_when):
+cm_child_years (child-years in the catchment, cm_catchment_share x the targeted ages, while the package's add-on runs,
+per person; charged even at cm_add 0; priced by CM_COST_ITEMS, Collins 2014's recurrent total) and treated_cm_ages
+(treated episodes in those ages, every arm). With cm_target 0 (the default) a run is byte-identical to v0.11
+(self-test C6; benchmarks/restamp_proof.py). Self-tests C0-C11 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -116,7 +126,21 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.11"
+VERSION = "0.12"
+# v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
+ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
+ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
+OO = "Oo et al. 2019 Malar J (PMC6683427)"
+# v0.12 (Codex r1 P2-3): the CM cost recipe. Collins et al. 2014 (Table 3) recurrent cost per child 2-59 months in the
+# catchment per year (2010-2012 US$; 2.07-10.26 across seven countries; central 5) is a total that already includes
+# medicines and supplies (3-26% of it), so it is charged on cm_child_years with no separate ACT / RDT item on the
+# same component; its `includes` make toolkit/alloc/costs.py refuse one (self-test C10). Start-up ($202-352 per CHW)
+# is a per_unit item the spec adds from its CHW count per unit.
+CM_COST_ITEMS = [
+    {"id": "cm_recurrent", "component": "cm", "value": 5.0, "price_year": 2012, "price_rule": "index",
+     "basis": "per_outcome", "outcome": "cm_child_years",
+     "includes": ["management", "supervision", "chw_recurrent", "medicines", "supplies"]},
+]
 # v0.11: SMC sources (ENGINE_NOTES.md, v0.11)
 MC20 = ("Malaria Consortium 2021, Quantitative report on SMC supported by Malaria Consortium in 2020: coverage and "
         "quality in Burkina Faso, Chad, Nigeria, and Togo")
@@ -169,7 +193,33 @@ _PARAMS = [
      "protective efficacy 79.8% (33.7-93.8) with SP+AQ on day 1 only vs 87.7% with all three doses; 79.8 / 87.7. "
      "Assumption (Codex r1 P2-5): the ratio of two 30-day clinical PEs is applied as a multiplier on the initial "
      "infection-blocking efficacy, with the same decay and clearance", "unverified"),
-    ("cm_add", 0.15, "scenario", "probability", None, None, A8 + " (enhanced CM: +0.15 effective treatment)", "unverified"),
+    # v0.12: the point value stays 0.15 (v0.11 outputs unchanged); a run sets its own value and range in the spec
+    ("cm_add", 0.15, "scenario", "probability", 0.0, 0.40, "enhanced CM, absolute gain in effective treatment. With "
+     "cm_target 1 it is the gain inside the iCCM catchment, children 2-59 months (the unit-wide gain is cm_add x "
+     "cm_catchment_share): ACT among confirmed cases +17 points, " + ORESANYA + "; appropriate treatment of the three "
+     "iCCM illnesses +33 points, " + ISIGUZO + "; home management RR 1.89 (1.60-2.22) on appropriate treatment, " + OO
+     + "; range about +0.15 to +0.40; 0 is the no-effect scenario. v0.11 and cm_target 0: a unit-wide gain for all "
+     "ages, 0.15 (attempt 8 value, no source)", "unverified"),
+    ("cm_catchment_share", 0.3, "fixed", "share", 0.2, 0.5, "share of the unit's children 2-59 months inside the iCCM "
+     "catchment (cm_target 1). It scales the effect (unit-wide gain cm_add x share) and the children charged "
+     "(cm_child_years) alike, because Collins et al. 2014 J Glob Health (iCCM costing tool, Table 3) price per child "
+     "within catchments. Assumption: iCCM in Nigeria serves hard-to-reach communities 5 km or more from a facility "
+     "(" + ORESANYA + "); no unit-level data; 0.2-0.5 assumed", "unverified"),
+    ("cm_target", 0.0, "fixed", "switch", None, None, "v0.12 model switch: 1 = the case-management package (targeted "
+     "ages, ramp, severe-care link, its cost drivers); 0 = the v0.11 add-on (all ages, from the delivery start, "
+     "severe-care access raised one for one), kept so earlier results reproduce exactly", "unverified"),
+    ("cm_age_lo_m", 2.0, "fixed", "months", None, None, "iCCM in Nigeria treats children 2-59 months (" + ORESANYA
+     + "; " + ISIGUZO + ")", "unverified"),
+    ("cm_age_hi_m", 60.0, "fixed", "months", None, None, "upper end (exclusive) of the iCCM age band, 2-59 months "
+     "(as cm_age_lo_m); ages 5 and over get no gain", "unverified"),
+    ("cm_ramp_years", 2.5, "fixed", "years", 2.0, 3.0, "assumption from programme timing: the RAcE endline gains "
+     "were measured about three years after the start (2014 to February 2017; " + ORESANYA + "; " + ISIGUZO + "), so "
+     "the gain ramps in linearly over 2-3 years from the delivery start", "unverified"),
+    ("cm_severe_link", 0.0, "fixed", "share", 0.0, 1.0, "share of the add-on's gain in uncomplicated effective "
+     "treatment that also raises severe-care access; no published estimate was found: " + OO + " pools no "
+     "severe-malaria outcome, and iCCM refers severe cases rather than treating them. Default 0 (conservative): the "
+     "add-on changes deaths only through transmission and post-treatment prophylaxis. 1 = the v0.11 one-for-one link",
+     "unverified"),
     ("cfr_severe_treated", 0.10, "fixed", "probability", None, None, "AQUAMAT (attempt 8 C48)", "unverified"),
     ("cfr_severe_untreated", 0.30, "fixed", "probability", None, None, "assumption (attempt 8 C49)", "unverified"),
     ("severe_access_add", 0.25, "fixed", "probability", None, None, A8 + " (severe-care access above CM)", "unverified"),
@@ -200,6 +250,7 @@ MIN_START_YEAR = 1900.0
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
 POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC_PARAM_NAMES, "cm_add",
+                       *M.CM_PARAM_NAMES,
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
@@ -425,7 +476,8 @@ class MalariaEngine:
                 "biting heterogeneity correlated with net non-use",
                 "ITN x IRS redundancy from shared indoor target, diversion and correlated coverage (no interaction factor)",
                 "SMC (v0.11: beta-propensity reach, adherence, clearance at dosing, Weibull protection against infection); "
-                "case management (effective treatment)",
+                "case management (effective treatment); v0.12 with cm_target 1: the add-on in declared ages (default "
+                "2-59 months) with a linear ramp, severe-care access raised only through cm_severe_link (default 0)",
                 "delivery period distinct from the outcome window: components act and cost drivers count only in "
                 "delivery years; routine net campaigns after the package's campaign in every arm (v0.6)",
                 "routine SMC in every arm after the delivery period, uncharged (v0.7)",
@@ -458,6 +510,9 @@ class MalariaEngine:
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
                                                       "net_use", "net_access"],
                      "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
+                     # v0.12: produced only with cm_target 1; the spec validator refuses a mapping to one otherwise
+                     "cost_drivers_when": {"cm_child_years": {"cm_target": 1.0},
+                                           "treated_cm_ages": {"cm_target": 1.0}},
                      "series": {k: dict(v) for k, v in SERIES.items()}},
             age_groups=AGES,
             valid_ranges={"m0": [0.2, 400], "resistance": [0.1, 1.0], "cm_ft": [0.0, 0.95], "eir_annual": [0.1, 300]},
@@ -615,7 +670,8 @@ class MalariaEngine:
     def _plan(self, P: dict, a: dict, components: dict, horizon: Horizon) -> dict:
         """The package's component settings and the decimal years at which they first act (from delivery_plan)."""
         dp = self.delivery_plan(a, components, horizon)
-        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "net": dp["net"], "smc": dp["smc"],
+        return {"cm_add": P["cm_add"] if dp["cm"]["on"] else 0.0, "cm_on": dp["cm"]["on"], "net": dp["net"],
+                "smc": dp["smc"],
                 "irs": dp["irs"], "events": dp["fork_events"]}
 
     def schedule(self, params, unit: UnitSpec, package: Package, horizon: Horizon) -> list:
@@ -710,6 +766,7 @@ class MalariaEngine:
                              f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
                              "so the population would not grow: shorten the burn-in or move the horizon")
         M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
+        M.cm_check(P)                                # v0.12: and the case-management options
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
         season = np.asarray(a.get("season", [1.0] * 12), float)
@@ -763,6 +820,7 @@ class MalariaEngine:
         if dz is not None:
             dz.P = dict(P)
         itv["cm"].add = float(cfg["cm_add"])
+        itv["cm"].pkg = bool(cfg.get("cm_on", False))    # v0.12: the package has the add-on (its cost drivers)
         net, smc, irs = itv["itn_new"], itv["smc"], itv["irs"]
         net.years = list(cfg["net"]["years"]) if cfg["net"] else []
         net.code = V.NET_CODE[cfg["net"]["net_type"]] if cfg["net"] else V.NET_CODE["pyr"]
@@ -893,6 +951,7 @@ class MalariaEngine:
         for p, u, k in zip(param_sets, units, pkgs):
             P = resolve_params(self, p)
             M.smc_check(P)          # v0.11: every member, not only the one whose parameters build the shared burn-in
+            M.cm_check(P)           # v0.12: likewise
             a = dict(u.attributes)
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
@@ -1003,6 +1062,12 @@ class MalariaEngine:
         tot_treated = float(dz.acc_del_treated.sum() / max(dz.acc_cost["pdays_del"] / ndel, 1e-9))
         cd = {"nets_given": float(dz.acc_cost["nets_given"]), "smc_doses": float(dz.acc_cost["smc_doses"]),
               "irs_sprayed": float(dz.acc_cost["irs_sprayed"]), "treated_all": tot_treated}
+        if P.get("cm_target"):
+            # v0.12: per mean person in the delivery period, as treated_all: child-years in the targeted ages while the
+            # package's add-on runs (the per-child cost), and treated episodes in those ages (commodities)
+            den = max(dz.acc_cost["pdays_del"] / ndel, 1e-9)
+            cd["cm_child_years"] = float(dz.acc_cm[0] * P["cm_catchment_share"] / 365.0 / den)   # in the catchment
+            cd["treated_cm_ages"] = float(dz.acc_cm[1] / den)
         if capped is None:
             capped = bool(getattr(self, "_access_capped", False))
         return Outcomes(per_capita=pc, windows=wins, cost_drivers=cd,
@@ -2438,6 +2503,227 @@ def _self_test_v011(ok, e, unit) -> None:
     case("Q6", q6)
 
 
+def _self_test_v012(ok, e, unit) -> None:
+    """v0.12 (F6 S2-2): case management as an implementable package (ENGINE_NOTES.md, v0.12). With cm_target = 1 the
+    add-on raises effective treatment only in the declared ages (default 2-59 months), ramps in linearly over
+    cm_ramp_years from the delivery start, raises severe-care access only through cm_severe_link (default 0), and the
+    engine reports the children covered and the treated episodes in those ages. cm_target = 0 is the v0.11 add-on."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    new = ("cm_target", "cm_age_lo_m", "cm_age_hi_m", "cm_ramp_years", "cm_severe_link", "cm_catchment_share")
+    v11 = {"nets_given", "smc_doses", "irs_sprayed", "treated_all"}
+    drv = {"cm_child_years", "treated_cm_ages"}
+
+    def c0():
+        sp = {p.name: p for p in e.parameters()}
+        want = {"cm_target": 0.0, "cm_age_lo_m": 2.0, "cm_age_hi_m": 60.0, "cm_ramp_years": 2.5, "cm_severe_link": 0.0,
+                "cm_catchment_share": 0.3}
+        got = {k: sp[k].value for k in want if k in sp and sp[k].kind == "fixed"}
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 12) and got == want and set(new) <= POST_FORK,
+           f"C0 engine v0.12: the case-management options are fixed card parameters acting after the fork ({got})")
+        ok("no published" in sp["cm_severe_link"].source and "Oresanya" in sp["cm_add"].source
+           and sp["cm_add"].kind == "scenario" and (sp["cm_add"].lo, sp["cm_add"].hi) == (0.0, 0.40)
+           and "Collins" in sp["cm_catchment_share"].source,
+           "C0b cm_add stays a scenario parameter with a sourced range; cm_severe_link says no estimate was found")
+        from toolkit.spec.priors import load_card
+        mc = load_card(e)
+        outs = e.describe().outputs
+        ok(mc["problems"] == [] and set(new) <= set(mc["fixed"]) and not drv & set(outs["cost_drivers"])
+           and outs.get("cost_drivers_when") == {d: {"cm_target": 1.0} for d in sorted(drv)},
+           f"C0c priors.yaml gives each new parameter a reason; the card lists the new cost drivers as produced only "
+           f"with cm_target 1 (cost_drivers_when; the contract test checks cost_drivers in every run) {mc['problems'][:2]}")
+    case("C0", c0)
+
+    def c1():
+        r = [M.cm_ramp(y, 2020.0, 2.0) for y in (2019.0, 2020.0, 2021.0, 2022.0, 2023.0)]
+        ok(r == [0.0, 0.0, 0.5, 1.0, 1.0] and M.cm_ramp(2020.0, 2020.0, 0.0) == 1.0,
+           f"C1 the ramp is linear from the delivery start over cm_ramp_years, 1 after it, a step at 0 years ({r})")
+    case("C1", c1)
+
+    hz = Horizon(2016.0, 2018.0, (2017.0, 2018.0), {"w": [2017.0, 2018.0]})
+    uu = UnitSpec("t", dict(unit.attributes, m0=20.0, itn_hist_years=[], campaign_year=2017.0, cm_ft=0.3))
+    base = {"n_agents": 3000, "burnin_years": 1, "cm_add": 0.3}
+    pk = [Package("none", {}), Package("cm", {"cm": 1})]
+
+    def ratio(o, g, num="treated", den="cases"):
+        return o.per_capita[num][g] / max(o.per_capita[den][g], 1e-12)
+
+    def cfr(P, pt):
+        return (1 - pt) * P["cfr_severe_untreated"] + pt * P["cfr_severe_treated"]
+
+    def c2():
+        P = resolve_params(e, base)
+        o0, o1 = e.run_batch([base] * 2, uu, pk, hz, 5)
+        ok(set(o1.cost_drivers) == v11 and ratio(o1, "15p") > ratio(o0, "15p") + 0.2,
+           f"C2 cm_target absent: the v0.11 add-on (all ages: treated share 15+ {ratio(o0, '15p'):.3f} -> "
+           f"{ratio(o1, '15p'):.3f}; cost drivers {sorted(o1.cost_drivers)})")
+        want = cfr(P, min(1.0, P["severe_access_add"] + 0.6))
+        ok(all(abs(ratio(o1, g, "deaths", "severe") - want) < 1e-6 for g in AGES),
+           "C2b cm_target absent: severe-care access rises one for one with the add-on (v0.11)")
+    case("C2", c2)
+
+    tp = dict(base, cm_target=1, cm_ramp_years=0, cm_catchment_share=1.0)
+
+    def c3():
+        P = resolve_params(e, tp)
+        o0, o1 = e.run_batch([tp] * 2, uu, pk, hz, 5)
+        gu5 = ratio(o1, "u5") - ratio(o0, "u5")
+        ok(0.2 < gu5 < 0.32 and all(abs(ratio(o1, g) - ratio(o0, g)) < 0.06 for g in ("5_14", "15p")),
+           f"C3 cm_target 1: the add-on raises effective treatment under 5 only (gain u5 {gu5:.3f}; 5-14 "
+           f"{ratio(o0, '5_14'):.3f} -> {ratio(o1, '5_14'):.3f}; 15+ {ratio(o0, '15p'):.3f} -> {ratio(o1, '15p'):.3f})")
+        want = cfr(P, min(1.0, P["severe_access_add"] + 0.3))
+        ok(all(abs(ratio(o, g, "deaths", "severe") - want) < 1e-6 for o in (o0, o1) for g in AGES),
+           "C3b cm_severe_link 0 (default): severe-care access does not move with the add-on")
+        q = dict(tp, cm_severe_link=1.0)
+        l0, l1 = e.run_batch([q] * 2, uu, pk, hz, 5)
+        ok(ratio(l1, "u5", "deaths", "severe") < want - 0.02 and all(
+            abs(ratio(l1, g, "deaths", "severe") - want) < 1e-6 for g in ("5_14", "15p")),
+           f"C3c cm_severe_link 1: severe-care access rises only in the targeted ages "
+           f"(u5 CFR {ratio(l1, 'u5', 'deaths', 'severe'):.4f} vs {want:.4f})")
+        q2 = dict(tp, cm_age_hi_m=180.0)
+        _, w1 = e.run_batch([q2] * 2, uu, pk, hz, 5)
+        ok(ratio(w1, "5_14") > ratio(o0, "5_14") + 0.15, "C3d the targeted ages come from cm_age_lo_m / cm_age_hi_m")
+    case("C3", c3)
+
+    def c4():
+        o0, full = e.run_batch([tp] * 2, uu, pk, hz, 6)
+        ramp = e.run_batch([dict(tp, cm_ramp_years=1.0)], uu, pk[1], hz, 6)[0]
+        f = (ratio(ramp, "u5") - ratio(o0, "u5")) / max(ratio(full, "u5") - ratio(o0, "u5"), 1e-9)
+        ok(0.3 < f < 0.7, f"C4 a ramp over the whole window gives about half the gain ({f:.3f})")
+    case("C4", c4)
+
+    def c5():
+        o0, o1 = e.run_batch([tp] * 2, uu, pk, hz, 5)
+        z = e.run_batch([dict(tp, cm_add=0.0)], uu, pk[1], hz, 5)[0]
+        sh = o1.meta["age_shares"]["u5"]
+        ok(drv <= set(o0.cost_drivers) and o0.cost_drivers["cm_child_years"] == 0.0
+           and 0.85 * sh < o1.cost_drivers["cm_child_years"] <= sh + 1e-9
+           and o1.cost_drivers["treated_cm_ages"] > o0.cost_drivers["treated_cm_ages"] > 0,
+           f"C5 cost drivers: children 2-59 months covered per person-year {o1.cost_drivers['cm_child_years']:.4f} "
+           f"(u5 share {sh:.4f}; 0 without the add-on) and treated episodes in the targeted ages "
+           f"({o0.cost_drivers.get('treated_cm_ages')} -> {o1.cost_drivers.get('treated_cm_ages')})")
+        ok(z.cost_drivers["cm_child_years"] == o1.cost_drivers["cm_child_years"] and z.per_capita == o0.per_capita
+           and z.windows == o0.windows and {k: z.cost_drivers[k] for k in v11 | {"treated_cm_ages"}}
+           == {k: o0.cost_drivers[k] for k in v11 | {"treated_cm_ages"}},
+           "C5b an add-on with cm_add 0 is still charged for the children it covers and changes no health outcome, "
+           "window metric or other cost driver")
+        # Codex r1 P2-4: the catchment share scales the effect and the children charged alike
+        h = e.run_batch([dict(tp, cm_catchment_share=0.4)], uu, pk[1], hz, 5)[0]
+        ok(abs(h.cost_drivers["cm_child_years"] - 0.4 * o1.cost_drivers["cm_child_years"]) < 1e-12
+           and ratio(o0, "u5") < ratio(h, "u5") < ratio(o1, "u5") - 0.1,
+           f"C5c cm_catchment_share 0.4: child-years charged are 0.4 x the targeted ages' "
+           f"({h.cost_drivers['cm_child_years']:.4f} vs {o1.cost_drivers['cm_child_years']:.4f}) and the gain is "
+           f"diluted (treated share u5 {ratio(o0, 'u5'):.3f} / {ratio(h, 'u5'):.3f} / {ratio(o1, 'u5'):.3f})")
+    case("C5", c5)
+
+    def c6():
+        a = e.run_batch([base, base], uu, pk, hz, 5)
+        b = e.run_batch([dict(base, cm_target=1)] * 2, uu, pk, hz, 5)
+        ok(a[0].per_capita == b[0].per_capita and a[0].windows == b[0].windows
+           and {k: b[0].cost_drivers[k] for k in v11} == a[0].cost_drivers,
+           "C6 without the add-on, cm_target 1 gives the v0.11 outputs exactly (plus the two new cost drivers)")
+        mix = [base, tp, dict(tp, cm_severe_link=0.5)]
+        bm = e.run_batch(mix, uu, pk[1], hz, 5)
+        solo = [e.run(q, uu, pk[1], hz, 5) for q in mix]
+        strip = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        ok([o.meta["burnin_members"] for o in bm] == [3] * 3 and [strip(o) for o in bm] == [strip(o) for o in solo],
+           "C6b members sharing one burn-in each act with their own case-management options")
+    case("C6", c6)
+
+    def c7():
+        bad = []
+        for over in ({"cm_target": 0.5}, {"cm_age_lo_m": 60.0}, {"cm_age_hi_m": float("nan")}, {"cm_ramp_years": -1.0},
+                     {"cm_severe_link": 1.5}, {"cm_add": 1.2}, {"cm_add": -0.1}, {"cm_catchment_share": 0.0},
+                     {"cm_catchment_share": 1.5}):
+            k = next(iter(over))
+            q = dict(tp, n_agents=200, **over) if k != "cm_target" else dict(base, n_agents=200, **over)
+            try:
+                e.run(q, uu, pk[1], hz, 1)
+                bad.append(over)
+            except ValueError as ex:
+                if k not in str(ex):
+                    bad.append((over, str(ex)[:60]))
+        ok(not bad, f"C7 out-of-domain case-management options fail closed, naming the parameter (accepted: {bad})")
+    case("C7", c7)
+
+    # Codex r1 P3: deterministic, hand-counted boundary cases of the pure functions Malaria.step and
+    # CaseManagement.step use
+    def c8():
+        # Codex r2 P2-1: signatures (age, ft, within-catchment gain, catchment share, ages); share 1 here
+        a = np.array([0.0, 60.8, 60.84, 1000.0, 1824.9, 1825.0, 4000.0])       # 2 months = 60.833 d, 60 = 1825 d
+        pft, in_t = M.cm_treat_prob(a, 0.3, 0.2, 1.0, 2.0, 60.0)
+        ok(in_t.tolist() == [False, False, True, True, True, False, False]
+           and np.allclose(pft, [0.3, 0.3, 0.5, 0.5, 0.5, 0.3, 0.3], atol=1e-15),
+           f"C8 the gain starts at exactly 2 months and stops at exactly 60 months ({in_t.tolist()})")
+        days = np.arange(0.0, 2000.0)                                          # one child ageing day by day
+        ok(int(M.cm_treat_prob(days, 0.3, 0.2, 1.0, 2.0, 60.0)[1].sum()) == 1825 - 61,
+           "C8b a child ageing from birth gets the gain on days 61-1824 of life only (1,764 days, hand count)")
+        ok(float(M.cm_treat_prob(np.array([100.0]), 0.9, 0.2, 1.0, 2.0, 60.0)[0][0]) == 0.95,
+           "C8c effective treatment is capped at 0.95")
+        sv = [float(M.cm_severe_access(0.25, 0.3, 1.0, g, 1.0)) for g in (0.0, 0.2)]
+        sat = [float(M.cm_severe_access(0.25, 0.7, k, 0.2, 1.0)) for k in (1.0, 0.5, 0.2)]
+        ok(np.allclose(sv, [0.55, 0.75], atol=1e-15) and sat[:2] == [1.0, 1.0] and abs(sat[2] - 0.99) < 1e-12,
+           f"C8d severe-care access = access + cm_ft + link x gain, saturating at 1 ({sv}, {sat})")
+        g = [M.cm_gain_at(y, 0.3, 2020.0, 2021.0, 2.5, True) for y in (2019.9, 2020.0, 2020.5, 2020.999, 2021.0)]
+        ok(np.allclose(g, [0.0, 0.0, 0.06, 0.3 * 0.999 / 2.5, 0.0], atol=1e-12)
+           and M.cm_gain_at(2020.5, 0.3, 2020.0, 2021.0, 2.5, False) == 0.0
+           and abs(M.cm_gain_at(2023.0, 0.3, 2020.0, None, 2.5, True) - 0.3) < 1e-15,
+           f"C8e delivery stopping before the ramp completes ends the gain at the stop; no package, no gain ({g})")
+        # Codex r2 P2-1: partial coverage caps inside the catchment first, then weights by the share
+        t = float(M.cm_treat_prob(np.array([100.0]), 0.8, 0.4, 0.3, 2.0, 60.0)[0][0])
+        sc = float(M.cm_severe_access(0.25, 0.7, 1.0, 0.2, 0.3))
+        ok(abs(t - 0.845) < 1e-12 and abs(sc - (0.7 * 0.95 + 0.3 * 1.0)) < 1e-12,
+           f"C8f partial coverage: treatment 0.7 x 0.8 + 0.3 x min(0.95, 0.8 + 0.4) = 0.845 ({t:.4f}); severe-care "
+           f"access 0.7 x 0.95 + 0.3 x min(1, 1.15) = 0.965 ({sc:.4f}); capping after averaging gives 0.92 and 1")
+        ok(float(M.cm_treat_prob(np.array([100.0]), 0.3, 0.0, 0.3, 2.0, 60.0)[0][0]) == 0.3,
+           "C8g a zero gain leaves treatment at cm_ft exactly")
+    case("C8", c8)
+
+    def c9():
+        from toolkit.engines.horizon import DeliveryHorizon
+        q = dict(tp, n_agents=1500, cm_catchment_share=0.5)
+        short = DeliveryHorizon(2016.0, 2018.0, (2017.0, 2018.0), {"d": [2017.0, 2018.0]}, delivery=(2017.0, 2018.0))
+        long_ = DeliveryHorizon(2016.0, 2019.0, (2017.0, 2019.0), {"d": [2017.0, 2018.0], "after": [2018.0, 2019.0]},
+                                delivery=(2017.0, 2018.0))
+        s0, s1 = e.run_batch([q] * 2, uu, pk, short, 8)
+        l0, l1 = e.run_batch([q] * 2, uu, pk, long_, 8)
+        ok(s1.cost_drivers == l1.cost_drivers and s0.cost_drivers == l0.cost_drivers and s1.windows["d"] == l1.windows["d"]
+           and l1.cost_drivers["cm_child_years"] > 0,
+           "C9 a longer outcome window: the cost drivers count only the delivery period, and the delivery year's "
+           "outcomes are unchanged")
+    case("C9", c9)
+
+    def c10():
+        from toolkit.alloc import costs as C
+        spec = {"units": {"id": "id", "populations": {"total": "pop"}}, "components": {"cm": {}},
+                "packages": {"none": [], "cm": ["cm"]},
+                "prices": {"base_year": 2024, "index": {"2012": 229.6, "2024": 313.7}},
+                "cost_items": [dict(it) for it in CM_COST_ITEMS]}
+        extra = {"id": "cm_act_rdt", "component": "cm", "value": 0.9, "price_year": 2024, "price_rule": "index",
+                 "basis": "per_outcome", "outcome": "treated_cm", "incremental": True,
+                 "includes": ["medicines", "supplies"]}
+        bad = C.validate(dict(spec, cost_items=spec["cost_items"] + [extra]))
+        ok(C.validate(spec) == [] and any("double count" in b and "cm_act_rdt" in b for b in bad)
+           and all(it["outcome"] == "cm_child_years" for it in CM_COST_ITEMS if it["basis"] == "per_outcome"),
+           f"C10 the documented CM cost recipe (Collins 2014 recurrent total, medicines and supplies included) "
+           f"validates, and a separate ACT/RDT charge on the same component is refused as a double count ({bad[:1]})")
+    case("C10", c10)
+
+    def c11():
+        from toolkit.engines.conditional_drivers import check
+
+        class Small(MalariaEngine):
+            def run(self, params, unit, package, horizon, seed):
+                return super().run(dict({"n_agents": 400, "burnin_years": 0}, **params), unit, package, horizon, seed)
+        probs = check(Small(), uu, pk[1], Horizon(2016.0, 2017.0, (2016.5, 2017.0), {"w": [2016.5, 2017.0]}), 2)
+        ok(probs == [], f"C11 the conditional cost drivers pass the conditional-driver contract test {probs}")
+    case("C11", c11)
+
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
@@ -2478,6 +2764,10 @@ def write_card(path: str) -> None:
     if os.path.exists(fp):
         f = yaml.safe_load(open(fp)) or {}
         card["fit_rule"] = f.get("fit_rule")
+    card["cm_cost_recipe"] = {"items": CM_COST_ITEMS, "range_per_child_year": [2.0, 5.0, 10.0],
+                              "source": "Collins et al. 2014 J Glob Health, iCCM costing tool, Table 3 (recurrent, "
+                                        "including medicines and supplies; per child 2-59 months within catchments)",
+                              "not_charged_separately": "ACT and RDT per treated episode (inside the recurrent total)"}
     yaml.safe_dump(card, open(path, "w"), sort_keys=False, width=110)
 
 

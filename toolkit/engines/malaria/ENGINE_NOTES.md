@@ -1,12 +1,15 @@
-# Malaria engine v0.11: benchmark notes
+# Malaria engine v0.12: benchmark notes
 
-Engine `malaria-starsim` v0.11 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.12 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.12 numbers are v0.11's.** v0.12 adds the case-management package (section below). It acts only when a run sets
+`cm_target = 1`, and the pack and the evidence do not. `benchmarks/restamp_proof.py` compared v0.11 (bb5cd80) and v0.12 (54db16e) and found 23 of 23 cases identical: the 14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and the 4 pinned scenarios, three of which include case-management arms (one with `cm_add` 0.25). The proof ran locally (Python 3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v012-4`). The identity fields of the four evidence files were then re-stamped; their `validate_once.sh` confirmation is pending. The evidence itself is stale for other reasons (F6 S1-2 benchmark bands: refit and re-run required), and F6 refits after this PR.
 
 **v0.11 numbers are recomputed.** v0.11 changes the SMC mechanism (section below). Every evidence file was recomputed by
 `bash toolkit/engines/malaria/benchmarks/validate_once.sh 16 12` on one Coiled VM (16 vCPU, 64 GiB; cluster 2331751,
@@ -76,6 +79,39 @@ with a delivery period, routine nets and SMC, boundary dates and heterogeneous b
 Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
+
+## v0.12 scope: case management as an implementable package (F6 S2-2; written with the v0.12 code)
+
+**Why.** In the F5 Nigeria run the case-management add-on `cm_add` was a fixed +0.15 to effective treatment, with no
+source. It applied to all ages from the first day of the delivery period. The same rise also lifted severe-care
+access one for one (`pt = min(1, severe_access_add + ft)`). Deaths drive the objective, so that link mattered most
+(F6 plan, critique C2 and C7).
+
+**What changes (with `cm_target = 1`).** `cm_target = 0` is the default and keeps v0.11 exactly.
+
+| Part | v0.12 | Standard model it follows, or why it departs | Sources |
+|---|---|---|---|
+| Uncomplicated treatment | A clinical episode is effectively treated with probability `cm_ft`, plus the add-on's gain if the person's age is in [`cm_age_lo_m`, `cm_age_hi_m`) months (default 2–59). The total is capped at 0.95. The draws are the same as in v0.11. | Griffin et al. 2010 and 2014: a clinical episode is treated with probability ft. The national Nigeria EMOD model (Ozodiegwu et al. 2023) takes effective treatment from ACT use among febrile children under 5 and assumes adults get the same. v0.12 departs from that for the add-on only: iCCM in Nigeria treats children 2–59 months. | Griffin 2010 PLoS Med 10.1371/journal.pmed.1000324; Ozodiegwu 2023 Malar J (PMC10130303); Oresanya 2019 J Glob Health (PMC6594663); Isiguzo 2019 J Glob Health Rep |
+| Size of the gain (`cm_add`, scenario) | With `cm_target = 1`, the absolute gain in effective treatment *inside the iCCM catchment*. The unit-wide gain is `cm_add` × `cm_catchment_share`. The card keeps 0.15 as its point value, so v0.11 runs are unchanged. The card range is [0, 0.40]. A run sets its value and range in the spec (S1-4). | Inside iCCM catchments the gain was about +0.15 to +0.40: ACT among confirmed cases +17 points (Niger State); appropriate treatment of all three iCCM illnesses +33 points (Abia); RR 1.89 on appropriate treatment for home management of malaria. Zero for ages 5 and over. | Oresanya 2019 Tables 5–6; Isiguzo 2019 Table 7; Oo et al. 2019 Malar J (PMC6683427) |
+| Catchment share (`cm_catchment_share`, default 0.3, card range 0.2–0.5) | The share of the unit's children aged 2–59 months who live inside the iCCM catchment. **One share scales both the effect and the cost.** Inside the catchment, treatment is min(0.95, `cm_ft` + `cm_add`) and severe-care access is capped at 1. The unit value is the share-weighted mean, (1 − s) × `cm_ft` + s × min(0.95, `cm_ft` + `cm_add`): the caps apply before the weighting (Codex round 2; with `cm_ft` 0.8, `cm_add` 0.4 and s 0.3 it is 0.845, not 0.92). `cm_child_years` counts share × the targeted ages, so a partial-coverage effect is never charged as coverage of the whole unit. There is no persistent catchment membership: the weighting is an expected value per episode. | iCCM in Nigeria serves hard-to-reach communities 5 km or more from a facility, a minority of a unit's children. Collins 2014 prices recurrent cost per child *within catchments*. There are no unit-level data, so 0.2–0.5 is an assumption. Derived unit-wide gains of 0.03 / 0.07 / 0.15 correspond, for example, to 0.15 × 0.2, 0.25 × 0.3 and 0.30 × 0.5. | Oresanya 2019; Collins et al. 2014 J Glob Health (iCCM costing tool, Table 3) |
+| Ramp (`cm_ramp_years`, default 2.5) | The gain rises linearly from 0 at the delivery start to its full value after `cm_ramp_years`, then stays there (`model.cm_ramp`). 0 is a step. | No published ramp form. The RAcE endline gains were measured about three years after the start (2014 to February 2017). The national EMOD scenarios also raise case management gradually, at the historical rate. Linear over 2–3 years is our assumption. | Oresanya 2019; Isiguzo 2019; Ozodiegwu 2023 |
+| Severe-care access (`cm_severe_link`, default 0) | Access is `severe_access_add` + `cm_ft`, plus, inside the catchment and in the targeted ages, `cm_severe_link` × the add-on's capped gain; access is capped at 1 inside the catchment and then weighted by the catchment share. With the default 0 the add-on does not move it. | The national EMOD model sets severe case management on its own (49% in every LGA), apart from uncomplicated treatment. v0.12 follows that separation. No source we found estimates how much of an iCCM gain reaches severe care: Oo 2019 pools no severe-malaria outcome, and iCCM refers severe cases rather than treating them. So the default is 0 (conservative). Deaths then fall only through less transmission and post-treatment prophylaxis. 1 reproduces the v0.11 link in the targeted ages. | Ozodiegwu 2023; Oo 2019 |
+| Cost drivers and their prices | `cm_child_years`: child-years inside the catchment (share × the targeted ages) while the package's add-on runs, per person, over the delivery period. It is charged even at `cm_add` 0, because the programme still runs. `treated_cm_ages`: treated episodes in the targeted ages per person, in every arm. It is a diagnostic and is not priced under the recipe below. Both appear only with `cm_target = 1`, so the card lists them under `outputs.cost_drivers_when`. A predicate may name only a `fixed` (structural) parameter. The spec validator refuses a mapping to one unless `cm_target` is 1 at the point value, in every range or prior, and in every decision test. `toolkit/engines/conditional_drivers.py` checks that each one is present and finite under its predicate. | **Recipe (one choice, no double count).** Collins 2014's recurrent cost per child aged 2–59 months in the catchment per year, $2.07–10.26 (2010–2012 US$; spec $2 / $5 / $10), is a total that already includes medicines and supplies (3–26% of it). It is charged on `cm_child_years` as `engine.CM_COST_ITEMS` (`includes: [management, supervision, chw_recurrent, medicines, supplies]`), with **no separate ACT or RDT item on the CM component**. `costs.py` refuses one as a double count (self-test C10). Start-up, $202–352 per CHW, is a `per_unit` item (`includes: [chw_training, equipment]`) built from the spec's CHW count per unit. | Collins et al. 2014 J Glob Health (Table 3); Daviaud et al. 2017 J Glob Health (PMC5502705) |
+
+All new options act after the fork (`POST_FORK`), so they share the burn-in. Each fails closed outside its domain
+(`model.cm_check`). With `cm_target = 1` and no add-on in the package, every v0.11 output is unchanged; only the two
+new drivers are added (self-test C6).
+
+**What this does not do (open items).**
+- The catchment share by unit (`cm_catchment_share`) is the main unknown behind both the
+  effect and the cost. It is a declared F6 assumption; the spec gives it a value and a range, because public data do
+  not settle it.
+- The CHW count per unit (for the start-up cost) is not an engine output; the spec sets it.
+- The baseline severe-care access is still `severe_access_add` + `cm_ft`, unsourced as in v0.11. Separating it fully
+  from the unit's `cm_ft` would change comparator deaths; S2-5 (absolute burden by state and age) is the place to
+  test it.
+- Mortality check: the pooled malaria-mortality RRs of community treatment (0.58, Oo 2019; 0.40, Kua et al. 2024, from the abstract only) are a
+  ceiling for the add-on's effect, from pre-ACT trials with intensive delivery. The check belongs with S2-5.
 
 ## v0.11 scope: SMC mechanism from the literature (owner approval 2026-11-05; written before the v0.11 code)
 
@@ -1177,6 +1213,9 @@ grid before the next pack run.
 - The *An. funestus* PBO row of Churcher 2016 Table 6, read as a linear form.
 - The product mix of the Cochrane IRS-added-to-ITN trials (set to the short-lived product).
 - Trial-site seasonality and past net campaigns.
+- Case management (v0.12, with `cm_target = 1`): the iCCM catchment share (`cm_catchment_share`, which scales the effect and the cost); the
+  linear 2–3-year ramp; `cm_severe_link` (no source; default 0); the baseline severe-care access
+  `severe_access_add` + `cm_ft`.
 - Field use (v0.3):
   - the exponential shape of net loss (the paper's loss curve is S-shaped); resolved in v0.9
     (smooth-compact, k = 20, Bertozzi-Villa 2021 Supplementary Note 1.4);

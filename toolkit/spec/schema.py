@@ -1001,7 +1001,21 @@ def _validate(s: Spec) -> list[str]:
     if r["comparator"].get("package") not in pk:
         bad.append(f"comparator: package {r['comparator'].get('package')!r} is not a package")
     an = r["analysis"]
-    drivers = card.outputs.get("cost_drivers", [])
+    # F6 S2-2: cost_drivers_when names drivers an engine produces only under a parameter setting
+    when = card.outputs.get("cost_drivers_when") or {}
+    drivers = list(card.outputs.get("cost_drivers", []))
+    drivers += [d for d in when if d not in drivers]
+    if when:
+        try:
+            from toolkit.spec import priors as PRI
+            dr = {k: (q.lo, q.hi) for k, q in PRI.drawn(s).items()}
+        except Exception as ex:  # noqa: BLE001 -- fail closed: the draws cannot be read, so the domain is unknown
+            dr, bad = {}, bad + [f"analysis.cost_outputs: the drawn priors could not be read to check conditional "
+                                 f"cost drivers ({type(ex).__name__}: {ex})"]
+        dom = parameter_domain(r, {n: p.value for n, p in pnames.items()}, dr)
+        for k, m in (an.get("cost_outputs") or {}).items():
+            bad += conditional_driver_problems(k, (m or {}).get("cost_driver"), when, dom,
+                                               {n: q.kind for n, q in pnames.items()})
     cost_outs = an.get("cost_outputs") or {}
     for it in opts.get("cost_items") or []:
         if it.get("basis") == "per_outcome" and it.get("outcome") not in cost_outs:
@@ -1062,6 +1076,55 @@ def labels_problems(raw: dict, labels: dict, pnames=None, card=None) -> list[str
         if k in labels and not (isinstance(labels[k], str) and labels[k].strip()):
             bad.append(f"labels.{k}: a non-empty string")
     return bad
+
+
+def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
+    """{parameter: [(where, [values])]}: every value the analysis can give an engine parameter: the point value (the
+    spec's engine_parameters value, else the engine default), a range (engine_parameters range, uncertainty.priors
+    range, or a drawn prior's (lo, hi) from `drawn`), and each parameter_value decision test's values."""
+    from toolkit.spec import engine_parameters as PV
+    ep = {n: e for n, e in ((raw or {}).get(PV.FIELD) or {}).items() if isinstance(e, dict)}
+    dom = {}
+    for n, v in defaults.items():
+        dom[n] = [("point value", [ep[n].get("value") if n in ep else v])]
+    for n, e in ep.items():
+        if e.get("range") is not None:
+            dom.setdefault(n, []).append((f"{PV.FIELD}.{n}.range", list(e["range"])))
+    for n, q in (((raw or {}).get("uncertainty") or {}).get("priors") or {}).items():
+        if isinstance(q, dict) and q.get("range") is not None:
+            dom.setdefault(n, []).append((f"uncertainty.priors.{n}.range", list(q["range"])))
+    for n, (lo, hi) in (drawn or {}).items():
+        dom.setdefault(n, []).append((f"the drawn prior on {n}", [lo, hi]))
+    for dt in ((raw or {}).get("analysis") or {}).get("decision_tests") or []:
+        if isinstance(dt, dict) and dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
+            dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
+    return dom
+
+
+def conditional_driver_problems(name, driver, when: dict, domain: dict, kinds: dict | None = None) -> list[str]:
+    """F6 S2-2 (Codex r1 P2-1): a cost driver the engine card lists under outputs.cost_drivers_when
+    ({driver: {parameter: value}}) is produced only when each parameter has its stated value, so every value the
+    analysis can give it (parameter_domain: the point value, any range, every decision-test value) must equal that
+    value. A range is refused unless both ends equal it (a continuous range reaches fractional switches).
+    Codex r2 P2-2: with `kinds` ({parameter: kind}), a predicate may name only a `fixed` engine parameter; fitted,
+    calibrated and scenario parameters are moved by the analysis (draws, emulator designs, tests), so it is refused."""
+    out = []
+    for p, v in ((when or {}).get(driver) or {}).items():
+        if kinds is not None and kinds.get(p) != "fixed":
+            out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} depends on {p}, a "
+                       f"{kinds.get(p, 'unknown')} parameter; a conditional driver's predicate must name a fixed "
+                       "(structural) engine parameter")
+            continue
+        for where, vals in domain.get(p) or [("point value", [None])]:
+            try:
+                same = bool(vals) and all(float(x) == float(v) for x in vals)
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                out.append(f"analysis.cost_outputs.{name}: engine cost driver {driver} is produced only when {p} = "
+                           f"{v:g}, but {where} gives {p} {vals!r}: set {p} to {v:g} in engine_parameters, with no "
+                           "range, prior or decision test that moves it")
+    return out
 
 
 def _validate_calibration(s, card, pnames, cols) -> list[str]:
@@ -1476,10 +1539,42 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    # F6 S2-2: a cost driver an engine produces only under a parameter setting (outputs.cost_drivers_when)
+    when = {"c_kids": {"switch": 1.0}}
+
+    def cdp(raw, drawn=None):
+        dom = parameter_domain(raw, {"switch": 0.0}, drawn or {})
+        return conditional_driver_problems("kids", "c_kids", when, dom)
+    on = {"engine_parameters": {"switch": {"value": 1}}}
+    ok(cdp({}) and "switch" in cdp({})[0] and cdp(on) == []
+       and conditional_driver_problems("t", "treated", when, parameter_domain({}, {"switch": 0.0}, {})) == [],
+       "SP-CD1 a conditional cost driver is refused unless the run sets its parameter (engine_parameters) to the "
+       "stated value; an unconditional driver is never refused")
+    # Codex r1 P2-1: the predicate must hold over every value the analysis can give the parameter
+    rng = {"engine_parameters": {"switch": {"value": 1, "range": [0, 1], "dist": "uniform"}}}
+    dt = dict(on, analysis={"decision_tests": [{"id": "sw_off", "type": "parameter_value", "parameter": "switch",
+                                                "values": [1, 0]}]})
+    pri = dict(on, uncertainty={"priors": {"switch": {"dist": "uniform", "range": [0.5, 1]}}})
+    ok(any("range" in x for x in cdp(rng)) and any("sw_off" in x for x in cdp(dt)) and cdp(pri)
+       and cdp(on, {"switch": (0.0, 1.0)}) and cdp(dict(on, analysis={"decision_tests": [
+           {"id": "keep", "type": "parameter_value", "parameter": "switch", "values": [1]}]})) == [],
+       "SP-CD2 a range (engine_parameters, uncertainty.priors or a drawn card prior, which can reach a fractional "
+       "switch) or a decision-test value that turns the driver off is refused; a test at the stated value is not")
     with tempfile.TemporaryDirectory() as d:
         p = toy_spec(d)
         s = load(p)
         ok(validate(s) == [], f"SP1 a well-formed toy spec validates: {validate(s)}")
+
+        # Codex r2 P2-2 (integrated): the toy spec draws the fitted parameters (uncertainty source engine_parameters)
+        def cd_errs(when):
+            r = copy.deepcopy(s.raw)
+            r["engine"] = {"ref": "toolkit.engines.conditional_drivers:ToyConditionalEngine", "config": {"when": when}}
+            r["analysis"]["cost_outputs"] = {"extra": {"cost_driver": "extra_doses"}}
+            return [x for x in validate(Spec(r, d)) if "extra_doses" in x]
+        e_fit, e_fix = cd_errs({"extra_doses": {"eff_a": 0.5}}), cd_errs({"extra_doses": {"noise": 0.0}})
+        ok(any("fixed" in x and "eff_a" in x for x in e_fit) and e_fix == [],
+           f"SP-CD3 with fitted-parameter uncertainty on, a conditional driver whose predicate names a fitted parameter "
+           f"is refused; one on a fixed parameter at its value is accepted ({e_fit[:1]}, {e_fix[:1]})")
 
         def bad(mut, needle, label):
             r = copy.deepcopy(s.raw)
