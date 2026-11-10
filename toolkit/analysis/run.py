@@ -371,7 +371,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
     # ---- plan variants (F6 S1-6), on the point tables within the headline plan's budget
-    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"])   # guarded by the point corrections
+    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"], out0)   # guarded by the point corrections
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
@@ -1005,6 +1005,17 @@ def _self_test_variants(ok, q):
            f"PV-R13 each solved variant's cost is counted against the budget over the uncertainty draws, with claims "
            f"and a line in results.md ({ {k: (a.get('draws_over_budget'), a.get('draws')) for k, a in afv.items()} }, "
            f"{sorted(need11 - cs)})")
+        ss = gv.get("same_spend") or {}      # review A2: the given plan against the optimum at its own cost
+        led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {})
+               .get("claims", [])}
+        g14, p14 = led.get("variant.given.same_spend_gain") or {}, led.get("variant.given.same_spend_gain_pct") or {}
+        rc = CL._scripts()[1].render_claim
+        ln = [x for x in txt.splitlines() if x.startswith("given at the same spend")]
+        ok(ss.get("status") == "solved" and abs(ss.get("budget", -1) - gv.get("cost", 0)) < 1e-6
+           and ss.get("cost", 1e18) <= ss["budget"] * (1 + 1e-9) and g14.get("value") == ss.get("value_gain")
+           and p14.get("value") == ss.get("value_gain_pct") and len(ln) == 1 and rc(g14) in ln[0] and rc(p14) in ln[0],
+           f"PV-R14 the given plan is compared with the optimum at its own cost, with claims and a results.md line "
+           f"({ss.get('status')}, {ss.get('value_gain')}, {g14.get('value')}, {ln})")
         ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")
         _resign(d, lambda x: x["analysis"]["plan_variants"].update(headline="service"))
         try:
