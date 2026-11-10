@@ -143,7 +143,7 @@ def card_fits(card, needs: dict) -> list[str]:
     wins = set((card.outputs or {}).get("windows") or [])
     why += [f"no window metric {w}" for w in needs.get("windows") or [] if w not in wins]
     why += [f"no unit attribute {a}" for a in needs.get("unit_attributes") or [] if a not in card.unit_attributes]
-    drivers = set((card.outputs or {}).get("cost_drivers") or [])
+    drivers = set((card.outputs or {}).get("cost_drivers") or []) | set((card.outputs or {}).get("cost_drivers_when") or {})
     why += [f"no cost driver {c}" for c in needs.get("cost_drivers") or [] if c not in drivers]
     why += [f"no age group {g}" for g in needs.get("age_groups") or [] if g not in (card.age_groups or [])]
     for a, (lo, hi) in (needs.get("ranges") or {}).items():
