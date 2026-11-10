@@ -198,7 +198,7 @@ def _boundary(run_dir: str, data, point) -> list[dict]:
         expect = BD.expected(schema.load(os.path.join(run_dir, SPEC)), plan)
     except Exception:  # noqa: BLE001 -- fail closed: findings() names a missing expectation
         expect = None
-    return BD.findings(data, plan, expect)
+    return BD.findings(data, point, expect)
 
 
 def _survey_changes(run_dir: str, data) -> list[dict]:

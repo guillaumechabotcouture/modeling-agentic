@@ -5,19 +5,22 @@ A unit's package is close to switching when the benefit per cost of its point-pl
 feasible, non-comparator package with the best benefit per cost among the others) are close: the relative gap
 |r_chosen - r_runner| / max(|r_chosen|, |r_runner|). The `boundary_units` units with the smallest gap (units whose plan
 package is not the comparator and that have a runner-up; thresholds.yaml `emulator`) are run on the engine at their
-calibrated values and the point parameters, for the comparator, the chosen package, the runner-up and every package their costs read (needed()); their benefit
-and cost are computed as the analysis computes them (toolkit/analysis/core.py evaluate), and the order of the two
-packages by benefit per cost is compared with the emulator's.
+calibrated values and the point parameters, for the comparator, the chosen package, the runner-up and every package
+their costs read (needed()); their benefit and cost are computed as the analysis computes them
+(toolkit/analysis/core.py evaluate), and the order of the two packages by benefit per cost is compared with the
+emulator's.
 
 Held-out source. The design's held-out points cannot serve: each is a real unit at Sobol values of the calibrated
 attribute and of every design parameter, not at the unit's calibrated value and the point parameters, and the plan's
-package (the boundary) is defined only there; few held-out points are boundary units at all. So the check makes its own
-engine runs: 3 or more per boundary unit (one shared-state task per unit for an engine whose packages share a burn-in), through
-the same compute path, provenance check and stored-row reuse as the design batch (analysis/boundary/results.jsonl).
+package (the boundary) is defined only there; few held-out points are boundary units at all. So the check makes its
+own engine runs: 3 or more per boundary unit (one shared-state task per unit for an engine whose packages share a
+burn-in), through the same compute path, provenance check and stored-row reuse as the design batch
+(analysis/boundary/results.jsonl).
 
 The share of boundary units whose order matches is gated (toolkit/analysis/contract.py) against
-`boundary_rank_agreement_min`. A unit whose two engine ratios are within `boundary_tie_rel_gap` (relative) is an engine tie and counts as matched. With no unit
-that has a runner-up, the check is not judged (status not_judged), never passed.
+`boundary_rank_agreement_min`. A unit whose two engine ratios are within `boundary_tie_rel_gap` (relative) is an
+engine tie and counts as matched. With no unit that has a runner-up, the check is not judged (status not_judged),
+never passed. Every funded unit's plan ratio must equal analysis/point.yaml's benefit / cost (else a HIGH finding).
 """
 from __future__ import annotations
 
@@ -71,9 +74,20 @@ def table(A, plan, ben, cost) -> dict:
 
 def expected(spec, plan) -> dict:
     """{unit: [packages]} the ratio table must cover, from the signed spec's feasibility and the point plan (the gate's
-    own expectation, Codex r2 P1)."""
+    own expectation, Codex r2 P1), with the headline plan variant's rule when the spec names one, as the analysis
+    applies it (toolkit/analysis/variants.py apply_headline; Codex r3 P2)."""
     from toolkit.alloc import packages as AP
-    feas = AP.feasibility(spec.alloc_spec(), spec.units())["feasible"]
+    from toolkit.analysis import variants as V
+    hid = V.headline_id(spec.raw)
+    if hid is None:
+        feas = AP.feasibility(spec.alloc_spec(), spec.units())["feasible"]
+    else:
+        class _A:           # what variants.feasibility reads of an Analysis
+            pass
+        a = _A()
+        a.spec, a.pk, a.alloc = spec, spec.packages(), spec.alloc_spec()
+        v = next(x for x in V.config(spec.raw)["variants"] if x["id"] == hid)
+        feas = V.feasibility(a, v)[1]["feasible"]
     comp = spec.comparator
     return {str(u): sorted(p for p in spec.packages() if p != comp and (p == ch or feas[str(u)].get(p)))
             for u, ch in plan.items() if ch != comp}
@@ -238,15 +252,17 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
     return s
 
 
-def findings(data, plan, expect) -> list[dict]:
-    """The gate: the artifact's ratio table checked against the point plan (`plan`, from analysis/point.yaml) and the
-    units and packages it must cover (`expect`, expected()); the candidates rebuilt from it, the rows bound to them,
-    and the share rejudged from the rows against thresholds.yaml (never the artifact's own verdict)."""
+def findings(data, point, expect) -> list[dict]:
+    """The gate: the artifact's ratio table checked against analysis/point.yaml (`point`: its plan, and each plan
+    ratio against its per_unit benefit / cost) and the units and packages it must cover (`expect`, expected()); the
+    candidates rebuilt from it, the rows bound to them, and the share rejudged from the rows against thresholds.yaml
+    (never the artifact's own verdict)."""
     def f(kind, claim, declarable):
         return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
                 "key": "emulator_boundary", "scope_declarable": declarable, "source": PRODUCER}
     W = "analysis/emulator_boundary.yaml"
     try:
+        plan = point.get("plan") if isinstance(point, dict) else None
         t = thresholds()
         tab, rows = data["table"], data["rows"]
         want = [(c["unit"], c["chosen"], c["runner_up"]) for c in pick(tab, t["units"])]
@@ -270,6 +286,18 @@ def findings(data, plan, expect) -> list[dict]:
     if data.get("units") != len(rows) or data.get("matched") != m or data.get("units_requested") != t["units"] \
             or (len(rows) == 0) != (data.get("status") == "not_judged"):
         bad.append(f"its counts ({data.get('matched')} of {data.get('units')}) are not its rows' ({m} of {len(rows)})")
+    # Codex r3 P1: no unit leaves judgment through a null or edited plan ratio
+    per = (point.get("per_unit") or {}) if isinstance(point, dict) else None
+    off = []
+    for u, e in sorted(tab.items()) if per is not None else []:
+        x, pu = e["ratios"].get(e["plan"]), per.get(u) or {}
+        y = _ratio(pu.get("benefit"), pu.get("cost")) if pu.get("package") in (None, e["plan"]) else None
+        if not _fin([x]) or y is None or abs(x - y) > 1e-9 * max(abs(y), 1e-300):
+            off.append(f"{u} ({x!r} vs {y!r})")
+    if off:
+        return [f("emulator_boundary_plan_ratio", f"{W}: {len(off)} funded units' plan-package benefit per cost is "
+                                                  f"missing, not finite, or not analysis/point.yaml's benefit / cost "
+                                                  f"(e.g. {off[:3]}): those units cannot be judged", False)]
     if bad:
         return [f("emulator_boundary_inconsistent", f"{W}: " + "; ".join(bad), False)]
     n = len(rows)
