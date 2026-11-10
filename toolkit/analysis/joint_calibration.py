@@ -582,6 +582,7 @@ def build(spec, units=None) -> tuple:
                                          sd_bias=float(t.get("bias_sd", 0.0)), sd_md=md,
                                          weights={i: float(rows[i][t["weights"]]) for i in members},
                                          source=t["source"]))
+                targets[-1].spec_id, targets[-1].group = t["id"], g     # the round that owns it (S2-3b)
         else:
             pack, fit, why = _benchmarks(spec.engine())
             if pack is None:
@@ -605,7 +606,7 @@ def build(spec, units=None) -> tuple:
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
                    groups={i: rows[i].get(reg, "") for i in ids} if reg else None,
-                   changes=change_pairs(j, rows, ids, targets, reg))
+                   changes=change_pairs(j, rows, ids, targets, reg, cal.get("target_column")))
     rec = [_observable(r, wins) for r in j.get("record") or []]
     return P, {"windows": wins, "dropped": dropped, "units": ids, "record": rec}
 
@@ -623,7 +624,7 @@ def _num(x):
     return v if math.isfinite(v) else None
 
 
-def _round_mismatch(a, b):
+def _round_mismatch(a, b, col=None):
     """Why two rounds of one survey cannot be compared (their definitions differ), or None."""
     if a["kind"] != b["kind"]:
         return f"definitions differ: {a['id']} is a {a['kind']} target, {b['id']} a {b['kind']} target"
@@ -632,15 +633,15 @@ def _round_mismatch(a, b):
             return f"definitions differ: {q} {a.get(q, dflt)!r} and {b.get(q, dflt)!r}"
     if [float(x) for x in a["window"]] == [float(x) for x in b["window"]]:
         return "the two rounds have the same window"
-    if a["kind"] == "unit" and a.get("column") == b.get("column"):
-        return f"the two rounds read one column ({a.get('column')})"
+    if a["kind"] == "unit" and a.get("column", col) == b.get("column", col):
+        return f"the two rounds read one column ({a.get('column', col)})"
     if a["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
             (b.get("key") or {}).get("units"), b.get("weights")):
         return "definitions differ: the rounds aggregate over different groupings or weights"
     return None
 
 
-def change_pairs(j, rows, ids, targets, reg) -> list:
+def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
     """F6 S2-3b: each pair of rounds of one survey (targets with the same survey, by window), one entry per group:
     unit rounds by the group column (changes.by, the survey's bias_by, else the region), each unit weighted (changes.
     weights, else equally); group rounds by their group. What cannot be compared is an entry with its reason."""
@@ -662,7 +663,7 @@ def change_pairs(j, rows, ids, targets, reg) -> list:
         for n, a in enumerate(ts):
             for b in ts[n + 1:]:
                 base = {"id": f"{s}:{a['id']}->{b['id']}", "survey": s, "from": a["id"], "to": b["id"]}
-                why = _round_mismatch(a, b)
+                why = _round_mismatch(a, b, default_column)
                 by = ch.get("by") or a.get("bias_by") or reg if a["kind"] == "unit" else (a.get("key") or {}).get("units")
                 if why or not by:
                     out.append(dict(base, not_computable=why or "no group column (changes.by, bias_by or the region)"))
@@ -681,8 +682,8 @@ def change_pairs(j, rows, ids, targets, reg) -> list:
                                                                  "w": wt[i] / tot} for i in us if wt[i] > 0])
                                    if tot > 0 else dict(e, not_computable="the group's units have no positive weight"))
                     continue
-                ga, gb = ({k[len(t["id"]) + 1:]: k for k, v in built.items() if v.kind == "group"
-                           and k.startswith(t["id"] + ":")} for t in (a, b))
+                ga, gb = ({str(getattr(v, "group", k[len(t["id"]) + 1:])): k for k, v in built.items()
+                           if v.kind == "group" and getattr(v, "spec_id", None) == t["id"]} for t in (a, b))
                 for g in sorted(set(ga) | set(gb) | {str(r.get(by)) for r in rows.values()}):
                     e = dict(base, id=f"{base['id']}:{g}", group=g, by=by)
                     out.append(dict(e, rho=rho, terms=[{"from": ga[g], "to": gb[g], "w": 1.0}]) if g in ga and g in gb
@@ -709,8 +710,20 @@ def change_findings(raw, data) -> list:
     if not (isinstance(sc, dict) and isinstance(sc.get("pairs"), list) and sc["pairs"] and sc.get("z_max") == zmax):
         return [_cf("calibration_change_unrecorded", f"{F} records no survey-change diagnostic at the threshold "
                     f"z_max {zmax:g} (survey_changes)", "survey_changes", False)]
-    asked = isinstance(raw, dict) and ((raw.get("calibration") or {}).get(FIELD) or {}).get("changes") is not None
+    jj = ((raw.get("calibration") or {}).get(FIELD) or {}) if isinstance(raw, dict) else {}
+    asked = jj.get("changes") is not None
     out = []
+    pairs = [p for p in sc["pairs"] if isinstance(p, dict)]
+    flags = sorted(str(p.get("id")) for p in pairs if p.get("flagged") is True)
+    named = {_survey(t) for t in jj.get("targets") or [] if isinstance(t, dict) and t.get("kind") in ("unit", "group")
+             and t.get("id") and _survey(t)}
+    miss = sorted(named - {p.get("survey") for p in pairs})
+    ids_ = [p.get("id") for p in pairs]
+    if len(pairs) != len(sc["pairs"]) or len(set(ids_)) != len(ids_) or sorted(sc.get("flagged") or []) != flags \
+            or miss:
+        out.append(_cf("calibration_change_inconsistent", f"{F}: survey_changes is incomplete or inconsistent (repeated "
+                       f"or malformed pairs, a flagged list that is not the flagged pairs, or surveys with no entry "
+                       f"{miss[:5]})", "survey_changes", False))
     for p in sc["pairs"]:
         pid = str(p.get("id")) if isinstance(p, dict) else "?"
         if isinstance(p, dict) and _text(p.get("not_computable")):
@@ -720,7 +733,11 @@ def change_findings(raw, data) -> list:
             continue
         z, d, sd, o, m = (p.get(k) for k in ("z", "difference", "sd", "observed", "modelled")) if isinstance(p, dict) \
             else (None,) * 5
+        sp = p.get("sd_parts") if isinstance(p, dict) and isinstance(p.get("sd_parts"), dict) else {}
+        parts = [sp.get(k) for k in ("sampling", "offset", "run")]
         if not (all(_isnum(v) for v in (z, d, sd, o, m)) and sd > 0 and abs(z - d / sd) <= 1e-6 * max(1.0, abs(z))
+                and all(_isnum(v) and v >= 0 for v in parts)
+                and abs(sd * sd - sum(v * v for v in parts)) <= 1e-9 * max(1.0, sd * sd)
                 and abs(d - (m - o)) <= 1e-9 * max(1.0, abs(m), abs(o))
                 and p.get("flagged") is (abs(z) > zmax)):
             out.append(_cf("calibration_change_inconsistent", f"{F}: survey change {pid}: its flag or z does not follow "
@@ -1791,6 +1808,7 @@ def _self_test() -> int:
     def ja17():          # the gate findings of the change diagnostic
         pair = {"id": "s:a->b:r0", "survey": "s", "group": "r0", "from": "a", "to": "b", "observed": -0.4,
                 "modelled": 0.1, "difference": 0.5, "sd": 0.1, "z": 5.0, "flagged": True,
+                "sd_parts": {"sampling": 0.1, "offset": 0.0, "run": 0.0},
                 "text": "the model's change has the opposite sign of the observed one"}
         data = {"survey_changes": {"status": "computed", "z_max": 3.0, "pairs": [pair], "flagged": [pair["id"]]}}
         raw = {"calibration": {"joint": {}}}
@@ -1799,7 +1817,8 @@ def _self_test() -> int:
            f"JA17a a flagged group is one declarable gate finding that states the direction ({f})")
         f = change_findings(raw, {})
         ok(len(f) == 1 and not f[0]["scope_declarable"], f"JA17b no change diagnostic in the artifact: a finding ({f})")
-        f = change_findings(raw, {"survey_changes": dict(data["survey_changes"], pairs=[dict(pair, flagged=False)])})
+        f = change_findings(raw, {"survey_changes": dict(data["survey_changes"], pairs=[dict(pair, flagged=False)],
+                                                         flagged=[])})
         ok(len(f) == 1 and not f[0]["scope_declarable"],
            f"JA17c a pair whose numbers exceed the threshold but is not flagged: a finding ({f})")
         nc = {"survey_changes": {"status": "not_computable", "z_max": 3.0, "flagged": [],
