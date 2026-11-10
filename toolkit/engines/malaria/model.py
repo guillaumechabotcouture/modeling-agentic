@@ -174,6 +174,9 @@ class Malaria(ss.Disease):
         # v0.14: per age group (AGES order) and day, expected severe episodes, expected deaths and people: the window
         # metrics severe_<g> and deaths_<g>. Kept apart from `daily`, which the start-state hash covers
         self.wdaily = {k: np.zeros((3, n)) for k in ('severe', 'deaths', 'pop')}
+        # Codex r1 P1: the day's effective treatment and whether deaths used the one case fatality of it (no
+        # severe-care link), so a member forked from a shared history recounts the shared days with its own parameters
+        self.wdaily['ft'], self.wdaily['plain'] = np.zeros(n), np.zeros(n)
         self.acc = {k: np.zeros(3) for k in ('cases', 'severe', 'deaths', 'pdays', 'treated')}
         self.acc_cost = dict(smc_doses=0.0, irs_sprayed=0.0, nets_given=0.0, pdays_all=0.0)
         # v0.6: treatments and person-days in the delivery period (the treatment cost driver); the same terms in the
@@ -405,6 +408,8 @@ class Malaria(ss.Disease):
                                                   P['cm_catchment_share']), pt)
             cfr_i = (1 - pti) * P['cfr_severe_untreated'] + pti * P['cfr_severe_treated']
         wd = self.wdaily
+        wd['ft'][ti], wd['plain'][ti] = p.ft, float(cfr_i is None)
+        self.sev_dtype = theta.dtype       # the precision of the step's product severe x case fatality
         for g in range(3):
             m = agi == g
             wd['severe'][g, ti] = theta[m].sum()

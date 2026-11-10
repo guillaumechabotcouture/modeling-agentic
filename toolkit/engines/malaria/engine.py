@@ -1098,11 +1098,25 @@ class MalariaEngine:
             # v0.14: severe episodes and deaths per person of each age group (and of all ages) over the window,
             # counted as the per-capita outcomes are: the window's total over the group's mean population in it
             nd, wd = max(int(sel.sum()), 1), dz.wdaily
-            for k in ("severe", "deaths"):
-                tot, pop = wd[k][:, sel].sum(axis=1), wd["pop"][:, sel].sum(axis=1) / nd
+            # Codex r1 P2: a window the simulated days do not cover (it starts before the sim or ends after it, or
+            # is empty) has no value: NaN, not 0
+            step = float(yv[1] - yv[0]) if len(yv) > 1 else 1.0 / 365
+            covered = t_a < t_b and t_a >= yv[0] - 1e-9 and t_b <= yv[-1] + step + 1e-9 and sel.any()
+            # Codex r1 P1: days shared with other members (before the fork) were counted with the first member's case
+            # fatality; days with one case fatality are recounted with this member's parameters (the same expression
+            # as the step's, so the member's own days are unchanged), days with the severe-care link are its own
+            pt = np.minimum(1.0, P["severe_access_add"] + wd["ft"][sel])
+            cfr = (1 - pt) * P["cfr_severe_untreated"] + pt * P["cfr_severe_treated"]
+            dt = getattr(dz, "sev_dtype", np.float64)     # the step multiplies in its states' precision
+            dth = np.where(wd["plain"][sel] > 0, (wd["severe"][:, sel].astype(dt) * cfr.astype(dt)).astype(float),
+                           wd["deaths"][:, sel])
+            for k, arr in (("severe", wd["severe"][:, sel]), ("deaths", dth)):
+                tot, pop = arr.sum(axis=1), wd["pop"][:, sel].sum(axis=1) / nd
                 for i, g in enumerate(AGES):
-                    wins[name][f"{k}_{g}"] = float(tot[i] / pop[i]) if pop[i] > 0 else 0.0
-                wins[name][f"{k}_all"] = float(tot.sum() / pop.sum()) if pop.sum() > 0 else 0.0
+                    wins[name][f"{k}_{g}"] = float(tot[i] / pop[i]) if covered and pop[i] > 0 else \
+                        (0.0 if covered else float("nan"))
+                wins[name][f"{k}_all"] = float(tot.sum() / pop.sum()) if covered and pop.sum() > 0 else \
+                    (0.0 if covered else float("nan"))
         # v0.6: treatments in the delivery period per mean person in it (the add-on and its funding end there); the
         # delivery accumulators equal the window ones when the period is the window
         d0, d1 = delivery_period(horizon)
