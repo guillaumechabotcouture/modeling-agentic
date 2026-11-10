@@ -1536,7 +1536,8 @@ def _self_test_burden_e2e(ok, d, q):
     from toolkit.engines.contract import ToyEngine, UnitSpec, Package
     open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
                                     "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,",
-                                    "X,r0,,cases,count,,2,1,,,estimated,synthetic X,ratio,,,REF-X,,report_only,none"])
+                                    "X,r0,,cases,count,,2,1,,,estimated,synthetic X,ratio,,,REF-X,,report_only,none",
+                                    "Y,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic Y,overlap,,,REF-Y,,,"])
                          + "\n")
     try:
         _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev"}))
@@ -1555,6 +1556,10 @@ def _self_test_burden_e2e(ok, d, q):
        and by["W"]["model"]["interval_from"] == "draws",
        f"BE8 the model value is the arm's window metric over the model window ({got:.6g} vs engine {want:.6g}; "
        f"decision-window mean {dec:.6g}), with the draws' interval")
+    pop = sum(float(A.by_id[i]["pop"]) for i in A.ids)
+    ok(abs(by["Y"]["model"]["point"] - got * 1000 / pop) <= 1e-9 * got and by["Y"]["model"]["interval_from"] == "draws",
+       f"BE11 (S2-5c) an age-banded row under a window: its group's window value, with the draws' interval "
+       f"({by['Y']['model']['point']:.6g} vs {got * 1000 / pop:.6g})")
     fs = contract.gate_findings(d)
     res = open(os.path.join(d, "results.md")).read()
     ok(by["X"]["status"] == "outside" and not [x for x in fs if x["key"] == "burden:X"] and "no published interval"

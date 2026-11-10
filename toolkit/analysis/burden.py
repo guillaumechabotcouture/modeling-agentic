@@ -1200,7 +1200,6 @@ def _self_test_s25b(ok, th):
                 ("a window outside the horizon", dict(W, window=[-1, 2]), [row()], "window"),
                 ("a window with no metrics", {"window": [0, 2]}, [row()], "window_metrics"),
                 ("an unknown window metric", dict(W, window_metrics={"cases": "zz"}), [row()], "window_metrics"),
-                ("an age band under a window", W, [row(band="all")], "age_band"),
                 ("an outcome with no window metric", W, [row().replace(",cases,", ",dalys,")], "window_metrics"),
                 ("an unknown role", {}, [row(9, "estimated,s,ratio,,,WMR-X,,maybe,")], "role"),
                 ("an unknown interval flag", {}, [row(9, "estimated,s,ratio,,,WMR-X,,,maybe")], "interval"),
@@ -1238,6 +1237,20 @@ def _self_test_s25b(ok, th):
            and v2 is not None and abs(v2 - want2) < 1e-9 * want2,
            f"BV37 several population groups need a window metric each, weighted by their populations ({v2} vs "
            f"{want2}): {b_str[:1]} {bad_map[:1]}")
+        # S2-5c: an age-banded row under a window is that population group's metric x its population; a mapping
+        # may name only the groups the rows reference
+        WA = dict(W, window_metrics={"cases": {"a": "events2"}})
+        s3 = spec([row(band="a"), row(band="a").replace("a,", "c,", 1).replace(",count,,", ",rate,1000,")], WA)
+        r3, b3 = load_references(s3)
+        b4 = load_references(spec([row(band="b")], WA))[1]
+        o3 = DirectModel(s3).predict(None, {}, A.ids)
+        A3 = types.SimpleNamespace(spec=s3, ids=A.ids, by_id=A.by_id)
+        v3 = [_value(A3, config(s3), r, o3, "none") for r in r3]
+        pa = sum(float(u["pop"]) for u in sw.units())     # group a; events2 = 2 per person-year over [0, 2)
+        ok(b3 == [] and len(v3) == 2 and None not in v3 and abs(v3[0] - 2 * pa) < 1e-9 * pa
+           and abs(v3[1] - 2000.0) < 1e-9 and any("window metric" in x and "'b'" in x for x in b4),
+           f"BV41 an age-banded row under a window: the group's metric x its population ({v3} vs {2 * pa}, 2000 per "
+           f"1000); a row for a group with no metric is refused: {b3} {b4[:1]}")
         raw0["decision_units"]["populations"] = rawT["decision_units"]["populations"]
         # Codex S2-5b r1 P1-2: the artifact's arm, window and window metrics are the signed spec's
         good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": {"all": "events"}}}
