@@ -381,6 +381,12 @@ def _blockers(critiques: dict):
                 yield reviewer, b
 
 
+def _listed(critiques: dict) -> set:
+    """Ids every critic in CRITICS lists this round, at any severity (Codex r1 on A5: a finding kept at LOW is listed)."""
+    return {str(b["id"]) for reviewer, doc in (critiques or {}).items() if reviewer in CRITICS
+            for b in (doc or {}).get("blockers") or [] if isinstance(b, dict) and b.get("id")}
+
+
 def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclude=()) -> dict:
     """Evaluate every test (frozen ones from the registry, new valid ones from
     the critiques) and, when `record`, save the registry. `exclude`: ids the
@@ -396,6 +402,10 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
     exclude = {str(x) for x in exclude or ()}
     missing: dict[str, list] = {}
     open_ids, closed_ids = set(), set()
+    listed = _listed(critiques)
+    for bid in listed & set(tests):     # the latest scope word: outside the brief now, or back in it
+        if isinstance(tests[bid], dict):
+            tests[bid]["outside_brief_round"] = round_n if bid in exclude else None
     for reviewer, b in _blockers(critiques):
         bid = str(b["id"])
         if bid in exclude:
@@ -441,9 +451,11 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         # (or the critic resolves or withdraws it) it stays open.
         # A judgement the critic resolved in an earlier round keeps that resolution (no harness check can pass it);
         # a runnable test that fails does not.
-        left_out = (bid not in open_ids and bid not in closed_ids and passes is not True
-                    and t.get("passed_round") is None
-                    and not (passes is None and t.get("critic_resolved_round") is not None))
+        # Codex r1: a finding tied to no brief item when last listed stays out; a registry written before
+        # critic_resolved_round existed cannot say whether a judgement was resolved, so it is not reopened.
+        left_out = (bid not in listed and passes is not True and t.get("passed_round") is None
+                    and not t.get("outside_brief_round")
+                    and not (passes is None and t.get("critic_resolved_round", round_n) is not None))
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
                        "frozen_round": t.get("frozen_round"), "result": result_of(passes),
                        "open": bid in open_ids or left_out, "severity": t.get("severity")}
@@ -460,7 +472,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         elif passes is False and bid in closed_ids:
             unmet.append(entry)
         elif left_out:
-            dropped.append(entry)
+            dropped.append(dict(entry, done_when=t["done_when"]))
         t["history"] = [h for h in t.get("history") or [] if h[0] != round_n] + [[round_n, passes]]
     if record:
         _save(run_dir, reg)
@@ -517,10 +529,12 @@ def gate_findings(result: dict) -> list[dict]:
                     "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
                               f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
                               f"(`done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
-    for r in result.get("dropped") or []:
-        out.append({"kind": "done_when_dropped", "severity": r["severity"], "id": r["id"],
+    for r in result.get("dropped") or []:   # HIGH as a regression is (Codex r1 P1-3: no persistence path); own key
+        out.append({"kind": "done_when_dropped", "severity": "HIGH", "id": r["id"], "key": r["id"],
+                    "done_when": r.get("done_when"),
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
-                    "claim": (f"{r['id']} ({r['reviewer']}) is an open finding that the current critique no longer "
+                    "claim": (f"{r['id']} ({r['reviewer']}, {r['severity']}) is an open finding that the current "
+                              f"critique no longer "
                               f"lists, and its done_when test has never passed: {r['detail'][:300]}. It stays open "
                               f"until the test passes or the critic lists it again (resolved, or the test withdrawn "
                               f"with `done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
