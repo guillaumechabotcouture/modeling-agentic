@@ -559,6 +559,18 @@ def _self_test_fixed(ok, attempt):
        and cf(dict(art, variants=[art["variants"][0], dict(rec, status="solved")]))
        and cf(dict(art, variants=[art["variants"][0], {k: x for k, x in rec.items() if k != "ineligible_units"}])),
        "PV27 the contract: a fixed plan is evaluated, a solved variant is not, and the eligibility report is required")
+    # Codex S2-6 r1 P1-2: any column name holds the plan (no internal key shadows it)
+    for u in A.spec.units():
+        u["__id"] = "none"
+    p8, e8 = attempt(g_("given_plan"), A, dict(fx, column="__id"))
+    ok(e8 is None and set((p8 or {}).values()) == {"none"}, f"PV28 a plan column of any name is read as given ({e8!r})")
+    # Codex S2-6 r1 P1-1: a package the envelope pruning dropped is named as pruned, not as unknown
+    raw9 = {"options": {"components": {"a": {}, "b": {}}, "packages": {"generate": True, "within_envelope": True}},
+            "analysis": {"plan_variants": {"variants": [dict(fx, column="gc")]}}}
+    e9, _ = attempt(validate, raw9, {"id", "gc"}, [{"id": "u1", "gc": "a+b"}],
+                    {"none": frozenset(), "a": frozenset({"a"}), "b": frozenset({"b"})}, "id")
+    ok(any("within_envelope" in x for x in e9 or []),
+       f"PV29 a given package that envelope pruning dropped is refused with why, not as unknown ({e9})")
 
 
 def _self_test() -> int:
