@@ -699,11 +699,17 @@ def _cf(kind, claim, key, declarable):
             "key": key, "scope_declarable": declarable, "source": PRODUCER}
 
 
-def change_findings(raw, data) -> list:
+def expected_change_ids(spec) -> set:
+    """The change pair ids the spec and its targets give (build), rebuilt by the gate independently of the record."""
+    return {str(c["id"]) for c in build(spec)[0].changes}
+
+
+def change_findings(raw, data, expected=None) -> list:
     """Gate findings of the survey-change diagnostic in analysis/joint_calibration.yaml (F6 S2-3b). A flagged group is
     declarable (the gap is declared with its reason); a missing or malformed record, another threshold, or a flag its
     numbers do not give is not (fail closed). A pair that cannot be computed is a finding only when the spec asks for
-    the diagnostic (calibration.joint.changes); it is recorded either way."""
+    the diagnostic (calibration.joint.changes); it is recorded either way. `expected`: the pair ids rebuilt from the
+    spec (expected_change_ids); a missing or extra entry is a finding that cannot be declared."""
     F = "analysis/joint_calibration.yaml"
     sc = data.get("survey_changes") if isinstance(data, dict) else None
     zmax = float(HM.thresholds()["survey_changes"]["z_max"])
@@ -724,6 +730,12 @@ def change_findings(raw, data) -> list:
         out.append(_cf("calibration_change_inconsistent", f"{F}: survey_changes is incomplete or inconsistent (repeated "
                        f"or malformed pairs, a flagged list that is not the flagged pairs, or surveys with no entry "
                        f"{miss[:5]})", "survey_changes", False))
+    if expected is not None:
+        got = {str(i) for i in ids_}
+        lost, extra = sorted(set(expected) - got), sorted(got - set(expected))
+        if lost or extra:
+            out.append(_cf("calibration_change_incomplete", f"{F}: survey_changes does not hold the pairs the spec gives: "
+                           f"missing {lost[:5]}, not expected {extra[:5]}", "survey_changes", False))
     for p in sc["pairs"]:
         pid = str(p.get("id")) if isinstance(p, dict) else "?"
         if isinstance(p, dict) and _text(p.get("not_computable")):
@@ -737,7 +749,7 @@ def change_findings(raw, data) -> list:
         parts = [sp.get(k) for k in ("sampling", "offset", "run")]
         if not (all(_isnum(v) for v in (z, d, sd, o, m)) and sd > 0 and abs(z - d / sd) <= 1e-6 * max(1.0, abs(z))
                 and all(_isnum(v) and v >= 0 for v in parts)
-                and abs(sd * sd - sum(v * v for v in parts)) <= 1e-9 * max(1.0, sd * sd)
+                and abs(sd * sd - sum(v * v for v in parts)) <= 1e-9 * max(sd * sd, sum(v * v for v in parts)) + 1e-300
                 and abs(d - (m - o)) <= 1e-9 * max(1.0, abs(m), abs(o))
                 and p.get("flagged") is (abs(z) > zmax)):
             out.append(_cf("calibration_change_inconsistent", f"{F}: survey change {pid}: its flag or z does not follow "

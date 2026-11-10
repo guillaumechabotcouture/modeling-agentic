@@ -182,7 +182,13 @@ def _survey_changes(run_dir: str, data) -> list[dict]:
     except (OSError, yaml.YAMLError) as e:
         return [_f("analysis_contract_calibration", f"{SPEC} unreadable for the survey-change diagnostic: {e}")]
     from toolkit.analysis import joint_calibration as JC
-    return JC.change_findings(raw, data)
+    try:                 # Codex r3: the expected pairs, rebuilt from the spec and its targets, not from the record
+        from toolkit.spec import schema
+        exp, out = JC.expected_change_ids(schema.load(os.path.join(run_dir, SPEC))), []
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        exp, out = None, [_f("analysis_contract_calibration", f"the expected survey-change pairs cannot be rebuilt from "
+                                                              f"{SPEC}: {type(e).__name__}: {e}")]
+    return out + JC.change_findings(raw, data, exp)
 
 
 def gate_findings(run_dir: str) -> list[dict]:
