@@ -975,6 +975,7 @@ def _self_test() -> int:
         ok(calls and b"WMR-NEW" in open(rp_, "rb").read() and "WMR-X" in txt and "WMR-NEW" not in txt and foot == hashlib.sha256(old_b).hexdigest() and refused,
            f"BV27 a file swapped during sheet generation: the sheet shows and binds the bytes it read, and signing "
            f"refuses the new file (footer {str(foot)[:12]}, refused {refused})")
+    _self_test_s25b(ok, th)
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]
@@ -990,6 +991,120 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+class _StepEngine:
+    """Self-test engine (S2-5b): one event per person-year before year 8, three from year 8 (the decision window):
+    the arm's future differs from its past. Window metric `events`: events per person over a named window."""
+
+    @staticmethod
+    def _f(a, b):
+        return max(0.0, min(b, 8.0) - a) + 3.0 * max(0.0, b - max(a, 8.0))
+
+    def describe(self):
+        from toolkit.engines.contract import EngineCard
+        return EngineCard("step", "1", ["step rate"], {"a": [0, 1], "b": [0, 1]}, {"x": "unused"},
+                          {"per_capita": ["cases", "dalys"], "windows": ["events"], "cost_drivers": []}, ["all"], {})
+
+    def parameters(self):
+        return []
+
+    def run(self, params, unit, package, horizon, seed):
+        from toolkit.engines.contract import Outcomes
+        v = self._f(*horizon.window)
+        return Outcomes({"cases": {"all": v}, "dalys": {"all": v}},
+                        {n: {"events": self._f(*w)} for n, w in (horizon.windows or {}).items()}, {},
+                        {"age_shares": {"all": 1.0}})
+
+
+def _self_test_s25b(ok, th):
+    """F6 S2-5b: a model window over past years, report-only rows, rows with no published interval."""
+    import copy
+    import tempfile
+    import types
+    from toolkit.spec import schema
+    from toolkit.analysis import batch as B
+    from toolkit.analysis.model import DirectModel
+    with tempfile.TemporaryDirectory() as d:
+        raw0 = yaml.safe_load(open(schema.toy_spec(d)))
+        ok(B.windows(schema.Spec(raw0, d)) == {"cal": [1, 2]}, "BV34 without a model window the engine windows are "
+           "unchanged (batch job hashes stay)")
+        raw0.update(horizon={"start": 0, "stop": 10})
+        raw0["objective"]["horizon"] = [8, 10]
+        raw0["calibration"]["target_source_id"] = "SURVEY-T"
+        head = ",".join(COLUMNS + ("role", "interval"))
+        W = {"window": [0, 2], "window_metrics": {"cases": "events"}}
+
+        def spec(lines, blk):
+            open(os.path.join(d, "w.csv"), "w").write("\n".join([head] + lines) + "\n")
+            r = copy.deepcopy(raw0)
+            r["validation"] = {"burden": dict({"csv": "w.csv"}, **blk)}
+            sp = schema.Spec(r, d)
+            sp._engine = _StepEngine()          # the spec's engine, in place of the toy's
+            return sp
+        row = lambda yr=1, rest="estimated,s,ratio,,,WMR-X,,,", band="", lo="80,130": (  # noqa: E731
+            f"a,*,{band},cases,count,,{yr},100,{lo},{rest}")
+        sw, s0 = spec([row()], W), spec([row()], {})
+        (rw, bw), (r0, b0) = load_references(sw), load_references(s0)
+        ok(bw == [] and rw[0].get("window") == [0.0, 2.0] and B.windows(sw).get(WINDOW) == [0.0, 2.0],
+           f"BV30 a model window inside the horizon validates and reaches the engine windows: {bw}")
+        ok(any("years from" in x for x in b0) and any("years from" in x for x in load_references(spec([row(9)], W))[1]),
+           "BV30 the year gap is measured from the model window when one is declared, else the decision window")
+        for name, blk, lines, needle in (
+                ("a window outside the horizon", dict(W, window=[-1, 2]), [row()], "window"),
+                ("a window with no metrics", {"window": [0, 2]}, [row()], "window_metrics"),
+                ("an unknown window metric", dict(W, window_metrics={"cases": "zz"}), [row()], "window_metrics"),
+                ("an age band under a window", W, [row(band="all")], "age_band"),
+                ("an outcome with no window metric", W, [row().replace(",cases,", ",dalys,")], "window_metrics"),
+                ("an unknown role", {}, [row(9, "estimated,s,ratio,,,WMR-X,,maybe,")], "role"),
+                ("an unknown interval flag", {}, [row(9, "estimated,s,ratio,,,WMR-X,,,maybe")], "interval"),
+                ("blank bounds without the flag", {}, [row(9, lo=",")], "lower"),
+                ("bounds with the flag none", {}, [row(9, "estimated,s,ratio,,,WMR-X,,,none")], "interval"),
+                ("overlap with no published interval", {}, [row(9, "estimated,s,overlap,,,WMR-X,,,none", lo=",")],
+                 "overlap"),
+                ("only report-only rows", {}, [row(9, "estimated,s,ratio,,,WMR-X,,report_only,")], "no checked")):
+            got = load_references(spec(lines, blk))[1]
+            ok(any(needle in x for x in got), f"BV31 the contract refuses {name}: {got}")
+        # the arm's past (1 per person-year) differs from its future (3): the model value is the past window's mean
+        A = types.SimpleNamespace(spec=sw, ids=sw.unit_ids(), by_id={str(u[sw.uid]): u for u in sw.units()})
+        out = DirectModel(sw).predict(None, {}, A.ids)
+        pop = sum(float(u["pop"]) for u in sw.units())
+        vw, v0 = _value(A, config(sw), rw[0], out, "none"), _value(A, config(s0), r0[0], out, "none")
+        ok(vw is not None and abs(vw - pop) < 1e-9 * pop and abs(v0 - 3 * pop) < 1e-9 * pop,
+           f"BV29 with a model window the value is the arm's mean over it ({vw} vs {pop}), not the decision-window "
+           f"mean ({v0})")
+        ok(_value(A, config(sw), rw[0], {i: {"y": out[i]["y"]} for i in A.ids}, "none") is None,
+           "BV29 a windowed reference with no window output has no model value (fails closed as unmatched)")
+        # report-only rows and rows with no published interval
+        lines = [row(9, "estimated,s,ratio,,,WMR-X,,report_only,"), row(9, "estimated,s,ratio,,,WMR-Y,,,none", lo=",")
+                 .replace("a,", "b,", 1)]
+        refs, bad = load_references(spec(lines, {}))
+        by = {r["id"]: r for r in refs}
+        ok(bad == [] and by.get("a", {}).get("role") == "report_only" and by.get("b", {}).get("lower") is None
+           and by.get("b", {}).get("interval") == "none" and by.get("a", {}).get("interval") == "published",
+           f"BV32 report-only rows and rows with no published interval validate: {bad}")
+        if bad:
+            return
+        rows = [compare(by["a"], 300.0, None), compare(by["b"], 300.0, None)]
+        sec = {"validation": {"burden": {"csv": "w.csv"}}}
+        fo = findings(sec, {"references": rows}, refs)
+        ok(rows[0]["status"] == "outside" and [x["key"] for x in fo] == ["burden:b"]
+           and "no published interval" in fo[0]["claim"] and rows[1]["ratio_interval"] == [None, None],
+           f"BV32 a report-only row is judged and reported, never a finding; a row with no published interval is "
+           f"judged on its tolerance band alone: {[x['claim'] for x in fo]}")
+        ok([x["kind"] for x in findings(sec, {"references": [dict(rows[0], role="checked"), rows[1]]}, refs)]
+           == ["burden_validation_inconsistent", "burden_outside_tolerance"],
+           "BV32 an artifact that changes a row's role is inconsistent")
+        data = {"window": [8, 10], "arm": "none", "group_column": "region", "references": rows,
+                "summary": {"within": 0, "outside": 2, "information": 0, "unmatched": 0, "n": 2},
+                "daly_parts": {"statement": "x"}}
+        txt = "\n".join(results_lines(data))
+        ids = {c[0] for c in claims(lambda *a: a, "art", data)}
+        ok("report only" in txt and "a" in txt.split("report only")[1][:80] and "no published interval" in txt
+           and "burden.a.role" in ids and "burden.b.lower" not in ids and "burden.a.lower" in ids,
+           f"BV33 results.md and the claims say which rows were report-only and which have no published interval")
+        ok(verdict(dict(rows[1], tolerance={"type": "overlap", "ratio_band": None}), th) == "invalid",
+           "BV33 an overlap tolerance with no published interval is invalid in an artifact")
 
 
 if __name__ == "__main__":

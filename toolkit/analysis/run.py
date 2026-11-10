@@ -1474,6 +1474,33 @@ def _self_test_burden_e2e(ok, d, q):
            for x in fs) and signoff.status(d) == "signed",
        f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
        f"{sorted({x['kind'] for x in fs})}")
+    # F6 S2-5b: a model window on the emulator path; a report-only row with no published interval
+    from toolkit.engines.contract import ToyEngine, UnitSpec, Package
+    open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
+                                    "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,",
+                                    "X,r0,,cases,count,,2,1,,,estimated,synthetic X,ratio,,,REF-X,,report_only,none"])
+                         + "\n")
+    try:
+        _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev"}))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE8 a run with a model window completes: {type(e).__name__}: {e}")
+        return
+    A, by = R["_A"], {r["id"]: r for r in bv["references"]}
+    h = A.spec.horizon({BV.WINDOW: [1, 2]})
+    want = sum(ToyEngine().run(A.theta0, UnitSpec(i, {"x": R["point"]["per_unit"][i]["z"]}), Package("none", {}), h,
+                               1).windows[BV.WINDOW]["prev"] * float(A.by_id[i]["pop"]) for i in A.ids)
+    dec = R["point"]["comparator_total"]["cases"] / 3.0
+    got = by["W"]["model"]["point"]
+    ok(abs(got - want) <= 0.05 * want and abs(got - dec) > 0.1 * dec and bv["window"] == [1.0, 2.0]
+       and by["W"]["model"]["interval_from"] == "draws",
+       f"BE8 the model value is the arm's window metric over the model window ({got:.6g} vs engine {want:.6g}; "
+       f"decision-window mean {dec:.6g}), with the draws' interval")
+    fs = contract.gate_findings(d)
+    res = open(os.path.join(d, "results.md")).read()
+    ok(by["X"]["status"] == "outside" and not [x for x in fs if x["key"] == "burden:X"] and "no published interval"
+       in res and "report only" in res, f"BE8 a report-only row is reported, never a finding: {fs}")
 
 
 def _self_test_floors_e2e(ok, d, q):
