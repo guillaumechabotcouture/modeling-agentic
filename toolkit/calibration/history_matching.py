@@ -341,9 +341,26 @@ class Problem:
             r = c.get("rho", 0.0)
             if not (isinstance(r, (int, float)) and -1.0 <= r <= 1.0):
                 bad.append(f"{w}: rho {r!r} must lie in [-1, 1]")
+            sides = {k: {tid[x[k]].observable for x in c["terms"] if x.get(k) in tid} for k in ("from", "to")}
+            sc = {tid[x[k]].scale for x in c["terms"] for k in ("from", "to") if x.get(k) in tid}
+            if len(sides["from"]) != 1 or len(sides["to"]) != 1 or sides["from"] == sides["to"] or len(sc) != 1:
+                bad.append(f"{w}: one round (observable) per side, two rounds on one scale")
+            kinds = {k: {tid[x[k]].kind for x in c["terms"] if x.get(k) in tid} for k in ("from", "to")}
+            if any((x.get("from") is None) != (x.get("to") is None) for x in c["terms"]) and \
+                    sorted(map(tuple, kinds.values())) != [("group",), ("unit",)]:
+                bad.append(f"{w}: one-sided terms are for a group round against a unit round only (two rounds of "
+                           "one kind pair within a term, so their sampling correlation applies)")
+            if any((x.get("from") is None) != (x.get("to") is None) for x in c["terms"]) and r not in (0, 0.0):
+                bad.append(f"{w}: a group round against a unit round combines their sampling errors as independent; "
+                           f"a sampling correlation ({r}) cannot apply")
             for x in c["terms"]:
                 a, b = tid.get(x.get("from")), tid.get(x.get("to"))
-                if a is None or b is None:
+                if (x.get("from") is None) != (x.get("to") is None):        # S2-3c: one side of a mixed pair
+                    if (a or b) is None:
+                        bad.append(f"{w}: {x.get('from') or x.get('to')} names an unknown target")
+                    elif not (isinstance(x.get("w"), (int, float)) and math.isfinite(x["w"]) and x["w"] > 0):
+                        bad.append(f"{w}: {(a or b).id}: weight must be > 0")
+                elif a is None or b is None:
                     bad.append(f"{w}: {x.get('from')} -> {x.get('to')} names an unknown target")
                 elif a.kind != b.kind or a.kind not in ("unit", "group") or a.unit != b.unit:
                     bad.append(f"{w}: {a.id} -> {b.id}: two unit targets of one unit, or two group targets")
@@ -589,7 +606,7 @@ class SharedEmulator:
 
 def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
     """F6 S2-3b: the change between two rounds over one group's terms [{from, to, w}] (target ids; w a unit's share of
-    the group). Observed and modelled change on the targets' scale (sum of w (to - from)); z = (modelled - observed) / sd.
+    the group; S2-3c: a term may hold one side only, so a group round pairs with a unit round aggregated by weights). Observed and modelled change on the targets' scale (sum of w (to - from)); z = (modelled - observed) / sd.
     sd: the rounds' sampling errors (correlation rho, as declared), the source offsets with signed coefficients (a block
     both rounds share cancels, offsets of different sources add) and `run_var`, the modelled change's run noise (paired:
     one trajectory gives both rounds). Model discrepancy is left out: it is declared per target as a level error, and
@@ -597,18 +614,24 @@ def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
     obs = mod = obs_n = mod_n = vs = vo = vn = 0.0
     coef, bsd, coef_n = {}, {}, {}
     for x in terms:
-        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
-        ma, mb = modelled.get(a.id), modelled.get(b.id)
-        if ma is None or mb is None:
-            return {"not_computable": f"no modelled value at the calibrated point for {a.id if ma is None else b.id}"}
-        obs += w * (b.y - a.y)
-        mod += w * (mb - ma)
-        obs_n += w * (b.value - a.value)
-        mod_n += w * (float(inv(mb, b.scale)) - float(inv(ma, a.scale)))
-        vs += w * w * (a.sd_obs ** 2 + b.sd_obs ** 2 - 2.0 * rho * a.sd_obs * b.sd_obs)
-        da, db = float(dinv(a.y, a.scale)), float(dinv(b.y, b.scale))     # the natural scale's error (delta method)
-        vn += w * w * ((da * a.sd_obs) ** 2 + (db * b.sd_obs) ** 2 - 2.0 * rho * da * db * a.sd_obs * b.sd_obs)
-        for t, sg, dt in ((a, -1.0, da), (b, 1.0, db)):
+        w = float(x["w"])
+        side = [(targets[x[k]], sg) for k, sg in (("from", -1.0), ("to", 1.0)) if x.get(k) is not None]
+        for t, _ in side:
+            if modelled.get(t.id) is None:
+                return {"not_computable": f"no modelled value at the calibrated point for {t.id}"}
+        dt_ = {t.id: float(dinv(t.y, t.scale)) for t, _ in side}           # the natural scale's error (delta method)
+        for t, sg in side:
+            obs += sg * w * t.y
+            mod += sg * w * modelled[t.id]
+            obs_n += sg * w * t.value
+            mod_n += sg * w * float(inv(modelled[t.id], t.scale))
+            vs += (w * t.sd_obs) ** 2
+            vn += (w * dt_[t.id] * t.sd_obs) ** 2
+        if len(side) == 2:            # the declared sampling correlation of one unit's (or group's) two rounds
+            (a, _), (b, _) = side
+            vs -= 2.0 * rho * w * w * a.sd_obs * b.sd_obs
+            vn -= 2.0 * rho * w * w * dt_[a.id] * dt_[b.id] * a.sd_obs * b.sd_obs
+        for t, sg, dt in ((t, sg, dt_[t.id]) for t, sg in side):
             if t.bias_key is None:
                 vo += (w * t.sd_bias) ** 2
                 vn += (w * dt * t.sd_bias) ** 2
@@ -644,24 +667,29 @@ def change_run_var(terms, targets, tn, pair_tn, member_y) -> float:
     covariance of one trajectory's two windows is c = (tn_a + tn_b - pair) / 2. A unit term is paired within its unit.
     A group target's members are independent runs, each entering the aggregate T(sum w p) with the coefficient
     w dinv(y_member) / dinv(Y_aggregate) (first order; member_y: {(unit, observable): modelled value on the scale})."""
-    v = 0.0
+    K, ob = {"from": {}, "to": {}}, {}       # each member's noise coefficient per side; the side's observable
     for x in terms:
-        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
-        ta, tb = tn[a.observable], tn[b.observable]
-        c = 0.5 * (ta + tb - pair_tn[(a.observable, b.observable)])
-        if a.kind == "unit":
-            v += w * w * (ta + tb - 2.0 * c)
-            continue
-        k = {}
-        for t in (a, b):
-            ws = sum(t.weights.values())
-            pbar = sum(q / ws * float(inv(member_y[(u, t.observable)], t.scale)) for u, q in t.weights.items())
-            dY = float(dinv(tr(pbar, t.scale), t.scale))
-            k[t.id] = {u: q / ws * float(dinv(member_y[(u, t.observable)], t.scale)) / max(dY, 1e-300)
-                       for u, q in t.weights.items()}
-        for u in set(a.weights) | set(b.weights):
-            ka, kb = k[a.id].get(u, 0.0), k[b.id].get(u, 0.0)
-            v += w * w * (kb * kb * tb + ka * ka * ta - 2.0 * ka * kb * c)
+        for side in ("from", "to"):
+            if x.get(side) is None:
+                continue
+            t = targets[x[side]]
+            ob[side] = t.observable
+            if t.kind == "unit":
+                k = {t.unit: 1.0}
+            else:
+                ws = sum(t.weights.values())
+                pbar = sum(q / ws * float(inv(member_y[(u, t.observable)], t.scale)) for u, q in t.weights.items())
+                dY = float(dinv(tr(pbar, t.scale), t.scale))
+                k = {u: q / ws * float(dinv(member_y[(u, t.observable)], t.scale)) / max(dY, 1e-300)
+                     for u, q in t.weights.items()}
+            for u, kv in k.items():
+                K[side][u] = K[side].get(u, 0.0) + float(x["w"]) * kv
+    if len(ob) < 2:
+        return 0.0
+    ta, tb = tn[ob["from"]], tn[ob["to"]]
+    c = 0.5 * (ta + tb - pair_tn[(ob["from"], ob["to"])])
+    v = sum(K["from"].get(u, 0.0) ** 2 * ta + K["to"].get(u, 0.0) ** 2 * tb
+            - 2.0 * K["from"].get(u, 0.0) * K["to"].get(u, 0.0) * c for u in set(K["from"]) | set(K["to"]))
     return max(v, 0.0)
 
 
@@ -2023,10 +2051,11 @@ class HistoryMatch:
         """change_run_var with this calibration's emulators; group members at their emulator means at the best point."""
         if not self.th["include_run_noise"]:
             return 0.0
-        ts = [self.tid[x[k]] for x in terms for k in ("from", "to")]
+        ts = [self.tid[x[k]] for x in terms for k in ("from", "to") if x.get(k) is not None]
         tn = {t.observable: self.em["unit"][t.observable].tn for t in ts}
-        pair = {(self.tid[x["from"]].observable, self.tid[x["to"]].observable): self._pair_noise(
-            self.tid[x["from"]].observable, self.tid[x["to"]].observable) for x in terms}
+        oa = next(self.tid[x["from"]].observable for x in terms if x.get("from") is not None)
+        ob = next(self.tid[x["to"]].observable for x in terms if x.get("to") is not None)
+        pair = {(oa, ob): self._pair_noise(oa, ob)}
         C = np.atleast_2d(self.state["C"][best_c]).reshape(1, self.p)
         my = {(u, t.observable): float(self.em["unit"][t.observable].predict(u, [self.zg[zbest[u]]], C,
                                                                              noise=False)[0][0])
@@ -2067,7 +2096,8 @@ class HistoryMatch:
                 return mean(t.unit, t.observable)
             ws = sum(t.weights.values())
             return tr(sum(w / ws * inv(mean(u, t.observable), t.scale) for u, w in t.weights.items()), t.scale)
-        D = sum(float(x["w"]) * (val(x["to"]) - val(x["from"])) for x in terms)
+        D = sum(float(x["w"]) * ((val(x["to"]) if x.get("to") is not None else 0.0)
+                                 - (val(x["from"]) if x.get("from") is not None else 0.0)) for x in terms)
         return [float(v) for v in np.percentile(D, [2.5, 50, 97.5])]
 
     def _survey_changes(self, ver, best_c, zbest, smp) -> dict:
@@ -2075,11 +2105,12 @@ class HistoryMatch:
         zmax = float(thresholds()["survey_changes"]["z_max"])
         pairs = []
         for c in self.P.changes:
-            base = {k: c[k] for k in ("id", "survey", "from", "to", "group", "by") if k in c}
+            base = {k: c[k] for k in ("id", "survey", "from", "to", "group", "by", "note") if k in c}
             if "not_computable" in c:
                 pairs.append(dict(base, not_computable=str(c["not_computable"])))
                 continue
-            mod = {x[k]: self._change_modelled(x[k], ver, best_c, zbest) for x in c["terms"] for k in ("from", "to")}
+            mod = {x[k]: self._change_modelled(x[k], ver, best_c, zbest) for x in c["terms"] for k in ("from", "to")
+                   if x.get(k) is not None}
             st = change_stats(c["terms"], self.tid, mod, self._change_run_var(c["terms"], best_c, zbest), float(c.get("rho", 0.0)),
                               zmax)
             if "z" in st:
@@ -3133,6 +3164,51 @@ def _self_test() -> int:
         ok(x["ratio"] is not None and abs(x["ratio"] - 1.0) < 1e-9 and "within its error" not in x["text"],
            f"HM44b a natural-scale change of -24.5 is not called within its error of zero ({x.get('text')})")
     safe(hm44, "HM44")
+
+    def hm45():          # F6 S2-3c: a group round paired with a unit round of one survey (aggregated by its weights)
+        G = Target("G", "group", "w0", 0.5, "identity", sd_obs=0.02, weights={"u0": 1.0, "u1": 3.0}, source="t")
+        U = {u: Target(f"{u}:w1", "unit", "w1", v, "identity", sd_obs=0.05, sd_bias=0.3, unit=u, source="t",
+                       bias_key="s|g") for u, v in (("u0", 0.2), ("u1", 0.4))}
+        tg = dict({"G": G}, **{t.id: t for t in U.values()})
+        terms = [{"from": "G", "w": 1.0}] + [{"to": f"{u}:w1", "w": w} for u, w in (("u0", 0.25), ("u1", 0.75))]
+        x = change_stats(terms, tg, {"G": 0.45, "u0:w1": 0.3, "u1:w1": 0.3}, 0.0, z_max=3.0)
+        samp = math.sqrt(0.02 ** 2 + (0.25 ** 2 + 0.75 ** 2) * 0.05 ** 2)
+        ok(abs(x["observed"] - (0.35 - 0.5)) < 1e-12 and abs(x["modelled"] - (0.3 - 0.45)) < 1e-12
+           and abs(x["sd_parts"]["sampling"] - samp) < 1e-12 and abs(x["sd_parts"]["offset"] - 0.3) < 1e-12
+           and x["sd"] > 5 * samp and not x["flagged"],
+           f"HM45a group minus the weighted unit round: known changes; the unit round's offset adds in full and "
+           f"dominates the sd ({x})")
+        tn = {"w0": 0.01, "w1": 0.01}
+        v0 = change_run_var(terms, tg, tn, {("w0", "w1"): 0.0}, {("u0", "w0"): 0.5, ("u1", "w0"): 0.5})
+        v1 = change_run_var(terms, tg, tn, {("w0", "w1"): 0.02}, {("u0", "w0"): 0.5, ("u1", "w0"): 0.5})
+        ok(abs(v0) < 1e-12 and abs(v1 - 2 * (0.25 ** 2 + 0.75 ** 2) * 0.01) < 1e-12,
+           f"HM45b run noise of a mixed pair is paired per member (shared: {v0}; independent: {v1})")
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0", "u1"], list(tg.values()),
+                    changes=[{"id": "p", "terms": terms}])
+        P2 = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0", "u1"], list(tg.values()),
+                     changes=[{"id": "p", "terms": [{"from": "G", "w": 1.0}, {"to": "nope", "w": 1.0}]}])
+        ok(not P._change_problems() and any("unknown" in b for b in P2._change_problems()),
+           f"HM45c a one-sided term is accepted; one naming an unknown target is refused ({P2._change_problems()})")
+    safe(hm45, "HM45")
+
+    def hm46():          # Codex r1 P2-2: one-sided terms are for a group round against a unit round only
+        a = Target("a", "unit", "w0", 0.4, "identity", sd_obs=0.1, unit="u0", source="t")
+        b = Target("b", "unit", "w1", 0.6, "identity", sd_obs=0.1, unit="u0", source="t")
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0"], [a, b],
+                    changes=[{"id": "p", "rho": 0.9, "terms": [{"from": "a", "w": 1.0}, {"to": "b", "w": 1.0}]}])
+        ok(any("one-sided" in x for x in P._change_problems()),
+           f"HM46 two unit rounds split into one-sided terms are refused (their correlation would be lost) "
+           f"({P._change_problems()})")
+    safe(hm46, "HM46")
+
+    def hm47():          # Codex r2 P1: a declared correlation cannot be silently dropped on a mixed pair
+        g = Target("g", "group", "w0", 0.4, "identity", sd_obs=0.1, weights={"u": 1.0}, source="t")
+        u = Target("u", "unit", "w1", 0.4, "identity", sd_obs=0.1, unit="u", source="t")
+        terms = [{"from": "g", "w": 1.0}, {"to": "u", "w": 1.0}]
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u"], [g, u], changes=[{"id": "p", "rho": 0.9, "terms": terms}])
+        ok(any("correlation" in x for x in P._change_problems()),
+           f"HM47 a mixed pair with a nonzero sampling correlation is refused ({P._change_problems()})")
+    safe(hm47, "HM47")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
