@@ -551,7 +551,7 @@ def smc_rounds_pmf(mean, rho, n) -> list:
     """v0.13: the share of children reached in 0..n of n rounds when each child's per-round reach is the beta
     propensity of smc_propensity (mean `mean`, intra-child correlation `rho`): the beta-binomial pmf. Its last entry
     is the all-rounds share that coverage surveys report beside the per-cycle mean. rho = 0 gives the binomial.
-    Rising factorials scaled by t = rho / (1 - rho), so the independent limit needs no special case (Codex r1 P3).
+    Rising-factorial ratios, each bounded, so neither limit of rho needs a special case (Codex r1 and r2 P3).
     Outside smc_cov's and smc_rho's domains, or with n not a whole number >= 0, it fails closed (Codex r1 P2)."""
     from math import comb, isfinite, prod
 
@@ -564,10 +564,11 @@ def smc_rounds_pmf(mean, rho, n) -> list:
         raise ValueError(f"smc_rounds_pmf: rho {rho!r} must be in [0, 1)")
     if not num(n) or float(n) != int(float(n)) or int(float(n)) < 0:
         raise ValueError(f"smc_rounds_pmf: n {n!r} must be a whole number of rounds >= 0")
-    m, n = float(mean), int(float(n))
-    t = float(rho) / (1.0 - float(rho))
-    den = prod(1.0 + i * t for i in range(n))
-    return [comb(n, k) * prod(m + i * t for i in range(k)) * prod(1.0 - m + j * t for j in range(n - k)) / den
+    m, n, r = float(mean), int(float(n)), float(rho)
+    # each factor (a + i) / (a + b + i) with a = m s, b = (1 - m) s, s = 1/rho - 1, multiplied through by rho: bounded
+    # by n, so no overflow near rho 1 (Codex r2 P3) and exact at rho 0
+    return [comb(n, k) * prod((m * (1.0 - r) + i * r) / ((1.0 - r) + i * r) for i in range(k))
+            * prod(((1.0 - m) * (1.0 - r) + j * r) / ((1.0 - r) + (k + j) * r) for j in range(n - k))
             for k in range(n + 1)]
 
 
