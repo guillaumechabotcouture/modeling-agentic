@@ -9,8 +9,10 @@ its two sources, so the stored spike batch reproduces):
                      posterior: rows of the canonical joint posterior sample (v2d §3.3: each draw records the
                      sample id, its row and the values applied, re-checked against the sample, fail closed)
   costs              a uniform multiplier per listed cost item
-  emulator           one joint draw of the reduction errors of every unit: a common (population-mean) component
-                     plus a per-unit one, from the held-out residuals (toolkit/analysis/model.py EmulatorError)
+  emulator           one joint draw of the errors of every unit: a common (population-mean) component plus a
+                     per-unit one, from the held-out residuals (toolkit/analysis/model.py EmulatorError), for every
+                     emulated quantity the decision uses: reductions, comparator burden and cost outputs (F6 S2-4),
+                     drawn from the same residual rows so they keep their held-out correlation
   priors             (v2 priors, drawn whenever there is one) every prior parameter from its declared bounded
                      distribution (toolkit/spec/priors.py), on its own random stream, before calibration
 The point plan is evaluated in every draw (the headline interval) and the plan is
@@ -388,6 +390,10 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
             "cost_floors": _acosts().draw_floor_summary(floors),
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
+    if "emulator" in D.src and getattr(A.model, "error_floors", None) is not None:   # F6 S2-4
+        data["emulator_error_floors"] = {"note": "per (cost output: package), unit values floored at zero after the "
+                                                 "drawn emulator error, over every evaluation with that error",
+                                         "counts": dict(A.model.error_floors)}
     if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
         data["budget_planned"] = float(A.plan_budget)
     if prov is not None:

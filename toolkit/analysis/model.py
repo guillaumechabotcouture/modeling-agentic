@@ -100,7 +100,9 @@ class EmulatorModel:
     def __init__(self, spec, design: dict, results: dict, log=print):
         self.spec, self.log = spec, log
         an = spec["analysis"]
-        self.features = list((an.get("emulator") or {}).get("features") or [])
+        from toolkit.analysis import features as FT       # F6 S2-4: unit columns or encoded engine attributes
+        self.features = FT.declared(spec.raw)
+        self.feature_names = [FT.name(f) for f in self.features]
         self.cost_outputs = dict(an.get("cost_outputs") or {})
         self.diagnostics = dict(an.get("diagnostics") or {})
         self.fitted_names = design["fitted_names"]
@@ -131,6 +133,7 @@ class EmulatorModel:
         self.outcomes = spec.outcomes()
         self.primary = self.outcomes[0]
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
+        self.fv = {i: FT.vector(spec, u) for i, u in self.by_id.items()}
         pts = design["points"]
         missing = [f"{p['point']}|{k}" for p in pts for k in self.packages if f"{p['point']}|{k}" not in results]
         if missing:
@@ -140,7 +143,7 @@ class EmulatorModel:
         self.lo, self.hi = X.min(0), X.max(0)
         # Codex P1-6: the design domain. The calibrated attribute and the fitted parameters span their declared
         # design box (calibration.range, engine-card ranges); unit features span what the design points contain.
-        self.input_names = ["z"] + self.param_names + list(self.features)
+        self.input_names = ["z"] + self.param_names + self.feature_names
         from toolkit.analysis.batch import fitted_ranges          # S1-2b: through the evidence snapshot
         fr = {k: (v[0], v[1]) for k, v in fitted_ranges(spec.engine()).items()}
         fr.update({k: (p.lo, p.hi) for k, p in want.items()})
@@ -192,11 +195,11 @@ class EmulatorModel:
                 self.train_corrections[f"burden_floor:{o}:{P}"] = int(np.sum(v < 1e-9))
             self.T[("bw", o, P)] = np.log(np.maximum(v, 1e-9))
         self.gps, self.accuracy = {}, {}
-        self.error = None
+        self.error, self.error_floors = None, {}
         self.design_points = n
 
     def _x(self, z, theta, u):
-        return [z] + [float(theta[nm]) for nm in self.param_names] + [float(u[f]) for f in self.features]
+        return [z] + [float(theta[nm]) for nm in self.param_names] + self.fv[str(u[self.spec.uid])]
 
     def _scale(self, X):
         return (X - self.lo) / np.where(self.hi > self.lo, self.hi - self.lo, 1.0)
@@ -264,6 +267,14 @@ class EmulatorModel:
         for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
             cols.append(("bw", o, P))
             res.append(self.T[("bw", o, P)][ho] - self.gps[("bw", o, P)].predict(Xh))
+        for P in self.pops:    # F6 S2-4: the comparator burden and every cost output too, from the same points
+            for o in self.outcomes:
+                cols.append(("base", P, o))
+                res.append(self.T[("base", P, o)][ho] - self.gps[("base", P, o)].predict(Xh))
+        for name in self.cost_outputs:
+            for k in self.packages:
+                cols.append(("cost", name, k))
+                res.append(self.T[("cost", name, k)][ho] - self.gps[("cost", name, k)].predict(Xh))
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
@@ -284,9 +295,10 @@ class EmulatorModel:
         return (g.predict(Xp) - g.predict(Xm)) / (2 * h)
 
     def predict(self, zs, theta, ids, noise=None):
-        """`noise`: an rng for the emulator-error source: one joint draw of the reduction errors of every unit
-        (EmulatorError: a common component plus a per-unit one, from the held-out residuals), one column per
-        (population group, outcome, package)."""
+        """`noise`: an rng for the emulator-error source: one joint draw of the errors of every unit (EmulatorError:
+        a common component plus a per-unit one, from the held-out residuals), one column per emulated quantity the
+        decision uses: the reduction per (population group, outcome, package), the comparator burden per (population
+        group, outcome), each cost output per package (F6 S2-4), and the burden-window values."""
         rows = [self.by_id[i] for i in ids]
         E = None
         if noise is not None:
@@ -307,7 +319,8 @@ class EmulatorModel:
         for P, pm in self.pops.items():
             popv = np.array([float(u[pm["column"]]) for u in rows])
             for o in self.outcomes:
-                b = np.exp(self.gps[("base", P, o)].predict(X))
+                lb = self.gps[("base", P, o)].predict(X)
+                b = np.exp(lb + E[:, self.error.col[("base", P, o)]] if E is not None else lb)
                 for j in range(n):
                     y[j]["y"][self.comp][o] = y[j]["y"][self.comp].get(o, 0.0) + float(b[j]) * popv[j]
                 for k in self.packages:
@@ -329,6 +342,11 @@ class EmulatorModel:
                 for j in np.flatnonzero(t < 0):
                     ev.append({"unit": ids[j], "package": k, "kind": "cost_output_floor", "output": name,
                                "value": float(t[j])})
+                if E is not None:     # F6 S2-4: a drawn error below zero is floored and counted, not a correction
+                    t = t + E[:, self.error.col[("cost", name, k)]]
+                    nf = int(np.sum(t < 0))
+                    if nf:
+                        self.error_floors[f"{name}:{k}"] = self.error_floors.get(f"{name}:{k}", 0) + nf
                 t = np.maximum(t, 0.0)
                 for j in range(n):
                     y[j]["cost"][k][name] = float(t[j]) * tot[j]
@@ -350,8 +368,12 @@ class EmulatorModel:
 
 
 class EmulatorError:
-    """The emulator-error source, from the held-out residuals of the reductions (one column per population group,
-    outcome and package, one row per held-out point; held-out points are real units at design values).
+    """The emulator-error source, from the held-out residuals of every emulated quantity the decision uses (one row per
+    held-out point; held-out points are real units at design values): one column per reduction (population group,
+    outcome, package), comparator burden (log scale, per population group and outcome), cost output (per capita, per
+    package; F6 S2-4) and burden-window value. All columns are drawn from the same residual rows, so a unit's comparator,
+    reduction and cost errors keep the correlation they show at the held-out points (the assumption: that correlation
+    is the one at the units' own inputs).
 
     A unit's error is split into the error of the population mean, which a sum over units does not average away, and
     the unit's deviation from it, which it does:
@@ -369,6 +391,9 @@ class EmulatorError:
     def __init__(self, cols: list, R):
         self.cols = list(cols)
         self.col = {c: j for j, c in enumerate(self.cols)}
+        if len(self.col) != len(self.cols):
+            raise ValueError("emulator error: two residual columns share a key (a population group named base, cost "
+                             "or bw?)")
         self.R = np.asarray(R, float)
         self.H = self.R.shape[0]
         self.m = self.R.mean(0)
@@ -391,8 +416,19 @@ class EmulatorError:
         if live.shape[1] > 1:
             C = np.corrcoef(live.T)
             corr = float(np.median(C[~np.eye(C.shape[0], dtype=bool)]))
+        kind = {"base": "comparator", "cost": "cost", "bw": "burden_window"}
+        by_q = {}
+        for c in self.cols:
+            by_q[kind.get(c[0], "reduction")] = by_q.get(kind.get(c[0], "reduction"), 0) + 1
+        pair = [np.corrcoef(self.R[:, self.col[c]], self.R[:, self.col[("base", c[0], c[1])]])[0, 1] for c in self.cols
+                if c[0] not in kind and ("base", c[0], c[1]) in self.col and s[self.col[c]] > 0
+                and s[self.col[("base", c[0], c[1])]] > 0]
         return {"model": "common (population-mean, centred on the signed mean residual) plus per-unit components from "
                          "the held-out residual vectors",
+                "columns_by_quantity": by_q,
+                "correlation": "every column is drawn from the same held-out residual rows, so a unit's comparator, "
+                               "reduction and cost errors keep their held-out correlation",
+                "comparator_reduction_corr_median": float(np.median(pair)) if pair else None,
                 "holdout_points": H, "columns": len(self.cols),
                 "residual_mean_median": float(np.median(self.m)), "residual_mean_abs_median": float(np.median(np.abs(self.m))),
                 "residual_sd_median": float(np.median(s)), "rmse_median": float(np.median(rmse)),

@@ -57,7 +57,42 @@ def name(f) -> str:
 
 def encode(f: dict, v) -> float:
     """One number from an attribute value; ValueError when the encoding cannot read it."""
-    raise NotImplementedError("F6 S2-4 beta")
+    e = f["encoding"]
+    if e == "equals":
+        if isinstance(v, (list, dict)):
+            raise ValueError(f"equals needs one value, got {v!r}")
+        same = (float(v) == float(f["value"])) if _finite(v) and _finite(f["value"]) else \
+            str(v).strip() == str(f["value"]).strip()
+        return 1.0 if same else 0.0
+    if e == "value":
+        if not _finite(v):
+            raise ValueError(f"value needs one finite number, got {v!r}")
+        return float(v)
+    if not isinstance(v, list) or not all(_finite(x) for x in v):
+        raise ValueError(f"{e} needs a list of finite numbers, got {v!r}")
+    xs = [float(x) for x in v]
+    if e == "count":
+        return float(len(xs))
+    if e == "sum":
+        return float(sum(xs))
+    if not xs:
+        if "empty" in f:
+            return float(f["empty"])
+        raise ValueError(f"{e} of an empty list: give `empty` (the number an empty list takes)")
+    n, m = len(xs), sum(xs) / len(xs)
+    if e == "mean":
+        return m
+    if e == "sd":
+        return math.sqrt(sum((x - m) ** 2 for x in xs) / n)
+    if e in ("min", "max"):
+        return min(xs) if e == "min" else max(xs)
+    if e in ("first", "last"):
+        return xs[0] if e == "first" else xs[-1]
+    if n < 2 or m <= 0:
+        raise ValueError(f"{e} needs at least 2 numbers with a positive sum, got {v!r}")
+    a = 2.0 / n * sum(x * math.cos(2 * math.pi * k / n) for k, x in enumerate(xs)) / m
+    b = 2.0 / n * sum(x * math.sin(2 * math.pi * k / n) for k, x in enumerate(xs)) / m
+    return a if e == "harmonic_cos" else b if e == "harmonic_sin" else math.hypot(a, b)
 
 
 def declared(raw: dict) -> list:
@@ -67,12 +102,65 @@ def declared(raw: dict) -> list:
 def vector(spec, row: dict) -> list[float]:
     """The unit's feature values, in declaration order (ValueError naming the feature when one cannot be read).
     `spec`: a Spec (toolkit/spec/schema.py) for its unit_attributes()."""
-    raise NotImplementedError("F6 S2-4 beta")
+    out, attrs = [], None
+    for f in declared(spec.raw):
+        if isinstance(f, str):
+            out.append(float(row[f]))
+            continue
+        if attrs is None:
+            attrs = spec.unit_attributes(row)
+        try:
+            out.append(encode(f, attrs[f["attribute"]]))
+        except (ValueError, TypeError, KeyError) as e:
+            raise ValueError(f"{W}: {name(f)}: {e}") from None
+    return out
 
 
 def problems(spec, cols) -> list[str]:
     """Fail closed on every feature the emulator could not read for every unit."""
-    raise NotImplementedError("F6 S2-4 beta")
+    feats = declared(spec.raw)
+    if not isinstance(feats, list):
+        return [f"{W}: a list"]
+    bad = []
+    ea = (spec.raw.get("decision_units") or {}).get("engine_attributes") or {}
+    cal_attr = (spec.raw.get("calibration") or {}).get("attribute")
+    ok = []
+    for f in feats:
+        if isinstance(f, str):
+            (ok.append(f) if f in cols else bad.append(f"{W}: no column {f}"))
+            continue
+        if not isinstance(f, dict) or set(f) - KEYS or "attribute" not in f or "encoding" not in f:
+            bad.append(f"{W}: {f!r}: a column, or {{attribute, encoding[, value][, empty]}}")
+            continue
+        a, e = f["attribute"], f["encoding"]
+        if e not in ENCODINGS:
+            bad.append(f"{W}: {a}: unknown encoding {e!r} (one of {', '.join(ENCODINGS)})")
+        elif a == cal_attr:
+            bad.append(f"{W}: {a} is the calibrated attribute, already the emulator's first input")
+        elif a not in ea:
+            bad.append(f"{W}: {a} is not an attribute bound in decision_units.engine_attributes")
+        elif (e == "equals") != ("value" in f):
+            bad.append(f"{W}: {a}.{e}: `value` is the category `equals` compares with, and only for it")
+        elif "empty" in f and (e in SCALAR or e in ("count", "sum") or not _finite(f["empty"])):
+            bad.append(f"{W}: {a}.{e}: `empty` is a number, for the list encodings an empty list cannot give")
+        else:
+            ok.append(f)
+    names = [name(f) for f in feats if isinstance(f, str) or (isinstance(f, dict) and {"attribute", "encoding"} <= set(f))]
+    bad += [f"{W}: two features are named {n}" for n in sorted({n for n in names if names.count(n) > 1})]
+    if bad:
+        return bad
+    from toolkit.spec.schema import Spec
+    sub = Spec(dict(spec.raw, analysis={"emulator": {"features": ok}}), spec.base)
+    try:
+        units = spec.units()
+    except OSError as e:
+        return [f"{W}: the units table is unreadable ({e})"]
+    for u in units:
+        try:
+            vector(sub, u)
+        except (ValueError, TypeError) as e:
+            return [f"{e} (unit {u.get(spec.uid)})"]
+    return []
 
 
 def _self_test() -> int:
