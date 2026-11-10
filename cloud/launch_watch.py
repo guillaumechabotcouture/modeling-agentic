@@ -3,6 +3,7 @@
     python cloud/launch_watch.py <config.py> [--cap CREDITS] [--interval S] [--start-minutes M]
                                  [--max-hours H] [--credits-per-instance-hour C] [--allow-no-cloud-limits]
                                  [--cap-collect-minutes M] [--launch-minutes M] [--relaunch-attempts N]
+                                 [--collect-minutes M] [--collect-attempts N]
     python cloud/launch_watch.py --self-test
 
 Replaces the local, per-launch watchdog scripts (F5, 2026-11-04 to 11-09). Every name (cluster, keeper, overflow
@@ -10,7 +11,9 @@ pool, labels, out_dir) comes from the config. It runs `run_cluster.py <config> l
 MA_LAUNCH_INVOCATION set to a fresh token, then:
 
   1. The launcher's exit code (run_cluster.py module doc). 0, 3, 4, 5: something was submitted, so nothing is
-     stopped; it watches. On 5, or 3 with no keeper in clusters.json, it runs `run_cluster.py <config> keeper`.
+     stopped; it watches. On 5, or 3 with no keeper in clusters.json, it logs that the keeper is not confirmed and
+     must be started by hand; it never runs `keeper` itself (its reconcile stops live helpers absent from this
+     launch's record, which may be another invocation's).
      1 or any other code: it stops clusters only when clusters.json's `invocation` is this token and its `status` is
      "failed", and then exactly the ids it names, by id. Any other record (none, an earlier launch's, another
      status) stops nothing.
@@ -37,7 +40,11 @@ A label that stays "missing" (its VM never started the run) for --start-minutes 
 is retried at the next window, at most --relaunch-attempts times; still missing after one accepted relaunch, or
 after the last attempt: exit 2. The launch itself is bounded by --launch-minutes (default 45): past it the launcher
 is terminated and reaped, and the result is treated as its exit 4 (submitted, unconfirmed: watch, stop nothing).
-Before an exit that leaves clusters up (2, 4, 6) one last listing logs every live cluster with this launch's names
+Before the launch it refuses (exit 8) when any live cluster of the config's names exists, or when the listing
+cannot be read: `launch` replaces same-named helpers it finds live, so it never meets a foreign one through the
+watch. Each collect is one attempt bounded by --collect-minutes (default 30), at most --collect-attempts (6), with
+the cap and --max-hours checked between attempts.
+Before an exit that leaves clusters up (1, 2, 4, 6) one last listing logs every live cluster with this launch's names
 and its ownership (recorded / journal / unknown); nothing more is stopped.
 
 Exit codes:
@@ -50,6 +57,7 @@ Exit codes:
   5 every run collected, but a cluster of the launch is still listed live after the stop requests
   6 the watch reached --max-hours (default run_timeout_hours + hold_hours + 1): nothing stopped
   7 refused: the config has no cloud-side limits (see 5 above)
+  8 refused: a cluster of the config's names is live before the launch, or the listing could not be read
 """
 from __future__ import annotations
 
@@ -67,9 +75,9 @@ sys.path.insert(0, HERE)
 import run_cluster as rc  # noqa: E402
 
 EXIT_DONE, EXIT_LAUNCH_FAILED, EXIT_NEVER_RAN, EXIT_CAP = 0, 1, 2, 3
-EXIT_UNCONFIRMED, EXIT_SHUTDOWN_UNCONFIRMED, EXIT_LIMIT, EXIT_REFUSED = 4, 5, 6, 7
+EXIT_UNCONFIRMED, EXIT_SHUTDOWN_UNCONFIRMED, EXIT_LIMIT, EXIT_REFUSED, EXIT_PRELIVE = 4, 5, 6, 7, 8
 SUBMITTED = (rc.EXIT_LAUNCHED, rc.EXIT_SUBMITTED_LOST, rc.EXIT_UNCONFIRMED, rc.EXIT_INCOMPLETE)   # 0, 3, 4, 5
-TIMEOUTS = {"status": 600, "collect": 4 * 3600, "keeper": 1800, "relaunch": 1800}   # `launch` has none
+TIMEOUTS = {"status": 600, "collect": 1800, "relaunch": 1800}   # defaults; launch and collect get the Watch's
 _NET = re.compile(r"gaierror|nodename nor servname|name resolution|Name or service not known|getaddrinfo|"
                   r"Timed out trying to connect|tls://|\bSSL|\bTLS\b|ConnectTimeout|ReadTimeout|TimeoutError|"
                   r"timed out|Connection(Reset|Refused|Aborted)Error|Connection (reset|refused|aborted)|"
@@ -248,7 +256,7 @@ def shell_runner(cfg_path, prefix=None):
 class Watch:
     def __init__(self, cfg, cfg_path, token, runner, api, clock, sleep, cap=650.0, interval_s=300.0,
                  start_s=300.0, max_hours=None, rate=8.0, allow_no_limits=False, retries=6, retry_s=60.0,
-                 cap_collect_s=600.0, launch_s=2700.0, relaunch_attempts=3):
+                 cap_collect_s=600.0, launch_s=2700.0, relaunch_attempts=3, collect_s=1800.0, collect_attempts=6):
         self.cfg, self.cfg_path, self.token, self.runner, self.api = cfg, cfg_path, token, runner, api
         self.clock, self.sleep, self.cap, self.interval_s, self.start_s = clock, sleep, cap, interval_s, start_s
         self.max_hours = max_hours if max_hours is not None else (cfg.run_timeout_hours or 48.0) + cfg.hold_hours + 1
@@ -257,10 +265,12 @@ class Watch:
         self.max_sizes = {"run": 1 + len(cfg.labels) + cfg.compute_max, "overflow": 1 + (cfg.overflow_max or 0),
                           "keeper": 2}                     # the fallback when Coiled gives no live count
         self.cap_collect_s, self.launch_s, self.relaunch_attempts = cap_collect_s, launch_s, relaunch_attempts
+        self.collect_s, self.collect_attempts, self.lines = collect_s, collect_attempts, []
         self.env = {**os.environ, "MA_LAUNCH_INVOCATION": token}
         self.pending_strays, self.reported, self.leftovers, self.start = set(), set(), None, None
 
     def log(self, msg):
+        self.lines.append(msg)
         print(f"{time.strftime('%F %T')} {self.cfg.name}: {msg}", flush=True)
 
     def safe(self, fn, *a):
@@ -299,6 +309,19 @@ class Watch:
         if why:
             self.log(f"refused: {why}")
             return EXIT_REFUSED
+        items = None
+        for i in range(self.retries):
+            items = self.safe(self.api.list_clusters)
+            if items is not None:
+                break
+            self.sleep(self.retry_s)
+        live = [] if items is None else [(x.get("name"), x.get("id")) for x in rc._items(items)
+                                         if x.get("name") in self.names and _live(x)]
+        if items is None or live:
+            self.log("refused: " + ("the cluster listing could not be read" if items is None else
+                                    "live before the launch: " + ", ".join(f"{n} ({i})" for n, i in live))
+                     + "; nothing launched, nothing stopped")
+            return EXIT_PRELIVE
         self.log(f"launch, invocation {self.token}")
         code, out = self.runner(["launch"], self.env, timeout=self.launch_s)
         if code is None:
@@ -310,11 +333,10 @@ class Watch:
         if d["action"] == "stop":
             for name, cid in d["stop"]:
                 self.safe(self.api.stop, name, cid, f"launch failed (invocation {self.token})")
-            return EXIT_LAUNCH_FAILED
+            return self.leave(self.record(), EXIT_LAUNCH_FAILED)
         if d["keeper"]:
-            kc, kout = self.call(["keeper"])
-            self.log(f"keeper exit {kc}: {str(kout).strip()[-200:]}" + ("" if kc == 0 else
-                     f" -- start it by hand: python cloud/run_cluster.py {self.cfg_path} keeper"))
+            self.log(f"keeper not confirmed: start it by hand with `python cloud/run_cluster.py {self.cfg_path} "
+                     "keeper` after checking `status`")
         return self.watch()
 
     def over_limit(self) -> bool:
@@ -439,7 +461,7 @@ class Watch:
 
     def finish(self, rec) -> int:
         ok, bad = False, list(self.cfg.labels)
-        for i in range(self.retries):
+        for i in range(self.collect_attempts):
             if i and self.over_limit():
                 return self.leave(rec, EXIT_LIMIT)
             if i and rec is not None:
@@ -449,8 +471,8 @@ class Watch:
                     if not self.stop_all(rec, f"credit cap {self.cap}"):
                         self.log("a cluster of this launch may still be live after the stop requests")
                     return EXIT_CAP
-            code, out = self.call(["collect", "--no-shutdown"])
-            self.log(f"collect exit {code}: {str(out).strip()[-300:]}")
+            code, out = self.call(["collect", "--no-shutdown"], retries=1, timeout=self.collect_s)   # one attempt
+            self.log(f"collect attempt {i + 1}/{self.collect_attempts} exit {code}: {str(out).strip()[-300:]}")
             ok, bad = self.collected()
             if ok:
                 break
@@ -1024,6 +1046,8 @@ def main(argv) -> int:
     p.add_argument("--cap-collect-minutes", type=float, default=10.0, help="the collect attempt at the cap")
     p.add_argument("--launch-minutes", type=float, default=45.0, help="deadline of the launch subprocess")
     p.add_argument("--relaunch-attempts", type=int, default=3)
+    p.add_argument("--collect-minutes", type=float, default=30.0, help="deadline of each collect attempt")
+    p.add_argument("--collect-attempts", type=int, default=6)
     a = p.parse_args(argv[1:])
     cfg = rc.load_config(a.config)
     token = f"watch-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(3)}"
@@ -1031,7 +1055,8 @@ def main(argv) -> int:
                  cap=a.cap, interval_s=a.interval, start_s=a.start_minutes * 60, max_hours=a.max_hours,
                  rate=a.credits_per_instance_hour, allow_no_limits=a.allow_no_cloud_limits,
                  cap_collect_s=a.cap_collect_minutes * 60, launch_s=a.launch_minutes * 60,
-                 relaunch_attempts=a.relaunch_attempts).run()
+                 relaunch_attempts=a.relaunch_attempts, collect_s=a.collect_minutes * 60,
+                 collect_attempts=a.collect_attempts).run()
 
 
 if __name__ == "__main__":

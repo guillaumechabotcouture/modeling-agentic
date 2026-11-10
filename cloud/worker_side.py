@@ -237,28 +237,56 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     return res
 
 
-def verify_attached(cl, expected_id):
-    """coiled.Cluster(name=...) creates an empty cluster when the named one
-    stopped between the state check and the call. If the cluster we got is not
-    the one we checked, shut it down at once and refuse."""
+ATTACH_SKEW_S = 120.0    # clock skew allowed against Coiled's `created` time; equal to run_cluster.OWN_SKEW_S (RC18f)
+
+
+def _utc_epoch(v):
+    """An ISO time from the Coiled API as epoch seconds (UTC when it has no zone), or None (run_cluster._ts)."""
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+def verify_attached(cl, expected_id, started=None, lister=None):
+    """coiled.Cluster(name=...) creates an empty cluster when the named one stopped between the state check and the
+    call. If the cluster we got is not the one we checked, refuse. It is shut down only when this attach created it:
+    the listing (`lister`) shows its `created` time no earlier than the attach's start (`started`) less
+    ATTACH_SKEW_S, the rule run_cluster._construct applies to a construction. Any doubt (no start time, not listed,
+    no created time, an earlier one, the listing failing) means it may be another invocation's: refused and left
+    alone (Codex round 2 on the launch watch)."""
     got = getattr(cl, "cluster_id", None)
-    if expected_id is not None and got != expected_id:
+    if expected_id is None or got == expected_id:
+        return cl
+    ts = None
+    if started is not None and lister is not None:
+        try:
+            ts = next((_utc_epoch(c.get("created")) for c in lister() if c.get("id") == got), None)
+        except Exception:  # noqa: BLE001 — unknown: not ours
+            ts = None
+    if ts is not None and ts >= started - ATTACH_SKEW_S:
         try:
             cl.shutdown()
         finally:
             raise SystemExit(f"cluster {expected_id} stopped while attaching; the new empty cluster {got} was shut down")
-    return cl
+    raise SystemExit(f"attached to cluster {got}, not the checked cluster {expected_id}, and this attach did not "
+                     f"create it (created {ts}, attach began {started}): refusing; {got} is left alone")
 
 
 def attach_existing(name, workspace, expected_id):
-    """The one attach call: coiled.Cluster(name=...) without waiting for workers, then
-    verify_attached, which shuts down and refuses any cluster other than `expected_id`. Callers
-    check first that the cluster is live (run_cluster.attach, the keeper loop), so a stopping or
-    stopped cluster is never attached by name; the overflow handle attaches by the id the launch
-    created."""
+    """The one attach call: coiled.Cluster(name=...) without waiting for workers, then verify_attached, which refuses
+    any cluster other than `expected_id` (and shuts it down only when this attach created it). Callers check first
+    that the cluster is live (run_cluster.attach, the keeper loop), so a stopping or stopped cluster is never attached
+    by name; the overflow handle attaches by the id the launch created."""
+    import time
     import coiled
-    return verify_attached(coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False,
-                                          wait_for_workers=False), expected_id)
+    started = time.time()
+    cl = coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False, wait_for_workers=False)
+    lister = lambda: (lambda cs: cs if isinstance(cs, list) else list(cs.values()))(  # noqa: E731
+        coiled.list_clusters(workspace=workspace))
+    return verify_attached(cl, expected_id, started=started, lister=lister)
 
 
 def task_state(key, dask_scheduler=None):
