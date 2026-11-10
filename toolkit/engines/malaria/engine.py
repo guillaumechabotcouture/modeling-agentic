@@ -106,6 +106,12 @@ rounds; the package's and routine SMC keep the parameter smc_cov. With it, smc_c
 the burn-in key, so a calibration can fit the history without moving the coverage the allocation uses. smc_rho and the
 child's persistent latent are shared by past and future rounds. Absent or empty, a run is byte-identical to v0.12
 (self-test HC3; benchmarks/restamp_proof.py). Self-tests HC0-HC7 (selftest_late.py).
+
+v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, so a burden check can compare a past window.
+For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are the expected severe episodes and
+deaths of the window's new infections per person of the group, over its mean population in the window:
+the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
+v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W4 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -134,7 +140,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.13"
+VERSION = "0.14"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -262,6 +268,8 @@ POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
+# v0.14: the parameters of the case fatality, which the decision window's deaths read on every window day
+CFR_PARAMS = frozenset({"cfr_severe_untreated", "cfr_severe_treated", "severe_access_add"})
 # v0.10: SMC parameters act before the fork when a unit has past SMC (smc_hist_years), so they join its burn-in key
 SMC_PARAMS = frozenset(M.SMC_PARAM_NAMES)      # v0.11: the seven SMC parameters
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
@@ -536,7 +544,8 @@ class MalariaEngine:
                                     "years from itn_hist_years; others hist_net (default none)"},
             outputs={"per_capita": ["cases", "severe", "deaths", "treated", "dalys"],
                      "windows": list(M.PFPR_BANDS) + ["inc_u5", "inc_all", "inc_u5_smc", "eir_annual",
-                                                      "net_use", "net_access"],
+                                                      "net_use", "net_access"]
+                     + [f"{k}_{g}" for k in ("severe", "deaths") for g in AGES + ["all"]],    # v0.14
                      "cost_drivers": ["nets_given", "smc_doses", "irs_sprayed", "treated_all"],
                      # v0.12: produced only with cm_target 1; the spec validator refuses a mapping to one otherwise
                      "cost_drivers_when": {"cm_child_years": {"cm_target": 1.0},
@@ -767,13 +776,19 @@ class MalariaEngine:
         return sorted(out, key=lambda x: x["t0"])
 
     @staticmethod
-    def _burnin_key(P: dict, a: dict) -> str:
+    def _burnin_key(P: dict, a: dict, horizon: Horizon | None = None) -> str:
         import json
         # v0.10: dual-AI nets in any past campaign (hist_net_by_year) and past SMC act before the fork, so their
         # parameters join the key (delivery_plan validated both attributes before this)
         hn = hist_net_types(a, [float(y) for y in a.get("itn_hist_years", [])]) or []
         dual = a.get("hist_net", "pyr") == "dual" or "dual" in hn
         skip = POST_FORK | (frozenset() if dual else DUAL_NET)
+        # v0.14: when the decision window starts before the delivery start, the shared history (to the fork, at the
+        # delivery start or later) holds window days whose deaths use the case fatality: members that differ in it
+        # get their own burn-in. Otherwise the key is v0.13's
+        if horizon is not None and explicit_delivery(horizon) \
+                and float(horizon.window[0]) < float(delivery_period(horizon)[0]):
+            skip = skip - CFR_PARAMS
         if a.get("smc_hist_years"):
             skip = skip - SMC_PARAMS
             # v0.13: with their own coverage the past rounds do not read smc_cov, which then acts only after the fork
@@ -989,7 +1004,7 @@ class MalariaEngine:
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
         for i, (P, a, _) in enumerate(mem):
-            groups.setdefault(self._burnin_key(P, a), []).append(i)
+            groups.setdefault(self._burnin_key(P, a, horizon), []).append(i)
         out, ser = [None] * B, [None] * B
         for idx in groups.values():
             t0 = time.time()
@@ -1021,7 +1036,7 @@ class MalariaEngine:
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
                 try:
-                    dz.daily, dz.mos = {}, []
+                    dz.daily, dz.mos, dz.wdaily = {}, [], {}
                     s.shrink(size_limit=None, die=False)   # Starsim keeps finished sims alive: drop their people and loop
                 except Exception:  # noqa: BLE001 -- best effort; the outcomes are already computed
                     pass
@@ -1088,6 +1103,28 @@ class MalariaEngine:
                 "inc_all": float(d["inc_all"][sel].sum()), "inc_u5_smc": float(d["inc_u5_smc"][sel].sum()),
                 "eir_annual": float(d["eir"][sel].sum() / dur),
                 "net_use": float(d["net_use"][sel].mean()), "net_access": float(d["net_access"][sel].mean())})
+            # v0.14: severe episodes and deaths per person of each age group (and of all ages) over the window,
+            # counted as the per-capita outcomes are: the window's total over the group's mean population in it
+            nd, wd = max(int(sel.sum()), 1), dz.wdaily
+            # Codex r1 P2: a window the simulated days do not cover (it starts before the sim or ends after it, or
+            # is empty) has no value: NaN, not 0
+            step = float(yv[1] - yv[0]) if len(yv) > 1 else 1.0 / 365
+            covered = t_a < t_b and t_a >= yv[0] - 1e-9 and t_b <= yv[-1] + step + 1e-9 and sel.any()
+            # Codex r1 P1: days shared with other members (before the fork) were counted with the first member's case
+            # fatality; days with one case fatality are recounted with this member's parameters (the same expression
+            # as the step's, so the member's own days are unchanged), days with the severe-care link are its own
+            pt = np.minimum(1.0, P["severe_access_add"] + wd["ft"][sel])
+            cfr = (1 - pt) * P["cfr_severe_untreated"] + pt * P["cfr_severe_treated"]
+            dt = getattr(dz, "sev_dtype", np.float64)     # the step multiplies in its states' precision
+            dth = np.where(wd["plain"][sel] > 0, (wd["severe"][:, sel].astype(dt) * cfr.astype(dt)).astype(float),
+                           wd["deaths"][:, sel])
+            for k, arr in (("severe", wd["severe"][:, sel]), ("deaths", dth)):
+                tot, pop = arr.sum(axis=1), wd["pop"][:, sel].sum(axis=1) / nd
+                for i, g in enumerate(AGES):
+                    wins[name][f"{k}_{g}"] = float(tot[i] / pop[i]) if covered and pop[i] > 0 else \
+                        (0.0 if covered else float("nan"))
+                wins[name][f"{k}_all"] = float(tot.sum() / pop.sum()) if covered and pop.sum() > 0 else \
+                    (0.0 if covered else float("nan"))
         # v0.6: treatments in the delivery period per mean person in it (the add-on and its funding end there); the
         # delivery accumulators equal the window ones when the period is the window
         d0, d1 = delivery_period(horizon)
@@ -2945,6 +2982,110 @@ def _self_test_v013(ok, e, unit) -> None:
            f"HC7e near smc_rho 1 the shares stay finite and approach all-or-none (0.4 none, 0.6 all: "
            f"{hi[0]:.6f}, {hi[-1]:.6f})")
     case("HC7", hc7)
+
+
+def _self_test_v014(ok, e, unit) -> None:
+    """v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, per person of each age group and of all
+    ages over any named window (severe_<g>, deaths_<g>, g in AGES or all), counted as the decision window's per-capita
+    outcomes are: expected severe episodes and deaths of the window's new infections over the group's mean
+    population in the window. A past window then gives the deaths those years would give as the decision window."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    names = [f"{k}_{g}" for k in ("severe", "deaths") for g in AGES + ["all"]]
+    p = {"n_agents": 1000, "burnin_years": 1}
+    none = Package("none", {})
+    close = lambda a, b: abs(a - b) <= 1e-12 * max(abs(a), abs(b), 1e-300)  # noqa: E731
+
+    def w0():
+        wn = e.describe().outputs["windows"]
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 14) and all(n in wn for n in names),
+           f"W0 engine v0.14 lists {names} among its window metrics")
+    case("W0", w0)
+
+    def w1():
+        # A counts 2015 as its decision window; B counts 2017 and names 2015 as a past window. The sims are the same
+        # (no package acts), so B's past-window metrics are A's per-capita outcomes
+        ha = Horizon(2015.0, 2018.0, (2015.0, 2016.0), {"past": [2015.0, 2016.0]})
+        hb = Horizon(2015.0, 2018.0, (2017.0, 2018.0), {"past": [2015.0, 2016.0], "dec": [2017.0, 2018.0]})
+        a, b = e.run(p, unit, none, ha, 4), e.run(p, unit, none, hb, 4)
+        wb, pa = b.windows["past"], a.per_capita
+        ok(all(close(wb[f"{k}_{g}"], pa[k][g]) for k in ("severe", "deaths") for g in AGES),
+           f"W1 a past window's deaths and severe cases per person of each age group equal those years counted as "
+           f"the decision window (deaths_u5 {wb.get('deaths_u5')} vs {pa['deaths']['u5']})")
+        sh = a.meta["age_shares"]
+        ok(all(close(wb[f"{k}_all"], sum(pa[k][g] * sh[g] for g in AGES)) for k in ("severe", "deaths")),
+           "W1b the all-ages metrics are deaths and severe cases per person of the whole population")
+        ok(all(close(b.windows["dec"][f"{k}_{g}"], b.per_capita[k][g]) for k in ("severe", "deaths") for g in AGES)
+           and pa["deaths"]["u5"] > 0, "W1c a named window equal to the decision window gives the per-capita outcomes")
+    case("W1", w1)
+
+    def w2():
+        # the case-management severe-care link (per-person case fatality) is counted the same way
+        hz = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"dec": [2016.0, 2017.0], "half": [2016.0, 2016.5]})
+        q = dict(p, cm_target=1.0, cm_severe_link=0.5, cm_add=0.3, cm_ramp_years=0.0)
+        o = e.run(q, UnitSpec("t", dict(unit.attributes, m0=20.0)), Package("cm", {"cm": 1}), hz, 2)
+        ok(all(close(o.windows["dec"][f"deaths_{g}"], o.per_capita["deaths"][g]) for g in AGES),
+           "W2 with the severe-care link the window deaths equal the per-capita deaths")
+        ok(all(0 < o.windows["half"][f"deaths_{g}"] < o.windows["dec"][f"deaths_{g}"] for g in AGES),
+           "W2b a half window holds part of the deaths")
+    case("W2", w2)
+
+    def w3():
+        # Codex r1 P1: members sharing a burn-in and history count their past deaths with their own case fatality
+        h = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"past": [2015.0, 2016.0], "dec": [2016.0, 2017.0]})
+        q = dict(p, cfr_severe_untreated=0.9, cfr_severe_treated=0.09, severe_access_add=0.1)
+        res = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        solo = [res(e.run(x, unit, none, h, 4)) for x in (p, q)]
+        fw, bw = e.run_batch([p, q], unit, none, h, 4), e.run_batch([q, p], unit, none, h, 4)
+        ok([o.meta["burnin_members"] for o in fw] == [2, 2] and [res(o) for o in fw] == solo
+           and [res(o) for o in bw] == solo[::-1],
+           f"W3 in a shared burn-in each member's past-window deaths are its own, in either order "
+           f"({fw[1].windows['past']['deaths_u5']} vs alone {solo[1][1]['past']['deaths_u5']})")
+    case("W3", w3)
+
+    def w4():
+        # Codex r1 P2: a window the sim does not cover (before its start, past its end, empty) gives NaN, not 0
+        h = Horizon(2015.0, 2016.0, (2015.0, 2016.0), {"before": [2013.0, 2014.0], "part": [2013.0, 2015.0],
+                                                      "after": [2015.5, 2016.5], "empty": [2015.5, 2015.5],
+                                                      "burnin": [2014.0, 2015.0]})
+        w = e.run(p, unit, none, h, 4).windows
+        ok(all(np.isnan(w[x][n]) for x in ("before", "part", "after", "empty") for n in names)
+           and all(np.isfinite(w["burnin"][n]) for n in names),
+           "W4 the new metrics are NaN for a window the simulated days do not cover, and finite inside the burn-in")
+    case("W4", w4)
+
+    def w5():
+        # the decision window starts before the delivery start: the shared history (to the fork at the delivery start)
+        # overlaps the window, so members that differ in case fatality must not share it (per_capita deaths)
+        from toolkit.engines.horizon import DeliveryHorizon
+        q = dict(p, cfr_severe_untreated=0.9, cfr_severe_treated=0.09, severe_access_add=0.1)
+        res = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        hl = DeliveryHorizon(2015.0, 2017.0, (2015.0, 2017.0), {"w": [2015.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        b = e.run_batch([p, q], unit, none, hl, 4)
+        ok([o.meta["burnin_members"] for o in b] == [1, 1]
+           and [res(o) for o in b] == [res(e.run(x, unit, none, hl, 4)) for x in (p, q)],
+           "W5 with the window starting before the delivery start, members differing in case fatality get their own "
+           f"burn-in and their own decision-window deaths ({[o.meta['burnin_members'] for o in b]})")
+        he = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"w": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        ok([o.meta["burnin_members"] for o in e.run_batch([p, q], unit, none, he, 4)] == [2, 2],
+           "W5b with the window starting at the delivery start they still share one burn-in (v0.13)")
+        P0, P1 = resolve_params(e, p), resolve_params(e, q)
+        f6 = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        a = dict(unit.attributes)
+        ok(e._burnin_key(P0, a, f6) == e._burnin_key(P1, a, f6) == e._burnin_key(P1, a)
+           and e._burnin_key(P0, a, hl) != e._burnin_key(P1, a, hl),
+           "W5c the F6 draft's horizon (window [2024, 2029.25], delivery [2024, 2027]) keeps the v0.13 burn-in key")
+        # Codex P3: each case-fatality parameter alone separates the key
+        ok(all(e._burnin_key(P0, a, hl) != e._burnin_key(dict(P0, **{k: P0[k] * 0.5 + 0.03}), a, hl)
+               and e._burnin_key(P0, a, he) == e._burnin_key(dict(P0, **{k: P0[k] * 0.5 + 0.03}), a, he)
+               for k in ("cfr_severe_untreated", "cfr_severe_treated", "severe_access_add")),
+           "W5d each of cfr_severe_untreated, cfr_severe_treated and severe_access_add alone separates the key under "
+           "the condition, and none does otherwise")
+    case("W5", w5)
 
 
 def write_card(path: str) -> None:
