@@ -594,8 +594,8 @@ def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
     both rounds share cancels, offsets of different sources add) and `run_var`, the modelled change's run noise (paired:
     one trajectory gives both rounds). Model discrepancy is left out: it is declared per target as a level error, and
     the change is the check the levels cannot make. Not computable: a missing modelled value, or no declared error."""
-    obs = mod = obs_n = mod_n = vs = vo = 0.0
-    coef, bsd = {}, {}
+    obs = mod = obs_n = mod_n = vs = vo = vn = 0.0
+    coef, bsd, coef_n = {}, {}, {}
     for x in terms:
         a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
         ma, mb = modelled.get(a.id), modelled.get(b.id)
@@ -606,30 +606,63 @@ def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
         obs_n += w * (b.value - a.value)
         mod_n += w * (float(inv(mb, b.scale)) - float(inv(ma, a.scale)))
         vs += w * w * (a.sd_obs ** 2 + b.sd_obs ** 2 - 2.0 * rho * a.sd_obs * b.sd_obs)
-        for t, sg in ((a, -1.0), (b, 1.0)):
+        da, db = float(dinv(a.y, a.scale)), float(dinv(b.y, b.scale))     # the natural scale's error (delta method)
+        vn += w * w * ((da * a.sd_obs) ** 2 + (db * b.sd_obs) ** 2 - 2.0 * rho * da * db * a.sd_obs * b.sd_obs)
+        for t, sg, dt in ((a, -1.0, da), (b, 1.0, db)):
             if t.bias_key is None:
                 vo += (w * t.sd_bias) ** 2
+                vn += (w * dt * t.sd_bias) ** 2
             else:
                 coef[t.bias_key] = coef.get(t.bias_key, 0.0) + sg * w
+                coef_n[t.bias_key] = coef_n.get(t.bias_key, 0.0) + sg * w * dt
                 bsd[t.bias_key] = t.sd_bias
     vo += sum((c * bsd[k]) ** 2 for k, c in coef.items() if abs(c) > 1e-12)
+    vn += sum((c * bsd[k]) ** 2 for k, c in coef_n.items() if abs(c) > 1e-12)
     vs, run_var = max(vs, 0.0), max(float(run_var), 0.0)
     sd = math.sqrt(vs + vo + run_var)
     if not sd > 1e-12:
         return {"not_computable": "the change has no declared error (no sampling error, and the survey's offset cancels)"}
     z = (mod - obs) / sd
-    so = math.sqrt(vs + vo)
-    ratio = mod_n / obs_n if so > 0 and abs(obs) >= so and obs_n != 0 else None
+    ratio = mod_n / obs_n if obs_n != 0 and abs(obs_n) >= math.sqrt(max(vn, 0.0)) else None
     word = "decline" if obs_n < 0 else "rise"
     nums = f"({mod_n:+.3g} against {obs_n:+.3g} observed)"
     text = (f"the observed change ({obs_n:+.3g}) is within its error of zero; the model's change is {mod_n:+.3g}"
             if ratio is None else f"the model's change has the opposite sign of the observed one {nums}" if ratio < 0
+            else f"the model's {word} matches the observed one {nums}" if abs(ratio - 1) < 0.005
             else f"the model's {word} is {100 * (1 - ratio):.0f}% smaller than observed {nums}" if ratio < 1
             else f"the model's {word} is {100 * (ratio - 1):.0f}% larger than observed {nums}")
     return {"observed": obs, "modelled": mod, "observed_natural": obs_n, "modelled_natural": mod_n,
+            "observed_natural_sd": math.sqrt(max(vn, 0.0)),
             "difference": mod - obs, "sd": sd, "sd_parts": {"sampling": math.sqrt(vs), "offset": math.sqrt(vo),
                                                             "run": math.sqrt(run_var)},
             "z": z, "flagged": bool(abs(z) > z_max), "ratio": ratio, "text": text}
+
+
+def change_run_var(terms, targets, tn, pair_tn, member_y) -> float:
+    """The modelled change's run noise over the terms (on the targets' scale). tn: {observable: run-noise variance};
+    pair_tn: {(from observable, to observable): the run-noise variance of their difference within one run}, so the
+    covariance of one trajectory's two windows is c = (tn_a + tn_b - pair) / 2. A unit term is paired within its unit.
+    A group target's members are independent runs, each entering the aggregate T(sum w p) with the coefficient
+    w dinv(y_member) / dinv(Y_aggregate) (first order; member_y: {(unit, observable): modelled value on the scale})."""
+    v = 0.0
+    for x in terms:
+        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
+        ta, tb = tn[a.observable], tn[b.observable]
+        c = 0.5 * (ta + tb - pair_tn[(a.observable, b.observable)])
+        if a.kind == "unit":
+            v += w * w * (ta + tb - 2.0 * c)
+            continue
+        k = {}
+        for t in (a, b):
+            ws = sum(t.weights.values())
+            pbar = sum(q / ws * float(inv(member_y[(u, t.observable)], t.scale)) for u, q in t.weights.items())
+            dY = float(dinv(tr(pbar, t.scale), t.scale))
+            k[t.id] = {u: q / ws * float(dinv(member_y[(u, t.observable)], t.scale)) / max(dY, 1e-300)
+                       for u, q in t.weights.items()}
+        for u in set(a.weights) | set(b.weights):
+            ka, kb = k[a.id].get(u, 0.0), k[b.id].get(u, 0.0)
+            v += w * w * (kb * kb * tb + ka * ka * ta - 2.0 * ka * kb * c)
+    return max(v, 0.0)
 
 
 def standardised_errors(sim, mean, var) -> np.ndarray:
@@ -1986,24 +2019,19 @@ class HistoryMatch:
             cache[(oa, ob)] = float(em.tn)
         return cache[(oa, ob)]
 
-    def _change_run_var(self, terms) -> float:
-        """The modelled change's run noise over the terms: paired within each unit; a group target's members are
-        independent runs, each counted with its weight on the aggregate's scale (a linear approximation)."""
+    def _change_run_var(self, terms, best_c, zbest) -> float:
+        """change_run_var with this calibration's emulators; group members at their emulator means at the best point."""
         if not self.th["include_run_noise"]:
             return 0.0
-        v = 0.0
-        for x in terms:
-            a, b, w = self.tid[x["from"]], self.tid[x["to"]], float(x["w"])
-            ta, tb = self.em["unit"][a.observable].tn, self.em["unit"][b.observable].tn
-            c = 0.5 * (ta + tb - self._pair_noise(a.observable, b.observable))
-            if a.kind == "unit":
-                v += w * w * (ta + tb - 2.0 * c)
-                continue
-            sa, sb = sum(a.weights.values()), sum(b.weights.values())
-            for u in set(a.weights) | set(b.weights):
-                wa, wb = a.weights.get(u, 0.0) / sa, b.weights.get(u, 0.0) / sb
-                v += w * w * (wb * wb * tb + wa * wa * ta - 2.0 * wa * wb * c)
-        return max(v, 0.0)
+        ts = [self.tid[x[k]] for x in terms for k in ("from", "to")]
+        tn = {t.observable: self.em["unit"][t.observable].tn for t in ts}
+        pair = {(self.tid[x["from"]].observable, self.tid[x["to"]].observable): self._pair_noise(
+            self.tid[x["from"]].observable, self.tid[x["to"]].observable) for x in terms}
+        C = np.atleast_2d(self.state["C"][best_c]).reshape(1, self.p)
+        my = {(u, t.observable): float(self.em["unit"][t.observable].predict(u, [self.zg[zbest[u]]], C,
+                                                                             noise=False)[0][0])
+              for t in ts if t.kind == "group" for u in t.weights}
+        return change_run_var(terms, self.tid, tn, pair, my)
 
     def _change_modelled(self, tid, ver, best_c, zbest):
         """A target's modelled value on its scale at the best point: the engine's verification run, else the emulator."""
@@ -2052,7 +2080,7 @@ class HistoryMatch:
                 pairs.append(dict(base, not_computable=str(c["not_computable"])))
                 continue
             mod = {x[k]: self._change_modelled(x[k], ver, best_c, zbest) for x in c["terms"] for k in ("from", "to")}
-            st = change_stats(c["terms"], self.tid, mod, self._change_run_var(c["terms"]), float(c.get("rho", 0.0)),
+            st = change_stats(c["terms"], self.tid, mod, self._change_run_var(c["terms"], best_c, zbest), float(c.get("rho", 0.0)),
                               zmax)
             if "z" in st:
                 st["basis"] = "engine verification at the best point" if ver else "emulator mean at the best point"

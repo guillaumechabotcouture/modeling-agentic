@@ -615,6 +615,14 @@ def _survey(t):
     return t.get("survey") or (t.get("bias_source", t["id"]) if t.get("bias_by") else None)
 
 
+def _num(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _round_mismatch(a, b):
     """Why two rounds of one survey cannot be compared (their definitions differ), or None."""
     if a["kind"] != b["kind"]:
@@ -664,19 +672,22 @@ def change_pairs(j, rows, ids, targets, reg) -> list:
                     for i in ids:
                         grp.setdefault(str(rows[i][by]), []).append(i)
                     for g, us in sorted(grp.items()):
-                        wt = {i: float(rows[i][ch["weights"]]) if ch.get("weights") else 1.0 for i in us}
-                        tot = sum(v for v in wt.values() if v > 0)
+                        wt = {i: _num(rows[i][ch["weights"]]) if ch.get("weights") else 1.0 for i in us}
+                        tot = sum(v for v in wt.values() if v is not None and v > 0)
                         e = dict(base, id=f"{base['id']}:{g}", group=g, by=by)
-                        out.append(dict(e, rho=rho, terms=[{"from": f"{a['id']}:{i}", "to": f"{b['id']}:{i}",
-                                                            "w": wt[i] / tot} for i in us if wt[i] > 0])
+                        badw = sorted(i for i, v in wt.items() if v is None or v < 0)
+                        out.append(dict(e, not_computable=f"weights not finite or negative for units {badw[:5]}") if badw
+                                   else dict(e, rho=rho, terms=[{"from": f"{a['id']}:{i}", "to": f"{b['id']}:{i}",
+                                                                 "w": wt[i] / tot} for i in us if wt[i] > 0])
                                    if tot > 0 else dict(e, not_computable="the group's units have no positive weight"))
                     continue
                 ga, gb = ({k[len(t["id"]) + 1:]: k for k, v in built.items() if v.kind == "group"
                            and k.startswith(t["id"] + ":")} for t in (a, b))
-                for g in sorted(set(ga) | set(gb)):
+                for g in sorted(set(ga) | set(gb) | {str(r.get(by)) for r in rows.values()}):
                     e = dict(base, id=f"{base['id']}:{g}", group=g, by=by)
                     out.append(dict(e, rho=rho, terms=[{"from": ga[g], "to": gb[g], "w": 1.0}]) if g in ga and g in gb
-                               else dict(e, not_computable=f"group {g} has no value in round {b['id'] if g in ga else a['id']}"
+                               else dict(e, not_computable=f"group {g} has no value in round "
+                                                           f"{' or '.join(t['id'] for t, q in ((a, ga), (b, gb)) if g not in q)}"
                                                            " (not in its table, or not every unit of the group is "
                                                            "calibrated)"))
     return out
@@ -695,7 +706,7 @@ def change_findings(raw, data) -> list:
     F = "analysis/joint_calibration.yaml"
     sc = data.get("survey_changes") if isinstance(data, dict) else None
     zmax = float(HM.thresholds()["survey_changes"]["z_max"])
-    if not (isinstance(sc, dict) and isinstance(sc.get("pairs"), list) and sc.get("z_max") == zmax):
+    if not (isinstance(sc, dict) and isinstance(sc.get("pairs"), list) and sc["pairs"] and sc.get("z_max") == zmax):
         return [_cf("calibration_change_unrecorded", f"{F} records no survey-change diagnostic at the threshold "
                     f"z_max {zmax:g} (survey_changes)", "survey_changes", False)]
     asked = isinstance(raw, dict) and ((raw.get("calibration") or {}).get(FIELD) or {}).get("changes") is not None
@@ -707,8 +718,10 @@ def change_findings(raw, data) -> list:
                 out.append(_cf("calibration_change_not_computable", f"survey change {pid}: not computable: "
                                                                     f"{p['not_computable']}", f"change:{pid}", True))
             continue
-        z, d, sd = (p.get(k) for k in ("z", "difference", "sd")) if isinstance(p, dict) else (None,) * 3
-        if not (_isnum(z) and _isnum(d) and _isnum(sd) and sd > 0 and abs(z - d / sd) <= 1e-6 * max(1.0, abs(z))
+        z, d, sd, o, m = (p.get(k) for k in ("z", "difference", "sd", "observed", "modelled")) if isinstance(p, dict) \
+            else (None,) * 5
+        if not (all(_isnum(v) for v in (z, d, sd, o, m)) and sd > 0 and abs(z - d / sd) <= 1e-6 * max(1.0, abs(z))
+                and abs(d - (m - o)) <= 1e-9 * max(1.0, abs(m), abs(o))
                 and p.get("flagged") is (abs(z) > zmax)):
             out.append(_cf("calibration_change_inconsistent", f"{F}: survey change {pid}: its flag or z does not follow "
                                                               "from its numbers", f"change:{pid}", False))
