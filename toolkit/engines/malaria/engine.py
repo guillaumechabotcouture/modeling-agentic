@@ -268,6 +268,8 @@ POST_FORK = frozenset({"irs_kill", "irs_rep", "irs_half", "irs_coverage", *M.SMC
                        "cfr_severe_treated", "cfr_severe_untreated", "severe_access_add", "dw_moderate", "dw_severe",
                        "dur_moderate_d", "dur_severe_d", "le_u5", "le_5_14", "le_15p"})
 DUAL_NET = frozenset({"cfp_kill", "cfp_half"})
+# v0.14: the parameters of the case fatality, which the decision window's deaths read on every window day
+CFR_PARAMS = frozenset({"cfr_severe_untreated", "cfr_severe_treated", "severe_access_add"})
 # v0.10: SMC parameters act before the fork when a unit has past SMC (smc_hist_years), so they join its burn-in key
 SMC_PARAMS = frozenset(M.SMC_PARAM_NAMES)      # v0.11: the seven SMC parameters
 IMM_BANDS = (("0_5", 0.0, 5.0), ("5_15", 5.0, 15.0), ("15_30", 15.0, 30.0), ("30p", 30.0, 1e9), ("15p", 15.0, 1e9))
@@ -774,13 +776,19 @@ class MalariaEngine:
         return sorted(out, key=lambda x: x["t0"])
 
     @staticmethod
-    def _burnin_key(P: dict, a: dict) -> str:
+    def _burnin_key(P: dict, a: dict, horizon: Horizon | None = None) -> str:
         import json
         # v0.10: dual-AI nets in any past campaign (hist_net_by_year) and past SMC act before the fork, so their
         # parameters join the key (delivery_plan validated both attributes before this)
         hn = hist_net_types(a, [float(y) for y in a.get("itn_hist_years", [])]) or []
         dual = a.get("hist_net", "pyr") == "dual" or "dual" in hn
         skip = POST_FORK | (frozenset() if dual else DUAL_NET)
+        # v0.14: when the decision window starts before the delivery start, the shared history (to the fork, at the
+        # delivery start or later) holds window days whose deaths use the case fatality: members that differ in it
+        # get their own burn-in. Otherwise the key is v0.13's
+        if horizon is not None and explicit_delivery(horizon) \
+                and float(horizon.window[0]) < float(delivery_period(horizon)[0]):
+            skip = skip - CFR_PARAMS
         if a.get("smc_hist_years"):
             skip = skip - SMC_PARAMS
             # v0.13: with their own coverage the past rounds do not read smc_cov, which then acts only after the fork
@@ -996,7 +1004,7 @@ class MalariaEngine:
             mem.append((P, a, self._plan(P, a, k.components, horizon)))
         groups = {}
         for i, (P, a, _) in enumerate(mem):
-            groups.setdefault(self._burnin_key(P, a), []).append(i)
+            groups.setdefault(self._burnin_key(P, a, horizon), []).append(i)
         out, ser = [None] * B, [None] * B
         for idx in groups.values():
             t0 = time.time()
