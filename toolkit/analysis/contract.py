@@ -289,6 +289,9 @@ def gate_findings(run_dir: str) -> list[dict]:
             unc_doc = doc.get("data") or {}
         if kind == "point":
             pt_doc = doc.get("data") or {}
+        if kind == "emulator_boundary":      # F6 S2-4b: rejudged from its rows against thresholds.yaml
+            from toolkit.analysis import boundary as BD
+            out += BD.findings(doc.get("data") or {})
         if kind == "burden_validation":
             bv_doc = doc.get("data") or {}
         if kind == "plan_variants":

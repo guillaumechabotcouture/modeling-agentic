@@ -35,7 +35,10 @@ OUT_REL = "analysis/boundary/results.jsonl"
 
 
 def thresholds() -> dict:
-    raise NotImplementedError("F6 S2-4b beta")
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        t = (yaml.safe_load(f) or {}).get("emulator") or {}
+    return {"units": int(t["boundary_units"]), "min_share": float(t["boundary_rank_agreement_min"]),
+            "tie": float(t["boundary_tie_rel_gap"])}
 
 
 def _ratio(b, c):
@@ -48,7 +51,21 @@ def _sign(x):
 
 def candidates(A, plan, ben, cost, k) -> list[dict]:
     """The k units closest to switching, by relative benefit-per-cost gap between the plan package and the runner-up."""
-    raise NotImplementedError("F6 S2-4b beta")
+    feas = A.feas["feasible"]
+    rows = []
+    for u in A.ids:
+        ch = plan[u]
+        rc = _ratio(ben[u][ch], cost[u][ch]) if ch != A.comp else None
+        if rc is None:
+            continue
+        others = [(r, p) for p in A.pk if p not in (ch, A.comp) and feas[u].get(p)
+                  for r in [_ratio(ben[u][p], cost[u][p])] if r is not None]
+        if not others:
+            continue
+        rr, ru = max(others)
+        rows.append({"unit": u, "chosen": ch, "runner_up": ru, "gap": abs(rc - rr) / max(abs(rc), abs(rr), 1e-300)})
+    rows.sort(key=lambda r: (r["gap"], str(r["unit"])))
+    return rows[:k]
 
 
 def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
@@ -101,7 +118,16 @@ def engine_tables(A, cands, z0, out0, res):
 
 
 def compare(cands, ben_em, cost_em, ben_en, cost_en, tie) -> list[dict]:
-    raise NotImplementedError("F6 S2-4b beta")
+    rows = []
+    for c in cands:
+        u, ch, ru = c["unit"], c["chosen"], c["runner_up"]
+        em = [_ratio(ben_em[u][p], cost_em[u][p]) for p in (ch, ru)]
+        en = [_ratio(ben_en[u][p], cost_en[u][p]) for p in (ch, ru)]
+        rows.append({"unit": u, "chosen": ch, "runner_up": ru, "gap": c["gap"],
+                     "emulator": {"ratio_chosen": em[0], "ratio_runner_up": em[1]},
+                     "engine": {"ratio_chosen": en[0], "ratio_runner_up": en[1]}, "engine_tie": _tie(en, tie),
+                     "match": _match(em, en, tie)})
+    return rows
 
 
 def _tie(en, tie) -> bool:
@@ -110,11 +136,20 @@ def _tie(en, tie) -> bool:
 
 
 def _match(em, en, tie) -> bool:
-    raise NotImplementedError("F6 S2-4b beta")
+    if None in em or None in en:
+        return False
+    return _tie(en, tie) or _sign(em[0] - em[1]) == _sign(en[0] - en[1])
 
 
 def summarise(rows, t) -> dict:
-    raise NotImplementedError("F6 S2-4b beta")
+    n, m = len(rows), sum(1 for r in rows if r["match"])
+    return {"status": "judged" if n else "not_judged", "units_requested": t["units"], "units": n, "matched": m,
+            "share_matched": m / n if n else None, "threshold": t["min_share"], "tie_rel_gap": t["tie"],
+            "engine_ties": sum(1 for r in rows if r.get("engine_tie")),
+            "passes": (m / n >= t["min_share"]) if n else None, "rows": rows,
+            "held_out_source": "engine runs at the boundary units' calibrated values and the point parameters "
+                               "(the design's held-out points are at design values, not calibrated ones)",
+            "engine_runs": sum(len({r["chosen"], r["runner_up"]}) + 1 for r in rows)}
 
 
 def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=print) -> dict:
@@ -138,7 +173,27 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
 
 def findings(data) -> list[dict]:
     """The gate: rejudged from the rows (never the artifact's own verdict) against thresholds.yaml."""
-    raise NotImplementedError("F6 S2-4b beta")
+    def f(kind, claim, declarable):
+        return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
+                "key": "emulator_boundary", "scope_declarable": declarable, "source": PRODUCER}
+    try:
+        t = thresholds()
+        rows = data["rows"]
+        n = len(rows)
+        m = sum(1 for r in rows if _match([r["emulator"]["ratio_chosen"], r["emulator"]["ratio_runner_up"]],
+                                          [r["engine"]["ratio_chosen"], r["engine"]["ratio_runner_up"]], t["tie"]))
+    except (OSError, KeyError, TypeError, ValueError, AttributeError) as e:
+        return [f("emulator_boundary_unreadable", f"analysis/emulator_boundary.yaml: unreadable ({type(e).__name__}: "
+                                                   f"{e})", False)]
+    if data.get("units") != n or data.get("matched") != m or (n == 0) != (data.get("status") == "not_judged"):
+        return [f("emulator_boundary_inconsistent", f"analysis/emulator_boundary.yaml: its counts ({data.get('matched')}"
+                                                     f" of {data.get('units')}) are not its rows' ({m} of {n})", False)]
+    if n and m / n < t["min_share"]:
+        return [f("emulator_boundary_ranking", f"the emulator orders the chosen package and its runner-up as the "
+                                               f"engine does for {m} of {n} units closest to a package switch "
+                                               f"({m / n:.0%}, below {t['min_share']:.0%}): add design points or "
+                                               "emulator features, or declare it with its decision test", True)]
+    return []
 
 
 def _self_test() -> int:

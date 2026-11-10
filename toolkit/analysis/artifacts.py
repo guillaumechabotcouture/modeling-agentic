@@ -49,6 +49,7 @@ KINDS = {
     "estimates": ("outputs", "windows", "decision", "determined"),     # deliverable kind estimates (v2d §2.3)
     "blocked": ("reason", "corrections"),
     "burden_validation": ("arm", "references", "summary", "daly_parts"),   # optional: F6 S2-5 (validation.burden)
+    "emulator_boundary": ("status", "units", "matched", "rows"),   # emulator path: F6 S2-4b (boundary.py)
 }
 
 

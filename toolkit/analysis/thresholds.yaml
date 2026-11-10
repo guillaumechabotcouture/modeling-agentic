@@ -67,3 +67,13 @@ burden:
   default_ratio_band: [0.5, 2.0]
   widest_ratio_band: [0.2, 5.0]
   max_year_gap: 5
+emulator:
+  # F6 S2-4b (proposals for the owner's review): ranking accuracy near package switches (toolkit/analysis/boundary.py).
+  # The `boundary_units` units whose plan package and runner-up are closest in benefit per cost are run on the engine
+  # at their calibrated values (3 runs each); when fewer than `boundary_rank_agreement_min` of them are in the engine's
+  # order, a gate finding. A unit whose two engine ratios are within `boundary_tie_rel_gap` of each other (relative)
+  # is an engine tie: either order loses at most that share of benefit per cost, so it counts as matched.
+  # Outside `calibration` and `estimates`, so changing these restamps no engine evidence.
+  boundary_units: 20
+  boundary_rank_agreement_min: 0.8
+  boundary_tie_rel_gap: 0.01

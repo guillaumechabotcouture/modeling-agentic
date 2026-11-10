@@ -335,6 +335,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
         point["headline_variant"] = A.headline_variant
     arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
+    bnd = None
+    if model.kind == "emulator":      # F6 S2-4b: the emulator's order near package switches, against engine runs
+        from toolkit.analysis import boundary as BD
+        bnd = BD.run(A, plan, z0, out0, ben0, cost0, design["horizon"], run_dir, compute_kw=kw, log=log)
+        arts["emulator_boundary"] = S.write("emulator_boundary", bnd, BD.PRODUCER, [arts["point"]] + (
+            [os.path.join(run_dir, BD.OUT_REL)] if bnd["units"] else []))
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
@@ -435,7 +441,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
-    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, pv=pv, burden=bvd)
+    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
+                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
@@ -443,7 +450,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
-    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else [])
+    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
+                              + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
