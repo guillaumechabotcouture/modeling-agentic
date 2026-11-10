@@ -192,7 +192,13 @@ def _boundary(run_dir: str, data, point) -> list[dict]:
                                                    "emulator's ranking near package switches is unchecked)",
                    "emulator_boundary")]
     from toolkit.analysis import boundary as BD
-    return BD.findings(data, (point or {}).get("plan"))
+    plan = (point or {}).get("plan")
+    try:
+        from toolkit.spec import schema
+        expect = BD.expected(schema.load(os.path.join(run_dir, SPEC)), plan)
+    except Exception:  # noqa: BLE001 -- fail closed: findings() names a missing expectation
+        expect = None
+    return BD.findings(data, plan, expect)
 
 
 def _survey_changes(run_dir: str, data) -> list[dict]:

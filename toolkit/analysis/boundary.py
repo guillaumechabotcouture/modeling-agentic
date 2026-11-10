@@ -56,19 +56,27 @@ def _sign(x):
 
 
 def table(A, plan, ben, cost) -> dict:
-    """{unit: {"plan": package, "ratios": {package: benefit per cost}}} for every unit whose plan package is not the
-    comparator: the plan package and every other feasible non-comparator package with a ratio. Recorded in the
-    artifact, so the gate rebuilds the candidates from it."""
+    """{unit: {"plan": package, "ratios": {package: benefit per cost or None}}} for every unit whose plan package is not
+    the comparator, over the plan package and every other feasible non-comparator package (None: no ratio, e.g. no
+    cost). Recorded in the artifact; the gate checks its units and packages against its own expectation (expected())
+    and rebuilds the candidates from it."""
     feas, out = A.feas["feasible"], {}
     for u in A.ids:
         ch = plan[u]
-        if ch == A.comp:
-            continue
-        r = {p: x for p in A.pk if p != A.comp and (p == ch or feas[u].get(p))
-             for x in [_ratio(ben[u][p], cost[u][p])] if x is not None}
-        if ch in r:
-            out[str(u)] = {"plan": ch, "ratios": r}
+        if ch != A.comp:
+            out[str(u)] = {"plan": ch, "ratios": {p: _ratio(ben[u][p], cost[u][p]) for p in A.pk
+                                                  if p != A.comp and (p == ch or feas[u].get(p))}}
     return out
+
+
+def expected(spec, plan) -> dict:
+    """{unit: [packages]} the ratio table must cover, from the signed spec's feasibility and the point plan (the gate's
+    own expectation, Codex r2 P1)."""
+    from toolkit.alloc import packages as AP
+    feas = AP.feasibility(spec.alloc_spec(), spec.units())["feasible"]
+    comp = spec.comparator
+    return {str(u): sorted(p for p in spec.packages() if p != comp and (p == ch or feas[str(u)].get(p)))
+            for u, ch in plan.items() if ch != comp}
 
 
 def pick(tab, k) -> list[dict]:
@@ -77,8 +85,8 @@ def pick(tab, k) -> list[dict]:
     rows = []
     for u, e in tab.items():
         ch, r = e["plan"], e["ratios"]
-        others = sorted(((x, p) for p, x in r.items() if p != ch), reverse=True)
-        if not others:
+        others = sorted(((x, p) for p, x in r.items() if p != ch and x is not None), reverse=True)
+        if r.get(ch) is None or not others:
             continue
         rr, ru = others[0]
         rc = r[ch]
@@ -230,10 +238,10 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
     return s
 
 
-def findings(data, plan) -> list[dict]:
-    """The gate: the candidates rebuilt from the artifact's ratio table and checked against the point plan (`plan`,
-    from analysis/point.yaml), the rows bound to them, and the share rejudged from the rows against thresholds.yaml
-    (never the artifact's own verdict)."""
+def findings(data, plan, expect) -> list[dict]:
+    """The gate: the artifact's ratio table checked against the point plan (`plan`, from analysis/point.yaml) and the
+    units and packages it must cover (`expect`, expected()); the candidates rebuilt from it, the rows bound to them,
+    and the share rejudged from the rows against thresholds.yaml (never the artifact's own verdict)."""
     def f(kind, claim, declarable):
         return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
                 "key": "emulator_boundary", "scope_declarable": declarable, "source": PRODUCER}
@@ -245,7 +253,7 @@ def findings(data, plan) -> list[dict]:
         got = [(r["unit"], r["chosen"], r["runner_up"]) for r in rows]
         em = [[r["emulator"]["ratio_chosen"], r["emulator"]["ratio_runner_up"]] for r in rows]
         en = [[r["engine"]["ratio_chosen"], r["engine"]["ratio_runner_up"]] for r in rows]
-        recorded = [[tab[u]["ratios"][ch], tab[u]["ratios"][ru]] for u, ch, ru in got]
+        recorded = [[tab[u]["ratios"].get(ch), tab[u]["ratios"].get(ru)] for u, ch, ru in got]
         m = sum(1 for a, b in zip(em, en) if _match(a, b, t["tie"]))
     except (OSError, KeyError, TypeError, ValueError, AttributeError) as e:
         return [f("emulator_boundary_unreadable", f"{W}: unreadable ({type(e).__name__}: {e})", False)]
@@ -256,6 +264,9 @@ def findings(data, plan) -> list[dict]:
         bad.append("its rows' emulator ratios are not its table's")
     if not isinstance(plan, dict) or any(plan.get(u) != e.get("plan") for u, e in tab.items()):
         bad.append("its table's plan packages are not analysis/point.yaml's plan")
+    if not isinstance(expect, dict) or sorted(tab) != sorted(expect) \
+            or any(sorted(tab[u]["ratios"]) != expect[u] for u in tab):
+        bad.append("its table does not cover exactly the units the plan funds and their feasible packages")
     if data.get("units") != len(rows) or data.get("matched") != m or data.get("units_requested") != t["units"] \
             or (len(rows) == 0) != (data.get("status") == "not_judged"):
         bad.append(f"its counts ({data.get('matched')} of {data.get('units')}) are not its rows' ({m} of {len(rows)})")
