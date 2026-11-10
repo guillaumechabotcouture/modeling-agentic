@@ -2031,6 +2031,19 @@ def _self_test() -> int:
            f"changes.by says ({got})")
     safe(ja22, "JA22")
 
+    def ja23():          # Codex r2 P1: changes.sampling_correlation on a mixed pair: independent, and said so
+        class T_:
+            def __init__(self, i, g):
+                self.id, self.kind, self.spec_id, self.group, self.weights = i, "group", "a", g, {"1": 1.0}
+        j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
+                          "key": {"csv": "region", "units": "region"}, "weights": "pop"},
+                         {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "x"}],
+             "changes": {"sampling_correlation": 0.5}}
+        got = change_pairs(j, {"1": {"region": "R", "pop": "1"}}, ["1"], [T_("a:R", "R")], "region")
+        ok(len(got) == 1 and got[0].get("rho") == 0.0 and "independent" in got[0].get("note", ""),
+           f"JA23 a mixed pair combines the rounds' sampling errors as independent and states it ({got})")
+    safe(ja23, "JA23")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

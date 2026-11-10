@@ -3198,6 +3198,15 @@ def _self_test() -> int:
            f"({P._change_problems()})")
     safe(hm46, "HM46")
 
+    def hm47():          # Codex r2 P1: a declared correlation cannot be silently dropped on a mixed pair
+        g = Target("g", "group", "w0", 0.4, "identity", sd_obs=0.1, weights={"u": 1.0}, source="t")
+        u = Target("u", "unit", "w1", 0.4, "identity", sd_obs=0.1, unit="u", source="t")
+        terms = [{"from": "g", "w": 1.0}, {"to": "u", "w": 1.0}]
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u"], [g, u], changes=[{"id": "p", "rho": 0.9, "terms": terms}])
+        ok(any("correlation" in x for x in P._change_problems()),
+           f"HM47 a mixed pair with a nonzero sampling correlation is refused ({P._change_problems()})")
+    safe(hm47, "HM47")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
