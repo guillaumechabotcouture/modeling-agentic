@@ -2,7 +2,9 @@
 
     python cloud/run_cluster.py <config.py> launch            # cluster, run(s), keeper; then safe to disconnect
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
-    python cloud/run_cluster.py <config.py> collect           # fetch finished runs (from storage once stopped)
+    python cloud/run_cluster.py <config.py> collect [--no-shutdown]
+                                                              # fetch finished runs (from storage once stopped);
+                                                              # then shut down, unless --no-shutdown
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
@@ -27,6 +29,7 @@
     python cloud/run_cluster.py --self-test
 
 Detached jobs on a single VM (the dev VM): cloud/vm_job.py.
+A launch watched to the end (launch, status, collect before any stop, credit cap, stray sweep): cloud/launch_watch.py.
 
 A config is a Python file defining CONFIG = RunConfig(...) (see cloud/configs/).
 
@@ -1307,7 +1310,7 @@ def _download(client, label, worker, dest_file):
     return m["meta"]
 
 
-def collect(cfg):
+def collect(cfg, shutdown_after: bool = True):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import results_store
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -1351,9 +1354,11 @@ def collect(cfg):
                   indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
         print(f"{label}: collected from the VM -> {dest}")
-    if running and not pending:
+    if running and not pending and shutdown_after:
         print("every run is collected: shutting down")
         shutdown(cfg)
+    elif running and not pending:
+        print("every run is collected (--no-shutdown: the clusters are left to the caller)")
 
 
 def shutdown(cfg):
@@ -2261,6 +2266,8 @@ def _self_test_attach(ok) -> None:
            and cl.cluster_id == 5, f"RC60a attach_existing attaches by name without waiting for workers: {calls}")
         made = []
         fake.Cluster = lambda **kw: made.append(Cl(**kw)) or made[-1]
+        listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "ready"},
+                      "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}]   # created by this attach
         try:
             ws.attach_existing("n", "w", 9)
             ok(False, "RC60b a cluster that is not the one checked is refused")
@@ -2286,6 +2293,17 @@ def _self_test_attach(ok) -> None:
         ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
                                                      "wait_for_workers": False}],
            f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
+        # Codex round 3 (P2-b): an attach refusal leaves the overflow pool unavailable for the tick; the keeper goes on
+        fake.Cluster = lambda **kw: Cl(_id=9, **kw)
+        listed[:] = [{"name": "n-overflow", "id": 9, "current_state": {"state": "running"},
+                      "created": "2020-01-01T00:00:00Z"}]   # another invocation's: refused, left alone
+        ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
+        try:
+            got, step = ov.attach(), ov.step(None, None, 4, 1, None, time.time())
+            ok(got == (None, None) and step.get("unavailable") and step["desired"] == 0 and step["scale_to"] is None
+               and not step["join"] and ov.cl is None, f"RC60g an overflow attach refusal: unavailable this tick: {step}")
+        except BaseException as e:  # noqa: BLE001 — SystemExit would end the keeper
+            ok(False, f"RC60g an overflow attach refusal must not end the keeper: {type(e).__name__}: {e}")
     finally:
         if saved is None:
             sys.modules.pop("coiled", None)
@@ -3431,6 +3449,28 @@ def _self_test_pipeline(ok, tb) -> None:
        "RP14 the launch commit is read from the archive itself (the commit that ships, not HEAD later)")
 
 
+def _self_test_collect_no_shutdown(ok) -> None:
+    """Codex round 1 on the launch watch (P1-1): `collect --no-shutdown` leaves stopping to the caller (the watch
+    stops by verified id); plain `collect` still shuts down once every run is collected, as before."""
+    import tempfile
+    from unittest import mock
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='cn', question_file='q', labels=('A',), out_dir={tmp!r}, "
+                          f"tree={os.path.dirname(HERE)!r})\n")
+    json.dump({"A": {"launch_id": "L1", "worker": "w"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    for extra, want, cid in (([], 1, "CN1 `collect` shuts down after collecting every run (default, unchanged)"),
+                             (["--no-shutdown"], 0, "CN2 `collect --no-shutdown` collects and never shuts down")):
+        downs = []
+        with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True,
+                                         "collect_from_storage": lambda *a, **k: {"exit_code": 0, "duration_s": 1},
+                                         "shutdown": lambda c: downs.append(c.name)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc_ = main(["run_cluster.py", path, "collect", *extra])
+        ok(rc_ == 0 and len(downs) == want, cid)
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3538,12 +3578,36 @@ def _self_test() -> int:
 
     fc = FakeCluster(7)
     ok(ws.verify_attached(fc, 7) is fc and not fc.stopped, "RC17 attaching to the checked cluster is kept")
-    fc = FakeCluster(8)
-    try:
-        ws.verify_attached(fc, 7)
-        ok(False, "RC18 a replacement cluster created by the attach is refused")
-    except SystemExit:
-        ok(fc.stopped, "RC18 a replacement cluster created by the attach is shut down and refused")
+    try:   # Codex round 2: before the change verify_attached takes no start time
+        t_att = _ts("2026-11-10T00:00:00Z")
+        listed = lambda cid, created: (lambda: [{"name": "a", "id": cid, "created": created}])  # noqa: E731
+        fc = FakeCluster(8)
+        try:
+            ws.verify_attached(fc, 7, started=t_att, lister=listed(8, "2026-11-10T00:00:30Z"))
+            ok(False, "RC18 a replacement cluster created by the attach is refused")
+        except SystemExit as e:
+            ok(fc.stopped and "8" in str(e) and "7" in str(e),
+               "RC18 a replacement cluster created by the attach is shut down and refused")
+        # Codex round 2 on the launch watch (P1-2): a cluster the attach did not create is refused, never shut down
+        for cid, lister, what in (
+                ("RC18b", listed(8, "2026-11-09T23:00:00Z"), "created an hour before the attach (another invocation's)"),
+                ("RC18c", listed(9, "2026-11-10T00:00:30Z"), "not in the listing"),
+                ("RC18d", lambda: (_ for _ in ()).throw(OSError("listing down")), "the listing fails")):
+            fc = FakeCluster(8)
+            try:
+                ws.verify_attached(fc, 7, started=t_att, lister=lister)
+                ok(False, f"{cid} a cluster {what} is refused")
+            except SystemExit as e:
+                ok(not fc.stopped and "8" in str(e) and "7" in str(e), f"{cid} a cluster {what}: refused, left alone: {e}")
+        fc = FakeCluster(8)
+        try:
+            ws.verify_attached(fc, 7)
+            ok(False, "RC18e no attach start time: refused")
+        except SystemExit:
+            ok(not fc.stopped, "RC18e no attach start time: refused, left alone")
+        ok(ws.ATTACH_SKEW_S == OWN_SKEW_S, "RC18f the attach and the construction use one ownership skew")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"RC18: {type(e).__name__}: {e}")
     ok(live_id("a", lambda: [{"name": "a", "id": 3, "current_state": {"state": "stopped"}},
                              {"name": "a", "id": 5, "current_state": {"state": "ready"}}]) == 5
        and live_id("a", lambda: [{"name": "a", "id": 3, "current_state": {"state": "stopped"}}]) is None,
@@ -3626,6 +3690,10 @@ def _self_test() -> int:
         _self_test_s18_smoke_a(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"A: {type(e).__name__}: {e}")
+    try:
+        _self_test_collect_no_shutdown(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CN: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -3672,7 +3740,7 @@ def main(argv) -> int:
     elif cmd == "status":
         status(cfg)
     elif cmd == "collect":
-        collect(cfg)
+        collect(cfg, shutdown_after="--no-shutdown" not in rest)
     elif cmd == "shutdown":
         shutdown(cfg)
     elif cmd == "relaunch":
