@@ -35,8 +35,10 @@ Forms (a list means all must pass):
    HIGH `done_when_regressed`, naming the round it passed. A finding the
    critic resolves while its runnable test fails is `done_when_unmet` (its own
    severity) until the test passes or the critic withdraws it
-   (`done_when_withdrawn: <reason>`). Critics need no fix check for items with
-   a runnable test: the harness checks them.
+   (`done_when_withdrawn: <reason>`). A finding the critique no longer lists,
+   whose test has never passed, stays open as `done_when_dropped` (its own
+   severity): leaving it out does not close it. Critics need no fix check for
+   items with a runnable test: the harness checks them.
 
 Agents check their own work before returning:
 
@@ -386,6 +388,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
     {resolved: [ids whose test passes while the critic has them open],
      regressed: [tests that passed at an earlier gate run and fail now],
      unmet: [findings a critic resolved whose runnable test fails and never passed],
+     dropped: [findings no critique lists any more whose test has never passed: still open],
      missing: {reviewer: [ids with no valid test]}, invalid: [registry ids that cannot be read],
      status: {id: {passes, detail, mechanical, frozen_round}}}."""
     reg = load_registry(run_dir)
@@ -417,7 +420,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         why = str(b.get("done_when_withdrawn") or "").strip()
         if why:
             tests[bid]["withdrawn"] = {"round": round_n, "reason": why[:300]}
-    resolved, regressed, unmet, invalid, status = [], [], [], [], {}
+    resolved, regressed, unmet, dropped, invalid, status = [], [], [], [], [], {}
     for bid, t in tests.items():
         if bid in exclude:
             continue
@@ -431,9 +434,13 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
                            "open": bid in open_ids, "severity": t.get("severity")}
             continue
         passes, detail = evaluate(t["done_when"], run_dir)
+        # Review A5: a finding no critique lists any more is not closed by its absence. Until its test passes
+        # (or the critic resolves or withdraws it) it stays open.
+        left_out = (bid not in open_ids and bid not in closed_ids and passes is not True
+                    and t.get("passed_round") is None)
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
                        "frozen_round": t.get("frozen_round"), "result": result_of(passes),
-                       "open": bid in open_ids, "severity": t.get("severity")}
+                       "open": bid in open_ids or left_out, "severity": t.get("severity")}
         entry = {"id": bid, "severity": t.get("severity") or "HIGH", "reviewer": t.get("reviewer"),
                  "passed_round": t.get("passed_round"), "detail": detail, "claim": t.get("claim") or "",
                  "target_stage": t.get("target_stage") or "MODEL"}
@@ -446,10 +453,13 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
             regressed.append(entry)   # any earlier gate run, the same round included
         elif passes is False and bid in closed_ids:
             unmet.append(entry)
+        elif left_out:
+            dropped.append(entry)
         t["history"] = [h for h in t.get("history") or [] if h[0] != round_n] + [[round_n, passes]]
     if record:
         _save(run_dir, reg)
-    return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "missing": missing,
+    return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "dropped": dropped,
+            "missing": missing,
             "invalid": sorted(invalid), "status": status}
 
 
@@ -481,9 +491,8 @@ def _save(run_dir: str, reg: dict) -> None:
 
 
 def gate_findings(result: dict) -> list[dict]:
-    """Regressions (HIGH), unmet tests (their severity), an unreadable
-    registry or a crashed evaluation (HIGH), missing tests (MEDIUM, one per
-    critic)."""
+    """Regressions (HIGH), unmet tests and findings left out of the critique (their severity), an
+    unreadable registry or a crashed evaluation (HIGH), missing tests (MEDIUM, one per critic)."""
     out = []
     if result.get("error"):
         out.append({"kind": "done_when_unavailable", "severity": "HIGH", "stage": "CRITIQUE",
@@ -502,6 +511,13 @@ def gate_findings(result: dict) -> list[dict]:
                     "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
                               f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
                               f"(`done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
+    for r in result.get("dropped") or []:
+        out.append({"kind": "done_when_dropped", "severity": r["severity"], "id": r["id"],
+                    "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
+                    "claim": (f"{r['id']} ({r['reviewer']}) is an open finding that the current critique no longer "
+                              f"lists, and its done_when test has never passed: {r['detail'][:300]}. It stays open "
+                              f"until the test passes or the critic lists it again (resolved, or the test withdrawn "
+                              f"with `done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
     if result.get("invalid"):
         out.append({"kind": "done_when_registry_invalid", "severity": "HIGH", "stage": "CRITIQUE",
                     "target_stage": "CRITIQUE", "scope_declarable": True,
