@@ -5,14 +5,14 @@ A unit's package is close to switching when the benefit per cost of its point-pl
 feasible, non-comparator package with the best benefit per cost among the others) are close: the relative gap
 |r_chosen - r_runner| / max(|r_chosen|, |r_runner|). The `boundary_units` units with the smallest gap (units whose plan
 package is not the comparator and that have a runner-up; thresholds.yaml `emulator`) are run on the engine at their
-calibrated values and the point parameters, for the comparator, the chosen package and the runner-up; their benefit
+calibrated values and the point parameters, for the comparator, the chosen package, the runner-up and every package their costs read (needed()); their benefit
 and cost are computed as the analysis computes them (toolkit/analysis/core.py evaluate), and the order of the two
 packages by benefit per cost is compared with the emulator's.
 
 Held-out source. The design's held-out points cannot serve: each is a real unit at Sobol values of the calibrated
 attribute and of every design parameter, not at the unit's calibrated value and the point parameters, and the plan's
 package (the boundary) is defined only there; few held-out points are boundary units at all. So the check makes its own
-engine runs: 3 per boundary unit (one shared-state task per unit for an engine whose packages share a burn-in), through
+engine runs: 3 or more per boundary unit (one shared-state task per unit for an engine whose packages share a burn-in), through
 the same compute path, provenance check and stored-row reuse as the design batch (analysis/boundary/results.jsonl).
 
 The share of boundary units whose order matches is gated (toolkit/analysis/contract.py) against
