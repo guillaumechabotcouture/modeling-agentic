@@ -1310,6 +1310,17 @@ def _self_test_review1(ok, td: str) -> None:
            f"{t['DT5']})")
     case("DR9", dr9)
 
+    # DR9b a cost_items decision test names each cost item and its multiplier
+    def dr9b():
+        spec = _toy_spec()
+        spec["analysis"]["decision_tests"] = [
+            {"id": "DT6", "type": "cost_items", "multipliers": {"ca": 0.8, "cb": 1.25}, "text": "at other prices?"}]
+        t = _decision_tests(spec, {})[0]
+        ok("unit costs" in t["varied"] and "ca ×0.8" in t["varied"] and "cb ×1.25" in t["varied"]
+           and "{" not in t["varied"] and t["values"] == [],
+           f"DR9b a cost_items test says which unit costs are multiplied, and by how much ({t['varied']!r})")
+    case("DR9b", dr9b)
+
     # DR10 (P1, round 2) the units table is hashed and parsed from one read
     def dr10():
         d = fresh("dr10")
