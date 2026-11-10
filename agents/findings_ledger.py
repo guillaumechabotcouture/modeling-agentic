@@ -74,12 +74,27 @@ class Finding:
     last_seen_round: int | None = None
     instances: int = 1
     claim: str = ""
+    fix_requires: str | None = None     # F6 S1-7: the required remedy, in full
     done_when: list | None = None
     decision_test: dict | None = None
     events: list = field(default_factory=list)
 
     def to_row(self) -> dict:
         return asdict(self)
+
+
+def remedy(f: dict) -> str | None:
+    """A finding's required remedy, in full (critics write `fix_requires`)."""
+    r = f.get("fix_requires") or f.get("required_remedy") or f.get("remedy")
+    return " ".join(str(r).split()) if r else None
+
+
+def short_label(text: str, n: int = 120) -> str:
+    """F6 S1-7: a short label for a field that must be short. It never replaces the full text, which is
+    kept beside it; a cut label ends with an ellipsis."""
+    t = " ".join(str(text or "").split())
+    first = t.split(". ")[0]
+    return first if len(first) <= n else first[:n - 1].rstrip() + "…"
 
 
 def owner_state_for(stage: str | None) -> tuple[str, bool]:
@@ -170,7 +185,7 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 id=str(b["id"]), kind="critique_blocker", severity=str(b.get("severity") or "HIGH").upper(),
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
-                last_seen_round=doc.get("round"), claim=str(b.get("claim") or "")[:600],
+                last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""), fix_requires=remedy(b),
                 done_when=b.get("done_when") if isinstance(b.get("done_when"), list) else None))
     return found, problems
 
@@ -213,7 +228,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 owner_state_known=known, target_stage=str(stage or ""),
                 scope_declarable=v.get("scope_declarable") is not False,
                 first_seen_round=v.get("first_seen_round", round_n), last_seen_round=round_n,
-                claim=str(v.get("claim") or v.get("evidence") or "")[:600])
+                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v))
             if v.get("owner_signoff"):
                 rows[fid].resolution_type = "owner_decision"
     # Blocking gate entries whose kind no violation list carries (e.g. a required artifact).
@@ -228,7 +243,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                              owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                              scope_declarable=b.get("scope_declarable") is not False,
                              first_seen_round=b.get("first_seen_round", round_n), last_seen_round=round_n,
-                             claim=str(b.get("claim") or "")[:600])
+                             claim=str(b.get("claim") or ""), fix_requires=remedy(b))
         if b.get("owner_signoff"):
             rows[kind].resolution_type = "owner_decision"
     for f in rows.values():
@@ -243,7 +258,7 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 id=str(b["id"]), kind="critique_blocker", severity="HIGH", source=str(b.get("reviewer")),
                 owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 first_seen_round=b.get("first_seen_round"), last_seen_round=round_n,
-                claim=str(b.get("claim") or "")[:600])).blocking = True
+                claim=str(b.get("claim") or ""), fix_requires=remedy(b))).blocking = True
     return list(rows.values()), problems
 
 
@@ -324,9 +339,10 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             _event(new, round_n, new.status, new.source)
             continue
         # keep identity and history; refresh what the source now says
-        for k in ("severity", "claim", "owner_state", "owner_state_known", "target_stage", "instances",
+        for k in ("severity", "claim", "fix_requires", "owner_state", "owner_state_known", "target_stage", "instances",
                   "scope_declarable", "last_seen_round"):
-            setattr(old, k, getattr(new, k))
+            if not (k == "fix_requires" and new.fix_requires is None):   # a gate row without one keeps the remedy
+                setattr(old, k, getattr(new, k))
         if not new.source.startswith("critique"):
             old.blocking = new.blocking
         if new.done_when is not None:
@@ -456,6 +472,35 @@ def _self_test() -> int:
             ok(True, "L12 an unreadable ledger line fails closed")
         ok(decision_test_result(d, "../x.yaml")["valid"] is False and decision_test_result(d, "nope.yaml")["valid"] is False,
            "L13 a decision test outside the run or missing is invalid")
+        # L15 (F6 S1-7): a finding's claim is kept in full, from a critic and from the gate.
+        longc = "a claim that runs well past six hundred characters; " * 20
+        d15 = os.path.join(d, "l15")
+        os.makedirs(d15)
+        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-003", "severity": "MEDIUM", "claim": longc,
+                                                  "fix_requires": "use a sourced range"}]},
+                       open(os.path.join(d15, CRITIQUE_FILES["critique-domain"]), "w"))
+        led, _ = sync(d15, {"rigor_violations": [{"kind": "long_gate", "severity": "MEDIUM", "stage": "MODEL",
+                                                  "claim": longc}]}, 1)
+        ok(led["D-003"].claim == longc and led["long_gate"].claim == longc
+           and getattr(load(d15)["D-003"], "fix_requires", None) == "use a sourced range",
+           "L15 the ledger keeps each finding's full claim and its required remedy")
+        # L16 (round 2): a HIGH critic finding the gate holds open keeps its remedy through sync() and the packet;
+        # a gate-only blocking entry brings its own.
+        d16 = os.path.join(d, "l16")
+        os.makedirs(d16)
+        yaml.safe_dump({"round": 1, "blockers": [{"id": "D-010", "severity": "HIGH", "claim": "c",
+                                                  "fix_requires": "REMEDY-D010"}]},
+                       open(os.path.join(d16, CRITIQUE_FILES["critique-domain"]), "w"))
+        dec16 = {"unresolved_high": [{"reviewer": "critique-domain", "id": "D-010", "claim": "c"},
+                                     {"reviewer": "rigor-artifacts", "kind": "req_x", "claim": "r",
+                                      "fix_requires": "REMEDY-REQ"}]}
+        sync(d16, dec16, 1)
+        led16, _ = sync(d16, dec16, 2)
+        import fix_loop as _FX
+        pk = {f["id"]: f for f in _FX.build_packet(d16, led16, 2, 3, dec16, None)["findings"]}
+        ok(led16["D-010"].fix_requires == "REMEDY-D010" and (pk.get("D-010") or {}).get("fix_requires") == "REMEDY-D010"
+           and (pk.get("req_x") or {}).get("fix_requires") == "REMEDY-REQ",
+           f"L16 remedies survive the gate rows through sync() into the planner packet {pk}")
     # L14 (run console review round 4, P1-2): the ledger is not written through a planted .tmp link
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         open(os.path.join(out, "v"), "w").write("untouched")

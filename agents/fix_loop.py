@@ -106,7 +106,8 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
     for f in FL.open_findings(ledger):
         fs.append({"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
                    "owner_state": f.owner_state, "resolution_type": f.resolution_type,
-                   "scope_declarable": f.scope_declarable, "claim": f.claim[:400], "done_when": f.done_when,
+                   "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
+                   "fix_requires": f.fix_requires, "done_when": f.done_when,
                    "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)})
     g = gate or {}
     return {"round": round_n, "max_rounds": max_rounds,
@@ -167,7 +168,7 @@ def default_plan(packet: dict) -> dict:
     for f in packet["findings"]:
         if f["blocking"] and f["resolution_type"] != "owner_decision":
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
-                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f['claim'][:300]}", "files": []})
+                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}", "files": []})
     return {"tasks": tasks, "deferred": [], "by": "harness default"}
 
 
@@ -492,6 +493,20 @@ def _self_test() -> int:
     ok("STAGE" not in FIX_PLANNER_PROMPT and "validate_critique_yaml" not in FIX_PLANNER_PROMPT
        and "spawn" not in FIX_PLANNER_PROMPT.lower(),
        "F12 the planner prompt has no stage protocol, validator invocation or spawn instructions")
+    # F16 (F6 S1-7): the planner gets each finding's full claim and required remedy, with a short label.
+    longc, fixr = "the effect is a fixed unsourced value; " * 20, "use a sourced range and rerun the test; " * 10
+    with tempfile.TemporaryDirectory() as d:
+        led16 = {"D-003": FL.Finding(id="D-003", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     claim=longc, blocking=True)}
+        try:
+            led16["D-003"].fix_requires = fixr
+        except Exception:  # noqa: BLE001
+            pass
+        f16 = build_packet(d, led16, 1, 3, None, None)["findings"][0]
+        ok(f16["claim"] == longc and f16.get("fix_requires") == fixr and 0 < len(f16.get("label") or "") <= 120
+           and "fix_requires" in FL.Finding.__dataclass_fields__
+           and len(default_plan({"findings": [f16]})["tasks"][0]["brief"]) <= 200,
+           "F16 the planner packet carries the full claim and remedy; labels and briefs stay short")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

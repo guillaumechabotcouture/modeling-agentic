@@ -49,7 +49,7 @@ class Tasks(Protocol):
     def critique(self, run_dir: str, reviewer: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def plan_fixes(self, packet: dict) -> TaskResult: ...
     def fix(self, task: dict, run_dir: str, evidence: dict | None) -> TaskResult: ...
-    def write(self, run_dir: str, mode: str) -> TaskResult: ...
+    def write(self, run_dir: str, mode: str, feedback: list | None = None) -> TaskResult: ...
 
 
 def _sio():
@@ -186,7 +186,7 @@ class StubTasks:
                 done.append(fid)
         return self._r(f"fix:{task['id']}", note=f"edited for {done}" if done else "no scripted edit")
 
-    def write(self, run_dir, mode):
+    def write(self, run_dir, mode, feedback=None):
         A = {}
         try:
             A = json.load(open(os.path.join(run_dir, "analysis", "analysis.json")))
@@ -199,6 +199,8 @@ class StubTasks:
         text = f"# Report\n\n{head}The plan is the harness's optimisation; the harness renders every number.{ref}\n"
         if self.s.get("manuscript"):
             text = f"# Report\n\n{head}{self.s['manuscript']}"
+        if feedback and self.s.get("manuscript_repair"):     # a repair of the write-up (F6 S1-7)
+            text = f"# Report\n\n{head}{self.s['manuscript_repair']}"
         del A
         _sio().write_nofollow(run_dir, "manuscript.md", text.encode("utf-8"), atomic=True)
-        return self._r(f"write:{mode}")
+        return self._r(f"write:{mode}" + (":repair" if feedback else ""))

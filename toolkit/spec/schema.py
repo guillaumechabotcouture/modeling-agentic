@@ -1314,6 +1314,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         if not (isinstance(em.get("points"), int) and em["points"] >= 8):
             bad.append("analysis.emulator.points: an integer >= 8")
         bad += [f"analysis.emulator.features: no column {f}" for f in em.get("features") or [] if f not in cols]
+    from toolkit.analysis import variants as _V      # F6 S1-6: operational plan variants
+    bad += _V.validate(s.raw, cols)
     for name, d in (an.get("diagnostics") or {}).items():
         if (d or {}).get("metric") not in card.outputs.get("windows", []):
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
@@ -1664,6 +1666,12 @@ def _self_test() -> int:
             "SP11c F6 S1-5: a regret threshold outside [0, 1] is refused")
         bad(lambda r: r["analysis"].update(dollars_threshold="x"), "analysis.dollars_threshold",
             "SP11d F6 S1-5: a dollars-moved threshold that is not a fraction is refused")
+        bad(lambda r: r["analysis"].update(plan_variants={"variants": [
+            {"id": "v", "type": "group_rule", "components": ["a"], "by": "nocol", "text": "one per group"}]}),
+            "by 'nocol'", "SP11e F6 S1-6: a plan variant on an unknown column is refused")
+        bad(lambda r: r["analysis"].update(plan_variants={"variants": [
+            {"id": "v", "type": "minimum_service", "text": "a service everywhere"}], "headline": "w"}),
+            "headline", "SP11f F6 S1-6: a headline that names no variant is refused")
         bad(lambda r: r["objective"].update(outcome="nope"), "per-capita output", "SP12 an unknown objective outcome")
         # owner 2026-11-02: display labels are not part of the signed spec (an unsigned presentation.yaml instead)
         bad(lambda r: r.update(presentation={"labels": {"components": {"a": "Service A"}}}), "presentation.yaml",
