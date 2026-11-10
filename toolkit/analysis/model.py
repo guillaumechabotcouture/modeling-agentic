@@ -337,6 +337,8 @@ class EmulatorModel:
             for j in range(n):
                 y[j]["diag"][name] = float(e[j])
         for o, P, _m in self.bw_keys:     # per population group, times its population (Codex S2-5b r2 P1)
+            if P not in self.pops:          # by_population(): a prediction for some groups only (Codex r3 P1)
+                continue
             e = self.gps[("bw", o, P)].predict(X)
             e = np.exp(e + E[:, self.error.col[("bw", o, P)]] if E is not None else e)
             col = self.pops[P]["column"]

@@ -541,6 +541,15 @@ def _param(A, x) -> float:
 
 
 def daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
+    """_daly_parts, whose statement says, under a model window, that both numbers are over the decision window
+    (Codex S2-5b r2-r3 P2)."""
+    res = _daly_parts(A, cfg, arm, out0, by_pop, point)
+    if cfg.get("window"):
+        res["statement"] += " (over the decision window, not the model window)"
+    return res
+
+
+def _daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
     """The share of the arm's DALYs from deaths (deaths x years of life lost per death), and the plan's DALYs averted
     per death averted."""
     dp = cfg["daly_parts"] or {}
@@ -562,8 +571,7 @@ def daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
     else:
         yll = sum(by_pop[b][i]["y"][arm][de] * _param(A, x) for b, x in y.items() for i in A.ids)
     res["deaths_share_of_dalys"] = yll / tot
-    res["statement"] = "deaths x declared years of life lost per death, over the arm's DALYs in the " + (
-        "decision window, not the model window" if cfg.get("window") else "window")
+    res["statement"] = "deaths x declared years of life lost per death, over the arm's DALYs in the window"
     return res
 
 
