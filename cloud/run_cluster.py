@@ -2,7 +2,9 @@
 
     python cloud/run_cluster.py <config.py> launch            # cluster, run(s), keeper; then safe to disconnect
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
-    python cloud/run_cluster.py <config.py> collect           # fetch finished runs (from storage once stopped)
+    python cloud/run_cluster.py <config.py> collect [--no-shutdown]
+                                                              # fetch finished runs (from storage once stopped);
+                                                              # then shut down, unless --no-shutdown
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
@@ -1308,7 +1310,7 @@ def _download(client, label, worker, dest_file):
     return m["meta"]
 
 
-def collect(cfg):
+def collect(cfg, shutdown_after: bool = True):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import results_store
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -1352,9 +1354,11 @@ def collect(cfg):
                   indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
         print(f"{label}: collected from the VM -> {dest}")
-    if running and not pending:
+    if running and not pending and shutdown_after:
         print("every run is collected: shutting down")
         shutdown(cfg)
+    elif running and not pending:
+        print("every run is collected (--no-shutdown: the clusters are left to the caller)")
 
 
 def shutdown(cfg):
@@ -3699,7 +3703,7 @@ def main(argv) -> int:
     elif cmd == "status":
         status(cfg)
     elif cmd == "collect":
-        collect(cfg)
+        collect(cfg, shutdown_after="--no-shutdown" not in rest)
     elif cmd == "shutdown":
         shutdown(cfg)
     elif cmd == "relaunch":

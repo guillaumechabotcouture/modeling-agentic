@@ -2,6 +2,7 @@
 
     python cloud/launch_watch.py <config.py> [--cap CREDITS] [--interval S] [--start-minutes M]
                                  [--max-hours H] [--credits-per-instance-hour C] [--allow-no-cloud-limits]
+                                 [--cap-collect-minutes M] [--launch-minutes M] [--relaunch-attempts N]
     python cloud/launch_watch.py --self-test
 
 Replaces the local, per-launch watchdog scripts (F5, 2026-11-04 to 11-09). Every name (cluster, keeper, overflow
@@ -14,22 +15,30 @@ MA_LAUNCH_INVOCATION set to a fresh token, then:
      "failed", and then exactly the ids it names, by id. Any other record (none, an earlier launch's, another
      status) stops nothing.
   2. Every --interval seconds: `status`. When every run is done, or the run cluster has stopped itself, it runs
-     `collect` and confirms that every label is collected locally for this launch (`<out_dir>/<label>/result.json`
+     `collect --no-shutdown` (stopping is the watch's job, by verified id only) and confirms that every label is collected locally for this launch (`<out_dir>/<label>/result.json`
      with the launch id of this invocation's assignments; `collect` fetches from storage, or from the agent VM when
      the upload failed). Only then does it stop, by id, whatever of this launch is still live. `status` can print
      "done ... stored=None" while the agent VM holds the only copy: unconfirmed, nothing is stopped (exit 4).
-  3. A credit cap (--cap, default 650): billed credits of this launch's clusters (by id from clusters.json) plus
-     live recorded clusters x their instance count x hours since the launch x --credits-per-instance-hour (Coiled
-     bills an instance when it stops). At the cap it attempts one collect, then stops every live cluster of the
-     launch by id: the one case where stopping without a confirmed collect is right.
-  4. A stray sweep: a live cluster with one of this launch's names, not a recorded id and created after the launch
-     (an attach race), seen on two consecutive sweeps, is stopped by id.
+  3. A credit cap (--cap, default 650): billed credits of this launch's clusters (by id from clusters.json) plus,
+     per live recorded cluster, its live instances (Coiled's cluster details: scheduler and workers; else the
+     configured maximum: run 1 + labels + compute_max, overflow 1 + overflow_max, keeper 2) x hours since the launch
+     x --credits-per-instance-hour (Coiled bills an instance when it stops). At the cap it makes one collect attempt
+     bounded by --cap-collect-minutes (default 10), then stops every cluster of the launch by id: the one case where
+     stopping without a confirmed collect is right. The cap and --max-hours are also checked between collect retries.
+  4. A stray sweep: a live cluster with one of this launch's names that is not a recorded id is stopped by id (on
+     its second sighting) only when the launcher's construction journal (<out_dir>/constructions.jsonl) records this
+     invocation creating that id. Any other one (name and time alone) is reported and never stopped.
   5. It refuses a config without cloud-side limits (run_timeout_hours None or cluster_timeout empty) unless
      --allow-no-cloud-limits is given: a watchdog on a laptop is not the only bound on spend.
   6. Network errors (DNS, TLS, timeouts) are retried; an unreadable status, listing or billing reading is
      "unknown", never "not running", and never leads to a stop.
-A label that stays "missing" (its VM never started the run) for --start-minutes gets one `relaunch <label>`
-(run_cluster.py refuses it while the scheduler holds the task); still missing after that: exit 2.
+A label that stays "missing" (its VM never started the run) for --start-minutes gets a `relaunch <label>`
+(run_cluster.py refuses it while the scheduler holds the task); a relaunch counts only when it exits 0 or 4, else it
+is retried at the next window, at most --relaunch-attempts times; still missing after one accepted relaunch, or
+after the last attempt: exit 2. The launch itself is bounded by --launch-minutes (default 45): past it the launcher
+is terminated and reaped, and the result is treated as its exit 4 (submitted, unconfirmed: watch, stop nothing).
+Before an exit that leaves clusters up (2, 4, 6) one last listing logs every live cluster with this launch's names
+and its ownership (recorded / journal / unknown); nothing more is stopped.
 
 Exit codes:
   0 every run collected and confirmed for this launch, and no cluster of the launch left live
@@ -147,19 +156,33 @@ def _live(x) -> bool:
     return rc.ws.state_of(x) in rc._ATTACH
 
 
-def strays(items, names, recorded_ids, launched_epoch) -> list:
-    """(name, id) of live clusters with this launch's names, not recorded, created after the launch."""
-    out = []
+def journal_ids(journal, token) -> set:
+    """Ids the construction journal records this invocation creating (run_cluster._construct: status "created")."""
+    return {e.get("id") for e in journal or () if isinstance(e, dict) and token and e.get("inv") == token
+            and e.get("status") == "created" and e.get("id") is not None}
+
+
+def strays(items, names, recorded_ids, owned_ids) -> dict:
+    """Live clusters with this launch's names that clusters.json does not record: "stop" those the journal
+    attributes to this invocation (`owned_ids`), "report" the rest (never stopped)."""
+    out = {"stop": [], "report": []}
     for x in rc._items(items):
-        t = rc._ts(x.get("created"))
-        if (x.get("name") in names and x.get("id") not in recorded_ids and _live(x) and t is not None
-                and t >= launched_epoch):
-            out.append((x["name"], x["id"]))
-    return sorted(out, key=lambda t: t[1])
+        if x.get("name") in names and x.get("id") not in recorded_ids and _live(x):
+            out["stop" if x.get("id") in owned_ids else "report"].append((x["name"], x["id"]))
+    return {k: sorted(v, key=lambda t: t[1]) for k, v in out.items()}
 
 
-def projected_credits(billed, live_roles, sizes, hours, rate) -> float:
-    return float(billed) + sum(sizes.get(r, 1) for r in live_roles) * max(hours, 0.0) * rate
+def instance_count(details):
+    """Live instances (scheduler and workers) in Coiled's cluster details (coiled.v2.cluster_details: "scheduler"
+    and "workers", each with current_state.state), or None when they cannot be read."""
+    if not isinstance(details, dict) or not isinstance(details.get("workers"), list):
+        return None
+    procs = [details.get("scheduler")] + details["workers"]
+    return sum(1 for w in procs if isinstance(w, dict) and rc.ws.state_of(w) not in ("stopped", "error", ""))
+
+
+def projected_credits(billed, counts, hours, rate) -> float:
+    return float(billed) + sum(counts) * max(hours, 0.0) * rate
 
 
 # ---- the watch (I/O through an injected runner and Coiled API) --------------------------------
@@ -177,22 +200,45 @@ class CoiledApi:
     def billing(self, start, end):
         return rc._bounded(rc.billing_events, start, end, timeout_s=300)
 
+    def instances(self, cid):
+        from coiled.v2 import cluster_details
+        return instance_count(rc._bounded(lambda: cluster_details(cid, workspace=rc.WORKSPACE), timeout_s=120))
 
-def shell_runner(cfg_path):
-    """`run_cluster.py <cfg_path> <cmd>` as (exit code or None on a timeout, output); `launch` is streamed."""
-    script = os.path.join(HERE, "run_cluster.py")
 
-    def run(tail, env=None):
-        cmd = [sys.executable, "-u", "-W", "ignore", script, cfg_path, *tail]
+def shell_runner(cfg_path, prefix=None):
+    """`run_cluster.py <cfg_path> <cmd>` as (exit code, or None past its deadline, output). `launch` is streamed,
+    and past its deadline terminated and reaped (`prefix` replaces the command, for the self-test)."""
+    prefix = prefix or [sys.executable, "-u", "-W", "ignore", os.path.join(HERE, "run_cluster.py"), cfg_path]
+
+    def run(tail, env=None, timeout=None):
+        import threading
+        cmd = [*prefix, *tail]
         if tail[0] == "launch":
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
             out = []
-            for line in p.stdout:
-                print(line, end="", flush=True)
-                out.append(line)
-            return p.wait(), "".join(out)
+
+            def read():
+                for line in p.stdout:
+                    print(line, end="", flush=True)
+                    out.append(line)
+            t = threading.Thread(target=read, daemon=True)
+            t.start()
+            try:
+                code = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.terminate()
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+                code = None
+                out.append(f"\nTimeoutError: launch did not return within {timeout} s: terminated\n")
+            t.join(timeout=10)
+            return code, "".join(out)
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=TIMEOUTS.get(tail[0], 1800))
+            p = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                               timeout=timeout or TIMEOUTS.get(tail[0], 1800))
         except subprocess.TimeoutExpired as e:
             return None, f"TimeoutError: {' '.join(tail)} did not return within {e.timeout} s"
         return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -201,15 +247,18 @@ def shell_runner(cfg_path):
 
 class Watch:
     def __init__(self, cfg, cfg_path, token, runner, api, clock, sleep, cap=650.0, interval_s=300.0,
-                 start_s=300.0, max_hours=None, rate=8.0, allow_no_limits=False, retries=6, retry_s=60.0):
+                 start_s=300.0, max_hours=None, rate=8.0, allow_no_limits=False, retries=6, retry_s=60.0,
+                 cap_collect_s=600.0, launch_s=2700.0, relaunch_attempts=3):
         self.cfg, self.cfg_path, self.token, self.runner, self.api = cfg, cfg_path, token, runner, api
         self.clock, self.sleep, self.cap, self.interval_s, self.start_s = clock, sleep, cap, interval_s, start_s
         self.max_hours = max_hours if max_hours is not None else (cfg.run_timeout_hours or 48.0) + cfg.hold_hours + 1
         self.rate, self.allow, self.retries, self.retry_s = rate, allow_no_limits, retries, retry_s
         self.names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
-        self.sizes = {"run": 1 + len(cfg.labels) + cfg.compute_start, "keeper": 2, "overflow": 1}
+        self.max_sizes = {"run": 1 + len(cfg.labels) + cfg.compute_max, "overflow": 1 + (cfg.overflow_max or 0),
+                          "keeper": 2}                     # the fallback when Coiled gives no live count
+        self.cap_collect_s, self.launch_s, self.relaunch_attempts = cap_collect_s, launch_s, relaunch_attempts
         self.env = {**os.environ, "MA_LAUNCH_INVOCATION": token}
-        self.pending_strays = set()
+        self.pending_strays, self.reported, self.leftovers, self.start = set(), set(), None, None
 
     def log(self, msg):
         print(f"{time.strftime('%F %T')} {self.cfg.name}: {msg}", flush=True)
@@ -222,11 +271,11 @@ class Watch:
             self.log(f"{getattr(fn, '__name__', 'call')} unavailable ({type(e).__name__}: {str(e)[:120]})")
             return None
 
-    def call(self, tail, retries=None):
+    def call(self, tail, retries=None, timeout=None):
         """run_cluster.py, retried while it fails with a network error or a timeout."""
         n = retries or self.retries
         for i in range(n):
-            code, out = self.runner(tail, self.env)
+            code, out = self.runner(tail, self.env, timeout=timeout)
             if code == 0 or not (code is None or is_network_error(out)):
                 return code, out
             self.log(f"{tail[0]}: network error or timeout (try {i + 1}/{n}): {str(out).strip()[-160:]}")
@@ -251,7 +300,11 @@ class Watch:
             self.log(f"refused: {why}")
             return EXIT_REFUSED
         self.log(f"launch, invocation {self.token}")
-        code, out = self.runner(["launch"], self.env)
+        code, out = self.runner(["launch"], self.env, timeout=self.launch_s)
+        if code is None:
+            self.log(f"launch did not return within {self.launch_s} s: terminated; treated as exit 4 (submitted, "
+                     "unconfirmed): watching, nothing stopped")
+            code = rc.EXIT_UNCONFIRMED
         d = after_launch(code, self.raw_record(), self.token, self.cfg.keeper)
         self.log(f"launch exit {code}: {d['action']}" + (f", stopping {d['stop']}" if d["stop"] else ""))
         if d["action"] == "stop":
@@ -264,12 +317,17 @@ class Watch:
                      f" -- start it by hand: python cloud/run_cluster.py {self.cfg_path} keeper"))
         return self.watch()
 
+    def over_limit(self) -> bool:
+        if self.clock() - self.start < self.max_hours * 3600:
+            return False
+        self.log(f"watch limit {self.max_hours} h reached: nothing stopped")
+        return True
+
     def watch(self) -> int:
-        start, missing_since, relaunched = self.clock(), {}, set()
+        self.start, missing_since, relaunched, attempts = self.clock(), {}, set(), {}
         while True:
-            if self.clock() - start >= self.max_hours * 3600:
-                self.log(f"watch limit {self.max_hours} h reached: nothing stopped")
-                return EXIT_LIMIT
+            if self.over_limit():
+                return self.leave(self.record(), EXIT_LIMIT)
             rec = self.record()
             if rec is None:
                 self.log("clusters.json is not this invocation's: no sweep, no credit cap, no stop by id")
@@ -289,19 +347,44 @@ class Watch:
             m = missing_action(st, missing_since, relaunched, self.clock(), self.start_s)
             if m and m[0] == "never_ran":
                 self.log(f"{m[1]} has not started, even after a relaunch: nothing stopped")
-                return EXIT_NEVER_RAN
+                return self.leave(rec, EXIT_NEVER_RAN)
             if m:
-                relaunched.add(m[1])
-                missing_since[m[1]] = self.clock()
-                rc_, rout = self.call(["relaunch", m[1]])
-                self.log(f"relaunch {m[1]} exit {rc_}: {str(rout).strip()[-200:]}")
+                lb = m[1]
+                attempts[lb] = attempts.get(lb, 0) + 1
+                rc_, rout = self.call(["relaunch", lb])
+                accepted = rc_ in (rc.EXIT_LAUNCHED, rc.EXIT_UNCONFIRMED)
+                self.log(f"relaunch {lb} (attempt {attempts[lb]}/{self.relaunch_attempts}) exit {rc_}, "
+                         f"{'accepted' if accepted else 'not accepted'}: {str(rout).strip()[-200:]}")
+                missing_since[lb] = self.clock()
+                if accepted:
+                    relaunched.add(lb)
+                elif attempts[lb] >= self.relaunch_attempts:
+                    self.log(f"{lb}: no relaunch accepted in {attempts[lb]} attempts: nothing stopped")
+                    return self.leave(rec, EXIT_NEVER_RAN)
             self.sleep(self.interval_s)
 
+    def owners(self, rec):
+        return {v["id"] for v in recorded(rec).values()}, journal_ids(rc.read_journal(self.cfg), self.token)
+
+    def leave(self, rec, code) -> int:
+        """Before an exit that leaves clusters up: every live cluster of this launch's names and its ownership."""
+        ids, owned = self.owners(rec)
+        items = self.safe(self.api.list_clusters)
+        self.leftovers = [] if items is None else [
+            (x.get("name"), x.get("id"), "recorded" if x.get("id") in ids else "journal" if x.get("id") in owned
+             else "unknown") for x in rc._items(items) if x.get("name") in self.names and _live(x)]
+        for name, cid, who in self.leftovers or ([("listing unavailable", None, "-")] if items is None else []):
+            self.log(f"left live: {name} ({cid}), {who}")
+        return code
+
     def sweep(self, rec, items):
-        launched = rc._ts(rec.get("launched_utc"))
-        if launched is None:
-            return
-        found = set(strays(items, self.names, {v["id"] for v in recorded(rec).values()}, launched))
+        s = strays(items, self.names, *self.owners(rec))
+        for name, cid in s["report"]:
+            if cid not in self.reported:
+                self.reported.add(cid)
+                self.log(f"{name} ({cid}): live, not recorded and not in this invocation's journal: reported, "
+                         "never stopped by this watch")
+        found = set(s["stop"])
         for name, cid in sorted(found & self.pending_strays, key=lambda t: t[1]):
             self.log(f"stray {name} ({cid}): stopping by id")
             self.safe(self.api.stop, name, cid, "stray cluster (attach race)")
@@ -317,8 +400,12 @@ class Watch:
             return None
         billed = sum(v["credits"] for v in rc.summarize_billing(events, roles).values())
         live = {x.get("id") for x in rc._items(items) if _live(x)}
-        return round(projected_credits(billed, [r for r, v in roles.items() if v["id"] in live], self.sizes,
-                                       (self.clock() - t0) / 3600, self.rate), 1)
+        counts = []
+        for role, v in roles.items():
+            if v["id"] in live:
+                n = self.safe(self.api.instances, v["id"])
+                counts.append(n if isinstance(n, int) else self.max_sizes.get(role, 1))
+        return round(projected_credits(billed, counts, (self.clock() - t0) / 3600, self.rate), 1)
 
     def collected(self):
         """(every label collected for this launch, the labels that are not)."""
@@ -335,14 +422,14 @@ class Watch:
         return not bad, bad
 
     def stop_all(self, rec, why) -> bool:
-        """Stop, by id, every live recorded cluster and stray of this launch; True once none is listed live."""
-        ids = {v["id"] for v in recorded(rec).values()}
-        launched = rc._ts(rec.get("launched_utc"))
+        """Stop, by id, every live cluster clusters.json records for this invocation and every stray its journal
+        attributes to it, nothing else; True once none of them is listed live."""
+        ids, owned = self.owners(rec)
         for _ in range(self.retries):
             items = self.safe(self.api.list_clusters)
             if items is not None:
                 live = {(x.get("name"), x.get("id")) for x in rc._items(items) if _live(x) and x.get("id") in ids}
-                live |= set(strays(items, self.names, ids, launched)) if launched is not None else set()
+                live |= set(strays(items, self.names, ids, owned)["stop"])
                 if not live:
                     return True
                 for name, cid in sorted(live, key=lambda t: t[1]):
@@ -352,8 +439,17 @@ class Watch:
 
     def finish(self, rec) -> int:
         ok, bad = False, list(self.cfg.labels)
-        for _ in range(self.retries):
-            code, out = self.call(["collect"])
+        for i in range(self.retries):
+            if i and self.over_limit():
+                return self.leave(rec, EXIT_LIMIT)
+            if i and rec is not None:
+                credits = self.credits(rec, self.safe(self.api.list_clusters) or [])
+                if credits is not None and credits >= self.cap:
+                    self.log(f"credit cap {self.cap} reached ({credits}) between collect attempts: stopping by id")
+                    if not self.stop_all(rec, f"credit cap {self.cap}"):
+                        self.log("a cluster of this launch may still be live after the stop requests")
+                    return EXIT_CAP
+            code, out = self.call(["collect", "--no-shutdown"])
             self.log(f"collect exit {code}: {str(out).strip()[-300:]}")
             ok, bad = self.collected()
             if ok:
@@ -362,7 +458,7 @@ class Watch:
         if not ok:
             self.log(f"not confirmed collected for this launch: {bad}; the run cluster is left up. Run "
                      f"`python cloud/run_cluster.py {self.cfg_path} collect` again")
-            return EXIT_UNCONFIRMED
+            return self.leave(rec, EXIT_UNCONFIRMED)
         if rec is None or not self.stop_all(rec, "every run collected"):
             self.log("every run collected, but a cluster of this launch may still be live: check the listing")
             return EXIT_SHUTDOWN_UNCONFIRMED
@@ -370,8 +466,9 @@ class Watch:
         return EXIT_DONE
 
     def at_cap(self, rec) -> int:
-        self.log(f"credit cap {self.cap} reached: one collect, then stopping every cluster of this launch by id")
-        code, out = self.call(["collect"], retries=2)
+        self.log(f"credit cap {self.cap} reached: one collect (at most {self.cap_collect_s} s), then stopping every "
+                 "cluster of this launch by id")
+        code, out = self.call(["collect", "--no-shutdown"], retries=1, timeout=self.cap_collect_s)
         self.log(f"collect exit {code}: {str(out).strip()[-300:]}; collected: {self.collected()}")
         if not self.stop_all(rec, f"credit cap {self.cap}"):
             self.log("a cluster of this launch may still be live after the stop requests: check the listing")
@@ -860,16 +957,21 @@ def main(argv) -> int:
     p.add_argument("config")
     p.add_argument("--cap", type=float, default=650.0, help="credit cap for this launch (default 650)")
     p.add_argument("--interval", type=float, default=300.0, help="seconds between status checks")
-    p.add_argument("--start-minutes", type=float, default=5.0, help="a run missing this long gets one relaunch")
+    p.add_argument("--start-minutes", type=float, default=5.0, help="a run missing this long gets a relaunch")
     p.add_argument("--max-hours", type=float, default=None)
     p.add_argument("--credits-per-instance-hour", type=float, default=8.0)
     p.add_argument("--allow-no-cloud-limits", action="store_true")
+    p.add_argument("--cap-collect-minutes", type=float, default=10.0, help="the collect attempt at the cap")
+    p.add_argument("--launch-minutes", type=float, default=45.0, help="deadline of the launch subprocess")
+    p.add_argument("--relaunch-attempts", type=int, default=3)
     a = p.parse_args(argv[1:])
     cfg = rc.load_config(a.config)
     token = f"watch-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(3)}"
     return Watch(cfg, a.config, token, shell_runner(os.path.abspath(a.config)), CoiledApi(), time.time, time.sleep,
                  cap=a.cap, interval_s=a.interval, start_s=a.start_minutes * 60, max_hours=a.max_hours,
-                 rate=a.credits_per_instance_hour, allow_no_limits=a.allow_no_cloud_limits).run()
+                 rate=a.credits_per_instance_hour, allow_no_limits=a.allow_no_cloud_limits,
+                 cap_collect_s=a.cap_collect_minutes * 60, launch_s=a.launch_minutes * 60,
+                 relaunch_attempts=a.relaunch_attempts).run()
 
 
 if __name__ == "__main__":
