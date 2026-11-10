@@ -1439,6 +1439,60 @@ def _self_test_cost_structure(ok, A, R):
            f"{r2.get('recommendation')}, {r2.get('point_plan_infeasible')}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"R5n1 a cost_items decision test runs: {type(e).__name__}: {e}")
+    # Codex r1: each multiplier reaches the cost table the plan is re-solved on; a cost item id that is not a string
+    # keeps its multiplier; a price case no allocation can afford is a not-run record with its prices, not a crash
+    orig, seen = A.solve, {}
+    m3 = {"a": 1.5, "b": 0.5}
+
+    def spy(ben, cost, budget=None, feas=None):
+        seen["cost"] = cost
+        return orig(ben, cost, budget=budget, feas=feas)
+
+    def no_plan(ben, cost, budget=None, feas=None):
+        raise RuntimeError("optimizer status infeasible")
+
+    def broken(ben, cost, budget=None, feas=None):
+        raise RuntimeError("optimizer status time_limit")
+    saved_items = copy.deepcopy(A.alloc["cost_items"])
+    try:
+        A.solve = spy
+        DT.run_one(A, {"id": "DTc3", "type": "cost_items", "multipliers": {its[c]: m for c, m in m3.items()}},
+                   z0, _b, cost0, plan, R["uncertainty"])
+        by0 = cost0.by_component
+        ok(all(abs(seen["cost"][i][k] - sum(v * m3.get(c, 1.0) for c, v in by0[i][k].items()))
+               <= 1e-9 * max(1.0, abs(cost0[i][k])) for i in A.ids for k in A.pk)
+           and any(abs(seen["cost"][i][k] - cost0[i][k]) > 1e-6 for i in A.ids for k in A.pk),
+           "R5n3 a cost_items test re-solves on a cost table with every listed multiplier applied to its own item")
+        A.solve = orig
+        for it in A.alloc["cost_items"]:
+            if it["id"] == its["a"]:
+                it["id"] = 7
+        t4 = DT.run_one(A, {"id": "DTc4", "type": "cost_items", "multipliers": {7: 1e9, its["b"]: 0.5}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        r4 = t4["results"][0]
+        ok(t4["decision_changes"] and r4["units_changed"] >= n_a0 and r4["cost_multipliers"].get(7) == 1e9
+           and not any("a" in seg.split(":")[0].strip().split("+") for seg in r4["recommendation"].split(";")),
+           f"R5n4 a cost item whose id is not a string keeps its multiplier: {r4.get('units_changed')} units change "
+           f"package ({n_a0} had a), {r4.get('recommendation')}")
+        A.alloc["cost_items"] = copy.deepcopy(saved_items)
+        A.solve = no_plan
+        t5 = DT.run_one(A, {"id": "DTc5", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 6.0}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        ok(t5["status"] == "not_run" and "no allocation" in t5["reason"] and t5.get("cost_multipliers") == {its["a"]: 6.0},
+           f"R5n5 a price case no allocation can afford is a not-run record that keeps its prices: {t5.get('status')}, "
+           f"{t5.get('reason')}")
+        A.solve = broken
+        try:
+            DT.run_one(A, {"id": "DTc6", "type": "cost_items", "multipliers": {its["a"]: 6.0}},
+                       z0, _b, cost0, plan, R["uncertainty"])
+            ok(False, "R5n6 a solver failure other than a proven infeasibility still stops the analysis")
+        except RuntimeError as e:
+            ok("time_limit" in str(e), f"R5n6 a solver failure other than a proven infeasibility still stops the analysis: {e}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5n3 the cost_items checks run: {type(e).__name__}: {e}")
+    finally:
+        A.solve = orig
+        A.alloc["cost_items"] = saved_items
     item = {"id": "ca_setup", "component": "a", "value": 100.0, "price_year": "2024", "price_rule": "as_published",
             "basis": "per_unit", "includes": ["setup", "supervision"]}
     saved = (copy.deepcopy(A.alloc), copy.deepcopy(A.spec.raw["options"]), copy.deepcopy(A.spec.raw["uncertainty"]))
