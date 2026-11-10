@@ -200,11 +200,30 @@ def digest(x) -> str:
     return hashlib.sha256(json.dumps(x, sort_keys=True, default=repr).encode()).hexdigest()
 
 
-def compare(old: dict, new: dict) -> dict:
-    """Per case: equal (the outputs compared exactly as JSON), and the two digests."""
+# v0.14: window metrics the new code adds (severe cases and deaths per named window). They are the only output the
+# old code lacks: compare() leaves them out of the new side, and only inside an output's `windows`, so every metric
+# both versions report is still compared exactly
+ADDED_WINDOW_METRICS = tuple(f"{k}_{g}" for k in ("severe", "deaths") for g in ("u5", "5_14", "15p", "all"))
+
+
+def drop_added(x, added=ADDED_WINDOW_METRICS):
+    """x without the named metrics inside any `windows: {window: {metric: value}}` mapping (other keys untouched)."""
+    if isinstance(x, dict):
+        return {k: ({w: ({m: v for m, v in d.items() if m not in added} if isinstance(d, dict) else d)
+                     for w, d in v.items()} if k == "windows" and isinstance(v, dict) else drop_added(v, added))
+                for k, v in x.items()}
+    if isinstance(x, list):
+        return [drop_added(v, added) for v in x]
+    return x
+
+
+def compare(old: dict, new: dict, added=ADDED_WINDOW_METRICS) -> dict:
+    """Per case: equal (the outputs compared exactly as JSON, the new side without the `added` window metrics), and
+    the two digests of what was compared."""
     rows = {}
     for cid in sorted(set(old["cases"]) | set(new["cases"])):
         a, b = old["cases"].get(cid), new["cases"].get(cid)
+        b = None if b is None else drop_added(b, added)
         rows[cid] = {"equal": a is not None and b is not None and json.dumps(a, sort_keys=True, default=repr)
                      == json.dumps(b, sort_keys=True, default=repr),
                      "old_sha256": digest(a), "new_sha256": digest(b)}
@@ -268,7 +287,8 @@ def proof_doc(old_ref: str, old_commit: str, new_commit: str, old: dict, new: di
                                        f"{sp.get('delivery')}" for n, sp in SCENARIOS.items()},
                       "not_repeated": "calibration-grid runs (same code path at other attribute values)",
                       "compared": "per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as "
-                                  "JSON; initial-state dicts exactly"},
+                                  "JSON; initial-state dicts exactly",
+                      "added_window_metrics": list(ADDED_WINDOW_METRICS)},
             "cases": rows, "n_cases": len(rows), "identical": bool(rows) and all(r["equal"] for r in rows.values())}
 
 
@@ -400,6 +420,17 @@ def _self_test() -> int:
     ok(not compare(a, b)["x"]["equal"] and compare(a, b)["y"]["equal"], "RP2 a last-bit difference is not identical")
     del b["cases"]["y"]
     ok(not compare(a, b)["y"]["equal"], "RP3 a case missing on one side is not identical")
+    # v0.14: the new side's added window metrics are left out, and nothing else
+    wa = {"cases": {"z": {"m0": {"windows": {"w": {"inc_u5": 1.0}}, "deaths_u5": 3}}}}
+    wb = {"cases": {"z": {"m0": {"windows": {"w": {"inc_u5": 1.0, "deaths_u5": 0.2, "severe_all": 0.1}},
+                                 "deaths_u5": 3}}}}
+    wc = json.loads(json.dumps(wb))
+    wc["cases"]["z"]["m0"]["windows"]["w"]["inc_u5"] = 1.5
+    wd = json.loads(json.dumps(wb))
+    wd["cases"]["z"]["m0"]["windows"]["w"]["deaths_u6"] = 0.2
+    ok(compare(wa, wb)["z"]["equal"] and not compare(wa, wc)["z"]["equal"] and not compare(wa, wd)["z"]["equal"]
+       and not compare(wb, wa)["z"]["equal"],
+       "RP3b the added window metrics are left out of the new side only; a changed or other new metric differs")
     pack = {"settings": {"s1": {}, "s2": {}}}
     cs = cases(pack, [11, 12])
     ok(sum(c["kind"] == "pack" for c in cs) == 4 and len({c["id"] for c in cs}) == len(cs),
