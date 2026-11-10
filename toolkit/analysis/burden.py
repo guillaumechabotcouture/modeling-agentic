@@ -38,7 +38,8 @@ group's units. With `window`, it is the arm's mean over that window instead: the
 windows (Horizon.windows, `WINDOW`) in the same runs, so each run returns the engine's window metrics for one more
 window and no run is added; on the emulator path one more GP per mapped outcome is fitted (a new window changes the
 batch's job hashes, so a batch computed without it is not reused). Its interval comes from the uncertainty draws for
-all-age references; an age-banded reference is the point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
+all-age references (with the emulator error, a column of its error model, on the emulator path); an age-banded
+reference is the point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
 """
 from __future__ import annotations
 
@@ -638,6 +639,25 @@ def findings(raw, data, expected=None) -> list[dict]:
     return out
 
 
+def block_findings(s, data) -> list[dict]:
+    """The artifact's arm, model window and window metrics against the signed spec `s` (Codex S2-5b r1 P1-2): rows
+    can match their declared metadata while the block was computed for another arm or window. Not declarable."""
+    if not isinstance(data, dict):
+        return []                      # a missing artifact is findings()' burden_validation_missing
+    mw = model_window(s)
+    want = {"arm": config(s)["arm"], "window": mw["window"] if mw else [float(x) for x in s["objective"]["horizon"]],
+            "window_metrics": mw["metrics"] if mw else None}
+    got = dict((k, data.get(k)) for k in want)
+    try:
+        got["window"] = [float(x) for x in got["window"]]
+    except (TypeError, ValueError):
+        pass
+    diff = [k for k in want if got[k] != want[k]]
+    return [_f("burden_validation_inconsistent", f"analysis/burden_validation.yaml: {diff} differ from the signed "
+               f"spec's validation.burden ({ {k: want[k] for k in diff} })", "burden_validation", False)
+            ] if diff else []
+
+
 def claims(c, art, data) -> list[dict]:
     """Claim specs (toolkit/analysis/claims.py `_c`) for each reference row and the DALY parts."""
     cl = []
@@ -1165,8 +1185,9 @@ def _self_test_s25b(ok, th):
         good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": "events"}}
         bf = [block_findings(sw, dict(good, **x)) for x in ({}, {"arm": "a"}, {"window": [8, 10]},
                                                              {"window_metrics": {"cases": "other"}})]
-        ok(bf[0] == [] and all([f["kind"] for f in b] == ["burden_validation_inconsistent"] and not b[0]["scope_declarable"]
-                               for b in bf[1:]) and block_findings(s0, {"arm": "none", "window": [8, 10]}) == [],
+        ok(bf[0] == [] and all([f["kind"] for f in b] == ["burden_validation_inconsistent"]
+                               and not b[0]["scope_declarable"] for b in bf[1:])
+           and block_findings(s0, {"arm": "none", "window": [8, 10]}) == [],
            f"BV36 an artifact whose arm, window or window metrics differ from the signed spec is inconsistent: {bf}")
         # Codex S2-5b r1 P1-1: a stored batch computed over another burden window is not adopted
         rawT["validation"] = {"burden": {"csv": "w.csv", "window": [1, 2], "window_metrics": {"cases": "prev"}}}

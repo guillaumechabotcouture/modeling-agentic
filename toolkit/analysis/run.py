@@ -1553,7 +1553,8 @@ def _self_test_burden_e2e(ok, d, q):
     # Codex S2-5b r1 P2: the emulator error reaches the window values as it reaches the reductions
     import numpy as np
     M, zs = R["_model"], {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
-    a, b, c = (M.predict(zs, A.theta0, A.ids, noise=None if s is None else np.random.default_rng(s)) for s in (1, 2, None))
+    a, b, c = (M.predict(zs, A.theta0, A.ids, noise=None if s is None else np.random.default_rng(s))
+               for s in (1, 2, None))
     w = lambda o: [o[i]["burden"]["none"]["cases"] for i in A.ids]  # noqa: E731
     ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("bw", "cases") in M.error.col,
        "BE9 a draw with the emulator error moves the window values (a column of the error model)")

@@ -156,9 +156,10 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
         return []
     try:              # the declared references, read again from the signed spec (Codex r1 P2: reconcile, not trust)
         from toolkit.spec import schema
-        refs, bad = BV.load_references(schema.load(os.path.join(run_dir, SPEC)))
+        sp = schema.load(os.path.join(run_dir, SPEC))
+        refs, bad = BV.load_references(sp)
     except Exception as e:  # noqa: BLE001 -- fail closed
-        refs, bad = None, [f"{type(e).__name__}: {e}"]
+        sp, refs, bad = None, None, [f"{type(e).__name__}: {e}"]
     out = [_f("analysis_contract_burden", f"validation.burden: {b}", "burden") for b in bad]
     if signed:          # Codex #165 r3: the sign-off binds the reference file's bytes; a replaced file is not signed
         try:
@@ -173,7 +174,7 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     if data is not None and not (isinstance(pv, dict) and pv.get("independent") is True):
         out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
                       "independent of the calibration inputs", "burden"))
-    return out + BV.findings(raw, data, None if bad else refs)
+    return out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
 
 
 def gate_findings(run_dir: str) -> list[dict]:

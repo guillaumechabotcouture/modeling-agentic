@@ -140,6 +140,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     d = {"points": points, "fitted_names": names, "packages": list(pk), "spec_engine": spec["engine"],
          "horizon": {"start": h["start"], "stop": h["stop"], "window": list(spec["objective"]["horizon"])},
          "cal_window": list(spec["calibration"]["window"])}
+    if windows(spec).get("burden_validation"):          # F6 S2-5b: only when declared, so other designs stay
+        d["burden_window"] = windows(spec)["burden_validation"]
     if spec["objective"].get("delivery") is not None:   # v0.6: only when given, so other specs' job hashes stay
         d["horizon"]["delivery"] = [float(x) for x in spec["objective"]["delivery"]]
     if pnames:
@@ -328,6 +330,8 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
             probs.append(f"stored design horizon.{k} differs")
     if sd.get("cal_window") != design["cal_window"]:
         probs.append("stored design calibration window differs")
+    if sd.get("burden_window") != design.get("burden_window"):         # Codex S2-5b r1 P1-1
+        probs.append("stored design burden window (validation.burden.window) differs")
     seen = set()
     with open(src_jobs) as f:
         for line in f:

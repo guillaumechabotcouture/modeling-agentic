@@ -260,6 +260,9 @@ class EmulatorModel:
         P0 = next(iter(self.pops))
         tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
+        for o in (self.bw or {}).get("metrics", {}):     # Codex S2-5b r1 P2: the window values' error, jointly
+            cols.append(("bw", o))
+            res.append(self.T[("bw", o)][ho] - self.gps[("bw", o)].predict(Xh))
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
@@ -333,7 +336,8 @@ class EmulatorModel:
             for j in range(n):
                 y[j]["diag"][name] = float(e[j])
         for o in (self.bw or {}).get("metrics", {}):
-            e = np.exp(self.gps[("bw", o)].predict(X))
+            e = self.gps[("bw", o)].predict(X)
+            e = np.exp(e + E[:, self.error.col[("bw", o)]] if E is not None else e)
             for j in range(n):
                 y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})[o] = float(e[j]) * tot[j]
         self.last_events = ev
