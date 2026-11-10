@@ -340,8 +340,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- uncertainty
     from toolkit.analysis import burden as BV
     bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
+    fcol = V.Draws(A) if V.fixed_variants(spec.raw) else None         # F6 S2-6: each fixed plan's outcome and cost
+    hooks = [h.add for h in (bcol, fcol) if h is not None]
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
-               on_draw=bcol.add if bcol else None)
+               on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
@@ -362,7 +364,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
     # ---- plan variants (F6 S1-6), on the point tables within the headline plan's budget
-    pv = V.run(A, ben0, cost0, plan, events0)     # guarded by the point evaluation's corrections
+    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"])   # guarded by the point corrections
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
@@ -907,8 +909,11 @@ def _self_test_variants(ok, q):
         r["analysis"]["plan_variants"] = {"variants": [
             {"id": "service", "type": "minimum_service", "components": ["a", "b"], "text": "a service in every unit"},
             {"id": "one_b", "type": "group_rule", "components": ["b"], "by": "region",
-             "text": "one decision on b per region"}]}
+             "text": "one decision on b per region"},
+            {"id": "given", "type": "fixed_plan", "column": "given", "text": "the plan as funded"}]}
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        _given_column(d, lambda i: "b" if i % 6 == 0 else "a+b" if i % 2 else "none")  # even units: b ineligible
+        _fixed_refusals(ok, d, r)
         signoff.sign(d, "lead", note="self-test")
         try:
             R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
@@ -936,6 +941,18 @@ def _self_test_variants(ok, q):
         txt = open(os.path.join(d, "results.md")).read()
         ok(need <= cs and "## Plan variants" in txt and "[CLAIM:" not in txt,
            f"PV-R3 claims and results.md report the variants: {sorted(need - cs)}")
+        gv = v.get("given") or {}
+        ok(gv.get("status") == "evaluated" and [x["unit"] for x in gv.get("ineligible_units") or []] == ["0", "6", "12", "18"]
+           and all(gv["plan"][x] == "b" for x in ("0", "6", "12", "18"))
+           and abs(gv["cost_minus_budget"] - (gv["cost"] - A.budget)) < 1e-6
+           and (gv.get("uncertainty") or {}).get("draws") == 2
+           and (gv["uncertainty"].get("affordability") or {}).get("draws") == 2,
+           f"PV-R9 the given plan is evaluated as given: ineligible units reported and kept, cost against the budget, "
+           f"quantiles over the draws ({gv.get('status')}, {gv.get('units_ineligible')}, {gv.get('uncertainty_note')})")
+        need9 = {"variant.given.cost", "variant.given.budget_difference", "variant.given.ineligible",
+                 "variant.given.value_lost", "variant.given.averted_median", "variant.given.cost_median"}
+        ok(need9 <= cs and "evaluated as given" in txt,
+           f"PV-R10 claims and results.md report the given plan: {sorted(need9 - cs)}")
         ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")
         _resign(d, lambda x: x["analysis"]["plan_variants"].update(headline="service"))
         try:
@@ -969,6 +986,38 @@ def _self_test_variants(ok, q):
         ok("analysis_contract_plan_variants" in kinds and "headline" in why,
            f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)}; "
            f"rebuild: {why[:120]})")
+
+
+def _given_column(d, pkg):
+    """Add the column `given` (unit i's package: pkg(i)) to the toy units table."""
+    rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+    with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]) + ["given"])
+        w.writeheader()
+        for k, x in enumerate(rows):
+            w.writerow(dict(x, given=pkg(k)))
+
+
+def _fixed_refusals(ok, d, r):
+    """F6 S2-6: the signed spec refuses a fixed plan as the headline, on a missing column, or with an unknown package."""
+    import copy
+
+    def errs(mut, units=None):
+        x = copy.deepcopy(r)
+        mut(x)
+        s = schema.Spec(x, d)
+        if units is not None:
+            s._units = units        # the units table as read, with one cell changed (no file written)
+        return schema.validate(s)
+    fx = lambda x: x["analysis"]["plan_variants"]["variants"][2]  # noqa: E731
+    e1 = errs(lambda x: x["analysis"]["plan_variants"].update(headline="given"))
+    e2 = errs(lambda x: fx(x).update(column="nocol"))
+    ok(any("cannot be the headline" in e for e in e1) and any("nocol" in e for e in e2)
+       and errs(lambda x: None) == [],
+       f"PV-R11 the spec refuses a fixed plan as headline or on a missing column ({e1[:2]}, {e2[:2]})")
+    rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+    e3 = errs(lambda x: None, [dict(rows[0], given="zz")] + rows[1:])
+    ok(any("zz" in e for e in e3), f"PV-R12 the spec refuses a unit given an unknown package ({e3[:2]})")
 
 
 def _self_test_posterior(ok, q):
@@ -1460,7 +1509,7 @@ def _self_test_burden_e2e(ok, d, q):
     A = R["_A"]
     seen = []
     U.run(A, R["point"]["plan"], "h", draws=2, seed=5, pre=U.evaluate_draws(A, 2, 5),
-          on_draw=lambda out, events: seen.append((len(out), type(events).__name__)))
+          on_draw=lambda out, events, cost=None: seen.append((len(out), type(events).__name__)))
     ok(seen == [(len(A.ids), "list")] * 2, f"BE6 precomputed draws call the hook with outcomes and events: {seen}")
     # Codex r3 P1: a reference file replaced after the run fails the gate closed (the sign-off no longer covers it)
     rp_ = os.path.join(d, "burden_refs.csv")

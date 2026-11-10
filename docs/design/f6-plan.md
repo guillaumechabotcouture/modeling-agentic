@@ -184,6 +184,7 @@ runs for a sample of LGAs at the boundary values.
 | S2-3 calibration error model | lead; engine agent for part 2 | part 1 now; part 2 after the engine change | part 1 merged (#166: shared offset per survey and group, drawn with the region; optional group-weighted best point); S2-3b next (change between surveys by group with a threshold); part 2 after that: historical and future coverage as separate parameters, history anchored to delivery surveys (needs an engine parameter for past coverage) |
 | S2-1, S2-4 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
 | S2-5 absolute burden validation | lead | PR by 2026-11-11 | merged (#165: `validation.burden`, `analysis/burden_validation.yaml`); the Nigeria reference file (estimated state cases and deaths with intervals) is built outside the repository before the F6 spec is signed |
+| S2-6 funded plan beside the optimised plan | lead | PR by 2026-11-11 | in review (#170: `fixed_plan` plan variant) |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
 Cost: Stage 1 is laptop and review time. The F6 run needs a full recalibration (the benchmark and error-model changes

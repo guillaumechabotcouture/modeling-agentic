@@ -319,7 +319,7 @@ REVIEWED: dict = {
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
                                                          "(_fig_bytes, contact_sheets), then lib.safe_io")},
-    "toolkit/analysis/run.py": {"open-write": (5, _FIX + " (_resign, _direct_toy)"), "os-remove": (1, _FIX),
+    "toolkit/analysis/run.py": {"open-write": (6, _FIX + " (_resign, _direct_toy, _given_column)"), "os-remove": (1, _FIX),
                                 "shutil": (1, _FIX)},
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
     "toolkit/engines/compartmental/benchmarks/compat_proof.py": {
