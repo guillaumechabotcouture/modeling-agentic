@@ -1,9 +1,9 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.14'
-  code_sha256: 58bc770fdecf72b6f8835ee1a4b07b410f5a2e5f1e7b2843cebf93f866fa3324
-  params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
+  version: '0.15'
+  code_sha256: 78be305240670fa256dac4ecb4d08fb7c70ae719b5a48ba1283428b7c652b3a0
+  params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
   config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 benchmarks:
 - id: B7
@@ -11,53 +11,55 @@ benchmarks:
   role: held_out
   target: 0.83
   band:
-  - 0.68
+  - 0.71
   - 0.98
   source: C21 Pryce 2018 Cochrane CD000363.pub3
+  band_sha256: 95787995db71bc67ffec418bc94210f1e9d47208f7c4e925ffd6738249c44591
   components:
-    Halbluetzel 1996 (0-59 months): 0.4837
-    Moyou-Somo 1995 (15 and under): 0.5067
-    Rowland 1996 (all ages): 0.5075
-    Smithuis 2013 (under 10): 0.5011
-    Sochantha 2006 (all ages): 0.5075
+    Halbluetzel 1996 (0-59 months): 0.7596
+    Moyou-Somo 1995 (15 and under): 0.7617
+    Rowland 1996 (all ages): 0.7578
+    Smithuis 2013 (under 10): 0.7565
+    Sochantha 2006 (all ages): 0.7578
   diagnostics:
-    windows.m12.pfpr_6m14y: 0.5074
-  computed: 0.5012
-  se_log: 0.0206
+    windows.m12.pfpr_6m14y: 0.7596
+  computed: 0.7587
+  se_log: 0.0111
   per_seed:
-  - 0.4729
-  - 0.5104
-  - 0.4661
-  - 0.5339
-  - 0.4941
-  - 0.5255
-  - 0.5389
-  - 0.474
-  seed_min: 0.4661
-  seed_max: 0.5389
-  in_band: false
-  status: out_of_band
+  - 0.7672
+  - 0.7239
+  - 0.7498
+  - 0.7877
+  - 0.7515
+  - 0.7634
+  - 0.7928
+  - 0.7357
+  seed_min: 0.7239
+  seed_max: 0.7928
+  in_band: true
+  status: in_band
 - id: B8
   metric: ITN vs none, clinical incidence RR 0-24 m (under 5)
   role: held_out
   target: 0.55
   band:
-  - 0.46
+  - 0.48
   - 0.64
   source: C22 Pryce 2018
-  computed: 0.4104
-  se_log: 0.0213
+  band_sha256: f13247248d764056e9bf1d3ce888bbfe8e55c58f5615f5c61e7f9921a582d2ab
+  computed: 0.6653
+  se_log: 0.0176
   per_seed:
-  - 0.3846
-  - 0.4273
-  - 0.3895
-  - 0.4508
-  - 0.4035
-  - 0.4086
-  - 0.4375
-  - 0.3868
-  seed_min: 0.3846
-  seed_max: 0.4508
+  - 0.672
+  - 0.7029
+  - 0.65
+  - 0.7234
+  - 0.6743
+  - 0.6379
+  - 0.6356
+  - 0.632
+  seed_min: 0.632
+  seed_max: 0.7234
   in_band: false
   status: out_of_band
 - id: B9
@@ -65,22 +67,23 @@ benchmarks:
   role: held_out
   target: 0.37
   band:
-  - 0.09
+  - 0.21
   - 0.65
   source: C15 Protopopoff 2018 Lancet, Table 2 (PBO LLIN vs standard LLIN, 9 months)
-  computed: 0.3768
-  se_log: 0.0191
+  band_sha256: 1ed98c1e8d3c0f6d92db9b7caed86e240848d307b2c21e407be6aef7a5dcd7b5
+  computed: 0.4742
+  se_log: 0.024
   per_seed:
-  - 0.3588
-  - 0.361
-  - 0.3488
-  - 0.3862
-  - 0.3755
-  - 0.405
-  - 0.4026
-  - 0.38
-  seed_min: 0.3488
-  seed_max: 0.405
+  - 0.5143
+  - 0.4821
+  - 0.4385
+  - 0.4742
+  - 0.5226
+  - 0.4344
+  - 0.4807
+  - 0.4543
+  seed_min: 0.4344
+  seed_max: 0.5226
   in_band: true
   status: in_band
 - id: B9b
@@ -91,19 +94,20 @@ benchmarks:
   - 0.2
   - 0.81
   source: C15 Protopopoff 2018, Table 2 (21 months; held-out durability check)
-  computed: 0.6665
-  se_log: 0.0131
+  band_sha256: ef0fbd901dedc422932cb2c4f20b8bbcc95166ef21005ae1437213364384c43b
+  computed: 0.7399
+  se_log: 0.0108
   per_seed:
-  - 0.6863
-  - 0.7034
-  - 0.6476
-  - 0.6531
-  - 0.6496
-  - 0.6675
-  - 0.6347
-  - 0.6927
-  seed_min: 0.6347
-  seed_max: 0.7034
+  - 0.7085
+  - 0.7265
+  - 0.7331
+  - 0.7267
+  - 0.7362
+  - 0.7814
+  - 0.7605
+  - 0.7484
+  seed_min: 0.7085
+  seed_max: 0.7814
   in_band: true
   status: in_band
 - id: B9c
@@ -114,19 +118,20 @@ benchmarks:
   - 0.67
   - 1.45
   source: C17 Mosha 2022 Lancet (added held-out durability check)
-  computed: 0.7308
-  se_log: 0.0072
+  band_sha256: 65e4383a405d9faf63dd988de905a3e6cea22c8ddb12b8f73b587f0cf97ce629
+  computed: 0.8213
+  se_log: 0.0192
   per_seed:
-  - 0.7241
-  - 0.7368
-  - 0.7464
-  - 0.7573
-  - 0.7164
-  - 0.7132
-  - 0.7254
-  - 0.7277
-  seed_min: 0.7132
-  seed_max: 0.7573
+  - 0.8758
+  - 0.7857
+  - 0.8595
+  - 0.8162
+  - 0.8535
+  - 0.8513
+  - 0.7537
+  - 0.7829
+  seed_min: 0.7537
+  seed_max: 0.8758
   in_band: true
   status: in_band
 - id: B10
@@ -134,45 +139,47 @@ benchmarks:
   role: fit
   target: 0.45
   band:
-  - 0.23
+  - 0.3
   - 0.67
-  source: C17 Mosha 2022
-  computed: 0.6671
-  se_log: 0.0198
+  source: C17 Mosha 2022 Lancet (PMID 35339225)
+  band_sha256: aed4319d37415d33af2028be21710a55d213fa8e90f12504c2812e291a02ef77
+  computed: 0.6477
+  se_log: 0.0286
   per_seed:
-  - 0.7046
-  - 0.6208
-  - 0.6424
-  - 0.7229
-  - 0.6223
-  - 0.6681
-  - 0.6876
-  - 0.6755
-  seed_min: 0.6208
-  seed_max: 0.7229
+  - 0.6557
+  - 0.6658
+  - 0.6382
+  - 0.6332
+  - 0.7205
+  - 0.6717
+  - 0.5438
+  - 0.6674
+  seed_min: 0.5438
+  seed_max: 0.7205
   in_band: true
   status: in_band
 - id: B11
-  metric: Dual-AI vs pyrethroid nets, incidence RR 0-24 m
+  metric: 'Dual-AI vs pyrethroid nets, incidence HR 0-24 m (engine: rate ratio)'
   role: fit
   target: 0.54
   band:
-  - 0.38
+  - 0.42
   - 0.7
-  source: C20 Accrombessi 2023 Lancet
-  computed: 0.4979
-  se_log: 0.0227
+  source: C20 Accrombessi 2023 Lancet (PMID 36706778)
+  band_sha256: 7bbe4f331dd56dcb61f0aaf2031f1744624e496aed39a1c2ced5c530c2b4e351
+  computed: 0.4865
+  se_log: 0.017
   per_seed:
-  - 0.5063
-  - 0.5119
-  - 0.521
-  - 0.4685
-  - 0.5018
-  - 0.4527
-  - 0.5526
-  - 0.4757
-  seed_min: 0.4527
-  seed_max: 0.5526
+  - 0.5282
+  - 0.4971
+  - 0.4565
+  - 0.4931
+  - 0.5
+  - 0.4885
+  - 0.4721
+  - 0.46
+  seed_min: 0.4565
+  seed_max: 0.5282
   in_band: true
   status: in_band
 - id: B12
@@ -180,22 +187,23 @@ benchmarks:
   role: fit
   target: 0.61
   band:
-  - 0.34
+  - 0.42
   - 0.88
   source: C23 Pryce 2022 Cochrane CD012688.pub3
-  computed: 0.8037
-  se_log: 0.0096
+  band_sha256: 9894dcae933cb233230fb10a3e5efa1b9655d5fcce3e8d056cf74641f15023a8
+  computed: 0.8296
+  se_log: 0.0152
   per_seed:
-  - 0.8264
-  - 0.8295
-  - 0.8084
-  - 0.77
-  - 0.8064
-  - 0.8063
-  - 0.8108
-  - 0.7741
-  seed_min: 0.77
-  seed_max: 0.8295
+  - 0.8182
+  - 0.8344
+  - 0.8279
+  - 0.8752
+  - 0.8145
+  - 0.8818
+  - 0.7698
+  - 0.8203
+  seed_min: 0.7698
+  seed_max: 0.8818
   in_band: true
   status: in_band
 - id: B12b
@@ -203,22 +211,23 @@ benchmarks:
   role: fit
   target: 0.86
   band:
-  - 0.49
+  - 0.61
   - 1.23
   source: C23 Pryce 2022
-  computed: 0.5794
-  se_log: 0.0177
+  band_sha256: 47ebb01b28033fbc3efd1111f1ae3ef57a1875159502a48abe81ba440f206df2
+  computed: 0.618
+  se_log: 0.0053
   per_seed:
-  - 0.5603
-  - 0.6204
-  - 0.5548
-  - 0.5606
-  - 0.5925
-  - 0.5607
-  - 0.6275
-  - 0.5636
-  seed_min: 0.5548
-  seed_max: 0.6275
+  - 0.6079
+  - 0.6195
+  - 0.622
+  - 0.6236
+  - 0.6199
+  - 0.6062
+  - 0.6112
+  - 0.6339
+  seed_min: 0.6062
+  seed_max: 0.6339
   in_band: true
   status: in_band
 - id: B12m
@@ -231,19 +240,20 @@ benchmarks:
   - 0.55
   source: Protopopoff 2018 Lancet, Table 2 (standard LLIN + IRS vs standard LLIN;
     band = 95% CI)
-  computed: 0.451
-  se_log: 0.0161
+  band_sha256: 16cbd951d1b5cb7a1f81394a487324530fcf50d5b4a637f23a0fd06ff1e90442
+  computed: 0.4891
+  se_log: 0.0265
   per_seed:
-  - 0.4582
-  - 0.4112
-  - 0.433
-  - 0.4523
-  - 0.4587
-  - 0.4695
-  - 0.4717
-  - 0.4566
-  seed_min: 0.4112
-  seed_max: 0.4717
+  - 0.5258
+  - 0.4967
+  - 0.458
+  - 0.5425
+  - 0.4985
+  - 0.4315
+  - 0.4677
+  - 0.5015
+  seed_min: 0.4315
+  seed_max: 0.5425
   in_band: true
   status: in_band
 - id: B13
@@ -253,20 +263,21 @@ benchmarks:
   band:
   - 0.14
   - 0.4
-  source: C27 Thwing 2024 AJTMH
-  computed: 0.2858
-  se_log: 0.0151
+  source: C27 Thwing 2024 AJTMH (PMC10793029)
+  band_sha256: d2a837e4731656a4ffeea0552be4c505bc22b774a8645bcccabe1efebf0840c0
+  computed: 0.2778
+  se_log: 0.0136
   per_seed:
-  - 0.3023
-  - 0.2665
-  - 0.2814
-  - 0.2894
-  - 0.2969
-  - 0.2948
-  - 0.2739
-  - 0.2831
-  seed_min: 0.2665
-  seed_max: 0.3023
+  - 0.2721
+  - 0.2737
+  - 0.2946
+  - 0.2832
+  - 0.2909
+  - 0.2753
+  - 0.2712
+  - 0.2628
+  seed_min: 0.2628
+  seed_max: 0.2946
   in_band: true
   status: in_band
 - id: B15
@@ -277,6 +288,7 @@ benchmarks:
   - 1.19
   - 4.97
   source: 'C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)'
+  band_sha256: 3c8a7c359ea906bd674a560eb8e59023a3cf6330d5fa6e310751559f6b0cac5a
   requires:
     B9:
     - 0.21
@@ -285,57 +297,57 @@ benchmarks:
     - 0.19
     - 0.55
   arm_or:
-  - a11: 0.2694
-    a10: 0.3588
-    a01: 0.4582
-  - a11: 0.2484
-    a10: 0.361
-    a01: 0.4112
-  - a11: 0.2486
-    a10: 0.3488
-    a01: 0.433
-  - a11: 0.257
-    a10: 0.3862
-    a01: 0.4523
-  - a11: 0.2521
-    a10: 0.3755
-    a01: 0.4587
-  - a11: 0.2393
-    a10: 0.405
-    a01: 0.4695
-  - a11: 0.2523
-    a10: 0.4026
-    a01: 0.4717
-  - a11: 0.293
-    a10: 0.38
-    a01: 0.4566
+  - a11: 0.3161
+    a10: 0.5143
+    a01: 0.5258
+  - a11: 0.3083
+    a10: 0.4821
+    a01: 0.4967
+  - a11: 0.3177
+    a10: 0.4385
+    a01: 0.458
+  - a11: 0.3494
+    a10: 0.4742
+    a01: 0.5425
+  - a11: 0.3045
+    a10: 0.5226
+    a01: 0.4985
+  - a11: 0.2896
+    a10: 0.4344
+    a01: 0.4315
+  - a11: 0.3019
+    a10: 0.4807
+    a01: 0.4677
+  - a11: 0.3208
+    a10: 0.4543
+    a01: 0.5015
   arm_or_geomean:
-    a11: 0.2571
-    a10: 0.3768
-    a01: 0.451
+    a11: 0.3131
+    a10: 0.4742
+    a01: 0.4891
   arm_prevalence:
-    a00: 0.5491
-    a10: 0.3146
-    a01: 0.3545
-    a11: 0.2385
-  computed: 1.5127
+    a00: 0.5564
+    a10: 0.3731
+    a01: 0.3803
+    a11: 0.2822
+  computed: 1.3502
   se_log: 0.0398
   per_seed:
-  - 1.6386
-  - 1.6734
-  - 1.6456
-  - 1.4712
-  - 1.4637
-  - 1.258
-  - 1.3281
-  - 1.6885
-  seed_min: 1.258
-  seed_max: 1.6885
+  - 1.1689
+  - 1.2876
+  - 1.582
+  - 1.3583
+  - 1.169
+  - 1.5449
+  - 1.3427
+  - 1.4082
+  seed_min: 1.1689
+  seed_max: 1.582
   in_band: true
   status: in_band
   requires_values:
-    B9: 0.3768
-    B12m: 0.451
+    B9: 0.4742
+    B12m: 0.4891
 - id: B16c
   metric: 'EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >=
     200 -> PfPR > 80%)'
@@ -343,6 +355,7 @@ benchmarks:
   target: null
   band: null
   source: C35 Beier 1999 AJTMH
+  band_sha256: 32ea10db7914fb63d1b74af37ef9d9ef18fb2dbf68740ea24cc38f51abe475b6
   points:
   - - 1.037
     - 0.1032
@@ -378,6 +391,7 @@ benchmarks:
   - 7.67
   - 191.9
   source: C28 Gilmartin 2021
+  band_sha256: d8cbd712b85e0c144f41ce4c2bca92228c096cda4398492d54f713bc7eda0c51
   computed: 14.6854
   outcome_averted_per_capita: 0.1172
   cost_per_capita: 1.7211
@@ -407,25 +421,26 @@ benchmarks:
   - 8.9
   - 222.6
   source: C29 Conteh 2021
-  computed: 21.9262
-  outcome_averted_per_capita: 0.0469
+  band_sha256: 33f354f88189414ed1c0592d3ab2bdbf24659b3b1f4f720056e07fec8975568c
+  computed: 29.8704
+  outcome_averted_per_capita: 0.0344
   cost_per_capita: 1.028
   comparator_outcome_per_capita: 0.3667
-  share_averted: 0.1279
+  share_averted: 0.0939
   price_floor: 2.8033
   target_below_price_floor: false
   share_averted_needed_for_band: 0.0126
   per_seed:
-  - 18.0627
-  - 21.2844
-  - 22.8709
-  - 31.8847
-  - 34.2163
-  - 16.4886
-  - 22.1529
-  - 19.0439
-  seed_min: 16.4886
-  seed_max: 34.2163
+  - 33.2279
+  - 22.2364
+  - 34.2058
+  - 35.6811
+  - 33.1705
+  - 32.746
+  - 26.6378
+  - 26.8513
+  seed_min: 22.2364
+  seed_max: 35.6811
   in_band: true
   status: in_band
 - id: B19
@@ -436,54 +451,60 @@ benchmarks:
   - 5.03
   - 125.8
   source: C29 Conteh 2021
-  computed: 115.6622
-  outcome_averted_per_capita: 0.2147
-  cost_per_capita: 24.8288
+  band_sha256: 4118f43d9652e89e138865707faa0f043ae4fb1157ec953bd80d041a48080bf9
+  computed: 130.8696
+  outcome_averted_per_capita: 0.1898
+  cost_per_capita: 24.8345
   comparator_outcome_per_capita: 0.3667
-  share_averted: 0.5854
-  price_floor: 67.7073
+  share_averted: 0.5175
+  price_floor: 67.7231
   target_below_price_floor: true
-  share_averted_needed_for_band: 0.5382
+  share_averted_needed_for_band: 0.5383
   per_seed:
-  - 117.292
-  - 112.042
-  - 118.7898
-  - 115.1588
-  - 125.9343
-  - 114.2866
-  - 115.2066
-  - 107.9342
-  seed_min: 107.9342
-  seed_max: 125.9343
-  in_band: true
-  status: in_band
+  - 132.1508
+  - 124.3702
+  - 135.8161
+  - 133.4194
+  - 142.7145
+  - 127.7093
+  - 129.078
+  - 123.5448
+  seed_min: 123.5448
+  seed_max: 142.7145
+  in_band: false
+  status: band_mis_based
+  reach_in_fitted_range:
+  - 130.8696
+  - 148.7911
+  mis_based_reason: unreachable_in_fitted_range
 - id: B20
   metric: Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)
   role: held_out
   target: 19.0
   band:
-  - 3.8
-  - 95.0
+  - 1.0
+  - 105.0
   source: C19 Mosha 2022
-  computed: 6.4052
-  outcome_averted_per_capita: 0.0377
+  band_sha256: 16f0e2b227f08a39d6035efb16a174f3fdf05478eb6a2fc1ce27de1c9f071fde
+  computed: 6.5532
+  outcome_averted_per_capita: 0.0368
   cost_per_capita: 0.2414
-  comparator_outcome_per_capita: 0.3426
-  share_averted: 0.11
-  price_floor: 0.7048
+  comparator_outcome_per_capita: 0.3441
+  share_averted: 0.1071
+  price_floor: 0.7016
   target_below_price_floor: false
-  share_averted_needed_for_band: 0.0074
+  share_averted_needed_for_band: 0.0067
   per_seed:
-  - 7.7121
-  - 4.8705
-  - 5.5452
-  - 9.2241
-  - 8.176
-  - 6.7224
-  - 5.8062
-  - 5.5249
-  seed_min: 4.8705
-  seed_max: 9.2241
+  - 7.6611
+  - 8.6601
+  - 5.3542
+  - 6.8454
+  - 5.1492
+  - 7.9332
+  - 7.6605
+  - 5.2246
+  seed_min: 5.1492
+  seed_max: 8.6601
   in_band: true
   status: in_band
 initialisation:
@@ -514,7 +535,7 @@ settings_calibrated:
     near_grid_edge: false
   muleba:
     attribute: m0
-    value: 115.87402456214336
+    value: 64.99665192295538
     grid:
     - 8
     - 16
@@ -523,18 +544,18 @@ settings_calibrated:
     - 128
     - 256
     baseline_values:
-    - 0.1727
-    - 0.2657
-    - 0.3549
-    - 0.4793
-    - 0.5619
-    - 0.6508
+    - 0.2281
+    - 0.3473
+    - 0.4536
+    - 0.548
+    - 0.638
+    - 0.7031
     target: 0.55
     at_grid_edge: false
     near_grid_edge: false
   misungwi:
     attribute: m0
-    value: 11.89802410254117
+    value: 10.928518327394979
     grid:
     - 8
     - 16
@@ -542,17 +563,17 @@ settings_calibrated:
     - 64
     - 128
     baseline_values:
-    - 0.3792
-    - 0.5168
-    - 0.6027
-    - 0.6809
-    - 0.7396
+    - 0.4034
+    - 0.5248
+    - 0.6133
+    - 0.6905
+    - 0.7438
     target: 0.458
     at_grid_edge: false
     near_grid_edge: false
   benin:
     attribute: m0
-    value: 15.402055112854258
+    value: 10.544719454655706
     grid:
     - 4
     - 8
@@ -560,17 +581,17 @@ settings_calibrated:
     - 32
     - 64
     baseline_values:
-    - 0.6665
-    - 1.2392
-    - 2.1077
-    - 3.0344
-    - 4.1291
+    - 0.9418
+    - 1.6708
+    - 2.6476
+    - 3.7554
+    - 4.5514
     target: 2.06
     at_grid_edge: false
     near_grid_edge: false
   irs_added:
     attribute: m0
-    value: 37.5908277518058
+    value: 22.67848244186045
     grid:
     - 8
     - 16
@@ -578,17 +599,17 @@ settings_calibrated:
     - 64
     - 128
     baseline_values:
-    - 0.1721
-    - 0.2654
-    - 0.3731
-    - 0.489
-    - 0.5923
+    - 0.236
+    - 0.3412
+    - 0.4581
+    - 0.5531
+    - 0.6386
     target: 0.4
     at_grid_edge: false
     near_grid_edge: false
   sahel_smc:
     attribute: m0
-    value: 22.34330759730701
+    value: 21.383795400494797
     grid:
     - 4
     - 8
@@ -596,11 +617,11 @@ settings_calibrated:
     - 32
     - 64
     baseline_values:
-    - 0.1859
-    - 0.2574
-    - 0.3578
-    - 0.4453
-    - 0.5408
+    - 0.1855
+    - 0.2593
+    - 0.3648
+    - 0.4489
+    - 0.5388
     target: 0.4
     at_grid_edge: false
     near_grid_edge: false
@@ -641,8 +662,8 @@ settings_calibrated:
     at_grid_edge: false
     near_grid_edge: false
 fitted_used:
-  cfp_kill: 0.405
-  irs_kill: 0.433438
+  cfp_kill: 0.485
+  irs_kill: 0.45125
 configs_validated: {}
 configs_not_exercised: []
 seeds:
@@ -654,252 +675,17 @@ seeds:
 - 16
 - 17
 - 18
-n_sims: 298
+n_sims: 362
 summary:
   in_band: 14
   total: 17
   by_status:
     in_band: 14
-    out_of_band: 3
+    out_of_band: 2
     not_assessable: 0
-    band_mis_based: 0
+    band_mis_based: 1
   held_out_in_band: 9
   held_out_total: 12
-engine_version: '0.14'
+engine_version: '0.15'
 fit_rule: joint-v1
-wall_s: 2832.9
-restamped:
-  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-  proof_identical: true
-  scope:
-    pack_settings:
-    - benin
-    - ce_ref
-    - ce_res
-    - cochrane_itn
-    - eir_1
-    - eir_10
-    - eir_100
-    - eir_3
-    - eir_30
-    - eir_300
-    - irs_added
-    - misungwi
-    - muleba
-    - sahel_smc
-    pack_arms: every arm of each setting, in one run_batch per setting and seed
-    seeds:
-    - 11
-    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
-      sensitivity the card's 4000
-    burnin_years: the card's (50), the pack's own
-    evidence_cases:
-    - - equilibration
-      - - 3.5
-        - base
-        - burnin_years: 50
-        - 1
-    - - equilibration
-      - - 28.0
-        - doubled
-        - burnin_years: 100
-        - 1
-    - - equilibration
-      - - 9.0
-        - guess_hi
-        - burnin_years: 50
-          init_eir_per_m0: 2.4
-        - 2
-    - - guess_sensitivity
-      - - 3.5
-        - x1
-        - 1
-        - 50
-    - - guess_sensitivity
-      - - 28.0
-        - x0.25
-        - 2
-        - 50
-    scenarios:
-      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-      heterogeneous: 5 members, seed 23, delivery None
-      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-    not_repeated: calibration-grid runs (same code path at other attribute values)
-    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-      dicts exactly
-    added_window_metrics:
-    - severe_u5
-    - severe_5_14
-    - severe_15p
-    - severe_all
-    - deaths_u5
-    - deaths_5_14
-    - deaths_15p
-    - deaths_all
-  old_engine_version: '0.13'
-  proof_script_commit: 0d6d1f73696fb27ef0a9c3314327c04230998e47
-  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
-    is pending.
-  confirmation:
-    validate_once: pending
-    evidence: null
-  old_identity:
-    name: malaria-starsim
-    version: '0.13'
-    code_sha256: 2310408557d9d9dd70db1e8673af2e1b71c3aabdb4115f88266bf6204e76dad7
-    params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-    config_sha256: f582a35071dd288069a265401d672aac33b85fab1a1aedeb60b832030f620619
-  previous:
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-        past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.12'
-    proof_script_commit: 4f0f9609a89ee448e4f6ae20ae924b0b417c3b3f
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_identity:
-      name: malaria-starsim
-      version: '0.12'
-      code_sha256: defb2d87b65f8210f7f04ec413687eaaf50104f3637975556d4e3cce675abbd5
-      params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-      config_sha256: 04b9eedeaec5d5f1bce0674f816a6f5890dd1fa751368bd61cfb440256a33398
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.11'
-    proof_script_commit: 1b0c74ff6aa4a0a0aab3f83f56f247642abaef1d
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_identity:
-      name: malaria-starsim
-      version: '0.11'
-      code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
-      params_sha256: 507912ed97660d905d0cfa2ed2e898383a3debc37858c68be18ddaa18d6ecfbb
-      config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3
+wall_s: 3260.3

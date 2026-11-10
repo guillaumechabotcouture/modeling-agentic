@@ -1,6 +1,6 @@
 producer: toolkit/engines/malaria/benchmarks/equilibration.py
-engine_version: '0.14'
-code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
+engine_version: '0.15'
+code_sha256: 78be305240670fa256dac4ecb4d08fb7c70ae719b5a48ba1283428b7c652b3a0
 burnin_years: 50
 init_eir_per_m0: 0.6
 criterion:
@@ -553,41 +553,41 @@ levels:
     guess_hi:
       seeds: 6
       N: 4044.5
-      pfpr_u5: 0.3964
+      pfpr_u5: 0.3961
       immunity:
         IB:
-          '0_5': 7.6703
-          '5_15': 32.8305
-          '15_30': 59.549
-          30p: 75.7091
-          15p: 68.6451
+          '0_5': 7.6516
+          '5_15': 32.4633
+          '15_30': 59.801
+          30p: 75.6759
+          15p: 68.7369
         IC:
-          '0_5': 4.8662
-          '5_15': 23.8059
-          '15_30': 51.6668
-          30p: 91.367
-          15p: 74.009
+          '0_5': 4.862
+          '5_15': 23.4929
+          '15_30': 51.8182
+          30p: 91.4036
+          15p: 74.0958
         ID:
-          '0_5': 4.2368
-          '5_15': 17.1106
-          '15_30': 28.8748
-          30p: 34.4838
-          15p: 32.0312
+          '0_5': 4.2412
+          '5_15': 16.9214
+          '15_30': 28.9422
+          30p: 34.4715
+          15p: 32.0538
         IV:
-          '0_5': 4.4895
-          '5_15': 21.4416
-          '15_30': 45.8292
-          30p: 80.7786
-          15p: 65.4994
+          '0_5': 4.4948
+          '5_15': 21.1843
+          '15_30': 45.927
+          30p: 80.7909
+          15p: 65.549
       immunity_sd:
         IC:
-          '15_30': 2.9953
-          30p: 2.3026
-          15p: 2.5459
+          '15_30': 3.1342
+          30p: 2.3204
+          15p: 2.6074
         ID:
-          '15_30': 1.357
-          30p: 0.6458
-          15p: 0.9462
+          '15_30': 1.4078
+          30p: 0.6459
+          15p: 0.9568
     guess_lo:
       seeds: 6
       N: 4044.5
@@ -672,14 +672,14 @@ levels:
     ID_30p: -0.0063
     ID_15p: -0.0098
   init_guess_rel:
-    IC_15_30: 0.0101
-    IC_30p: -0.0701
-    IC_15p: -0.0456
-    ID_15_30: 0.0035
-    ID_30p: -0.0101
-    ID_15p: -0.0048
+    IC_15_30: 0.0072
+    IC_30p: -0.0705
+    IC_15p: -0.0468
+    ID_15_30: 0.0012
+    ID_30p: -0.0097
+    ID_15p: -0.0055
   max_abs_doubling_rel: 0.0203
-  max_abs_init_guess_rel: 0.0701
+  max_abs_init_guess_rel: 0.0705
 - m0: 28.0
   arms:
     base:
@@ -888,230 +888,10 @@ levels:
     ID_15p: -0.0046
   max_abs_doubling_rel: 0.021
   max_abs_init_guess_rel: 0.0863
-wall_s: 1230.9
-cpu_s: 18972.7
+wall_s: 1340.1
+cpu_s: 20669.7
 problems:
 - 'init_guess: m0 3.5: IC 30p differs -6.5% between the x0.25 and x4 guesses'
 - 'init_guess: m0 9.0: IC 30p differs -7.0% between the x0.25 and x4 guesses'
 - 'init_guess: m0 28.0: IC 30p differs -8.6% between the x0.25 and x4 guesses'
 - 'init_guess: m0 28.0: IC 15p differs -6.3% between the x0.25 and x4 guesses'
-restamped:
-  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-  proof_identical: true
-  scope:
-    pack_settings:
-    - benin
-    - ce_ref
-    - ce_res
-    - cochrane_itn
-    - eir_1
-    - eir_10
-    - eir_100
-    - eir_3
-    - eir_30
-    - eir_300
-    - irs_added
-    - misungwi
-    - muleba
-    - sahel_smc
-    pack_arms: every arm of each setting, in one run_batch per setting and seed
-    seeds:
-    - 11
-    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
-      sensitivity the card's 4000
-    burnin_years: the card's (50), the pack's own
-    evidence_cases:
-    - - equilibration
-      - - 3.5
-        - base
-        - burnin_years: 50
-        - 1
-    - - equilibration
-      - - 28.0
-        - doubled
-        - burnin_years: 100
-        - 1
-    - - equilibration
-      - - 9.0
-        - guess_hi
-        - burnin_years: 50
-          init_eir_per_m0: 2.4
-        - 2
-    - - guess_sensitivity
-      - - 3.5
-        - x1
-        - 1
-        - 50
-    - - guess_sensitivity
-      - - 28.0
-        - x0.25
-        - 2
-        - 50
-    scenarios:
-      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-      heterogeneous: 5 members, seed 23, delivery None
-      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-    not_repeated: calibration-grid runs (same code path at other attribute values)
-    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-      dicts exactly
-    added_window_metrics:
-    - severe_u5
-    - severe_5_14
-    - severe_15p
-    - severe_all
-    - deaths_u5
-    - deaths_5_14
-    - deaths_15p
-    - deaths_all
-  old_engine_version: '0.13'
-  proof_script_commit: 0d6d1f73696fb27ef0a9c3314327c04230998e47
-  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
-    is pending.
-  confirmation:
-    validate_once: pending
-    evidence: null
-  old_code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
-  previous:
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-        past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.12'
-    proof_script_commit: 4f0f9609a89ee448e4f6ae20ae924b0b417c3b3f
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.11'
-    proof_script_commit: 1b0c74ff6aa4a0a0aab3f83f56f247642abaef1d
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
