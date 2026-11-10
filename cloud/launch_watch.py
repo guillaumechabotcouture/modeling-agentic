@@ -571,8 +571,10 @@ def _self_test() -> int:
         cfg = cfg_of(tmp, name=name, labels=labels)
         log = []
         r = rec(cfg) if callable(rec) else rec
+        box = {}
 
         def launch(tail):
+            box["api"].up = True
             if r is not None:
                 write_record(cfg, r)
             write_assign(cfg)
@@ -587,6 +589,7 @@ def _self_test() -> int:
                                               if r else {})
         api = kw.pop("api", None)
         api = api.bind(cfg, log, live) if api is not None else Api(cfg, log, live=live)
+        box["api"] = api
         w = watch(cfg, runner, api, **kw)
         return w.run(), log, cfg, runner, w
 
@@ -602,9 +605,9 @@ def _self_test() -> int:
         case(f"LW1a.{code}", f"launch exit {code}: watch, stop nothing, whatever the record says",
              lambda code=code: all(after_launch(code, r, TOKEN)["action"] == "watch" and not after_launch(
                  code, r, TOKEN)["stop"] for r in (record(c), record(c, status="failed"), None)))
-    case("LW1b", "launch exit 5: watch and start the keeper",
+    case("LW1b", "launch exit 5: watch; the keeper is not confirmed",
          lambda: (lambda d: d["action"] == "watch" and d["keeper"] and not d["stop"])(after_launch(5, record(c), TOKEN)))
-    case("LW1c", "launch exit 3 with no keeper recorded: start it; with one recorded: do not",
+    case("LW1c", "launch exit 3 with no keeper recorded: keeper not confirmed; with one recorded: confirmed",
          lambda: after_launch(3, record(c, roles=("run",)), TOKEN)["keeper"]
          and not after_launch(3, record(c), TOKEN)["keeper"]
          and not after_launch(3, record(c, roles=("run",)), TOKEN, keeper_wanted=False)["keeper"])
@@ -631,9 +634,12 @@ def _self_test() -> int:
     case("LW1j", "end to end: exit 1 with an earlier launch's record stops nothing",
          lambda: (lambda r: r[0] == EXIT_LAUNCH_FAILED and stops(r[1]) == [])(
              scenario(1, lambda cfg: record(cfg, token="earlier", status="failed"))))
-    case("LW1k", "end to end: exit 5 runs `keeper` before watching",
-         lambda: (lambda r: r[0] == EXIT_DONE and runs(r[1])[:3] == ["launch", "keeper", "status"])(
-             scenario(5, record, done_script)))
+    case("LW1k", "end to end: exit 5 and exit 3 without a keeper: `keeper` is never run, one line says to start it "
+         "by hand", lambda: all(r[0] == EXIT_DONE and "keeper" not in runs(r[1])
+                                and sum("keeper not confirmed" in ln for ln in r[4].lines) == 1
+                                for r in (scenario(5, record, done_script),
+                                          scenario(3, lambda cfg: record(cfg, roles=("run", "overflow")),
+                                                   done_script))))
 
     # 2. collect first, confirm, then stop; unconfirmed storage leaves the run cluster up
     case("LW2a", "parse_status: per-label state and stored (None when status prints stored=None)",
@@ -788,6 +794,7 @@ def _self_test() -> int:
         cfg = cfg_of(tmp, compute_start=5, compute_max=24)
         rec = record(cfg)
         api = _Counted(counts).bind(cfg, log, {v["id"]: v["name"] for v in recorded(rec).values()})
+        api.up = True
         w = watch(cfg, Runner({}, log), api)
         return w.credits(rec, api.list_clusters()) == want
     case("LW10b", "credits: an autoscaled run cluster's live count from the API (12), overflow at its maximum",
@@ -848,6 +855,47 @@ def _self_test() -> int:
                                                scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError")]},
                                                         max_hours=0.5))))
 
+    # Codex round 2 on the launch watch
+    # P1-2: no launch while a cluster of the config's names is live (launch's _fresh() replaces same-named helpers)
+    class _Pre(_FakeApi):
+        def __init__(self, pre):
+            super().__init__()
+            self.pre = pre
+    foreign = [{"name": "cfg-x-keeper", "id": 77, "current_state": {"state": "running"},
+                "created": "2026-11-09T00:00:00Z"}]
+    case("LW15a", "a live cluster of the config's names before the launch: exit 8, no launch, nothing stopped",
+         lambda: (lambda r: r[0] == EXIT_PRELIVE and runs(r[1]) == [] and stops(r[1]) == []
+                  and any("cfg-x-keeper (77)" in ln for ln in r[4].lines))(
+             scenario(0, record, done_script, api=_Pre(foreign))))
+    case("LW15b", "a stopped one, or another name, does not block the launch",
+         lambda: scenario(0, record, done_script, api=_Pre([{**foreign[0], "current_state": {"state": "stopped"}},
+                                                            {**foreign[0], "name": "other"}]))[0] == EXIT_DONE)
+    case("LW15c", "the listing before the launch cannot be read: exit 8, no launch",
+         lambda: (lambda r: r[0] == EXIT_PRELIVE and runs(r[1]) == [])(scenario(0, record, done_script,
+                                                                                api=_PreFailing())))
+
+    # P2-3: a collect is one attempt with its own deadline; the runner's network retry does not stack
+    case("LW16a", "collect always fails with a network error: 6 attempts in all, each with the 30-minute deadline",
+         lambda: (lambda r: r[0] == EXIT_UNCONFIRMED and runs(r[1]).count("collect") == 6
+                  and all(t == 1800.0 for k, t in r[3].timeouts if k == "collect"))(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done", "B": "done"}))],
+                                              "collect": [(1, "Temporary failure in name resolution")]})))
+    case("LW16b", "--collect-minutes sets the deadline and --collect-attempts the bound",
+         lambda: (lambda r: runs(r[1]).count("collect") == 2 and ("collect", 120.0) in r[3].timeouts)(
+             scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done", "B": "done"}))],
+                                              "collect": [(1, "ConnectTimeout")]}, collect_s=120.0,
+                      collect_attempts=2)))
+
+    # P2-4: exit 1 also reports what is left live
+    case("LW17a", "exit 1 with an earlier launch's record: nothing stopped, leftovers listed",
+         lambda: (lambda r: r[0] == EXIT_LAUNCH_FAILED and stops(r[1]) == [] and r[4].leftovers is not None
+                  and len(r[4].leftovers) == 3)(
+             scenario(1, lambda cfg: record(cfg, token="earlier", status="failed"))))
+    case("LW17b", "exit 1 with this token's failed record: its ids stopped, then the leftovers listed",
+         lambda: (lambda r: r[0] == EXIT_LAUNCH_FAILED and stops(r[1]) == [100]
+                  and r[4].leftovers == [] and r[1][-1] == ("list",))(
+             scenario(1, lambda cfg: record(cfg, status="failed", roles=("run",)))))
+
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed: {', '.join(fails)}")
         return 1
@@ -858,7 +906,7 @@ def _self_test() -> int:
 class _FakeApi:
     """Base for the self-test's special listings (configured by scenario through cfg/log)."""
     def __init__(self):
-        self.cfg, self.log, self.live = None, None, None
+        self.cfg, self.log, self.live, self.up, self.pre = None, None, None, False, []
 
     def bind(self, cfg, log, live):
         self.cfg, self.log, self.live = cfg, log, dict(live)
@@ -866,6 +914,8 @@ class _FakeApi:
 
     def list_clusters(self):
         self.log.append(("list",))
+        if not self.up:                         # before the launch: only what was live already
+            return list(self.pre)
         return [{"name": n, "id": i, "current_state": {"state": "running"}, "created": "2026-11-10T00:00:05Z"}
                 for i, n in self.live.items()]
 
@@ -939,9 +989,19 @@ class _Growing(_Billed):
         return super().billing(start, end)
 
 
+class _PreFailing(_FakeApi):
+    def list_clusters(self):
+        self.log.append(("list",))
+        if not self.up:
+            raise OSError("Temporary failure in name resolution")
+        return super().list_clusters()
+
+
 class _Failing(_FakeApi):
     def list_clusters(self):
         self.log.append(("list",))
+        if not self.up:
+            return []
         raise OSError("Temporary failure in name resolution")
 
     def billing(self, start, end):
