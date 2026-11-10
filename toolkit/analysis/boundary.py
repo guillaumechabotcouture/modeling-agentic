@@ -337,22 +337,53 @@ def _self_test() -> int:
              "ratio": dict(good, rows=[dict(good["rows"][0], emulator={"ratio_chosen": inf, "ratio_runner_up": 1.0})]
                           + good["rows"][1:])}
     ex = {u: ["a", "b"] for u in br}               # the gate's own expectation: plan units, feasible packages
+    pt = {"plan": pr, "per_unit": {u: {"package": "a", "benefit": br[u]["a"], "cost": cr[u]["a"]} for u in br}}
     omit = {u: e for u, e in bad["table"].items() if u != u0}       # Codex r2 P1: a failing unit dropped everywhere
     cases.update(omit=dict(bad, table=omit, rows=bad["rows"][1:] + [], units=K - 1, matched=0),
                  emptytab=dict(bad, table={}, rows=[], units=0, matched=0, status="not_judged"),
                  nopkg=dict(good, table=dict(good["table"], **{u0: {"plan": "a", "ratios": {"a": 1.0}}})))
-    got = {k: [x["kind"] for x in findings(v, pr, ex)] for k, v in cases.items()}
-    ok(findings(good, pr, ex) == [] and [x["kind"] for x in findings(bad, pr, ex)] == ["emulator_boundary_ranking"]
-       and findings(bad, pr, ex)[0]["scope_declarable"]
+    got = {k: [x["kind"] for x in findings(v, pt, ex)] for k, v in cases.items()}
+    ok(findings(good, pt, ex) == [] and [x["kind"] for x in findings(bad, pt, ex)] == ["emulator_boundary_ranking"]
+       and findings(bad, pt, ex)[0]["scope_declarable"]
        and all(v == ["emulator_boundary_inconsistent"] for v in got.values())
-       and [x["kind"] for x in findings(good, dict(pr, **{u0: "b"}), ex)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings(good, dict(pt, plan=dict(pr, **{u0: "b"})), ex)]
+       == ["emulator_boundary_inconsistent"]
        and [x["kind"] for x in findings(good, None, ex)] == ["emulator_boundary_inconsistent"]
-       and [x["kind"] for x in findings(good, pr, None)] == ["emulator_boundary_inconsistent"]
-       and [x["kind"] for x in findings({"units": 1}, pr, ex)] == ["emulator_boundary_unreadable"]
-       and findings(summarise([], real, {}, 0), {}, {}) == [],
+       and [x["kind"] for x in findings(good, pt, None)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings({"units": 1}, pt, ex)] == ["emulator_boundary_unreadable"]
+       and findings(summarise([], real, {}, 0), {"plan": {}, "per_unit": {}}, {}) == [],
        f"BD4 the gate rebuilds the candidates from the recorded ratio table and the point plan: below the share is "
        f"declarable; duplicated, dropped, emptied or edited rows, another plan, or an unreadable artifact are not; "
        f"an empty table is not judged, no finding (Codex r1 P1-3): {got}")
+    # BD7 (Codex r3 P1): every plan ratio is checked against point.yaml's benefit / cost; a null, non-finite or other
+    # value is a HIGH finding the owner cannot declare, so no unit leaves judgment silently
+    last = sorted(br)[-1]                       # a unit outside the candidates: its null would otherwise hide nothing
+    forged = {k: dict(good, table=dict(good["table"], **{u: {"plan": "a", "ratios": dict(good["table"][u]["ratios"],
+                                                                                         a=val)}}))
+              for k, u, val in (("null", u0, None), ("nan", last, nan), ("other", last, 0.5))}
+    g7 = {k: findings(v, pt, ex) for k, v in forged.items()}
+    zero = findings(good, dict(pt, per_unit=dict(pt["per_unit"], **{last: {"package": "a", "benefit": 1.0,
+                                                                          "cost": 0.0}})), ex)
+    ok(all([x["kind"] for x in v] == ["emulator_boundary_plan_ratio"] and not v[0]["scope_declarable"]
+           and v[0]["severity"] == "HIGH" for v in list(g7.values()) + [zero]),
+       f"BD7 a plan ratio that is null, non-finite, unlike point.yaml's, or without one there is a HIGH finding, "
+       f"not declarable: {[[x['kind'] for x in v] for v in g7.values()]}")
+    # BD8 (Codex r3 P2): the expectation applies the headline plan variant's feasibility, as the analysis does
+    import tempfile
+    from toolkit.spec import schema
+    with tempfile.TemporaryDirectory() as d8:
+        p8 = schema.toy_spec(d8, n=4)
+        r8 = yaml.safe_load(open(p8))
+        r8["analysis"]["plan_variants"] = {"headline": "svc", "variants": [
+            {"id": "svc", "type": "minimum_service", "components": ["a"], "text": "a in every unit"}]}
+        yaml.safe_dump(r8, open(p8, "w"), sort_keys=False)
+        s8 = schema.load(p8)
+        e8 = expected(s8, {u: "a" for u in s8.unit_ids()})
+        r8["analysis"].pop("plan_variants")
+        yaml.safe_dump(r8, open(p8, "w"), sort_keys=False)
+        e0 = expected(schema.load(p8), {u: "a" for u in s8.unit_ids()})
+    ok(all("b" not in v and "a" in v for v in e8.values()) and any("b" in v for v in e0.values()),
+       f"BD8 a minimum_service headline restricts the expected packages as it restricts the analysis's: {e8}")
     ok(needed({"none": [], "a": ["a"], "b": ["b"], "a+b": ["a", "b"]}, "none", "a+b", "a") == ["none", "a+b", "a", "b"],
        "BD6 the engine runs every package the two packages' costs read: each without one of its components "
        "(incremental per-outcome items; Codex r1 P1-1)")
