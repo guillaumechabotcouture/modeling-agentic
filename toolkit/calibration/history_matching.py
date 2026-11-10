@@ -2826,6 +2826,92 @@ def _self_test() -> int:
            f"({ {k: (round(t[k]['modelled_at_best'], 4), round(t[k]['implausibility_at_best'], 3)) for k in t} })")
     safe(hm40, "HM40")
 
+    def change_pairs(P, a="w0", b="w1"):
+        """One change pair per group of P (P.groups): the mean over the group's units of round b minus round a."""
+        by = {}
+        for u in P.units:
+            by.setdefault(P.groups[u], []).append(u)
+        return [{"id": f"s:{a}->{b}:{g}", "survey": "s", "from": a, "to": b, "group": g, "rho": 0.0,
+                 "terms": [{"from": f"{u}:{a}", "to": f"{u}:{b}", "w": 1.0 / len(us)} for u in us]}
+                for g, us in by.items()]
+
+    def hm41():          # F6 S2-3b: the change between two rounds of one survey, by group
+        off = {"A": 0.4, "B": -0.5, "C": 0.3}           # one offset per (survey, group), shared by both rounds
+        chg = {"A": 0.4, "B": 0.4, "C": -0.2}           # C declines while the model (one shared e) rises
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.2 + off[g], 0.2 + chg[g] + off[g])  # noqa: E731
+        P, sim = gtoy({"A": 8, "B": 8, "C": 2}, f0, f1, obs, sd=0.05, md=0.25, sd_b=0.5,
+                      key=lambda ob, g: f"s|{g}", shared=[Param("e", 0.0, 1.0, "uniform", None, "toy")])
+        P.changes = change_pairs(P)
+        r = calibrate(P, sim, seed=4, waves=1, log=q, candidates_log2=9, points_per_unit=10)
+        sc = {x["group"]: x for x in (r.get("survey_changes") or {}).get("pairs") or []}
+        ok(set(sc) == {"A", "B", "C"} and sc["C"]["flagged"] and sc["C"]["z"] > 0 and sc["C"]["ratio"] < 0
+           and "opposite" in sc["C"]["text"],
+           f"HM41a a group whose observed change has the opposite sign of the model's is flagged, with the direction "
+           f"({ {g: (x.get('z'), x.get('flagged'), x.get('text')) for g, x in sc.items()} })")
+        ok(all(not sc[g]["flagged"] and sc[g]["sd_parts"]["offset"] == 0.0 and sc[g]["sd"] < 0.06 for g in "AB"),
+           f"HM41b the shared offset (sd 0.5) cancels in the same-survey change: it adds nothing to the change's sd "
+           f"({ {g: (sc[g].get('sd'), sc[g].get('sd_parts')) for g in 'AB' if g in sc} })")
+        ok((r.get("survey_changes") or {}).get("flagged") == ["s:w0->w1:C"]
+           and (r.get("survey_changes") or {}).get("z_max") == 3.0,
+           f"HM41c the report lists the flagged pairs and the threshold ({r.get('survey_changes', {}).get('flagged')})")
+    safe(hm41, "HM41")
+
+    def hm42():          # the model's change comes from one trajectory: its run noise is paired, not summed
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.0, 0.5)  # noqa: E731
+        P, _ = gtoy({"A": 6, "B": 6}, f0, f1, obs, sd=0.05, md=0.3, shared=[Param("e", 0.0, 1.0, "uniform", None, "t")])
+        P.changes = change_pairs(P)
+
+        def sim(pts):          # one noise draw (sd 0.2) moves both windows of a run together
+            out = []
+            for p in pts:
+                n = np.random.default_rng(p["seed"]).normal(0, 0.2)
+                out.append({"w0": _expit(p["z"] + n), "w1": _expit(p["z"] + p["theta"]["e"] + n)})
+            return out
+        h = HistoryMatch(P, sim, 6, q, candidates_log2=9, points_per_unit=12)
+        r = h.run(1)
+        sc = {x["group"]: x for x in (r.get("survey_changes") or {}).get("pairs") or []}
+        tn = h.em["unit"]["w0"].tn + h.em["unit"]["w1"].tn
+        pn = h._pair_noise("w0", "w1")
+        ok(tn > 0.03 and pn < 0.1 * tn and all(x["sd_parts"]["run"] < 0.05 for x in sc.values()) and len(sc) == 2,
+           f"HM42 shared run noise cancels in the modelled change (window noise {tn:.4f}, paired {pn:.5f}, run sd "
+           f"{ {g: x.get('sd_parts', {}).get('run') for g, x in sc.items()} })")
+    safe(hm42, "HM42")
+
+    def hm43():          # the change arithmetic, signed offsets and fail-closed cases
+        T_ = lambda i, v, sd, b=0.0, k=None, u="u0", ob="w0": Target(i, "unit", ob, v, "identity", sd_obs=sd,  # noqa
+                                                                       sd_bias=b, unit=u, source="t", bias_key=k)
+        tg = {"a": T_("a", 0.5, 0.01, 0.5, "s|g"), "b": T_("b", 0.3, 0.01, 0.5, "s|g", ob="w1"),
+              "c": T_("c", 0.5, 0.01, 0.5, None), "d": T_("d", 0.5, 0.0, 0.5, "s|g"),
+              "e": T_("e", 0.3, 0.0, 0.5, "s|g", ob="w1")}
+        one = [{"from": "a", "to": "b", "w": 1.0}]
+        x = change_stats(one, tg, {"a": 0.5, "b": 0.4}, 0.0, rho=0.0, z_max=3.0)
+        ok(abs(x["sd"] - math.sqrt(2) * 0.01) < 1e-9 and x["sd_parts"]["offset"] == 0.0 and x["flagged"]
+           and abs(x["ratio"] - 0.5) < 1e-9 and "decline is 50% smaller than observed" in x["text"],
+           f"HM43a one survey's offset cancels; the model's decline is half the observed one ({x})")
+        x = change_stats([{"from": "c", "to": "b", "w": 1.0}], tg, {"c": 0.5, "b": 0.4}, 0.0, z_max=3.0)
+        ok(abs(x["sd_parts"]["offset"] - math.sqrt(0.5)) < 1e-9 and not x["flagged"],
+           f"HM43b offsets of two sources add (their own sd and the other block's) ({x.get('sd_parts')})")
+        x = change_stats(one, tg, {"a": 0.5, "b": 0.4}, 0.0, rho=0.5, z_max=3.0)
+        ok(abs(x["sd_parts"]["sampling"] - 0.01) < 1e-9,
+           f"HM43c a declared sampling correlation between the rounds enters the change ({x.get('sd_parts')})")
+        x = change_stats([{"from": "d", "to": "e", "w": 1.0}], tg, {"d": 0.5, "e": 0.4}, 0.0, z_max=3.0)
+        y = change_stats(one, tg, {"a": 0.5, "b": None}, 0.0, z_max=3.0)
+        ok("not_computable" in x and "not_computable" in y,
+           f"HM43d no declared error in the change, or no modelled value, is not computable ({x}, {y})")
+        units = ["u0"]
+        bad = [("an unknown target", [{"id": "p", "terms": [{"from": "u0:w0", "to": "nope", "w": 1.0}]}]),
+               ("one observable twice", [{"id": "p", "terms": [{"from": "u0:w0", "to": "u0:w0", "w": 1.0}]}]),
+               ("no terms and no reason", [{"id": "p", "terms": []}])]
+        for why, ch in bad:
+            P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, units,
+                        [T_("u0:w0", 0.5, 0.1), T_("u0:w1", 0.4, 0.1, ob="w1")], changes=ch)
+            ok(any("change" in b for b in P.problems()), f"HM43e refused: {why} ({P.problems()})")
+    safe(hm43, "HM43")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

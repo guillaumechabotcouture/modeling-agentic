@@ -1572,6 +1572,100 @@ def _self_test() -> int:
                f"({rep.get('weighting')}, {summary(rep)})")
     safe(ja15, "JA15")
 
+    def ja16():          # F6 S2-3b: rounds of one survey paired by group, from the spec
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+            with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]) + ["tgt2"])
+                w.writeheader()
+                w.writerows([dict(r, tgt2=f"{float(r['tgt']) * 0.8:.5f}") for r in rows])
+            with open(os.path.join(d, "region_late.csv"), "w") as f:
+                f.write("region,level,prev,lo,hi\nr0,region,0.3,0.25,0.35\nr1,region,0.3,0.25,0.35\n")
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            P0, _ = build(schema.load(p))
+            nc0 = [c for c in P0.changes if "not_computable" in c]
+            ok(len(P0.changes) == 1 == len(nc0) and "survey" in nc0[0]["not_computable"],
+               f"JA16a no target names its survey: one explicit not-computable entry ({P0.changes})")
+            j["targets"][0].update(bias_sd=0.2, bias_by="region", bias_source="s")
+            j["targets"].append(dict(j["targets"][0], id="unit_late", column="tgt2", window=[2, 3]))
+            j["targets"][1]["survey"] = "g"
+            j["targets"].append(dict(j["targets"][1], id="region_late", csv="region_late.csv", window=[2, 3]))
+            j["changes"] = {"weights": "pop"}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            P, _ = build(schema.load(p))
+            ch = {c["id"]: c for c in P.changes}
+            us = [c for c in ch.values() if c.get("survey") == "s" and "terms" in c]
+            pop = {r["id"]: float(r["pop"]) for r in rows}
+            w0 = {x["from"].split(":")[1]: x["w"] for x in us[0]["terms"]} if us else {}
+            ok(len(us) == 3 and all(len(c["terms"]) == 4 and c["from"] == "unit_t" and c["to"] == "unit_late"
+                                    for c in us)
+               and abs(sum(w0.values()) - 1) < 1e-9
+               and abs(w0[min(w0)] / w0[max(w0)] - pop[min(w0)] / pop[max(w0)]) < 1e-9,
+               f"JA16b two unit rounds of one survey: one pair per group (the survey's bias_by), population weights "
+               f"({ {k: len(c.get('terms') or []) for k, c in ch.items()} })")
+            gs = {c.get("group"): c for c in ch.values() if c.get("survey") == "g"}
+            ok(set(gs) == {"r0", "r1", "r2"} and "terms" in gs["r0"] and "region_late" in gs["r2"].get(
+                "not_computable", ""),
+               f"JA16c group rounds pair by group; a group missing from one round is not computable, with the reason "
+               f"({ {g: c.get('not_computable', 'ok') for g, c in gs.items()} })")
+            r2 = yaml.safe_load(open(p))
+            t2 = r2["calibration"]["joint"]["targets"]
+            t2[2]["scale"] = "identity"
+            t2.append(dict(t2[0], id="unit_once", survey="once", window=[1, 3]))
+            t2[-1].pop("bias_by")
+            t2[-1].pop("bias_source")
+            t2[-1].pop("bias_sd")
+            p2 = os.path.join(d, "s2.yaml")
+            yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+            P2, _ = build(schema.load(p2))
+            why = {c.get("survey"): c.get("not_computable", "") for c in P2.changes}
+            ok("scale" in why.get("s", "") and "single round" in why.get("once", ""),
+               f"JA16d different definitions (scale) and a single round are not computable, with the reason ({why})")
+            bad_cases = [("changes.by names no units column", lambda j: j["changes"].update(by="nope")),
+                         ("a sampling correlation outside [-1, 1]",
+                          lambda j: j["changes"].update(sampling_correlation=1.5)),
+                         ("an unknown changes key", lambda j: j["changes"].update(colour=1)),
+                         ("a survey that is not text", lambda j: j["targets"][0].update(survey=3))]
+            for why_, mut in bad_cases:
+                r3 = yaml.safe_load(open(p))
+                mut(r3["calibration"]["joint"])
+                yaml.safe_dump(r3, open(p2, "w"), sort_keys=False)
+                ok(bool(spec_problems(schema.load(p2))), f"JA16e refused: {why_}")
+            rep = run(schema.load(p), d, {"max_workers": 2}, log=q, **fast)
+            sc = rep.get("survey_changes") or {}
+            got = [x for x in sc.get("pairs") or [] if "z" in x]
+            ok(sc.get("status") == "computed" and len(got) == 5 and all(
+                set(x) >= {"observed", "modelled", "difference", "sd", "z", "flagged", "text"} for x in got)
+               and artifact(rep).get("survey_changes") == sc,
+               f"JA16f the toy run writes each group's change into the calibration artifact ({sc.get('status')}, "
+               f"{[(x['id'], x.get('z'), x.get('not_computable')) for x in sc.get('pairs') or []]})")
+    safe(ja16, "JA16")
+
+    def ja17():          # the gate findings of the change diagnostic
+        pair = {"id": "s:a->b:r0", "survey": "s", "group": "r0", "from": "a", "to": "b", "observed": -0.4,
+                "modelled": 0.1, "difference": 0.5, "sd": 0.1, "z": 5.0, "flagged": True,
+                "text": "the model's change has the opposite sign of the observed one"}
+        data = {"survey_changes": {"status": "computed", "z_max": 3.0, "pairs": [pair], "flagged": [pair["id"]]}}
+        raw = {"calibration": {"joint": {}}}
+        f = change_findings(raw, data)
+        ok(len(f) == 1 and f[0]["scope_declarable"] and "opposite sign" in f[0]["claim"] and "r0" in f[0]["claim"],
+           f"JA17a a flagged group is one declarable gate finding that states the direction ({f})")
+        f = change_findings(raw, {})
+        ok(len(f) == 1 and not f[0]["scope_declarable"], f"JA17b no change diagnostic in the artifact: a finding ({f})")
+        f = change_findings(raw, {"survey_changes": dict(data["survey_changes"], pairs=[dict(pair, flagged=False)])})
+        ok(len(f) == 1 and not f[0]["scope_declarable"],
+           f"JA17c a pair whose numbers exceed the threshold but is not flagged: a finding ({f})")
+        nc = {"survey_changes": {"status": "not_computable", "z_max": 3.0, "flagged": [],
+                                 "pairs": [{"id": "s", "survey": "s", "not_computable": "a single round (a)"}]}}
+        f0 = change_findings(raw, nc)
+        f1 = change_findings({"calibration": {"joint": {"changes": {}}}}, nc)
+        ok(f0 == [] and len(f1) == 1 and "single round" in f1[0]["claim"],
+           f"JA17d not computable is recorded; a finding only when the spec asks for the diagnostic ({f0}, {f1})")
+    safe(ja17, "JA17")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
