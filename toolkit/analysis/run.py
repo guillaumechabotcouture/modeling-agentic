@@ -346,7 +346,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- uncertainty
     from toolkit.analysis import burden as BV
     bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
-    fcol = V.Draws(A) if V.fixed_variants(spec.raw) else None         # F6 S2-6: each fixed plan's outcome and cost
+    # F6 S2-6: each fixed plan's outcome and cost in every draw; each solved variant's too (its cost against the budget)
+    fcol = V.Draws(A, V.solved_plans(A, ben0, cost0)) if V.config(spec.raw).get("variants") else None
     hooks = [h.add for h in (bcol, fcol) if h is not None]
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
                on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None)
@@ -1001,7 +1002,7 @@ def _self_test_variants(ok, q):
         need11 = {f"variant.{k}.{n}" for k in afv for n in ("cost_median", "draws_over_budget")}
         ok(all(a.get("draws") == 2 and a.get("budget_allocatable") == A.budget for a in afv.values()) and need11 <= cs
            and "draws over budget [CLAIM:" not in txt and txt.count("draws over budget") >= 3,
-           f"PV-R11 each solved variant's cost is counted against the budget over the uncertainty draws, with claims "
+           f"PV-R13 each solved variant's cost is counted against the budget over the uncertainty draws, with claims "
            f"and a line in results.md ({ {k: (a.get('draws_over_budget'), a.get('draws')) for k, a in afv.items()} }, "
            f"{sorted(need11 - cs)})")
         ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")

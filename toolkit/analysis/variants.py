@@ -26,6 +26,10 @@ allocatable budget (over or under, never refused for it), the units given a pack
 (with why; kept in the plan, evaluated as given), the caps and group rules it breaks, and, through UQ.run's on_draw
 hook (`Draws`), its outcome and cost quantiles over the uncertainty draws as uncertainty.yaml reports the headline
 plan's. Model corrections bearing on it, at the point or in a draw, stop publication as for every other plan.
+A solved variant is followed over the same draws (`solved_plans`, `Draws`): its record carries the same uncertainty
+block, and its share of draws over the allocatable budget is judged against `uncertainty.affordability` when the spec
+declares it (rule_met). The reserve is set for the headline plan, so a variant can fail the rule; it is then reported
+as failing it, not re-solved.
 """
 from __future__ import annotations
 
@@ -275,13 +279,32 @@ def eligibility(A, fp: dict, feas: dict) -> dict:
             "constraints_broken": MV.infeasible_reasons(A.ids, fp, {i: {fp[i]: 0.0} for i in A.ids}, rest, 0.0)}
 
 
-class Draws:
-    """Each uncertainty draw's outcomes averted and cost of every fixed plan (UQ.run's on_draw hook), guarded against
-    the draw's model corrections."""
+def solved_plans(A, ben0, cost0) -> dict:
+    """{variant id: plan} of each rule variant that solves on the point tables, as run() solves it (within the headline
+    plan's budget), for Draws to follow over the uncertainty draws. A variant with no feasible plan is left out here
+    and reported as not solved by run()."""
+    out = {}
+    for v in config(A.spec.raw).get("variants") or []:
+        if v["type"] == "fixed_plan":
+            continue
+        try:
+            out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
+        except (ValueError, RuntimeError):
+            continue
+    return out
 
-    def __init__(self, A):
+
+class Draws:
+    """Each uncertainty draw's outcomes averted and cost of every fixed plan and, with `solved` ({variant id: plan},
+    solved_plans()), of every solved variant (UQ.run's on_draw hook), guarded against the draw's model corrections. A
+    solved variant's cost is judged against the spec's affordability rule (rule_met); a fixed plan's is reported,
+    not judged."""
+
+    def __init__(self, A, solved=None):
         self.A, self.n = A, 0
         self.plans = {v["id"]: given_plan(A, v) for v in fixed_variants(A.spec.raw)}
+        self.solved = {k: dict(p) for k, p in (solved or {}).items()}
+        self.plans.update(self.solved)
         self.y = {k: {o: [] for o in A.outcomes} for k in self.plans}
         self.cost = {k: [] for k in self.plans}
 
@@ -300,8 +323,9 @@ class Draws:
         from toolkit.analysis import uncertainty as UQ
         from toolkit.analysis.core import q
         lvl = (interval or {}).get("level", 0.95)
+        rule = ((self.A.spec.raw.get("uncertainty") or {}).get("affordability") or None) if k in self.solved else None
         return {"draws": self.n, "interval": interval, "averted": {o: q(v, lvl) for o, v in self.y[k].items()},
-                "affordability": UQ.affordability(self.cost[k], self.A.budget, None, lvl)}
+                "affordability": UQ.affordability(self.cost[k], self.A.budget, rule, lvl)}
 
 
 def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | None:
@@ -356,6 +380,12 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
                    **{k: m[k] for k in MOVES})
+        if draws is not None and v["id"] in draws.solved:     # its cost and outcome over the uncertainty draws
+            if draws.solved[v["id"]] != dict(vp):
+                raise RuntimeError(f"plan variant {v['id']}: the uncertainty draws followed another plan than its "
+                                   "solved plan")
+            if draws.n > 0:
+                rec["uncertainty"] = draws.summary(v["id"], interval)
         if v["type"] == "group_rule":       # each group's choice; a shared "none" is allowed unless provide: true
             rec["group_choices"] = group_choices(A, v, vp)
             rec["groups_none"] = sum(c == "none" for c in rec["group_choices"].values())
@@ -574,20 +604,20 @@ def _self_test_fixed(ok, attempt):
     ok(e8 is None and e9 is None and e10 is None and n8.get("status") == "solved" and (sp or {}).get("nets") == n8.get("plan")
        and a8.get("draws") == 2 and a8.get("draws_over_budget") == over8 == 1 and a8.get("rule_met") is False
        and ((v8.get("given") or {}).get("uncertainty") or {}).get("affordability", {}).get("rule_met") is None,
-       f"PV28 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
+       f"PV31 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
        f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
        f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
     A.budget = 1.0
     sp9, e11 = attempt(g_("solved_plans"), A, ben, cost)
     A.budget = 2.0
     ok(e11 is None and sp9 == {},
-       f"PV29 a variant the budget makes infeasible has no plan to follow over the draws ({e11!r}, {sp9})")
+       f"PV32 a variant the budget makes infeasible has no plan to follow over the draws ({e11!r}, {sp9})")
     D3, _ = attempt(g_("Draws"), A, {"nets": {i: "none" for i in A.ids}})
     for t in tabs:
         attempt(lambda *a: D3.add(*a), out, [], t)
     _, e12 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D3, {"level": 0.9})
     ok(isinstance(e12, RuntimeError) and "nets" in str(e12),
-       f"PV30 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
+       f"PV33 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
     del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
