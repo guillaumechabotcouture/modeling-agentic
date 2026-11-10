@@ -223,6 +223,8 @@ modeler work around the gap instead of fixing it.
 
 This redundancy is deliberate: it forces you to actually check each prior
 blocker rather than silently dropping it.
+A HIGH or MEDIUM blocker you leave out is not closed: until its
+`done_when` test passes, the gate keeps it open as `done_when_dropped`.
 
 ## structural_mismatch criteria
 
