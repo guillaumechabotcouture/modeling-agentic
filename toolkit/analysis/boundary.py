@@ -22,6 +22,7 @@ that has a runner-up, the check is not judged (status not_judged), never passed.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import sys
 
@@ -42,30 +43,60 @@ def thresholds() -> dict:
 
 
 def _ratio(b, c):
-    return float(b) / float(c) if c > 0 else None
+    """Benefit per cost: None unless both are finite numbers and the cost is positive (Codex r1 P1-4)."""
+    try:
+        b, c = float(b), float(c)
+    except (TypeError, ValueError):
+        return None
+    return b / c if math.isfinite(b) and math.isfinite(c) and c > 0 else None
 
 
 def _sign(x):
     return (x > 0) - (x < 0)
 
 
-def candidates(A, plan, ben, cost, k) -> list[dict]:
-    """The k units closest to switching, by relative benefit-per-cost gap between the plan package and the runner-up."""
-    feas = A.feas["feasible"]
-    rows = []
+def table(A, plan, ben, cost) -> dict:
+    """{unit: {"plan": package, "ratios": {package: benefit per cost}}} for every unit whose plan package is not the
+    comparator: the plan package and every other feasible non-comparator package with a ratio. Recorded in the
+    artifact, so the gate rebuilds the candidates from it."""
+    feas, out = A.feas["feasible"], {}
     for u in A.ids:
         ch = plan[u]
-        rc = _ratio(ben[u][ch], cost[u][ch]) if ch != A.comp else None
-        if rc is None:
+        if ch == A.comp:
             continue
-        others = [(r, p) for p in A.pk if p not in (ch, A.comp) and feas[u].get(p)
-                  for r in [_ratio(ben[u][p], cost[u][p])] if r is not None]
+        r = {p: x for p in A.pk if p != A.comp and (p == ch or feas[u].get(p))
+             for x in [_ratio(ben[u][p], cost[u][p])] if x is not None}
+        if ch in r:
+            out[str(u)] = {"plan": ch, "ratios": r}
+    return out
+
+
+def pick(tab, k) -> list[dict]:
+    """The k units closest to switching: smallest relative gap between the plan package's ratio and the runner-up's
+    (the best other package in the table)."""
+    rows = []
+    for u, e in tab.items():
+        ch, r = e["plan"], e["ratios"]
+        others = sorted(((x, p) for p, x in r.items() if p != ch), reverse=True)
         if not others:
             continue
-        rr, ru = max(others)
+        rr, ru = others[0]
+        rc = r[ch]
         rows.append({"unit": u, "chosen": ch, "runner_up": ru, "gap": abs(rc - rr) / max(abs(rc), abs(rr), 1e-300)})
-    rows.sort(key=lambda r: (r["gap"], str(r["unit"])))
+    rows.sort(key=lambda x: (x["gap"], str(x["unit"])))
     return rows[:k]
+
+
+def needed(pk, comp, ch, ru) -> list[str]:
+    """The packages whose outcomes the benefit and cost of `ch` and `ru` read: the comparator, the two packages, and
+    each of them without one of its components (an incremental per-outcome cost item reads that package,
+    toolkit/alloc/costs.py item_cost; Codex r1 P1-1)."""
+    sets = {n: frozenset(cs) for n, cs in pk.items()}
+    out = [comp, ch, ru]
+    for p in (ch, ru):
+        for c in sorted(sets[p]):
+            out += [n for n, s in sets.items() if s == sets[p] - {c}]
+    return list(dict.fromkeys(out))
 
 
 def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
@@ -78,7 +109,7 @@ def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
         a = sp.unit_attributes(A.by_id[u])
         if attr and z0.get(u) is not None:
             a[attr] = Bt.calibrated_value(sp, z0[u])
-        for k in dict.fromkeys([A.comp, c["chosen"], c["runner_up"]]):
+        for k in needed(A.pk, A.comp, c["chosen"], c["runner_up"]):
             out.append({"id": f"boundary:{u}|{k}", "point": f"boundary:{u}", "package": k,
                         "components": sp.engine_package(A.pk[k]), "unit": a, "params": dict(A.theta0), "seed": seed,
                         "engine": sp["engine"], "horizon": horizon, "windows": Bt.windows(sp)})
@@ -86,34 +117,57 @@ def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
 
 
 def engine_tables(A, cands, z0, out0, res):
-    """(benefit, cost) on the engine for the boundary units: the emulator's point outcomes with the comparator, chosen
-    and runner-up packages replaced by the engine's, through the analysis's own benefit and cost computation."""
+    """(benefit, cost) on the engine for the boundary units: the emulator's point outcomes with every package the two
+    compared packages read replaced by the engine's (needed()), through the analysis's own benefit and cost
+    computation. Evaluated twice, with the packages not run filled once by the emulator's values and once by other
+    values: the compared packages must not move (fail closed), so nothing emulated reaches the engine side."""
     from toolkit.analysis.model import DirectModel
     from toolkit.engines.contract import Outcomes
     dm = DirectModel(A.spec, log=lambda *a: None)
-    hyb = {}
+    eng = {}
     for c in cands:
         u = c["unit"]
-        dm.packages = list(dict.fromkeys([A.comp, c["chosen"], c["runner_up"]]))
+        dm.packages = needed(A.pk, A.comp, c["chosen"], c["runner_up"])
         rs = {(u, k): Outcomes(**res[f"boundary:{u}|{k}"]) for k in dm.packages}
         dm._runs = lambda theta, ids, zs, rs=rs: rs
-        row = dm.predict(z0, A.theta0, [u])[u]
-        h = copy.deepcopy(out0[u])
-        for k in dm.packages:
-            h["y"][k], h["cost"][k] = row["y"][k], row["cost"][k]
-        hyb[u] = h
+        eng[u] = (list(dm.packages), dm.predict(z0, A.theta0, [u])[u])
+
+    def hybrid(scale):
+        hyb = {}
+        for u, (pks, row) in eng.items():
+            h = copy.deepcopy(out0[u])
+            for k in h["y"]:
+                if k in pks:
+                    h["y"][k], h["cost"][k] = row["y"][k], row["cost"][k]
+                else:
+                    h["y"][k] = {o: v * scale for o, v in h["y"][k].items()}
+                    h["cost"][k] = {o: v * scale + (scale - 1.0) for o, v in h["cost"][k].items()}
+            hyb[u] = h
+        return hyb
 
     class _Stub:
         last_events = []
 
+        def __init__(self, hyb):
+            self.hyb = hyb
+
         def predict(self, zs, theta, ids, noise=None):
-            return {i: hyb[i] for i in ids}
+            return {i: self.hyb[i] for i in ids}
     saved, saved_ev, saved_fl = A.model, A.last_events, A.last_cost_floors
-    A.model = _Stub()
     try:
-        _o, ben, cost = A.evaluate(A.theta0, z0, ids=[c["unit"] for c in cands])
+        tabs = []
+        for scale in (1.0, 2.0):
+            A.model = _Stub(hybrid(scale))
+            tabs.append(A.evaluate(A.theta0, z0, ids=list(eng))[1:])
     finally:
         A.model, A.last_events, A.last_cost_floors = saved, saved_ev, saved_fl
+    (ben, cost), (ben2, cost2) = tabs
+    for c in cands:
+        u = c["unit"]
+        for k in (c["chosen"], c["runner_up"]):
+            if ben[u][k] != ben2[u][k] or cost[u][k] != cost2[u][k]:
+                raise ValueError(f"boundary ranking: unit {u}, package {k}: the engine-side benefit or cost reads a "
+                                 "package that was not run on the engine: fails closed")
     return ben, cost
 
 
@@ -130,34 +184,39 @@ def compare(cands, ben_em, cost_em, ben_en, cost_en, tie) -> list[dict]:
     return rows
 
 
+def _fin(xs) -> bool:
+    return all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in xs)
+
+
 def _tie(en, tie) -> bool:
     """The engine's two ratios within `tie` of each other (relative): either order loses at most that share."""
-    return None not in en and abs(en[0] - en[1]) <= tie * max(abs(en[0]), abs(en[1]))
+    return _fin(en) and abs(en[0] - en[1]) <= tie * max(abs(en[0]), abs(en[1]))
 
 
 def _match(em, en, tie) -> bool:
-    if None in em or None in en:
+    if not (_fin(em) and _fin(en)):
         return False
     return _tie(en, tie) or _sign(em[0] - em[1]) == _sign(en[0] - en[1])
 
 
-def summarise(rows, t) -> dict:
+def summarise(rows, t, tab, n_runs) -> dict:
     n, m = len(rows), sum(1 for r in rows if r["match"])
     return {"status": "judged" if n else "not_judged", "units_requested": t["units"], "units": n, "matched": m,
             "share_matched": m / n if n else None, "threshold": t["min_share"], "tie_rel_gap": t["tie"],
             "engine_ties": sum(1 for r in rows if r.get("engine_tie")),
-            "passes": (m / n >= t["min_share"]) if n else None, "rows": rows,
+            "passes": (m / n >= t["min_share"]) if n else None, "rows": rows, "table": tab,
             "held_out_source": "engine runs at the boundary units' calibrated values and the point parameters "
                                "(the design's held-out points are at design values, not calibrated ones)",
-            "engine_runs": sum(len({r["chosen"], r["runner_up"]}) + 1 for r in rows)}
+            "engine_runs": n_runs}
 
 
 def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=print) -> dict:
     from toolkit.analysis import batch as Bt
     t = thresholds()
-    cands = candidates(A, plan, ben0, cost0, t["units"])
+    tab = table(A, plan, ben0, cost0)
+    cands = pick(tab, t["units"])
     if not cands:
-        return summarise([], t)
+        return summarise([], t, tab, 0)
     js = jobs(A, cands, z0, horizon, seed=int((A.spec["analysis"].get("direct") or {}).get("seed", 1)))
     b = Bt.run(run_dir, js, A.eng, out_rel=OUT_REL, **(compute_kw or {}))
     miss = [j["id"] for j in js if j["id"] not in b["results"]]
@@ -165,29 +224,44 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
         raise ValueError(f"boundary ranking: engine results missing or without matching provenance "
                          f"({(b['problems'] + miss)[:3]}): fails closed")
     ben_en, cost_en = engine_tables(A, cands, z0, out0, b["results"])
-    s = summarise(compare(cands, ben0, cost0, ben_en, cost_en, t["tie"]), t)
+    s = summarise(compare(cands, ben0, cost0, ben_en, cost_en, t["tie"]), t, tab, len(js))
     log(f"boundary ranking: emulator order matches the engine for {s['matched']} of {s['units']} boundary units "
         f"(threshold {t['min_share']:.0%})")
     return s
 
 
-def findings(data) -> list[dict]:
-    """The gate: rejudged from the rows (never the artifact's own verdict) against thresholds.yaml."""
+def findings(data, plan) -> list[dict]:
+    """The gate: the candidates rebuilt from the artifact's ratio table and checked against the point plan (`plan`,
+    from analysis/point.yaml), the rows bound to them, and the share rejudged from the rows against thresholds.yaml
+    (never the artifact's own verdict)."""
     def f(kind, claim, declarable):
         return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
                 "key": "emulator_boundary", "scope_declarable": declarable, "source": PRODUCER}
+    W = "analysis/emulator_boundary.yaml"
     try:
         t = thresholds()
-        rows = data["rows"]
-        n = len(rows)
-        m = sum(1 for r in rows if _match([r["emulator"]["ratio_chosen"], r["emulator"]["ratio_runner_up"]],
-                                          [r["engine"]["ratio_chosen"], r["engine"]["ratio_runner_up"]], t["tie"]))
+        tab, rows = data["table"], data["rows"]
+        want = [(c["unit"], c["chosen"], c["runner_up"]) for c in pick(tab, t["units"])]
+        got = [(r["unit"], r["chosen"], r["runner_up"]) for r in rows]
+        em = [[r["emulator"]["ratio_chosen"], r["emulator"]["ratio_runner_up"]] for r in rows]
+        en = [[r["engine"]["ratio_chosen"], r["engine"]["ratio_runner_up"]] for r in rows]
+        recorded = [[tab[u]["ratios"][ch], tab[u]["ratios"][ru]] for u, ch, ru in got]
+        m = sum(1 for a, b in zip(em, en) if _match(a, b, t["tie"]))
     except (OSError, KeyError, TypeError, ValueError, AttributeError) as e:
-        return [f("emulator_boundary_unreadable", f"analysis/emulator_boundary.yaml: unreadable ({type(e).__name__}: "
-                                                   f"{e})", False)]
-    if data.get("units") != n or data.get("matched") != m or (n == 0) != (data.get("status") == "not_judged"):
-        return [f("emulator_boundary_inconsistent", f"analysis/emulator_boundary.yaml: its counts ({data.get('matched')}"
-                                                     f" of {data.get('units')}) are not its rows' ({m} of {n})", False)]
+        return [f("emulator_boundary_unreadable", f"{W}: unreadable ({type(e).__name__}: {e})", False)]
+    bad = []
+    if got != want:
+        bad.append(f"its rows ({len(got)}) are not the {len(want)} candidates its ratio table gives")
+    if em != recorded:
+        bad.append("its rows' emulator ratios are not its table's")
+    if not isinstance(plan, dict) or any(plan.get(u) != e.get("plan") for u, e in tab.items()):
+        bad.append("its table's plan packages are not analysis/point.yaml's plan")
+    if data.get("units") != len(rows) or data.get("matched") != m or data.get("units_requested") != t["units"] \
+            or (len(rows) == 0) != (data.get("status") == "not_judged"):
+        bad.append(f"its counts ({data.get('matched')} of {data.get('units')}) are not its rows' ({m} of {len(rows)})")
+    if bad:
+        return [f("emulator_boundary_inconsistent", f"{W}: " + "; ".join(bad), False)]
+    n = len(rows)
     if n and m / n < t["min_share"]:
         return [f("emulator_boundary_ranking", f"the emulator orders the chosen package and its runner-up as the "
                                                f"engine does for {m} of {n} units closest to a package switch "

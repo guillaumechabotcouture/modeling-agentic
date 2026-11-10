@@ -177,6 +177,24 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     return out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
 
 
+def _boundary(run_dir: str, data, point) -> list[dict]:
+    """F6 S2-4b: the signed spec's evaluation mode decides whether the boundary ranking artifact is required (never the
+    manifest's own list, Codex r1 P1-2); it is then rejudged against the point plan (toolkit/analysis/boundary.py)."""
+    try:
+        ev = ((yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("analysis") or {}).get("evaluation")
+    except (OSError, yaml.YAMLError, AttributeError) as e:
+        return [_f("analysis_contract_incomplete", f"{SPEC} unreadable for the boundary ranking check: {e}",
+                   "emulator_boundary")]
+    if ev != "emulator":
+        return []
+    if data is None:
+        return [_f("analysis_contract_incomplete", "an emulator-path run has no emulator_boundary artifact (the "
+                                                   "emulator's ranking near package switches is unchecked)",
+                   "emulator_boundary")]
+    from toolkit.analysis import boundary as BD
+    return BD.findings(data, (point or {}).get("plan"))
+
+
 def _survey_changes(run_dir: str, data) -> list[dict]:
     try:
         raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
@@ -204,6 +222,7 @@ def gate_findings(run_dir: str) -> list[dict]:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
     cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc = None, None, None, None, None, None
+    bd_doc = None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -289,9 +308,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             unc_doc = doc.get("data") or {}
         if kind == "point":
             pt_doc = doc.get("data") or {}
-        if kind == "emulator_boundary":      # F6 S2-4b: rejudged from its rows against thresholds.yaml
-            from toolkit.analysis import boundary as BD
-            out += BD.findings(doc.get("data") or {})
+        if kind == "emulator_boundary":
+            bd_doc = doc.get("data") or {}
         if kind == "burden_validation":
             bv_doc = doc.get("data") or {}
         if kind == "plan_variants":
@@ -317,6 +335,8 @@ def gate_findings(run_dir: str) -> list[dict]:
     if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
         out += _plan_variants(run_dir, pt_doc, pv_doc)
     out += _burden(run_dir, bv_doc, man.get("spec_signed") is True)
+    if man.get("deliverable_kind") != "estimates":
+        out += _boundary(run_dir, bd_doc, pt_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
