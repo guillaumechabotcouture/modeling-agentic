@@ -399,7 +399,7 @@ class Collector:
             raise ValueError("validation.burden: " + "; ".join(bad))
         self.draws = {r["id"]: [] for r in self.refs if not r["age_band"]}
 
-    def add(self, out, events=()):
+    def add(self, out, events=(), cost=None):
         n = getattr(self, "n", 0)
         self.n = n + 1
         guard_point(self.A, self.cfg["arm"], events, f"burden validation arm, uncertainty draw {n}")

@@ -340,8 +340,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- uncertainty
     from toolkit.analysis import burden as BV
     bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
+    fcol = V.Draws(A) if V.fixed_variants(spec.raw) else None         # F6 S2-6: each fixed plan's outcome and cost
+    hooks = [h.add for h in (bcol, fcol) if h is not None]
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
-               on_draw=bcol.add if bcol else None)
+               on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
@@ -362,7 +364,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   yaml.safe_dump(plain(ST.robustness_yaml(stab)), sort_keys=False).encode(), atomic=True)
         S.deliverable(rp, ST.PRODUCER, "allocation_robustness")
     # ---- plan variants (F6 S1-6), on the point tables within the headline plan's budget
-    pv = V.run(A, ben0, cost0, plan, events0)     # guarded by the point evaluation's corrections
+    pv = V.run(A, ben0, cost0, plan, events0, fcol, u["data"]["interval"])   # guarded by the point corrections
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity

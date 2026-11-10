@@ -1256,7 +1256,7 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             bad.append("analysis.emulator.points: an integer >= 8")
         bad += [f"analysis.emulator.features: no column {f}" for f in em.get("features") or [] if f not in cols]
     from toolkit.analysis import variants as _V      # F6 S1-6: operational plan variants
-    bad += _V.validate(s.raw, cols)
+    bad += _V.validate(s.raw, cols, s.units(), pk, s.uid)
     for name, d in (an.get("diagnostics") or {}).items():
         if (d or {}).get("metric") not in card.outputs.get("windows", []):
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
