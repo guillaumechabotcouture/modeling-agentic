@@ -104,7 +104,7 @@ SCENARIOS = {
                     {"package": {"smc": 1}, "unit": {"hist_net_by_year": {}, "smc_hist_rounds": [], "hist_net": "dual"},
                      "params": {"smc_cov": 0.7}}]},
     # v0.13: past SMC (in the burn-in and after horizon.start) without its own coverage, so the past rounds run at
-    # smc_cov as in v0.12; one member gives smc_hist_cov as [] (absent), which the old code does not read
+    # smc_cov as in v0.12; members give smc_hist_cov as [] and None (absent), which the old code does not read
     "past_smc_v013": {
         "unit": dict(_BASE_UNIT, itn_hist_years=[2021.25], campaign_year=2024.5, smc_hist_years=[2022, 2023],
                      smc_hist_rounds=[3, 4]),
@@ -112,7 +112,8 @@ SCENARIOS = {
                     "windows": {"pre": [2023.0, 2024.0], "y1": [2024.0, 2025.0], "y2": [2025.0, 2026.0]}},
         "delivery": [2024.0, 2026.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 25,
         "members": [{"package": {}}, {"package": {"smc": 1}}, {"package": {"smc": 1}, "params": {"smc_cov": 0.7}},
-                    {"package": {"net": "dual", "smc": 1}, "unit": {"smc_hist_cov": []}}]},
+                    {"package": {"net": "dual", "smc": 1}, "unit": {"smc_hist_cov": []}},
+                    {"package": {"smc": 1}, "unit": {"smc_hist_cov": None}}]},     # Codex r1 P3: None too
 }
 
 # Codex r2 P3: the execution environment of a worker, recorded per side (the source is shared by the worker, which runs

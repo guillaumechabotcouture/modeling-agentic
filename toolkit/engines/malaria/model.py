@@ -550,15 +550,25 @@ def smc_protection(dt_days, e0, half, k):
 def smc_rounds_pmf(mean, rho, n) -> list:
     """v0.13: the share of children reached in 0..n of n rounds when each child's per-round reach is the beta
     propensity of smc_propensity (mean `mean`, intra-child correlation `rho`): the beta-binomial pmf. Its last entry
-    is the all-rounds share that coverage surveys report beside the per-cycle mean. rho = 0 gives the binomial."""
-    from math import comb, exp, lgamma
-    m, r, n = float(mean), float(rho), int(n)
-    if r < 1e-9 or m >= 1.0 or m <= 0.0:
-        return [comb(n, k) * m ** k * (1.0 - m) ** (n - k) for k in range(n + 1)]
-    s = 1.0 / r - 1.0
-    a, b = m * s, (1.0 - m) * s
-    lbeta = lambda x, y: lgamma(x) + lgamma(y) - lgamma(x + y)  # noqa: E731
-    return [comb(n, k) * exp(lbeta(k + a, n - k + b) - lbeta(a, b)) for k in range(n + 1)]
+    is the all-rounds share that coverage surveys report beside the per-cycle mean. rho = 0 gives the binomial.
+    Rising factorials scaled by t = rho / (1 - rho), so the independent limit needs no special case (Codex r1 P3).
+    Outside smc_cov's and smc_rho's domains, or with n not a whole number >= 0, it fails closed (Codex r1 P2)."""
+    from math import comb, isfinite, prod
+
+    def num(x):
+        return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, (bool, np.bool_)) \
+            and isfinite(float(x))
+    if not num(mean) or not 0.0 < float(mean) <= 1.0:
+        raise ValueError(f"smc_rounds_pmf: mean {mean!r} must be in (0, 1]")
+    if not num(rho) or not 0.0 <= float(rho) < 1.0:
+        raise ValueError(f"smc_rounds_pmf: rho {rho!r} must be in [0, 1)")
+    if not num(n) or float(n) != int(float(n)) or int(float(n)) < 0:
+        raise ValueError(f"smc_rounds_pmf: n {n!r} must be a whole number of rounds >= 0")
+    m, n = float(mean), int(float(n))
+    t = float(rho) / (1.0 - float(rho))
+    den = prod(1.0 + i * t for i in range(n))
+    return [comb(n, k) * prod(m + i * t for i in range(k)) * prod(1.0 - m + j * t for j in range(n - k)) / den
+            for k in range(n + 1)]
 
 
 def smc_propensity(u, mean, rho):
