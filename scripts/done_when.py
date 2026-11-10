@@ -403,6 +403,8 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         (closed_ids if b.get("resolved") is True else open_ids).add(bid)
         if bid in tests:
             t = tests[bid]
+            if isinstance(t, dict):        # the critic's latest word, kept for the rounds it stops listing the finding
+                t["critic_resolved_round"] = round_n if b.get("resolved") is True else None
             # A critic may withdraw a frozen test, with its reason: a visible,
             # counted change of target, never a silent one.
             why = str(b.get("done_when_withdrawn") or "").strip()
@@ -416,7 +418,8 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
             continue
         tests[bid] = {"reviewer": reviewer, "severity": b["severity"], "claim": str(b.get("claim") or ""),
                       "target_stage": str(b.get("target_stage") or "").upper(), "done_when": dw,
-                      "frozen_round": round_n, "passed_round": None, "history": []}
+                      "frozen_round": round_n, "passed_round": None, "history": [],
+                      "critic_resolved_round": round_n if b.get("resolved") is True else None}
         why = str(b.get("done_when_withdrawn") or "").strip()
         if why:
             tests[bid]["withdrawn"] = {"round": round_n, "reason": why[:300]}
@@ -436,8 +439,11 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         passes, detail = evaluate(t["done_when"], run_dir)
         # Review A5: a finding no critique lists any more is not closed by its absence. Until its test passes
         # (or the critic resolves or withdraws it) it stays open.
+        # A judgement the critic resolved in an earlier round keeps that resolution (no harness check can pass it);
+        # a runnable test that fails does not.
         left_out = (bid not in open_ids and bid not in closed_ids and passes is not True
-                    and t.get("passed_round") is None)
+                    and t.get("passed_round") is None
+                    and not (passes is None and t.get("critic_resolved_round") is not None))
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
                        "frozen_round": t.get("frozen_round"), "result": result_of(passes),
                        "open": bid in open_ids or left_out, "severity": t.get("severity")}
