@@ -16,9 +16,9 @@ old:
     python: 3.14.3
     starsim: 3.3.2
 new:
-  commit_of_tree_base: 20fbb161650b49b5553b4ba0117d177661288d7d
+  commit_of_tree_base: 17b6314d9959245ad9bc157f8d80b2f69a669fb6
   identity:
-    code_sha256: ad7cb4c24d9e72ea40cd2761c3f7bde219e258c716dc6142122acd208a05d708
+    code_sha256: 58bc770fdecf72b6f8835ee1a4b07b410f5a2e5f1e7b2843cebf93f866fa3324
     config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
     name: malaria-starsim
     params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
@@ -31,7 +31,7 @@ new:
     python: 3.14.3
     starsim: 3.3.2
 execution:
-  run_id: local-v014-2
+  run_id: local-v014-4
 scope:
   pack_settings:
   - benin

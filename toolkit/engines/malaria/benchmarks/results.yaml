@@ -2,7 +2,7 @@ producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
   version: '0.14'
-  code_sha256: ad7cb4c24d9e72ea40cd2761c3f7bde219e258c716dc6142122acd208a05d708
+  code_sha256: 58bc770fdecf72b6f8835ee1a4b07b410f5a2e5f1e7b2843cebf93f866fa3324
   params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
   config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 benchmarks:
