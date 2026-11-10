@@ -185,6 +185,7 @@ runs for a sample of LGAs at the boundary values.
 | S2-1, S2-4 | lead and engine agent | dated once O1 and O2 are in | S2-1 waiting on O1; S2-4 in review in two PRs: part 1 #175 (emulator features from encoded unit attributes; emulator error on comparator burden and cost outputs, drawn jointly with the reductions), part 2 (ranking accuracy near package switches against engine runs at calibrated values, gated) |
 | S2-5 absolute burden validation | lead | PR by 2026-11-11 | merged (#165: `validation.burden`, `analysis/burden_validation.yaml`); the Nigeria reference file (estimated state cases and deaths with intervals) is built outside the repository before the F6 spec is signed |
 | S2-5b burden window, report-only rows, no published interval | lead | PR by 2026-11-10 | in review: `validation.burden.window` with `window_metrics` (past years from engine window metrics in the same runs; deaths and DALYs need an engine change); `role`, `interval` columns |
+| S2-5c age-banded rows under the burden window | lead | PR by 2026-11-10 | in review: an age-banded row is its population group's window metric x population; `window_metrics` may map only the groups the rows reference |
 | S2-6 funded plan beside the optimised plan | lead | PR by 2026-11-11 | in review (#170: `fixed_plan` plan variant) |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 

@@ -16,8 +16,9 @@ Spec (optional section; checked by toolkit/spec/schema.py, no values in code):
         window_metrics: {cases: {<population group>: <metric>}}   # with window: per outcome and population group,
                                           # the engine window metric giving it per person of the group over a named
                                           # window, weighted by the group's population; one metric (a string) only
-                                          # with one population group spanning the engine's age groups. Every
-                                          # reference's outcome needs one
+                                          # with one population group spanning the engine's age groups. Groups may
+                                          # be left out (S2-5c): an all-ages row needs every group's metric, a row
+                                          # with an age band (a population group) only that group's
 
 Reference CSV contract (COLUMNS): id; group (a value of the group column, or * for every unit); age_band (blank: all
 ages, or a decision_units.populations key); outcome (one the spec reports); measure (count | rate, per `per` people of
@@ -42,7 +43,8 @@ windows (Horizon.windows, `WINDOW`) in the same runs, so each run returns the en
 window and no run is added; on the emulator path one more GP per mapped outcome is fitted (a new window changes the
 batch's job hashes, so a batch computed without it is not reused). Its interval comes from the uncertainty draws for
 all-age references (with the emulator error, a column of its error model, on the emulator path); an age-banded
-reference is the point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
+reference is the point value outside a model window (under one, its population group's window value, with
+draws: S2-5c), and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
 """
 from __future__ import annotations
 
@@ -104,7 +106,7 @@ def model_window(s) -> dict | None:
         return None
     pops = list(s["decision_units"]["populations"])
     m = {o: ({pops[0]: x} if isinstance(x, str) and len(pops) == 1 else x) for o, x in m.items()}
-    if not all(isinstance(x, dict) and set(x) == set(pops) for x in m.values()):
+    if not all(isinstance(x, dict) and x and set(x) <= set(pops) for x in m.values()):     # S2-5c: partial
         return None
     return {"window": [float(x) for x in w], "metrics": m, "arm": config(s)["arm"]}
 
@@ -322,14 +324,15 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             == set(card.age_groups)
 
         def _ok(m):         # Codex S2-5b r2 P1: weighted by the spec's populations, as the decision window is
-            return (m in wn and one) if isinstance(m, str) else (isinstance(m, dict) and set(m) == set(pops)
+            return (m in wn and one) if isinstance(m, str) else (isinstance(m, dict) and m and set(m) <= set(pops)
                                                                   and all(isinstance(x, str) and x in wn
                                                                           for x in m.values()))
         if not (isinstance(wm, dict) and wm and all(o in outs and _ok(m) for o, m in wm.items())):
             bad.append(f"{P}.window_metrics: with window, {{reported outcome: {{population group: an engine window "
-                       f"metric {wn} per person of that group over the window}} for every group}} (a single metric "
-                       "only with one population group spanning the engine's age groups)")
+                       f"metric {wn} per person of that group over the window}}}} (a single metric only with one "
+                       "population group spanning the engine's age groups)")
             wm = {}
+        wm = {o: ({next(iter(pops)): m} if isinstance(m, str) else m) for o, m in (wm or {}).items()}
     refs, seen = [], set()
     for n, r in enumerate(rows, 2):
         e = []
@@ -342,10 +345,12 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             e.append(f"group {g!r} is not a value of {cfg['group']} (or *): no unit to compare")
         if band and band not in pops:
             e.append(f"age_band {band!r} is not a decision_units.populations group")
-        if mw and band:
-            e.append("age_band: a model window compares all ages (window metrics are per person, all ages)")
         if mw and wm and r["outcome"] not in wm:
             e.append(f"outcome {r['outcome']!r} has no window_metrics entry for the model window")
+        elif mw and wm:     # S2-5c: a banded row needs its group's metric, an all-ages row every group's
+            miss = sorted(({band} if band else set(pops)) - set(wm[r["outcome"]]))
+            if miss:
+                e.append(f"population groups {miss} have no window metric for {r['outcome']!r} (window_metrics)")
         if r["outcome"] not in outs:
             e.append(f"outcome {r['outcome']!r} is not reported by the spec {outs}")
         per = _num(r["per"])
@@ -431,8 +436,10 @@ def _value(A, cfg, ref, out, arm):
     if not ids:
         return None
     if ref.get("window"):
-        try:
-            tot = sum(float(out[i]["burden"][arm][ref["outcome"]]) for i in ids) / (ref["window"][1] - ref["window"][0])
+        try:            # S2-5c: an age-banded row is its population group's window value alone
+            tot = sum(float(out[i]["burden_group"][arm][ref["outcome"]][ref["age_band"]] if ref["age_band"]
+                            else out[i]["burden"][arm][ref["outcome"]]) for i in ids)
+            tot /= ref["window"][1] - ref["window"][0]
         except (KeyError, TypeError, ValueError):
             return None
     else:
@@ -475,7 +482,7 @@ class Collector:
         self.refs, bad = load_references(A.spec, self.data)
         if bad:
             raise ValueError("validation.burden: " + "; ".join(bad))
-        self.draws = {r["id"]: [] for r in self.refs if not r["age_band"]}
+        self.draws = {r["id"]: [] for r in self.refs if not r["age_band"] or r["window"]}   # S2-5c: windowed too
 
     def add(self, out, events=(), cost=None):
         n = getattr(self, "n", 0)
@@ -580,11 +587,12 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
     cfg, arm, refs = col.cfg, col.cfg["arm"], col.refs
     guard_point(A, arm, events0)
     yp = (cfg["daly_parts"] or {}).get("yll_per_death") or {}
-    bands = sorted({r["age_band"] for r in refs if r["age_band"]} | ({b for b in yp if b != "all"}))
+    bands = sorted({r["age_band"] for r in refs if r["age_band"] and not r["window"]} | ({b for b in yp
+                                                                                           if b != "all"}))
     by_pop = by_population(A, A.theta0, z0, bands, arm) if bands else {}
     rows = []
     for r in refs:
-        out = by_pop[r["age_band"]] if r["age_band"] else out0
+        out = by_pop[r["age_band"]] if r["age_band"] and not r["window"] else out0
         rows.append(compare(r, _value(A, cfg, r, out, arm), col.draws.get(r["id"]) or None, level))
     mw = model_window(A.spec)
     t0, t1 = mw["window"] if mw else A.spec["objective"]["horizon"]
