@@ -109,7 +109,7 @@ child's persistent latent are shared by past and future rounds. Absent or empty,
 
 v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, so a burden check can compare a past window.
 For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are the expected severe episodes and
-deaths of the window's new clinical infections per person of the group, over its mean population in the window:
+deaths of the window's new infections per person of the group, over its mean population in the window:
 the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
 v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W2 (selftest_late.py).
 """
@@ -2965,7 +2965,7 @@ def _self_test_v013(ok, e, unit) -> None:
 def _self_test_v014(ok, e, unit) -> None:
     """v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, per person of each age group and of all
     ages over any named window (severe_<g>, deaths_<g>, g in AGES or all), counted as the decision window's per-capita
-    outcomes are: expected severe episodes and deaths of the window's new clinical infections over the group's mean
+    outcomes are: expected severe episodes and deaths of the window's new infections over the group's mean
     population in the window. A past window then gives the deaths those years would give as the decision window."""
     def case(label, fn):
         try:
@@ -3011,6 +3011,30 @@ def _self_test_v014(ok, e, unit) -> None:
         ok(all(0 < o.windows["half"][f"deaths_{g}"] < o.windows["dec"][f"deaths_{g}"] for g in AGES),
            "W2b a half window holds part of the deaths")
     case("W2", w2)
+
+    def w3():
+        # Codex r1 P1: members sharing a burn-in and history count their past deaths with their own case fatality
+        h = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"past": [2015.0, 2016.0], "dec": [2016.0, 2017.0]})
+        q = dict(p, cfr_severe_untreated=0.9, cfr_severe_treated=0.09, severe_access_add=0.1)
+        res = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        solo = [res(e.run(x, unit, none, h, 4)) for x in (p, q)]
+        fw, bw = e.run_batch([p, q], unit, none, h, 4), e.run_batch([q, p], unit, none, h, 4)
+        ok([o.meta["burnin_members"] for o in fw] == [2, 2] and [res(o) for o in fw] == solo
+           and [res(o) for o in bw] == solo[::-1],
+           f"W3 in a shared burn-in each member's past-window deaths are its own, in either order "
+           f"({fw[1].windows['past']['deaths_u5']} vs alone {solo[1][1]['past']['deaths_u5']})")
+    case("W3", w3)
+
+    def w4():
+        # Codex r1 P2: a window the sim does not cover (before its start, past its end, empty) gives NaN, not 0
+        h = Horizon(2015.0, 2016.0, (2015.0, 2016.0), {"before": [2013.0, 2014.0], "part": [2013.0, 2015.0],
+                                                      "after": [2015.5, 2016.5], "empty": [2015.5, 2015.5],
+                                                      "burnin": [2014.0, 2015.0]})
+        w = e.run(p, unit, none, h, 4).windows
+        ok(all(np.isnan(w[x][n]) for x in ("before", "part", "after", "empty") for n in names)
+           and all(np.isfinite(w["burnin"][n]) for n in names),
+           "W4 the new metrics are NaN for a window the simulated days do not cover, and finite inside the burn-in")
+    case("W4", w4)
 
 
 def write_card(path: str) -> None:
