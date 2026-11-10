@@ -2724,6 +2724,176 @@ def _self_test_v012(ok, e, unit) -> None:
     case("C11", c11)
 
 
+def _self_test_v013(ok, e, unit) -> None:
+    """v0.13 (F6 S2-3 part 2, critique C3): past SMC coverage apart from future coverage. `smc_hist_cov` (one share, or
+    one per smc_hist_years entry) is the mean per-round reach of the past SMC rounds; the package's and routine SMC keep
+    smc_cov. A calibration can then fit the history without moving the coverage the allocation uses. Absent or empty,
+    a run is byte-identical to v0.12 (HC3; benchmarks/restamp_proof.py)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    from toolkit.engines.horizon import DeliveryHorizon
+    from toolkit.engines.malaria import model as MM
+    season = [0.4, 0.4, 0.5, 0.7, 1.0, 1.4, 1.8, 2.0, 1.6, 1.0, 0.7, 0.5]
+    months = default_smc_months(np.asarray(season))          # (6, 7, 8, 9) for this season
+    attrs = dict(unit.attributes, season=season, itn_hist_years=[2014.3], campaign_year=2016.1)
+    hs = DeliveryHorizon(2014.0, 2017.0, (2016.0, 2017.0), {"d": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+    h1 = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"d": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+    small = {"n_agents": 300, "burnin_years": 1}
+    none, smc = Package("none", {}), Package("smc", {"smc": 1})
+    strip = lambda o: (o.per_capita, o.windows, o.cost_drivers,  # noqa: E731
+                       {k: v for k, v in o.meta.items() if k != "seconds"})
+    cov0 = {p.name: p.value for p in e.parameters()}["smc_cov"]
+
+    def hc0():
+        ua = e.describe().unit_attributes
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 13) and "smc_hist_cov" in ua,
+           "HC0 engine v0.13 declares smc_hist_cov on its card")
+        from toolkit.spec.schema import load_binding
+        b, probs = load_binding(e)
+        m = b.get("smc_hist_cov")
+        ok(not probs and isinstance(m, dict) and "default" in m and "smc_cov" in str(m.get("meaning") or ""),
+           f"HC0b attribute_binding.yaml gives smc_hist_cov a default and its meaning (past rounds at smc_cov) {probs}")
+    case("HC0", hc0)
+
+    def hc1():
+        a = dict(attrs, smc_hist_years=[2015, 2014], smc_hist_cov=[0.3, 0.9])
+        sh = smc_history(a, 2016.0, months)
+        want = [0.9] * 4 + [0.3] * 4                          # rounds are in year order; each year keeps its share
+        ok(sh is not None and sh.get("covs") == want and len(sh["rounds"]) == 8,
+           f"HC1 one share per past year follows its year: {sh and sh.get('covs')}")
+        sh = smc_history(dict(attrs, smc_hist_years=[2014, 2015], smc_hist_rounds=[2, 3], smc_hist_cov=0.5),
+                         2016.0, months)
+        ok(sh is not None and sh.get("covs") == [0.5] * 5, f"HC1b one share applies to every past round: {sh}")
+        for v in (None, []):
+            sh = smc_history(dict(attrs, smc_hist_years=[2015], smc_hist_cov=v), 2016.0, months)
+            ok(sh is not None and sh.get("covs") is None, f"HC1c smc_hist_cov {v!r}: past rounds at smc_cov (v0.12)")
+        u0 = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015]))
+        uc = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015], smc_hist_cov=[0.3, 0.9]))
+        ok(e.schedule(small, u0, smc, hs) == e.schedule(small, uc, smc, hs),
+           "HC1d the past coverage changes no delivery date (the schedule is v0.12's)")
+    case("HC1", hc1)
+
+    def hc2():
+        for at, label in (({"smc_hist_cov": 0}, "0"), ({"smc_hist_cov": 1.2}, "above 1"),
+                          ({"smc_hist_cov": -0.1}, "negative"), ({"smc_hist_cov": float("nan")}, "NaN"),
+                          ({"smc_hist_cov": True}, "a boolean"), ({"smc_hist_cov": "0.5"}, "a string"),
+                          ({"smc_hist_cov": [0.5]}, "a list of another length"),
+                          ({"smc_hist_cov": [0.5, None]}, "a list with a missing value"),
+                          ({"smc_hist_cov": {2014: 0.5, 2015: 0.6}}, "a mapping"),
+                          ({"smc_hist_years": [], "smc_hist_cov": [0.5]}, "a list without past years"),
+                          ({"smc_hist_years": [], "smc_hist_cov": 1.5}, "out of range without past years")):
+            u = UnitSpec("t", dict(attrs, **dict({"smc_hist_years": [2014, 2015]}, **at)))
+            try:
+                e.schedule(small, u, none, hs)
+                ok(False, f"HC2 smc_hist_cov {label} fails closed")
+            except ValueError as ex:
+                ok("smc_hist_cov" in str(ex), f"HC2 smc_hist_cov {label} fails closed ({ex})")
+        try:
+            e.run(small, UnitSpec("t", dict(attrs, smc_hist_years=[2015], smc_hist_cov=0)), none, h1, 1)
+            ok(False, "HC2b the sim path refuses it too")
+        except ValueError as ex:
+            ok("smc_hist_cov" in str(ex), f"HC2b the sim path refuses it too ({ex})")
+    case("HC2", hc2)
+
+    def hc3():
+        pk = [none, smc]
+        uh = dict(attrs, smc_hist_years=[2015])
+        ref = [strip(o) for o in e.run_batch([small] * 2, UnitSpec("t", uh), pk, h1, 5)]
+        s0, _ = e.build_sim(small, UnitSpec("t", uh), smc, h1, 5)
+        s0.init()
+        names = list(s0.interventions.keys())
+        for extra, nm in (({"smc_hist_cov": None}, "None"), ({"smc_hist_cov": []}, "[]"),
+                          ({"smc_hist_cov": cov0}, "equal to smc_cov"), ({"smc_hist_cov": [cov0]}, "[smc_cov]")):
+            ux = UnitSpec("t", dict(uh, **extra))
+            got = [strip(o) for o in e.run_batch([small] * 2, ux, pk, h1, 5)]
+            ok(got == ref, f"HC3 (smc_hist_cov {nm}) byte-identical outcomes, cost drivers and meta to v0.12's past SMC")
+            sx, _ = e.build_sim(small, ux, smc, h1, 5)
+            sx.init()
+            ok(list(sx.interventions.keys()) == names, f"HC3b ({nm}) the same interventions as v0.12")
+        r0 = [strip(o) for o in e.run_batch([small] * 2, UnitSpec("t", attrs), pk, h1, 5)]
+        r1 = [strip(o) for o in e.run_batch([small] * 2, UnitSpec("t", dict(attrs, smc_hist_cov=0.4)), pk, h1, 5)]
+        ok(r1 == r0, "HC3c smc_hist_cov without past SMC years changes nothing")
+    case("HC3", hc3)
+
+    def hc4():
+        # changing the future coverage (smc_cov) leaves the history years exactly as they were
+        p = {"n_agents": 800, "burnin_years": 1}
+        u = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015], smc_hist_cov=0.6))
+        ps = [dict(p, smc_cov=0.5), dict(p, smc_cov=0.95)]
+        out, ser = e._run_members(ps, [u, u], [smc, smc], hs, 5, series=["pfpr_u5", "inc_u5"])
+        t = np.asarray(ser[0]["t"])
+        pre, post = t < 2016.0 - 1e-9, t >= 2016.0 - 1e-9
+        same = all(np.array_equal(np.asarray(ser[0]["values"][k])[pre], np.asarray(ser[1]["values"][k])[pre])
+                   for k in ("pfpr_u5", "inc_u5"))
+        moved = not np.array_equal(np.asarray(ser[0]["values"]["inc_u5"])[post],
+                                   np.asarray(ser[1]["values"]["inc_u5"])[post])
+        ok(same and moved and [o.meta["burnin_members"] for o in out] == [2, 2],
+           "HC4 with smc_hist_cov, smc_cov 0.5 and 0.95 share one burn-in and history: the monthly series are "
+           f"identical before the delivery start and differ after it (burn-in members "
+           f"{[o.meta['burnin_members'] for o in out]})")
+        solo = [strip(e.run(q, u, smc, hs, 5)) for q in ps]
+        ok([strip(o) for o in out] == solo, "HC4b each member of the shared burn-in equals its own run")
+        u12 = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015]))
+        o12 = e.run_batch(ps, u12, smc, hs, 5)
+        ok([o.meta["burnin_members"] for o in o12] == [1, 1],
+           "HC4c without smc_hist_cov (v0.12) the past rounds run at smc_cov, so the two do not share a burn-in")
+    case("HC4", hc4)
+
+    def reach(hist_cov, smc_cov):
+        """Per-year mean share of children 3-59 months reached per round, history and package rounds."""
+        u = UnitSpec("t", dict(attrs, smc_hist_years=[2014, 2015], smc_hist_cov=hist_cov))
+        sim, _ = e.build_sim({"n_agents": 3000, "burnin_years": 0, "smc_cov": smc_cov}, u, smc, hs, 7)
+        sim.init()
+        yv = np.asarray(sim.t.yearvec)
+        itv, dz = sim.interventions, sim.diseases.malaria
+        steps = sorted(MM.event_steps(yv, itv["smc_hist"].targets()) | MM.event_steps(yv, itv["smc"].targets()))
+        by = {}
+        for s in steps:
+            sim.run(until=yv[s - 1])
+            uu = sim.people.auids
+            a = np.asarray(sim.people.age[uu])
+            el = uu[(a >= 0.25) & (a < 5)]
+            sim.run(until=yv[s])
+            by.setdefault(int(np.floor(yv[s] + 1e-9)), []).append(float(np.mean(np.asarray(dz.smc_t[el]) == s)))
+        return {y: float(np.mean(v)) for y, v in by.items()}
+
+    def hc5():
+        # changing the past coverage (smc_hist_cov) leaves the package's SMC at smc_cov in the delivery years
+        r1, r2 = reach([0.35, 0.9], 0.7), reach(0.6, 0.7)
+        ok(abs(r1.get(2014, 9) - 0.35) < 0.06 and abs(r1.get(2015, 9) - 0.9) < 0.06 and abs(r2.get(2014, 9) - 0.6) < 0.06
+           and abs(r2.get(2015, 9) - 0.6) < 0.06,
+           f"HC5 past rounds reach smc_hist_cov, year by year: {r1} and {r2}")
+        ok(abs(r1.get(2016, 9) - 0.7) < 0.06 and abs(r2.get(2016, 9) - 0.7) < 0.06,
+           f"HC5b the package's rounds reach smc_cov (0.7) whatever the past coverage: {r1.get(2016)} and {r2.get(2016)}")
+    case("HC5", hc5)
+
+    def hc6():
+        P = resolve_params(e, small)
+        a = dict(attrs, smc_hist_years=[2015], smc_hist_cov=0.6)
+        k = lambda q, x: e._burnin_key(dict(P, **q), x)  # noqa: E731
+        ok(k({"smc_cov": 0.5}, a) == k({"smc_cov": 0.9}, a) and k({"smc_rho": 0.42}, a) != k({"smc_rho": 0.5}, a)
+           and k({}, a) != k({}, dict(a, smc_hist_cov=0.7)),
+           "HC6 with smc_hist_cov, smc_cov leaves the burn-in key; smc_rho and the past coverage stay in it")
+        a0 = dict(attrs, smc_hist_years=[2015])
+        ok(k({"smc_cov": 0.5}, a0) != k({"smc_cov": 0.9}, a0), "HC6b without it smc_cov stays in the key (v0.12)")
+    case("HC6", hc6)
+
+    def hc7():
+        pmf = MM.smc_rounds_pmf(0.796, 0.417, 4)
+        want = [0.055, 0.074, 0.103, 0.166, 0.601]          # ENGINE_NOTES.md v0.11: the fit to Table 21
+        ok(len(pmf) == 5 and abs(sum(pmf) - 1) < 1e-9 and all(abs(x - w) < 0.003 for x, w in zip(pmf, want)),
+           f"HC7 smc_rounds_pmf gives the beta-binomial rounds-received shares (all four rounds {pmf[-1]:.3f})")
+        from math import comb
+        b = MM.smc_rounds_pmf(0.6, 0.0, 3)
+        ok(all(abs(x - comb(3, i) * 0.6 ** i * 0.4 ** (3 - i)) < 1e-12 for i, x in enumerate(b)),
+           "HC7b smc_rho 0 gives the binomial")
+    case("HC7", hc7)
+
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
