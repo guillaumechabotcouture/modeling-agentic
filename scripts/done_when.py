@@ -35,8 +35,10 @@ Forms (a list means all must pass):
    HIGH `done_when_regressed`, naming the round it passed. A finding the
    critic resolves while its runnable test fails is `done_when_unmet` (its own
    severity) until the test passes or the critic withdraws it
-   (`done_when_withdrawn: <reason>`). Critics need no fix check for items with
-   a runnable test: the harness checks them.
+   (`done_when_withdrawn: <reason>`). A finding the critique no longer lists,
+   whose test has never passed, stays open as `done_when_dropped` (its own
+   severity): leaving it out does not close it. Critics need no fix check for
+   items with a runnable test: the harness checks them.
 
 Agents check their own work before returning:
 
@@ -379,6 +381,12 @@ def _blockers(critiques: dict):
                 yield reviewer, b
 
 
+def _listed(critiques: dict) -> set:
+    """Ids every critic in CRITICS lists this round, at any severity (Codex r1 on A5: a finding kept at LOW is listed)."""
+    return {str(b["id"]) for reviewer, doc in (critiques or {}).items() if reviewer in CRITICS
+            for b in (doc or {}).get("blockers") or [] if isinstance(b, dict) and b.get("id")}
+
+
 def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclude=()) -> dict:
     """Evaluate every test (frozen ones from the registry, new valid ones from
     the critiques) and, when `record`, save the registry. `exclude`: ids the
@@ -386,6 +394,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
     {resolved: [ids whose test passes while the critic has them open],
      regressed: [tests that passed at an earlier gate run and fail now],
      unmet: [findings a critic resolved whose runnable test fails and never passed],
+     dropped: [findings no critique lists any more whose test has never passed: still open],
      missing: {reviewer: [ids with no valid test]}, invalid: [registry ids that cannot be read],
      status: {id: {passes, detail, mechanical, frozen_round}}}."""
     reg = load_registry(run_dir)
@@ -393,6 +402,10 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
     exclude = {str(x) for x in exclude or ()}
     missing: dict[str, list] = {}
     open_ids, closed_ids = set(), set()
+    listed = _listed(critiques)
+    for bid in listed & set(tests):     # the latest scope word: outside the brief now, or back in it
+        if isinstance(tests[bid], dict):
+            tests[bid]["outside_brief_round"] = round_n if bid in exclude else None
     for reviewer, b in _blockers(critiques):
         bid = str(b["id"])
         if bid in exclude:
@@ -400,6 +413,8 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         (closed_ids if b.get("resolved") is True else open_ids).add(bid)
         if bid in tests:
             t = tests[bid]
+            if isinstance(t, dict):        # the critic's latest word, kept for the rounds it stops listing the finding
+                t["critic_resolved_round"] = round_n if b.get("resolved") is True else None
             # A critic may withdraw a frozen test, with its reason: a visible,
             # counted change of target, never a silent one.
             why = str(b.get("done_when_withdrawn") or "").strip()
@@ -413,11 +428,12 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
             continue
         tests[bid] = {"reviewer": reviewer, "severity": b["severity"], "claim": str(b.get("claim") or ""),
                       "target_stage": str(b.get("target_stage") or "").upper(), "done_when": dw,
-                      "frozen_round": round_n, "passed_round": None, "history": []}
+                      "frozen_round": round_n, "passed_round": None, "history": [],
+                      "critic_resolved_round": round_n if b.get("resolved") is True else None}
         why = str(b.get("done_when_withdrawn") or "").strip()
         if why:
             tests[bid]["withdrawn"] = {"round": round_n, "reason": why[:300]}
-    resolved, regressed, unmet, invalid, status = [], [], [], [], {}
+    resolved, regressed, unmet, dropped, invalid, status = [], [], [], [], [], {}
     for bid, t in tests.items():
         if bid in exclude:
             continue
@@ -431,9 +447,18 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
                            "open": bid in open_ids, "severity": t.get("severity")}
             continue
         passes, detail = evaluate(t["done_when"], run_dir)
+        # Review A5: a finding no critique lists any more is not closed by its absence. Until its test passes
+        # (or the critic resolves or withdraws it) it stays open.
+        # A judgement the critic resolved in an earlier round keeps that resolution (no harness check can pass it);
+        # a runnable test that fails does not.
+        # Codex r1: a finding tied to no brief item when last listed stays out; a registry written before
+        # critic_resolved_round existed cannot say whether a judgement was resolved, so it is not reopened.
+        left_out = (bid not in listed and passes is not True and t.get("passed_round") is None
+                    and not t.get("outside_brief_round")
+                    and not (passes is None and t.get("critic_resolved_round", round_n) is not None))
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
                        "frozen_round": t.get("frozen_round"), "result": result_of(passes),
-                       "open": bid in open_ids, "severity": t.get("severity")}
+                       "open": bid in open_ids or left_out, "severity": t.get("severity")}
         entry = {"id": bid, "severity": t.get("severity") or "HIGH", "reviewer": t.get("reviewer"),
                  "passed_round": t.get("passed_round"), "detail": detail, "claim": t.get("claim") or "",
                  "target_stage": t.get("target_stage") or "MODEL"}
@@ -446,10 +471,13 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
             regressed.append(entry)   # any earlier gate run, the same round included
         elif passes is False and bid in closed_ids:
             unmet.append(entry)
+        elif left_out:
+            dropped.append(dict(entry, done_when=t["done_when"]))
         t["history"] = [h for h in t.get("history") or [] if h[0] != round_n] + [[round_n, passes]]
     if record:
         _save(run_dir, reg)
-    return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "missing": missing,
+    return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "dropped": dropped,
+            "missing": missing,
             "invalid": sorted(invalid), "status": status}
 
 
@@ -481,9 +509,8 @@ def _save(run_dir: str, reg: dict) -> None:
 
 
 def gate_findings(result: dict) -> list[dict]:
-    """Regressions (HIGH), unmet tests (their severity), an unreadable
-    registry or a crashed evaluation (HIGH), missing tests (MEDIUM, one per
-    critic)."""
+    """Regressions (HIGH), unmet tests and findings left out of the critique (their severity), an
+    unreadable registry or a crashed evaluation (HIGH), missing tests (MEDIUM, one per critic)."""
     out = []
     if result.get("error"):
         out.append({"kind": "done_when_unavailable", "severity": "HIGH", "stage": "CRITIQUE",
@@ -502,6 +529,15 @@ def gate_findings(result: dict) -> list[dict]:
                     "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
                               f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
                               f"(`done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
+    for r in result.get("dropped") or []:   # HIGH as a regression is (Codex r1 P1-3: no persistence path); own key
+        out.append({"kind": "done_when_dropped", "severity": "HIGH", "id": r["id"], "key": r["id"],
+                    "done_when": r.get("done_when"),
+                    "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
+                    "claim": (f"{r['id']} ({r['reviewer']}, {r['severity']}) is an open finding that the current "
+                              f"critique no longer "
+                              f"lists, and its done_when test has never passed: {r['detail'][:300]}. It stays open "
+                              f"until the test passes or the critic lists it again (resolved, or the test withdrawn "
+                              f"with `done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
     if result.get("invalid"):
         out.append({"kind": "done_when_registry_invalid", "severity": "HIGH", "stage": "CRITIQUE",
                     "target_stage": "CRITIQUE", "scope_declarable": True,
@@ -728,6 +764,78 @@ def _self_test() -> int:
            f"DW25 the summary counts passed, failed and not judged separately, and names the open ones: {sm}")
         ok(load_registry(dj)["tests"]["D-003"]["claim"] == long_claim,
            "DW26 the registry keeps the finding's full claim")
+        # DW27-DW30 (project review A5): a critic that leaves out an open finding whose test never passed does not
+        # close it. Round 2's critique lists none of round 1's findings.
+        rd = run(dj, {"critique-domain": {"blockers": []}}, 2, record=False)
+        dropped = sorted(x["id"] for x in rd.get("dropped") or [])
+        gd = [g for g in gate_findings(rd) if g["kind"] == "done_when_dropped"]
+        ok(dropped == ["D-003", "D-005"] and {(g["id"], g["severity"]) for g in gd} == {("D-003", "HIGH"),
+                                                                                       ("D-005", "HIGH")}
+           and any("MEDIUM" in g["claim"] for g in gd if g["id"] == "D-005"),
+           f"DW27 an open finding left out of the critique, whose test never passed, blocks as HIGH (as a regression "
+           f"does), naming its own severity: {dropped}, {gd}")
+        ok(summary(rd["status"]).get("required_not_judged") == ["D-003"],
+           f"DW28 a left-out finding whose test is not judged still counts as open and not judged: "
+           f"{summary(rd['status'])}")
+        ok("D-004" not in dropped, "DW29 a left-out finding whose test passes is not reopened")
+        rx = run(dj, {"critique-domain": {"blockers": []}}, 2, record=False, exclude={"D-003"})
+        cw = {"critique-domain": {"blockers": [dict(cj["critique-domain"]["blockers"][2],
+                                                    done_when_withdrawn="replaced by D-006")]}}
+        run(dj, cw, 2)
+        rw = run(dj, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in rx.get("dropped") or []] == ["D-005"]
+           and [x["id"] for x in rw.get("dropped") or []] == ["D-003"],
+           f"DW30 a finding outside the brief or withdrawn with a reason is not reopened: {rx.get('dropped')}, "
+           f"{rw.get('dropped')}")
+        # DW31 (self-review): a critic's resolution of a judgement test holds once the critic stops listing it; a
+        # resolved finding whose runnable test fails still does not leave by being left out.
+        dk = os.path.join(d, "s31")
+        os.makedirs(dk)
+        ck = {"critique-domain": {"blockers": [
+            {"id": "D-010", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"judgement": "sourced"}},
+            {"id": "D-011", "severity": "HIGH", "resolved": False, "claim": "c",
+             "done_when": {"file": "never.csv", "exists": True}}]}}
+        run(dk, ck, 1)
+        for b in ck["critique-domain"]["blockers"]:
+            b["resolved"] = True
+        run(dk, ck, 2)
+        r31 = run(dk, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in r31["dropped"]] == ["D-011"] and not r31["status"]["D-010"]["open"],
+           f"DW31 a judgement the critic resolved stays resolved when left out; a failing runnable test does not: "
+           f"{[x['id'] for x in r31['dropped']]}")
+        # DW32-DW35 (Codex r1 on A5)
+        dm = os.path.join(d, "s32")
+        os.makedirs(dm)
+        cm = {"critique-domain": {"blockers": [
+            {"id": "D-020", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"file": "no.csv", "exists": True}},
+            {"id": "D-021", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"file": "no.csv", "exists": True}},
+            {"id": "D-022", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "no.csv", "exists": True}}]}}
+        run(dm, cm, 1)
+        run(dm, cm, 2, exclude={"D-020"})                                   # P1-1: tied to no brief item in round 2
+        low = {"critique-domain": {"blockers": [dict(cm["critique-domain"]["blockers"][1], severity="LOW")]}}
+        r32 = run(dm, low, 3, record=False)                                 # P1-2: D-021 still listed, now LOW
+        ok([x["id"] for x in r32["dropped"]] == ["D-022"],
+           f"DW32 a finding classified outside the brief, or still listed at LOW, is not dropped: "
+           f"{[x['id'] for x in r32['dropped']]}")
+        g33 = [g for g in gate_findings(run(dm, {"critique-domain": {"blockers": []}}, 3, record=False))
+               if g["kind"] == "done_when_dropped"]
+        import stall_rule as _sr
+        ok(sorted(_sr.finding_key(g) for g in g33) == ["D-021", "D-022"] and all(g.get("done_when") for g in g33),
+           f"DW33 each dropped finding keeps its own key (one ledger row each) and its test: "
+           f"{[(_sr.finding_key(g), bool(g.get('done_when'))) for g in g33]}")
+        dl = os.path.join(d, "s34")
+        os.makedirs(dl)
+        ck2 = {"critique-domain": {"blockers": [dict(b, resolved=True) for b in ck["critique-domain"]["blockers"]]}}
+        run(dl, ck2, 2)
+        legacy = load_registry(dl)
+        for t in legacy["tests"].values():
+            t.pop("critic_resolved_round", None)                            # P1-4: written before this field existed
+        _save(dl, legacy)
+        r34 = run(dl, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in r34["dropped"]] == ["D-011"],
+           f"DW34 a registry written before critic_resolved_round does not reopen a judgement; a failing runnable "
+           f"test still stays open: {[x['id'] for x in r34['dropped']]}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

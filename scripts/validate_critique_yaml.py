@@ -6282,6 +6282,13 @@ def _run_self_test() -> int:
         reg = [b for b in dec["unresolved_high"] if b.get("kind") == "done_when_regressed"]
         ok(len(reg) == 1 and "R-001" in reg[0]["claim"] and "round 3" in reg[0]["claim"]
            and dec["action"] != "ACCEPT", f"DG4: a broken test reopens as a HIGH gate finding: {dec['unresolved_high']}")
+        ecrit = {"critique-redteam": {"blockers": [], "carried_forward": [], "structural_mismatch": {"detected": False}}}
+        dec7, res7 = _apply_done_when(decide(ecrit, 8, 5), ecrit, d, 8, 5, record=False)
+        dec7 = _incorporate_rigor_violations(dec7, _dw.gate_findings(res7), 8, 5)
+        ok(dec7["action"] != "ACCEPT" and any(b.get("kind") == "done_when_dropped" and "R-004" in b.get("claim", "")
+                                              for b in dec7["unresolved_high"]),
+           f"DG4b (review A5): a critique that stops listing its open findings does not reach ACCEPT: "
+           f"{dec7['action']}, {[b.get('kind') for b in dec7['unresolved_high']]}")
         for rnd in (1, 2):
             _append_validator_history(d, rnd, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
                 {"kind": "critique_done_when_missing", "severity": "MEDIUM", "stage": "CRITIQUE"}]}, False)
