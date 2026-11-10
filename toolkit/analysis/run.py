@@ -338,10 +338,19 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
-    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre)
+    from toolkit.analysis import burden as BV
+    bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
+    u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
+               on_draw=bcol.add if bcol else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
+    bvd = None
+    if bcol is not None:        # F6 S2-5: the continuation arm's burden against external estimates
+        bvd = BV.run(A, out0, z0, point, bcol, level=u["data"]["interval"].get("level", 0.95), events0=events0)
+        arts["burden_validation"] = S.write("burden_validation", bvd, BV.PRODUCER,
+                                            [arts["point"], arts["uncertainty"], BV.csv_path(spec)])
+        log(f"burden validation: {bvd['summary']}")
     # ---- stability
     stab = ST.run(A, z0, out0, ben0, cost0, plan)
     arts["stability"] = S.write("stability", stab, ST.PRODUCER, [arts["point"], arts["calibration"]])
@@ -424,14 +433,16 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for fgd in figs:
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
-    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, pv=pv)
+    c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal, model.accuracy, pv=pv, burden=bvd)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
-                             + ([arts["plan_variants"]] if pv is not None else []))
+                             + ([arts["plan_variants"]] if pv is not None else [])
+                             + ([arts["burden_validation"]] if bvd else []))
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
-    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else []),
+    S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS) + (["emulator"] if model.kind == "emulator" else [])
+                              + (["burden_validation"] if bvd else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
@@ -746,6 +757,7 @@ def _self_test() -> int:
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
+        _self_test_burden_e2e(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -1391,6 +1403,77 @@ def _self_test_draw_floors(ok, A, R):
     finally:
         del A.model.predict
         A.alloc = saved
+
+
+def _self_test_burden_e2e(ok, d, q):
+    """F6 S2-5: validation.burden on the emulator path: each reference against the comparator arm's annual mean, with
+    the draws' interval for all-age references and the point value for an age band; one declarable finding for the
+    group outside tolerance, none for a reported value; results.md, claims and the figure."""
+    import yaml
+    from toolkit.analysis import burden as BV, contract
+    rows = ["A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
+            "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
+            "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
+            "D,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic D,overlap,,,REF-D,REF-A",
+            "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,"]
+    open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS)] + rows) + "\n")
+    try:
+        _resign(d, lambda r: (r.update(validation={"burden": {"csv": "burden_refs.csv"}}),
+                              r["calibration"].update(target_source_id="TOY-TARGETS")))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE1 a run with validation.burden completes: {type(e).__name__}: {e}")
+        return
+    try:
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except (OSError, TypeError, KeyError) as e:
+        ok(False, f"BE1 the burden_validation artifact is written: {e}")
+        return
+    by = {r["id"]: r for r in bv["references"]}
+    ok({k: r["status"] for k, r in by.items()} == {"A": "within", "B": "outside", "C": "information", "D": "within",
+                                                    "E": "within"} and bv["arm"] == "none",
+       f"BE1 each reference is judged against the comparator arm: { {k: r['status'] for k, r in by.items()} }")
+    pop = sum(float(u["pop"]) for u in R["_A"].spec.units())
+    tot = R["point"]["comparator_total"]["cases"] / 3.0
+    ok(by["A"]["model"]["interval_from"] == "draws" and bv["draws"] == 4 and by["D"]["model"]["interval_from"] == "point"
+       and abs(by["E"]["model"]["point"] - tot) <= 1e-9 * tot
+       and abs(by["D"]["model"]["point"] * pop / 1000 - tot) <= 1e-9 * tot,
+       f"BE2 annual means over the window; draws for all ages, the point value for an age band "
+       f"(E {by['E']['model']['point']:.6g} vs {tot:.6g})")
+    fs = contract.gate_findings(d)
+    ok([(x["kind"], x["key"], x["scope_declarable"]) for x in fs] == [("burden_outside_tolerance", "burden:B", True)],
+       f"BE3 the group outside tolerance is one declarable gate finding; the reported value none: {fs}")
+    res = open(os.path.join(d, "results.md")).read()
+    led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {})
+           .get("claims", [])}
+    figs = {f["figure"] for f in yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]}
+    ok("## Absolute burden against external estimates" in res and "[CLAIM:" not in res and "burden.B.ratio" in led
+       and "burden_validation" in figs and "not computed" in bv["daly_parts"]["statement"],
+       f"BE4 results.md, the claims ledger and the figure carry the comparison ({sorted(figs)[:3]})")
+    pv = bv.get("provenance") or {}
+    ok(pv.get("independent") is True and pv.get("csv") == "burden_refs.csv" and pv.get("calibration_inputs")
+       and pv.get("calibration_source_ids") == ["TOY-TARGETS"]
+       and {x["id"]: x["derived_from"] for x in pv.get("references") or []}.get("D") == ["REF-A"],
+       f"BE5 the artifact records the reference file's provenance and the calibration inputs it is independent of: {pv}")
+    # Codex r1 P2: precomputed draws (the reserve search) reach the hook with their events, so the arm is guarded
+    from toolkit.analysis import uncertainty as U
+    A = R["_A"]
+    seen = []
+    U.run(A, R["point"]["plan"], "h", draws=2, seed=5, pre=U.evaluate_draws(A, 2, 5),
+          on_draw=lambda out, events: seen.append((len(out), type(events).__name__)))
+    ok(seen == [(len(A.ids), "list")] * 2, f"BE6 precomputed draws call the hook with outcomes and events: {seen}")
+    # Codex r3 P1: a reference file replaced after the run fails the gate closed (the sign-off no longer covers it)
+    rp_ = os.path.join(d, "burden_refs.csv")
+    good = open(rp_).read()
+    open(rp_, "w").write(good.replace("1e12,1e11,1e13", "84,40,200"))
+    try:
+        fs = contract.gate_findings(d)
+    finally:
+        open(rp_, "w").write(good)
+    ok(any(x["kind"] == "analysis_contract_burden" and "sign-off" in x["claim"] and not x["scope_declarable"]
+           for x in fs) and signoff.status(d) == "signed",
+       f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
+       f"{sorted({x['kind'] for x in fs})}")
 
 
 def _self_test_floors_e2e(ok, d, q):

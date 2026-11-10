@@ -101,6 +101,8 @@ docs/design/v2-spec-and-analysis.md §1):
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]
+    validation:                            # optional (F6 S2-5): external estimates the analysis compares with
+      burden: {csv, group, arm, daly_parts}   # toolkit/analysis/burden.py (reference contract and tolerances)
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv
@@ -1028,6 +1030,8 @@ def _validate(s: Spec) -> list[str]:
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
+    from toolkit.analysis import burden as BV
+    bad += BV.load_references(s)[1]
     return bad
 
 
