@@ -176,6 +176,21 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     return out + BV.findings(raw, data, None if bad else refs)
 
 
+def _survey_changes(run_dir: str, data) -> list[dict]:
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_calibration", f"{SPEC} unreadable for the survey-change diagnostic: {e}")]
+    from toolkit.analysis import joint_calibration as JC
+    try:                 # Codex r3: the expected pairs, rebuilt from the spec and its targets, not from the record
+        from toolkit.spec import schema
+        exp, out = JC.expected_change_ids(schema.load(os.path.join(run_dir, SPEC))), []
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        exp, out = None, [_f("analysis_contract_calibration", f"the expected survey-change pairs cannot be rebuilt from "
+                                                              f"{SPEC}: {type(e).__name__}: {e}")]
+    return out + JC.change_findings(raw, data, exp)
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -264,6 +279,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             if cur_h != h:
                 out.append(_f("analysis_contract_stale", f"artifact {rel}: input {src} changed (or vanished) after it "
                                                          "was computed", f"{rel}:{src}"))
+        if kind == "joint_calibration":       # F6 S2-3b: the change between survey rounds by group
+            out += _survey_changes(run_dir, doc.get("data") or {})
         if kind == "calibration":
             out += _calibration(rel, doc.get("data") or {})
             cal_doc = (rel, doc.get("data") or {})
