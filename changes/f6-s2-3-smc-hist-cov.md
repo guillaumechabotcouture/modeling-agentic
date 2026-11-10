@@ -1,0 +1,13 @@
+---
+phase: "F6"
+commit: "S2-3 part 2"
+status_group: "F6 Stage 2"
+---
+
+## Changelog
+
+**Past SMC coverage apart from future coverage (F6 S2-3 part 2, critique C3; malaria engine v0.13).** From v0.10 to v0.12 the past SMC rounds (`smc_hist_years`, `smc_hist_rounds`) reached children at the engine parameter `smc_cov`, the coverage the package's SMC also uses, so a calibration could fit the history by moving the coverage the allocation then uses. The new optional unit attribute `smc_hist_cov` (one share in (0, 1], or one per `smc_hist_years` entry; a units-table column `{column: c}` or `{column, split: " ", empty: "none"}`) is the mean per-round reach of the past rounds only (`model.SMCDelivery` `covs`); the package's and routine SMC keep `smc_cov`. With it, `smc_cov` leaves the burn-in key, so parameter sets that differ only in the future coverage share one burn-in and history. `smc_rho` and each child's persistent latent stay shared. The form follows the national Nigeria EMOD model (Ozodiegwu et al. 2023): past SMC from post-campaign coverage surveys, per cycle, apart from the plan's future coverage. The all-cycle share is not a second input: it follows from the per-cycle mean and `smc_rho` through the v0.11 beta-binomial, and the new `model.smc_rounds_pmf` gives it (0.601 for four rounds at 0.796 and 0.417, against 60.2% observed in Nigeria in 2020). `attribute_binding.yaml` declares the default (`smc_cov`). With the attribute absent, `None` or `[]`, a run is byte-identical to v0.12: `benchmarks/restamp_proof.py` found v0.12 (8bccb68) and v0.13 (5c68f6f) outputs identical in 24 of 24 cases (14 pack settings, 5 evidence cases, 5 pinned scenarios including the new `past_smc_v013`; local run `local-v013-3`), and the four evidence files were re-stamped (`validate_once.sh` confirmation pending). Tests, written first: engine HC0-HC7e (`selftest_late.py`), including HC4 (changing `smc_cov` leaves the history years identical) and HC5 (changing `smc_hist_cov` leaves the package's per-round reach at `smc_cov`). Codex review: round 1 no P1 (P2: `smc_rounds_pmf` domain checks; P3: precision near rho 0; P3: a `None` member in the proof scenario); round 2 no P1 in this branch (its one P1 came from a review diff taken after the base moved), P3 overflow near rho 1; round 3 no P1. Each fix was test-first (HC7c-e). Open: one P3, `smc_rounds_pmf` raises OverflowError above about 1,000 rounds.
+
+## Status
+
+- **S2-3 part 2 (engine):** the malaria engine takes past SMC coverage per unit and year (`smc_hist_cov`), apart from the future coverage `smc_cov`. The past-coverage data from the state-year delivery surveys, and the calibration's use of them, are done outside the repository and come next.
