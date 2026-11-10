@@ -355,6 +355,95 @@ def _self_test_round1(ok, attempt):
        f"PV17 the contract requires the artifact and agreement on the headline ({[len(b or []) for b in bad]})")
 
 
+def _self_test_fixed(ok, attempt):
+    """F6 S2-6: a plan given in full (a unit column of package ids) is evaluated, never solved."""
+    from toolkit.analysis.core import AnalysisBlocked
+    g_ = globals().get      # the functions under test, looked up so a missing one fails its case (no crash)
+    fx = {"id": "given", "type": "fixed_plan", "column": "gc", "text": "the plan as funded"}
+    units = [{"id": f"u{k}", "gc": g} for k, g in enumerate(["s", "n1", "s", "none"], 1)]
+    pk = {"none": frozenset(), "n1": frozenset({"n1"}), "n2": frozenset({"n2"}), "s": frozenset({"s"})}
+    comps = {"n1": {}, "n2": {}, "s": {}}
+    val = lambda pv, us=units, cols=("id", "gc"): attempt(  # noqa: E731
+        validate, {"options": {"components": comps}, "analysis": {"plan_variants": pv}}, set(cols), us, pk, "id")
+    good, e0 = val({"variants": [fx]})
+    bads = [val({"variants": [dict(fx, column="nocol")]}, cols=("id",)),
+            val({"variants": [fx]}, us=[dict(units[0], gc=" "), *units[1:]]),
+            val({"variants": [fx]}, us=[dict(units[0], gc="zz"), *units[1:]]),
+            val({"variants": [fx], "headline": "given"}),
+            val({"variants": [dict(fx, components=["s"])]})]
+    want = ("nocol", "u1", "zz", "cannot be the headline", "unknown key components")
+    ok(e0 is None and good == [] and all(b[1] is None and any(w in x for x in b[0]) for b, w in zip(bads, want)),
+       f"PV18 a fixed plan is validated: a known column, every unit's package known and non-empty, never the "
+       f"headline ({good}, {[b[0] for b in bads]})")
+    A, ben, cost, ms, gr = _toy()
+    for u, g in zip(A.spec.units(), ["s", "n1", "s", "none"]):
+        u["gc"] = g
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms, fx]}
+    plan = A.solve(ben, cost)["choice"]
+    r, e = attempt(run, A, ben, cost, plan, [])
+    f = {x["id"]: x for x in (r or {}).get("variants", [])}.get("given") or {}
+    ok(e is None and f.get("status") == "evaluated" and f.get("plan") == {"u1": "s", "u2": "n1", "u3": "s", "u4": "none"}
+       and abs(f.get("objective", 0) - 7.2) < 1e-9 and abs(f.get("value_lost", 0) - 6.8) < 1e-9
+       and abs(f.get("value_lost_pct", 0) - 100 * 6.8 / 14) < 1e-9 and f.get("units_no_package") == 1,
+       f"PV19 the given plan is evaluated on the point benefits, its value lost against the unconstrained plan by "
+       f"hand ({e!r}, {f.get('objective')}, {f.get('value_lost')})")
+    ok(abs(f.get("cost", 0) - 2.5) < 1e-9 and abs(f.get("cost_minus_budget", 0) - 0.5) < 1e-9
+       and f.get("within_budget") is False and f.get("budget_allocatable") == 2.0
+       and f.get("dollars_by_component") == {"n1": 0.0, "n2": -0.5, "s": 1.0} and f.get("dollars_moved") == 1.0
+       and f.get("units_changed") == 2 and f.get("population_changed") == 200.0,
+       f"PV20 a plan over the budget is reported with its cost against the envelope, not refused; dollars moved and "
+       f"units changing package against the unconstrained plan ({f.get('cost')}, {f.get('dollars_by_component')})")
+    ok(f.get("ineligible_units") == [] and f.get("units_ineligible") == 0 and f.get("uncertainty") is None
+       and "point" in str(f.get("uncertainty_note")),
+       f"PV21 no draws given: the point estimate only, said so ({f.get('uncertainty_note')})")
+    A.feas["feasible"]["u2"]["n1"] = False
+    A.feas["reasons"].setdefault("u2", {})["n1"] = ["n1 not eligible here"]
+    r2, e2 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    f2 = {x["id"]: x for x in (r2 or {}).get("variants", [])}.get("given") or {}
+    ok(e2 is None and f2.get("units_ineligible") == 1 and f2.get("plan", {}).get("u2") == "n1"
+       and f2.get("ineligible_units") == [{"unit": "u2", "package": "n1", "reasons": ["n1 not eligible here"]}],
+       f"PV22 a unit given a package it is not eligible for is reported with why, and kept in the plan ({e2!r}, "
+       f"{f2.get('ineligible_units')})")
+    A.spec.units()[0]["gc"] = "zz"
+    _, e3 = attempt(run, A, ben, cost, plan, [])
+    A.spec.units()[0]["gc"] = ""
+    _, e3b = attempt(g_("given_plan"), A, fx)
+    _, e3c = attempt(g_("given_plan"), A, dict(fx, column="nocol"))
+    ok(all(isinstance(x, ValueError) for x in (e3, e3b, e3c)),
+       f"PV23 an unknown or empty package id, or a missing column, fails closed at evaluation ({e3!r}, {e3b!r}, {e3c!r})")
+    A.spec.units()[0]["gc"] = "s"
+    _, e4 = attempt(run, A, ben, cost, plan, [{"unit": "u2", "package": "n1", "kind": "extrapolation"}])
+    ok(isinstance(e4, AnalysisBlocked), f"PV24 the point corrections guard the given plan ({e4!r})")
+    # draws: the given plan's outcome and cost in each uncertainty draw (UQ.run's on_draw hook)
+    A.outcomes = ["dalys"]
+    D, e5 = attempt(g_("Draws"), A)
+    out = {i: {"y": {k: {"dalys": 10.0 - ben[i][k]} for k in A.pk}} for i in A.ids}
+    tabs = [{i: {k: m * cost[i][k] for k in A.pk} for i in A.ids} for m in (0.8, 1.2)]
+    for t in tabs:
+        attempt(lambda *a: D.add(*a), out, [], t)
+    r6, e6 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D, {"level": 0.9})
+    u6 = ({x["id"]: x for x in (r6 or {}).get("variants", [])}.get("given") or {}).get("uncertainty") or {}
+    af = u6.get("affordability") or {}
+    ok(e5 is None and e6 is None and u6.get("draws") == 2 and abs(u6["averted"]["dalys"]["median"] - 7.2) < 1e-9
+       and af.get("draws_over_budget") == 1 and abs(af["fixed_plan_cost"]["median"] - 2.5) < 1e-9
+       and u6.get("interval") == {"level": 0.9},
+       f"PV25 the given plan's outcome and cost quantiles over the uncertainty draws, as the headline plan's ({e6!r}, "
+       f"{u6})")
+    _, e7 = attempt(lambda *a: D.add(*a), out, [{"unit": "u1", "package": "s", "kind": "clip"}], tabs[0])
+    ok(isinstance(e7, AnalysisBlocked), f"PV26 a draw's corrections on the given plan stop publication ({e7!r})")
+    # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
+    raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
+    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
+           "cost_minus_budget": 0.5}
+    art = {"headline": "unconstrained", "variants": [{"id": "nets", "type": "minimum_service", "status": "solved"}, rec]}
+    pt = {"plan": {}, "headline_variant": None}
+    cf = lambda v: attempt(contract_findings, raw, pt, v)[0]  # noqa: E731
+    ok(cf(art) == [] and cf(dict(art, variants=[dict(art["variants"][0], status="evaluated"), rec]))
+       and cf(dict(art, variants=[art["variants"][0], dict(rec, status="solved")]))
+       and cf(dict(art, variants=[art["variants"][0], {k: x for k, x in rec.items() if k != "ineligible_units"}])),
+       "PV27 the contract: a fixed plan is evaluated, a solved variant is not, and the eligibility report is required")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -429,6 +518,7 @@ def _self_test() -> int:
        f"PV10 the spec's variants are validated ({errs}, {e8!r})")
     ok(validate({"analysis": {}}, set()) == [] if e8 is None else False, "PV11 no plan_variants: nothing to validate")
     _self_test_round1(ok, attempt)
+    _self_test_fixed(ok, attempt)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
