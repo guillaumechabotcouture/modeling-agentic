@@ -17,6 +17,9 @@ block (at most one per unit), not added to each target's variance (F6 S2-3; see 
 is a feasibility rule, not marginal Gaussian implausibility: a target alone may sit up to cutoff (sd_e + sd_bias)
 away (each bound at the cutoff), where integrating the offset out gives cutoff sqrt(sd_e^2 + sd_bias^2); it is
 stricter on contrasts within a block. A spec may weight each group once in the best point (best_point_weighting).
+Survey changes (F6 S2-3b, a diagnostic): Problem.changes pairs two rounds of one survey over one group's targets; the
+report gives the observed and modelled change, their signed difference and z against survey_changes.z_max
+(change_stats; the region's modelled change from the emulators). A shared offset cancels in a same-survey change.
 
 Method (Vernon et al. 2010; Andrianakis et al. 2015): waves of simulation; emulators of every observable; the
 implausibility I = |E[f] - y| / sqrt(V_emulator + V_observation + V_discrepancy) of every target; the
@@ -240,8 +243,12 @@ class Problem:
     same length; may be empty); targets: [Target]; scales: {observable: scale}. groups: a label per unit (figures and
     the best point's weights)."""
 
-    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None):
+    def __init__(self, shared, unit_param, units, targets, features=None, feature_names=None, groups=None,
+                 changes=None):
         self.shared = list(shared)
+        # F6 S2-3b: [{id, survey, from, to, group, rho, terms: [{from: target id, to: target id, w}]}], or an entry
+        # {id, ..., not_computable: reason} (the adapter pairs the rounds and names what cannot be compared)
+        self.changes = [dict(c) for c in changes or []]
         self.unit_param = dict(unit_param) if unit_param else None
         self.units = [str(u) for u in units]
         self.targets = list(targets)
@@ -317,10 +324,39 @@ class Problem:
                 if len(v) > 1]
         return bad
 
+    def _change_problems(self) -> list:
+        bad, tid = [], {t.id: t for t in self.targets}
+        ids = [c.get("id") for c in self.changes]
+        if len(set(ids)) != len(ids):
+            bad.append("changes: repeated ids")
+        for n, c in enumerate(self.changes):
+            w = f"change {c.get('id', n)}"
+            if "not_computable" in c:
+                if not str(c["not_computable"] or "").strip():
+                    bad.append(f"{w}: a not-computable entry states its reason")
+                continue
+            if not (isinstance(c.get("terms"), list) and c["terms"]):
+                bad.append(f"{w}: terms [{{from, to, w}}] or a not_computable reason")
+                continue
+            r = c.get("rho", 0.0)
+            if not (isinstance(r, (int, float)) and -1.0 <= r <= 1.0):
+                bad.append(f"{w}: rho {r!r} must lie in [-1, 1]")
+            for x in c["terms"]:
+                a, b = tid.get(x.get("from")), tid.get(x.get("to"))
+                if a is None or b is None:
+                    bad.append(f"{w}: {x.get('from')} -> {x.get('to')} names an unknown target")
+                elif a.kind != b.kind or a.kind not in ("unit", "group") or a.unit != b.unit:
+                    bad.append(f"{w}: {a.id} -> {b.id}: two unit targets of one unit, or two group targets")
+                elif a.observable == b.observable or a.scale != b.scale:
+                    bad.append(f"{w}: {a.id} -> {b.id}: two rounds (observables) on one scale")
+                elif not (isinstance(x.get("w"), (int, float)) and math.isfinite(x["w"]) and x["w"] > 0):
+                    bad.append(f"{w}: {a.id} -> {b.id}: weight must be > 0")
+        return bad
+
     def problems(self) -> list:
         bad = []
         th = thresholds()["history_matching"]
-        bad += self._bias_problems()
+        bad += self._bias_problems() + self._change_problems()
         for p in self.shared:
             bad += p.problems()
         if len(set(self.names)) != len(self.names):
@@ -549,6 +585,84 @@ class SharedEmulator:
         if not noise:
             v = np.maximum(v - self.tn, 1e-12)
         return m, v
+
+
+def change_stats(terms, targets, modelled, run_var, rho=0.0, z_max=3.0) -> dict:
+    """F6 S2-3b: the change between two rounds over one group's terms [{from, to, w}] (target ids; w a unit's share of
+    the group). Observed and modelled change on the targets' scale (sum of w (to - from)); z = (modelled - observed) / sd.
+    sd: the rounds' sampling errors (correlation rho, as declared), the source offsets with signed coefficients (a block
+    both rounds share cancels, offsets of different sources add) and `run_var`, the modelled change's run noise (paired:
+    one trajectory gives both rounds). Model discrepancy is left out: it is declared per target as a level error, and
+    the change is the check the levels cannot make. Not computable: a missing modelled value, or no declared error."""
+    obs = mod = obs_n = mod_n = vs = vo = vn = 0.0
+    coef, bsd, coef_n = {}, {}, {}
+    for x in terms:
+        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
+        ma, mb = modelled.get(a.id), modelled.get(b.id)
+        if ma is None or mb is None:
+            return {"not_computable": f"no modelled value at the calibrated point for {a.id if ma is None else b.id}"}
+        obs += w * (b.y - a.y)
+        mod += w * (mb - ma)
+        obs_n += w * (b.value - a.value)
+        mod_n += w * (float(inv(mb, b.scale)) - float(inv(ma, a.scale)))
+        vs += w * w * (a.sd_obs ** 2 + b.sd_obs ** 2 - 2.0 * rho * a.sd_obs * b.sd_obs)
+        da, db = float(dinv(a.y, a.scale)), float(dinv(b.y, b.scale))     # the natural scale's error (delta method)
+        vn += w * w * ((da * a.sd_obs) ** 2 + (db * b.sd_obs) ** 2 - 2.0 * rho * da * db * a.sd_obs * b.sd_obs)
+        for t, sg, dt in ((a, -1.0, da), (b, 1.0, db)):
+            if t.bias_key is None:
+                vo += (w * t.sd_bias) ** 2
+                vn += (w * dt * t.sd_bias) ** 2
+            else:
+                coef[t.bias_key] = coef.get(t.bias_key, 0.0) + sg * w
+                coef_n[t.bias_key] = coef_n.get(t.bias_key, 0.0) + sg * w * dt
+                bsd[t.bias_key] = t.sd_bias
+    vo += sum((c * bsd[k]) ** 2 for k, c in coef.items() if abs(c) > 1e-12)
+    vn += sum((c * bsd[k]) ** 2 for k, c in coef_n.items() if abs(c) > 1e-12)
+    vs, run_var = max(vs, 0.0), max(float(run_var), 0.0)
+    sd = math.sqrt(vs + vo + run_var)
+    if not sd > 1e-12:
+        return {"not_computable": "the change has no declared error (no sampling error, and the survey's offset cancels)"}
+    z = (mod - obs) / sd
+    ratio = mod_n / obs_n if obs_n != 0 and abs(obs_n) >= math.sqrt(max(vn, 0.0)) else None
+    word = "decline" if obs_n < 0 else "rise"
+    nums = f"({mod_n:+.3g} against {obs_n:+.3g} observed)"
+    text = (f"the observed change ({obs_n:+.3g}) is within its error of zero; the model's change is {mod_n:+.3g}"
+            if ratio is None else f"the model's change has the opposite sign of the observed one {nums}" if ratio < 0
+            else f"the model's {word} matches the observed one {nums}" if abs(ratio - 1) < 0.005
+            else f"the model's {word} is {100 * (1 - ratio):.0f}% smaller than observed {nums}" if ratio < 1
+            else f"the model's {word} is {100 * (ratio - 1):.0f}% larger than observed {nums}")
+    return {"observed": obs, "modelled": mod, "observed_natural": obs_n, "modelled_natural": mod_n,
+            "observed_natural_sd": math.sqrt(max(vn, 0.0)),
+            "difference": mod - obs, "sd": sd, "sd_parts": {"sampling": math.sqrt(vs), "offset": math.sqrt(vo),
+                                                            "run": math.sqrt(run_var)},
+            "z": z, "flagged": bool(abs(z) > z_max), "ratio": ratio, "text": text}
+
+
+def change_run_var(terms, targets, tn, pair_tn, member_y) -> float:
+    """The modelled change's run noise over the terms (on the targets' scale). tn: {observable: run-noise variance};
+    pair_tn: {(from observable, to observable): the run-noise variance of their difference within one run}, so the
+    covariance of one trajectory's two windows is c = (tn_a + tn_b - pair) / 2. A unit term is paired within its unit.
+    A group target's members are independent runs, each entering the aggregate T(sum w p) with the coefficient
+    w dinv(y_member) / dinv(Y_aggregate) (first order; member_y: {(unit, observable): modelled value on the scale})."""
+    v = 0.0
+    for x in terms:
+        a, b, w = targets[x["from"]], targets[x["to"]], float(x["w"])
+        ta, tb = tn[a.observable], tn[b.observable]
+        c = 0.5 * (ta + tb - pair_tn[(a.observable, b.observable)])
+        if a.kind == "unit":
+            v += w * w * (ta + tb - 2.0 * c)
+            continue
+        k = {}
+        for t in (a, b):
+            ws = sum(t.weights.values())
+            pbar = sum(q / ws * float(inv(member_y[(u, t.observable)], t.scale)) for u, q in t.weights.items())
+            dY = float(dinv(tr(pbar, t.scale), t.scale))
+            k[t.id] = {u: q / ws * float(dinv(member_y[(u, t.observable)], t.scale)) / max(dY, 1e-300)
+                       for u, q in t.weights.items()}
+        for u in set(a.weights) | set(b.weights):
+            ka, kb = k[a.id].get(u, 0.0), k[b.id].get(u, 0.0)
+            v += w * w * (kb * kb * tb + ka * ka * ta - 2.0 * ka * kb * c)
+    return max(v, 0.0)
 
 
 def standardised_errors(sim, mean, var) -> np.ndarray:
@@ -1882,6 +1996,7 @@ class HistoryMatch:
                 "n_units": len(P.units), "n_matched": sum(1 for u in units.values() if u["matched"]),
                 "targets": tsum, "unit_targets": {u: [t.describe() for t in P.unit_targets(u)] for u in P.units},
                 "verification": ver, "bias": bias, "bias_components": bcomp,
+                "survey_changes": self._survey_changes(ver, best_c, zbest, smp),
                 "weighting": {"best_point": self.th.get("best_point_weighting", "per_unit"),
                               "bias_draws": int(self.th["bias_draws"])},
                 "waves": self.waves, "simulated_at_boundary": dict(self.boundary),
@@ -1889,6 +2004,96 @@ class HistoryMatch:
                               "shared": {ob: {"kernel": str(e.gp.kernel_)} for ob, e in self.em["shared"].items()}},
                 "thresholds": {"history_matching": self.th, "emulator": self.eth, "blocking": self.bth},
                 "sample": smp}
+
+    # ----------------------------------------------------------------------- survey changes (F6 S2-3b)
+    def _pair_noise(self, oa, ob) -> float:
+        """The run-noise variance of ob - oa within one run: the nugget of an emulator of the paired difference itself,
+        so the covariance of the two windows of one trajectory is in it (Var(b) + Var(a) - 2 Cov(a, b))."""
+        cache = self.__dict__.setdefault("_pair_tn", {})
+        if (oa, ob) not in cache:
+            rows = [r for r in self.data.unit if oa in r["obs"] and ob in r["obs"]]
+            S = np.array([r["s"] for r in rows])
+            T = np.array([r["t"] for r in rows]).reshape(len(rows), self.p)
+            d = tr([r["obs"][ob] for r in rows], self.P.scales[ob]) - tr([r["obs"][oa] for r in rows], self.P.scales[oa])
+            em = UnitEmulator(self.p, self.P.features, float(self.eth["ridge"])).fit([r["unit"] for r in rows], S, T, d)
+            cache[(oa, ob)] = float(em.tn)
+        return cache[(oa, ob)]
+
+    def _change_run_var(self, terms, best_c, zbest) -> float:
+        """change_run_var with this calibration's emulators; group members at their emulator means at the best point."""
+        if not self.th["include_run_noise"]:
+            return 0.0
+        ts = [self.tid[x[k]] for x in terms for k in ("from", "to")]
+        tn = {t.observable: self.em["unit"][t.observable].tn for t in ts}
+        pair = {(self.tid[x["from"]].observable, self.tid[x["to"]].observable): self._pair_noise(
+            self.tid[x["from"]].observable, self.tid[x["to"]].observable) for x in terms}
+        C = np.atleast_2d(self.state["C"][best_c]).reshape(1, self.p)
+        my = {(u, t.observable): float(self.em["unit"][t.observable].predict(u, [self.zg[zbest[u]]], C,
+                                                                             noise=False)[0][0])
+              for t in ts if t.kind == "group" for u in t.weights}
+        return change_run_var(terms, self.tid, tn, pair, my)
+
+    def _change_modelled(self, tid, ver, best_c, zbest):
+        """A target's modelled value on its scale at the best point: the engine's verification run, else the emulator."""
+        t = self.tid[tid]
+        if ver is not None:
+            if t.kind == "unit":
+                row = next((x for x in (ver["units"].get(t.unit) or {}).get("targets") or [] if x["target"] == tid), None)
+                v = None if row is None else row["simulated"]
+            else:
+                v = (ver["targets"].get(tid) or {}).get("simulated")
+            return None if v is None else float(tr(v, t.scale))
+        if t.kind == "unit":
+            return float(self.em["unit"][t.observable].predict(t.unit, [self.zg[zbest[t.unit]]], np.atleast_2d(
+                self.state["C"][best_c]).reshape(1, self.p), noise=False)[0][0])
+        return float(self.state["targets"][tid]["mean"][best_c])
+
+    def _region_change(self, terms, smp):
+        """The modelled change over the region sample's rows (emulator means): its 2.5%, 50% and 97.5% points."""
+        R, col = np.asarray(smp["rows"], float), {n: i for i, n in enumerate(smp["names"])}
+        T = np.column_stack([(R[:, j] - p.lo) / (p.hi - p.lo) for j, p in enumerate(self.P.shared)]) if self.p else \
+            np.zeros((len(R), 0))
+        lo, hi = self.P.unit_param["lo"], self.P.unit_param["hi"]
+        cache = {}
+
+        def mean(u, ob):
+            if (u, ob) not in cache:
+                cache[(u, ob)] = self.em["unit"][ob].predict(u, (R[:, col[f"z:{u}"]] - lo) / (hi - lo), T, noise=False)[0]
+            return cache[(u, ob)]
+
+        def val(tid):
+            t = self.tid[tid]
+            if t.kind == "unit":
+                return mean(t.unit, t.observable)
+            ws = sum(t.weights.values())
+            return tr(sum(w / ws * inv(mean(u, t.observable), t.scale) for u, w in t.weights.items()), t.scale)
+        D = sum(float(x["w"]) * (val(x["to"]) - val(x["from"])) for x in terms)
+        return [float(v) for v in np.percentile(D, [2.5, 50, 97.5])]
+
+    def _survey_changes(self, ver, best_c, zbest, smp) -> dict:
+        """Each declared change pair at the best point (change_stats), with its modelled range over the region."""
+        zmax = float(thresholds()["survey_changes"]["z_max"])
+        pairs = []
+        for c in self.P.changes:
+            base = {k: c[k] for k in ("id", "survey", "from", "to", "group", "by") if k in c}
+            if "not_computable" in c:
+                pairs.append(dict(base, not_computable=str(c["not_computable"])))
+                continue
+            mod = {x[k]: self._change_modelled(x[k], ver, best_c, zbest) for x in c["terms"] for k in ("from", "to")}
+            st = change_stats(c["terms"], self.tid, mod, self._change_run_var(c["terms"], best_c, zbest), float(c.get("rho", 0.0)),
+                              zmax)
+            if "z" in st:
+                st["basis"] = "engine verification at the best point" if ver else "emulator mean at the best point"
+                if smp and self.P.unit_param:
+                    st["modelled_region"] = dict(zip(("q025", "median", "q975"), self._region_change(c["terms"], smp)))
+            pairs.append(dict(base, n_terms=len(c["terms"]), rho=float(c.get("rho", 0.0)), **st))
+        comp = [p for p in pairs if "z" in p]
+        return {"status": "computed" if comp else "not_computable", "z_max": zmax,
+                **({} if comp else {"reason": "; ".join(sorted({p["not_computable"] for p in pairs}))
+                                    or "no change pairs are declared"}),
+                "statistic": "z = (modelled change - observed change) / sd on the targets' scale; sd from sampling "
+                             "(as declared), offsets (shared ones cancel) and paired run noise, not discrepancy",
+                "pairs": pairs, "flagged": [p["id"] for p in comp if p["flagged"]]}
 
     def sample(self, n: int, seed: int | None = None) -> dict:
         """n rows over the region: shared values drawn from the accepted candidates by prior weight, each unit's
@@ -2825,6 +3030,109 @@ def _self_test() -> int:
            f"HM40 each aggregate's reported prediction lies within its reported implausibility of its target "
            f"({ {k: (round(t[k]['modelled_at_best'], 4), round(t[k]['implausibility_at_best'], 3)) for k in t} })")
     safe(hm40, "HM40")
+
+    def change_pairs(P, a="w0", b="w1"):
+        """One change pair per group of P (P.groups): the mean over the group's units of round b minus round a."""
+        by = {}
+        for u in P.units:
+            by.setdefault(P.groups[u], []).append(u)
+        return [{"id": f"s:{a}->{b}:{g}", "survey": "s", "from": a, "to": b, "group": g, "rho": 0.0,
+                 "terms": [{"from": f"{u}:{a}", "to": f"{u}:{b}", "w": 1.0 / len(us)} for u in us]}
+                for g, us in by.items()]
+
+    def hm41():          # F6 S2-3b: the change between two rounds of one survey, by group
+        off = {"A": 0.4, "B": -0.5, "C": 0.3}           # one offset per (survey, group), shared by both rounds
+        chg = {"A": 0.4, "B": 0.4, "C": -0.2}           # C declines while the model (one shared e) rises
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.2 + off[g], 0.2 + chg[g] + off[g])  # noqa: E731
+        P, sim = gtoy({"A": 8, "B": 8, "C": 2}, f0, f1, obs, sd=0.05, md=0.25, sd_b=0.5,
+                      key=lambda ob, g: f"s|{g}", shared=[Param("e", 0.0, 1.0, "uniform", None, "toy")])
+        P.changes = change_pairs(P)
+        r = calibrate(P, sim, seed=4, waves=1, log=q, candidates_log2=9, points_per_unit=10)
+        sc = {x["group"]: x for x in (r.get("survey_changes") or {}).get("pairs") or []}
+        ok(set(sc) == {"A", "B", "C"} and sc["C"]["flagged"] and sc["C"]["z"] > 0 and sc["C"]["ratio"] < 0
+           and "opposite" in sc["C"]["text"],
+           f"HM41a a group whose observed change has the opposite sign of the model's is flagged, with the direction "
+           f"({ {g: (x.get('z'), x.get('flagged'), x.get('text')) for g, x in sc.items()} })")
+        ok(all(not sc[g]["flagged"] and sc[g]["sd_parts"]["offset"] == 0.0 and sc[g]["sd"] < 0.06 for g in "AB"),
+           f"HM41b the shared offset (sd 0.5) cancels in the same-survey change: it adds nothing to the change's sd "
+           f"({ {g: (sc[g].get('sd'), sc[g].get('sd_parts')) for g in 'AB' if g in sc} })")
+        ok((r.get("survey_changes") or {}).get("flagged") == ["s:w0->w1:C"]
+           and (r.get("survey_changes") or {}).get("z_max") == 3.0,
+           f"HM41c the report lists the flagged pairs and the threshold ({r.get('survey_changes', {}).get('flagged')})")
+    safe(hm41, "HM41")
+
+    def hm42():          # the model's change comes from one trajectory: its run noise is paired, not summed
+        f0 = lambda u, z, th: z  # noqa: E731
+        f1 = lambda u, z, th: z + th["e"]  # noqa: E731
+        obs = lambda u, g: (0.0, 0.5)  # noqa: E731
+        P, _ = gtoy({"A": 6, "B": 6}, f0, f1, obs, sd=0.05, md=0.3, shared=[Param("e", 0.0, 1.0, "uniform", None, "t")])
+        P.changes = change_pairs(P)
+
+        def sim(pts):          # one noise draw (sd 0.2) moves both windows of a run together
+            out = []
+            for p in pts:
+                n = np.random.default_rng(p["seed"]).normal(0, 0.2)
+                out.append({"w0": _expit(p["z"] + n), "w1": _expit(p["z"] + p["theta"]["e"] + n)})
+            return out
+        h = HistoryMatch(P, sim, 6, q, candidates_log2=9, points_per_unit=12)
+        r = h.run(1)
+        sc = {x["group"]: x for x in (r.get("survey_changes") or {}).get("pairs") or []}
+        tn = h.em["unit"]["w0"].tn + h.em["unit"]["w1"].tn
+        pn = h._pair_noise("w0", "w1")
+        ok(tn > 0.03 and pn < 0.1 * tn and all(x["sd_parts"]["run"] < 0.05 for x in sc.values()) and len(sc) == 2,
+           f"HM42 shared run noise cancels in the modelled change (window noise {tn:.4f}, paired {pn:.5f}, run sd "
+           f"{ {g: x.get('sd_parts', {}).get('run') for g, x in sc.items()} })")
+    safe(hm42, "HM42")
+
+    def hm43():          # the change arithmetic, signed offsets and fail-closed cases
+        T_ = lambda i, v, sd, b=0.0, k=None, u="u0", ob="w0": Target(i, "unit", ob, v, "identity", sd_obs=sd,  # noqa
+                                                                       sd_bias=b, unit=u, source="t", bias_key=k)
+        tg = {"a": T_("a", 0.5, 0.01, 0.5, "s|g"), "b": T_("b", 0.3, 0.01, 0.5, "s|g", ob="w1"),
+              "c": T_("c", 0.5, 0.01, 0.5, None), "d": T_("d", 0.5, 0.0, 0.5, "s|g"),
+              "e": T_("e", 0.3, 0.0, 0.5, "s|g", ob="w1")}
+        one = [{"from": "a", "to": "b", "w": 1.0}]
+        x = change_stats(one, tg, {"a": 0.5, "b": 0.4}, 0.0, rho=0.0, z_max=3.0)
+        ok(abs(x["sd"] - math.sqrt(2) * 0.01) < 1e-9 and x["sd_parts"]["offset"] == 0.0 and x["flagged"]
+           and abs(x["ratio"] - 0.5) < 1e-9 and "decline is 50% smaller than observed" in x["text"],
+           f"HM43a one survey's offset cancels; the model's decline is half the observed one ({x})")
+        x = change_stats([{"from": "c", "to": "b", "w": 1.0}], tg, {"c": 0.5, "b": 0.4}, 0.0, z_max=3.0)
+        ok(abs(x["sd_parts"]["offset"] - math.sqrt(0.5)) < 1e-9 and not x["flagged"],
+           f"HM43b offsets of two sources add (their own sd and the other block's) ({x.get('sd_parts')})")
+        x = change_stats(one, tg, {"a": 0.5, "b": 0.4}, 0.0, rho=0.5, z_max=3.0)
+        ok(abs(x["sd_parts"]["sampling"] - 0.01) < 1e-9,
+           f"HM43c a declared sampling correlation between the rounds enters the change ({x.get('sd_parts')})")
+        x = change_stats([{"from": "d", "to": "e", "w": 1.0}], tg, {"d": 0.5, "e": 0.4}, 0.0, z_max=3.0)
+        y = change_stats(one, tg, {"a": 0.5, "b": None}, 0.0, z_max=3.0)
+        ok("not_computable" in x and "not_computable" in y,
+           f"HM43d no declared error in the change, or no modelled value, is not computable ({x}, {y})")
+        units = ["u0"]
+        bad = [("an unknown target", [{"id": "p", "terms": [{"from": "u0:w0", "to": "nope", "w": 1.0}]}]),
+               ("one observable twice", [{"id": "p", "terms": [{"from": "u0:w0", "to": "u0:w0", "w": 1.0}]}]),
+               ("no terms and no reason", [{"id": "p", "terms": []}])]
+        for why, ch in bad:
+            P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, units,
+                        [T_("u0:w0", 0.5, 0.1), T_("u0:w1", 0.4, 0.1, ob="w1")], changes=ch)
+            ok(any("change" in b for b in P.problems()), f"HM43e refused: {why} ({P.problems()})")
+    safe(hm43, "HM43")
+
+    def hm44():          # Codex r1 P2-1, P2-6: group run noise on the aggregate's scale; ratio and text on one scale
+        g = lambda i, ob, ws: Target(i, "group", ob, 5.0, "log", sd_obs=0.01, weights=ws, source="t")  # noqa: E731
+        ws = {"u0": 1.0, "u1": 1.0}
+        tg = {"A": g("A", "w0", ws), "B": g("B", "w1", ws)}
+        y = {("u0", "w0"): math.log(1.0), ("u1", "w0"): math.log(9.0), ("u0", "w1"): math.log(9.0),
+             ("u1", "w1"): math.log(1.0)}
+        v = change_run_var([{"from": "A", "to": "B", "w": 1.0}], tg, {"w0": 0.01, "w1": 0.01}, {("w0", "w1"): 0.0}, y)
+        ok(abs(v - 0.0128) < 1e-4, f"HM44a members' paired noise through the log aggregate (0.0128, got {v:.5f})")
+        L = lambda i, ob, u, x: Target(i, "unit", ob, x, "log", sd_obs=0.01, unit=u, source="t")  # noqa: E731
+        tl = {"a0": L("a0", "w0", "u0", 1.0), "b0": L("b0", "w1", "u0", 2.0), "a1": L("a1", "w0", "u1", 100.0),
+              "b1": L("b1", "w1", "u1", 50.0)}
+        terms = [{"from": "a0", "to": "b0", "w": 0.5}, {"from": "a1", "to": "b1", "w": 0.5}]
+        x = change_stats(terms, tl, {k: math.log(t.value) for k, t in tl.items()}, 0.0, z_max=3.0)
+        ok(x["ratio"] is not None and abs(x["ratio"] - 1.0) < 1e-9 and "within its error" not in x["text"],
+           f"HM44b a natural-scale change of -24.5 is not called within its error of zero ({x.get('text')})")
+    safe(hm44, "HM44")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
