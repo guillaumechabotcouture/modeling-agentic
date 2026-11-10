@@ -997,6 +997,13 @@ def _self_test_variants(ok, q):
                  "variant.given.value_lost", "variant.given.averted_median", "variant.given.cost_median"}
         ok(need9 <= cs and "evaluated as given" in txt,
            f"PV-R10 claims and results.md report the given plan: {sorted(need9 - cs)}")
+        afv = {k: ((x.get("uncertainty") or {}).get("affordability") or {}) for k, x in (("service", sv), ("one_b", ob))}
+        need11 = {f"variant.{k}.{n}" for k in afv for n in ("cost_median", "draws_over_budget")}
+        ok(all(a.get("draws") == 2 and a.get("budget_allocatable") == A.budget for a in afv.values()) and need11 <= cs
+           and "draws over budget [CLAIM:" not in txt and txt.count("draws over budget") >= 3,
+           f"PV-R11 each solved variant's cost is counted against the budget over the uncertainty draws, with claims "
+           f"and a line in results.md ({ {k: (a.get('draws_over_budget'), a.get('draws')) for k, a in afv.items()} }, "
+           f"{sorted(need11 - cs)})")
         ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")
         _resign(d, lambda x: x["analysis"]["plan_variants"].update(headline="service"))
         try:

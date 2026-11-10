@@ -560,6 +560,35 @@ def _self_test_fixed(ok, attempt):
        f"{u6})")
     _, e7 = attempt(lambda *a: D.add(*a), out, [{"unit": "u1", "package": "s", "kind": "clip"}], tabs[0])
     ok(isinstance(e7, AnalysisBlocked), f"PV26 a draw's corrections on the given plan stop publication ({e7!r})")
+    # review A6: a solved variant's cost in each draw too, judged against the spec's affordability rule
+    A.spec.raw["uncertainty"] = {"affordability": {"max_share_over_budget": 0.25}}
+    sp, e8 = attempt(g_("solved_plans"), A, ben, cost)
+    D2, e9 = attempt(g_("Draws"), A, sp)
+    for t in tabs:
+        attempt(lambda *a: D2.add(*a), out, [], t)
+    r8, e10 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D2, {"level": 0.9})
+    v8 = {x["id"]: x for x in (r8 or {}).get("variants", [])}
+    n8 = v8.get("nets") or {}
+    a8 = (n8.get("uncertainty") or {}).get("affordability") or {}
+    over8 = sum(m * n8.get("cost", 0.0) > A.budget * (1 + 1e-9) for m in (0.8, 1.2))
+    ok(e8 is None and e9 is None and e10 is None and n8.get("status") == "solved" and (sp or {}).get("nets") == n8.get("plan")
+       and a8.get("draws") == 2 and a8.get("draws_over_budget") == over8 == 1 and a8.get("rule_met") is False
+       and ((v8.get("given") or {}).get("uncertainty") or {}).get("affordability", {}).get("rule_met") is None,
+       f"PV28 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
+       f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
+       f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
+    A.budget = 1.0
+    sp9, e11 = attempt(g_("solved_plans"), A, ben, cost)
+    A.budget = 2.0
+    ok(e11 is None and sp9 == {},
+       f"PV29 a variant the budget makes infeasible has no plan to follow over the draws ({e11!r}, {sp9})")
+    D3, _ = attempt(g_("Draws"), A, {"nets": {i: "none" for i in A.ids}})
+    for t in tabs:
+        attempt(lambda *a: D3.add(*a), out, [], t)
+    _, e12 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D3, {"level": 0.9})
+    ok(isinstance(e12, RuntimeError) and "nets" in str(e12),
+       f"PV30 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
+    del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
     rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
