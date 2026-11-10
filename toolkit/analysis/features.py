@@ -59,8 +59,9 @@ def encode(f: dict, v) -> float:
     """One number from an attribute value; ValueError when the encoding cannot read it."""
     e = f["encoding"]
     if e == "equals":
-        if isinstance(v, (list, dict)):
-            raise ValueError(f"equals needs one value, got {v!r}")
+        for what, x in (("category", f.get("value")), ("value", v)):     # Codex r1 P1-2: both operands checked
+            if not (_finite(x) or (isinstance(x, str) and x.strip())):
+                raise ValueError(f"equals needs a finite number or a non-blank text as its {what}, got {x!r}")
         same = (float(v) == float(f["value"])) if _finite(v) and _finite(f["value"]) else \
             str(v).strip() == str(f["value"]).strip()
         return 1.0 if same else 0.0

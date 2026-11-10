@@ -391,9 +391,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             "cost_floors": _acosts().draw_floor_summary(floors),
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if "emulator" in D.src and getattr(A.model, "error_floors", None) is not None:   # F6 S2-4
-        data["emulator_error_floors"] = {"note": "per (cost output: package), unit values floored at zero after the "
+        data["emulator_error_floors"] = {"note": "{cost output: {package: n}}, unit values floored at zero after the "
                                                  "drawn emulator error, over every evaluation with that error",
-                                         "counts": dict(A.model.error_floors)}
+                                         "counts": {k: dict(v) for k, v in A.model.error_floors.items()}}
     if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
         data["budget_planned"] = float(A.plan_budget)
     if prov is not None:

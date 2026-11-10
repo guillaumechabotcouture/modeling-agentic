@@ -269,11 +269,11 @@ class EmulatorModel:
             res.append(self.T[("bw", o, P)][ho] - self.gps[("bw", o, P)].predict(Xh))
         for P in self.pops:    # F6 S2-4: the comparator burden and every cost output too, from the same points
             for o in self.outcomes:
-                cols.append(("base", P, o))
+                cols.append(("emu", "base", P, o))    # four parts: never a reduction's or a window's key
                 res.append(self.T[("base", P, o)][ho] - self.gps[("base", P, o)].predict(Xh))
         for name in self.cost_outputs:
             for k in self.packages:
-                cols.append(("cost", name, k))
+                cols.append(("emu", "cost", name, k))
                 res.append(self.T[("cost", name, k)][ho] - self.gps[("cost", name, k)].predict(Xh))
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
@@ -320,7 +320,7 @@ class EmulatorModel:
             popv = np.array([float(u[pm["column"]]) for u in rows])
             for o in self.outcomes:
                 lb = self.gps[("base", P, o)].predict(X)
-                b = np.exp(lb + E[:, self.error.col[("base", P, o)]] if E is not None else lb)
+                b = np.exp(lb + E[:, self.error.col[("emu", "base", P, o)]] if E is not None else lb)
                 for j in range(n):
                     y[j]["y"][self.comp][o] = y[j]["y"][self.comp].get(o, 0.0) + float(b[j]) * popv[j]
                 for k in self.packages:
@@ -343,10 +343,11 @@ class EmulatorModel:
                     ev.append({"unit": ids[j], "package": k, "kind": "cost_output_floor", "output": name,
                                "value": float(t[j])})
                 if E is not None:     # F6 S2-4: a drawn error below zero is floored and counted, not a correction
-                    t = t + E[:, self.error.col[("cost", name, k)]]
+                    t = t + E[:, self.error.col[("emu", "cost", name, k)]]
                     nf = int(np.sum(t < 0))
                     if nf:
-                        self.error_floors[f"{name}:{k}"] = self.error_floors.get(f"{name}:{k}", 0) + nf
+                        fl = self.error_floors.setdefault(name, {})
+                        fl[k] = fl.get(k, 0) + nf
                 t = np.maximum(t, 0.0)
                 for j in range(n):
                     y[j]["cost"][k][name] = float(t[j]) * tot[j]
@@ -392,8 +393,8 @@ class EmulatorError:
         self.cols = list(cols)
         self.col = {c: j for j, c in enumerate(self.cols)}
         if len(self.col) != len(self.cols):
-            raise ValueError("emulator error: two residual columns share a key (a population group named base, cost "
-                             "or bw?)")
+            raise ValueError("emulator error: two residual columns share a key (a population group named bw whose "
+                             "package and outcome names match a burden-window column?)")
         self.R = np.asarray(R, float)
         self.H = self.R.shape[0]
         self.m = self.R.mean(0)
@@ -416,13 +417,15 @@ class EmulatorError:
         if live.shape[1] > 1:
             C = np.corrcoef(live.T)
             corr = float(np.median(C[~np.eye(C.shape[0], dtype=bool)]))
-        kind = {"base": "comparator", "cost": "cost", "bw": "burden_window"}
+        def kind(c):
+            return {"base": "comparator", "cost": "cost"}[c[1]] if len(c) == 4 else \
+                "burden_window" if c[0] == "bw" else "reduction"
         by_q = {}
         for c in self.cols:
-            by_q[kind.get(c[0], "reduction")] = by_q.get(kind.get(c[0], "reduction"), 0) + 1
-        pair = [np.corrcoef(self.R[:, self.col[c]], self.R[:, self.col[("base", c[0], c[1])]])[0, 1] for c in self.cols
-                if c[0] not in kind and ("base", c[0], c[1]) in self.col and s[self.col[c]] > 0
-                and s[self.col[("base", c[0], c[1])]] > 0]
+            by_q[kind(c)] = by_q.get(kind(c), 0) + 1
+        pair = [np.corrcoef(self.R[:, self.col[c]], self.R[:, self.col[b]])[0, 1] for c in self.cols
+                for b in [("emu", "base", c[0], c[1])] if kind(c) == "reduction" and b in self.col
+                and s[self.col[c]] > 0 and s[self.col[b]] > 0]
         return {"model": "common (population-mean, centred on the signed mean residual) plus per-unit components from "
                          "the held-out residual vectors",
                 "columns_by_quantity": by_q,
