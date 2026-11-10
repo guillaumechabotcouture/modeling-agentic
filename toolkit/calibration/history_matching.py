@@ -350,6 +350,9 @@ class Problem:
                     sorted(map(tuple, kinds.values())) != [("group",), ("unit",)]:
                 bad.append(f"{w}: one-sided terms are for a group round against a unit round only (two rounds of "
                            "one kind pair within a term, so their sampling correlation applies)")
+            if any((x.get("from") is None) != (x.get("to") is None) for x in c["terms"]) and r not in (0, 0.0):
+                bad.append(f"{w}: a group round against a unit round combines their sampling errors as independent; "
+                           f"a sampling correlation ({r}) cannot apply")
             for x in c["terms"]:
                 a, b = tid.get(x.get("from")), tid.get(x.get("to"))
                 if (x.get("from") is None) != (x.get("to") is None):        # S2-3c: one side of a mixed pair

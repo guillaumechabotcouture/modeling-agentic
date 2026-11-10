@@ -710,8 +710,11 @@ def _mixed_pairs(base, a, b, ch, rows, reg, built, rho) -> list:
         uby = ut.get("bias_by") if ut.get("bias_by") not in (None, gby) else uby
         return [dict(base, not_computable=f"the groups do not match: the unit round {ut['id']} is grouped by {uby}, the "
                                           f"group round {gt['id']} by {gby}")]
-    note = (f"the unit round is aggregated with the group round's weights ({gt.get('weights')}), not changes.weights "
-            f"({ch['weights']})" if ch.get("weights") and ch["weights"] != gt.get("weights") else None)
+    notes = ([f"the unit round is aggregated with the group round's weights ({gt.get('weights')}), not changes.weights "
+              f"({ch['weights']})"] if ch.get("weights") and ch["weights"] != gt.get("weights") else []) + (
+        [f"changes.sampling_correlation ({rho:g}) does not apply: the group round's and the unit round's sampling "
+         "errors are combined as independent"] if rho else [])
+    note, rho = "; ".join(notes) or None, 0.0
     gg = {str(getattr(v, "group", "")): v for v in built.values() if v.kind == "group"
           and getattr(v, "spec_id", None) == gt["id"]}
     out = []
