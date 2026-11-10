@@ -245,6 +245,49 @@ def contract_findings(raw: dict, point: dict, pv) -> list[str]:
         h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
         if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
             out.append(f"the headline plan is not the solved plan of variant {hv}")
+    return out + _affordability_findings(raw, pv, types)
+
+
+def _affordability_findings(raw: dict, pv: dict, types: dict) -> list[str]:
+    """Codex r1 on A6: each variant's affordability record agrees with its own per-draw costs, the spec's rule (a
+    solved variant) or no rule (a fixed plan), one budget and one draw count across variants; when any variant has
+    draws, every solved variant has them. A consistent `rule_met: false` is a result, not a finding."""
+    rule = ((raw.get("uncertainty") or {}).get("affordability") or None)
+    recs = [x for x in pv.get("variants") or [] if isinstance(x, dict)]
+    drawn = [x for x in recs if x.get("uncertainty")]
+    if not drawn:
+        return []
+    out, budgets, counts = [], set(), set()
+    for x in recs:
+        vid, u = x.get("id"), x.get("uncertainty")
+        if not u:
+            if x.get("status") == "solved":
+                out.append(f"plan variant {vid}: solved, but has no uncertainty draws while other variants do")
+            continue
+        a = u.get("affordability") if isinstance(u, dict) else None
+        c = a.get("per_draw_cost") if isinstance(a, dict) else None
+        if not isinstance(c, list) or not c or not all(isinstance(v, (int, float)) for v in c):
+            out.append(f"plan variant {vid}: no per-draw cost in its affordability record")
+            continue
+        b = a.get("budget_allocatable")
+        if not isinstance(b, (int, float)):
+            out.append(f"plan variant {vid}: no allocatable budget in its affordability record")
+            continue
+        over = sum(v > float(b) * (1 + 1e-9) for v in c)
+        want_rule = None if types.get(vid) == "fixed_plan" else rule
+        met = None if not want_rule else over / len(c) <= float(want_rule["max_share_over_budget"]) + 1e-12
+        if not (u.get("draws") == a.get("draws") == len(c)):
+            out.append(f"plan variant {vid}: draw counts disagree ({u.get('draws')}, {a.get('draws')}, {len(c)} costs)")
+        if a.get("draws_over_budget") != over or abs(float(a.get("share_over_budget") or 0) - over / len(c)) > 1e-12:
+            out.append(f"plan variant {vid}: draws over budget are not its per-draw costs' ({over} of {len(c)})")
+        if (a.get("rule") or None) != (dict(want_rule) if want_rule else None) or a.get("rule_met") is not met:
+            out.append(f"plan variant {vid}: rule or rule_met is not the spec's rule applied to its draws "
+                       f"({a.get('rule')}, {a.get('rule_met')!r}; expected {want_rule}, {met!r})")
+        budgets.add(float(b))
+        counts.add(len(c))
+    if len(budgets) > 1 or len(counts) > 1:
+        out.append(f"plan variants: affordability records use different budgets {sorted(budgets)} or draw counts "
+                   f"{sorted(counts)}")
     return out
 
 
@@ -304,6 +347,7 @@ class Draws:
         self.A, self.n = A, 0
         self.plans = {v["id"]: given_plan(A, v) for v in fixed_variants(A.spec.raw)}
         self.solved = {k: dict(p) for k, p in (solved or {}).items()}
+        self.follows_solved = solved is not None      # Codex r1: then every variant run() solves must be here
         self.plans.update(self.solved)
         self.y = {k: {o: [] for o in A.outcomes} for k in self.plans}
         self.cost = {k: [] for k in self.plans}
@@ -380,6 +424,9 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
                    **{k: m[k] for k in MOVES})
+        if draws is not None and draws.n > 0 and draws.follows_solved and v["id"] not in draws.solved:
+            # Codex r1 P1: its pre-draw solve failed and this one succeeded, so no draw followed (or guarded) it
+            raise RuntimeError(f"plan variant {v['id']}: solved here but not followed over the uncertainty draws")
         if draws is not None and v["id"] in draws.solved:     # its cost and outcome over the uncertainty draws
             if draws.solved[v["id"]] != dict(vp):
                 raise RuntimeError(f"plan variant {v['id']}: the uncertainty draws followed another plan than its "
