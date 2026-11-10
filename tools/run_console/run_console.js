@@ -1,7 +1,7 @@
 // The run console page script (served by run_console.py at /run_console.js; the CSP allows no inline script).
 "use strict";
 const TOKEN = document.querySelector('meta[name="console-token"]').content;
-const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null, loadSeq: 0, loading: false };
+const S = { runs: [], run: null, runId: null, filter: null, anchor: null, verdict: null, meta: null, live: false, liveTimer: null, tab: "runs", view: "stream", cmp: null, loadSeq: 0, loading: false, drawn: null, drawnNode: null, sig: null, refs: [0, 0], toBottom: false };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const unesc = (s) => String(s).replace(/&(amp|lt|gt|quot|#39);/g, (m, k) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" }[k]));
@@ -12,7 +12,7 @@ const REFS = {};
 let REF_N = 0;
 function ref(obj) { const k = "r" + (++REF_N); REFS[k] = obj; return k; }
 const getRef = (k) => REFS[k] || {};
-let TOG_N = 0;
+const kid = (...p) => p.join("-").replace(/[^A-Za-z0-9_-]+/g, "_");   // a toggle's id, the same on every redraw, so a refresh keeps it open
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 4000); }
 // Errors are never swallowed: a failed fetch or render shows one line at the top of the page.
 function fail(where, e) { $("banner-text").textContent = `${where} failed: ${e && e.message ? e.message : e}`; $("banner").hidden = false; console.error(where, e); }
@@ -30,6 +30,8 @@ async function api(path, body) {
   return j;
 }
 const q = (o) => Object.entries(o).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+const HASH = new URLSearchParams(String(location.hash || "").slice(1));   // the address names the run and the view
+function setHash() { if (typeof history !== "undefined" && history.replaceState && S.runId) history.replaceState(null, "", "#" + q({ run: S.runId, view: S.view })); }
 
 // ---- words: stage labels, run state, short title, times
 const STAGE = { SPEC: "Spec", SIGN: "Sign", EVIDENCE: "Evidence", ENGINE_CHOICE: "Engine", CONFIGURE: "Configure", ANALYZE: "Analyze",
@@ -78,7 +80,7 @@ function bench(text) {     // benchmark ids in run text, defined by the run's en
   return esc(text).replace(/\bB\d+[a-z]?\b/g, (id) => B[id] ? `<span class="term" tabindex="0" title="${esc(`${id}: ${B[id].metric || ""}. Role ${String(B[id].role || "?").replace("_", " ")}; target ${B[id].target} (band ${(B[id].band || []).join("–")}); engine ${B[id].computed}; ${String(B[id].status || "").replace(/_/g, " ")}.`)}">${id}</span>` : id);
 }
 const clip = (t, n) => (t.length <= n ? t : t.slice(0, n).replace(/\s+\S*$/, "") + "…");
-const ctx = (what, needs) => `<div class="ctx">${what} <b>Needs you: ${needs}</b></div>`;
+const ctx = (what, needs) => `<div class="ctx">${what} <span class="nd${/^yes/.test(needs) ? " yes" : ""}">Needs you: ${needs}</span></div>`;
 const fmtS = (s) => s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : s + " s";
 
 // ---- markdown (small, local) with [[file#anchor]] citations
@@ -138,7 +140,11 @@ function renderLoaded() {
   renderSync();
   if (S.tab === "runs") renderRuns();
   const first = ((S.meta.projects || [])[0] || {}).lineage || [];
-  if (!S.runId && S.runs.length) selectRun(first.length ? first[first.length - 1] : S.runs[0].id);
+  if (!S.runId && S.runs.length) {
+    const want = HASH.get("run"), v = HASH.get("view");
+    if (VIEWS.includes(v)) { S.view = v; markView(); }
+    selectRun(S.runs.some((r) => r.id === want) ? want : first.length ? first[first.length - 1] : S.runs[0].id);
+  }
 }
 function renderSync() {   // the mirror's freshness: last successful sync, failures, stale after two missed
   const sy = S.meta.sync, el = $("syncline");
@@ -149,20 +155,26 @@ function renderSync() {   // the mirror's freshness: last successful sync, failu
   el.textContent = !sy.configured ? `Mirror: ${sy.why}.` : `Mirror synced ${last}${sy.failures ? ` · ${sy.failures} failed since` : ""}${sy.stale ? ` · stale: ${sy.why}; remote approval is off` : ""}`;
   el.title = sy.last_error ? "last error: " + sy.last_error : "";
 }
-function renderChatSpend() {
+function renderChatSpend() {   // with chat off the box records feedback: Record is the one button, and "question" cannot be chosen
   const c = S.meta && S.meta.chat; if (!c) return;
-  $("chatspend").textContent = c.key ? `chat ${usd(c.spent)} of ${usd(c.cap)}` : "Chat is off (no API key). Record only still works.";
-  $("send").disabled = !c.key; $("send").title = c.key ? "Send (Ctrl or Cmd + Enter)" : "Chat is off: ANTHROPIC_API_KEY is unset or a placeholder.";
+  const off = !c.key, ask = [...$("kind").options].find((o) => o.value === "question");
+  $("chatspend").textContent = off ? "Chat is off (ANTHROPIC_API_KEY is unset or a placeholder): notes are recorded as feedback." : `chat ${usd(c.spent)} of ${usd(c.cap)}`;
+  $("send").hidden = off; $("send").disabled = off; $("send").title = "Send (Ctrl or Cmd + Enter)";
+  $("record").classList.toggle("primary", off); $("record").textContent = off ? "Record" : "Record only";
+  $("record").title = off ? "Record as feedback (Ctrl or Cmd + Enter)" : "Record as feedback without asking Claude";
+  if (ask) ask.disabled = off;
+  if (off && $("kind").value === "question") { $("kind").value = "guidance"; syncComposer(); }
+  if (!S.anchor) $("text").placeholder = off ? "Record guidance or a correction…" : "Ask, or give guidance or a correction…";
 }
-const runLabel = (r) => r.label || r.name;
+const runLabel = (r) => (r.draft && r.full_label) || r.label || r.name;
 const CHIP = { completed: "ok", failed: "bad", stopped: "", running: "live", waiting: "warn", ended: "" };
 function runRow(r, sub) {
   const cls = CHIP[r.chip] != null ? CHIP[r.chip] : runState(r)[0], words = r.chip || runState(r)[1];
   const eng = r.engine_id && r.engine_id.name ? `${r.engine_id.name} ${r.engine_id.version || ""}`.trim() : (r.engine || "");
   const on = r.id === S.runId, cmp = S.cmp === r.id;
   const det = on ? `<div class="det">
-      ${eng ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
-      ${r.ended ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
+      ${eng && (r.relation || r.draft) ? `<span>engine</span><b>${esc(eng)}</b>` : ""}
+      ${r.ended && (r.relation || r.draft) ? `<span>ended</span><b>${esc(r.ended)}</b>` : ""}
       ${r.headline_number ? `<span>outcome</span><b>${esc(r.headline_number)}${r.ui_vals ? " (" + uiText(...r.ui_vals) + ")" : r.ui ? " (95% UI " + esc(r.ui.replace(/([0-9.]+)M-/, "$1–")) + ")" : ""}</b>` : ""}
       ${r.shift ? `<span>largest shifts</span><b>${(r.shifts || []).length ? r.shifts.map((x) => `${esc(x.name)}: ${x.before} → ${x.after} units`).join("<br>") : esc(r.shift)}<br><span class="muted">vs ${esc(r.shift_vs)}</span></b>` : ""}
       ${r.spent_usd != null ? `<span>model spend</span><b>${usd(r.spent_usd)}</b>` : ""}
@@ -200,7 +212,8 @@ function renderRuns() {
 }
 async function renderLearning() {
   let j; try { j = await api("/api/learning"); } catch (e) { $("sidebar").innerHTML = `<div class="card error">${esc(e.message)}</div>`; return; }
-  let h = `<div class="small muted" style="margin:0 8px">${j.n} feedback item(s) across ${S.runs.length} run(s), by layer.</div><div style="margin:8px"><button id="export">Export digest</button></div>`;
+  let h = j.n ? `<div class="small muted" style="margin:0 8px">${j.n} feedback item(s) across ${S.runs.length} run(s), by layer.</div><div style="margin:8px"><button id="export">Export digest</button></div>`
+    : `<div class="small muted" style="margin:0 8px">No feedback recorded yet. Agree, Disagree or Comment on a card in a run, or write a note in the box under the run and select Record. Each item is filed here under the layer it is about (engine, analysis, critique, writer, spec, data or process), and Export digest then writes them to one file for the next round of changes.</div>`;
   for (const [layer, items] of Object.entries(j.by_layer)) {
     if (!items.length) continue;
     h += `<div class="group">${esc(layer)} (${items.length})</div>`;
@@ -209,13 +222,13 @@ async function renderLearning() {
   }
   if (j.errors.length) h += `<div class="card error small">${j.errors.map(esc).join("<br>")}</div>`;
   $("sidebar").innerHTML = h;
-  $("export").onclick = async () => { try { const r = await api("/api/export", {}); toast("Digest written: " + r.path); } catch (e) { toast(e.message); } };
+  if ($("export")) $("export").onclick = async () => { try { const r = await api("/api/export", {}); toast("Digest written: " + r.path); } catch (e) { toast(e.message); } };
 }
 
 // ---- one run: header, stepper, stream
 async function selectRun(id) {   // the composer's anchor and snapshot belong to the run they were taken in
-  if (id !== S.runId) setAnchor(null, null, null);
-  S.runId = id; S.filter = null; S.cmp = null; await refresh(); if (S.tab === "runs") renderRuns();
+  if (id !== S.runId) { setAnchor(null, null, null); $("qbox").hidden = true; }
+  S.runId = id; S.filter = null; S.cmp = null; setHash(); await refresh(); if (S.tab === "runs") renderRuns();
 }
 async function refresh() {
   // Only the answer to the latest request is shown: a slower answer for an earlier request, or for a run no
@@ -226,7 +239,7 @@ async function refresh() {
   let run;
   try { run = await api("/api/run?" + q({ run: id })); } catch (e) {
     if (seq !== S.loadSeq) return;
-    S.loading = false;
+    S.loading = false; S.drawn = null;
     $("stream").innerHTML = `<div class="card error"><div class="head"><span class="t">The run cannot be read</span></div><div class="body">${esc(e.message)}</div></div>`; fail("Loading the run", e); return;
   }
   if (seq !== S.loadSeq || id !== S.runId) return;
@@ -237,10 +250,11 @@ function renderHeader() {
   const r = S.run, st = r.state || {}, c = r.compute || {}, sp = r.stepper || { stages: [] };
   const summary = S.runs.find((x) => x.id === S.runId) || {};
   const question = st.question || "";
-  $("crumb").textContent = runLabel(summary.label ? summary : r);
-  $("title").textContent = shortTitle(question) || r.name;
-  $("title").title = question;
-  $("qbox").hidden = !question; $("qtext").textContent = question;
+  const pj = ((S.meta && S.meta.projects) || []).find((p) => (p.lineage || []).includes(S.runId) || (p.drafts || []).includes(S.runId));
+  $("crumb").textContent = (pj && pj.title) || shortTitle(question) || "Run"; $("crumb").title = question;
+  $("title").textContent = "Run " + runLabel(summary.label ? summary : r);
+  $("title").title = r.run_dir || "";
+  $("qbox").textContent = question; if (!question) $("qbox").hidden = true;
   // at most four items: state and round, engine batch, spend, compute used
   const [cls0, words] = runState({ ...st, status: r.status || st.status, finished: r.finished, error: r.error, fail_statuses: r.fail_statuses });
   const failed = sp.stages.find((s) => s.status === "failed"), cls = summary.chip === "stopped" ? "" : cls0;
@@ -252,13 +266,14 @@ function renderHeader() {
   items.push(`<span><b>${usd(st.spent_usd)}</b>${st.budget_usd != null ? " of " + usd(st.budget_usd) : ""} spent</span>`);
   const reused = (summary.batches || r.batches || []).filter((b) => b.reused);
   items.push(`<span title="${esc((c.cap_source || "") + (c.error ? " · " + c.error : ""))}">this run <b>${esc(c.used_core_h)}</b> of ${esc(c.cap_core_h)} core-h${reused.map((b) => ` · plus ${num(b.reused)} reused points${b.reused_from ? " computed in " + esc(b.reused_from) : " from an earlier batch"}`).join("")}</span>`);
-  const task = (r.stop || "").split(": ")[1];
+  const task = (r.stop || "").split(": ").slice(1).join(": "), why = task.replace(/^task (\w+)/, (m, t) => `the “${t.replace(/_/g, " ")}” task`);
   const where = (r.stop || "").split(":")[0].replace(/ \(round (\d+) of \d+\)/, ", round $1");
-  $("stopline").innerHTML = r.stop ? `<span title="${esc(task || "")}">Stopped ${esc(where)}; no reason recorded.</span>${r.operator_note ? ` <button class="link" id="b-note">note</button>` : ""}` : "";
+  $("stopline").innerHTML = r.stop ? `<span>Stopped ${esc(where)}${why ? ": " + esc(why) + "." : "; no reason recorded."}</span>${r.operator_note ? ` <button class="link" id="b-note">note</button>` : ""}` : "";
   if ($("b-note")) $("b-note").onclick = () => side("operator note · progress.md", `<p>${esc(r.operator_note)}</p><p class="small muted">The latest note in progress.md, written after this run's last transition.</p>`);
   $("stopline").hidden = !r.stop;
   $("meta").innerHTML = items.join("");
-  $("acts").innerHTML = `<button class="link" id="b-results">Results</button><button class="link" id="b-compute">Compute</button><button class="link" id="b-build">Build on this run</button>`;
+  $("acts").innerHTML = `${question ? '<button class="link" id="b-q" title="Show or hide the question this run answers">Question</button>' : ""}<button class="link" id="b-results">Results</button><button class="link" id="b-compute">Compute</button><button class="link" id="b-build">Build on this run</button>`;
+  if ($("b-q")) $("b-q").onclick = () => { $("qbox").hidden = !$("qbox").hidden; };
   $("b-results").onclick = () => openDoc();
   $("b-compute").onclick = () => openCompute();
   $("b-build").onclick = buildOn;
@@ -279,7 +294,8 @@ function renderStepper() {
 // Stream and Figures narrate the run; Spec, Evidence, Engine and Calibration (dossier.js) show what it is made of.
 const VIEWS = ["stream", "figs", "spec", "evidence", "engine", "calibration"];
 VIEWS.forEach((v) => { if ($("v-" + v)) $("v-" + v).onclick = () => setView(v); });
-function setView(v) { S.view = v; S.cmp = null; VIEWS.forEach((x) => { if ($("v-" + x)) $("v-" + x).classList.toggle("on", x === v); }); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
+function markView() { VIEWS.forEach((x) => { if ($("v-" + x)) $("v-" + x).classList.toggle("on", x === S.view); }); }
+function setView(v) { S.view = v; S.cmp = null; markView(); setHash(); renderStream(); renderRuns(); $("streambox").scrollTop = 0; }
 // A figure is shown only as the bytes its render-time snapshot hashed: the request is snapshot-bound (bound=1, the
 // digest) and refused by the server on a mismatch. With no captured digest (the file could not be read when the
 // card was rendered) no request is made (review round 5, P2-5).
@@ -298,8 +314,12 @@ function renderFigures() {
       : an.status === "done" ? "ANALYZE wrote none to figures/" : "the run has not reached ANALYZE";
     return `<div class="empty">No figures yet: ${why}.</div>`;
   }
-  return `<div class="figs">${figs.map((c) => `<div class="fig" data-act="open" data-file="${esc(c.file)}">${figSrc(c.file, c.snapshot) ? `<img loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" alt="">` : FIG_NO_DIGEST}
-    <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div></div>`).join("")}</div>`;
+  return `<div class="figs">${figs.map(figTile).join("")}</div>`;
+}
+function figTile(c) {   // one figure: select it for the full size, its source and a Comment button
+  const src = figSrc(c.file, c.snapshot);
+  return `<div class="fig" data-act="open" data-file="${esc(c.file)}">${src ? `<img loading="lazy" src="${esc(src)}" alt="">` : FIG_NO_DIGEST}
+    <div class="c">${esc(c.body || c.title)}</div><div class="p">${esc(c.producer || c.title)}${c.at ? " · " + esc(day(c.at)) + " " + esc(hhmm(c.at)) : ""}</div>${c.provenance_error ? `<div class="p" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}</div>`;
 }
 async function renderCompare() {
   const order = ((S.meta.projects || []).find((p) => p.lineage.includes(S.runId)) || { lineage: [] }).lineage;
@@ -322,26 +342,77 @@ async function renderCompare() {
   $("stream").innerHTML = h; $("streambox").scrollTop = 0;
   $("cmp-close").onclick = () => { S.cmp = null; renderRuns(); renderStream(); };
 }
-function renderStream() {
-  if (S.cmp) return renderCompare();
-  if (S.view === "figs") { $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
-  if (S.view !== "stream" && typeof renderDossier === "function") { renderFigures(); return renderDossier(); }
-  renderFigures();
-  const box = $("streambox"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+function streamItems() {   // the cards of the stage in view, grouped for reading
   const cards = S.run.cards.filter((c) => !S.filter || c.stage === S.filter), items = [], seen = {};
-  for (const c of cards) {   // blockers of one round and all decision tests read as one table each
+  let last = null;
+  for (const c of cards) {   // blockers of one round and all decision tests read as one table each; stage lines and figures that follow one another fold into one item
+    const f = c.kind === "stage" ? "stage_run" : c.kind === "figure" ? "figure_run" : null;
+    if (f) { if (!last || last.kind !== f) items.push(last = { kind: f, at: c.at, rows: [] }); last.rows.push(c); last.at = c.at; continue; }
     const g = c.kind === "blocker" ? "b" + (c.round == null ? "" : c.round) : c.kind === "decision_test" ? "dt" : null;
-    if (!g) { items.push(c); continue; }
-    if (!seen[g]) { seen[g] = { kind: g === "dt" ? "dt_table" : "blocker_table", round: c.round, at: c.at, rows: [] }; items.push(seen[g]); }
-    seen[g].rows.push(c);
+    if (g && seen[g]) { seen[g].rows.push(c); continue; }   // joins its table; does not break a run of stage lines
+    if (g) seen[g] = { kind: g === "dt" ? "dt_table" : "blocker_table", round: c.round, at: c.at, rows: [c] };
+    items.push(last = g ? seen[g] : c);
   }
-  const top = !S.filter ? summaryBlock() : "";
+  return items;
+}
+function renderStream() {
+  if (S.cmp) { S.drawn = null; return renderCompare(); }
+  if (S.view === "figs") { S.drawn = null; $("stream").innerHTML = renderFigures(); wire($("stream")); return; }
+  if (S.view !== "stream" && typeof renderDossier === "function") { S.drawn = null; renderFigures(); return renderDossier(); }
+  renderFigures();
+  const box = $("streambox"), el = $("stream"), atBottom = box.scrollTop > 0 && box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const items = streamItems();
+  const top = !S.filter ? standing() + summaryBlock() : "";
+  const n0 = REF_N;
+  const html = top + (items.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>');
+  // The page asks for the run again every 20 s. An unchanged answer leaves the page as it is (rows the reader opened
+  // stay open, the scroll position holds); a changed one is redrawn with the open rows and toggles opened again.
+  const key = S.runId + "|" + (S.filter || ""), fresh = S.drawn !== key || el.firstElementChild !== S.drawnNode;
+  const sig = html.replace(/(data-ref|name)="r\d+(_\d+)?"/g, "");
+  if (!fresh && sig === S.sig && REF_N - n0 === S.refs[1] - S.refs[0]) {   // the controls on the page now act on the fresh answer's objects
+    for (let i = 1; i <= REF_N - n0; i++) { REFS["r" + (S.refs[0] + i)] = REFS["r" + (n0 + i)]; delete REFS["r" + (n0 + i)]; }
+    S.toBottom = false; markLoading(); return;
+  }
+  const openKeys = fresh ? [] : [...el.querySelectorAll("[data-k]")].filter((n) => n.tagName === "DETAILS" ? n.open : !n.hidden).map((n) => n.dataset.k);
   const saved = saveForms();
-  $("stream").innerHTML = top + (items.map(card).join("") || '<div class="muted small" style="padding:12px 0">Nothing here for this stage.</div>');
+  el.innerHTML = html;
+  S.sig = sig; S.refs = [n0, REF_N]; S.drawn = key; S.drawnNode = el.firstElementChild;
+  el.querySelectorAll("[data-k]").forEach((n) => { if (!openKeys.includes(n.dataset.k)) return; if (n.tagName === "DETAILS") n.open = true; else n.hidden = false; });
+  el.querySelectorAll("[data-more]").forEach((b) => { const m = document.getElementById(b.dataset.more); if (m && !m.hidden) b.textContent = "less"; });
   restoreForms(saved);
-  wire($("stream"));
+  wire(el);
   markLoading();
-  if (atBottom) box.scrollTop = box.scrollHeight;
+  if (S.toBottom || (!fresh && atBottom)) box.scrollTop = box.scrollHeight; else if (fresh) box.scrollTop = 0;   // a run opens at its summary
+  S.toBottom = false;
+}
+const gateRound = (c) => `round ${(String(c.title).match(/round (\d+)/) || [])[1] || "?"}${/post-write/.test(c.title) ? " (post-write)" : ""}`;
+function standing() {   // first in the stream: whether anything waits for the owner, and what the run has produced so far
+  const r = S.run, st = r.state || {}, cards = r.cards || [], rows = [];
+  const jump = (ck, word) => `<button class="link" data-act="jump" data-ck="${esc(ck)}">${word}</button>`;
+  const need = cards.filter((c) => c.kind === "decision_needed");
+  rows.push(["Needs you", need.length ? `<span class="nd yes">Yes: ${need.map((c) => esc(String(c.title).replace(/^Your decision needed: /, ""))).join("; ")}.</span>`
+    : st.paused ? `No decision card is open. The run state says paused: ${esc(String(st.paused).replace(/_/g, " "))}.` : "No.", need.length ? jump("need", "answer") : ""]);
+  const hl = String(r.headline || ""), cut = hl.length >= 300 && !/[.!?]$/.test(hl);   // the server keeps the first 300 characters
+  if (hl) rows.push(["Result so far", esc(cut ? hl.replace(/\s+\S*$/, "") + " …" : hl), Object.keys(r.docs || {}).length ? '<button class="link" data-act="docs">read</button>' : ""]);
+  const gates = cards.filter((c) => c.kind === "gate"), g = gates[gates.length - 1];
+  if (g) {
+    const dw = g.done_when || [], n = (v) => dw.filter((x) => x.passes === v).length, unk = dw.length - n(true) - n(false), act = g.action || "", rule = g.rule != null ? `rule ${g.rule}` : "";
+    rows.push([T("gate", "Gate"), `${gateRound(g).replace(/^r/, "R")}: ${T(act)}${rule ? ` <span class="muted">(${T(rule)})</span>` : ""}${dw.length ? ` · ${T("done-when")} tests: ${n(true)} pass, ${n(false)} fail${unk ? `, ${unk} unknown` : ""}` : ""}`, jump("gate", "show")]);
+  }
+  const bl = cards.filter((c) => c.kind === "blocker");
+  if (bl.length) {
+    const rd = bl[bl.length - 1].round, cur = bl.filter((c) => c.round === rd), high = cur.filter((c) => c.severity === "HIGH" && !c.resolved).length;
+    rows.push(["Critique", `${rd != null ? "Round " + esc(rd) + ": " : ""}${cur.length} ${T("blocker", "blockers")} · ${high} open ${T("HIGH")} · ${cur.filter((c) => c.resolved).length} resolved`, jump("critique", "show")]);
+  }
+  const dts = cards.filter((c) => c.kind === "decision_test");
+  if (dts.length) {
+    const n = (w) => dts.filter((c) => (c.state || DT_STATE_OF[c.verdict] || "error") === w).length;
+    rows.push([T("decision test", "Decision tests"), `${n("changed")} of ${dts.length} change the plan${n("not_run") ? ` · ${n("not_run")} not run` : ""}${n("error") ? ` · ${n("error")} cannot be read` : ""}`, jump("dt", "show")]);
+  }
+  const nf = cards.filter((c) => c.kind === "figure").length, docs = Object.keys(r.docs || {});
+  if (nf) rows.push(["Figures", `${nf} from the analysis`, '<button class="link" data-act="view" data-v="figs">show</button>']);
+  rows.push(["Documents", docs.length ? docs.map(esc).join(" · ") : '<span class="muted">No results.md, manuscript.md or report.md yet.</span>', docs.length ? '<button class="link" data-act="docs">open</button>' : ""]);
+  return `<div class="card stand"><div class="head"><span class="t">Where this run stands</span></div><table class="t stand">${rows.map(([k, v, a]) => `<tr><td>${k}</td><td>${v}</td><td>${a}</td></tr>`).join("")}</table></div>`;
 }
 function summaryBlock(forDoc) {
   const sm = (S.run && S.run.summary) || [];
@@ -354,33 +425,37 @@ function summaryBlock(forDoc) {
     return `<div class="stat ${i === 0 && it.ui ? "wide" : ""}"><div class="k">${label}</div><div class="v ${i === 0 && it.ui ? "hero" : ""}">${v}</div>${ui}<div>${cite(it)}${it.ui_source ? " " + cite({ source: it.ui_source, key: "fixed_plan" }) : ""}</div></div>`;
   }).join("");
   const covers = (sm[0] && sm[0].covers) || [];
-  return `<div class="stats">${tiles}</div>${covers.length ? `<div class="ctx">Point plan, ${T("comparator")}-based. The ${T("UI")} covers ${covers.map((c) => c === "calibration_partly_clamped" ? T("calibration partly clamped") : esc(c.replace(/_/g, " "))).join(", ")}. <b>Needs you: no.</b></div>` : ""}`;
+  return `<div class="stats">${tiles}</div>${covers.length ? `<div class="ctx">Point plan, ${T("comparator")}-based. The ${T("UI")} covers ${covers.map((c) => c === "calibration_partly_clamped" ? T("calibration partly clamped") : esc(c.replace(/_/g, " "))).join(", ")}. <span class="nd">Needs you: no.</span></div>` : ""}`;
 }
 function statusCell(p) { return p === true ? '<span class="ok-i">✓ pass</span>' : p === false ? '<span class="bad-i">✗ fail</span>' : '<span class="muted">? unknown</span>'; }
 function gateCard(c, head, open, comment) {
-  const dw = c.done_when || [];
+  const dw = c.done_when || [], np = (v) => dw.filter((r) => r.passes === v).length, unk = dw.length - np(true) - np(false);
   const rows = dw.map((r) => {
-    const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"], n = checks.length;
-    return `<tr class="grp"><td colspan="5"><b>${esc(r.blocker)}</b> ${r.severity ? T(r.severity) : ""} · ${esc(r.reviewer || "")} — ${bench(clip((r.claim || "").split("\n")[0], 150))}</td></tr>` +
-      checks.map((ch, k) => `<tr><td>${esc(r.blocker)}.${k + 1}</td><td${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</td>${k === 0 ? `<td rowspan="${esc(n)}">${statusCell(r.passes)}</td><td rowspan="${esc(n)}">${esc((r.detail || "").replace(/^(FAIL|PASS)\s*/, ""))}</td><td rowspan="${esc(n)}">${r.mechanical ? T("mechanical") : T("judged")}</td>` : ""}</tr>`).join("");
+    const checks = r.checks.length ? r.checks : ["(no done-when test recorded)"];
+    const said = checks.map((ch) => String(ch).replace(/^judged: /, ""));   // a judgement that only repeats its test is not shown twice
+    const detail = (r.detail || "").replace(/^(FAIL|PASS)\s*/, "").split("; ").filter((d) => d && !said.some((x) => x.startsWith(d.replace(/^judgement: /, ""))));
+    return `<tr><td><b>${esc(r.blocker)}</b><div class="sub">${r.severity ? T(r.severity) : ""}${r.reviewer ? " · " + esc(r.reviewer) : ""}</div></td>
+      <td>${bench(clip((r.claim || "").split("\n")[0], 150))}<ul class="chk">${checks.map((ch, k) => `<li${(r.raw || [])[k] ? ` title="${esc("pattern: " + r.raw[k])}"` : ""}>${bench(ch)}</li>`).join("")}</ul></td>
+      <td>${statusCell(r.passes)}</td><td>${detail.map((d) => `<div>${esc(d)}</div>`).join("") || "—"}</td><td>${r.mechanical ? T("mechanical") : T("judged")}</td></tr>`;
   }).join("");
   const act = c.action || "", rule = c.rule != null ? `rule ${c.rule}` : "";
   const needs = act === "AWAIT_OWNER" ? "yes, answer the decision card below." : "no.";
-  return `<div class="card">${head(`${T("gate", "Gate")} round ${esc((c.title.match(/round (\d+)/) || [])[1] || "?")}: ${T(act)} <span class="muted small">(${T(rule)})</span>`)}
+  return `<div class="card" data-ck="gate">${head(`${T("gate", "Gate")} ${gateRound(c)}: ${T(act)} <span class="muted small">(${T(rule)})</span>`)}
     ${ctx(`${T("gate", "The gate")} decides whether the run may write its report. ${T("ACCEPT")} needs no unresolved ${T("HIGH")} ${T("blocker")} and no missing required artifact.`, needs)}
     <div class="body">${esc(c.body)}</div>
-    ${rows ? `<div class="cmp-h">${T("done-when", "Done-when")} tests, by blocker</div><table class="t fixed"><colgroup><col style="width:11%"><col style="width:45%"><col style="width:9%"><col style="width:24%"><col style="width:11%"></colgroup><tr><th>criterion</th><th>what it checks</th><th>status</th><th>detail</th><th>test</th></tr>${rows}</table>` : ""}
+    ${rows ? `<details class="fold" data-k="${esc(kid("dw", c.at, c.title))}"><summary><b>${T("done-when", "Done-when")} tests</b> for ${dw.length} ${T("blocker", dw.length === 1 ? "blocker" : "blockers")}: ${np(true)} pass · ${np(false)} fail${unk ? ` · ${unk} unknown` : ""}</summary>
+      <table class="t fixed"><colgroup><col style="width:12%"><col style="width:44%"><col style="width:10%"><col style="width:23%"><col style="width:11%"></colgroup><tr><th>blocker</th><th>claim, and what its test checks</th><th>status</th><th>detail</th><th>test</th></tr>${rows}</table></details>` : ""}
     <div class="acts">${open}${comment}</div></div>`;
 }
 function blockerTable(g) {
   const rows = g.rows.map((c, i) => {
-    const tog = "bt" + (++TOG_N);
+    const tog = kid("bt", g.round, i, c.blocker_id);
     return `<tr class="row" data-tog="${esc(tog)}"><td>${esc(c.blocker_id)}</td><td>${T(c.severity)}</td><td>${esc(c.reviewer || "")}</td><td>${esc(stage(c.target_stage))}</td><td class="clip">${bench(String(c.claim || "").split("\n")[0])}</td><td>${c.resolved ? '<span class="ok-i">✓ resolved</span>' : "open"}</td></tr>
-      <tr class="more" id="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
+      <tr class="more" id="${esc(tog)}" data-k="${esc(tog)}" hidden><td colspan="6"><div>${bench(c.claim || "")}</div>${c.evidence ? `<div class="sub">Evidence: ${bench(c.evidence)}</div>` : ""}${c.fix_requires ? `<div class="sub">Fix requires: ${bench(c.fix_requires)}</div>` : ""}
       <div class="acts"><button data-act="agree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Agree</button><button data-act="disagree" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Disagree</button><button data-act="comment" data-ref="${ref({ anchor: c.anchor || {}, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button><button data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.blocker_id)}">Open</button></div></td></tr>`;
   }).join("");
   const high = g.rows.filter((c) => c.severity === "HIGH" && !c.resolved).length;
-  return `<div class="card"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
+  return `<div class="card" data-ck="critique"><div class="head"><span class="t">Critique${g.round != null ? " round " + esc(g.round) : ""}: ${g.rows.length} ${T("blocker", "blockers")}, ${high} open ${T("HIGH")}</span>${when(g.at)}</div>
     ${ctx(`Findings from the critics. An open ${T("HIGH")} blocks ${T("ACCEPT")}; each has a ${T("done-when")} test. Click a row for the full claim.`, "no. Agree or disagree to record feedback.")}
     <table class="t"><tr><th>id</th><th>severity</th><th>reviewer</th><th>${T("target stage")}</th><th>claim</th><th>status</th></tr>${rows}</table></div>`;
 }
@@ -392,16 +467,34 @@ function dtTable(g) {
   g.rows.forEach((c) => { if (!c.state) c.state = DT_STATE_OF[c.verdict] || "error"; c.test_id = c.test_id || (c.anchor || {}).id; });   // a server from before the four states
   const thrs = [...new Set(g.rows.map((c) => c.threshold_pct))], thr = thrs.length === 1 ? thrs[0] : undefined;
   const first = (t) => { const m = String(t).match(/^.*?[.?!](?=\s|$)/); return m ? m[0] : String(t); };
-  const rows = g.rows.map((c, i) => { const body = c.body || "", lead = first(body), rest = body.slice(lead.length).trim();
+  const rows = g.rows.map((c, i) => { const body = c.body || "", lead = first(body), rest = body.slice(lead.length).trim(), tog = kid("dtm", i, c.test_id);
     return `<tr><td><button class="link" data-act="open" data-file="${esc(c.anchor.file)}" data-anchor-id="${esc(c.test_id)}">${esc(c.test_id).replace(/_/g, "_<wbr>")}</button></td>
-    <td>${bench(lead)}${rest ? ` <button class="link" data-more="${esc("dtm" + i)}">more</button><div id="${esc("dtm" + i)}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
+    <td>${bench(lead)}${rest ? ` <button class="link" data-more="${esc(tog)}">more</button><div id="${esc(tog)}" data-k="${esc(tog)}" hidden class="sub">${bench(rest)}</div>` : ""}${c.parameter ? `<div class="sub">${esc(c.parameter)}</div>` : ""}</td>
     <td class="n">${(c.values || []).map((v) => esc(typeof v === "number" ? num(v) : v)).join(", ") || "—"}${c.unit && (c.values || []).some((v) => typeof v === "number") ? ` <span class="muted">${esc(c.unit)}</span>` : ""}</td>
     <td${c.why ? ` title="${esc(c.why)}"` : ""}>${DT_CELL[c.state] || DT_CELL.error}</td><td class="n">${pct(c.share_pct)}${c.threshold_pct != null && c.threshold_pct !== thr ? ` <span class="muted">(threshold ${pct(c.threshold_pct, 0)})</span>` : ""}</td>
     <td class="n">${(c.objective_vs_point_pct || []).map((x) => x == null ? "—" : (x > 0 ? "+" : "") + pct(x, 2)).join(", ") || "—"}</td></tr>`; }).join("");
   const n = (st) => g.rows.filter((c) => c.state === st).length, nr = n("not_run"), er = n("error");
-  return `<div class="card"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${n("changed")} of ${g.rows.length} change the plan${nr ? `, ${nr} not run` : ""}${er ? `, ${er} cannot be read` : ""}</span>${when(g.at)}</div>
+  return `<div class="card" data-ck="dt"><div class="head"><span class="t">${T("decision test", "Decision tests")}: ${n("changed")} of ${g.rows.length} change the plan${nr ? `, ${nr} not run` : ""}${er ? `, ${er} cannot be read` : ""}</span>${when(g.at)}</div>
     ${ctx(`Each test re-solves the plan with one input at other values. It changes the plan when more than ${thr != null ? pct(thr, 0) : "the threshold share"} of units change package.`, "no.")}
-    <table class="t"><tr><th>id</th><th style="width:44%">what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
+    <table class="t fixed"><colgroup><col style="width:19%"><col style="width:37%"><col style="width:14%"><col style="width:10%"><col style="width:9%"><col style="width:11%"></colgroup><tr><th>id</th><th>what it tests</th><th class="n">value tested</th><th>plan changes?</th><th class="n">units changed</th><th class="n"><span class="term" tabindex="0" title="The objective of the plan re-solved at the tested value, relative to the point plan's objective evaluated at the same value: how much re-optimising gains (models/decision_tests/*.yaml: objective vs point_plan_objective_under_test).">re-solved vs point plan</span></th></tr>${rows}</table></div>`;
+}
+const stName = (s) => /^[A-Z_]+$/.test(s) ? stage(s) : s;
+const stFailed = (c) => c.stage === "FINAL" && /fail/i.test(c.body || "");
+function stageLine(c) {
+  return `<div class="line ${stFailed(c) ? "bad" : ""}"><span class="x"><b>${esc(String(c.title).split(" → ").map(stName).join(" → "))}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)} to date` : ""}</span>${when(c.at)}</div>`;
+}
+function stageRun(g) {   // transitions that follow one another read as one line: the path taken, how it ended, the spend to date
+  const rows = [...g.rows];
+  for (let i = 0; i + 1 < rows.length; i++) {   // two transitions recorded in the same second: the one the other continues comes first
+    const a = String(rows[i].title).split(" → "), b = String(rows[i + 1].title).split(" → ");
+    if (rows[i].at === rows[i + 1].at && a[0] === b[b.length - 1] && a[a.length - 1] !== b[0]) [rows[i], rows[i + 1]] = [rows[i + 1], rows[i]];
+  }
+  if (rows.length === 1) return stageLine(rows[0]);
+  const segs = []; let prev = null;
+  for (const c of rows) { const p = String(c.title).split(" → "); if (prev !== null && p.length > 1 && p[0] === prev) segs[segs.length - 1].push(...p.slice(1)); else segs.push([...p]); prev = p[p.length - 1]; }
+  const end = rows[rows.length - 1], k = kid("sr", g.rows[0].at, g.rows[0].title);
+  return `<div class="line ${rows.some(stFailed) ? "bad" : ""}"><span class="x"><b>${esc(segs.map((x) => x.map(stName).join(" → ")).join(", "))}</b>${end.body ? " · " + esc(end.body) : ""}${end.spent_usd != null ? ` · ${usd(end.spent_usd)} to date` : ""}</span><button class="link" data-more="${esc(k)}" title="Each of the ${esc(rows.length)} steps, with its note, spend and time">more</button>${when(end.at)}</div>
+    <div class="steplines" id="${esc(k)}" data-k="${esc(k)}" hidden>${rows.map(stageLine).join("")}</div>`;
 }
 function card(c) {
   const comment = c.anchor ? `<button data-act="comment" data-ref="${ref({ anchor: c.anchor, evidence: c.snapshot, run: S.run && S.run.run_dir })}">Comment</button>` : "";
@@ -411,11 +504,10 @@ function card(c) {
   switch (c.kind) {
     case "blocker_table": return blockerTable(c);
     case "dt_table": return dtTable(c);
-    case "stage": return line(c.stage === "FINAL" && /fail/i.test(c.body || "") ? "bad" : "", `<b>${esc(c.title)}</b>${c.body ? " · " + esc(c.body) : ""}${c.spent_usd != null ? ` · ${usd(c.spent_usd)}` : ""}`);
+    case "stage_run": return stageRun(c);
     case "fix_loop": return line("", `<b>Fix loop</b> · ${esc(c.body)}`);
     case "batch": return line("", `<b>Engine batch</b> · ${c.done == null ? "?" : c.done}/${esc(c.n)} done${c.live ? (c.eta_s != null ? " · ETA " + fmtS(c.eta_s) : "") : c.done != null ? " · interrupted" : ""}${c.error ? " · " + esc(c.error) : ""}`);
-    case "figure": return `<div class="card">${head(esc(c.body || c.title))}${ctx("A figure from the analysis.", "no.")}${figSrc(c.file, c.snapshot) ? `<img class="thumb" loading="lazy" src="${esc(figSrc(c.file, c.snapshot))}" data-act="open" data-file="${esc(c.file)}">` : FIG_NO_DIGEST}
-      <div class="sub">${esc(c.title)}${c.producer ? ` · ${esc(c.producer)}` : ""}</div>${c.provenance_error ? `<div class="sub" style="color:var(--bad)">provenance unreadable: ${esc(c.provenance_error)}</div>` : ""}<div class="acts">${open}${comment}</div></div>`;
+    case "figure_run": return `<div class="card">${head(`${c.rows.length} figure${c.rows.length === 1 ? "" : "s"} from the analysis`)}${ctx("Select a figure to open it at full size, with its source and a Comment button.", "no.")}<div class="figs">${c.rows.map(figTile).join("")}</div></div>`;
     case "gate": return gateCard(c, head, open, comment);
     case "decision_needed": return decisionCard(c, head);
     case "chat": {
@@ -441,7 +533,7 @@ function decisionCard(c, head) {
   const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, ssha: c.sheet_sha256, fps: c.fingerprints || [] });
   const block = remoteBlock() || (c.sub === "spec" && c.sheet_stale ? `The sign-off sheet is stale (${c.sheet_stale}); approval waits for the regenerated sheet.` : ""), dis = block ? " disabled" : "";
   const blockNote = block ? `<div class="small" style="color:var(--bad)">${esc(block)}</div>` : "";
-  if (c.sub === "spec") return `<div class="card need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
+  if (c.sub === "spec") return `<div class="card need" data-ck="need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
     <div class="small muted">Signing binds to decision_spec.yaml sha256 ${esc(String(c.spec_sha256 || "?").slice(0, 12))}; a spec changed since this page loaded is refused.</div>
     <div class="answer" data-ref="${esc(k)}" data-key="${esc(c.ticket || "")}"><textarea class="note" placeholder="Your note (required): what you checked, what you accept"></textarea>
     <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec"${dis}>Sign</button>${blockNote}<div class="small result"></div></div></div>`;
@@ -450,7 +542,7 @@ function decisionCard(c, head) {
       ${(it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
       <div style="margin-top:6px"><label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="accept" data-f="${esc(it.fingerprint)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
       <label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="decline" data-f="${esc(it.fingerprint)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
-  return `<div class="card need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
+  return `<div class="card need" data-ck="need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
     <div class="answer" data-ref="${esc(k)}" data-key="${esc(c.ticket || "")}"><textarea class="note" placeholder="Your note (required)"></textarea>
     <label class="inline"><input type="checkbox" class="confirm"> I answer these declarations as the owner</label><button class="primary" data-act="scope"${dis}>Submit answers</button>${blockNote}<div class="small result"></div></div></div>`;
 }
@@ -492,6 +584,13 @@ async function act(b) {
   if (anchor && R.run && R.run !== S.runId && b.dataset.act !== "open") { toast("This control belongs to another run: reload it."); return; }
   switch (b.dataset.act) {
     case "open": return openFile(b.dataset.file, b.dataset.anchorId || "");
+    case "jump": {   // from "Where this run stands" to the latest card of that kind, opened
+      const hits = document.querySelectorAll(`#stream .card[data-ck="${b.dataset.ck}"]`), t = hits[hits.length - 1]; if (!t) return;
+      const d = t.querySelector("details.fold"); if (d) d.open = true;
+      t.scrollIntoView({ block: "start", behavior: "smooth" }); return;
+    }
+    case "view": return setView(b.dataset.v);
+    case "docs": return openDoc();
     case "comment": return setAnchor(anchor, null, shown, R.run);
     case "agree":
       try { await api("/api/feedback", { run: R.run || S.runId, kind: "approval", layer: "critique", verdict: "agree", anchor, evidence: shown, text: `Agree with ${anchor.id}`, stage: "CRITIQUE" }); toast(`Recorded: agree with ${anchor.id}`); refresh(); } catch (e) { toast(e.message); }
@@ -517,7 +616,7 @@ async function act(b) {
 
 // ---- composer
 function setAnchor(a, verdict, shown, run) {   // the composer's anchor, its snapshot and the run they were taken in
-  S.anchor = a; S.verdict = verdict; S.shown = shown || null; S.anchorRun = a ? (run || S.runId) : null; renderAnchor(); $("text").focus();
+  S.anchor = a; S.verdict = verdict; S.shown = shown || null; S.anchorRun = a ? (run || S.runId) : null; renderAnchor(); if (a) $("text").focus();
 }
 function composerRun() {   // the run the composer posts to, or null when its anchor was taken in another run
   if (S.anchor && S.anchorRun && S.anchorRun !== S.runId) { toast("The anchor was taken in another run: clear it first."); return null; }
@@ -526,7 +625,11 @@ function composerRun() {   // the run the composer posts to, or null when its an
 function renderAnchor() {
   $("anchor").innerHTML = S.anchor ? `<span class="chip">on ${esc(S.anchor.kind)} ${esc(S.anchor.id || "")}${S.verdict ? " · " + S.verdict : ""} <button class="link" id="unanchor">×</button></span>` : "";
   if ($("unanchor")) $("unanchor").onclick = () => setAnchor(null, null);
+  syncHas(); if (!S.anchor) renderChatSpend();
 }
+// The kind, layer and proposed-change fields show once a note is being written (focus, some text or an anchor).
+function syncHas() { document.querySelector(".composer").classList.toggle("has", !!($("text").value.trim() || S.anchor)); }
+$("text").addEventListener("input", syncHas);
 function syncComposer() { const steer = $("kind").value !== "question"; $("layer").style.display = steer ? "" : "none"; $("proposed").style.display = steer ? "" : "none"; $("record").style.display = steer ? "" : "none"; }
 $("kind").onchange = syncComposer;
 function curStage() { return S.filter || (S.run && S.run.state && S.run.state.state) || ""; }
@@ -534,7 +637,7 @@ $("record").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
   const run = composerRun(); if (!run) return;   // S.anchorRun
   try { await api("/api/feedback", { run, kind: $("kind").value, layer: $("layer").value, text, anchor: S.anchor, evidence: S.shown, verdict: S.verdict, proposed_change: $("proposed").value, stage: curStage() });
-    $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); refresh(); } catch (e) { toast(e.message); }
+    $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); toast("Feedback recorded"); S.toBottom = S.view === "stream"; refresh(); } catch (e) { toast(e.message); }
 };
 $("send").onclick = async () => {
   const text = $("text").value.trim(); if (!text || !S.runId) return;
@@ -546,14 +649,14 @@ $("send").onclick = async () => {
     const r = await api("/api/chat", body);
     if (!r.ok) toast(r.error + (r.feedback ? " (the feedback was recorded)" : ""));
     else { $("text").value = ""; $("proposed").value = ""; setAnchor(null, null); S.meta.chat.spent = r.spent; }
-    refresh();
+    S.toBottom = S.view === "stream"; refresh();
   } catch (e) { toast(e.message); } finally { btn.textContent = "Send"; renderChatSpend(); }
 };
-$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("send").click(); });
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $(S.meta && S.meta.chat && !S.meta.chat.key ? "record" : "send").click(); });
 
 // ---- side panel: artifacts, results, compute, build-on
-function side(title, html) { $("side-title").textContent = title; $("side-content").innerHTML = html; $("side").classList.add("open"); wire($("side-content")); }
-$("side-close").onclick = () => { $("side").classList.remove("open"); stopLive(); };
+function side(title, html) { $("side-title").textContent = title; $("side-content").innerHTML = html; $("side").classList.add("open"); $("app").classList.add("sideopen"); wire($("side-content")); }
+$("side-close").onclick = () => { $("side").classList.remove("open"); $("app").classList.remove("sideopen"); stopLive(); };
 async function openFile(file, anchor) {
   if (!S.runId) return;
   const figc = (S.run && S.run.cards || []).find((c) => c.kind === "figure" && c.file === file);
