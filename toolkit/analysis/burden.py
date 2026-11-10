@@ -13,8 +13,11 @@ Spec (optional section; checked by toolkit/spec/schema.py, no values in code):
         daly_parts: {dalys: dalys, deaths: deaths, yll_per_death: {<population group> | all: <number | parameter>}}
         window: [2019, 2024]              # optional (S2-5b): the years the model value is averaged over (default: the
                                           # decision window); inside the simulated horizon
-        window_metrics: {cases: <metric>} # with window: per outcome, the engine window metric that gives it per person
-                                          # over a named window (all ages); every reference's outcome needs one
+        window_metrics: {cases: {<population group>: <metric>}}   # with window: per outcome and population group,
+                                          # the engine window metric giving it per person of the group over a named
+                                          # window, weighted by the group's population; one metric (a string) only
+                                          # with one population group spanning the engine's age groups. Every
+                                          # reference's outcome needs one
 
 Reference CSV contract (COLUMNS): id; group (a value of the group column, or * for every unit); age_band (blank: all
 ages, or a decision_units.populations key); outcome (one the spec reports); measure (count | rate, per `per` people of
@@ -92,13 +95,18 @@ def config(s) -> dict:
 
 
 def model_window(s) -> dict | None:
-    """{window, metrics, arm} when validation.burden declares a well-formed model window, else None (validation
-    refuses a malformed one before any run)."""
+    """{window, metrics: {outcome: {population group: engine window metric}}, arm} when validation.burden declares
+    a well-formed model window, else None (validation refuses a malformed one before any run). An all-ages metric
+    (a string) is the single population group's (Codex S2-5b r2 P1)."""
     b = section(getattr(s, "raw", None))
     w, m = (b.get("window"), b.get("window_metrics")) if isinstance(b, dict) else (None, None)
     if not (isinstance(w, list) and len(w) == 2 and all(_num(x) is not None for x in w) and isinstance(m, dict) and m):
         return None
-    return {"window": [float(x) for x in w], "metrics": dict(m), "arm": config(s)["arm"]}
+    pops = list(s["decision_units"]["populations"])
+    m = {o: ({pops[0]: x} if isinstance(x, str) and len(pops) == 1 else x) for o, x in m.items()}
+    if not all(isinstance(x, dict) and set(x) == set(pops) for x in m.values()):
+        return None
+    return {"window": [float(x) for x in w], "metrics": m, "arm": config(s)["arm"]}
 
 
 def csv_path(s) -> str:
@@ -205,8 +213,7 @@ def sheet_lines(raw, run_dir, data=None) -> list[str]:
     mw = model_window(sp)
     if mw:
         out += [f"Model values are the arm's mean over {mw['window'][0]:g}-{mw['window'][1]:g}, from the engine window "
-                f"metrics {', '.join(f'{o} <- {m}' for o, m in mw['metrics'].items())} (per person over the window).",
-                ""]
+                f"metrics {metrics_text(mw['metrics'])} (per person of each population group over the window).", ""]
     out += [f"Signing attests that no reference below comes from, or is derived from, a source the calibration fits "
             f"(calibration sources: {', '.join(pv['calibration_source_ids']) or 'none declared'}). Reference file "
             f"`{pv['csv']}` (sha256 `{(pv['sha256'] or 'unreadable')[:16]}`).", "",
@@ -310,10 +317,18 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             bad.append(f"{P}.window: [start, end], start < end, inside the simulated horizon {h0:g}-{h1:g}")
         else:
             mw, (t0, t1) = w, w
-        wn = s.engine().describe().outputs.get("windows", [])
-        if not (isinstance(wm, dict) and wm and all(o in outs and m in wn for o, m in wm.items())):
-            bad.append(f"{P}.window_metrics: with window, {{reported outcome: an engine window metric {wn} giving "
-                       "it per person over the window}")
+        card = s.engine().describe()
+        wn, one = card.outputs.get("windows", []), len(pops) == 1 and set(next(iter(pops.values()))["age_groups"]) \
+            == set(card.age_groups)
+
+        def _ok(m):         # Codex S2-5b r2 P1: weighted by the spec's populations, as the decision window is
+            return (m in wn and one) if isinstance(m, str) else (isinstance(m, dict) and set(m) == set(pops)
+                                                                  and all(isinstance(x, str) and x in wn
+                                                                          for x in m.values()))
+        if not (isinstance(wm, dict) and wm and all(o in outs and _ok(m) for o, m in wm.items())):
+            bad.append(f"{P}.window_metrics: with window, {{reported outcome: {{population group: an engine window "
+                       f"metric {wn} per person of that group over the window}} for every group}} (a single metric "
+                       "only with one population group spanning the engine's age groups)")
             wm = {}
     refs, seen = [], set()
     for n, r in enumerate(rows, 2):
@@ -547,7 +562,8 @@ def daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
     else:
         yll = sum(by_pop[b][i]["y"][arm][de] * _param(A, x) for b, x in y.items() for i in A.ids)
     res["deaths_share_of_dalys"] = yll / tot
-    res["statement"] = "deaths x declared years of life lost per death, over the arm's DALYs in the window"
+    res["statement"] = "deaths x declared years of life lost per death, over the arm's DALYs in the " + (
+        "decision window, not the model window" if cfg.get("window") else "window")
     return res
 
 
@@ -639,6 +655,10 @@ def findings(raw, data, expected=None) -> list[dict]:
     return out
 
 
+def metrics_text(m) -> str:
+    return "; ".join(f"{o} from " + ", ".join(f"{x} ({P})" for P, x in mp.items()) for o, mp in m.items())
+
+
 def block_findings(s, data) -> list[dict]:
     """The artifact's arm, model window and window metrics against the signed spec `s` (Codex S2-5b r1 P1-2): rows
     can match their declared metadata while the block was computed for another arm or window. Not declarable."""
@@ -707,7 +727,7 @@ def results_lines(data) -> list[str]:
     L += [""] + [f"Model interval from {p}." for p in pts]
     if data.get("window_metrics"):
         L.append("Model values over the window are the engine's window metrics (per person over the window, times "
-                 "the population): " + ", ".join(f"{o} from {m}" for o, m in data["window_metrics"].items()) + ".")
+                 "each population group's population): " + metrics_text(data["window_metrics"]) + ".")
     dp = data["daly_parts"]
     s = []
     if dp.get("deaths_share_of_dalys") is not None:
@@ -1110,7 +1130,8 @@ class _StepEngine:
     def describe(self):
         from toolkit.engines.contract import EngineCard
         return EngineCard("step", "1", ["step rate"], {"a": [0, 1], "b": [0, 1]}, {"x": "unused"},
-                          {"per_capita": ["cases", "dalys"], "windows": ["events", "events2"], "cost_drivers": []}, ["all"], {})
+                          {"per_capita": ["cases", "dalys"], "windows": ["events", "events2"], "cost_drivers": []},
+                          ["all"], {})
 
     def parameters(self):
         return []
@@ -1119,7 +1140,8 @@ class _StepEngine:
         from toolkit.engines.contract import Outcomes
         v = self._f(*horizon.window)
         return Outcomes({"cases": {"all": v}, "dalys": {"all": v}},
-                        {n: {"events": self._f(*w), "events2": 2 * self._f(*w)} for n, w in (horizon.windows or {}).items()}, {},
+                        {n: {"events": self._f(*w), "events2": 2 * self._f(*w)}
+                         for n, w in (horizon.windows or {}).items()}, {},
                         {"age_shares": {"all": 1.0}})
 
 
@@ -1204,7 +1226,7 @@ def _self_test_s25b(ok, th):
            f"{want2}): {b_str[:1]} {bad_map[:1]}")
         raw0["decision_units"]["populations"] = rawT["decision_units"]["populations"]
         # Codex S2-5b r1 P1-2: the artifact's arm, window and window metrics are the signed spec's
-        good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": "events"}}
+        good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": {"all": "events"}}}
         bf = [block_findings(sw, dict(good, **x)) for x in ({}, {"arm": "a"}, {"window": [8, 10]},
                                                              {"window_metrics": {"cases": "other"}})]
         ok(bf[0] == [] and all([f["kind"] for f in b] == ["burden_validation_inconsistent"]

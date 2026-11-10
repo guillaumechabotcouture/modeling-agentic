@@ -185,11 +185,12 @@ class EmulatorModel:
                 self.train_corrections[f"diag_floor:{name}"] = int(np.sum(v < 1e-6))
             self.T[("diag", name)] = np.log(np.maximum(v, 1e-6))
         self.bw = BV.model_window(spec)       # F6 S2-5b: the arm's window metrics over the burden model window
-        for o, m in (self.bw or {}).get("metrics", {}).items():
+        self.bw_keys = [(o, P, m) for o, mp in (self.bw or {}).get("metrics", {}).items() for P, m in mp.items()]
+        for o, P, m in self.bw_keys:
             v = np.array([_metric(get(i, self.bw["arm"]), BV.WINDOW, m, f"design point {i}") for i in range(n)])
             if np.any(v < 1e-9):
-                self.train_corrections[f"burden_floor:{o}"] = int(np.sum(v < 1e-9))
-            self.T[("bw", o)] = np.log(np.maximum(v, 1e-9))
+                self.train_corrections[f"burden_floor:{o}:{P}"] = int(np.sum(v < 1e-9))
+            self.T[("bw", o, P)] = np.log(np.maximum(v, 1e-9))
         self.gps, self.accuracy = {}, {}
         self.error = None
         self.design_points = n
@@ -207,8 +208,8 @@ class EmulatorModel:
         self.gps[("cal",)] = _gp(Xt, self.T[("cal",)][tr])
         for name in self.diagnostics:
             self.gps[("diag", name)] = _gp(Xt, self.T[("diag", name)][tr], self.gps[("cal",)].kernel_)
-        for o in (self.bw or {}).get("metrics", {}):
-            self.gps[("bw", o)] = _gp(Xt, self.T[("bw", o)][tr], self.gps[("cal",)].kernel_)
+        for o, P, _m in self.bw_keys:
+            self.gps[("bw", o, P)] = _gp(Xt, self.T[("bw", o, P)][tr], self.gps[("cal",)].kernel_)
         for P in self.pops:
             g0 = _gp(Xt, self.T[("base", P, self.primary)][tr])
             self.gps[("base", P, self.primary)] = g0
@@ -260,9 +261,9 @@ class EmulatorModel:
         P0 = next(iter(self.pops))
         tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
-        for o in (self.bw or {}).get("metrics", {}):     # Codex S2-5b r1 P2: the window values' error, jointly
-            cols.append(("bw", o))
-            res.append(self.T[("bw", o)][ho] - self.gps[("bw", o)].predict(Xh))
+        for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
+            cols.append(("bw", o, P))
+            res.append(self.T[("bw", o, P)][ho] - self.gps[("bw", o, P)].predict(Xh))
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
@@ -335,11 +336,13 @@ class EmulatorModel:
             e = np.exp(self.gps[("diag", name)].predict(X))
             for j in range(n):
                 y[j]["diag"][name] = float(e[j])
-        for o in (self.bw or {}).get("metrics", {}):
-            e = self.gps[("bw", o)].predict(X)
-            e = np.exp(e + E[:, self.error.col[("bw", o)]] if E is not None else e)
+        for o, P, _m in self.bw_keys:     # per population group, times its population (Codex S2-5b r2 P1)
+            e = self.gps[("bw", o, P)].predict(X)
+            e = np.exp(e + E[:, self.error.col[("bw", o, P)]] if E is not None else e)
+            col = self.pops[P]["column"]
             for j in range(n):
-                y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})[o] = float(e[j]) * tot[j]
+                b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
+                b[o] = b.get(o, 0.0) + float(e[j]) * float(rows[j][col])
         self.last_events = ev
         return dict(zip(ids, y))
 
@@ -477,8 +480,9 @@ class DirectModel:
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
                 if self.bw and k == self.bw["arm"]:
-                    row["burden"] = {k: {o: _metric({"windows": r.windows}, BV.WINDOW, m, f"unit {i}, {k}") * tot
-                                         for o, m in self.bw["metrics"].items()}}
+                    row["burden"] = {k: {o: sum(_metric({"windows": r.windows}, BV.WINDOW, mp[P], f"unit {i}, {k}")
+                                                 * float(u[pm["column"]]) for P, pm in self.pops.items())
+                                         for o, mp in self.bw["metrics"].items()}}
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
