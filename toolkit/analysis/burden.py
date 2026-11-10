@@ -779,6 +779,12 @@ def _self_test() -> int:
     gap = compare(ref, 150.0, [140.0, None, 160.0])
     ok(gap["status"] == "unmatched" and gap["model"]["low"] is None and "draw" in gap["model"]["note"],
        f"BV42 (Codex S2-5c P2) a draw with no model value leaves the row unmatched, never the point value: {gap['model']}")
+    gd = {"window": [0, 1], "arm": "none", "group_column": "g", "references": [dict(gap, source_id="S")],
+          "summary": {"within": 0, "outside": 0, "information": 0, "unmatched": 1, "n": 1}, "daly_parts": {}}
+    gids = {x[0] for x in claims(lambda *a: a, "art", gd)}
+    gtxt = "\n".join(results_lines(gd))
+    ok("burden.r.model_low" not in gids and "burden.r.model" in gids and "[CLAIM:burden.r.model_low]" not in gtxt
+       and "no model interval" in gtxt, f"BV43 (Codex S2-5c r2 P2) an empty model interval has no null claim: {gids}")
     r2 = compare(ref, 250.0, [240.0, 260.0])
     ok(r2["status"] == "outside" and r2["ratio_interval"] == [250 / 130, 250 / 80], "BV2 a ratio outside its band")
     ov = dict(ref, tolerance={"type": "overlap", "ratio_band": None})
