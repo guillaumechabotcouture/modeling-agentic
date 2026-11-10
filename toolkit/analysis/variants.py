@@ -10,6 +10,10 @@ Spec `analysis.plan_variants`:
                                    # is one of the choices: a group may share no provision. `provide: true` adds
                                    # minimum service on the same components, so every group provides one; each
                                    # group's choice is reported (group_choices, groups_none)
+      - {id: as_funded, type: fixed_plan, column: <unit column>, text: "..."}
+                                   # F6 S2-6: a plan given in full, each unit's package id in a units-table column
+                                   # (every cell a known package; the comparator's id for a unit given none);
+                                   # evaluated, never solved, and never the headline
     headline: service_everywhere   # optional: the headline plan is this variant's (default: the unconstrained plan)
 Each variant is solved on the point benefits and costs within the headline plan's budget (the reserved budget when
 uncertainty.affordability.enforce is set) and reported with its value lost against the unconstrained plan (absolute
@@ -17,6 +21,11 @@ and as a share of its objective), the dollars moved between components, the popu
 changes (toolkit/analysis/moves.py), and the units left with no package. A variant the rule or the budget makes
 infeasible is reported as not solved, with why, never dropped. With `headline`, the analysis's feasibility carries
 the variant's rule, so every re-optimisation (draws, stability, sensitivity, decision tests) does too.
+A fixed plan (status `evaluated`) reports the same fields on the same point tables, plus its cost against the
+allocatable budget (over or under, never refused for it), the units given a package the signed constraints rule out
+(with why; kept in the plan, evaluated as given), the caps and group rules it breaks, and, through UQ.run's on_draw
+hook (`Draws`), its outcome and cost quantiles over the uncertainty draws as uncertainty.yaml reports the headline
+plan's. Model corrections bearing on it, at the point or in a draw, stop publication as for every other plan.
 """
 from __future__ import annotations
 
@@ -31,7 +40,13 @@ if ROOT not in sys.path:
 from toolkit.alloc import packages as apackages  # noqa: E402
 
 PRODUCER = "toolkit/analysis/variants.py"
-TYPES = ("minimum_service", "group_rule")
+TYPES = ("minimum_service", "group_rule", "fixed_plan")
+KEYS = {"minimum_service": {"id", "type", "components", "text", "provide"},     # provide: refused below
+        "group_rule": {"id", "type", "components", "by", "text", "provide"},
+        "fixed_plan": {"id", "type", "column", "text"}}
+MOVES = ("units_changed", "share_units_changed", "population_changed", "population_changed_share",
+         "dollars_by_component", "dollars_moved", "dollars_moved_share", "dollars_reallocated",
+         "dollars_reallocated_share", "units_changed_by_group")
 
 
 def config(raw: dict) -> dict:
@@ -42,8 +57,37 @@ def headline_id(raw: dict):
     return config(raw).get("headline")
 
 
-def validate(raw: dict, cols) -> list[str]:
-    """Spec errors in analysis.plan_variants (called by toolkit/spec/schema.py validate)."""
+def fixed_variants(raw: dict) -> list[dict]:
+    return [v for v in config(raw).get("variants") or [] if isinstance(v, dict) and v.get("type") == "fixed_plan"]
+
+
+def _package_problems(cells: dict, pk, options=None) -> list[str]:
+    """A fixed plan's column ({unit id: cell}): every cell a known, non-empty package id. A generated package that
+    `within_envelope` pruning dropped (it costs more than the envelope in every unit) has no outcomes in the analysis:
+    it is refused with why (Codex S2-6 r1 P1-1)."""
+    out = []
+    empty = [str(u) for u, c in cells.items() if not str(c or "").strip()]
+    unknown = sorted({str(c).strip() for c in cells.values() if str(c or "").strip() and str(c).strip() not in pk})
+    p = (options or {}).get("packages")
+    pruned = []
+    if unknown and isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True:
+        from toolkit.alloc import costs as acosts
+        pruned = [x for x in unknown if x in acosts.packages(options)]
+        unknown = [x for x in unknown if x not in pruned]
+    if empty:
+        out.append(f"{len(empty)} units have no package id (e.g. {empty[:5]}); give the comparator's id for none")
+    if pruned:
+        out.append(f"packages {pruned[:5]} were dropped by options.packages.within_envelope (each costs more than the "
+                   "envelope in every unit), so the analysis has no outcomes for them; set within_envelope: false to "
+                   "evaluate this plan")
+    if unknown:
+        out.append(f"package ids {unknown[:5]} are not packages of options.packages {sorted(pk)[:8]}")
+    return out
+
+
+def validate(raw: dict, cols, units=None, pk=None, uid=None) -> list[str]:
+    """Spec errors in analysis.plan_variants (called by toolkit/spec/schema.py validate; given the units table and
+    the packages, a fixed plan's package ids are checked too)."""
     pv = (raw.get("analysis") or {}).get("plan_variants")
     if pv is None:
         return []
@@ -60,8 +104,14 @@ def validate(raw: dict, cols) -> list[str]:
         if v.get("type") not in TYPES:
             bad.append(f"plan variant {i}: type {v.get('type')!r} not in {TYPES}")
             continue
+        if v["type"] == "fixed_plan":
+            if v.get("column") not in cols:
+                bad.append(f"plan variant {i}: column {v.get('column')!r} is not a column of the units table")
+            elif units is not None and pk is not None:
+                bad += [f"plan variant {i}: {m}" for m in _package_problems(
+                    {u.get(uid): u.get(v["column"]) for u in units}, pk, raw.get("options"))]
         cs = v.get("components")
-        if (cs is not None or v["type"] == "group_rule") and not (
+        if v["type"] != "fixed_plan" and (cs is not None or v["type"] == "group_rule") and not (
                 isinstance(cs, list) and cs and all(c in comps for c in cs)):
             bad.append(f"plan variant {i}: components must be a non-empty list of known components")
         if v["type"] == "group_rule" and v.get("by") not in cols:
@@ -71,12 +121,15 @@ def validate(raw: dict, cols) -> list[str]:
             bad.append(f"plan variant {i}: text (what the rule means, in words, no numbers)")
         if "provide" in v and (v["type"] != "group_rule" or not isinstance(v["provide"], bool)):
             bad.append(f"plan variant {i}: provide (true or false) applies to a group_rule only")
-        for k in sorted(set(v) - {"id", "type", "components", "by", "text", "provide"}):
+        for k in sorted(set(v) - KEYS[v["type"]]):
             bad.append(f"plan variant {i}: unknown key {k}")
     for k in sorted(set(pv) - {"variants", "headline"}):
         bad.append(f"analysis.plan_variants: unknown key {k}")
     if pv.get("headline") is not None and pv["headline"] not in ids:
         bad.append(f"analysis.plan_variants.headline: {pv['headline']!r} is not a variant id")
+    elif any(v.get("id") == pv.get("headline") for v in fixed_variants(raw)):
+        bad.append(f"analysis.plan_variants.headline: {pv['headline']!r} is a fixed_plan, which is evaluated, not "
+                   "solved: it cannot be the headline")
     return bad
 
 
@@ -174,10 +227,16 @@ def contract_findings(raw: dict, point: dict, pv) -> list[str]:
     got = [x.get("id") for x in pv.get("variants") or [] if isinstance(x, dict)]
     if got != [v["id"] for v in cfg.get("variants") or []]:
         out.append(f"the plan_variants artifact's variants {got} are not the spec's")
-    bad = [x.get("id") for x in pv.get("variants") or [] if not isinstance(x, dict)
-           or x.get("status") not in ("solved", "not_solved")]
+    types = {v["id"]: v.get("type") for v in cfg.get("variants") or []}
+    bad = [x.get("id") for x in pv.get("variants") or [] if not isinstance(x, dict) or x.get("status") not in (
+        ("evaluated",) if types.get(x.get("id")) == "fixed_plan" else ("solved", "not_solved"))]
     if bad:
-        out.append(f"plan variants {bad}: status is neither solved nor not_solved")
+        out.append(f"plan variants {bad}: status is not evaluated (a fixed plan) or solved / not_solved (a rule)")
+    for x in pv.get("variants") or []:      # F6 S2-6: a fixed plan's eligibility report and budget difference
+        if isinstance(x, dict) and types.get(x.get("id")) == "fixed_plan" and x.get("status") == "evaluated" and not (
+                isinstance(x.get("ineligible_units"), list) and x.get("units_ineligible") == len(x["ineligible_units"])
+                and isinstance(x.get("cost_minus_budget"), (int, float))):
+            out.append(f"fixed plan {x.get('id')}: no eligibility report or cost against the budget")
     if hv is not None:
         h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
         if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
@@ -194,10 +253,62 @@ def group_choices(A, v: dict, plan: dict) -> dict:
     return {g: "/".join(sorted(c)) for g, c in sorted(out.items())}
 
 
-def run(A, ben0, cost0, plan, events=None) -> dict | None:
+def given_plan(A, v: dict) -> dict:
+    """{unit: package} of fixed plan `v` from its units-table column; an unknown or empty id, or a missing column,
+    fails closed (ValueError)."""
+    if any(v["column"] not in A.by_id[i] for i in A.ids):
+        raise ValueError(f"plan variant {v['id']}: no column {v['column']!r} in the units table")
+    bad = _package_problems({i: A.by_id[i][v["column"]] for i in A.ids}, A.pk, A.spec.raw.get("options"))
+    if bad:
+        raise ValueError(f"plan variant {v['id']}: " + "; ".join(bad))
+    return {i: str(A.by_id[i][v["column"]]).strip() for i in A.ids}
+
+
+def eligibility(A, fp: dict, feas: dict) -> dict:
+    """Where a given plan breaks the signed constraints: each unit whose package they rule out (with why), and the
+    caps and group rules it breaks (toolkit/analysis/moves.py infeasible_reasons, the budget apart)."""
+    from toolkit.analysis import moves as MV
+    bad = [{"unit": i, "package": fp[i], "reasons": list((feas.get("reasons") or {}).get(i, {}).get(fp[i]) or [])}
+           for i in A.ids if not feas["feasible"][i].get(fp[i], False)]
+    rest = dict(feas, feasible={i: {fp[i]: True} for i in A.ids})       # eligibility is reported unit by unit above
+    return {"ineligible_units": bad, "units_ineligible": len(bad),
+            "constraints_broken": MV.infeasible_reasons(A.ids, fp, {i: {fp[i]: 0.0} for i in A.ids}, rest, 0.0)}
+
+
+class Draws:
+    """Each uncertainty draw's outcomes averted and cost of every fixed plan (UQ.run's on_draw hook), guarded against
+    the draw's model corrections."""
+
+    def __init__(self, A):
+        self.A, self.n = A, 0
+        self.plans = {v["id"]: given_plan(A, v) for v in fixed_variants(A.spec.raw)}
+        self.y = {k: {o: [] for o in A.outcomes} for k in self.plans}
+        self.cost = {k: [] for k in self.plans}
+
+    def add(self, out, events=(), cost=None):
+        A, d = self.A, self.n
+        if cost is None:
+            raise ValueError("fixed plan draws: the draw's cost table is required")
+        self.n += 1
+        for k, p in self.plans.items():
+            A.guard(f"plan variant {k}, uncertainty draw {d}", [p], events=list(events))
+            for o in A.outcomes:
+                self.y[k][o].append(sum(out[i]["y"][A.comp][o] - out[i]["y"][p[i]][o] for i in A.ids))
+            self.cost[k].append(sum(float(cost[i][p[i]]) for i in A.ids))
+
+    def summary(self, k: str, interval: dict) -> dict:
+        from toolkit.analysis import uncertainty as UQ
+        from toolkit.analysis.core import q
+        lvl = (interval or {}).get("level", 0.95)
+        return {"draws": self.n, "interval": interval, "averted": {o: q(v, lvl) for o, v in self.y[k].items()},
+                "affordability": UQ.affordability(self.cost[k], self.A.budget, None, lvl)}
+
+
+def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | None:
     """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
     headline plan's budget (A.solve: the reserve when enforced), each guarded against the point evaluation's model
-    corrections `events` (Codex S1-6 r1 P1-1). None when the spec asks for none."""
+    corrections `events` (Codex S1-6 r1 P1-1); every fixed plan evaluated as given, with its draws from `draws` (a
+    Draws fed by the uncertainty step; None: the point estimate only). None when the spec asks for none."""
     from toolkit.analysis import moves as MV
     cfg = config(A.spec.raw)
     if not cfg:
@@ -216,6 +327,22 @@ def run(A, ben0, cost0, plan, events=None) -> dict | None:
     for v in cfg["variants"]:
         rec = {"id": v["id"], "type": v["type"], "text": v["text"], "components": v.get("components"),
                "by": v.get("by")}
+        if v["type"] == "fixed_plan":         # F6 S2-6: evaluated as given, never solved (fails closed on bad ids)
+            fp = given_plan(A, v)
+            A.guard(f"plan variant {v['id']}", [fp], events=ev)
+            fo = float(sum(ben0[i][fp[i]] for i in A.ids))
+            bf = getattr(A, "base_feas", None) or A.feas
+            m = MV.summarise(A, up, fp, ben0, cost0, fo, feas=bf)
+            r, drawn = row(fp, fo), draws is not None and draws.n > 0      # no draws: the point estimate only
+            rec.update(r, status="evaluated", column=v["column"], plan=dict(fp), value_lost=uo - fo,
+                       value_lost_pct=100.0 * (uo - fo) / uo if uo > 0 else None, **{k: m[k] for k in MOVES},
+                       budget_allocatable=float(A.budget), cost_minus_budget=r["cost"] - float(A.budget),
+                       within_budget=r["cost"] <= float(A.budget) * (1 + 1e-9), **eligibility(A, fp, bf),
+                       uncertainty=draws.summary(v["id"], interval) if drawn else None,
+                       uncertainty_note=("outcome and cost over the uncertainty draws" if drawn else
+                                         "point estimate only: no uncertainty draws were collected"))
+            out["variants"].append(rec)
+            continue
         try:
             _a, feas = feasibility(A, v)
             sol = A.solve(ben0, cost0, feas=feas)
@@ -228,10 +355,7 @@ def run(A, ben0, cost0, plan, events=None) -> dict | None:
         lost = uo - vo
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
-                   **{k: m[k] for k in ("units_changed", "share_units_changed", "population_changed",
-                                        "population_changed_share", "dollars_by_component", "dollars_moved",
-                                        "dollars_moved_share", "dollars_reallocated", "dollars_reallocated_share",
-                                        "units_changed_by_group")})
+                   **{k: m[k] for k in MOVES})
         if v["type"] == "group_rule":       # each group's choice; a shared "none" is allowed unless provide: true
             rec["group_choices"] = group_choices(A, v, vp)
             rec["groups_none"] = sum(c == "none" for c in rec["group_choices"].values())
@@ -355,6 +479,112 @@ def _self_test_round1(ok, attempt):
        f"PV17 the contract requires the artifact and agreement on the headline ({[len(b or []) for b in bad]})")
 
 
+def _self_test_fixed(ok, attempt):
+    """F6 S2-6: a plan given in full (a unit column of package ids) is evaluated, never solved."""
+    from toolkit.analysis.core import AnalysisBlocked
+    g_ = globals().get      # the functions under test, looked up so a missing one fails its case (no crash)
+    fx = {"id": "given", "type": "fixed_plan", "column": "gc", "text": "the plan as funded"}
+    units = [{"id": f"u{k}", "gc": g} for k, g in enumerate(["s", "n1", "s", "none"], 1)]
+    pk = {"none": frozenset(), "n1": frozenset({"n1"}), "n2": frozenset({"n2"}), "s": frozenset({"s"})}
+    comps = {"n1": {}, "n2": {}, "s": {}}
+    val = lambda pv, us=units, cols=("id", "gc"): attempt(  # noqa: E731
+        validate, {"options": {"components": comps}, "analysis": {"plan_variants": pv}}, set(cols), us, pk, "id")
+    good, e0 = val({"variants": [fx]})
+    bads = [val({"variants": [dict(fx, column="nocol")]}, cols=("id",)),
+            val({"variants": [fx]}, us=[dict(units[0], gc=" "), *units[1:]]),
+            val({"variants": [fx]}, us=[dict(units[0], gc="zz"), *units[1:]]),
+            val({"variants": [fx], "headline": "given"}),
+            val({"variants": [dict(fx, components=["s"])]})]
+    want = ("nocol", "u1", "zz", "cannot be the headline", "unknown key components")
+    ok(e0 is None and good == [] and all(b[1] is None and any(w in x for x in b[0]) for b, w in zip(bads, want)),
+       f"PV18 a fixed plan is validated: a known column, every unit's package known and non-empty, never the "
+       f"headline ({good}, {[b[0] for b in bads]})")
+    A, ben, cost, ms, gr = _toy()
+    for u, g in zip(A.spec.units(), ["s", "n1", "s", "none"]):
+        u["gc"] = g
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms, fx]}
+    plan = A.solve(ben, cost)["choice"]
+    r, e = attempt(run, A, ben, cost, plan, [])
+    f = {x["id"]: x for x in (r or {}).get("variants", [])}.get("given") or {}
+    ok(e is None and f.get("status") == "evaluated" and f.get("plan") == {"u1": "s", "u2": "n1", "u3": "s", "u4": "none"}
+       and abs(f.get("objective", 0) - 7.2) < 1e-9 and abs(f.get("value_lost", 0) - 6.8) < 1e-9
+       and abs(f.get("value_lost_pct", 0) - 100 * 6.8 / 14) < 1e-9 and f.get("units_no_package") == 1,
+       f"PV19 the given plan is evaluated on the point benefits, its value lost against the unconstrained plan by "
+       f"hand ({e!r}, {f.get('objective')}, {f.get('value_lost')})")
+    ok(abs(f.get("cost", 0) - 2.5) < 1e-9 and abs(f.get("cost_minus_budget", 0) - 0.5) < 1e-9
+       and f.get("within_budget") is False and f.get("budget_allocatable") == 2.0
+       and f.get("dollars_by_component") == {"n1": 0.0, "n2": -0.5, "s": 1.0} and f.get("dollars_moved") == 1.0
+       and f.get("units_changed") == 2 and f.get("population_changed") == 200.0,
+       f"PV20 a plan over the budget is reported with its cost against the envelope, not refused; dollars moved and "
+       f"units changing package against the unconstrained plan ({f.get('cost')}, {f.get('dollars_by_component')})")
+    ok(f.get("ineligible_units") == [] and f.get("units_ineligible") == 0 and f.get("uncertainty") is None
+       and "point" in str(f.get("uncertainty_note")),
+       f"PV21 no draws given: the point estimate only, said so ({f.get('uncertainty_note')})")
+    A.outcomes = ["dalys"]
+    r0, e0b = attempt(lambda: run(A, ben, cost, plan, [], Draws(A), {"level": 0.9}))
+    f0 = {x["id"]: x for x in (r0 or {}).get("variants", [])}.get("given") or {}
+    ok(e0b is None and f0.get("uncertainty") is None and "point" in str(f0.get("uncertainty_note")),
+       f"PV21b a draw collector that saw no draws (draws: 0) gives the point estimate only ({e0b!r})")
+    A.feas["feasible"]["u2"]["n1"] = False
+    A.feas["reasons"].setdefault("u2", {})["n1"] = ["n1 not eligible here"]
+    r2, e2 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    f2 = {x["id"]: x for x in (r2 or {}).get("variants", [])}.get("given") or {}
+    ok(e2 is None and f2.get("units_ineligible") == 1 and f2.get("plan", {}).get("u2") == "n1"
+       and f2.get("ineligible_units") == [{"unit": "u2", "package": "n1", "reasons": ["n1 not eligible here"]}],
+       f"PV22 a unit given a package it is not eligible for is reported with why, and kept in the plan ({e2!r}, "
+       f"{f2.get('ineligible_units')})")
+    A.spec.units()[0]["gc"] = "zz"
+    _, e3 = attempt(run, A, ben, cost, plan, [])
+    A.spec.units()[0]["gc"] = ""
+    _, e3b = attempt(g_("given_plan"), A, fx)
+    _, e3c = attempt(g_("given_plan"), A, dict(fx, column="nocol"))
+    ok(all(isinstance(x, ValueError) for x in (e3, e3b, e3c)),
+       f"PV23 an unknown or empty package id, or a missing column, fails closed at evaluation ({e3!r}, {e3b!r}, {e3c!r})")
+    A.spec.units()[0]["gc"] = "s"
+    _, e4 = attempt(run, A, ben, cost, plan, [{"unit": "u2", "package": "n1", "kind": "extrapolation"}])
+    ok(isinstance(e4, AnalysisBlocked), f"PV24 the point corrections guard the given plan ({e4!r})")
+    # draws: the given plan's outcome and cost in each uncertainty draw (UQ.run's on_draw hook)
+    A.outcomes = ["dalys"]
+    D, e5 = attempt(g_("Draws"), A)
+    out = {i: {"y": {k: {"dalys": 10.0 - ben[i][k]} for k in A.pk}} for i in A.ids}
+    tabs = [{i: {k: m * cost[i][k] for k in A.pk} for i in A.ids} for m in (0.8, 1.2)]
+    for t in tabs:
+        attempt(lambda *a: D.add(*a), out, [], t)
+    r6, e6 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D, {"level": 0.9})
+    u6 = ({x["id"]: x for x in (r6 or {}).get("variants", [])}.get("given") or {}).get("uncertainty") or {}
+    af = u6.get("affordability") or {}
+    ok(e5 is None and e6 is None and u6.get("draws") == 2 and abs(u6["averted"]["dalys"]["median"] - 7.2) < 1e-9
+       and af.get("draws_over_budget") == 1 and abs(af["fixed_plan_cost"]["median"] - 2.5) < 1e-9
+       and u6.get("interval") == {"level": 0.9},
+       f"PV25 the given plan's outcome and cost quantiles over the uncertainty draws, as the headline plan's ({e6!r}, "
+       f"{u6})")
+    _, e7 = attempt(lambda *a: D.add(*a), out, [{"unit": "u1", "package": "s", "kind": "clip"}], tabs[0])
+    ok(isinstance(e7, AnalysisBlocked), f"PV26 a draw's corrections on the given plan stop publication ({e7!r})")
+    # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
+    raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
+    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
+           "cost_minus_budget": 0.5}
+    art = {"headline": "unconstrained", "variants": [{"id": "nets", "type": "minimum_service", "status": "solved"}, rec]}
+    pt = {"plan": {}, "headline_variant": None}
+    cf = lambda v: attempt(contract_findings, raw, pt, v)[0]  # noqa: E731
+    ok(cf(art) == [] and cf(dict(art, variants=[dict(art["variants"][0], status="evaluated"), rec]))
+       and cf(dict(art, variants=[art["variants"][0], dict(rec, status="solved")]))
+       and cf(dict(art, variants=[art["variants"][0], {k: x for k, x in rec.items() if k != "ineligible_units"}])),
+       "PV27 the contract: a fixed plan is evaluated, a solved variant is not, and the eligibility report is required")
+    # Codex S2-6 r1 P1-2: any column name holds the plan (no internal key shadows it)
+    for u in A.spec.units():
+        u["__id"] = "none"
+    p8, e8 = attempt(g_("given_plan"), A, dict(fx, column="__id"))
+    ok(e8 is None and set((p8 or {}).values()) == {"none"}, f"PV28 a plan column of any name is read as given ({e8!r})")
+    # Codex S2-6 r1 P1-1: a package the envelope pruning dropped is named as pruned, not as unknown
+    raw9 = {"options": {"components": {"a": {}, "b": {}}, "packages": {"generate": True, "within_envelope": True}},
+            "analysis": {"plan_variants": {"variants": [dict(fx, column="gc")]}}}
+    e9, _ = attempt(validate, raw9, {"id", "gc"}, [{"id": "u1", "gc": "a+b"}],
+                    {"none": frozenset(), "a": frozenset({"a"}), "b": frozenset({"b"})}, "id")
+    ok(any("within_envelope" in x for x in e9 or []),
+       f"PV29 a given package that envelope pruning dropped is refused with why, not as unknown ({e9})")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -429,6 +659,7 @@ def _self_test() -> int:
        f"PV10 the spec's variants are validated ({errs}, {e8!r})")
     ok(validate({"analysis": {}}, set()) == [] if e8 is None else False, "PV11 no plan_variants: nothing to validate")
     _self_test_round1(ok, attempt)
+    _self_test_fixed(ok, attempt)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -188,7 +188,7 @@ def variant_claims(A, arts, pv) -> list[dict]:
     """F6 S1-6: each solved plan variant's value lost, dollars moved, unfunded units and units changing package."""
     out = []
     for j, v in enumerate((pv or {}).get("variants") or []):
-        if v.get("status") != "solved":
+        if v.get("status") not in ("solved", "evaluated"):
             continue
         f, c = f"data.variants[{j}]", f"variant.{v['id']}"
         out += [_c(f"{c}.value_lost", "scalar", arts["plan_variants"], f"{f}.value_lost", A.primary),
@@ -200,6 +200,18 @@ def variant_claims(A, arts, pv) -> list[dict]:
             out.append(_c(f"{c}.value_lost_pct", "percentage", arts["plan_variants"], f"{f}.value_lost_pct", "%"))
         if v.get("group_choices") is not None:
             out.append(_c(f"{c}.groups_none", "count", arts["plan_variants"], f"{f}.groups_none", "groups"))
+        if v.get("status") == "evaluated":       # F6 S2-6: a fixed plan's cost against the budget and eligibility
+            out += [_c(f"{c}.cost", "currency", arts["plan_variants"], f"{f}.cost", "USD"),
+                    _c(f"{c}.budget_difference", "currency", arts["plan_variants"], f"{f}.cost_minus_budget", "USD"),
+                    _c(f"{c}.ineligible", "count", arts["plan_variants"], f"{f}.units_ineligible", "units")]
+            un = v.get("uncertainty")
+            if un:
+                out += [_c(f"{c}.averted_median", "scalar", arts["plan_variants"],
+                           f"{f}.uncertainty.averted.{A.primary}.median", A.primary, interval=un["interval"]),
+                        _c(f"{c}.cost_median", "currency", arts["plan_variants"],
+                           f"{f}.uncertainty.affordability.fixed_plan_cost.median", "USD", interval=un["interval"]),
+                        _c(f"{c}.draws_over_budget", "count", arts["plan_variants"],
+                           f"{f}.uncertainty.affordability.draws_over_budget", "draws")]
     if pv:
         out.append(_c("variant.unconstrained.no_package", "count", arts["plan_variants"],
                       "data.unconstrained.units_no_package", "units"))
@@ -212,7 +224,8 @@ def variants_markdown(A, pv) -> str:
         return ""
     hv = pv["headline"]
     L = ["", "## Plan variants", "",
-         "Each variant is solved on the point outcomes and costs within the same budget as the headline plan, and "
+         "Each rule variant is solved on the point outcomes and costs within the same budget as the headline plan; "
+         "each fixed plan is evaluated as given on the same outcomes and costs, whatever it costs. Each is "
          "compared with the unconstrained plan (units with no package there: [CLAIM:variant.unconstrained.no_package]). "
          + ("The headline plan is the unconstrained plan." if hv == "unconstrained" else
             f"The headline plan is the variant {hv}, as the spec states (analysis.plan_variants.headline)."), "",
@@ -221,12 +234,29 @@ def variants_markdown(A, pv) -> str:
          "|---|---|---|---|---|---|---|---|"]
     for v in pv["variants"]:
         c = f"variant.{v['id']}"
-        if v.get("status") != "solved":
+        if v.get("status") not in ("solved", "evaluated"):
             L.append(f"| {v['id']} | {v['text']} | not solved: {v.get('reason', '')} | | | | | |")
             continue
         L.append(f"| {v['id']} | {v['text']} | [CLAIM:{c}.value_lost] | "
                  + (f"[CLAIM:{c}.value_lost_pct]" if v.get("value_lost_pct") is not None else "n/a")
                  + f" | [CLAIM:{c}.dollars] | [CLAIM:{c}.reallocated] | [CLAIM:{c}.units_changed] | [CLAIM:{c}.no_package] |")
+    for v in pv["variants"]:        # F6 S2-6: a plan given in full, evaluated as given
+        if v.get("status") != "evaluated":
+            continue
+        c = f"variant.{v['id']}"
+        bad = v.get("ineligible_units") or []
+        L += ["", f"{v['id']} is evaluated as given, not solved: each unit's package from the units-table column "
+              f"{v['column']}, on the same outcomes and costs as the headline plan. Its cost is [CLAIM:{c}.cost]; its cost "
+              f"minus the allocatable budget is [CLAIM:{c}.budget_difference] (positive: over the budget; a plan over "
+              f"the budget is reported, not refused, and its value lost can then be negative). Units given a package the signed constraints rule out: [CLAIM:{c}.ineligible]"
+              + (" (" + "; ".join(f"{x['unit']}: {x['package']}" for x in bad[:GROUPS_LISTED])
+                 + (" ..." if len(bad) > GROUPS_LISTED else "") + "; kept in the plan and evaluated as given)"
+                 if bad else "") + "."
+              + (" It breaks caps or group rules of the signed constraints (constraints_broken in the plan_variants "
+                 "artifact)." if v.get("constraints_broken") else "")
+              + (f" Over the uncertainty draws: {A.primary} averted [CLAIM:{c}.averted_median], cost "
+                 f"[CLAIM:{c}.cost_median], draws over budget [CLAIM:{c}.draws_over_budget]." if v.get("uncertainty")
+                 else f" {str(v.get('uncertainty_note') or '').capitalize()}.")]
     for v in pv["variants"]:        # Codex S1-6 r1 P3: what a group rule allows, and what each group chose
         if v.get("status") != "solved" or v.get("group_choices") is None:
             continue
