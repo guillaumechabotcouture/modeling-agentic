@@ -1803,6 +1803,9 @@ def _self_test() -> int:
                and artifact(rep).get("survey_changes") == sc,
                f"JA16f the toy run writes each group's change into the calibration artifact ({sc.get('status')}, "
                f"{[(x['id'], x.get('z'), x.get('not_computable')) for x in sc.get('pairs') or []]})")
+            exp = expected_change_ids(schema.load(p))
+            ok(exp == {x["id"] for x in sc.get("pairs") or []},
+               f"JA16g the gate rebuilds the expected pair ids from the spec and targets ({sorted(exp)})")
     safe(ja16, "JA16")
 
     def ja17():          # the gate findings of the change diagnostic
@@ -1887,6 +1890,36 @@ def _self_test() -> int:
         ok(len(got) == 1 and "one column" in got[0].get("not_computable", ""),
            f"JA19c a round reading the spec's default column is compared with that column ({got})")
     safe(ja19, "JA19")
+
+    def ja20():          # Codex r3: a dropped group is caught against the expected set; a relative sd tolerance
+        import math as m_
+        raw = {"calibration": {"joint": {"targets": [{"id": "a", "kind": "unit", "survey": "s"},
+                                                     {"id": "b", "kind": "unit", "survey": "s"}]}}}
+
+        def mk(gid, o, m, s0):
+            sd = m_.sqrt(2) * s0
+            return {"id": f"s:a->b:{gid}", "survey": "s", "group": gid, "from": "a", "to": "b", "observed": o,
+                    "modelled": m, "difference": m - o, "sd": sd, "sd_parts": {"sampling": sd, "offset": 0.0, "run": 0.0},
+                    "z": (m - o) / sd, "flagged": abs(m - o) / sd > 3, "text": "t"}
+        G, H = mk("G", -0.1, -0.1, 0.01), mk("H", -0.1, 0.1, 0.01)
+        exp = {G["id"], H["id"]}
+        full = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [G, H], "flagged": [H["id"]]}}, exp)
+        drop = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [G], "flagged": []}}, exp)
+        extra = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [G, H, mk("K", 0.0, 0.0, 0.01)],
+                                                         "flagged": [H["id"]]}}, exp)
+        ok([f["kind"] for f in full] == ["calibration_change_discrepancy"]
+           and any(not f["scope_declarable"] and H["id"] in f["claim"] for f in drop)
+           and any(not f["scope_declarable"] and "s:a->b:K" in f["claim"] for f in extra),
+           f"JA20a one group's entry and its flag dropped, or an extra entry, is a finding that cannot be declared "
+           f"({full}, {drop}, {extra})")
+        P = mk("P", 0.0, 2e-5, 1e-5)
+        bad = dict(P, sd=P["sd"] * 1.1)
+        bad.update(z=bad["difference"] / bad["sd"], flagged=abs(bad["difference"] / bad["sd"]) > 3)
+        f0 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [P], "flagged": []}}, {P["id"]})
+        f1 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [bad], "flagged": []}}, {P["id"]})
+        ok(f0 == [] and any(f["kind"] == "calibration_change_inconsistent" for f in f1),
+           f"JA20b errors near 1e-5 with the sd inflated by 10% are caught; the exact record is not ({f0}, {f1})")
+    safe(ja20, "JA20")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
