@@ -352,7 +352,19 @@ shared parameters are lost.
   outweigh small ones by repetition; it is not derived from a likelihood. The region does not depend on it; only the
   verification point does.
 
-The change between surveys by group (a calibration diagnostic with a threshold) follows in S2-3b. Part 2 (historical
+**Change between survey rounds (S2-3b).** Targets that name one survey (`survey`, or `bias_source` with `bias_by`)
+are its rounds, ordered by window. Each pair of rounds is compared per group, at the best point (the engine's
+verification runs), as the weighted mean over the group's units of the change on the targets' scale. Group rounds are
+compared per group of their table. z = (modelled − observed) / sd. The sd combines the rounds' sampling errors (a
+declared correlation, default 0) and the source offsets with signed coefficients, so an offset both rounds share
+cancels and offsets of different sources add. It also holds the modelled change's run noise, taken from an emulator of
+the paired difference, so the covariance of one trajectory's two windows is in it. Model discrepancy is left out. A
+group with |z| above `survey_changes.z_max` (3) is a declarable gate finding that states the direction ("the model's
+decline is 40% smaller than observed"). A single round, a missing group, or rounds whose metric, scale, kind or
+grouping differ are recorded as not computable, with the reason. They become a finding when the spec declares
+`calibration.joint.changes`. The region's range of the modelled change (emulator means) is reported beside it.
+
+Part 2 (historical
 and future intervention parameters, and histories anchored to delivery surveys) needs an engine parameter for past
 coverage. It follows separately.
 
