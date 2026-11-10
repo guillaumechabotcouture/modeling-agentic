@@ -626,16 +626,16 @@ def _num(x):
 
 def _round_mismatch(a, b, col=None):
     """Why two rounds of one survey cannot be compared (their definitions differ), or None."""
-    if a["kind"] != b["kind"]:
+    if a["kind"] != b["kind"] and {a["kind"], b["kind"]} != {"unit", "group"}:
         return f"definitions differ: {a['id']} is a {a['kind']} target, {b['id']} a {b['kind']} target"
     for q, dflt in (("metric", None), ("scale", "logit")):
         if a.get(q, dflt) != b.get(q, dflt):
             return f"definitions differ: {q} {a.get(q, dflt)!r} and {b.get(q, dflt)!r}"
     if [float(x) for x in a["window"]] == [float(x) for x in b["window"]]:
         return "the two rounds have the same window"
-    if a["kind"] == "unit" and a.get("column", col) == b.get("column", col):
+    if a["kind"] == b["kind"] == "unit" and a.get("column", col) == b.get("column", col):
         return f"the two rounds read one column ({a.get('column', col)})"
-    if a["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
+    if a["kind"] == b["kind"] == "group" and ((a.get("key") or {}).get("units"), a.get("weights")) != (
             (b.get("key") or {}).get("units"), b.get("weights")):
         return "definitions differ: the rounds aggregate over different groupings or weights"
     return None
@@ -644,7 +644,9 @@ def _round_mismatch(a, b, col=None):
 def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
     """F6 S2-3b: each pair of rounds of one survey (targets with the same survey, by window), one entry per group:
     unit rounds by the group column (changes.by, the survey's bias_by, else the region), each unit weighted (changes.
-    weights, else equally); group rounds by their group. What cannot be compared is an entry with its reason."""
+    weights, else equally); group rounds by their group. S2-3c: a group round and a unit round pair per group of the
+    group round, the unit round aggregated with the group round's own weights. What cannot be compared is an entry with
+    its reason."""
     ch = j.get("changes") or {}
     rho = float(ch.get("sampling_correlation", 0.0))
     series = {}
@@ -664,6 +666,9 @@ def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
             for b in ts[n + 1:]:
                 base = {"id": f"{s}:{a['id']}->{b['id']}", "survey": s, "from": a["id"], "to": b["id"]}
                 why = _round_mismatch(a, b, default_column)
+                if not why and a["kind"] != b["kind"]:
+                    out += _mixed_pairs(base, a, b, ch, rows, reg, built, rho)
+                    continue
                 by = ch.get("by") or a.get("bias_by") or reg if a["kind"] == "unit" else (a.get("key") or {}).get("units")
                 if why or not by:
                     out.append(dict(base, not_computable=why or "no group column (changes.by, bias_by or the region)"))
@@ -691,6 +696,34 @@ def change_pairs(j, rows, ids, targets, reg, default_column=None) -> list:
                                                            f"{' or '.join(t['id'] for t, q in ((a, ga), (b, gb)) if g not in q)}"
                                                            " (not in its table, or not every unit of the group is "
                                                            "calibrated)"))
+    return out
+
+
+def _mixed_pairs(base, a, b, ch, rows, reg, built, rho) -> list:
+    """F6 S2-3c: a group round minus (or from) a unit round of one survey, per group of the group round: the unit
+    round aggregated with the group round's own weights (the group target's members and weights, as built), so
+    the change is the group observation against the same aggregate of the unit observations."""
+    gt, ut = (a, b) if a["kind"] == "group" else (b, a)
+    gs, us = ("from", "to") if gt is a else ("to", "from")
+    gby, uby = (gt.get("key") or {}).get("units"), ch.get("by") or ut.get("bias_by") or reg
+    if uby != gby:
+        return [dict(base, not_computable=f"the groups do not match: the unit round {ut['id']} is grouped by {uby}, the "
+                                          f"group round {gt['id']} by {gby}")]
+    note = (f"the unit round is aggregated with the group round's weights ({gt.get('weights')}), not changes.weights "
+            f"({ch['weights']})" if ch.get("weights") and ch["weights"] != gt.get("weights") else None)
+    gg = {str(getattr(v, "group", "")): v for v in built.values() if v.kind == "group"
+          and getattr(v, "spec_id", None) == gt["id"]}
+    out = []
+    for g in sorted(set(gg) | {str(r.get(gby)) for r in rows.values()}):
+        e = dict(base, id=f"{base['id']}:{g}", group=g, by=gby, **({"note": note} if note else {}))
+        T = gg.get(g)
+        ws = (T.weights or {}) if T is not None else {}
+        tot = sum(ws.values())
+        why = (f"group {g} has no value in round {gt['id']} (not in its table, or not every unit of the group is "
+               "calibrated)" if T is None else None if all(math.isfinite(v) and v >= 0 for v in ws.values())
+               and tot > 0 else f"group {g}: the group round's weights are not finite, negative or all zero")
+        out.append(dict(e, not_computable=why) if why else dict(e, rho=rho, terms=[{gs: T.id, "w": 1.0}] + [
+            {us: f"{ut['id']}:{u}", "w": q / tot} for u, q in ws.items() if q > 0]))
     return out
 
 
