@@ -3,7 +3,8 @@
     model.predict(zs, theta, ids) -> {unit: {"y": {package: {outcome: total}},
                                              "cost": {package: {cost output: total}},
                                              "diag": {name: value},
-                                             "burden": {arm: {outcome: total over the model window}}}}
+                                             "burden": {arm: {outcome: total over the model window}},
+                                             "burden_group": {arm: {outcome: {population group: total}}}}}
 
 `burden` only when validation.burden declares a model window (F6 S2-5b, toolkit/analysis/burden.py): the arm's
 engine window metric for each mapped outcome over that window, times the unit's population.
@@ -362,8 +363,11 @@ class EmulatorModel:
             e = np.exp(e + E[:, self.error.col[("emu", "bw", o, P)]] if E is not None else e)
             col = self.pops[P]["column"]
             for j in range(n):
-                b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
-                b[o] = b.get(o, 0.0) + float(e[j]) * float(rows[j][col])
+                v = float(e[j]) * float(rows[j][col])
+                y[j].setdefault("burden_group", {}).setdefault(self.bw["arm"], {}).setdefault(o, {})[P] = v
+                if set(self.bw["metrics"][o]) == set(self.pops):     # S2-5c: the all-ages total needs every group
+                    b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
+                    b[o] = b.get(o, 0.0) + v
         self.last_events = ev
         return dict(zip(ids, y))
 
@@ -519,9 +523,11 @@ class DirectModel:
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
                 if self.bw and k == self.bw["arm"]:
-                    row["burden"] = {k: {o: sum(_metric({"windows": r.windows}, BV.WINDOW, mp[P], f"unit {i}, {k}")
-                                                 * float(u[pm["column"]]) for P, pm in self.pops.items())
-                                         for o, mp in self.bw["metrics"].items()}}
+                    bg = {o: {P: _metric({"windows": r.windows}, BV.WINDOW, m, f"unit {i}, {k}")
+                                  * float(u[self.pops[P]["column"]]) for P, m in mp.items()
+                                  if P in self.pops} for o, mp in self.bw["metrics"].items()}
+                    row["burden_group"] = {k: bg}          # S2-5c: per population group; the total needs every one
+                    row["burden"] = {k: {o: sum(g.values()) for o, g in bg.items() if set(g) == set(self.pops)}}
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))

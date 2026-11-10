@@ -16,8 +16,9 @@ Spec (optional section; checked by toolkit/spec/schema.py, no values in code):
         window_metrics: {cases: {<population group>: <metric>}}   # with window: per outcome and population group,
                                           # the engine window metric giving it per person of the group over a named
                                           # window, weighted by the group's population; one metric (a string) only
-                                          # with one population group spanning the engine's age groups. Every
-                                          # reference's outcome needs one
+                                          # with one population group spanning the engine's age groups. Groups may
+                                          # be left out (S2-5c): an all-ages row needs every group's metric, a row
+                                          # with an age band (a population group) only that group's
 
 Reference CSV contract (COLUMNS): id; group (a value of the group column, or * for every unit); age_band (blank: all
 ages, or a decision_units.populations key); outcome (one the spec reports); measure (count | rate, per `per` people of
@@ -42,7 +43,8 @@ windows (Horizon.windows, `WINDOW`) in the same runs, so each run returns the en
 window and no run is added; on the emulator path one more GP per mapped outcome is fitted (a new window changes the
 batch's job hashes, so a batch computed without it is not reused). Its interval comes from the uncertainty draws for
 all-age references (with the emulator error, a column of its error model, on the emulator path); an age-banded
-reference is the point value, and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
+reference is the point value outside a model window (under one, its population group's window value, with
+draws: S2-5c), and the artifact says so. Thresholds: toolkit/analysis/thresholds.yaml `burden`.
 """
 from __future__ import annotations
 
@@ -104,7 +106,7 @@ def model_window(s) -> dict | None:
         return None
     pops = list(s["decision_units"]["populations"])
     m = {o: ({pops[0]: x} if isinstance(x, str) and len(pops) == 1 else x) for o, x in m.items()}
-    if not all(isinstance(x, dict) and set(x) == set(pops) for x in m.values()):
+    if not all(isinstance(x, dict) and x and set(x) <= set(pops) for x in m.values()):     # S2-5c: partial
         return None
     return {"window": [float(x) for x in w], "metrics": m, "arm": config(s)["arm"]}
 
@@ -322,14 +324,15 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             == set(card.age_groups)
 
         def _ok(m):         # Codex S2-5b r2 P1: weighted by the spec's populations, as the decision window is
-            return (m in wn and one) if isinstance(m, str) else (isinstance(m, dict) and set(m) == set(pops)
+            return (m in wn and one) if isinstance(m, str) else (isinstance(m, dict) and m and set(m) <= set(pops)
                                                                   and all(isinstance(x, str) and x in wn
                                                                           for x in m.values()))
         if not (isinstance(wm, dict) and wm and all(o in outs and _ok(m) for o, m in wm.items())):
             bad.append(f"{P}.window_metrics: with window, {{reported outcome: {{population group: an engine window "
-                       f"metric {wn} per person of that group over the window}} for every group}} (a single metric "
-                       "only with one population group spanning the engine's age groups)")
+                       f"metric {wn} per person of that group over the window}}}} (a single metric only with one "
+                       "population group spanning the engine's age groups)")
             wm = {}
+        wm = {o: ({next(iter(pops)): m} if isinstance(m, str) else m) for o, m in (wm or {}).items()}
     refs, seen = [], set()
     for n, r in enumerate(rows, 2):
         e = []
@@ -342,10 +345,12 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
             e.append(f"group {g!r} is not a value of {cfg['group']} (or *): no unit to compare")
         if band and band not in pops:
             e.append(f"age_band {band!r} is not a decision_units.populations group")
-        if mw and band:
-            e.append("age_band: a model window compares all ages (window metrics are per person, all ages)")
         if mw and wm and r["outcome"] not in wm:
             e.append(f"outcome {r['outcome']!r} has no window_metrics entry for the model window")
+        elif mw and wm:     # S2-5c: a banded row needs its group's metric, an all-ages row every group's
+            miss = sorted(({band} if band else set(pops)) - set(wm[r["outcome"]]))
+            if miss:
+                e.append(f"population groups {miss} have no window metric for {r['outcome']!r} (window_metrics)")
         if r["outcome"] not in outs:
             e.append(f"outcome {r['outcome']!r} is not reported by the spec {outs}")
         per = _num(r["per"])
@@ -431,8 +436,10 @@ def _value(A, cfg, ref, out, arm):
     if not ids:
         return None
     if ref.get("window"):
-        try:
-            tot = sum(float(out[i]["burden"][arm][ref["outcome"]]) for i in ids) / (ref["window"][1] - ref["window"][0])
+        try:            # S2-5c: an age-banded row is its population group's window value alone
+            tot = sum(float(out[i]["burden_group"][arm][ref["outcome"]][ref["age_band"]] if ref["age_band"]
+                            else out[i]["burden"][arm][ref["outcome"]]) for i in ids)
+            tot /= ref["window"][1] - ref["window"][0]
         except (KeyError, TypeError, ValueError):
             return None
     else:
@@ -475,7 +482,7 @@ class Collector:
         self.refs, bad = load_references(A.spec, self.data)
         if bad:
             raise ValueError("validation.burden: " + "; ".join(bad))
-        self.draws = {r["id"]: [] for r in self.refs if not r["age_band"]}
+        self.draws = {r["id"]: [] for r in self.refs if not r["age_band"] or r["window"]}   # S2-5c: windowed too
 
     def add(self, out, events=(), cost=None):
         n = getattr(self, "n", 0)
@@ -518,6 +525,9 @@ def compare(ref, point, draws, level=0.95) -> dict:
     if ok and draws:
         lo, med, hi = (float(np.percentile(draws, q)) for q in (a, 50, 100 - a))
         src = f"{len(draws)} uncertainty draws, central {level:.0%}"
+    elif point is not None and draws:       # Codex S2-5c P2: a draw with no value never falls back to the point
+        lo = med = hi = None
+        src = "no model value in some uncertainty draws"
     else:
         lo = med = hi = point
         src = ("the point value: the draws keep all-age totals only" if ref["age_band"] else
@@ -580,11 +590,12 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
     cfg, arm, refs = col.cfg, col.cfg["arm"], col.refs
     guard_point(A, arm, events0)
     yp = (cfg["daly_parts"] or {}).get("yll_per_death") or {}
-    bands = sorted({r["age_band"] for r in refs if r["age_band"]} | ({b for b in yp if b != "all"}))
+    bands = sorted({r["age_band"] for r in refs if r["age_band"] and not r["window"]} | ({b for b in yp
+                                                                                           if b != "all"}))
     by_pop = by_population(A, A.theta0, z0, bands, arm) if bands else {}
     rows = []
     for r in refs:
-        out = by_pop[r["age_band"]] if r["age_band"] else out0
+        out = by_pop[r["age_band"]] if r["age_band"] and not r["window"] else out0
         rows.append(compare(r, _value(A, cfg, r, out, arm), col.draws.get(r["id"]) or None, level))
     mw = model_window(A.spec)
     t0, t1 = mw["window"] if mw else A.spec["objective"]["horizon"]
@@ -691,10 +702,10 @@ def claims(c, art, data) -> list[dict]:
     cl = []
     for j, r in enumerate(data["references"]):
         f, k = f"data.references[{j}]", f"burden.{r['id']}"
-        cl += [c(f"{k}.model", "scalar", art, f"{f}.model.point", r["outcome"]),
-               c(f"{k}.model_low", "scalar", art, f"{f}.model.low", r["outcome"]),
-               c(f"{k}.model_high", "scalar", art, f"{f}.model.high", r["outcome"]),
-               c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
+        m = r.get("model") or {}       # Codex S2-5c P2: no claim for a missing model value or interval
+        cl += [c(f"{k}.{n}", "scalar", art, f"{f}.model.{q}", r["outcome"])
+               for n, q in (("model", "point"), ("model_low", "low"), ("model_high", "high")) if m.get(q) is not None]
+        cl += [c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
                c(f"{k}.status", "label", art, f"{f}.status"), c(f"{k}.role", "label", art, f"{f}.role")]
         if r.get("interval", "published") == "published":
             cl += [c(f"{k}.lower", "scalar", art, f"{f}.lower", r["outcome"]),
@@ -723,8 +734,10 @@ def results_lines(data) -> list[str]:
         k, tol = f"burden.{r['id']}", r["tolerance"]
         unit = f" per {r['per']:g}" if r["measure"] == "rate" else ""
         L.append(f"| {r['id']} ({r['source']}; {r['source_id']}) | {r['group']} | {r['age_band'] or 'all'} | {r['outcome']}{unit} | "
-                 f"{r['year']:g} | [CLAIM:{k}.model] | [CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] "
-                 f"({r['model']['interval_from']}) | [CLAIM:{k}.value] "
+                 f"{r['year']:g} | " + (f"[CLAIM:{k}.model]" if r["model"].get("point") is not None else "n/a")
+                 + " | " + (f"[CLAIM:{k}.model_low] to [CLAIM:{k}.model_high] ({r['model']['interval_from']})"
+                            if None not in (r["model"].get("low"), r["model"].get("high")) else "no model interval")
+                 + f" | [CLAIM:{k}.value] "
                  + (f"([CLAIM:{k}.lower] to [CLAIM:{k}.upper])" if r.get("interval", "published") == "published"
                     else "(no published interval)") + " | "
                  + (f"[CLAIM:{k}.ratio]" if r.get("ratio") is not None else "n/a") + f" | {r['kind']} | "
@@ -765,6 +778,15 @@ def _self_test() -> int:
            "source": "synthetic", "tolerance": {"type": "ratio", "ratio_band": [0.5, 2.0]}}
     ok(compare(ref, 150.0, [140.0, 150.0, 160.0])["status"] == "within"
        and abs(compare(ref, 150.0, None)["ratio"] - 1.5) < 1e-12, "BV1 a ratio inside its band is within")
+    gap = compare(ref, 150.0, [140.0, None, 160.0])
+    ok(gap["status"] == "unmatched" and gap["model"]["low"] is None and "draw" in gap["model"]["note"],
+       f"BV42 (Codex S2-5c P2) a draw with no model value leaves the row unmatched, never the point value: {gap['model']}")
+    gd = {"window": [0, 1], "arm": "none", "group_column": "g", "references": [dict(gap, source_id="S")],
+          "summary": {"within": 0, "outside": 0, "information": 0, "unmatched": 1, "n": 1}, "daly_parts": {}}
+    gids = {x[0] for x in claims(lambda *a: a, "art", gd)}
+    gtxt = "\n".join(results_lines(gd))
+    ok("burden.r.model_low" not in gids and "burden.r.model" in gids and "[CLAIM:burden.r.model_low]" not in gtxt
+       and "no model interval" in gtxt, f"BV43 (Codex S2-5c r2 P2) an empty model interval has no null claim: {gids}")
     r2 = compare(ref, 250.0, [240.0, 260.0])
     ok(r2["status"] == "outside" and r2["ratio_interval"] == [250 / 130, 250 / 80], "BV2 a ratio outside its band")
     ov = dict(ref, tolerance={"type": "overlap", "ratio_band": None})
@@ -1200,7 +1222,6 @@ def _self_test_s25b(ok, th):
                 ("a window outside the horizon", dict(W, window=[-1, 2]), [row()], "window"),
                 ("a window with no metrics", {"window": [0, 2]}, [row()], "window_metrics"),
                 ("an unknown window metric", dict(W, window_metrics={"cases": "zz"}), [row()], "window_metrics"),
-                ("an age band under a window", W, [row(band="all")], "age_band"),
                 ("an outcome with no window metric", W, [row().replace(",cases,", ",dalys,")], "window_metrics"),
                 ("an unknown role", {}, [row(9, "estimated,s,ratio,,,WMR-X,,maybe,")], "role"),
                 ("an unknown interval flag", {}, [row(9, "estimated,s,ratio,,,WMR-X,,,maybe")], "interval"),
@@ -1238,6 +1259,20 @@ def _self_test_s25b(ok, th):
            and v2 is not None and abs(v2 - want2) < 1e-9 * want2,
            f"BV37 several population groups need a window metric each, weighted by their populations ({v2} vs "
            f"{want2}): {b_str[:1]} {bad_map[:1]}")
+        # S2-5c: an age-banded row under a window is that population group's metric x its population; a mapping
+        # may name only the groups the rows reference
+        WA = dict(W, window_metrics={"cases": {"a": "events2"}})
+        s3 = spec([row(band="a"), row(band="a").replace("a,", "c,", 1).replace(",count,,", ",rate,1000,")], WA)
+        r3, b3 = load_references(s3)
+        b4 = load_references(spec([row(band="b")], WA))[1]
+        o3 = DirectModel(s3).predict(None, {}, A.ids)
+        A3 = types.SimpleNamespace(spec=s3, ids=A.ids, by_id=A.by_id)
+        v3 = [_value(A3, config(s3), r, o3, "none") for r in r3]
+        pa = sum(float(u["pop"]) for u in sw.units())     # group a; events2 = 2 per person-year over [0, 2)
+        ok(b3 == [] and len(v3) == 2 and None not in v3 and abs(v3[0] - 2 * pa) < 1e-9 * pa
+           and abs(v3[1] - 2000.0) < 1e-9 and any("window metric" in x and "'b'" in x for x in b4),
+           f"BV41 an age-banded row under a window: the group's metric x its population ({v3} vs {2 * pa}, 2000 per "
+           f"1000); a row for a group with no metric is refused: {b3} {b4[:1]}")
         raw0["decision_units"]["populations"] = rawT["decision_units"]["populations"]
         # Codex S2-5b r1 P1-2: the artifact's arm, window and window metrics are the signed spec's
         good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": {"all": "events"}}}
