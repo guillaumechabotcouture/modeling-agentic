@@ -766,6 +766,22 @@ def _self_test() -> int:
            and [x["id"] for x in rw.get("dropped") or []] == ["D-003"],
            f"DW30 a finding outside the brief or withdrawn with a reason is not reopened: {rx.get('dropped')}, "
            f"{rw.get('dropped')}")
+        # DW31 (self-review): a critic's resolution of a judgement test holds once the critic stops listing it; a
+        # resolved finding whose runnable test fails still does not leave by being left out.
+        dk = os.path.join(d, "s31")
+        os.makedirs(dk)
+        ck = {"critique-domain": {"blockers": [
+            {"id": "D-010", "severity": "HIGH", "resolved": False, "claim": "c", "done_when": {"judgement": "sourced"}},
+            {"id": "D-011", "severity": "HIGH", "resolved": False, "claim": "c",
+             "done_when": {"file": "never.csv", "exists": True}}]}}
+        run(dk, ck, 1)
+        for b in ck["critique-domain"]["blockers"]:
+            b["resolved"] = True
+        run(dk, ck, 2)
+        r31 = run(dk, {"critique-domain": {"blockers": []}}, 3, record=False)
+        ok([x["id"] for x in r31["dropped"]] == ["D-011"] and not r31["status"]["D-010"]["open"],
+           f"DW31 a judgement the critic resolved stays resolved when left out; a failing runnable test does not: "
+           f"{[x['id'] for x in r31['dropped']]}")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
