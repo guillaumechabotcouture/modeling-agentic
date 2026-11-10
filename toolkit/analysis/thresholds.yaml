@@ -60,3 +60,10 @@ estimates:
   # initial susceptible share gives), it is retried once with this larger budget before adaptive Metropolis (measured
   # on the estimates self-test: ESS 332 at the defaults, 2,135 with this budget, 58 s).
   importance_retry: {sobol_log2: 16, stage_log2: 14, max_stages: 20}
+burden:
+  # F6 S2-5 (proposals for the owner's review): absolute burden against external estimates (toolkit/analysis/burden.py).
+  # A reference's ratio tolerance (model / reference value) defaults to `default_ratio_band` and may not be declared
+  # wider than `widest_ratio_band`; a reference year more than `max_year_gap` years from the decision window is refused.
+  default_ratio_band: [0.5, 2.0]
+  widest_ratio_band: [0.2, 5.0]
+  max_year_gap: 5

@@ -351,8 +351,9 @@ def evaluate(dw, run_dir: str) -> tuple[bool | None, str]:
         details.append(("pass " if ok else "FAIL ") + d)
         if not ok:
             return False, "; ".join(details)
-    if judged:   # the runnable parts are necessary; a critic decides the rest
-        return None, "; ".join(details + ["judgement: " + str(judged[0]["judgement"])[:200]])
+    if judged:   # the runnable parts are necessary; a critic decides the rest (F6 S1-7: never reads as a pass)
+        return None, "; ".join(["not judged: " + str(judged[0]["judgement"])]
+                               + [f"runnable part {x}" for x in details])
     return True, "; ".join(details)
 
 
@@ -410,7 +411,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
             if b.get("resolved") is not True:
                 missing.setdefault(reviewer, []).append(bid)
             continue
-        tests[bid] = {"reviewer": reviewer, "severity": b["severity"], "claim": str(b.get("claim") or "")[:200],
+        tests[bid] = {"reviewer": reviewer, "severity": b["severity"], "claim": str(b.get("claim") or ""),
                       "target_stage": str(b.get("target_stage") or "").upper(), "done_when": dw,
                       "frozen_round": round_n, "passed_round": None, "history": []}
         why = str(b.get("done_when_withdrawn") or "").strip()
@@ -426,11 +427,13 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         if t.get("withdrawn"):
             status[bid] = {"passes": None, "detail": f"withdrawn in round {t['withdrawn'].get('round')}: "
                                                      f"{t['withdrawn'].get('reason')}", "mechanical": False,
-                           "frozen_round": t.get("frozen_round")}
+                           "frozen_round": t.get("frozen_round"), "result": "withdrawn",
+                           "open": bid in open_ids, "severity": t.get("severity")}
             continue
         passes, detail = evaluate(t["done_when"], run_dir)
         status[bid] = {"passes": passes, "detail": detail, "mechanical": mechanical(t["done_when"]),
-                       "frozen_round": t.get("frozen_round")}
+                       "frozen_round": t.get("frozen_round"), "result": result_of(passes),
+                       "open": bid in open_ids, "severity": t.get("severity")}
         entry = {"id": bid, "severity": t.get("severity") or "HIGH", "reviewer": t.get("reviewer"),
                  "passed_round": t.get("passed_round"), "detail": detail, "claim": t.get("claim") or "",
                  "target_stage": t.get("target_stage") or "MODEL"}
@@ -448,6 +451,25 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         _save(run_dir, reg)
     return {"resolved": sorted(resolved), "regressed": regressed, "unmet": unmet, "missing": missing,
             "invalid": sorted(invalid), "status": status}
+
+
+def result_of(passes) -> str:
+    """F6 S1-7: a test's result in words. None (a judgement no one has made, or a test that cannot run) is
+    `not_judged`, never a pass."""
+    return "passed" if passes is True else "failed" if passes is False else "not_judged"
+
+
+def summary(status: dict, required=("HIGH", "MEDIUM")) -> dict:
+    """Counts of passed, failed and not-judged tests, and the open findings of a required severity whose
+    test is not judged: those cannot yield ACCEPT. A withdrawn test is counted apart, not as a pass."""
+    out = {"passed": 0, "failed": 0, "not_judged": 0, "withdrawn": 0, "required_not_judged": []}
+    for bid, e in sorted((status or {}).items()):
+        e = e if isinstance(e, dict) else {}
+        r = e.get("result") or result_of(e.get("passes"))
+        out[r if r in out else "not_judged"] += 1
+        if r == "not_judged" and e.get("open", True) and str(e.get("severity") or "HIGH") in required:
+            out["required_not_judged"].append(str(bid))
+    return out
 
 
 def _save(run_dir: str, reg: dict) -> None:
@@ -473,13 +495,13 @@ def gate_findings(result: dict) -> list[dict]:
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
                     "claim": (f"{r['id']} ({r['reviewer']}) passed its done_when test in round {r['passed_round']} "
                               f"and fails now: {r['detail'][:300]}. Something changed since; restore the fix. "
-                              f"Finding: {r['claim'][:150]}")})
+                              f"Finding: {r['claim']}")})
     for r in result.get("unmet") or []:
         out.append({"kind": "done_when_unmet", "severity": r["severity"], "id": r["id"],
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
                     "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
                               f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
-                              f"(`done_when_withdrawn: <reason>`). Finding: {r['claim'][:150]}")})
+                              f"(`done_when_withdrawn: <reason>`). Finding: {r['claim']}")})
     if result.get("invalid"):
         out.append({"kind": "done_when_registry_invalid", "severity": "HIGH", "stage": "CRITIQUE",
                     "target_stage": "CRITIQUE", "scope_declarable": True,
@@ -680,6 +702,32 @@ def _self_test() -> int:
         ok(st["M-001"]["mechanical"] and st["M-001"]["passes"] is False, f"DW17 status per test: {st}")
         ok(check_cli(d, ["R-005"]) == 0 and check_cli(d, ["M-001"]) == 1 and check_cli(d, ["Z-9"]) == 1,
            "DW18 the check command exits 0 only when every named test passes")
+        # DW24-DW26 (F6 S1-7): a test that is not judged is reported as not judged, never as a pass.
+        long_claim = "The case-management effect is a fixed value with no source; " * 8
+        cj = {"critique-domain": {"blockers": [
+            {"id": "D-003", "severity": "HIGH", "resolved": False, "claim": long_claim,
+             "done_when": [{"file": "alloc.csv", "exists": True}, {"judgement": "the effect is sourced"}]},
+            {"id": "D-004", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "alloc.csv", "exists": True}},
+            {"id": "D-005", "severity": "MEDIUM", "resolved": False, "claim": "c",
+             "done_when": {"file": "never.csv", "exists": True}}]}}
+        dj = os.path.join(d, "s17")
+        os.makedirs(dj)
+        open(os.path.join(dj, "alloc.csv"), "w").write("unit,package\na,P1\n")
+        rj = run(dj, cj, 1)
+        sj = rj["status"]
+        ok(sj["D-003"].get("result") == "not_judged" and sj["D-004"].get("result") == "passed"
+           and sj["D-005"].get("result") == "failed" and not sj["D-003"]["detail"].startswith("pass"),
+           f"DW24 each test has a result: passed, failed or not_judged; a pending judgement never reads as a pass: {sj}")
+        try:
+            sm = summary(sj)
+        except NameError as e:
+            sm = {"error": str(e)}
+        ok(sm.get("passed") == 1 and sm.get("failed") == 1 and sm.get("not_judged") == 1
+           and sm.get("required_not_judged") == ["D-003"],
+           f"DW25 the summary counts passed, failed and not judged separately, and names the open ones: {sm}")
+        ok(load_registry(dj)["tests"]["D-003"]["claim"] == long_claim,
+           "DW26 the registry keeps the finding's full claim")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

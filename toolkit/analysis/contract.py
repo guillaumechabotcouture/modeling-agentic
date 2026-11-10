@@ -144,6 +144,38 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     return reserve_findings(rule, point or {}, unc or {})
 
 
+def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
+    """F6 S2-5: the signed spec's validation.burden, judged from the artifact's numbers (toolkit/analysis/burden.py);
+    a group outside its tolerance is declarable, every other problem is not (fail closed)."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_burden", f"{SPEC} unreadable for validation.burden: {e}", "burden")]
+    from toolkit.analysis import burden as BV
+    if BV.section(raw) is None:
+        return []
+    try:              # the declared references, read again from the signed spec (Codex r1 P2: reconcile, not trust)
+        from toolkit.spec import schema
+        refs, bad = BV.load_references(schema.load(os.path.join(run_dir, SPEC)))
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        refs, bad = None, [f"{type(e).__name__}: {e}"]
+    out = [_f("analysis_contract_burden", f"validation.burden: {b}", "burden") for b in bad]
+    if signed:          # Codex #165 r3: the sign-off binds the reference file's bytes; a replaced file is not signed
+        try:
+            from toolkit.spec import signoff
+            st = signoff.status(run_dir)
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            st = f"unreadable ({type(e).__name__}: {e})"
+        if st != "signed":
+            out.append(_f("analysis_contract_burden", f"the reference file or the spec changed since sign-off "
+                          f"(status {st}): the analysis ran on a signed spec, the inputs now are not", "burden"))
+    pv = (data or {}).get("provenance") if isinstance(data, dict) else None
+    if data is not None and not (isinstance(pv, dict) and pv.get("independent") is True):
+        out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
+                      "independent of the calibration inputs", "burden"))
+    return out + BV.findings(raw, data, None if bad else refs)
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
@@ -155,7 +187,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc, pt_doc = None, None, None, None
+    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc = None, None, None, None, None, None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -239,6 +271,10 @@ def gate_findings(run_dir: str) -> list[dict]:
             unc_doc = doc.get("data") or {}
         if kind == "point":
             pt_doc = doc.get("data") or {}
+        if kind == "burden_validation":
+            bv_doc = doc.get("data") or {}
+        if kind == "plan_variants":
+            pv_doc = doc.get("data") or {}
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -257,6 +293,9 @@ def gate_findings(run_dir: str) -> list[dict]:
         out += _posterior_provenance(cal_doc[0], cal_doc[1], unc_doc)
     out += _affordability(run_dir, unc_doc or {})
     out += _reserve(run_dir, pt_doc, unc_doc or {})
+    if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
+        out += _plan_variants(run_dir, pt_doc, pv_doc)
+    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -384,6 +423,15 @@ def _posterior_provenance(rel, cal: dict, unc: dict) -> list[dict]:
         return [_f(kind, f"{rel}: the canonical sample is unreadable ({e})", rel)]
     return [_f(kind, f"{rel}: {len(found)} draw values are not the canonical sample's rows (e.g. {found[0]})", rel)] \
         if found else []
+
+
+def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
+    from toolkit.analysis import variants as V
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_plan_variants", f"{SPEC} unreadable: {e}")]
+    return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
 def _decision_tests(run_dir, man) -> list[dict]:

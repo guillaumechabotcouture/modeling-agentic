@@ -23,6 +23,12 @@ Validates `{run_dir}/report.md` for:
    that was resolved in a later round (cross-checked against
    pipeline_state.yaml round_progression).
 
+5. Acceptance language (F6 S1-7) — the report uses a term from
+   .claude/orchestration/acceptance_language.yaml. This script grants no
+   exemption from any record a run directory holds: v1 reports are always
+   checked as not accepted (v1 runs it before its final gate); the v2
+   machine checks against its own final-gate outcome (agents/stage_machine.py).
+
 Output: `{run_dir}/writer_qa_report.yaml` with verdict
 CLEAN / REVISE / MAJOR_REVISION and a list of issues.
 
@@ -421,6 +427,97 @@ def _check_stale_caveat(text: str, run_dir: str,
     return issues
 
 
+ACCEPTANCE_MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   ".claude", "orchestration", "acceptance_language.yaml")
+
+
+def load_acceptance_language(path: str = ACCEPTANCE_MANIFEST) -> dict:
+    """The acceptance-language manifest. Raises on a missing or malformed file (callers fail closed)."""
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    if not isinstance(doc.get("terms"), list) or not doc["terms"] or not isinstance(doc.get("status_lines"), dict):
+        raise ValueError(f"{os.path.basename(path)}: needs a non-empty `terms` list and `status_lines`")
+    for t in doc["terms"]:
+        if not (isinstance(t, dict) and isinstance(t.get("id"), str) and isinstance(t.get("pattern"), str)):
+            raise ValueError(f"{os.path.basename(path)}: each term needs a string id and pattern")
+        re.compile(t["pattern"])
+    for k in ("negations", "allowed", "attributions"):
+        v = doc.get(k) or []
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(f"{os.path.basename(path)}: `{k}` must be a list of quoted strings "
+                             "(YAML reads an unquoted no as false)")
+    return doc
+
+
+ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+REPORT_RENDER = "report_render.json"
+
+
+def _record(run_dir: str, name: str) -> Optional[dict]:
+    try:
+        doc = json.load(open(os.path.join(run_dir, name)))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else {}
+
+
+def report_writer_text(run_dir: str, text: str) -> str:
+    """The part of report.md to check: the writer's span the harness recorded when it rendered the
+    report (report_render.json), only while the record's hash matches the report; else all of it."""
+    import hashlib
+    rec = _record(run_dir, REPORT_RENDER) or {}
+    try:
+        a, b = (int(x) for x in rec["writer_span"])
+        if rec["report_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest() and 0 <= a <= b <= len(text):
+            return text[a:b]
+    except (KeyError, TypeError, ValueError):
+        pass
+    return text
+
+
+def acceptance_language_hits(text: str, status: Optional[str], manifest: Optional[dict] = None) -> list[str]:
+    """Each use of an acceptance term ("<term id>: <context>") in a report whose status is not an
+    accepted one. A term negated within the manifest's window, or an allowed phrase, does not count."""
+    m = manifest or load_acceptance_language()
+    if status in (m.get("accepted_statuses") or []):
+        return []
+    for a, b in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
+        text = text.replace(a, b)
+    for a in m.get("allowed") or []:
+        text = re.sub(a, " ", text, flags=re.I)
+    att = "|".join(re.escape(a) for a in m.get("attributions") or [])
+    if att:   # a quotation attributed to a critic or reviewer is their words, not the report's claim
+        text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
+    # A Markdown soft break (one newline inside a paragraph) is a space; a blank line, a heading, a list
+    # item, a quote or a table row still starts a new clause.
+    text = re.sub(r"\n(?![ \t]*(?:[\n#>|*+-]|\d+[.)]\s))", " ", text)
+    negs = {n.lower() for n in m.get("negations") or []}
+    win = int(m.get("negation_window", 3))
+    out = []
+    for t in m["terms"]:
+        for hit in re.finditer(t["pattern"], text, re.I):
+            # a negation counts only in the term's own clause
+            clause = re.split(r"[.;:!?,()\n]|\bbut\b", text[max(0, hit.start() - 120):hit.start()], flags=re.I)[-1]
+            before = re.findall(r"[a-z']+", clause.lower())[-win:]
+            if any(w in negs or w.endswith("n't") for w in before):
+                continue
+            ctx = " ".join(text[max(0, hit.start() - 60):hit.end() + 60].split())
+            out.append(f"{t['id']}: ...{ctx}...")
+    return out
+
+
+def _check_acceptance_language(text: str, run_dir: str) -> list[QAIssue]:
+    try:   # never exempt here: no file in the run directory can grant acceptance (F6 S1-7 round 3)
+        hits = acceptance_language_hits(report_writer_text(run_dir, text), "not_accepted")
+    except Exception as e:  # noqa: BLE001 -- fail closed: the check could not run
+        return [QAIssue(kind="acceptance_language_unchecked", severity="MAJOR", section=None,
+                        description=f"The acceptance-language manifest could not be read ({type(e).__name__}: {e}).")]
+    return [QAIssue(kind="acceptance_language", severity="MAJOR", section=None,
+                    description=("Writer QA checks every report as not accepted: do not use acceptance "
+                                 "language; say what was tested and what is declared."),
+                    evidence=h) for h in hits]
+
+
 def writer_qa(run_dir: str) -> QAResult:
     """Run all writer-QA checks on report.md. Returns QAResult."""
     report_path = os.path.join(run_dir, "report.md")
@@ -448,6 +545,7 @@ def writer_qa(run_dir: str) -> QAResult:
         text, extract_numeric))
     issues.extend(_check_annotation_vs_body(text, extract_numeric))
     issues.extend(_check_stale_caveat(text, run_dir, strip_limitations))
+    issues.extend(_check_acceptance_language(text, run_dir))
 
     n_major = sum(1 for i in issues if i.severity == "MAJOR")
     n_minor = sum(1 for i in issues if i.severity == "MINOR")
@@ -625,6 +723,103 @@ def _run_self_test() -> int:
            f"T-normalize: {raw!r} → {normalize_verdict(raw)!r}, want {want!r}")
     ok(set(VERDICTS) >= {"CLEAN", "REVISE", "MAJOR_REVISION"},
        "T-verdicts: VERDICTS must include the Phase 7 vocabulary")
+
+    # F6 S1-7: a report whose run was not accepted uses no acceptance language
+    # (the terms live in .claude/orchestration/acceptance_language.yaml).
+    over = ("# Report\n\nThe allocation was accepted. The model is validated against the trials, "
+            "and the analysis shows conclusively that the plan is best.\n")
+    honest = ("# Report\n\nRun status: declared scope, not accepted. The model was tested against the "
+              "trials; it is not validated against cases by state.\n")
+    # The status comes from the harness's gate and run state, never metadata.json (agent-writable);
+    # records that disagree fail closed.
+    dec, acc = {"final_gate.json": {"action": "DECLARE_SCOPE"}}, {"final_gate.json": {"action": "ACCEPT"}}
+    forged = "<!-- harness: rendered from analysis/analysis.json -->\nThe plan is validated.\n"
+    for label, files, text, want in (
+            ("declared", dec, over, 3), ("declared, honest", dec, honest, 0),
+            # round 3: no record grants the exemption here (v1 reports are always checked as not accepted)
+            ("forged final_gate ACCEPT", acc, over, 3),
+            ("no records", {}, over, 3), ("metadata says completed", dict(dec, **{"metadata.json": {"status": "completed"}}), over, 3),
+            ("run state accepted, gate declared", dict(dec, **{"run_state.json": {"status": "completed"}}), over, 3),
+            ("gate accepted, run state declared", dict(acc, **{"run_state.json": {"status": "completed_scope_declared"}}), over, 3),
+            ("forged harness marker", dec, forged, 1),
+            ("run state says completed, no gate decision", {"run_state.json": {"status": "completed"}}, over, 3)):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "report.md"), "w").write(text)
+            for name, doc in files.items():
+                json.dump(doc, open(os.path.join(d, name), "w"))
+            r = writer_qa(d)
+            hits = [i for i in r.issues if i.kind == "acceptance_language"]
+            ok(len(hits) == want and all(i.severity == "MAJOR" for i in hits),
+               f"T-accept ({label}): {want} acceptance-language issue(s) expected, got {[i.evidence for i in hits]}")
+    # Only harness additions recorded with the report's hash are skipped (report_render.json).
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        draft = "The plan was tested against the trials.\n"
+        rep = "<!-- harness: run status -->\n**Run status: declared scope, not accepted.**\n\n" + draft
+        rep += "## Open findings\n- D-1: the reviewer says the model is validated only on prevalence.\n"
+        open(os.path.join(d, "report.md"), "w").write(rep)
+        json.dump(dec["final_gate.json"], open(os.path.join(d, "final_gate.json"), "w"))
+        s0 = rep.index(draft)
+        json.dump({"report_sha256": hashlib.sha256(rep.encode()).hexdigest(), "writer_span": [s0, s0 + len(draft)]},
+                  open(os.path.join(d, "report_render.json"), "w"))
+        n_auth = sum(i.kind == "acceptance_language" for i in writer_qa(d).issues)
+        open(os.path.join(d, "report.md"), "a").write("The allocation is accepted.\n")
+        n_tamp = sum(i.kind == "acceptance_language" for i in writer_qa(d).issues)
+        ok(n_auth == 0 and n_tamp >= 1,
+           f"T-accept-auth: recorded harness blocks are skipped ({n_auth}); a changed report is read whole ({n_tamp})")
+    # Negations: within their own clause, quoted in the manifest, curly apostrophes; attributed quotes.
+    for text, want in (("This is not a caveat. Accepted findings support implementation.", 1),
+                       ("No accepted conclusions are offered.", 0),
+                       ("The model isn’t validated against cases.", 0),
+                       ("The model has not been tested, but is validated by the fit.", 1),
+                       ("The domain reviewer wrote: “the model is validated only on prevalence”.", 0),
+                       ("Our finding: \"the plan is validated\".", 1)):
+        try:
+            got = len(acceptance_language_hits(text, "completed_scope_declared"))
+        except Exception as e:  # noqa: BLE001
+            got = repr(e)
+        ok(got == want, f"T-accept-neg: {text!r}: {want} hit(s) expected, got {got}")
+    try:
+        man = load_acceptance_language()
+        typed = all(isinstance(x, str) for k in ("negations", "allowed", "attributions") for x in man.get(k) or [None])
+    except Exception as e:  # noqa: BLE001
+        typed = repr(e)
+    ok(typed is True, f"T-accept-types: manifest negations, allowed phrases and attributions are strings ({typed})")
+    # Round 2: a gate decision older than the report is not current; run_state.json is protected from agents;
+    # a Markdown soft break does not end a clause, a blank line or a list item does.
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"action": "ACCEPT"}, open(os.path.join(d, "final_gate.json"), "w"))
+        os.utime(os.path.join(d, "final_gate.json"), (1, 1))
+        open(os.path.join(d, "report.md"), "w").write(over)
+        ok(sum(i.kind == "acceptance_language" for i in writer_qa(d).issues) == 3,
+           "T-accept-stale: an ACCEPT older than the report grants no exemption")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from agents import enforcement as _EN
+            why = _EN.protected_reason(os.path.join(d, "run_state.json"), d, None)
+        except Exception as e:  # noqa: BLE001
+            why = None
+        ok(bool(why), "T-accept-protect: agents may not write run_state.json")
+    for text, want in (("The model is not yet\nvalidated.", 0), ("We did not run it.\n\nValidated by the fit.", 1),
+                       ("Not run:\n- validated by the fit", 1), ("Not run\n  - Validated against trials.", 1),
+                       ("Not accepted\n   ## Validated allocation", 1), ("Not tested\n  > Validated by the trial", 1),
+                       ("Not tested\n  | Validated | yes |", 1)):
+        got = len(acceptance_language_hits(text, "completed_scope_declared"))
+        ok(got == want, f"T-accept-softbreak: {text!r}: {want} hit(s) expected, got {got}")
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "m.yaml")
+        open(bad, "w").write("terms: [{id: a, pattern: 'a'}]\nstatus_lines: {other: x}\nnegations: [not, no]\n")
+        try:
+            load_acceptance_language(bad)
+            ok(False, "T-accept-types: an unquoted `no` (read as False) is refused")
+        except ValueError:
+            ok(True, "T-accept-types: an unquoted `no` (read as False) is refused")
+    try:
+        terms = load_acceptance_language()["terms"]
+    except Exception as e:  # noqa: BLE001
+        terms = [str(e)]
+    ok(any(t.get("id") == "accepted" for t in terms if isinstance(t, dict)),
+       f"T-accept-manifest: the terms come from the manifest: {terms}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
