@@ -774,8 +774,9 @@ def _self_test_fixed(ok, attempt):
     del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
-    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
-           "cost_minus_budget": 0.5, "same_spend": {"status": "not_solved", "reason": "toy"}}
+    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "units_ineligible": 1, "cost": 2.5,
+           "ineligible_units": [{"unit": "u1", "package": "s", "reasons": ["toy"]}], "cost_minus_budget": 0.5,
+           "same_spend": {"status": "not_solved", "budget": 2.5, "reason": "toy"}}
     art = {"headline": "unconstrained", "variants": [{"id": "nets", "type": "minimum_service", "status": "solved"}, rec]}
     pt = {"plan": {}, "headline_variant": None}
     cf = lambda v: attempt(contract_findings, raw, pt, v)[0]  # noqa: E731
@@ -860,9 +861,73 @@ def _self_test_same_spend(ok, attempt):
            mut(lambda x: x["same_spend"].update(status="maybe")),
            mut(lambda x: x.update(same_spend="solved"))]
     good = attempt(contract_findings, raw, pt, r4)[0]
-    ns = mut(lambda x: x.update(same_spend={"status": "not_solved", "reason": "optimizer status infeasible"}))
-    ok(good == [] and ns == [] and all(b and any("same" in m for m in b) for b in bad),
-       f"PV40 the contract requires a consistent same-spend block for each evaluated fixed plan ({good}, {ns}, {bad})")
+    ok(good == [] and all(b and any("same" in m for m in b) for b in bad),
+       f"PV40 the contract requires a consistent same-spend block for each evaluated fixed plan ({good}, {bad})")
+    _self_test_same_spend_r1(ok, attempt, setup, mut)
+
+
+def _self_test_same_spend_r1(ok, attempt, setup, mut):
+    """Codex round 1 on the same-spend comparison."""
+    from toolkit.analysis import claims as CL
+    from toolkit.analysis.core import AnalysisBlocked
+    given = {"u1": "none", "u2": "none", "u3": "none", "u4": "s"}
+    # P2-1: the gain in undiscounted outcomes, the objective difference apart
+    A, ben, cost = setup(given)
+    A.dfac = 0.5
+    out = {i: {"y": {k: {"dalys": 100.0 - ben[i][k] / A.dfac} for k in A.pk}} for i in A.ids}
+    r, e = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], [], None, None, out))
+    s = ({x["id"]: x for x in (r or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
+    cl = {c["id"]: c for c in (CL.variant_claims(A, {"plan_variants": "pv"}, r) if r else [])}
+    md = CL.variants_markdown(A, r) if r else ""
+    ok(e is None and abs(s.get("objective_gain", 0) - 7.4) < 1e-9 and abs(s.get("value_gain", 0) - 14.8) < 1e-9
+       and abs(s.get("value_gain_pct", 0) - 100 * 14.8 / 16) < 1e-9
+       and (cl.get("variant.given.same_spend_gain") or {}).get("source_field", "").endswith("same_spend.value_gain")
+       and "undiscounted" in md and "[CLAIM:variant.given.same_spend_gain]" in md,
+       f"PV41 with discounting, the same-spend gain is in undiscounted outcomes and the claim uses it; the objective "
+       f"difference is apart ({e!r}, {s.get('value_gain')}, {s.get('objective_gain')})")
+    # P2-2: not solved is refused for a feasible given plan, and needs the plan's cost as its budget
+    ns = {"status": "not_solved", "reason": "optimizer status infeasible"}
+    feas_ns = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"])))
+    no_b = mut(lambda x: x.update(same_spend=dict(ns), units_ineligible=1, ineligible_units=[{"unit": "u1"}]))
+    bad_b = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"] + 1), units_ineligible=1,
+                                   ineligible_units=[{"unit": "u1"}]))
+    ok_ns = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"]), units_ineligible=1,
+                                   ineligible_units=[{"unit": "u1"}]))
+    broken = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"]), constraints_broken=["cap c"]))
+    ok(all(b and any("same" in m for m in b) for b in (feas_ns, no_b, bad_b)) and ok_ns == [] and broken == [],
+       f"PV42 not solved is a finding for a fixed plan feasible under the signed constraints, or without its cost as "
+       f"budget ({feas_ns}, {no_b}, {bad_b}, {ok_ns}, {broken})")
+    # P2-3: the plan covers the fixed plan's units with package ids; numbers finite; never an exception
+    bad = [mut(lambda x: x["same_spend"]["plan"].pop("u1")),
+           mut(lambda x: x["same_spend"]["plan"].update(u9="n1")),
+           mut(lambda x: x["same_spend"]["plan"].update(u1="")),
+           mut(lambda x: x["same_spend"]["plan"].update(u1=3)),
+           mut(lambda x: x["same_spend"].update(objective=float("nan"))),
+           mut(lambda x: x["same_spend"].update(cost="a lot")),
+           mut(lambda x: x["same_spend"].update(value_gain=float("inf"))),
+           mut(lambda x: x.update(cost=None)),
+           mut(lambda x: x.update(objective="high"))]
+    ok(all(b and any("same" in m for m in b) for b in bad),
+       f"PV43 a same-spend plan off the fixed plan's units or without package ids, or a field that is not a finite "
+       f"number, is a finding, not an exception ({bad})")
+    # note: with a headline variant, the same-spend solve uses the unconstrained feasibility
+    A, ben, cost = setup(given)
+    ms = {"id": "nets", "type": "minimum_service", "components": ["n1", "n2"], "text": "a net in every unit"}
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms, A.spec.raw["analysis"]["plan_variants"]["variants"][0]],
+                                               "headline": "nets"}
+    _, eh = attempt(apply_headline, A)
+    r5, e5 = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], []))
+    s5 = ({x["id"]: x for x in (r5 or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
+    ok(eh is None and e5 is None and s5.get("status") == "solved" and abs(s5.get("objective", 0) - 8.0) < 1e-9,
+       f"PV44 with a variant headline the same-spend optimum is solved under the unconstrained feasibility "
+       f"({eh!r}, {e5!r}, {s5.get('status')}, {s5.get('objective')})")
+    # note: a correction on a package only the same-spend optimum uses stops the analysis
+    A, ben, cost = setup({"u1": "none", "u2": "none", "u3": "none", "u4": "s"})
+    ben["u3"]["n1"] = 5.5          # at cost 1 the optimum is n1 in u1 and u3; u3 takes s in the unconstrained plan
+    r6, e6 = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], [
+        {"unit": "u3", "package": "n1", "kind": "extrapolation"}]))
+    ok(isinstance(e6, AnalysisBlocked) and "cost" in str(e6),
+       f"PV45 a correction on a package only the same-spend optimum uses stops the analysis ({e6!r})")
 
 
 def _self_test() -> int:
