@@ -562,7 +562,7 @@ def _self_test_emulator(ok):
         ok(M.input_names[-3:] == ["cov", "group.count", "group.last"] and M.fv[u3][1:] == [3.0, 2017.0]
            and M.X.shape[1] == len(M.input_names), f"EM3 the encoded attributes are emulator inputs: {M.input_names}")
         cols = set(M.error.cols)
-        ok({("base", "all", o) for o in M.outcomes} <= cols and {("cost", "doses", k) for k in M.packages} <= cols,
+        ok({("emu", "base", "all", o) for o in M.outcomes} <= cols and {("emu", "cost", "doses", k) for k in M.packages} <= cols,
            "EM4 the error model has comparator-burden and cost-output columns")
         ids = list(M.by_id)[:4]
         zs = {i: 0.2 for i in ids}
@@ -577,12 +577,23 @@ def _self_test_emulator(ok):
            and M.predict(zs, th, ids) == y0,
            "EM5 drawn emulator error moves the comparator burden and the cost outputs; without noise nothing moves")
         R5 = np.zeros((6, len(M.error.cols)))
-        R5[:, M.error.col[("cost", "doses", M.comp)]] = -1.0          # the comparator gives no doses: pushed below 0
+        R5[:, M.error.col[("emu", "cost", "doses", M.comp)]] = -1.0          # the comparator gives no doses: pushed below 0
         M.error, M.error_floors = EmulatorError(M.error.cols, R5), {}
         y5 = M.predict(zs, th, ids, noise=np.random.default_rng(1))
-        ok(all(y5[i]["cost"][M.comp]["doses"] == 0.0 for i in ids) and M.error_floors.get(f"doses:{M.comp}") == 4
+        ok(all(y5[i]["cost"][M.comp]["doses"] == 0.0 for i in ids) and M.error_floors == {"doses": {M.comp: 4}}
            and not [e for e in M.last_events if e["kind"] == "cost_output_floor"],
            f"EM6 a drawn cost error below zero is floored and counted, not a model correction: {M.error_floors}")
+        # Codex r1 P1-1: a population group named like a quantity, with a cost output named like an outcome
+        r["decision_units"]["populations"] = {"cost": r["decision_units"]["populations"]["all"]}
+        r["options"]["populations"] = {"total": "pop"}
+        r["analysis"]["cost_outputs"] = {"dalys": {"cost_driver": "a_doses"}}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        sp7 = schema.load(p)
+        try:
+            M7 = EmulatorModel(sp7, d1, res, log=lambda *a: None).fit()
+            ok(len(set(M7.error.cols)) == len(M7.error.cols), "EM7 quantity keys cannot collide with group names")
+        except ValueError as e:
+            ok(False, f"EM7 quantity keys cannot collide with group names ({e})")
 
 
 def _self_test() -> int:
@@ -638,7 +649,7 @@ def _self_test() -> int:
     rng6 = np.random.default_rng(8)
     g6 = rng6.normal(0, 0.05, size=40)
     R6 = np.column_stack([g6, -0.8 * g6 + rng6.normal(0, 0.01, size=40), rng6.normal(0, 0.05, size=40)])
-    e6 = EmulatorError([("base", "all", "a"), ("all", "a", "k"), ("cost", "c", "k")], R6)
+    e6 = EmulatorError([("emu", "base", "all", "a"), ("all", "a", "k"), ("emu", "cost", "c", "k")], R6)
     x6 = e6.sample(np.random.default_rng(9), 4000)
     want6 = np.corrcoef(R6.T)
     got6 = np.corrcoef(x6.T)

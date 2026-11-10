@@ -237,6 +237,13 @@ def _self_test() -> int:
            f"keys, duplicate names ({[g[:1] for g in got]})")
         ok(probs([{"attribute": "group", "encoding": "equals", "value": "k1"}],
                  {"group": {"column": "kind"}}) == [], "FT9 a category attribute is usable through equals")
+        # Codex r1 P1-2: the category and the attribute value are checked before they are compared
+        p10 = [probs([{"attribute": "group", "encoding": "equals", "value": v}], {"group": {"column": "kind"}})
+               for v in (["k1"], {"a": 1}, float("nan"), None)]
+        p10.append(probs([{"attribute": "group", "encoding": "equals", "value": "k1"}],
+                         {"group": {"value": float("nan"), "source": "x"}}))
+        ok(all(p10) and raises(E("equals", value=float("nan")), float("nan")),
+           f"FT10 equals refuses a list, mapping, non-finite or missing category and a non-finite value ({p10})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

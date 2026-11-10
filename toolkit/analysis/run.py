@@ -1298,10 +1298,12 @@ def _self_test_priors(ok, q):
            f"{rec['statement']}")
         err = M.error
         npk = len(M.packages) - 1
-        red = [c for c in (err.cols if err else []) if c[0] not in ("base", "cost", "bw")]
+        red = [c for c in (err.cols if err else []) if len(c) == 3 and c[0] != "bw"]
         ok(err is not None and len(red) == len(M.pops) * len(M.outcomes) * npk and {c[1] for c in red} == set(M.outcomes)
-           and {c for c in err.cols if c[0] == "base"} == {("base", P, o) for P in M.pops for o in M.outcomes}
-           and {c for c in err.cols if c[0] == "cost"} == {("cost", n, k) for n in M.cost_outputs for k in M.packages},
+           and {c for c in err.cols if c[:2] == ("emu", "base")} == {("emu", "base", P, o) for P in M.pops
+                                                                    for o in M.outcomes}
+           and {c for c in err.cols if c[:2] == ("emu", "cost")} == {("emu", "cost", n, k) for n in M.cost_outputs
+                                                                    for k in M.packages},
            f"RP9 each outcome gets its own held-out residual column, so one outcome's bias is not applied to another "
            f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
            "columns")
