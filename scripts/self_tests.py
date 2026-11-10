@@ -14,6 +14,7 @@ unless it is listed in EXEMPT with the reason it has none. So a new module under
     python3 scripts/self_tests.py --list       # print what would run, and the exemptions
     python3 scripts/self_tests.py --jobs 2     # run two at a time
     python3 scripts/self_tests.py --per-test-timeout 900   # kill (and fail) a self-test after 15 min (default)
+    python3 scripts/self_tests.py --shard 2/4  # only shard 2 of 4 (CI runs the 4 shards in parallel)
     python3 scripts/self_tests.py --self-test  # test the discovery rule itself
 """
 from __future__ import annotations
@@ -127,6 +128,44 @@ def discover(repo: str = REPO):
 
 PER_TEST_TIMEOUT_S = 15 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
 
+# Seconds each slow self-test took on a CI runner (run 42734450748, 2026-11-10), for balancing shards only: a stale
+# or missing entry changes how evenly the shards finish, never which self-tests run. Others count DEFAULT_WEIGHT_S.
+WEIGHTS_S = {
+    "agents/stage_machine.py": 511, "toolkit/engines/malaria/engine.py": 345,
+    "toolkit/engines/malaria/selftest_late.py": 288, "toolkit/analysis/observed_targets.py": 280,
+    "toolkit/analysis/estimates.py": 272, "cloud/vm_job.py": 239, "scripts/compute.py": 237,
+    "toolkit/analysis/calibration.py": 182, "toolkit/analysis/run.py": 176,
+    "toolkit/calibration/history_matching.py": 81, "toolkit/analysis/joint_calibration.py": 46,
+    "toolkit/engines/compartmental/selftest_age.py": 32, "toolkit/spec/engine_parameters.py": 31,
+    "toolkit/analysis/figures.py": 25, "scripts/pipeline.py": 25, "scripts/validate_critique_yaml.py": 22,
+    "agents/analysis_backend.py": 21, "toolkit/analysis/trajectories.py": 19, "toolkit/analysis/model.py": 15,
+}
+DEFAULT_WEIGHT_S = 5
+
+
+def parse_shard(spec: str) -> tuple[int, int]:
+    """'K/N' -> (K, N) with 1 <= K <= N; raises ValueError otherwise."""
+    try:
+        k, n = (int(x) for x in spec.split("/"))
+    except ValueError:
+        raise ValueError(f"--shard {spec!r}: expected K/N, e.g. 2/4") from None
+    if not 1 <= k <= n:
+        raise ValueError(f"--shard {spec!r}: need 1 <= K <= N")
+    return k, n
+
+
+def shard(files, k: int, n: int, weights=WEIGHTS_S) -> list[str]:
+    """Shard K of N: the longest self-tests are dealt first, each to the shard with the least total weight so far
+    (ties to the lowest shard). Every file lands in exactly one shard, and the split depends only on the file list.
+    The shard's files come back slowest first, so a long self-test never starts last."""
+    w = lambda p: weights.get(p, DEFAULT_WEIGHT_S)  # noqa: E731
+    loads, owned = [0.0] * n, [[] for _ in range(n)]
+    for p in sorted(set(files), key=lambda p: (-w(p), p)):
+        i = min(range(n), key=lambda j: (loads[j], j))
+        loads[i] += w(p)
+        owned[i].append(p)
+    return owned[k - 1]
+
 
 def _run_one(python: str, repo: str, path: str, timeout_s: float | None = None):
     """(path, exit code or None when timed out, output, seconds). Each self-test runs in its own session; one that
@@ -151,10 +190,10 @@ def _run_one(python: str, repo: str, path: str, timeout_s: float | None = None):
 
 
 def run_all(python: str, jobs: int, repo: str = REPO, per_test_timeout: float | None = PER_TEST_TIMEOUT_S,
-            files: list | None = None) -> int:
-    """Run every discovered self-test (or `files`, which skips discovery: the watchdog's own test). A self-test that
-    runs longer than `per_test_timeout` seconds (0 or None: no limit) is killed, named and counted as failed; the
-    others still run."""
+            files: list | None = None, shard_kn: tuple[int, int] | None = None) -> int:
+    """Run every discovered self-test (or `files`, which skips discovery: the watchdog's own test), or only shard
+    `shard_kn` = (K, N) of them. A self-test that runs longer than `per_test_timeout` seconds (0 or None: no limit)
+    is killed, named and counted as failed; the others still run. Discovery problems fail every shard."""
     if files is None:
         try:
             run, skipped, notes, problems = discover(repo)
@@ -163,6 +202,10 @@ def run_all(python: str, jobs: int, repo: str = REPO, per_test_timeout: float | 
             return 1
     else:
         run, skipped, notes, problems = list(files), [], [], []
+    if shard_kn:
+        total = len(run)
+        run = shard(run, *shard_kn)
+        print(f"shard {shard_kn[0]}/{shard_kn[1]}: {len(run)} of {total} self-tests", flush=True)
     gha = os.environ.get("GITHUB_ACTIONS") == "true"
     failed, timed_out = [], []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
@@ -275,6 +318,32 @@ def _self_test() -> int:
            and "2/3 self-tests passed" in out,
            f"ST13 a hung self-test is killed with its process group, named and failed; the rest pass "
            f"(rc {rc!r}, {dt:.0f}s, child alive {child_alive}): {out[-400:]!r}")
+    # ST14: shards. Every file runs in exactly one shard, the split is deterministic, the slowest file opens its shard,
+    # and the CI-weighted live tree splits into 4 shards within 20% of each other (or the slowest file bounds them).
+    files = [f"scripts/f{i}.py" for i in range(10)]
+    wts = {"scripts/f0.py": 100, "scripts/f1.py": 60, "scripts/f2.py": 50}
+    parts = [shard(files, k, 3, wts) for k in (1, 2, 3)]
+    ok(sorted(sum(parts, [])) == sorted(files), f"ST14 every file is in exactly one shard ({parts})")
+    ok(parts == [shard(list(reversed(files)), k, 3, wts) for k in (1, 2, 3)],
+       "ST14 the split does not depend on the order of the file list")
+    ok(parts[0][0] == "scripts/f0.py" and all(len(p) > 0 for p in parts), f"ST14 slowest first, no empty shard ({parts})")
+    ok(shard(files, 1, 1, wts) == sorted(files, key=lambda p: (-wts.get(p, DEFAULT_WEIGHT_S), p)),
+       "ST14 one shard holds every file")
+    for bad in ("0/4", "5/4", "2", "a/b", "2/0"):
+        try:
+            parse_shard(bad)
+            ok(False, f"ST14 --shard {bad!r} is refused")
+        except ValueError:
+            pass
+    ok(parse_shard("2/4") == (2, 4), "ST14 --shard 2/4 parses")
+    try:
+        lrun = discover()[0]
+        loads = [sum(WEIGHTS_S.get(p, DEFAULT_WEIGHT_S) for p in shard(lrun, k, 4)) for k in (1, 2, 3, 4)]
+        ok(max(loads) <= max(1.2 * min(loads), max(WEIGHTS_S.values())), f"ST14 live 4-shard loads balance ({loads})")
+        stale = [p for p in WEIGHTS_S if p not in lrun]
+        ok(not stale, f"ST14 every WEIGHTS_S entry names a discovered self-test ({stale})")
+    except RuntimeError as e:
+        fails.append(f"ST14 git ls-files failed: {e}")
     for f in fails:
         print(f"FAIL: {f}")
     if fails:
@@ -291,17 +360,24 @@ def main(argv=None) -> int:
     ap.add_argument("--per-test-timeout", type=float, default=PER_TEST_TIMEOUT_S, metavar="S",
                     help="kill a self-test (and its process group) that runs longer than S seconds and count it as "
                          f"failed; 0 for no limit (default {PER_TEST_TIMEOUT_S:.0f})")
+    ap.add_argument("--shard", metavar="K/N", help="run only shard K of N (CI runs N in parallel); every self-test "
+                                                   "is in exactly one shard")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
+    try:
+        shard_kn = parse_shard(a.shard) if a.shard else None
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     if a.list:
         try:
             run, skipped, notes, problems = discover()
         except RuntimeError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
-        print("\n".join(run))
+        print("\n".join(shard(run, *shard_kn) if shard_kn else run))
         for p, why in skipped:
             print(f"# exempt: {p}: {why}")
         for n in notes:
@@ -309,7 +385,7 @@ def main(argv=None) -> int:
         for p in problems:
             print(f"# DISCOVERY PROBLEM: {p}")
         return 1 if problems else 0
-    return run_all(a.python, a.jobs, per_test_timeout=a.per_test_timeout)
+    return run_all(a.python, a.jobs, per_test_timeout=a.per_test_timeout, shard_kn=shard_kn)
 
 
 if __name__ == "__main__":

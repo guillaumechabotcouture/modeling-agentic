@@ -15,11 +15,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  self-tests:
     runs-on: ubuntu-latest
-    # A guard against a hung job, not a duration budget: a normal run takes 25-40 min on a
-    # loaded runner; 40 cancelled healthy runs (2026-11-03), so the ceiling sits well above it.
-    timeout-minutes: 120
+    strategy:
+      fail-fast: false     # one failing shard must not hide another's failures
+      matrix:
+        shard: [1, 2, 3, 4]
+    # A guard against a hung job, not a duration budget: a shard takes about 10 min (the whole
+    # suite took 25-40 min unsharded; 40 cancelled healthy runs on 2026-11-03).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,13 +48,38 @@ jobs:
       # One discovery rule, shared with CLAUDE.md: every tracked module under scripts/, toolkit/
       # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
       # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
-      - name: Self-tests (every module with --self-test, found by scripts/self_tests.py)
+      # --shard: each self-test runs in exactly one of the 4 shards, balanced by measured CI time.
+      - name: Self-tests, shard ${{ matrix.shard }} of 4 (every module with --self-test, found by scripts/self_tests.py)
         # --per-test-timeout: a hung self-test is killed with its process group, named, and failed;
         # the others still run (the job timeout above would cancel the whole step with no name).
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 900
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 900 --shard ${{ matrix.shard }}/4
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"
+
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # structure metrics compare with main and read merged-PR history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-agent.txt
+
+      # A project venv, as in local use: main.py's self-test checks that
+      # agents get the venv interpreter first on PATH.
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
 
       # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
       # a PR into a long-lived branch (v2) that merges main brings main's checked rows.
