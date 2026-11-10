@@ -649,7 +649,7 @@ def findings(raw, data, expected=None) -> list[dict]:
         if r.get("status") != want or want == "invalid":
             out.append(_f("burden_validation_inconsistent", f"{F}: reference {rid} has status {r.get('status')!r}; "
                           f"its numbers give {want!r}", f"burden:{rid}", False))
-        elif want == "unmatched":
+        elif want == "unmatched" and r.get("role", "checked") == "checked":     # Codex #173 P2: as for outside
             out.append(_f("burden_reference_unmatched", f"{F}: reference {rid} ({r.get('group')}) has no model value",
                           f"burden:{rid}", False))
         elif want == "outside" and r.get("role", "checked") == "checked":     # S2-5b: report-only rows never are
@@ -733,6 +733,9 @@ def results_lines(data) -> list[str]:
                  + (" (report only)" if r.get("role") == "report_only" else "") + " |")
     pts = sorted({r["model"]["note"] for r in data["references"] if r["model"]["interval_from"] == "point"})
     L += [""] + [f"Model interval from {p}." for p in pts]
+    un = [r["id"] for r in data["references"] if r.get("status") == "unmatched"]
+    if un:
+        L.append(f"References with no model value (unmatched): {', '.join(un)}.")
     if data.get("window_metrics"):
         L.append("Model values over the window are the engine's window metrics (per person over the window, times "
                  "each population group's population): " + metrics_text(data["window_metrics"]) + ".")
