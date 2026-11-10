@@ -13,7 +13,7 @@ unless it is listed in EXEMPT with the reason it has none. So a new module under
     python3 scripts/self_tests.py              # run them all (exit 1 on any failure)
     python3 scripts/self_tests.py --list       # print what would run, and the exemptions
     python3 scripts/self_tests.py --jobs 2     # run two at a time
-    python3 scripts/self_tests.py --per-test-timeout 900   # kill (and fail) a self-test after 15 min (default)
+    python3 scripts/self_tests.py --per-test-timeout 1800  # kill (and fail) a self-test after 30 min (default)
     python3 scripts/self_tests.py --shard 2/4  # only shard 2 of 4 (CI runs the 4 shards in parallel)
     python3 scripts/self_tests.py --self-test  # test the discovery rule itself
 """
@@ -126,13 +126,13 @@ def discover(repo: str = REPO):
     return classify(tracked_files(repo), file_has_marker(repo))
 
 
-PER_TEST_TIMEOUT_S = 15 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
+PER_TEST_TIMEOUT_S = 30 * 60     # the watchdog's default: about twice the slowest self-test on a loaded CI runner
 
-# Seconds each slow self-test took on a CI runner (run 42734450748, 2026-11-10), for balancing shards only: a stale
+# Seconds each slow self-test took on a CI runner (run 42734450748, 2026-11-10; selftest_late.py from #179), for balancing shards only: a stale
 # or missing entry changes how evenly the shards finish, never which self-tests run. Others count DEFAULT_WEIGHT_S.
 WEIGHTS_S = {
     "agents/stage_machine.py": 511, "toolkit/engines/malaria/engine.py": 345,
-    "toolkit/engines/malaria/selftest_late.py": 288, "toolkit/analysis/observed_targets.py": 280,
+    "toolkit/engines/malaria/selftest_late.py": 870, "toolkit/analysis/observed_targets.py": 280,
     "toolkit/analysis/estimates.py": 272, "cloud/vm_job.py": 239, "scripts/compute.py": 237,
     "toolkit/analysis/calibration.py": 182, "toolkit/analysis/run.py": 176,
     "toolkit/calibration/history_matching.py": 81, "toolkit/analysis/joint_calibration.py": 46,

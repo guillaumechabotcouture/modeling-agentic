@@ -26,6 +26,10 @@ allocatable budget (over or under, never refused for it), the units given a pack
 (with why; kept in the plan, evaluated as given), the caps and group rules it breaks, and, through UQ.run's on_draw
 hook (`Draws`), its outcome and cost quantiles over the uncertainty draws as uncertainty.yaml reports the headline
 plan's. Model corrections bearing on it, at the point or in a draw, stop publication as for every other plan.
+A solved variant is followed over the same draws (`solved_plans`, `Draws`): its record carries the same uncertainty
+block, and its share of draws over the allocatable budget is judged against `uncertainty.affordability` when the spec
+declares it (rule_met). The reserve is set for the headline plan, so a variant can fail the rule; it is then reported
+as failing it, not re-solved.
 """
 from __future__ import annotations
 
@@ -241,6 +245,49 @@ def contract_findings(raw: dict, point: dict, pv) -> list[str]:
         h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
         if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
             out.append(f"the headline plan is not the solved plan of variant {hv}")
+    return out + _affordability_findings(raw, pv, types)
+
+
+def _affordability_findings(raw: dict, pv: dict, types: dict) -> list[str]:
+    """Codex r1 on A6: each variant's affordability record agrees with its own per-draw costs, the spec's rule (a
+    solved variant) or no rule (a fixed plan), one budget and one draw count across variants; when any variant has
+    draws, every solved variant has them. A consistent `rule_met: false` is a result, not a finding."""
+    rule = ((raw.get("uncertainty") or {}).get("affordability") or None)
+    recs = [x for x in pv.get("variants") or [] if isinstance(x, dict)]
+    drawn = [x for x in recs if x.get("uncertainty")]
+    if not drawn:
+        return []
+    out, budgets, counts = [], set(), set()
+    for x in recs:
+        vid, u = x.get("id"), x.get("uncertainty")
+        if not u:
+            if x.get("status") == "solved":
+                out.append(f"plan variant {vid}: solved, but has no uncertainty draws while other variants do")
+            continue
+        a = u.get("affordability") if isinstance(u, dict) else None
+        c = a.get("per_draw_cost") if isinstance(a, dict) else None
+        if not isinstance(c, list) or not c or not all(isinstance(v, (int, float)) for v in c):
+            out.append(f"plan variant {vid}: no per-draw cost in its affordability record")
+            continue
+        b = a.get("budget_allocatable")
+        if not isinstance(b, (int, float)):
+            out.append(f"plan variant {vid}: no allocatable budget in its affordability record")
+            continue
+        over = sum(v > float(b) * (1 + 1e-9) for v in c)
+        want_rule = None if types.get(vid) == "fixed_plan" else rule
+        met = None if not want_rule else over / len(c) <= float(want_rule["max_share_over_budget"]) + 1e-12
+        if not (u.get("draws") == a.get("draws") == len(c)):
+            out.append(f"plan variant {vid}: draw counts disagree ({u.get('draws')}, {a.get('draws')}, {len(c)} costs)")
+        if a.get("draws_over_budget") != over or abs(float(a.get("share_over_budget") or 0) - over / len(c)) > 1e-12:
+            out.append(f"plan variant {vid}: draws over budget are not its per-draw costs' ({over} of {len(c)})")
+        if (a.get("rule") or None) != (dict(want_rule) if want_rule else None) or a.get("rule_met") is not met:
+            out.append(f"plan variant {vid}: rule or rule_met is not the spec's rule applied to its draws "
+                       f"({a.get('rule')}, {a.get('rule_met')!r}; expected {want_rule}, {met!r})")
+        budgets.add(float(b))
+        counts.add(len(c))
+    if len(budgets) > 1 or len(counts) > 1:
+        out.append(f"plan variants: affordability records use different budgets {sorted(budgets)} or draw counts "
+                   f"{sorted(counts)}")
     return out
 
 
@@ -275,13 +322,33 @@ def eligibility(A, fp: dict, feas: dict) -> dict:
             "constraints_broken": MV.infeasible_reasons(A.ids, fp, {i: {fp[i]: 0.0} for i in A.ids}, rest, 0.0)}
 
 
-class Draws:
-    """Each uncertainty draw's outcomes averted and cost of every fixed plan (UQ.run's on_draw hook), guarded against
-    the draw's model corrections."""
+def solved_plans(A, ben0, cost0) -> dict:
+    """{variant id: plan} of each rule variant that solves on the point tables, as run() solves it (within the headline
+    plan's budget), for Draws to follow over the uncertainty draws. A variant with no feasible plan is left out here
+    and reported as not solved by run()."""
+    out = {}
+    for v in config(A.spec.raw).get("variants") or []:
+        if v["type"] == "fixed_plan":
+            continue
+        try:
+            out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
+        except (ValueError, RuntimeError):
+            continue
+    return out
 
-    def __init__(self, A):
+
+class Draws:
+    """Each uncertainty draw's outcomes averted and cost of every fixed plan and, with `solved` ({variant id: plan},
+    solved_plans()), of every solved variant (UQ.run's on_draw hook), guarded against the draw's model corrections. A
+    solved variant's cost is judged against the spec's affordability rule (rule_met); a fixed plan's is reported,
+    not judged."""
+
+    def __init__(self, A, solved=None):
         self.A, self.n = A, 0
         self.plans = {v["id"]: given_plan(A, v) for v in fixed_variants(A.spec.raw)}
+        self.solved = {k: dict(p) for k, p in (solved or {}).items()}
+        self.follows_solved = solved is not None      # Codex r1: then every variant run() solves must be here
+        self.plans.update(self.solved)
         self.y = {k: {o: [] for o in A.outcomes} for k in self.plans}
         self.cost = {k: [] for k in self.plans}
 
@@ -300,8 +367,9 @@ class Draws:
         from toolkit.analysis import uncertainty as UQ
         from toolkit.analysis.core import q
         lvl = (interval or {}).get("level", 0.95)
+        rule = ((self.A.spec.raw.get("uncertainty") or {}).get("affordability") or None) if k in self.solved else None
         return {"draws": self.n, "interval": interval, "averted": {o: q(v, lvl) for o, v in self.y[k].items()},
-                "affordability": UQ.affordability(self.cost[k], self.A.budget, None, lvl)}
+                "affordability": UQ.affordability(self.cost[k], self.A.budget, rule, lvl)}
 
 
 def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | None:
@@ -356,6 +424,15 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
                    **{k: m[k] for k in MOVES})
+        if draws is not None and draws.n > 0 and draws.follows_solved and v["id"] not in draws.solved:
+            # Codex r1 P1: its pre-draw solve failed and this one succeeded, so no draw followed (or guarded) it
+            raise RuntimeError(f"plan variant {v['id']}: solved here but not followed over the uncertainty draws")
+        if draws is not None and v["id"] in draws.solved:     # its cost and outcome over the uncertainty draws
+            if draws.solved[v["id"]] != dict(vp):
+                raise RuntimeError(f"plan variant {v['id']}: the uncertainty draws followed another plan than its "
+                                   "solved plan")
+            if draws.n > 0:
+                rec["uncertainty"] = draws.summary(v["id"], interval)
         if v["type"] == "group_rule":       # each group's choice; a shared "none" is allowed unless provide: true
             rec["group_choices"] = group_choices(A, v, vp)
             rec["groups_none"] = sum(c == "none" for c in rec["group_choices"].values())
@@ -560,6 +637,90 @@ def _self_test_fixed(ok, attempt):
        f"{u6})")
     _, e7 = attempt(lambda *a: D.add(*a), out, [{"unit": "u1", "package": "s", "kind": "clip"}], tabs[0])
     ok(isinstance(e7, AnalysisBlocked), f"PV26 a draw's corrections on the given plan stop publication ({e7!r})")
+    # review A6: a solved variant's cost in each draw too, judged against the spec's affordability rule
+    A.spec.raw["uncertainty"] = {"affordability": {"max_share_over_budget": 0.25}}
+    sp, e8 = attempt(g_("solved_plans"), A, ben, cost)
+    D2, e9 = attempt(g_("Draws"), A, sp)
+    for t in tabs:
+        attempt(lambda *a: D2.add(*a), out, [], t)
+    r8, e10 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D2, {"level": 0.9})
+    v8 = {x["id"]: x for x in (r8 or {}).get("variants", [])}
+    n8 = v8.get("nets") or {}
+    a8 = (n8.get("uncertainty") or {}).get("affordability") or {}
+    over8 = sum(m * n8.get("cost", 0.0) > A.budget * (1 + 1e-9) for m in (0.8, 1.2))
+    ok(e8 is None and e9 is None and e10 is None and n8.get("status") == "solved" and (sp or {}).get("nets") == n8.get("plan")
+       and a8.get("draws") == 2 and a8.get("draws_over_budget") == over8 == 1 and a8.get("rule_met") is False
+       and ((v8.get("given") or {}).get("uncertainty") or {}).get("affordability", {}).get("rule_met") is None,
+       f"PV31 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
+       f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
+       f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
+    A.budget = 1.0
+    sp9, e11 = attempt(g_("solved_plans"), A, ben, cost)
+    A.budget = 2.0
+    ok(e11 is None and sp9 == {},
+       f"PV32 a variant the budget makes infeasible has no plan to follow over the draws ({e11!r}, {sp9})")
+    D3, _ = attempt(g_("Draws"), A, {"nets": {i: "none" for i in A.ids}})
+    for t in tabs:
+        attempt(lambda *a: D3.add(*a), out, [], t)
+    _, e12 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D3, {"level": 0.9})
+    ok(isinstance(e12, RuntimeError) and "nets" in str(e12),
+       f"PV33 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
+    # Codex r1 on A6. P1: a variant left out of the draws (its pre-draw solve failed) and solved later is refused.
+    D4, _ = attempt(g_("Draws"), A, {})
+    for t in tabs:
+        attempt(lambda *a: D4.add(*a), out, [], t)
+    _, e13 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D4, {"level": 0.9})
+    ok(isinstance(e13, RuntimeError) and "nets" in str(e13),
+       f"PV34 a solved variant the draws did not follow fails closed, not published without its uncertainty ({e13!r})")
+    # P2: package-specific draw costs and outcomes; the variant's quantiles are its own plan's, not the headline's
+    from toolkit.analysis.core import q as _q
+    mult = ({"none": 1, "n1": 0.5, "n2": 2.0, "s": 1.0}, {"none": 1, "n1": 2.0, "n2": 0.5, "s": 1.5})
+    tabs2 = [{i: {k: m[k] * cost[i][k] for k in A.pk} for i in A.ids} for m in mult]
+    outs2 = [{i: {"y": {k: {"dalys": 10.0 - f * ben[i][k]} for k in A.pk}} for i in A.ids} for f in (1.0, 3.0)]
+    sp5 = solved_plans(A, ben, cost)
+    D5 = Draws(A, sp5)
+    for o_, t in zip(outs2, tabs2):
+        D5.add(o_, [], t)
+    hp5 = A.solve(ben, cost)["choice"]
+    r14, e14 = attempt(run, A, ben, cost, hp5, [], D5, {"level": 0.9})
+    n14 = {x["id"]: x for x in (r14 or {}).get("variants", [])}.get("nets") or {}
+    vp = n14.get("plan") or {}
+    want_c = [sum(t[i][vp[i]] for i in A.ids) for t in tabs2] if vp else []
+    head_c = [sum(t[i][hp5[i]] for i in A.ids) for t in tabs2]
+    want_y = [sum(o_[i]["y"]["none"]["dalys"] - o_[i]["y"][vp[i]]["dalys"] for i in A.ids) for o_ in outs2] if vp else []
+    u14 = n14.get("uncertainty") or {}
+    a14 = u14.get("affordability") or {}
+    ok(e14 is None and vp != dict(hp5) and want_c != head_c
+       and a14.get("per_draw_cost") == want_c and a14.get("fixed_plan_cost") == _q(want_c, 0.9)
+       and u14.get("averted", {}).get("dalys") == _q(want_y, 0.9)
+       and a14.get("draws_over_budget") == sum(c > A.budget * (1 + 1e-9) for c in want_c),
+       f"PV35 a solved variant's draw costs and outcomes are its own plan's, package by package ({e14!r}, "
+       f"{a14.get('per_draw_cost')} vs {want_c}, headline {head_c})")
+    # P2: the contract checks the affordability record against its own draws and the spec's rule
+    pt14 = {"headline_variant": None, "plan": dict(hp5)}
+    c0 = contract_findings(A.spec.raw, pt14, r14) if r14 else ["no record"]
+    bad_recs = []
+    for mutate in (lambda a, u: a.update(rule_met=not a["rule_met"]),
+                   lambda a, u: a.update(draws_over_budget=a["draws_over_budget"] + 1),
+                   lambda a, u: a.update(rule={"max_share_over_budget": 0.99}),
+                   lambda a, u: a.update(budget_allocatable=a["budget_allocatable"] * 2),
+                   lambda a, u: u.update(draws=u["draws"] + 1),
+                   lambda a, u: u.pop("affordability")):
+        rr = copy.deepcopy(r14 or {})
+        nr = next((x for x in rr.get("variants", []) if x.get("id") == "nets"), None)
+        if nr and nr.get("uncertainty"):
+            mutate(nr["uncertainty"].get("affordability", {}), nr["uncertainty"])
+        bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    rr = copy.deepcopy(r14 or {})
+    for x in rr.get("variants", []):
+        if x.get("id") == "nets":
+            x.pop("uncertainty", None)
+    bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    ok(c0 == [] and all(bad_recs),
+       f"PV36 a consistent record passes (rule not met included); a verdict, count, rule, budget or draw count that "
+       f"contradicts the draws, or a solved variant missing its draws, is a contract finding ({c0}, "
+       f"{[len(b) for b in bad_recs]})")
+    del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
     rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
