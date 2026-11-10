@@ -213,31 +213,58 @@ def _self_test() -> int:
            "u3": {"none": 0, "a": 10, "b": 50, "ab": 10}, "u4": {"none": 0, "a": 5, "b": 1, "ab": 6}}
     cost = {u: {"none": 0, "a": 1.0, "b": 1.0, "ab": 2.0} for u in ben}
     plan = {"u1": "a", "u2": "a", "u3": "a", "u4": "none"}
-    c = candidates(_A, plan, ben, cost, 2)
-    ok([(x["unit"], x["runner_up"]) for x in c] == [("u1", "b"), ("u2", "ab")] and abs(c[0]["gap"] - 0.05) < 1e-12,
+    tab = table(_A, plan, ben, cost)
+    c = pick(tab, 2)
+    ok([(x["unit"], x["runner_up"]) for x in c] == [("u1", "b"), ("u2", "ab")] and abs(c[0]["gap"] - 0.05) < 1e-12
+       and "u4" not in tab and "b" not in tab["u3"]["ratios"],
        f"BD1 the units closest to switching, with their runner-up among feasible non-comparator packages: {c}")
     en = {u: dict(v) for u, v in ben.items()}
     en["u1"]["b"] = 10.5                       # the engine puts the runner-up first for u1
     rows = compare(c, ben, cost, en, cost, 0.01)
+    inf, nan = float("inf"), float("nan")
     ok([r["match"] for r in rows] == [False, True] and _match([1.0, 1.1], [2.0, 2.0], 0.01)
        and _match([1.1, 1.0], [1.0, 1.005], 0.01) and not _match([1.1, 1.0], [1.0, 1.05], 0.01)
-       and not _match([None, 1.0], [1.0, 0.5], 0.01),
-       "BD2 order agreement per unit: the engine's order, or an engine tie within the tolerance; no ratio fails")
-    s = summarise(rows, {"units": 2, "min_share": 0.75, "tie": 0.01})
+       and not _match([None, 1.0], [1.0, 0.5], 0.01) and not _match([1.0, 2.0], [inf, 1.0], 0.01)
+       and not _match([nan, nan], [nan, nan], 0.01) and _ratio(nan, 1.0) is None and _ratio(1.0, inf) is None,
+       "BD2 order agreement per unit: the engine's order, or an engine tie within the tolerance; a missing or "
+       "non-finite ratio never matches (Codex r1 P1-4)")
+    s = summarise(rows, {"units": 2, "min_share": 0.75, "tie": 0.01}, tab, 6)
     ok(s["status"] == "judged" and s["matched"] == 1 and s["share_matched"] == 0.5 and s["passes"] is False
-       and s["engine_runs"] == 6, f"BD3 the share matched and the extra engine runs are reported: {s}")
+       and s["engine_runs"] == 6 and s["table"] == tab, f"BD3 the share matched and the extra engine runs are reported")
     real = thresholds()
-    base = summarise(rows, real)
-    f1 = findings(dict(base, rows=[rows[1]] * 4, units=4, matched=4))
-    f2 = findings(dict(base, rows=[rows[0]] * 4, units=4, matched=0))
-    f3 = findings(dict(base, matched=2))
-    f4 = findings({"status": "not_judged", "units": 0, "matched": 0, "rows": []})
-    f5 = findings({"units": 1})
-    ok(f1 == [] and [x["kind"] for x in f2] == ["emulator_boundary_ranking"] and f2[0]["scope_declarable"]
-       and [x["kind"] for x in f3] == ["emulator_boundary_inconsistent"] and f4 == []
-       and [x["kind"] for x in f5] == ["emulator_boundary_unreadable"],
-       "BD4 the gate rejudges from the rows against thresholds.yaml: below the share is declarable; counts that "
-       "disagree with the rows or an unreadable artifact are not; not judged is no finding")
+    K = real["units"]
+    br = {f"v{i:02d}": {"a": 1.0, "b": 1.0 - 0.002 * (i + 1)} for i in range(K + 5)}
+    cr = {u: {"a": 1.0, "b": 1.0} for u in br}
+    pr = {u: "a" for u in br}
+
+    class _B:
+        ids, comp, pk = list(br), "none", {"none": [], "a": ["a"], "b": ["b"]}
+        feas = {"feasible": {u: {"none": True, "a": True, "b": True} for u in br}}
+    tr = table(_B, pr, br, cr)
+    cand = pick(tr, K)
+    rev = {u: {"a": 1.0, "b": 2.0} for u in br}         # the engine puts b first, far beyond the tie tolerance
+    good = summarise(compare(cand, br, cr, br, cr, real["tie"]), real, tr, 3 * K)
+    bad = summarise(compare(cand, br, cr, rev, cr, real["tie"]), real, tr, 3 * K)
+    u0 = cand[0]["unit"]
+    cases = {"dup": dict(bad, rows=[good["rows"][0]] * K, matched=K),
+             "drop": dict(bad, rows=[r for r in bad["rows"] if r["match"]], units=0, matched=0),
+             "empty": dict(bad, rows=[], units=0, matched=0, status="not_judged"),
+             "ratio": dict(good, rows=[dict(good["rows"][0], emulator={"ratio_chosen": inf, "ratio_runner_up": 1.0})]
+                          + good["rows"][1:])}
+    got = {k: [x["kind"] for x in findings(v, pr)] for k, v in cases.items()}
+    ok(findings(good, pr) == [] and [x["kind"] for x in findings(bad, pr)] == ["emulator_boundary_ranking"]
+       and findings(bad, pr)[0]["scope_declarable"]
+       and all(v == ["emulator_boundary_inconsistent"] for v in got.values())
+       and [x["kind"] for x in findings(good, dict(pr, **{u0: "b"}))] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings(good, None)] == ["emulator_boundary_inconsistent"]
+       and [x["kind"] for x in findings({"units": 1}, pr)] == ["emulator_boundary_unreadable"]
+       and findings(summarise([], real, {}, 0), {}) == [],
+       f"BD4 the gate rebuilds the candidates from the recorded ratio table and the point plan: below the share is "
+       f"declarable; duplicated, dropped, emptied or edited rows, another plan, or an unreadable artifact are not; "
+       f"an empty table is not judged, no finding (Codex r1 P1-3): {got}")
+    ok(needed({"none": [], "a": ["a"], "b": ["b"], "a+b": ["a", "b"]}, "none", "a+b", "a") == ["none", "a+b", "a", "b"],
+       "BD6 the engine runs every package the two packages' costs read: each without one of its components "
+       "(incremental per-outcome items; Codex r1 P1-1)")
     from toolkit.engines.benchmark_sources import CALIBRATOR_THRESHOLD_SECTIONS
     ok("emulator" not in CALIBRATOR_THRESHOLD_SECTIONS and real["units"] >= 1 and 0 < real["min_share"] <= 1,
        f"BD5 the thresholds sit outside the sections the evidence digests bind (no engine restamp): {real}")

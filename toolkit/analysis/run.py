@@ -558,6 +558,19 @@ def _self_test() -> int:
         got = [r0["engine"]["ratio_chosen"], r0["engine"]["ratio_runner_up"]]
         ok(all(abs(g / w - 1) < 1e-9 for g, w in zip(got, want)),
            f"BD-R2 the engine side equals the engine evaluated directly at the calibrated values ({got} vs {want})")
+        import shutil                     # Codex r1 P1-2: the signed evaluation mode requires the artifact
+        d3 = os.path.join(d, "..", os.path.basename(d) + "_nobd")
+        shutil.copytree(d, d3)
+        try:
+            mp3 = os.path.join(d3, "analysis", "manifest.json")
+            man3 = json.load(open(mp3))
+            man3["artifacts"] = {k: v for k, v in man3["artifacts"].items() if v.get("kind") != "emulator_boundary"}
+            man3["expected"]["kinds"] = [k for k in man3["expected"]["kinds"] if k != "emulator_boundary"]
+            json.dump(man3, open(mp3, "w"))
+            ok("emulator_boundary" in {f.get("key") for f in contract.gate_findings(d3)},
+               "BD-R3 an emulator-path run without the boundary artifact is a finding, whatever its manifest expects")
+        finally:
+            shutil.rmtree(d3, ignore_errors=True)
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
