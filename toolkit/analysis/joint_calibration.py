@@ -706,7 +706,8 @@ def _mixed_pairs(base, a, b, ch, rows, reg, built, rho) -> list:
     gt, ut = (a, b) if a["kind"] == "group" else (b, a)
     gs, us = ("from", "to") if gt is a else ("to", "from")
     gby, uby = (gt.get("key") or {}).get("units"), ch.get("by") or ut.get("bias_by") or reg
-    if uby != gby:
+    if uby != gby or ut.get("bias_by") not in (None, gby):      # the offsets' grouping too, whatever changes.by says
+        uby = ut.get("bias_by") if ut.get("bias_by") not in (None, gby) else uby
         return [dict(base, not_computable=f"the groups do not match: the unit round {ut['id']} is grouped by {uby}, the "
                                           f"group round {gt['id']} by {gby}")]
     note = (f"the unit round is aggregated with the group round's weights ({gt.get('weights')}), not changes.weights "

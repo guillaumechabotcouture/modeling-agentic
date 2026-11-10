@@ -345,6 +345,11 @@ class Problem:
             sc = {tid[x[k]].scale for x in c["terms"] for k in ("from", "to") if x.get(k) in tid}
             if len(sides["from"]) != 1 or len(sides["to"]) != 1 or sides["from"] == sides["to"] or len(sc) != 1:
                 bad.append(f"{w}: one round (observable) per side, two rounds on one scale")
+            kinds = {k: {tid[x[k]].kind for x in c["terms"] if x.get(k) in tid} for k in ("from", "to")}
+            if any((x.get("from") is None) != (x.get("to") is None) for x in c["terms"]) and \
+                    sorted(map(tuple, kinds.values())) != [("group",), ("unit",)]:
+                bad.append(f"{w}: one-sided terms are for a group round against a unit round only (two rounds of "
+                           "one kind pair within a term, so their sampling correlation applies)")
             for x in c["terms"]:
                 a, b = tid.get(x.get("from")), tid.get(x.get("to"))
                 if (x.get("from") is None) != (x.get("to") is None):        # S2-3c: one side of a mixed pair
@@ -3188,7 +3193,7 @@ def _self_test() -> int:
         b = Target("b", "unit", "w1", 0.6, "identity", sd_obs=0.1, unit="u0", source="t")
         P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0"], [a, b],
                     changes=[{"id": "p", "rho": 0.9, "terms": [{"from": "a", "w": 1.0}, {"to": "b", "w": 1.0}]}])
-        ok(any("one side" in x for x in P._change_problems()),
+        ok(any("one-sided" in x for x in P._change_problems()),
            f"HM46 two unit rounds split into one-sided terms are refused (their correlation would be lost) "
            f"({P._change_problems()})")
     safe(hm46, "HM46")
