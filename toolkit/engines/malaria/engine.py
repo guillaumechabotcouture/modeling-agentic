@@ -2947,6 +2947,57 @@ def _self_test_v013(ok, e, unit) -> None:
     case("HC7", hc7)
 
 
+def _self_test_v014(ok, e, unit) -> None:
+    """v0.14 (F6 S2-5b): severe cases and malaria deaths as window metrics, per person of each age group and of all
+    ages over any named window (severe_<g>, deaths_<g>, g in AGES or all), counted as the decision window's per-capita
+    outcomes are: expected severe episodes and deaths of the window's new clinical infections over the group's mean
+    population in the window. A past window then gives the deaths those years would give as the decision window."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    names = [f"{k}_{g}" for k in ("severe", "deaths") for g in AGES + ["all"]]
+    p = {"n_agents": 1000, "burnin_years": 1}
+    none = Package("none", {})
+    close = lambda a, b: abs(a - b) <= 1e-12 * max(abs(a), abs(b), 1e-300)  # noqa: E731
+
+    def w0():
+        wn = e.describe().outputs["windows"]
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 14) and all(n in wn for n in names),
+           f"W0 engine v0.14 lists {names} among its window metrics")
+    case("W0", w0)
+
+    def w1():
+        # A counts 2015 as its decision window; B counts 2017 and names 2015 as a past window. The sims are the same
+        # (no package acts), so B's past-window metrics are A's per-capita outcomes
+        ha = Horizon(2015.0, 2018.0, (2015.0, 2016.0), {"past": [2015.0, 2016.0]})
+        hb = Horizon(2015.0, 2018.0, (2017.0, 2018.0), {"past": [2015.0, 2016.0], "dec": [2017.0, 2018.0]})
+        a, b = e.run(p, unit, none, ha, 4), e.run(p, unit, none, hb, 4)
+        wb, pa = b.windows["past"], a.per_capita
+        ok(all(close(wb[f"{k}_{g}"], pa[k][g]) for k in ("severe", "deaths") for g in AGES),
+           f"W1 a past window's deaths and severe cases per person of each age group equal those years counted as "
+           f"the decision window (deaths_u5 {wb.get('deaths_u5')} vs {pa['deaths']['u5']})")
+        sh = a.meta["age_shares"]
+        ok(all(close(wb[f"{k}_all"], sum(pa[k][g] * sh[g] for g in AGES)) for k in ("severe", "deaths")),
+           "W1b the all-ages metrics are deaths and severe cases per person of the whole population")
+        ok(all(close(b.windows["dec"][f"{k}_{g}"], b.per_capita[k][g]) for k in ("severe", "deaths") for g in AGES)
+           and pa["deaths"]["u5"] > 0, "W1c a named window equal to the decision window gives the per-capita outcomes")
+    case("W1", w1)
+
+    def w2():
+        # the case-management severe-care link (per-person case fatality) is counted the same way
+        hz = Horizon(2015.0, 2017.0, (2016.0, 2017.0), {"dec": [2016.0, 2017.0], "half": [2016.0, 2016.5]})
+        q = dict(p, cm_target=1.0, cm_severe_link=0.5, cm_add=0.3, cm_ramp_years=0.0)
+        o = e.run(q, UnitSpec("t", dict(unit.attributes, m0=20.0)), Package("cm", {"cm": 1}), hz, 2)
+        ok(all(close(o.windows["dec"][f"deaths_{g}"], o.per_capita["deaths"][g]) for g in AGES),
+           "W2 with the severe-care link the window deaths equal the per-capita deaths")
+        ok(all(0 < o.windows["half"][f"deaths_{g}"] < o.windows["dec"][f"deaths_{g}"] for g in AGES),
+           "W2b a half window holds part of the deaths")
+    case("W2", w2)
+
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
