@@ -242,7 +242,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         cases = [(v, ben0, cost0, A.planned(float(v) - fixed), None) for v in dt["values"]]
         lowers = [False] * len(cases)
     elif t == "cost_items":
-        mult = {str(k): float(m) for k, m in dt["multipliers"].items()}
+        mult = {k: float(m) for k, m in dt["multipliers"].items()}      # the ids as the cost items declare them
         varied = "the unit costs of the listed cost items multiplied together (cost_multipliers)"
         _, ben, cost = A.evaluate(A.theta0, z0, cost_mult=mult)
         evs["case"] = list(A.last_events)
@@ -252,7 +252,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         raise ValueError(f"decision test {dt.get('id')}: unknown type {t}")
     results = []
     for (v, ben, cost, budget, feas), low in zip(cases, lowers):
-        sol = A.solve(ben, cost, budget=budget, feas=feas)
+        try:
+            sol = A.solve(ben, cost, budget=budget, feas=feas)
+        except RuntimeError as e:
+            if t != "cost_items" or str(e).strip() != "optimizer status infeasible":
+                raise
+            # Codex r1: the price case has no affordable plan; the record keeps the prices and says why
+            return _not_run(A, dt, "at these prices no allocation that meets the constraints fits the budget the plan "
+                                   "is solved within (the solver proves it), so there is no re-solved plan to compare "
+                                   "with the point plan", {"cost_multipliers": dict(mult)})
         ch = sol["choice"]
         A.guard(f"decision test {dt['id']} at {v}", [plan, ch], events=evs.get(v, []))
         # F6 S1-5: what moves beside the share (regret, population, dollars by component, units by group)
