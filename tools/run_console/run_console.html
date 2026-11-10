@@ -29,7 +29,7 @@ button { background: none; border: 1px solid var(--line); border-radius: 6px; pa
 button:hover { border-color: var(--faint); }
 button:disabled { opacity: .5; cursor: default; }
 button.primary { background: var(--accent); color: var(--panel); border-color: var(--accent); }
-button.link { border: none; color: var(--muted); padding: 2px 4px; }
+button.link { border: none; color: var(--muted); padding: 2px 4px; text-align: left; }
 button.link:hover { color: var(--accent); }
 select, input, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 13px; }
 .app { display: grid; grid-template-columns: 300px minmax(0, 1fr) auto; height: 100vh; }
@@ -72,17 +72,17 @@ details.drafts summary { cursor: pointer; }
 /* main column: header, stepper, stream, composer */
 main { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100vh; }
 .wrap { max-width: 900px; margin: 0 auto; padding: 0 28px; width: 100%; }
-header { padding: 20px 0 6px; flex: none; }
+header { padding: 12px 0 4px; flex: none; }
 .crumb { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+#crumb { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #navbtn { display: none; }
-h1 { font-size: 18px; font-weight: 600; margin: 2px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta { display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: center; font-size: 13px; color: var(--muted); }
 .meta b { color: var(--ink); font-weight: 500; }
-.crumb .acts { margin-left: auto; display: flex; gap: 2px; }
-details.question { margin-top: 8px; font-size: 13px; color: var(--muted); }
-details.question summary { cursor: pointer; width: max-content; }
-details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240px; overflow: auto; margin-top: 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
-.stepper { flex: none; padding: 14px 0 12px; border-bottom: 1px solid var(--line); }
+.crumb .acts { margin-left: auto; display: flex; gap: 2px; flex: none; }
+.question { white-space: pre-wrap; font-size: 13px; max-height: 240px; overflow: auto; margin: 8px 0 4px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+#stopline { margin: 4px 0 0; }
+.stepper { flex: none; padding: 10px 0 8px; border-bottom: 1px solid var(--line); }
 .steps { display: flex; overflow-x: auto; scrollbar-width: none; }
 .st { flex: 1 0 58px; position: relative; text-align: center; cursor: pointer; padding-top: 14px; font-size: 11.5px; color: var(--faint); }
 .st::before { content: ""; position: absolute; top: 4px; left: 0; right: 0; height: 2px; background: var(--line); }
@@ -96,7 +96,7 @@ details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240
 .st.waiting i { border-color: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
 .st.failed { color: var(--bad); } .st.failed i { background: var(--bad); border-color: var(--bad); width: 8px; height: 8px; margin-left: -4px; top: 1px; }
 .st.sel span { text-decoration: underline; text-underline-offset: 3px; }
-.stepnote { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 12px; align-items: center; }
+.stepnote { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 12px; align-items: center; }
 .views { display: flex; gap: 2px; background: var(--soft); border-radius: 7px; padding: 2px; }
 .views button { border: none; border-radius: 5px; color: var(--muted); padding: 1px 10px; font-size: 12.5px; }
 .views button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
@@ -105,6 +105,8 @@ details.question div { white-space: pre-wrap; color: var(--ink); max-height: 240
 .fig img { width: 100%; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; border-radius: 6px; display: block; }
 .fig .c { font-size: 13px; margin-top: 8px; }
 .fig .p { font-size: 11.5px; color: var(--faint); margin-top: 2px; }
+.card .figs { margin: 10px 0 0; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.card .fig { padding: 8px; background: var(--bg); }
 .empty { color: var(--muted); font-size: 13.5px; padding: 18px 2px; }
 table.cmp { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; margin: 6px 0 4px; }
 table.cmp th:first-child { width: 40%; }
@@ -117,12 +119,22 @@ table.cmp tr.ch td { background: color-mix(in srgb, var(--accent-soft) 55%, tran
 .term { border-bottom: 1px dotted var(--faint); cursor: help; }
 .ctx { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
 .ctx b { font-weight: 500; color: var(--ink); }
+.nd { color: var(--faint); } .nd.yes { color: var(--warn); font-weight: 600; }
 table.t { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
 table.t th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
 table.t td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.t tr:last-child td { border-bottom: none; }
 table.t td:first-child { max-width: 150px; min-width: 64px; }
 table.t.fixed { table-layout: fixed; } table.t.fixed td { overflow-wrap: anywhere; max-width: none; }
+table.t.fixed .n { white-space: normal; }
+table.t td .sub { margin-top: 2px; }
+table.t ul.chk { margin: 4px 0 0; padding-left: 16px; color: var(--muted); }
+table.t.stand td:first-child { width: 132px; color: var(--muted); white-space: nowrap; }
+table.t.stand td:last-child { text-align: right; white-space: nowrap; width: 1%; padding-right: 0; }
+.card.dossier table.t.reg { table-layout: fixed; } table.t.reg td { overflow-wrap: anywhere; }
+table.t.reg th:nth-child(1) { width: 24%; } table.t.reg th:nth-child(2) { width: 8%; } table.t.reg th:nth-child(3), table.t.reg th:nth-child(4) { width: 11%; } table.t.reg th:nth-child(5) { width: 30%; }
+details.fold { margin-top: 8px; } details.fold > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+details.fold > summary b { color: var(--ink); font-weight: 600; }
 table.t .n, .md td.n, .md th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.t td.clip { max-width: 0; width: 46%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 table.t tr.row { cursor: pointer; } table.t tr.row:hover td { background: var(--soft); }
@@ -158,6 +170,8 @@ table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
 .line .x { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .line b { color: var(--ink); font-weight: 500; }
 .line.bad b { color: var(--bad); }
+.line button.link { flex: none; font-size: 12px; }
+.steplines { margin: 0 0 4px 10px; border-left: 2px solid var(--line); padding-left: 8px; }
 .chat.user { background: var(--accent-soft); border-color: transparent; margin-left: 12%; }
 .chat.feedback { border-style: dashed; }
 .sev { font-size: 11px; font-weight: 600; letter-spacing: .02em; margin-right: 6px; }
@@ -169,11 +183,12 @@ table.t tr.grp td { padding-top: 10px; font-size: 12.5px; color: var(--muted); }
 .stream pre { background: var(--soft); padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; font: inherit; font-size: 13px; }
 
 /* composer: sticky, always visible */
-.composer { flex: none; border-top: 1px solid var(--line); background: var(--panel); padding: 10px 0 12px; }
+.composer { flex: none; border-top: 1px solid var(--line); background: var(--panel); padding: 8px 0 10px; }
 .composer .row { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea { flex: 1; min-height: 40px; max-height: 30vh; resize: vertical; padding: 9px 12px; border-radius: 8px; font-size: 14px; background: var(--bg); }
 .composer .opts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
 .composer .opts input { flex: 1; min-width: 160px; }
+.composer:not(:focus-within):not(.has) .opts { display: none; }   /* the options show once a note is being written */
 .chip { font-size: 12px; background: var(--accent-soft); color: var(--accent); border-radius: 12px; padding: 1px 8px; }
 
 /* side panel: the only place with mono ids and paths */
@@ -228,6 +243,8 @@ ul.mech { margin: 4px 0 8px; padding-left: 18px; font-size: 13px; }
 ul.mech li { margin: 2px 0; }
 .views { flex-wrap: wrap; }
 
+/* an open side panel takes the sidebar's place until the window is wide enough for all three */
+@media (min-width: 761px) and (max-width: 1700px) { .app.sideopen { grid-template-columns: minmax(0, 1fr) auto; } .app.sideopen aside { display: none; } }
 @media (max-width: 760px) {
   .app { grid-template-columns: minmax(0, 1fr); }
   aside { display: none; position: fixed; inset: 0 auto 0 0; width: 84vw; z-index: 10; box-shadow: 0 0 24px rgba(0,0,0,.25); }
@@ -257,20 +274,20 @@ ul.mech li { margin: 2px 0; }
       <h1 id="title">Select a run</h1>
       <div class="meta" id="meta"></div>
       <div class="ctx" id="stopline" hidden></div>
-      <details class="question" id="qbox" hidden><summary>Question</summary><div id="qtext"></div></details>
+      <div class="question" id="qbox" hidden></div>
     </div></header>
     <div class="stepper"><div class="wrap"><div class="steps" id="stepper"></div><div class="stepnote"><span class="views"><button id="v-stream" class="on">Stream</button><button id="v-figs">Figures</button><button id="v-spec" title="The signed decision spec and its sign-off history">Spec</button><button id="v-evidence" title="Evidence, staged inputs and derivations">Evidence</button><button id="v-engine" title="Engine choice, card, parameters and benchmarks">Engine</button><button id="v-calibration" title="Calibration and emulator accuracy">Calibration</button></span><span id="stepnote"></span></div></div></div>
     <div class="stream" id="streambox"><div class="wrap" id="stream"></div></div>
     <div class="composer"><div class="wrap">
       <div class="row">
         <textarea id="text" rows="1" placeholder="Ask, or give guidance or a correction…"></textarea>
+        <button id="record" title="Record as feedback without asking Claude">Record only</button>
         <button id="send" class="primary">Send</button>
       </div>
       <div class="opts">
         <select id="kind" title="What this message is"></select>
         <select id="layer" title="Which layer the feedback is about"></select>
         <input id="proposed" placeholder="proposed change (optional)">
-        <button id="record" title="Record as feedback without asking Claude">Record only</button>
         <span id="anchor"></span>
         <span style="flex:1"></span>
         <span id="chatspend"></span>
