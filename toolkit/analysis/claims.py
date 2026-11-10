@@ -204,6 +204,13 @@ def variant_claims(A, arts, pv) -> list[dict]:
             out += [_c(f"{c}.cost", "currency", arts["plan_variants"], f"{f}.cost", "USD"),
                     _c(f"{c}.budget_difference", "currency", arts["plan_variants"], f"{f}.cost_minus_budget", "USD"),
                     _c(f"{c}.ineligible", "count", arts["plan_variants"], f"{f}.units_ineligible", "units")]
+            ss = v.get("same_spend") or {}      # review A2: against the optimum at the plan's own cost
+            if ss.get("status") == "solved":
+                out.append(_c(f"{c}.same_spend_gain", "scalar", arts["plan_variants"], f"{f}.same_spend.value_gain",
+                              A.primary))
+                if ss.get("value_gain_pct") is not None:
+                    out.append(_c(f"{c}.same_spend_gain_pct", "percentage", arts["plan_variants"],
+                                  f"{f}.same_spend.value_gain_pct", "%"))
         un = v.get("uncertainty")       # a fixed plan's, and each solved variant's, outcome and cost over the draws
         if un:
             out += [_c(f"{c}.averted_median", "scalar", arts["plan_variants"],
@@ -269,6 +276,16 @@ def variants_markdown(A, pv) -> str:
               + (f" Over the uncertainty draws: {A.primary} averted [CLAIM:{c}.averted_median], cost "
                  f"[CLAIM:{c}.cost_median], draws over budget [CLAIM:{c}.draws_over_budget]." if v.get("uncertainty")
                  else f" {str(v.get('uncertainty_note') or '').capitalize()}.")]
+        ss = v.get("same_spend") or {}      # review A2: equal spend, so the allocation alone differs
+        L += ["", f"{v['id']} at the same spend: " + (
+            f"the best plan under the signed constraints that costs no more than {v['id']} ([CLAIM:{c}.cost]), solved "
+            f"on the same outcomes and costs, averts [CLAIM:{c}.same_spend_gain] more {A.primary} than {v['id']}"
+            + (f" ([CLAIM:{c}.same_spend_gain_pct] of that plan's {A.primary} averted)"
+               if ss.get("value_gain_pct") is not None else "")
+            + f". The value lost above compares with the unconstrained plan at the headline budget, so it mixes a "
+            f"different allocation with a different spend; this comparison holds the spend fixed (negative when "
+            f"{v['id']} breaks the signed constraints)." if ss.get("status") == "solved" else
+            f"no plan under the signed constraints is feasible at its cost ({ss.get('reason', 'no same-spend record')}).")]
     for v in pv["variants"]:        # Codex S1-6 r1 P3: what a group rule allows, and what each group chose
         if v.get("status") != "solved" or v.get("group_choices") is None:
             continue

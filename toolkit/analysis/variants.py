@@ -26,6 +26,8 @@ allocatable budget (over or under, never refused for it), the units given a pack
 (with why; kept in the plan, evaluated as given), the caps and group rules it breaks, and, through UQ.run's on_draw
 hook (`Draws`), its outcome and cost quantiles over the uncertainty draws as uncertainty.yaml reports the headline
 plan's. Model corrections bearing on it, at the point or in a draw, stop publication as for every other plan.
+Its value lost mixes a different allocation with a different spend, so it is also compared with the optimum re-solved
+at its own point cost under the unconstrained feasibility (`same_spend`, review A2; not solved, with why, when none).
 A solved variant is followed over the same draws (`solved_plans`, `Draws`): its record carries the same uncertainty
 block, and its share of draws over the allocatable budget is judged against `uncertainty.affordability` when the spec
 declares it (rule_met). The reserve is set for the headline plan, so a variant can fail the rule; it is then reported
@@ -241,6 +243,8 @@ def contract_findings(raw: dict, point: dict, pv) -> list[str]:
                 isinstance(x.get("ineligible_units"), list) and x.get("units_ineligible") == len(x["ineligible_units"])
                 and isinstance(x.get("cost_minus_budget"), (int, float))):
             out.append(f"fixed plan {x.get('id')}: no eligibility report or cost against the budget")
+        if isinstance(x, dict) and types.get(x.get("id")) == "fixed_plan" and x.get("status") == "evaluated":
+            out += _same_spend_findings(x)      # review A2: the comparison at the plan's own cost
     if hv is not None:
         h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
         if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
@@ -337,6 +341,52 @@ def solved_plans(A, ben0, cost0) -> dict:
     return out
 
 
+def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events) -> dict:
+    """Review A2: the optimum re-solved on the same point tables and the unconstrained (signed) feasibility `feas`,
+    with the budget set to fixed plan `fp`'s own cost `spend`, guarded as every other solve; what moves from the given
+    plan to it. Not solved (with why) when no plan is feasible at that spend; any other solver error raises."""
+    from toolkit.analysis import moves as MV
+    try:
+        s = A.solve(ben0, cost0, budget=spend, feas=feas)
+    except RuntimeError as e:
+        if "infeasible" not in str(e):
+            raise
+        return {"status": "not_solved", "budget": spend, "reason": str(e)}
+    sp, so = dict(s["choice"]), float(s["objective"])
+    A.guard(f"plan variant {vid}: the optimum at its cost", [sp], events=events)
+    m = MV.summarise(A, fp, sp, ben0, cost0, so, budget=spend, feas=feas)
+    return {"status": "solved", "budget": spend, "objective": so, "cost": float(sum(cost0[i][sp[i]] for i in A.ids)),
+            "value_gain": so - fo, "value_gain_pct": 100.0 * (so - fo) / so if so > 0 else None,
+            **{k: m[k] for k in MOVES}, "plan": sp}
+
+
+def _same_spend_findings(x: dict) -> list[str]:
+    """A fixed plan's same-spend block is present and agrees with its record. [] when it does."""
+    s, vid = x.get("same_spend"), x.get("id")
+    if not isinstance(s, dict) or s.get("status") not in ("solved", "not_solved"):
+        return [f"fixed plan {vid}: no same-spend comparison (status solved or not_solved)"]
+    if s["status"] == "not_solved":
+        return [] if s.get("reason") else [f"fixed plan {vid}: a same-spend comparison not solved, without why"]
+    if not all(_num(s, k) for k in ("budget", "objective", "cost", "value_gain")) or not isinstance(s.get("plan"), dict):
+        return [f"fixed plan {vid}: the same-spend comparison has no budget, objective, cost, value gain or plan"]
+    tol = lambda a, b: abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))  # noqa: E731
+    out = []
+    if not _num(x, "cost") or not tol(s["budget"], x["cost"]) or s["cost"] > s["budget"] * (1 + 1e-9) + 1e-9:
+        out.append(f"fixed plan {vid}: the same-spend budget {s['budget']} is not the plan's cost {x.get('cost')}, "
+                   f"or the same-spend optimum costs more ({s['cost']})")
+    if not _num(x, "objective") or not tol(s["value_gain"], s["objective"] - float(x["objective"])):
+        out.append(f"fixed plan {vid}: the same-spend value gain {s['value_gain']} is not its objective minus the "
+                   f"plan's ({s['objective']} - {x.get('objective')})")
+    pct = 100.0 * s["value_gain"] / s["objective"] if s["objective"] > 0 else None
+    if (pct is None) != (s.get("value_gain_pct") is None) or (pct is not None and not tol(pct, s["value_gain_pct"])):
+        out.append(f"fixed plan {vid}: the same-spend value gain share {s.get('value_gain_pct')} is not {pct}")
+    return out
+
+
+def _num(x: dict, k: str) -> bool:
+    return isinstance(x.get(k), (int, float)) and not isinstance(x.get(k), bool)
+
+
 class Draws:
     """Each uncertainty draw's outcomes averted and cost of every fixed plan and, with `solved` ({variant id: plan},
     solved_plans()), of every solved variant (UQ.run's on_draw hook), guarded against the draw's model corrections. A
@@ -403,6 +453,7 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
             m = MV.summarise(A, up, fp, ben0, cost0, fo, feas=bf)
             r, drawn = row(fp, fo), draws is not None and draws.n > 0      # no draws: the point estimate only
             rec.update(r, status="evaluated", column=v["column"], plan=dict(fp), value_lost=uo - fo,
+                       same_spend=same_spend(A, v["id"], fp, fo, r["cost"], ben0, cost0, bf, ev),
                        value_lost_pct=100.0 * (uo - fo) / uo if uo > 0 else None, **{k: m[k] for k in MOVES},
                        budget_allocatable=float(A.budget), cost_minus_budget=r["cost"] - float(A.budget),
                        within_budget=r["cost"] <= float(A.budget) * (1 + 1e-9), **eligibility(A, fp, bf),
