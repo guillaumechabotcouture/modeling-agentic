@@ -525,6 +525,9 @@ def compare(ref, point, draws, level=0.95) -> dict:
     if ok and draws:
         lo, med, hi = (float(np.percentile(draws, q)) for q in (a, 50, 100 - a))
         src = f"{len(draws)} uncertainty draws, central {level:.0%}"
+    elif point is not None and draws:       # Codex S2-5c P2: a draw with no value never falls back to the point
+        lo = med = hi = None
+        src = "no model value in some uncertainty draws"
     else:
         lo = med = hi = point
         src = ("the point value: the draws keep all-age totals only" if ref["age_band"] else
