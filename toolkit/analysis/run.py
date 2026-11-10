@@ -1298,10 +1298,17 @@ def _self_test_priors(ok, q):
            f"{rec['statement']}")
         err = M.error
         npk = len(M.packages) - 1
-        ok(err is not None and len(err.cols) == len(M.pops) * len(M.outcomes) * npk
-           and {c[1] for c in err.cols} == set(M.outcomes),
+        red = [c for c in (err.cols if err else []) if c[0] not in ("base", "cost", "bw")]
+        ok(err is not None and len(red) == len(M.pops) * len(M.outcomes) * npk and {c[1] for c in red} == set(M.outcomes)
+           and {c for c in err.cols if c[0] == "base"} == {("base", P, o) for P in M.pops for o in M.outcomes}
+           and {c for c in err.cols if c[0] == "cost"} == {("cost", n, k) for n in M.cost_outputs for k in M.packages},
            f"RP9 each outcome gets its own held-out residual column, so one outcome's bias is not applied to another "
-           f"(Codex r2 P1): {err and len(err.cols)} columns")
+           f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
+           "columns")
+        ok(em["columns_by_quantity"].get("comparator") == len(M.pops) * len(M.outcomes)
+           and "emulator_error_floors" in u,
+           f"RP9b the report counts the error columns by quantity and the uncertainty records cost floors (F6 S2-4): "
+           f"{em['columns_by_quantity']}")
         design.pop("prior_names")
         try:
             EmulatorModel(schema.load(p), design, {}, log=q)

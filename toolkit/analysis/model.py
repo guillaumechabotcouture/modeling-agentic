@@ -492,6 +492,63 @@ class DirectModel:
         return out
 
 
+def _self_test_emulator(ok):
+    """F6 S2-4 on the toy engine: an encoded attribute is an emulator input, the design and job hashes do not move with
+    features, and the drawn error reaches the comparator burden and the cost outputs."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import batch as Bt
+    from toolkit.spec import schema
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        lines = open(os.path.join(d, "units.csv")).read().splitlines()
+        open(os.path.join(d, "units.csv"), "w").write("\n".join([lines[0] + ",yrs"] + [
+            ln + "," + " ".join(str(2015 + k) for k in range(i % 4)) if i % 4 else ln + ",none"
+            for i, ln in enumerate(lines[1:])]) + "\n")
+        r = yaml.safe_load(open(p))
+        r["decision_units"]["engine_attributes"] = {"group": {"column": "yrs", "split": " ", "empty": "none"}}
+        r["analysis"]["emulator"]["points"] = 40
+        r["analysis"]["cost_outputs"] = {"doses": {"cost_driver": "a_doses"}}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        sp0 = schema.load(p)
+        d0, j0 = Bt.design(sp0)
+        r["analysis"]["emulator"]["features"] = ["cov", {"attribute": "group", "encoding": "count"},
+                                                 {"attribute": "group", "encoding": "last", "empty": 2010}]
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        sp = schema.load(p)
+        ok(schema.validate(sp) == [], f"EM1 a spec with attribute features validates: {schema.validate(sp)}")
+        d1, j1 = Bt.design(sp)
+        ok(d1 == d0 and [Bt.job_sha(j) for j in j1] == [Bt.job_sha(j) for j in j0],
+           "EM2 features change neither the design nor any batch job hash, so a stored batch is reused")
+        res = {j["id"]: Bt.run_job(j)["result"] for j in j1}
+        M = EmulatorModel(sp, d1, res, log=lambda *a: None).fit()
+        u3 = next(i for i, u in M.by_id.items() if u["yrs"] == "2015 2016 2017")
+        ok(M.input_names[-3:] == ["cov", "group.count", "group.last"] and M.fv[u3][1:] == [3.0, 2017.0]
+           and M.X.shape[1] == len(M.input_names), f"EM3 the encoded attributes are emulator inputs: {M.input_names}")
+        cols = set(M.error.cols)
+        ok({("base", "all", o) for o in M.outcomes} <= cols and {("cost", "doses", k) for k in M.packages} <= cols,
+           "EM4 the error model has comparator-burden and cost-output columns")
+        ids = list(M.by_id)[:4]
+        zs = {i: 0.2 for i in ids}
+        th = {nm: float(np.mean([pt["theta"][nm] for pt in d1["points"]])) for nm in M.param_names}
+        y0 = M.predict(zs, th, ids)
+        # the toy's dose counts do not depend on the inputs (zero held-out error): residual rows with spread instead
+        M.error = EmulatorError(M.error.cols, np.random.default_rng(3).normal(0, 0.1, size=(6, len(M.error.cols))))
+        ya, yb = (M.predict(zs, th, ids, noise=np.random.default_rng(s)) for s in (1, 2))
+        i0, pk = ids[0], "a"
+        ok(ya[i0]["y"][M.comp]["dalys"] != yb[i0]["y"][M.comp]["dalys"] != y0[i0]["y"][M.comp]["dalys"]
+           and ya[i0]["cost"][pk]["doses"] != yb[i0]["cost"][pk]["doses"]
+           and M.predict(zs, th, ids) == y0,
+           "EM5 drawn emulator error moves the comparator burden and the cost outputs; without noise nothing moves")
+        R5 = np.zeros((6, len(M.error.cols)))
+        R5[:, M.error.col[("cost", "doses", M.comp)]] = -1.0          # the comparator gives no doses: pushed below 0
+        M.error, M.error_floors = EmulatorError(M.error.cols, R5), {}
+        y5 = M.predict(zs, th, ids, noise=np.random.default_rng(1))
+        ok(all(y5[i]["cost"][M.comp]["doses"] == 0.0 for i in ids) and M.error_floors.get(f"doses:{M.comp}") == 4
+           and not [e for e in M.last_events if e["kind"] == "cost_output_floor"],
+           f"EM6 a drawn cost error below zero is floored and counted, not a model correction: {M.error_floors}")
+
+
 def _self_test() -> int:
     """python3 toolkit/analysis/model.py --self-test (the emulator-error model; the emulators are tested in run.py)."""
     fails = []
@@ -541,6 +598,29 @@ def _self_test() -> int:
     sm = e2.summary()
     ok(sm["holdout_points"] == 400 and sm["sd_common_median"] < sm["sd_unit_median"]
        and "not_captured" in sm, f"ME4 the error model is summarised for the artifact ({sm['sd_common_median']:.4f})")
+    # ME6 F6 S2-4: a comparator column and a reduction column drawn from the same residual rows keep their correlation
+    rng6 = np.random.default_rng(8)
+    g6 = rng6.normal(0, 0.05, size=40)
+    R6 = np.column_stack([g6, -0.8 * g6 + rng6.normal(0, 0.01, size=40), rng6.normal(0, 0.05, size=40)])
+    e6 = EmulatorError([("base", "all", "a"), ("all", "a", "k"), ("cost", "c", "k")], R6)
+    x6 = e6.sample(np.random.default_rng(9), 4000)
+    want6 = np.corrcoef(R6.T)
+    got6 = np.corrcoef(x6.T)
+    ok(abs(got6[0, 1] - want6[0, 1]) < 0.05 and abs(got6[0, 2] - want6[0, 2]) < 0.1 and got6[0, 1] < -0.9
+       and e6.summary()["columns_by_quantity"] == {"comparator": 1, "reduction": 1, "cost": 1}
+       and e6.summary()["comparator_reduction_corr_median"] < -0.9,
+       f"ME6 comparator, reduction and cost errors keep their held-out correlation ({got6[0, 1]:.3f} vs "
+       f"{want6[0, 1]:.3f}; {got6[0, 2]:.3f} vs {want6[0, 2]:.3f})")
+    # ME7 adding columns leaves the draws of the existing ones unchanged (the same random numbers per draw)
+    a7 = EmulatorError([("all", "a", "k")], R6[:, 1:2]).sample(np.random.default_rng(4), 30)
+    b7 = e6.sample(np.random.default_rng(4), 30)
+    ok(np.allclose(a7[:, 0], b7[:, 1], rtol=1e-12, atol=1e-15), "ME7 the reduction errors are drawn as before when columns are added")
+    try:
+        EmulatorError([("a", "b", "c"), ("a", "b", "c")], R6[:, :2])
+        ok(False, "ME9 two residual columns with one key are refused")
+    except ValueError:
+        ok(True, "ME9 two residual columns with one key are refused")
+    _self_test_emulator(ok)
     # MD1-MD2: the direct model batches an engine that declares batch_equals_run, with the same outcomes
     import tempfile
     from toolkit.analysis import observed_targets as OT
