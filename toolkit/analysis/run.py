@@ -527,6 +527,29 @@ def _self_test() -> int:
         from toolkit.engines.contract import engine_identity as _eid
         ok(pt.get("engine_identity") == _eid(spec.engine()),
            "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
+        # F6 S2-4b: ranking near package switches, against engine runs at the calibrated values
+        from toolkit.analysis import contract
+        bd = yaml.safe_load(open(os.path.join(d, R["artifacts"]["emulator_boundary"])))["data"]
+        ok(bd["status"] == "judged" and 0 < bd["units"] <= 20 and bd["units"] == len(bd["rows"])
+           and bd["matched"] == sum(r["match"] for r in bd["rows"])
+           and os.path.exists(os.path.join(d, "analysis", "boundary", "results.jsonl"))
+           and "Ranking near package switches" in open(os.path.join(d, "results.md")).read()
+           and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
+                    and f["kind"] != "emulator_boundary_ranking"],
+           f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
+        from toolkit.analysis.model import DirectModel
+        Ab, r0 = R["_A"], bd["rows"][0]
+        zb = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        saved_m = Ab.model
+        try:
+            Ab.model = DirectModel(Ab.spec, log=q)
+            _o, bb, cb = Ab.evaluate(Ab.theta0, zb, ids=[r0["unit"]])
+        finally:
+            Ab.model = saved_m
+        want = [bb[r0["unit"]][k] / cb[r0["unit"]][k] for k in (r0["chosen"], r0["runner_up"])]
+        got = [r0["engine"]["ratio_chosen"], r0["engine"]["ratio_runner_up"]]
+        ok(all(abs(g / w - 1) < 1e-9 for g, w in zip(got, want)),
+           f"BD-R2 the engine side equals the engine evaluated directly at the calibrated values ({got} vs {want})")
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
