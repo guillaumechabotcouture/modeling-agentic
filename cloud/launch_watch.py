@@ -47,6 +47,12 @@ the cap and --max-hours checked between attempts.
 Before an exit that leaves clusters up (1, 2, 4, 6) one last listing logs every live cluster with this launch's names
 and its ownership (recorded / journal / unknown); nothing more is stopped.
 
+Known limitation (single operator per config name). Ownership of a same-named cluster is decided by its created
+time (worker_side.verify_attached, during an attach) and by a listing before the launch. Neither proves that this
+invocation created it, so a second machine launching the same config name at the same time could have its clusters
+stopped (by verify_attached during an attach, or by launch's `_fresh()` after the pre-launch check). Launch a config
+from one machine only. Follow-up planned: per-invocation cluster names recorded in clusters.json.
+
 Exit codes:
   0 every run collected and confirmed for this launch, and no cluster of the launch left live
   1 the launch failed before submitting anything (this invocation's failed record's ids stopped, or nothing)
@@ -462,21 +468,17 @@ class Watch:
     def finish(self, rec) -> int:
         ok, bad = False, list(self.cfg.labels)
         for i in range(self.collect_attempts):
-            if i and self.over_limit():
-                return self.leave(rec, EXIT_LIMIT)
-            if i and rec is not None:
-                credits = self.credits(rec, self.safe(self.api.list_clusters) or [])
-                if credits is not None and credits >= self.cap:
-                    self.log(f"credit cap {self.cap} reached ({credits}) between collect attempts: stopping by id")
-                    if not self.stop_all(rec, f"credit cap {self.cap}"):
-                        self.log("a cluster of this launch may still be live after the stop requests")
-                    return EXIT_CAP
+            stop = self.collect_guard(rec) if i else None
+            if stop is not None:
+                return stop
             code, out = self.call(["collect", "--no-shutdown"], retries=1, timeout=self.collect_s)   # one attempt
             self.log(f"collect attempt {i + 1}/{self.collect_attempts} exit {code}: {str(out).strip()[-300:]}")
             ok, bad = self.collected()
             if ok:
                 break
             self.sleep(self.retry_s)
+        if not ok and self.collect_guard(rec) is not None:      # the last attempt may have taken its full deadline
+            return self.collect_guard_code
         if not ok:
             self.log(f"not confirmed collected for this launch: {bad}; the run cluster is left up. Run "
                      f"`python cloud/run_cluster.py {self.cfg_path} collect` again")
@@ -486,6 +488,21 @@ class Watch:
             return EXIT_SHUTDOWN_UNCONFIRMED
         self.log("every run collected; no cluster of this launch is live")
         return EXIT_DONE
+
+    def collect_guard(self, rec):
+        """Between collect attempts and after the last: EXIT_LIMIT (nothing stopped) or EXIT_CAP (stopped by id),
+        else None."""
+        self.collect_guard_code = None
+        if self.over_limit():
+            self.collect_guard_code = self.leave(rec, EXIT_LIMIT)
+        elif rec is not None:
+            credits = self.credits(rec, self.safe(self.api.list_clusters) or [])
+            if credits is not None and credits >= self.cap:
+                self.log(f"credit cap {self.cap} reached ({credits}) during the collect attempts: stopping by id")
+                if not self.stop_all(rec, f"credit cap {self.cap}"):
+                    self.log("a cluster of this launch may still be live after the stop requests")
+                self.collect_guard_code = EXIT_CAP
+        return self.collect_guard_code
 
     def at_cap(self, rec) -> int:
         self.log(f"credit cap {self.cap} reached: one collect (at most {self.cap_collect_s} s), then stopping every "

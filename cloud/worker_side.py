@@ -517,14 +517,26 @@ class _Overflow:
         self.spec, self.workspace, self.cl, self.c, self.idle_since = spec, workspace, None, None, {}
 
     def attach(self):
+        """(cluster, client), or (None, None) when verify_attached refuses the attachment (Codex round 3 on the
+        launch watch): the overflow pool is unavailable this tick and the keeper goes on with the primary pool."""
         if self.cl is None:
-            self.cl = attach_existing(self.spec["name"], self.workspace, self.spec["id"])
-            self.c = self.cl.get_client()
+            try:
+                cl = attach_existing(self.spec["name"], self.workspace, self.spec["id"])
+            except SystemExit as e:
+                import time
+                print(f"{time.strftime('%T')} overflow {self.spec['name']} ({self.spec['id']}) unavailable this "
+                      f"tick: {str(e)[:200]}", flush=True)
+                self.refused = str(e)[:200]
+                return None, None
+            self.cl, self.c = cl, cl.get_client()
         return self.cl, self.c
 
     def step(self, run_client, run_cluster, target, n_primary, last_refusal_at, now):
-        from distributed import fire_and_forget
         cl, c = self.attach()
+        if cl is None:                    # no overflow growth this tick
+            return {"desired": 0, "vms": 0, "joined": 0, "planned": 0, "scale_to": None, "join": [], "close": [],
+                    "unavailable": getattr(self, "refused", "attach refused")}
+        from distributed import fire_and_forget
         desired = overflow_desired(target, n_primary, self.spec.get("max", 0), last_refusal_at, now,
                                    self.spec.get("hold_s", 1800))
         proc = c.processing()
