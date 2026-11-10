@@ -1558,6 +1558,17 @@ def _self_test_burden_e2e(ok, d, q):
     w = lambda o: [o[i]["burden"]["none"]["cases"] for i in A.ids]  # noqa: E731
     ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("bw", "cases", "all") in M.error.col,
        "BE9 a draw with the emulator error moves the window values (a column of the error model)")
+    saved = M.pops          # Codex S2-5b r3 P1: by_population() predicts with a subset of the population groups
+    try:
+        M.pops = {}
+        got = M.predict(zs, A.theta0, A.ids)
+        err = None
+    except Exception as e:  # noqa: BLE001
+        got, err = None, e
+    finally:
+        M.pops = saved
+    ok(err is None and all("burden" not in got[i] for i in A.ids),
+       f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
 
 
 def _self_test_floors_e2e(ok, d, q):

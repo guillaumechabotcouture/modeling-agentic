@@ -1112,6 +1112,9 @@ def _self_test() -> int:
                      {"averted": {"dalys": 90.0, "deaths": 3.0}})
     ok("decision window" in dpw["statement"] and "not the model window" in dpw["statement"],
        f"BV38 (Codex S2-5b r2 P2) with a model window the DALY parts say they are over the decision window: {dpw}")
+    dpn = daly_parts(_A, {"daly_parts": {}, "window": [0, 2]}, "none", out, {}, {"averted": {"dalys": 90.0, "deaths": 3.0}})
+    ok(dpn["dalys_averted_per_death_averted"] == 30 and "not the model window" in dpn["statement"],
+       f"BV39 (Codex S2-5b r3 P2) so do they without years of life lost per death: {dpn['statement']}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
