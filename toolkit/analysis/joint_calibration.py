@@ -1933,6 +1933,54 @@ def _self_test() -> int:
            f"JA20b errors near 1e-5 with the sd inflated by 10% are caught; the exact record is not ({f0}, {f1})")
     safe(ja20, "JA20")
 
+    def ja21():          # F6 S2-3c: a group round (own CI) and a unit round (shared offset) of one survey
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+            with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]) + ["tgt2", "w2"])
+                w.writeheader()
+                w.writerows([dict(r, tgt2=f"{float(r['tgt']) * 0.8:.5f}", w2=str(1 + n % 2)) for n, r in enumerate(rows)])
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            j["targets"][1]["survey"] = "s"
+            j["targets"].append(dict(j["targets"][0], id="unit_late", column="tgt2", window=[2, 3], bias_sd=0.3,
+                                     bias_by="region", bias_source="s"))
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            P, _ = build(spec)
+            ch = {c["group"]: c for c in P.changes if c.get("survey") == "s" and "group" in c}
+            pop = {r["id"]: float(r["pop"]) for r in rows}
+            t0 = (ch.get("r0") or {}).get("terms") or []
+            uw = {x["to"].split(":")[1]: x["w"] for x in t0 if "to" in x}
+            ok(set(ch) == {"r0", "r1", "r2"} and [x.get("from") for x in t0 if "from" in x] == ["region_t:r0"]
+               and abs(sum(uw.values()) - 1) < 1e-9 and len(uw) == 4
+               and abs(uw[min(uw)] / uw[max(uw)] - pop[min(uw)] / pop[max(uw)]) < 1e-9,
+               f"JA21a the group round minus the unit round aggregated by the group round's weights, per group ({ch})")
+            r2 = yaml.safe_load(open(p))
+            r2["calibration"]["joint"]["changes"] = {"weights": "w2"}
+            p2 = os.path.join(d, "s2.yaml")
+            yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+            c2 = [c for c in build(schema.load(p2))[0].changes if c.get("group") == "r0"][0]
+            uw2 = {x["to"].split(":")[1]: x["w"] for x in c2.get("terms") or [] if "to" in x}
+            ok(uw2 == uw and "pop" in c2.get("note", "") and "w2" in c2.get("note", ""),
+               f"JA21b weights that differ between the rounds: the group round's, stated ({c2.get('note')})")
+            r3 = yaml.safe_load(open(p))
+            r3["calibration"]["joint"]["targets"][-1]["bias_by"] = "grp"
+            yaml.safe_dump(r3, open(p2, "w"), sort_keys=False)
+            c3 = [c for c in build(schema.load(p2))[0].changes if c.get("survey") == "s"]
+            ok(c3 and all("not_computable" in c and "group" in c["not_computable"] for c in c3),
+               f"JA21c rounds grouped by different columns are not computable ({c3})")
+            rep = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            sc = {x["id"]: x for x in (rep.get("survey_changes") or {}).get("pairs") or []}
+            got = [x for x in sc.values() if x.get("survey") == "s" and "z" in x]
+            ok(len(got) == 3 and all(x["sd_parts"]["offset"] >= 0.3 - 1e-9 for x in got)
+               and expected_change_ids(spec) == set(sc),
+               f"JA21d the toy run computes each group's mixed change, the offset in full; the gate's rebuild agrees "
+               f"({[(k, x.get('z'), x.get('not_computable')) for k, x in sc.items()]})")
+    safe(ja21, "JA21")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

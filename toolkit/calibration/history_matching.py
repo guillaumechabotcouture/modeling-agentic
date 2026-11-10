@@ -3134,6 +3134,32 @@ def _self_test() -> int:
            f"HM44b a natural-scale change of -24.5 is not called within its error of zero ({x.get('text')})")
     safe(hm44, "HM44")
 
+    def hm45():          # F6 S2-3c: a group round paired with a unit round of one survey (aggregated by its weights)
+        G = Target("G", "group", "w0", 0.5, "identity", sd_obs=0.02, weights={"u0": 1.0, "u1": 3.0}, source="t")
+        U = {u: Target(f"{u}:w1", "unit", "w1", v, "identity", sd_obs=0.05, sd_bias=0.3, unit=u, source="t",
+                       bias_key="s|g") for u, v in (("u0", 0.2), ("u1", 0.4))}
+        tg = dict({"G": G}, **{t.id: t for t in U.values()})
+        terms = [{"from": "G", "w": 1.0}] + [{"to": f"{u}:w1", "w": w} for u, w in (("u0", 0.25), ("u1", 0.75))]
+        x = change_stats(terms, tg, {"G": 0.45, "u0:w1": 0.3, "u1:w1": 0.3}, 0.0, z_max=3.0)
+        samp = math.sqrt(0.02 ** 2 + (0.25 ** 2 + 0.75 ** 2) * 0.05 ** 2)
+        ok(abs(x["observed"] - (0.35 - 0.5)) < 1e-12 and abs(x["modelled"] - (0.3 - 0.45)) < 1e-12
+           and abs(x["sd_parts"]["sampling"] - samp) < 1e-12 and abs(x["sd_parts"]["offset"] - 0.3) < 1e-12
+           and x["sd"] > 5 * samp and not x["flagged"],
+           f"HM45a group minus the weighted unit round: known changes; the unit round's offset adds in full and "
+           f"dominates the sd ({x})")
+        tn = {"w0": 0.01, "w1": 0.01}
+        v0 = change_run_var(terms, tg, tn, {("w0", "w1"): 0.0}, {("u0", "w0"): 0.5, ("u1", "w0"): 0.5})
+        v1 = change_run_var(terms, tg, tn, {("w0", "w1"): 0.02}, {("u0", "w0"): 0.5, ("u1", "w0"): 0.5})
+        ok(abs(v0) < 1e-12 and abs(v1 - 2 * (0.25 ** 2 + 0.75 ** 2) * 0.01) < 1e-12,
+           f"HM45b run noise of a mixed pair is paired per member (shared: {v0}; independent: {v1})")
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0", "u1"], list(tg.values()),
+                    changes=[{"id": "p", "terms": terms}])
+        P2 = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0", "u1"], list(tg.values()),
+                     changes=[{"id": "p", "terms": [{"from": "G", "w": 1.0}, {"to": "nope", "w": 1.0}]}])
+        ok(not P._change_problems() and any("unknown" in b for b in P2._change_problems()),
+           f"HM45c a one-sided term is accepted; one naming an unknown target is refused ({P2._change_problems()})")
+    safe(hm45, "HM45")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
