@@ -13,7 +13,7 @@ unless it is listed in EXEMPT with the reason it has none. So a new module under
     python3 scripts/self_tests.py              # run them all (exit 1 on any failure)
     python3 scripts/self_tests.py --list       # print what would run, and the exemptions
     python3 scripts/self_tests.py --jobs 2     # run two at a time
-    python3 scripts/self_tests.py --per-test-timeout 900   # kill (and fail) a self-test after 15 min (default)
+    python3 scripts/self_tests.py --per-test-timeout 1800  # kill (and fail) a self-test after 30 min (default)
     python3 scripts/self_tests.py --shard 2/4  # only shard 2 of 4 (CI runs the 4 shards in parallel)
     python3 scripts/self_tests.py --self-test  # test the discovery rule itself
 """
