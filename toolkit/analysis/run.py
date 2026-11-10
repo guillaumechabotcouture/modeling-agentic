@@ -1002,20 +1002,21 @@ def _fixed_refusals(ok, d, r):
     """F6 S2-6: the signed spec refuses a fixed plan as the headline, on a missing column, or with an unknown package."""
     import copy
 
-    def errs(mut):
+    def errs(mut, units=None):
         x = copy.deepcopy(r)
         mut(x)
-        return schema.validate(schema.Spec(x, d))
+        s = schema.Spec(x, d)
+        if units is not None:
+            s._units = units        # the units table as read, with one cell changed (no file written)
+        return schema.validate(s)
     fx = lambda x: x["analysis"]["plan_variants"]["variants"][2]  # noqa: E731
     e1 = errs(lambda x: x["analysis"]["plan_variants"].update(headline="given"))
     e2 = errs(lambda x: fx(x).update(column="nocol"))
     ok(any("cannot be the headline" in e for e in e1) and any("nocol" in e for e in e2)
        and errs(lambda x: None) == [],
        f"PV-R11 the spec refuses a fixed plan as headline or on a missing column ({e1[:2]}, {e2[:2]})")
-    rows = open(os.path.join(d, "units.csv")).read()
-    open(os.path.join(d, "units.csv"), "w").write(rows.replace(",a+b\n", ",zz\n", 1))
-    e3 = errs(lambda x: None)
-    open(os.path.join(d, "units.csv"), "w").write(rows)
+    rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+    e3 = errs(lambda x: None, [dict(rows[0], given="zz")] + rows[1:])
     ok(any("zz" in e for e in e3), f"PV-R12 the spec refuses a unit given an unknown package ({e3[:2]})")
 
 

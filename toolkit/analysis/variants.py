@@ -321,13 +321,13 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
             fo = float(sum(ben0[i][fp[i]] for i in A.ids))
             bf = getattr(A, "base_feas", None) or A.feas
             m = MV.summarise(A, up, fp, ben0, cost0, fo, feas=bf)
-            r = row(fp, fo)
+            r, drawn = row(fp, fo), draws is not None and draws.n > 0      # no draws: the point estimate only
             rec.update(r, status="evaluated", column=v["column"], plan=dict(fp), value_lost=uo - fo,
                        value_lost_pct=100.0 * (uo - fo) / uo if uo > 0 else None, **{k: m[k] for k in MOVES},
                        budget_allocatable=float(A.budget), cost_minus_budget=r["cost"] - float(A.budget),
                        within_budget=r["cost"] <= float(A.budget) * (1 + 1e-9), **eligibility(A, fp, bf),
-                       uncertainty=draws.summary(v["id"], interval) if draws is not None else None,
-                       uncertainty_note=("outcome and cost over the uncertainty draws" if draws is not None else
+                       uncertainty=draws.summary(v["id"], interval) if drawn else None,
+                       uncertainty_note=("outcome and cost over the uncertainty draws" if drawn else
                                          "point estimate only: no uncertainty draws were collected"))
             out["variants"].append(rec)
             continue
@@ -508,6 +508,11 @@ def _self_test_fixed(ok, attempt):
     ok(f.get("ineligible_units") == [] and f.get("units_ineligible") == 0 and f.get("uncertainty") is None
        and "point" in str(f.get("uncertainty_note")),
        f"PV21 no draws given: the point estimate only, said so ({f.get('uncertainty_note')})")
+    A.outcomes = ["dalys"]
+    r0, e0b = attempt(lambda: run(A, ben, cost, plan, [], Draws(A), {"level": 0.9}))
+    f0 = {x["id"]: x for x in (r0 or {}).get("variants", [])}.get("given") or {}
+    ok(e0b is None and f0.get("uncertainty") is None and "point" in str(f0.get("uncertainty_note")),
+       f"PV21b a draw collector that saw no draws (draws: 0) gives the point estimate only ({e0b!r})")
     A.feas["feasible"]["u2"]["n1"] = False
     A.feas["reasons"].setdefault("u2", {})["n1"] = ["n1 not eligible here"]
     r2, e2 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
