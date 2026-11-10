@@ -128,7 +128,9 @@ Thresholds for value lost are proposals in `toolkit/analysis/thresholds.yaml`.
 
 **Decision tests (lesson 8).** Types: `interaction_rescale` (the spike's DT1),
 `parameter_value` (an engine parameter set to a value), `group_rule` (a group rule on or
-off), `envelope` (another budget). Before solving, each test states whether it can move
+off), `envelope` (another budget), `cost_items` (one price case: the unit costs of the
+listed cost items multiplied together, for prices that move together, which the
+one-at-a-time cost sensitivity cannot show; the benefits do not change). Before solving, each test states whether it can move
 the plan: a test that only lowers the benefit of a component absent from the point plan
 and from every re-optimised draw cannot add it, and the result file says so first. The
 result file follows the Phase 49 schema (`finding`, `varied`, `criterion`,
