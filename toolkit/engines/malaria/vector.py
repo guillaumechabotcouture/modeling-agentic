@@ -386,6 +386,18 @@ def _self_test() -> int:
     w0 = np.ones(4)
     f, mu = cycle(b, w0, np.ones(4), np.ones(4), np.zeros(4))
     ok(abs(mu - b["mu0"]) < 1e-9, "V15 without interventions the cycle reproduces baseline mortality")
+    # v0.15 (F6 engine review, finding 1): cycle also returns W-bar, the mean probability that a feeding attempt ends
+    # in a blood meal the mosquito survives. The biting rates on humans carry 1/W-bar (Griffin 2010 Protocol S2)
+    hn4 = np.array([True, True, False, False])
+    rn4, kn4, fn4 = itn_effect(np.full(4, NET_CODE["pyr"]), 0.5, np.zeros(4), P)
+    y4, w4, z4 = feeding(b, hn4, rn4, kn4, fn4, np.zeros(4), np.zeros(4))
+    out0, out4 = cycle(b, w0, np.ones(4), np.ones(4), np.zeros(4)), cycle(b, w0, y4, w4, z4)
+    W0_, W4_ = (o[2] if len(o) == 3 else float("nan") for o in (out0, out4))
+    ok(abs(W0_ - 1) < 1e-12 and abs(W4_ - (1 - b["Q0"] + b["Q0"] * w4.mean())) < 1e-12 and W4_ < 1,
+       f"V29 cycle returns W-bar: 1 without interventions, 1 - Q0 + Q0 mean(w) under nets ({W0_:.4f}, {W4_:.4f})")
+    ok(abs(b["Q0"] * w4.mean() / W4_ - (1 - (1 - b["Q0"]) / W4_)) < 1e-12 and b["Q0"] * w4.mean() / W4_ > b["Q0"] * w4.mean(),
+       "V30 with 1/W-bar the surviving bites on humans per cycle are the human blood index under interventions, "
+       "Q = 1 - (1 - Q0)/W-bar (Griffin 2010 Protocol S2)")
     # Churcher 2016 Equation 4, against the paper: worked value and the published statements
     ok(abs(float(pbo_bioassay(0.088)) - 0.460) < 0.002,
        f"V21 Eq. 4 at x = 0.088 gives PBO bioassay mortality 0.460 ({float(pbo_bioassay(0.088)):.3f})")

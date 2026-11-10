@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""The malaria engine's v0.8-v0.14 self-test sections, in their own process.
+"""The malaria engine's v0.8-v0.15 self-test sections, in their own process.
 
     python3 toolkit/engines/malaria/selftest_late.py --self-test
 
 engine.py --self-test runs M1-M21 and the v0.5-v0.7 sections. This module runs the v0.8 figure hooks (S0-S15),
 the v0.9 net survival (N0-N7), the v0.10 past SMC and per-campaign net types (H0-H7) and the v0.11 SMC
 mechanism (Q0-Q6) and the v0.12 case-management package (C0-C11) and the v0.13 past SMC
-coverage (HC0-HC7) and the v0.14 window metrics for severe cases and deaths (W0-W4). The sections are defined
-in engine.py, beside the code they test; they are split across two processes only so that each one stays well
-inside CI's per-test time limit (scripts/self_tests.py discovers and runs both modules).
+coverage (HC0-HC7) and the v0.14 window metrics for severe cases and deaths (W0-W4) and the v0.15 biting rates
+(BR0-BR4). The sections are defined in engine.py, beside the code they test; they are split across two processes
+only so that each one stays well inside CI's per-test time limit (scripts/self_tests.py discovers and runs both
+modules).
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ else:  # pragma: no cover
     from toolkit.engines.malaria import engine as E  # noqa: E402
 
 SECTIONS = ("_self_test_v08", "_self_test_v09", "_self_test_v010", "_self_test_v011", "_self_test_v012",
-            "_self_test_v013", "_self_test_v014")
+            "_self_test_v013", "_self_test_v014", "_self_test_v015")
 
 
 def _self_test() -> int:
