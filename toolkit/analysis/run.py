@@ -1435,7 +1435,7 @@ def _self_test_cost_structure(ok, A, R):
            and not any("a" in seg.split(":")[0].strip().split("+") for seg in r2["recommendation"].split(";"))
            and r2["cost_multipliers"] == {its["a"]: 1e9, its["b"]: 0.5} and t2["cost_multipliers"] == r2["cost_multipliers"],
            f"R5n2 a cost_items test that prices component a out re-solves without it, says the point plan is not "
-           f"affordable under the test, and records the multipliers: {r2.get('units_changed')} of {n_a0} units with a, "
+           f"affordable under the test, and records the multipliers: {r2.get('units_changed')} units change package ({n_a0} had a), "
            f"{r2.get('recommendation')}, {r2.get('point_plan_infeasible')}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"R5n1 a cost_items decision test runs: {type(e).__name__}: {e}")

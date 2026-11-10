@@ -308,6 +308,9 @@ def _decision_tests(spec: dict, units: dict) -> list:
                                                                                  "define it)"))
         elif typ == "envelope":
             varied, unit = "the envelope (the plan re-solved at each value; fixed costs unchanged)", "USD"
+        elif typ == "cost_items" and isinstance(t.get("multipliers"), dict):
+            varied = ("unit costs multiplied together (one price case; the plan re-solved, benefits unchanged): "
+                      + ", ".join(f"{k} ×{v}" for k, v in t["multipliers"].items()))
         else:
             varied = _short({k: v for k, v in t.items() if k not in ("id", "type", "text", "values", "finding")})
         out.append({"id": t.get("id"), "type": typ, "varied": varied, "values": values, "unit": unit,

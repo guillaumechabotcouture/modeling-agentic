@@ -103,7 +103,8 @@ docs/design/v2-spec-and-analysis.md §1):
       stability: {holdout_group: col, covariates: [..]}
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
-      decision_tests: [{id, type, text, finding, ...}]
+      decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
+                                           # price case in which the listed unit costs change together
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     deliverable:
@@ -165,7 +166,7 @@ OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-car
                             "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
                      "emulator": "emulator error"}
-DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope")
+DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -427,6 +428,11 @@ class Spec:
                     lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
         for it_id, r in (((self.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items") or {}).items():
             lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
+        for dt in (self.raw.get("analysis") or {}).get("decision_tests") or []:      # a cost_items test's price case
+            if isinstance(dt, dict) and dt.get("type") == "cost_items" and isinstance(dt.get("multipliers"), dict):
+                for it_id, m in dt["multipliers"].items():
+                    if _isnum(m):
+                        lo[it_id] = min(lo.get(it_id, 1.0), float(m))
         comp_cost = {}
         for u in self.units():
             uid = str(u[self.uid])
@@ -1343,6 +1349,7 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         if not (_isnum(thr) and 0 <= thr <= 1):
             bad.append(f"analysis.{k}: a fraction in [0, 1]")
     rules = {g.get("id") for g in s.raw["constraints"].get("group_rules") or []}
+    cost_ids = {it.get("id") for it in s.raw["options"].get("cost_items") or []}
     for dt in an.get("decision_tests") or []:
         i = dt.get("id")
         if not i or i in seen:
@@ -1384,6 +1391,17 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         elif t == "envelope":
             if not dt.get("values") or not all(_isnum(v) for v in dt["values"]):
                 bad.append(f"decision test {i}: values (envelopes in USD)")
+        elif t == "cost_items":
+            m = dt.get("multipliers")
+            if not isinstance(m, dict) or not m:
+                bad.append(f"decision test {i}: multipliers {{cost_item_id: multiplier}} (one price case: the listed "
+                           "unit costs are multiplied together)")
+                continue
+            for it_id, v in m.items():
+                if it_id not in cost_ids:
+                    bad.append(f"decision test {i}: unknown cost item {it_id}")
+                elif not (_isnum(v) and 0 < v < float("inf")):
+                    bad.append(f"decision test {i}: multipliers.{it_id}: a positive multiplier")
     return bad
 
 
