@@ -2014,6 +2014,22 @@ def _self_test() -> int:
                f"({[(k, x.get('z'), x.get('not_computable')) for k, x in sc.items()]})")
     safe(ja21, "JA21")
 
+    def ja22():          # Codex r1 P2-1: changes.by cannot hide a unit round whose offsets are grouped otherwise
+        class T_:
+            def __init__(self, i, g):
+                self.id, self.kind, self.spec_id, self.group, self.weights = i, "group", "a", g, {"1": 1.0, "2": 1.0}
+        j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
+                          "key": {"csv": "region", "units": "region"}, "weights": "pop"},
+                         {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "x",
+                          "bias_by": "district", "bias_sd": 0.3}],
+             "changes": {"by": "region"}}
+        rows = {"1": {"region": "R", "district": "D0", "pop": "1"}, "2": {"region": "R", "district": "D1", "pop": "1"}}
+        got = change_pairs(j, rows, ["1", "2"], [T_("a:R", "R")], None)
+        ok(len(got) == 1 and "groups do not match" in got[0].get("not_computable", ""),
+           f"JA22 a unit round with offsets by district against a group round by region is not computable, whatever "
+           f"changes.by says ({got})")
+    safe(ja22, "JA22")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

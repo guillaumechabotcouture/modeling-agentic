@@ -3183,6 +3183,16 @@ def _self_test() -> int:
            f"HM45c a one-sided term is accepted; one naming an unknown target is refused ({P2._change_problems()})")
     safe(hm45, "HM45")
 
+    def hm46():          # Codex r1 P2-2: one-sided terms are for a group round against a unit round only
+        a = Target("a", "unit", "w0", 0.4, "identity", sd_obs=0.1, unit="u0", source="t")
+        b = Target("b", "unit", "w1", 0.6, "identity", sd_obs=0.1, unit="u0", source="t")
+        P = Problem([], {"name": "z", "lo": 0.0, "hi": 1.0}, ["u0"], [a, b],
+                    changes=[{"id": "p", "rho": 0.9, "terms": [{"from": "a", "w": 1.0}, {"to": "b", "w": 1.0}]}])
+        ok(any("one side" in x for x in P._change_problems()),
+           f"HM46 two unit rounds split into one-sided terms are refused (their correlation would be lost) "
+           f"({P._change_problems()})")
+    safe(hm46, "HM46")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
