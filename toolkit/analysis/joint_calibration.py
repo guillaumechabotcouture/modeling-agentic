@@ -1813,7 +1813,7 @@ def _self_test() -> int:
     def ja18():          # Codex r1 P2-2 to P2-5: groups, weights and gate arithmetic, fail closed
         class T_:
             def __init__(self, i):
-                self.id, self.kind = i, "group"
+                self.id, self.kind, self.spec_id = i, "group", i.split(":")[0]
         j = {"targets": [{"id": "a", "kind": "group", "survey": "s", "window": [1, 2], "metric": "m",
                           "key": {"csv": "g", "units": "g"}, "weights": "pop"},
                          {"id": "b", "kind": "group", "survey": "s", "window": [2, 3], "metric": "m",
@@ -1837,6 +1837,37 @@ def _self_test() -> int:
         ok(len(f1) == 1 and not f1[0]["scope_declarable"] and len(f2) == 1 and not f2[0]["scope_declarable"],
            f"JA18c a difference that is not modelled - observed, and an empty record, are findings ({f1}, {f2})")
     safe(ja18, "JA18")
+
+    def ja19():          # Codex r2: target ownership, record completeness, the sd's parts, the default column
+        class T_:
+            def __init__(self, i, own):
+                self.id, self.kind, self.spec_id = i, "group", own
+        g = lambda i, w: {"id": i, "kind": "group", "survey": "s" if ":" not in i else "o", "window": w,  # noqa: E731
+                          "metric": "m", "key": {"csv": "g", "units": "g"}, "weights": "pop"}
+        j = {"targets": [g("a", [1, 2]), g("b", [2, 3]), g("a:x", [1, 2]), g("b:x", [2, 3])]}
+        tg = [T_("a:G", "a"), T_("b:G", "b"), T_("a:x:G", "a:x"), T_("b:x:G", "b:x")]
+        got = [c["id"] for c in change_pairs(j, {"1": {"g": "G", "pop": "1"}}, ["1"], tg, None)]
+        ok(sorted(got) == ["o:a:x->b:x:G", "s:a->b:G"], f"JA19a each round's targets are its own, never by prefix ({got})")
+        mk = lambda gid, o, m: {"id": f"s:a->b:{gid}", "survey": "s", "group": gid, "from": "a", "to": "b",  # noqa
+                                "observed": o, "modelled": m, "difference": m - o, "sd": 0.1414213562373095,
+                                "sd_parts": {"sampling": 0.1414213562373095, "offset": 0.0, "run": 0.0},
+                                "z": (m - o) / 0.1414213562373095, "flagged": abs(m - o) / 0.1414 > 3, "text": "t"}
+        raw = {"calibration": {"joint": {"targets": [{"id": "a", "kind": "unit", "survey": "s"},
+                                                     {"id": "b", "kind": "unit", "survey": "s"},
+                                                     {"id": "c", "kind": "unit", "survey": "t"}]}}}
+        G, H = mk("G", 1.0, 1.0), mk("H", 1.0, 2.0)
+        f1 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [G], "flagged": [H["id"]]}})
+        H2 = dict(H, sd=100.0, z=0.01, flagged=False)
+        f2 = change_findings(raw, {"survey_changes": {"z_max": 3.0, "pairs": [G, H2], "flagged": []}})
+        ok(any(not x["scope_declarable"] for x in f1) and any(not x["scope_declarable"] for x in f2),
+           f"JA19b a flagged list the pairs do not match, a survey of the spec with no entry, and an sd its parts do "
+           f"not give are findings ({f1}, {f2})")
+        ju = {"targets": [{"id": "a", "kind": "unit", "survey": "s", "window": [1, 2], "metric": "m"},
+                          {"id": "b", "kind": "unit", "survey": "s", "window": [2, 3], "metric": "m", "column": "x"}]}
+        got = change_pairs(ju, {"1": {"g": "G", "x": "0.5"}}, ["1"], [], "g", default_column="x")
+        ok(len(got) == 1 and "one column" in got[0].get("not_computable", ""),
+           f"JA19c a round reading the spec's default column is compared with that column ({got})")
+    safe(ja19, "JA19")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
