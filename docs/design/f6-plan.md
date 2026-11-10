@@ -185,6 +185,7 @@ runs for a sample of LGAs at the boundary values.
 | S2-1, S2-4 | lead and engine agent | dated once O1 and O2 are in | waiting on O1, O2 |
 | S2-5 absolute burden validation | lead | PR by 2026-11-11 | merged (#165: `validation.burden`, `analysis/burden_validation.yaml`); the Nigeria reference file (estimated state cases and deaths with intervals) is built outside the repository before the F6 spec is signed |
 | S2-5b burden window, report-only rows, no published interval | lead | PR by 2026-11-10 | in review: `validation.burden.window` with `window_metrics` (past years from engine window metrics in the same runs; deaths and DALYs need an engine change); `role`, `interval` columns |
+| S2-6 funded plan beside the optimised plan | lead | PR by 2026-11-11 | in review (#170: `fixed_plan` plan variant) |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
 Cost: Stage 1 is laptop and review time. The F6 run needs a full recalibration (the benchmark and error-model changes
