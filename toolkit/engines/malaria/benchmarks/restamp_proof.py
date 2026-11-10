@@ -6,8 +6,8 @@
     python3 toolkit/engines/malaria/benchmarks/restamp_proof.py --self-test
 
 v0.6 adds a delivery period and routine campaigns, v0.7 routine SMC (smc_routine), and v0.10 past SMC
-(smc_hist_years) and a net type per past campaign (hist_net_by_year); each acts only when a horizon or a unit asks
-for it. The benchmark pack, the equilibration evidence and the guess-sensitivity evidence ask for none. `prove` runs their inputs under
+(smc_hist_years) and a net type per past campaign (hist_net_by_year), v0.13 past SMC at its own coverage
+(smc_hist_cov); each acts only when a horizon or a unit asks for it. The benchmark pack, the equilibration evidence and the guess-sensitivity evidence ask for none. `prove` runs their inputs under
 the old code (`git archive <old-ref>` into a temporary directory) and under the working tree, one process each, and
 compares every output exactly (per-capita outcomes, windows, cost drivers, meta without wall-clock seconds;
 initial-state dicts). It writes restamp_proof.yaml: the scope, the two engine identities, one sha256 per case and
@@ -103,6 +103,17 @@ SCENARIOS = {
                     {"package": {"net": "pyr", "irs": 1}, "unit": {"hist_net_by_year": {2021.25: "pbo", 2022.5: "pbo"}}},
                     {"package": {"smc": 1}, "unit": {"hist_net_by_year": {}, "smc_hist_rounds": [], "hist_net": "dual"},
                      "params": {"smc_cov": 0.7}}]},
+    # v0.13: past SMC (in the burn-in and after horizon.start) without its own coverage, so the past rounds run at
+    # smc_cov as in v0.12; members give smc_hist_cov as [] and None (absent), which the old code does not read
+    "past_smc_v013": {
+        "unit": dict(_BASE_UNIT, itn_hist_years=[2021.25], campaign_year=2024.5, smc_hist_years=[2022, 2023],
+                     smc_hist_rounds=[3, 4]),
+        "horizon": {"start": 2023.0, "stop": 2026.0, "window": [2024.0, 2026.0],
+                    "windows": {"pre": [2023.0, 2024.0], "y1": [2024.0, 2025.0], "y2": [2025.0, 2026.0]}},
+        "delivery": [2024.0, 2026.0], "params": {"n_agents": 1500, "burnin_years": 20}, "seed": 25,
+        "members": [{"package": {}}, {"package": {"smc": 1}}, {"package": {"smc": 1}, "params": {"smc_cov": 0.7}},
+                    {"package": {"net": "dual", "smc": 1}, "unit": {"smc_hist_cov": []}},
+                    {"package": {"smc": 1}, "unit": {"smc_hist_cov": None}}]},     # Codex r1 P3: None too
 }
 
 # Codex r2 P3: the execution environment of a worker, recorded per side (the source is shared by the worker, which runs
@@ -459,6 +470,9 @@ def _self_test() -> int:
         "v0.10 history attributes at their empty values": any(
             "smc_hist_years" in x and not x["smc_hist_years"] and "hist_net_by_year" in x for sp in specs
             for x in units(sp)),
+        "v0.13 past SMC without its own coverage (smc_hist_cov absent and [])": any(
+            x.get("smc_hist_years") and not x.get("smc_hist_cov") for sp in specs for x in units(sp))
+        and any("smc_hist_cov" in x and x["smc_hist_years"] for sp in specs for x in units(sp)),
         "heterogeneous members": any(len({json.dumps(x, sort_keys=True) for x in units(sp)}) > 1
                                      and len({json.dumps(m.get("params") or {}, sort_keys=True)
                                               for m in sp["members"]}) > 1 for sp in specs),
