@@ -348,7 +348,14 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -
         L.append("")
     L += attribute_simplifications(A)
     if emu_acc and not emu_acc.get("direct"):
-        L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in emu_acc.items())}.", ""]
+        acc = {k: v for k, v in emu_acc.items() if k != "boundary_ranking"}
+        L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in acc.items())}.", ""]
+        bd = emu_acc.get("boundary_ranking")      # F6 S2-4b (toolkit/analysis/boundary.py)
+        if bd:
+            L += [("Ranking near package switches: not judged (no unit has a runner-up package)." if not bd["units"] else
+                   f"Ranking near package switches: for {bd['matched']} of {bd['units']} units closest to switching, the "
+                   f"emulator orders the plan package and its runner-up as engine runs at the calibrated values do "
+                   f"(threshold {bd['threshold']:.0%})."), ""]
     if burden:
         from toolkit.analysis import burden as BV
         L += BV.results_lines(burden)
