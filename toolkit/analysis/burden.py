@@ -1111,6 +1111,7 @@ def _self_test_s25b(ok, th):
         raw0 = yaml.safe_load(open(schema.toy_spec(d)))
         ok(B.windows(schema.Spec(raw0, d)) == {"cal": [1, 2]}, "BV34 without a model window the engine windows are "
            "unchanged (batch job hashes stay)")
+        rawT = copy.deepcopy(raw0)
         raw0.update(horizon={"start": 0, "stop": 10})
         raw0["objective"]["horizon"] = [8, 10]
         raw0["calibration"]["target_source_id"] = "SURVEY-T"
@@ -1160,6 +1161,30 @@ def _self_test_s25b(ok, th):
            f"mean ({v0})")
         ok(_value(A, config(sw), rw[0], {i: {"y": out[i]["y"]} for i in A.ids}, "none") is None,
            "BV29 a windowed reference with no window output has no model value (fails closed as unmatched)")
+        # Codex S2-5b r1 P1-2: the artifact's arm, window and window metrics are the signed spec's
+        good = {"arm": "none", "window": [0, 2], "window_metrics": {"cases": "events"}}
+        bf = [block_findings(sw, dict(good, **x)) for x in ({}, {"arm": "a"}, {"window": [8, 10]},
+                                                             {"window_metrics": {"cases": "other"}})]
+        ok(bf[0] == [] and all([f["kind"] for f in b] == ["burden_validation_inconsistent"] and not b[0]["scope_declarable"]
+                               for b in bf[1:]) and block_findings(s0, {"arm": "none", "window": [8, 10]}) == [],
+           f"BV36 an artifact whose arm, window or window metrics differ from the signed spec is inconsistent: {bf}")
+        # Codex S2-5b r1 P1-1: a stored batch computed over another burden window is not adopted
+        rawT["validation"] = {"burden": {"csv": "w.csv", "window": [1, 2], "window_metrics": {"cases": "prev"}}}
+        sT = schema.Spec(rawT, d)
+        dz, jobs = B.design(sT)
+        import json
+        for n_, rows_ in (("sd.json", dict(dz, burden_window=None)), ("sj.jsonl", jobs),
+                          ("sr.jsonl", [{"id": j["id"], "ok": True, "result": {}} for j in jobs])):
+            open(os.path.join(d, n_), "w").write(json.dumps(rows_) if n_.endswith(".json") else
+                                                 "".join(json.dumps(x) + "\n" for x in rows_))
+        try:
+            B.adopt(d, os.path.join(d, "sr.jsonl"), os.path.join(d, "sj.jsonl"), os.path.join(d, "sd.json"), jobs, dz,
+                    sT.engine(), sample=len(jobs))
+            why = "adopted"
+        except ValueError as e:
+            why = str(e)
+        ok(dz.get("burden_window") == [1.0, 2.0] and "burden window" in why,
+           f"BV35 a stored batch whose design has another burden window is refused at adoption: {why[:160]}")
         # report-only rows and rows with no published interval
         lines = [row(9, "estimated,s,ratio,,,WMR-X,,report_only,"), row(9, "estimated,s,ratio,,,WMR-Y,,,none", lo=",")
                  .replace("a,", "b,", 1)]
