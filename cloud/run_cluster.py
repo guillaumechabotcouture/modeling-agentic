@@ -27,6 +27,7 @@
     python cloud/run_cluster.py --self-test
 
 Detached jobs on a single VM (the dev VM): cloud/vm_job.py.
+A launch watched to the end (launch, status, collect before any stop, credit cap, stray sweep): cloud/launch_watch.py.
 
 A config is a Python file defining CONFIG = RunConfig(...) (see cloud/configs/).
 
