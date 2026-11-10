@@ -3050,6 +3050,29 @@ def _self_test_v014(ok, e, unit) -> None:
            "W4 the new metrics are NaN for a window the simulated days do not cover, and finite inside the burn-in")
     case("W4", w4)
 
+    def w5():
+        # the decision window starts before the delivery start: the shared history (to the fork at the delivery start)
+        # overlaps the window, so members that differ in case fatality must not share it (per_capita deaths)
+        from toolkit.engines.horizon import DeliveryHorizon
+        q = dict(p, cfr_severe_untreated=0.9, cfr_severe_treated=0.09, severe_access_add=0.1)
+        res = lambda o: (o.per_capita, o.windows, o.cost_drivers)  # noqa: E731
+        hl = DeliveryHorizon(2015.0, 2017.0, (2015.0, 2017.0), {"w": [2015.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        b = e.run_batch([p, q], unit, none, hl, 4)
+        ok([o.meta["burnin_members"] for o in b] == [1, 1]
+           and [res(o) for o in b] == [res(e.run(x, unit, none, hl, 4)) for x in (p, q)],
+           "W5 with the window starting before the delivery start, members differing in case fatality get their own "
+           f"burn-in and their own decision-window deaths ({[o.meta['burnin_members'] for o in b]})")
+        he = DeliveryHorizon(2015.0, 2017.0, (2016.0, 2017.0), {"w": [2016.0, 2017.0]}, delivery=(2016.0, 2017.0))
+        ok([o.meta["burnin_members"] for o in e.run_batch([p, q], unit, none, he, 4)] == [2, 2],
+           "W5b with the window starting at the delivery start they still share one burn-in (v0.13)")
+        P0, P1 = resolve_params(e, p), resolve_params(e, q)
+        f6 = DeliveryHorizon(2023.0, 2029.25, (2024.0, 2029.25), {}, delivery=(2024.0, 2027.0))
+        a = dict(unit.attributes)
+        ok(e._burnin_key(P0, a, f6) == e._burnin_key(P1, a, f6) == e._burnin_key(P1, a)
+           and e._burnin_key(P0, a, hl) != e._burnin_key(P1, a, hl),
+           "W5c the F6 draft's horizon (window [2024, 2029.25], delivery [2024, 2027]) keeps the v0.13 burn-in key")
+    case("W5", w5)
+
 
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
