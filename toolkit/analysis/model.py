@@ -2,7 +2,11 @@
 
     model.predict(zs, theta, ids) -> {unit: {"y": {package: {outcome: total}},
                                              "cost": {package: {cost output: total}},
-                                             "diag": {name: value}}}
+                                             "diag": {name: value},
+                                             "burden": {arm: {outcome: total over the model window}}}}
+
+`burden` only when validation.burden declares a model window (F6 S2-5b, toolkit/analysis/burden.py): the arm's
+engine window metric for each mapped outcome over that window, times the unit's population.
 
 Totals are over the decision window, scaled by the unit's populations (spec
 `decision_units.populations`: each population group is a unit column and a set of engine
@@ -28,6 +32,7 @@ import numpy as np
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+from toolkit.analysis import burden as BV
 from toolkit.analysis.batch import CAL_WINDOW, calibrated_value
 from toolkit.engines.contract import Package, UnitSpec
 
@@ -179,6 +184,13 @@ class EmulatorModel:
             if np.any(v < 1e-6):
                 self.train_corrections[f"diag_floor:{name}"] = int(np.sum(v < 1e-6))
             self.T[("diag", name)] = np.log(np.maximum(v, 1e-6))
+        self.bw = BV.model_window(spec)       # F6 S2-5b: the arm's window metrics over the burden model window
+        self.bw_keys = [(o, P, m) for o, mp in (self.bw or {}).get("metrics", {}).items() for P, m in mp.items()]
+        for o, P, m in self.bw_keys:
+            v = np.array([_metric(get(i, self.bw["arm"]), BV.WINDOW, m, f"design point {i}") for i in range(n)])
+            if np.any(v < 1e-9):
+                self.train_corrections[f"burden_floor:{o}:{P}"] = int(np.sum(v < 1e-9))
+            self.T[("bw", o, P)] = np.log(np.maximum(v, 1e-9))
         self.gps, self.accuracy = {}, {}
         self.error = None
         self.design_points = n
@@ -196,6 +208,8 @@ class EmulatorModel:
         self.gps[("cal",)] = _gp(Xt, self.T[("cal",)][tr])
         for name in self.diagnostics:
             self.gps[("diag", name)] = _gp(Xt, self.T[("diag", name)][tr], self.gps[("cal",)].kernel_)
+        for o, P, _m in self.bw_keys:
+            self.gps[("bw", o, P)] = _gp(Xt, self.T[("bw", o, P)][tr], self.gps[("cal",)].kernel_)
         for P in self.pops:
             g0 = _gp(Xt, self.T[("base", P, self.primary)][tr])
             self.gps[("base", P, self.primary)] = g0
@@ -247,6 +261,9 @@ class EmulatorModel:
         P0 = next(iter(self.pops))
         tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
+        for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
+            cols.append(("bw", o, P))
+            res.append(self.T[("bw", o, P)][ho] - self.gps[("bw", o, P)].predict(Xh))
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
@@ -319,6 +336,15 @@ class EmulatorModel:
             e = np.exp(self.gps[("diag", name)].predict(X))
             for j in range(n):
                 y[j]["diag"][name] = float(e[j])
+        for o, P, _m in self.bw_keys:     # per population group, times its population (Codex S2-5b r2 P1)
+            if P not in self.pops:          # by_population(): a prediction for some groups only (Codex r3 P1)
+                continue
+            e = self.gps[("bw", o, P)].predict(X)
+            e = np.exp(e + E[:, self.error.col[("bw", o, P)]] if E is not None else e)
+            col = self.pops[P]["column"]
+            for j in range(n):
+                b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
+                b[o] = b.get(o, 0.0) + float(e[j]) * float(rows[j][col])
         self.last_events = ev
         return dict(zip(ids, y))
 
@@ -396,7 +422,8 @@ class DirectModel:
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.attrs = {i: spec.unit_attributes(u) for i, u in self.by_id.items()}
         self.cal_attr = spec["calibration"].get("attribute")
-        self.horizon = spec.horizon()
+        self.bw = BV.model_window(spec)       # F6 S2-5b: only the burden model window is added (none: unchanged)
+        self.horizon = spec.horizon({BV.WINDOW: self.bw["window"]} if self.bw else None)
         self.fitted_names = [p.name for p in self.eng.parameters() if p.kind == "fitted"]
         self.accuracy = {"direct": True, "note": "outcomes from the engine itself; no emulator error"}
         self.runs = 0
@@ -454,6 +481,10 @@ class DirectModel:
                                          for g, n in gsz.items()} for o in self.outcomes}
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
+                if self.bw and k == self.bw["arm"]:
+                    row["burden"] = {k: {o: sum(_metric({"windows": r.windows}, BV.WINDOW, mp[P], f"unit {i}, {k}")
+                                                 * float(u[pm["column"]]) for P, pm in self.pops.items())
+                                         for o, mp in self.bw["metrics"].items()}}
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
