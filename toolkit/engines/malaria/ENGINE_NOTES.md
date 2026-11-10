@@ -1,12 +1,14 @@
-# Malaria engine v0.12: benchmark notes
+# Malaria engine v0.13: benchmark notes
 
-Engine `malaria-starsim` v0.12 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.13 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.13 numbers are v0.12's.** v0.13 adds a past SMC coverage, `smc_hist_cov` (section below). It acts only when a unit sets it, and the pack and the evidence do not. `benchmarks/restamp_proof.py` compared v0.12 (origin/v2 at 8bccb68; the engine code is that of #167) and v0.13 (tree at 5c68f6f) and found 24 of 24 cases identical: the 14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and 5 pinned scenarios, including the new `past_smc_v013` (past SMC in the burn-in and after the horizon start, `smc_hist_cov` absent, `[]` and `None`). The proof ran locally (Python 3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v013-3`). The identity fields of the four evidence files were then re-stamped; their `validate_once.sh` confirmation is pending. The evidence is stale for the F6 S1-2 reasons named below, as at v0.12.
 
 **v0.12 numbers are v0.11's.** v0.12 adds the case-management package (section below). It acts only when a run sets
 `cm_target = 1`, and the pack and the evidence do not. `benchmarks/restamp_proof.py` compared v0.11 (bb5cd80) and v0.12 (54db16e) and found 23 of 23 cases identical: the 14 pack settings with all arms at seed 11, the 5 equilibration and guess-sensitivity cases, and the 4 pinned scenarios, three of which include case-management arms (one with `cm_add` 0.25). The proof ran locally (Python 3.14.3, NumPy 2.4.4, Starsim 3.3.2, macOS arm64, run `local-v012-4`). The identity fields of the four evidence files were then re-stamped; their `validate_once.sh` confirmation is pending. The evidence itself is stale for other reasons (F6 S1-2 benchmark bands: refit and re-run required), and F6 refits after this PR.

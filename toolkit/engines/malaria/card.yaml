@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.12'
+version: '0.13'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -21,7 +21,8 @@ mechanisms:
 - 'delivery period distinct from the outcome window: components act and cost drivers count only in delivery years;
   routine net campaigns after the package''s campaign in every arm (v0.6)'
 - routine SMC in every arm after the delivery period, uncharged (v0.7)
-- past SMC before the delivery period and a net type per past net campaign, in every arm, uncharged (v0.10)
+- past SMC before the delivery period and a net type per past net campaign, in every arm, uncharged (v0.10); past
+  SMC at its own per-round coverage, apart from the package's (v0.13)
 - expected severe episodes and deaths; DALYs from GBD 2019 weights and reference life table
 - microscopy prevalence by age band, including the ITN trials' own bands (under 5 from birth, under 10, 15 and under,
   all ages; Pryce 2018 characteristics of included studies)
@@ -63,6 +64,8 @@ unit_attributes:
     every arm, never charged (default [])'
   smc_hist_rounds: 'optional rounds per past SMC year: one number, or one per smc_hist_years entry; the first n
     SMC months (default: every SMC month)'
+  smc_hist_cov: 'optional mean per-round reach of past SMC, a share in (0, 1]: one number, or one per smc_hist_years
+    entry; the package''s and routine SMC keep smc_cov (default: smc_cov; v0.13)'
   hist_net_by_year: 'optional net type per past campaign, {year: pyr | pbo | dual} or ''year:type ...''; years from
     itn_hist_years; others hist_net (default none)'
 outputs:
