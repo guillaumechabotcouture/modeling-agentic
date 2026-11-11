@@ -474,20 +474,50 @@ def _self_test() -> int:
                "BG5c set refuses a scope not in budget_scopes.yaml and a non-positive or non-finite amount")
         case("BG1-5", bg1)
 
+        def bg15():
+            bd, day = os.path.join(d, "cfg15"), 86400
+            t1 = time.time() - 2 * day
+            p = set_budget("f6", 50, "first", store, budget_dir=bd, pub_file=pub, scopes_file=sc, now=t1)
+            r1 = load_budget("f6", budget_dir=bd, pub_file=pub)
+            ok(_ts(r1["expires_utc"]) - _ts(r1["issued_utc"]) == 14 * day,
+               f"BG15 a budget expires 14 days after it is issued by default: {r1['expires_utc']}")
+            ok(refused(lambda: load_budget("f6", budget_dir=bd, pub_file=pub, now=t1 + 15 * day)) is not None,
+               "BG15b an expired budget is refused")
+            ok(refused(lambda: set_budget("f6", 5, "", store, budget_dir=bd, pub_file=pub, scopes_file=sc, days=61))
+               is not None and refused(lambda: set_budget("f6", 5, "", store, budget_dir=bd, pub_file=pub,
+                                                          scopes_file=sc, days=0)) is not None,
+               "BG15c set refuses --days outside 1-60")
+            old = open(p).read()
+            set_budget("f6", 20, "second", store, budget_dir=bd, pub_file=pub, scopes_file=sc, now=t1 + day, days=30)
+            r2 = load_budget("f6", budget_dir=bd, pub_file=pub)
+            open(p, "w").write(old)
+            ok(r2["usd"] == 20 and _ts(r2["expires_utc"]) - _ts(r2["issued_utc"]) == 30 * day
+               and os.path.exists(os.path.join(bd, "budget_f6.seen"))
+               and refused(lambda: load_budget("f6", budget_dir=bd, pub_file=pub)) is not None,
+               "BG16 an older signed budget put back after a newer one was seen is refused (budget_<scope>.seen)")
+        case("BG15-16", bg15)
+
         def bg6():
             calls = []
 
+            inputs = []
+
             def run(argv, **kw):
                 calls.append(argv)
-                return types.SimpleNamespace(returncode=0 if argv[1] != "find-generic-password" or "-w" in argv
+                inputs.append(kw.get("input"))
+                return types.SimpleNamespace(returncode=0 if argv[1:2] != ["find-generic-password"] or "-w" in argv
                                              else 44, stdout="ab" * 32 + "\n", stderr="")
             k = Keychain(run=run)
-            k.put("cd" * 32)
+            secret = "cd" * 32
+            k.put(secret)
             got, ex = k.get(), k.exists()
-            add = calls[0]
-            ok(add[:2] == ["security", "add-generic-password"] and add[add.index("-T") + 1] == ""
-               and "-A" not in add and "-U" not in add and add[add.index("-s") + 1] == KEYCHAIN_SERVICE,
-               f"BG6 the key goes in with an empty trusted-application list (-T \"\"), never -A or -U: {add[:8]}")
+            add, line = calls[0], str(inputs[0] or "")
+            toks = line.split()
+            ok(add == ["security", "-i"] and not any(secret in a for c in calls for a in c)
+               and toks[:1] == ["add-generic-password"] and secret in toks and toks[toks.index("-T") + 1] == '""'
+               and "-A" not in toks and "-U" not in toks and toks[toks.index("-s") + 1] == KEYCHAIN_SERVICE,
+               f"BG6 the key goes to `security -i` on stdin, never on a command line, with an empty trusted-application "
+               f"list (-T \"\"), never -A or -U: argv {add} stdin {line.replace(secret, '<key>')[:120]}")
             ok(got == "ab" * 32 and calls[1][:2] == ["security", "find-generic-password"] and "-w" in calls[1]
                and ex is False and "-w" not in calls[2],
                "BG6b the key is read with find-generic-password -w (the prompted read); exists reads no secret")
@@ -519,11 +549,17 @@ def _self_test() -> int:
                f"BG7 billed USD = credits x 0.061 + cloud USD, for the scope's clusters created since the start "
                f"(not another scope's, not a name that only contains a prefix, not one created before): {by}")
             ok(abs(s["rate_usd_per_instance_hour"] - 5.55) < 1e-9 and by[2]["live_instances"] == 2
-               and abs(by[2]["projected_usd"] - 4 * 5.55) < 1e-9
+               and abs(by[2]["projected_usd"] - (4.3 * 5.55 - 1.61)) < 1e-9
                and abs(s["total_usd"] - (s["billed_usd"] + s["projected_usd"])) < 1e-9
-               and abs(s["total_usd"] - (10.1 + 1.61 + 22.2)) < 1e-9,
-               f"BG8 a running cluster adds live instance-hours x the median rate of the scope's stopped clusters "
-               f"(older ones included for the rate): rate {s['rate_usd_per_instance_hour']}, total {s['total_usd']}")
+               and abs(s["total_usd"] - (10.1 + 4.3 * 5.55)) < 1e-9,
+               f"BG8 a running cluster counts max(billed, its instance-hours so far x the median rate of the scope's "
+               f"stopped clusters, older ones included): rate {s['rate_usd_per_instance_hour']}, total {s['total_usd']}")
+            big = dict(dets)
+            big[2] = _det(2, "lw-smoke-b", T0 + 120, 1000, 50.0, state="running",
+                          insts=[(now - 3 * 3600, None), (now - 3600, None), (T0 + 120, T0 + 1200)])
+            b2 = {c["id"]: c for c in spend("f6", source=_FakeSource(items, big), budget=rec, now=now)["clusters"]}[2]
+            ok(b2["projected_usd"] == 0 and abs(b2["billed_usd"] - 111.0) < 1e-9,
+               f"BG8d when Coiled has billed more than the projection, the billed amount counts alone: {b2}")
             cheap = dict(dets)
             cheap[1] = _det(1, "f6-refit-a", T0 + 60, 1, 0.01, insts=[(T0 + 60, T0 + 2 * 3600 + 60)])
             cheap[3] = _det(3, "f6-refit-old", T0 - 86400, 1, 0.01, insts=[(T0 - 86400, T0 - 86400 + 4 * 3600)])
@@ -531,7 +567,7 @@ def _self_test() -> int:
             ok(s2["rate_usd_per_instance_hour"] == 1.0,
                f"BG8b the rate never goes below the signed floor: {s2['rate_usd_per_instance_hour']}")
             s3 = spend("f6", source=_FakeSource(items[1:2], {2: dets[2]}), budget=rec, now=now)
-            ok(s3["rate_usd_per_instance_hour"] == 1.0 and abs(s3["projected_usd"] - 4.0) < 1e-9,
+            ok(s3["rate_usd_per_instance_hour"] == 1.0 and abs(s3["projected_usd"] - (4.3 - 1.61)) < 1e-9,
                "BG8c with no stopped cluster measured, the floor is the rate")
         case("BG7-8", bg7)
 
@@ -583,7 +619,7 @@ def _self_test() -> int:
             ok(not launch_budget_ok("f6", 1, source=src(), now=now, budget_dir=os.path.join(d, "nobudget"),
                                     pub_file=pub)[0], "BG10e no signed budget, no launch")
             m = job_meter("f6", source=src(), clock=lambda: now, **kw)
-            ok(abs(m(2) - (1.61 + 22.2)) < 1e-9 and abs(m(1) - 10.1) < 1e-9,
+            ok(abs(m(2) - 4.3 * 5.55) < 1e-9 and abs(m(1) - 10.1) < 1e-9,
                "BG11 the job meter reads one cluster's billed + projected USD at the scope's rate")
             lines = status_lines(spend("f6", source=src(), **kw))
             txt = "\n".join(lines)
