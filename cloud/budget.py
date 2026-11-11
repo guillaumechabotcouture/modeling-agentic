@@ -38,8 +38,9 @@ start is in the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
 ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time). A reservation
-counts its whole cap until a cluster named after it (its helpers included) appears, then max(0, cap - those
-clusters' spend) until all of them are stopped, when it is released; one whose cluster never appears lapses after
+names the exact cluster its launch creates and counts its whole cap until that cluster, or one of its helpers
+(<name>-keeper, <name>-overflow), created after the reservation appears; then max(0, cap - those clusters' spend)
+until all of them are stopped, when it is released; one whose cluster never appears lapses after
 2 h. A malformed ledger refuses. This guards against concurrent launches from this machine only.
 """
 from __future__ import annotations
@@ -66,6 +67,7 @@ USD_PER_CREDIT = 0.061
 RATE_SAMPLE = 5                 # stopped clusters the measured rate is the median of
 RESERVATION_S = 2 * 3600        # a reservation lapses this long after it was made, if no cluster of its name appears
 MAX_DAYS = 60
+CLOCK_SKEW_S = 30            # tolerated difference between this clock and Coiled's
 # VM types seen on our clusters' instance records (read-only check, 2026-11-11): every scheduler and keeper, the
 # P6 compute workers, and vm_job --cpu 32 / --cpu 64. vm_job sizes by --cpu, and Coiled picked Standard_D<cpu>_v5.
 OBSERVED_VM_TYPES = ("Standard_D2_v5", "Standard_E8s_v5", "Standard_D32_v5", "Standard_D64_v5")
@@ -397,6 +399,8 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
         t1 = now if on else _ts((inst.get("current_state") or {}).get("updated"))
         if t0 is None or t1 is None or not state_of(inst):
             raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
+        if (not on and t1 < t0) or t0 > now + CLOCK_SKEW_S:
+            raise BudgetError(f"cluster {d.get('id')}: an instance stopped before it started, or starts in the future")
         if vm not in prices:
             raise BudgetError(f"cluster {d.get('id')}: VM type {vm!r} is not in cloud/vm_prices.yaml")
         hours += max(0.0, t1 - t0) / 3600
@@ -456,7 +460,7 @@ def _measure(rec, env, now) -> dict:
             "items": items}
 
 
-def _ledger(env) -> list:
+def _ledger(env, now) -> list:
     """The reservations ledger: a list of {scope, cap_usd, name, invocation, time}; anything else refuses."""
     try:
         allr = json.load(open(env.reservations))
@@ -464,26 +468,30 @@ def _ledger(env) -> list:
         return []
     except (OSError, ValueError) as e:
         raise BudgetError(f"{env.reservations} cannot be read: {e}") from None
+    def num(x):
+        return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
     ok = isinstance(allr, list) and all(
         isinstance(r, dict) and set(r) == {"scope", "cap_usd", "name", "invocation", "time"}
         and isinstance(r["scope"], str) and isinstance(r["name"], str) and r["name"] and isinstance(r["invocation"], str)
-        and not isinstance(r["cap_usd"], bool) and isinstance(r["cap_usd"], (int, float)) and r["cap_usd"] > 0
-        and not isinstance(r["time"], bool) and isinstance(r["time"], (int, float)) for r in allr)
+        and num(r["cap_usd"]) and r["cap_usd"] > 0 and num(r["time"]) and 0 < r["time"] <= now + CLOCK_SKEW_S
+        for r in allr)
     if not ok:
         raise BudgetError(f"{env.reservations} is not a list of reservations: refusing")
     return allr
 
 
 def _reservations(env, scope, rows, now):
-    """(this scope's open reservations, each with its outstanding USD; the ledger to keep). A reservation holds its
-    cap until a cluster named after it appears, then max(0, cap - those clusters' spend) while any of them runs;
+    """(this scope's open reservations, each with its outstanding USD; the ledger to keep). A reservation names the
+    exact cluster its launch creates (helpers: <name>-keeper, <name>-overflow); it holds its cap until such a cluster
+    created after the reservation appears, then max(0, cap - those clusters' spend) while any of them runs;
     it is released once all are stopped, or after RESERVATION_S with none."""
     mine, keep = [], []
-    for r in _ledger(env):
+    for r in _ledger(env, now):
         if r["scope"] != scope:
             keep.append(r)                 # another scope's: measured by its own launches
             continue
-        match = [x for x in rows if str(x["name"] or "").startswith(r["name"]) and x["created"] >= r["time"] - 120]
+        own = {r["name"], r["name"] + "-keeper", r["name"] + "-overflow"}   # the launch's cluster and its helpers
+        match = [x for x in rows if x["name"] in own and x["created"] >= r["time"] - CLOCK_SKEW_S]
         if match:
             if not any(x["live_instances"] or x["listed_state"] not in ENDED for x in match):
                 continue                   # every cluster of the launch stopped: released
