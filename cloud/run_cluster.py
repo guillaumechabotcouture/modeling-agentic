@@ -3471,6 +3471,171 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_checkpoint(ok) -> None:
+    """CK1-CK12 (F6 run checkpoints, 2026-11-11: a 3-h preview stopped at its cap stored nothing). The agent VM
+    uploads a checkpoint of the run dir every checkpoint_minutes while main.py runs; `checkpoint` fetches it,
+    sha256-verified; `collect` says when only a checkpoint exists. Fake store, fake main.py, no cloud."""
+    import hashlib
+    import tempfile
+    import threading
+    from unittest import mock
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+    import results_store
+    ok(RunConfig(name="t", question_file="q").checkpoint_minutes == 15, "CK1 checkpoint_minutes defaults to 15")
+    try:
+        RunConfig(name="t", question_file="q", checkpoint_minutes=-1)
+        ok(False, "CK1b a negative checkpoint_minutes is refused")
+    except ValueError:
+        ok(True, "CK1b a negative checkpoint_minutes is refused")
+    import types
+    got = []
+    for minutes in (15, 0):
+        sub = []
+        fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append(kw) or "fut")
+        with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}):
+            _submit(RunConfig(name="z", question_file="q", pipeline="v2", checkpoint_minutes=minutes), fc, "R1", "w",
+                    b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
+        got.append(sub[0].get("checkpoint_s", "absent"))
+    ok(got == [900.0, None], f"CK2 the interval reaches run_to_disk in seconds; 0 sends None (disabled): {got}")
+    ok(ws.checkpoint_starter("R1", "runs/t", "L1", None, None, None) is None
+       and ws.checkpoint_starter("R1", "runs/t", "L1", None, None, 0) is None
+       and callable(ws.checkpoint_starter("R1", "runs/t", "L1", None, None, 900.0)),
+       "CK2b the agent VM starts no checkpoint thread when the interval is 0 or None")
+
+    class Store:
+        """results_store's archive helpers, uploads into a dict (optionally failing or blocking)."""
+        write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
+
+        def __init__(self, fail=False, gate=None):
+            self.files, self.fail, self.gate, self.uploads = {}, fail, gate, []
+
+        def upload_file(self, path, blob, account=None):
+            if self.gate is not None:
+                self.gate.wait(10)
+            if self.fail:
+                raise OSError("storage unreachable")
+            self.files[blob] = open(path, "rb").read()
+            self.uploads.append(blob)
+            return {"blob": blob, "bytes": len(self.files[blob])}
+
+        def download(self, blob, path, account=None):
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            open(path, "wb").write(self.files[blob])
+
+    secret = "sk-ant-TESTSECRET12345"
+    main_py = ("import json, os, time\n"
+               "rd = 'runs/R_x'\n"
+               "for d in ('models', '_truth'):\n    os.makedirs(os.path.join(rd, d), exist_ok=True)\n"
+               "open(rd + '/_truth/key.yaml', 'w').write('answer')\n"
+               "json.dump({'state': 'ANALYZE', 'round': 2}, open(rd + '/run_state.json', 'w'))\n"
+               "open(rd + '/models/b.jsonl.partial.jsonl', 'w').write("
+               "json.dumps({'_partial': {'fn': 'f', 'code_fp': 'x'}}) + '\\n' + '{\"ok\": true, \"key\": \"k#0\"}\\n')\n"
+               f"open(rd + '/notes.md', 'w').write('key {secret}')\n"
+               "time.sleep(float(os.environ.get('CK_SLEEP', '1.5')))\n")
+    import io as _io
+    b = _io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        ti = tarfile.TarInfo("main.py")
+        ti.size = len(main_py.encode())
+        t.addfile(ti, _io.BytesIO(main_py.encode()))
+    code = b.getvalue()
+    tar_blob, json_blob = ws.checkpoint_blobs("runs/t", "L1", "R1")
+    ok((tar_blob, json_blob) == ("outputs/runs/t/launch_L1/checkpoint_R1.tar.gz",
+                                 "outputs/runs/t/launch_L1/checkpoint_R1.json"), f"CK3 the blob names: {tar_blob}")
+
+    def run(store, interval_s=0.25):
+        cps = []
+
+        def on_start(work):
+            c = ws.Checkpointer("R1", work, "runs/t", "L1", None, store, interval_s, secrets=[secret], poll_s=0.05,
+                                log=lambda m: None)
+            c.start()
+            cps.append(c)
+        with mock.patch.object(ws, "WORK", work_root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
+            res = ws.run_job_impl("R1", code, "q", [], "k", None, on_start=on_start)
+        cps[0].stop()
+        return res, cps[0]
+    work_root = tempfile.mkdtemp()
+    store = Store()
+    res, c = run(store)
+    rec = json.loads(store.files.get(json_blob, b"{}"))
+    data = store.files.get(tar_blob, b"")
+    ok(res["exit_code"] == 0 and c.done >= 2 and store.uploads[:2] == [tar_blob, json_blob],
+       f"CK4 while main.py runs the thread uploads the tarball, then its record, every interval: done={c.done} "
+       f"{store.uploads[:4]}")
+    ok(rec.get("sha256") == hashlib.sha256(data).hexdigest() and rec.get("bytes") == len(data)
+       and rec.get("run_state") == {"state": "ANALYZE", "round": 2} and rec.get("cached_batches") == 1
+       and rec.get("cached_rows") == 1 and rec.get("run_dir") == "R_x" and rec.get("time_utc"),
+       f"CK5 the record: time, size, sha256, run_state state and round, cached batches: {rec}")
+    with tarfile.open(fileobj=_io.BytesIO(data), mode="r:gz") as t:
+        names = t.getnames()
+        body = t.extractfile("runs/R_x/notes.md").read() if "runs/R_x/notes.md" in names else b""
+    ok("runs/R_x/run_state.json" in names and "run.log" in names and not any("_truth" in n for n in names)
+       and secret.encode() not in body and b"<redacted>" in body,
+       f"CK6 the tarball holds the run dir and run.log, never _truth/, secrets redacted: {names}")
+    bad = Store(fail=True)
+    res2, c2 = run(bad)
+    ok(res2["exit_code"] == 0 and c2.failed >= 1 and c2.done == 0
+       and "storage unreachable" in open(os.path.join(work_root, "R1", ".checkpoint", "checkpoint.log")).read(),
+       f"CK7 an upload failure is logged and never kills the run: exit={res2['exit_code']} failed={c2.failed}")
+    gate = threading.Event()
+    slow = Store(gate=gate)
+    wd = os.path.join(work_root, "S")
+    os.makedirs(os.path.join(wd, "runs", "R_y"))
+    open(os.path.join(wd, "runs", "R_y", "a.txt"), "w").write("a")
+    c3 = ws.Checkpointer("S", wd, "runs/t", "L1", None, slow, 3600, log=lambda m: None)
+    first, second = c3.trigger("t1"), c3.trigger("t2")
+    gate.set()
+    c3.wait_idle(10)
+    ok(first and not second and c3.skipped == 1 and c3.done == 1,
+       f"CK8 a checkpoint while the previous upload runs is skipped: {first} {second} skipped={c3.skipped}")
+    # checkpoint-now: the side function asks the running thread for one checkpoint and waits, bounded
+    c4 = ws.Checkpointer("S", wd, "runs/t", "L1", None, Store(), 3600, poll_s=0.05, log=lambda m: None)
+    with mock.patch.object(ws, "WORK", work_root):
+        none = ws.checkpoint_now_side("S", timeout_s=1, poll_s=0.05)
+        c4.start()
+        try:
+            open(os.path.join(wd, "run.log"), "w").write("x")
+            now_ = ws.checkpoint_now_side("S", timeout_s=10, poll_s=0.05)
+        finally:
+            c4.stop()
+    ok(none.get("state") == "no checkpointer" and now_.get("state") == "checkpointed"
+       and (now_.get("record") or {}).get("blob") == tar_blob,
+       f"CK9 checkpoint-now: one checkpoint from the running thread, awaited; none without one: {none} {now_}")
+    # fetch on the laptop: sha256 verified, extracted under <out_dir>/<label>/checkpoint/
+    out = tempfile.mkdtemp()
+    cfg = RunConfig(name="t", question_file="q", out_dir=out, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = fetch_checkpoint(cfg, store, "R1")
+    dest = os.path.join(out, "R1", "checkpoint")
+    ok(got.get("sha256") == rec["sha256"] and os.path.exists(os.path.join(dest, "runs", "R_x", "run_state.json"))
+       and json.load(open(os.path.join(dest, "checkpoint.json"))).get("sha256") == rec["sha256"],
+       f"CK10 `checkpoint` downloads, verifies and extracts the latest checkpoint with its record: {got}")
+    store.files[tar_blob] = data + b"tampered"
+    out2 = tempfile.mkdtemp()
+    cfg2 = RunConfig(name="t", question_file="q", out_dir=out2, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg2.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fetch_checkpoint(cfg2, store, "R1")
+        ok(False, "CK11 a tarball whose sha256 differs from its record is refused")
+    except SystemExit as e:
+        ok("sha256" in str(e) and not os.path.exists(os.path.join(out2, "R1", "checkpoint")),
+           f"CK11 a tarball whose sha256 differs from its record is refused, nothing extracted: {e}")
+    store.files[tar_blob] = data
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: False,
+                                     "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("x")),
+                                     "checkpoint_record": lambda c, s, lb, lid: rec}), \
+            contextlib.redirect_stdout(io.StringIO()) as buf:
+        collect(cfg2, shutdown_after=False)
+    ok("only a checkpoint" in buf.getvalue() and "checkpoint --label R1" in buf.getvalue(),
+       f"CK12 `collect` reports a run with only a checkpoint (no final result): {buf.getvalue()!r}")
+    ok(checkpoint_record(cfg2, store, "R1", "L1") == rec and checkpoint_record(cfg2, store, "R1", "L9") is None,
+       "CK12b the checkpoint record of a launch, None when there is none")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3694,6 +3859,10 @@ def _self_test() -> int:
         _self_test_collect_no_shutdown(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CN: {type(e).__name__}: {e}")
+    try:
+        _self_test_checkpoint(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CK: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:

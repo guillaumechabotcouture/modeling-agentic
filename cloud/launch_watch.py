@@ -945,11 +945,50 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_LIMIT and runs(r[1]).count("collect") == 6 and stops(r[1]) == [])(
              scenario(0, record, fail6, retry_s=600.0, max_hours=3300 / 3600)))
 
+    # F6 run checkpoints (2026-11-11: the preview stopped at its cap after 3 h with nothing stored)
+    running = lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"}))]}  # noqa: E731
+    ck_path = "outputs/runs/cfg-x/launch_L1/checkpoint_A.tar.gz"
+    case("LW19a", "at the cap: one final checkpoint is requested and awaited before any stop; the exit names it",
+         lambda: (lambda r: r[0] == EXIT_CAP and "checkpoint-now" in runs(r[1]) and stops(r[1])
+                  and r[1].index(("run", "checkpoint-now")) < r[1].index(("stop", min(stops(r[1]))))
+                  and any(ck_path in ln for ln in r[4].lines[-3:]))(
+             scenario(0, record, running, api=_Billed(700.0))))
+    case("LW19b", "at --max-hours: one final checkpoint, nothing stopped, the exit message names the checkpoint",
+         lambda: (lambda r: r[0] == EXIT_LIMIT and "checkpoint-now" in runs(r[1]) and stops(r[1]) == []
+                  and any(ck_path in ln for ln in r[4].lines[-3:]))(scenario(0, record, running, max_hours=0.0)))
+    case("LW19c", "the final checkpoint is bounded: --checkpoint-minutes reaches the side call and the subprocess",
+         lambda: (lambda r: ["checkpoint-now", "--timeout-s", "120"] in r[3].tails
+                  and ("checkpoint-now", 180.0) in r[3].timeouts)(
+             scenario(0, record, running, api=_Billed(700.0), checkpoint_s=120.0)))
+    case("LW19d", "a failed or timed-out final checkpoint never blocks the stop at the cap",
+         lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102])(
+             scenario(0, record, lambda cfg: {**running(cfg), "checkpoint-now": [(None, "TimeoutError")]},
+                      api=_Billed(700.0))))
+    case("LW20a", "--cap-usd converts with --usd-per-credit (default 0.124, the measured 2026-11-11 ratio)",
+         lambda: cap_credits(None, 80.6, USD_PER_CREDIT) == (650.0, "cap $80.60 = 650.0 credits at $0.124/credit")
+         and USD_PER_CREDIT == 0.124 and cap_credits(None, None, 0.124)[0] == 650.0
+         and cap_credits(500.0, None, 0.124) == (500.0, "cap 500.0 credits (~$62.00 at $0.124/credit)"))
+    case("LW20b", "--cap and --cap-usd together are refused; a non-positive ratio is refused",
+         lambda: all(_raises(lambda a=a: cap_credits(*a), ValueError) for a in ((500.0, 60.0, 0.124),
+                                                                                (None, 60.0, 0.0))))
+    case("LW20c", "the credits log line gives dollars too",
+         lambda: (lambda r: any((lambda m: m and abs(float(m[2]) - round(float(m[1]) * 0.124, 2)) < 1e-9)(
+             re.search(r"credits \(billed \+ projected\): ([\d.]+) \(~\$([\d.]+)\)", ln)) for ln in r[4].lines))(
+             scenario(0, record, done_script, api=_Billed(10.0))))
+
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed: {', '.join(fails)}")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _raises(fn, exc) -> bool:
+    try:
+        fn()
+    except exc:
+        return True
+    return False
 
 
 class _FakeApi:
