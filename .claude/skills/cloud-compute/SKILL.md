@@ -78,7 +78,7 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --c
     [--workers N --cluster-compute] -- <command ...>
 ```
 
-- `--cap-usd` is required (for `up` too): the launch is refused before any
+- `--cap-usd` is required (for `up` and `start` too): the launch is refused before any
   cluster exists unless the owner-signed budget of the name's scope
   (`cloud/budget.py status`) covers the scope's spend plus the cap, and `run`
   stops the cluster when its cost reaches the cap. Only the owner can set or
