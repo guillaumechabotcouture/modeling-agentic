@@ -75,6 +75,184 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
     return buf.getvalue(), skipped
 
 
+REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
+
+
+def _plain(rel: str) -> list[str]:
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") or "\0" in p for p in parts):
+        raise OSError(f"not a plain relative name: {rel!r}")
+    return parts
+
+
+def _open_tree(base: str, rel: str) -> int:
+    """A directory fd for base/rel, reached from `base` one plain component at a time with no link followed."""
+    cur = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    if rel in ("", "."):
+        return cur
+    try:
+        for p in _plain(rel):
+            nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+    except BaseException:
+        os.close(cur)
+        raise
+    return cur
+
+
+def _open_nofollow(root: str, rel: str, root_fd: int | None = None) -> int:
+    """A read fd for root/rel (or, with `root_fd`, rel under that directory fd) opened without following a link at
+    any component, `root` itself included (a planted link raises OSError), and only for a regular file (else
+    OSError). `rel` is split on "/" only and never translated: a component that is empty, "." or ".." (an absolute
+    or climbing name) is refused (Codex round 2)."""
+    import stat
+    parts = _plain(rel)
+    cur = os.dup(root_fd) if root_fd is not None else os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for p in parts[:-1]:
+            nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=cur)
+    finally:
+        os.close(cur)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"not a regular file: {rel}")
+    return fd
+
+
+def _copy_scan(fd: int, dst, secrets: list[bytes]) -> bool:
+    """Copy the open file to `dst` in 1 MiB blocks; True if a secret is in what was copied (an overlap carries a
+    secret across two blocks)."""
+    keep, tail, found = max((len(x) for x in secrets), default=0), b"", False
+    while True:
+        block = os.read(fd, 2**20)
+        if not block:
+            return found
+        dst.write(block)
+        buf = tail + block
+        found = found or any(x in buf for x in secrets)
+        tail = buf[-keep:] if keep else b""
+
+
+def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=(),
+                  _hook=None, base: str | None = None) -> list[str]:
+    """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, with bounded
+    memory. The run dir is reached from `base` (the trusted job work dir) one component at a time, no link followed
+    (Codex round 3: a parent such as work/runs linked into _truth/ is refused); without `base`, `root` itself must
+    not be a link. Files are listed and opened through that directory fd. Each file is opened once, no link followed
+    at any component, regular files only; its bytes are copied to a temporary file, and what is scanned and redacted
+    is that copy, which is what is archived, so a rewrite or a swap for a link after the listing can neither leak a
+    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted; a larger one is left out (listed) if it holds
+    a secret. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
+    (self-test). Returns what was left out."""
+    sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
+    skipped = []
+    items = []
+    if base is not None:
+        root_fd = _open_tree(base, os.path.relpath(os.path.abspath(root), os.path.abspath(base)))
+    else:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # a root that is a link: OSError
+    try:
+        for dp, dirs, files, _ in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
+            dirs.sort()
+            items += [(root_fd, os.path.normpath(os.path.join(dp, fn)), None) for fn in sorted(files)]
+        items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
+        _write_items(items, arcname, out_path, sec, skipped, _hook)
+    finally:
+        os.close(root_fd)
+    return skipped
+
+
+def _write_items(items, arcname, out_path, sec, skipped, _hook):
+    import io
+    import tarfile
+    import tempfile
+    with tarfile.open(out_path, mode="w:gz") as t:
+        for where, rel, arc in items:
+            listed = rel if arc is None else arc
+            if arc is None and is_sensitive_path(rel):
+                skipped.append(rel)
+                continue
+            if _hook:
+                _hook(rel)
+            try:
+                fd = _open_nofollow(where, rel, root_fd=where) if isinstance(where, int) else _open_nofollow(where, rel)
+            except OSError:            # gone, a link, or not a regular file
+                skipped.append(listed)
+                continue
+            try:
+                mtime = int(os.fstat(fd).st_mtime)
+                with tempfile.TemporaryFile(dir=os.path.dirname(os.path.abspath(out_path))) as tmp:
+                    found = _copy_scan(fd, tmp, sec)
+                    size = tmp.tell()
+                    tmp.seek(0)
+                    ti = tarfile.TarInfo(os.path.join(arcname, rel) if arc is None else arc)
+                    ti.mtime = mtime
+                    if size <= REDACT_MAX_MB * 2**20:
+                        data = tmp.read()
+                        for x in sec:
+                            data = data.replace(x, b"<redacted>")
+                        ti.size = len(data)
+                        t.addfile(ti, io.BytesIO(data))
+                    elif found:
+                        skipped.append(listed)
+                    else:
+                        ti.size = size
+                        t.addfile(ti, tmp)
+            finally:
+                os.close(fd)
+    return skipped
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(2**20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def upload_file(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
+    """upload_retry with bounded memory: the file is streamed up and the read-back verified chunk by chunk."""
+    import time
+    want, size = sha256_file(path), os.path.getsize(path)
+    container, name = _split(blob)
+    last = None
+    for k in range(attempts):
+        try:
+            client = (service or _service(account)).get_blob_client(container, name)
+            with open(path, "rb") as f:
+                client.upload_blob(f, overwrite=True, length=size)
+            h = hashlib.sha256()
+            for block in client.download_blob().chunks():
+                h.update(block)
+            if h.hexdigest() != want:
+                raise RuntimeError(f"upload of {blob} did not verify")
+            return {"blob": blob, "bytes": size, "sha256": want}
+        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
+            last = e
+            time.sleep(2 ** k)
+    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
+
+
+def sha256_blob(blob: str, account: str | None = None, service=None) -> str:
+    """A blob's sha256, hashed chunk by chunk as it streams: never read whole, never written to disk."""
+    container, name = _split(blob)
+    h = hashlib.sha256()
+    for block in (service or _service(account)).get_blob_client(container, name).download_blob().chunks():
+        h.update(block)
+    return h.hexdigest()
+
+
+def delete(blob: str, account: str | None = None, service=None) -> None:
+    """Remove one blob (an old checkpoint generation)."""
+    container, name = _split(blob)
+    (service or _service(account)).get_blob_client(container, name).delete_blob()
+
+
 def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
     import time
     last = None
@@ -223,6 +401,124 @@ def _self_test() -> int:
             fails.append(f"S7 a transient failure must be retried: {e}")
         finally:
             _t.sleep = _sleep
+
+        class _Stream(_Svc):        # the Azure call shapes upload_file uses: a stream with its length, chunks back
+            def get_blob_client(self, c, n):
+                st = self.store
+                return type("B", (), {
+                    "upload_blob": lambda _s, f, overwrite=False, length=None: st.__setitem__((c, n), f.read(length)),
+                    "download_blob": lambda _s: type("D", (), {"chunks": lambda _d: iter([st[(c, n)][:5],
+                                                                                         st[(c, n)][5:]])})()})()
+        sv = _Stream()
+        r = upload_file(p, "outputs/ck/r.tar.gz", service=sv)
+        if sv.store.get(("outputs", "ck/r.tar.gz")) != b"result bytes" or r["sha256"] != sha256_file(p):
+            fails.append(f"S8 upload_file streams the file and verifies the read-back by chunks: {r}")
+        big = os.path.join(ar, "models", "big.bin")
+        open(big, "wb").write(b"x" * 100 + b"sk-ant-SECRETSECRET123")
+        _max = globals()["REDACT_MAX_MB"]
+        globals()["REDACT_MAX_MB"] = 0       # every file counts as large: streamed, and left out if it holds a secret
+        try:
+            sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        if "models/big.bin" not in sk or "report.md" not in sk or "_truth/answers.yaml" not in sk:
+            fails.append(f"S9 write_archive leaves out large files holding a secret, and _truth/: {sk}")
+        # Codex round 1 P1-2: each file is opened once, without following links, and what is scanned is what is
+        # archived. The hook runs between the listing and the open, as a concurrent writer would.
+        os.remove(big)
+        swap = os.path.join(ar, "models", "swap.txt")
+        open(swap, "w").write("plain\n")
+        open(os.path.join(ar, "models", "late.txt"), "w").write("plain\n")
+
+        def race(rel):
+            if rel == "models/swap.txt":
+                os.remove(swap)
+                os.symlink(os.path.join(ar, "_truth", "answers.yaml"), swap)
+            if rel == "models/late.txt":
+                open(os.path.join(ar, "models", "late.txt"), "w").write("now sk-ant-SECRETSECRET123\n")
+        out = os.path.join(d, "r.tar.gz")
+        sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
+        tf = _tf.open(out, mode="r:gz")
+        late = tf.extractfile("run/models/late.txt").read()
+        if "run/models/swap.txt" in tf.getnames() or "models/swap.txt" not in sk:
+            fails.append(f"S10 a file swapped for a link to _truth/ after the listing is refused: {tf.getnames()} {sk}")
+        if b"SECRETSECRET" in late or b"<redacted>" not in late:
+            fails.append(f"S11 a file rewritten with a secret after the listing is archived redacted: {late!r}")
+        os.remove(swap)
+        globals()["REDACT_MAX_MB"] = 0
+        try:
+            sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        if "models/late.txt" not in sk:
+            fails.append(f"S12 a large file rewritten with a secret after the listing is left out: {sk}")
+        # Codex round 2 P1-1: a name is never translated or allowed to climb out; the root itself is no link
+        esc = os.path.join(d, "esc")
+        os.makedirs(os.path.join(esc, "work", "run"))
+        open(os.path.join(esc, "private.json"), "w").write("OUTSIDE\n")
+        open(os.path.join(esc, "work", "run", "..\\..\\private.json"), "w").write("inside\n")
+        write_archive(os.path.join(esc, "work", "run"), "run", out)
+        tf = _tf.open(out, mode="r:gz")
+        got = tf.extractfile("run/..\\..\\private.json").read() if "run/..\\..\\private.json" in tf.getnames() else b""
+        if got != b"inside\n":
+            fails.append(f"S14 a name holding backslashes is that file, never a path out of the run: {got!r}")
+        refused = []
+        for rel in ("../private.json", "work/../../private.json", "/etc/hosts", "run//x"):
+            try:
+                os.close(_open_nofollow(os.path.join(esc, "work"), rel))
+            except (OSError, ValueError):
+                refused.append(rel)
+        if len(refused) != 4:
+            fails.append(f"S14b names with '..', empty or absolute components are refused: {refused}")
+        link_root = os.path.join(d, "linked_run")
+        os.symlink(os.path.join(ar, "_truth"), link_root)
+        try:
+            sk = write_archive(link_root, "run", out)
+            names = _tf.open(out, mode="r:gz").getnames()
+            fails.append(f"S15 a run dir that is a link (into _truth/) is refused: archived {names} {sk}")
+        except OSError:
+            pass
+        # Codex round 3 P1-1: a link in a parent of the run dir (work/runs -> _truth/) is refused from the trusted base
+        work = os.path.join(d, "work3")
+        os.makedirs(os.path.join(ar, "_truth", "R"))
+        open(os.path.join(ar, "_truth", "R", "answers.yaml"), "w").write("secret answer\n")
+        os.makedirs(work)
+        os.symlink(os.path.join(ar, "_truth"), os.path.join(work, "runs"))
+        try:
+            write_archive(os.path.join(work, "runs", "R"), "runs/R", out, base=work)
+            fails.append(f"S16 a parent link (work/runs -> _truth/) is refused: archived "
+                         f"{_tf.open(out, mode='r:gz').getnames()}")
+        except OSError:
+            pass
+        os.remove(os.path.join(work, "runs"))
+        os.makedirs(os.path.join(work, "runs", "R"))
+        open(os.path.join(work, "runs", "R", "ok.txt"), "w").write("ok\n")
+        write_archive(os.path.join(work, "runs", "R"), "runs/R", out, base=work)
+        if _tf.open(out, mode="r:gz").getnames() != ["runs/R/ok.txt"]:
+            fails.append("S16b real directories under the trusted base are archived")
+        # Codex round 4 P2: a blob's sha256 by streaming its chunks; it is never read whole or written to disk
+        block = b"z" * 2**20
+
+        class _Big:
+            def get_blob_client(self, c, n):
+                def readall(_s):
+                    raise AssertionError("readall: the blob would be materialised")
+                return type("B", (), {"download_blob": lambda _s: type("D", (), {
+                    "chunks": lambda _d: (block for _ in range(200)), "readall": readall})()})()
+        want = hashlib.sha256()
+        for _ in range(200):
+            want.update(block)
+        try:
+            got = sha256_blob("outputs/ck/big.tar.gz", service=_Big())
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        if got != want.hexdigest():
+            fails.append(f"S17 sha256_blob streams a 200 MiB blob chunk by chunk: {got}")
+        sv.store[("outputs", "ck/x")] = b"x"
+        sv.get_blob_client = lambda c, n: type("B", (), {"delete_blob": lambda _s: sv.store.pop((c, n))})()
+        delete("outputs/ck/x", service=sv)
+        if ("outputs", "ck/x") in sv.store:
+            fails.append("S13 delete removes a blob")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
