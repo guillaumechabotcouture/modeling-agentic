@@ -140,56 +140,422 @@ _ENV = _Env()
 
 # ---- implementation --------------------------------------------------------------------------
 
+def _ts(v):
+    """An ISO time as epoch seconds (UTC when it has no zone), or None."""
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
 def _iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
+def _num(x, what, minimum=None) -> float:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise BudgetError(f"{what} is not a number: {x!r}")
+    if minimum is not None and x < minimum:
+        raise BudgetError(f"{what} is below {minimum}: {x!r}")
+    return float(x)
+
+
+def _canon(record) -> bytes:
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _scope_name(scope) -> str:
+    if not isinstance(scope, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,40}", scope):
+        raise BudgetError(f"bad scope name {scope!r}")
+    return scope
+
+
+def _write_private(path, text) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def init_key(env=None) -> str:
-    raise NotImplementedError
+    """A new key pair: the private half into the keychain, the public half (hex) to the tracked public-key file.
+    Refuses to replace either."""
+    from cryptography.hazmat.primitives import serialization as ser
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    env = env or _ENV
+    store = env.keys()
+    if os.path.exists(env.pub_file) or store.exists():
+        raise BudgetError(f"a key exists already ({env.pub_file} or the keychain item {KEYCHAIN_SERVICE}): refusing")
+    k = Ed25519PrivateKey.generate()
+    store.put(k.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption()).hex())
+    if not store.exists():
+        raise BudgetError("the keychain does not hold the new key: no public key written")
+    pub = k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+    with open(env.pub_file, "x") as f:
+        f.write(pub + "\n")
+    return pub
 
 
-def _sign(rec, store) -> dict:
-    raise NotImplementedError("read_into")
+def _read_pub(env) -> str:
+    try:
+        v = open(env.pub_file).read().strip()
+    except OSError as e:
+        raise BudgetError(f"no owner public key at {env.pub_file} ({e}): the owner runs `budget.py init-key`") from None
+    if not re.fullmatch(r"[0-9a-f]{64}", v):
+        raise BudgetError(f"{env.pub_file} is not an Ed25519 public key in hex")
+    return v
 
 
-def set_budget(scope, usd, note, start_utc=None, days=14, env=None) -> str:
-    raise NotImplementedError
-
-
-def load_budget(scope, env=None) -> dict:
-    raise NotImplementedError
+def load_scopes(path=SCOPES_FILE) -> dict:
+    import yaml
+    try:
+        y = yaml.safe_load(open(path))
+        floor = _num(y["floor_usd_per_instance_hour"], "floor_usd_per_instance_hour")
+        scopes = {_scope_name(k): list(v) for k, v in y["scopes"].items()}
+    except BudgetError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- any unreadable file refuses
+        raise BudgetError(f"{path} cannot be read: {type(e).__name__}: {e}") from None
+    if floor <= 0 or not all(v and all(isinstance(p, str) and p for p in v) for v in scopes.values()):
+        raise BudgetError(f"{path}: the floor must be positive and every scope needs non-empty prefixes")
+    return {"floor": floor, "scopes": scopes}
 
 
 def scope_for_name(name, path=SCOPES_FILE):
-    raise NotImplementedError
+    """The one scope whose prefix `name` starts with, else None."""
+    hits = [s for s, ps in load_scopes(path)["scopes"].items() if any(str(name).startswith(p) for p in ps)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def load_prices(path=PRICES_FILE) -> dict:
-    raise NotImplementedError
+    """{VM type: upper-bound USD per instance-hour} (see cloud/vm_prices.yaml)."""
+    import yaml
+    try:
+        y = yaml.safe_load(open(path))
+        m, c = _num(y["margin"], "margin", 1.0), _num(y["credits_per_vcpu_hour"], "credits_per_vcpu_hour", 0.0)
+        return {t: _num(v["usd_per_hour"], t, 0.0) * m + _num(v["vcpu"], t, 1) * c * USD_PER_CREDIT
+                for t, v in y["types"].items()}
+    except BudgetError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise BudgetError(f"{path} cannot be read: {type(e).__name__}: {e}") from None
+
+
+def _check_record(rec) -> dict:
+    if not isinstance(rec, dict) or sorted(rec) != sorted(FIELDS):
+        raise BudgetError(f"the budget record's fields are not {FIELDS}")
+    _scope_name(rec["scope"])
+    if _num(rec["usd"], "usd") <= 0 or _num(rec["floor_usd_per_instance_hour"], "floor") <= 0:
+        raise BudgetError("the budget and the floor must be positive")
+    times = [_ts(rec[k]) for k in ("start_utc", "issued_utc", "expires_utc")]
+    if None in times or times[2] <= times[1] or not isinstance(rec["nonce"], str) or len(rec["nonce"]) < 16:
+        raise BudgetError("bad times or nonce in the budget record")
+    if not (isinstance(rec["prefixes"], list) and rec["prefixes"] and all(isinstance(p, str) and p
+                                                                          for p in rec["prefixes"])):
+        raise BudgetError("bad prefixes in the budget record")
+    return rec
+
+
+def _verify(doc, pub_hex) -> dict:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        rec, sig = doc["record"], bytes.fromhex(doc["signature"])
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex)).verify(sig, _canon(rec))
+    except (InvalidSignature, KeyError, TypeError, ValueError, AttributeError):
+        raise BudgetError("the budget's signature does not verify against the owner's public key") from None
+    return _check_record(rec)
+
+
+def _sign(rec, store) -> dict:
+    """The one place the private key is read: sign exactly `rec`, then zero the buffer. Returns the signed document
+    only, never the key."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    msg = _canon(_check_record(rec))
+    buf = store.read_into()
+    try:
+        sig = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(buf.decode())).sign(msg)
+    except ValueError:
+        raise BudgetError("the keychain item is not an Ed25519 key") from None
+    finally:
+        buf[:] = b"\0" * len(buf)
+    return {"alg": "ed25519", "record": rec, "signature": sig.hex()}
+
+
+def _read_seen(env, scope):
+    try:
+        s = json.load(open(env.path(f"budget_{scope}.seen")))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise BudgetError(f"the {scope} .seen mark cannot be read: {e}") from None
+    if not isinstance(s, dict) or _ts(s.get("issued_utc")) is None or not isinstance(s.get("nonce"), str):
+        raise BudgetError(f"the {scope} .seen mark is malformed")
+    return s
+
+
+def _check_seen(env, rec) -> None:
+    """Refuse a record older than the newest seen for its scope, or the same issued time with another nonce;
+    raise the mark to a newer record."""
+    s = _read_seen(env, rec["scope"])
+    if s is not None:
+        a, b = _ts(rec["issued_utc"]), _ts(s["issued_utc"])
+        if a < b or (a == b and rec["nonce"] != s["nonce"]):
+            raise BudgetError(f"this {rec['scope']} budget (issued {rec['issued_utc']}) is not the newest one seen "
+                              f"({s['issued_utc']}): an older record restored is refused")
+        if a == b:
+            return
+    _write_private(env.path(f"budget_{rec['scope']}.seen"),
+                   json.dumps({"issued_utc": rec["issued_utc"], "nonce": rec["nonce"]}) + "\n")
+
+
+def set_budget(scope, usd, note, start_utc=None, days=14, env=None) -> str:
+    """Sign a budget after the owner confirms the record on the terminal (the keychain then asks for the owner's
+    password), and write it with its `.seen` mark."""
+    import secrets
+    env = env or _ENV
+    sc = load_scopes(env.scopes)
+    if _scope_name(scope) not in sc["scopes"]:
+        raise BudgetError(f"scope {scope!r} is not in {env.scopes}")
+    if not 0 < _num(days, "days") <= MAX_DAYS:
+        raise BudgetError(f"--days must be 1 to {MAX_DAYS}, not {days}")
+    now = env.clock()
+    seen = _read_seen(env, scope)
+    if seen is not None and _ts(seen["issued_utc"]) >= math.floor(now):
+        raise BudgetError("a record for this scope was issued this second or later: try again in a second")
+    rec = _check_record({"scope": scope, "usd": _num(usd, "usd"), "start_utc": start_utc or _iso(now),
+                         "note": str(note or ""), "issued_utc": _iso(now), "expires_utc": _iso(now + days * 86400),
+                         "nonce": secrets.token_hex(16), "prefixes": sc["scopes"][scope],
+                         "floor_usd_per_instance_hour": sc["floor"]})
+    if not env.confirm(rec):
+        raise BudgetError("not confirmed on the terminal: nothing signed")
+    doc = _sign(rec, env.keys())
+    _verify(doc, _read_pub(env))       # the keychain's key is the tracked anchor's pair, or nothing is written
+    p = env.path(f"budget_{scope}.json")
+    _write_private(p, json.dumps(doc, indent=1) + "\n")
+    _check_seen(env, rec)
+    return p
+
+
+def load_budget(scope, env=None) -> dict:
+    """The scope's verified, unexpired record, not older than the newest seen, else BudgetError."""
+    env = env or _ENV
+    p = env.path(f"budget_{_scope_name(scope)}.json")
+    try:
+        doc = json.load(open(p))
+    except FileNotFoundError:
+        raise BudgetError(f"no budget for {scope} ({p}): the owner signs one with `budget.py set`") from None
+    except (OSError, ValueError) as e:
+        raise BudgetError(f"{p} cannot be read: {e}") from None
+    rec = _verify(doc, _read_pub(env))
+    if rec["scope"] != scope:
+        raise BudgetError(f"{p} holds the budget of {rec['scope']!r}, not {scope!r}")
+    if env.clock() >= _ts(rec["expires_utc"]):
+        raise BudgetError(f"the {scope} budget expired at {rec['expires_utc']}: the owner signs a new one")
+    _check_seen(env, rec)
+    return rec
 
 
 class CoiledSource:
+    """All Coiled access for spend: the IDM workspace only, read-only."""
+
     def list_clusters(self) -> list:
-        raise NotImplementedError
+        import coiled
+        cs = coiled.list_clusters(workspace=WORKSPACE, max_pages=None)
+        return cs if isinstance(cs, list) else list(cs.values())
 
     def details(self, cid) -> dict:
-        raise NotImplementedError
+        from coiled.v2.core import CloudV2    # the raw record: coiled.cluster_details drops the cost fields
+        with CloudV2() as cloud:
+            return cloud._get_cluster_details_synced(cluster_id=cid, workspace=WORKSPACE)
+
+
+_RUNNING = ("started", "running", "ready")
+
+
+def _cluster_cost(d, now, start, median, prices) -> dict:
+    """One cluster: billed USD, the estimate in the window, and the count (max of the two; the estimate alone for a
+    cluster created before `start`). Refuses incomplete or negative data."""
+    if not isinstance(d, dict) or not {"scheduler", "workers", "total_cost", "cloud_total_cost", "created"} <= set(d) \
+            or not isinstance(d["workers"], list) or not isinstance(d["scheduler"], dict):
+        raise BudgetError(f"cluster {d.get('id') if isinstance(d, dict) else '?'}: incomplete record")
+    live, hours, est = 0, 0.0, 0.0
+    for p in [d["scheduler"]] + d["workers"]:
+        inst = p.get("instance") if isinstance(p, dict) else None
+        if not inst:
+            if not isinstance(p, dict) or state_of(p) in _RUNNING or not state_of(p):
+                raise BudgetError(f"cluster {d.get('id')}: a process without instance data")
+            continue                       # a process that never got a VM (pending, refused)
+        t0, vm = _ts(inst.get("created")), inst.get("instance_type_id")
+        on = state_of(inst) not in ENDED
+        t1 = now if on else _ts((inst.get("current_state") or {}).get("updated"))
+        if t0 is None or t1 is None or not state_of(inst):
+            raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
+        if vm not in prices:
+            raise BudgetError(f"cluster {d.get('id')}: VM type {vm!r} is not in cloud/vm_prices.yaml")
+        hours += max(0.0, t1 - t0) / 3600
+        est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, prices[vm])
+        live += on
+    tc, cc = d["total_cost"], d["cloud_total_cost"]
+    if live and tc is None and cc is None:
+        tc = cc = 0.0                      # not billed yet: the estimate covers it
+    billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
+    before = _ts(d["created"]) is None or _ts(d["created"]) < start
+    return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "live_instances": live,
+            "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
+            "usd": est if before else max(billed, est), "_billed_all": billed}
+
+
+def _measure(rec, env, now) -> dict:
+    """Spend of a verified record's scope (clusters only), and the rate context the job meter reuses."""
+    src, prices = env.coiled(), load_prices(env.prices)
+    start, prefixes = _ts(rec["start_utc"]), tuple(rec["prefixes"])
+    items = src.list_clusters()
+    if not isinstance(items, list):
+        raise BudgetError("the cluster listing is not a list")
+    mine = []
+    for c in items:
+        if str(c.get("name") or "").startswith(prefixes):
+            t = _ts(c.get("created"))
+            if t is None:
+                raise BudgetError(f"cluster {c.get('id')} has no creation time")
+            mine.append((t, c))
+    mine.sort(key=lambda x: -x[0])         # newest first
+
+    def overlaps(t, c):
+        upd = _ts((c.get("current_state") or {}).get("updated")) if isinstance(c.get("current_state"), dict) else None
+        return t >= start or state_of(c) not in ENDED or upd is None or upd >= start
+    counted = [c for t, c in mine if overlaps(t, c)]
+    dets = {c["id"]: src.details(c["id"]) for c in counted}
+    sample = []
+    for t, c in mine:
+        if len(sample) >= RATE_SAMPLE:
+            break
+        if state_of(c) in ENDED:
+            r = _cluster_cost(dets[c["id"]] if c["id"] in dets else src.details(c["id"]), now, -math.inf, 0.0, prices)
+            if not r["live_instances"] and r["instance_hours"] >= 0.05:
+                sample.append(r["_billed_all"] / r["instance_hours"])
+    sample.sort()
+    n = len(sample)
+    median = 0.0 if not n else sample[n // 2] if n % 2 else (sample[n // 2 - 1] + sample[n // 2]) / 2
+    median = max(median, _num(rec["floor_usd_per_instance_hour"], "floor"))
+    rows = [_cluster_cost(dets[c["id"]], now, start, median, prices) for c in counted]
+    for r in rows:
+        r.pop("_billed_all")
+    return {"median": median, "rate_from_clusters": n, "prices": prices, "start": start, "rows": rows,
+            "items": items}
+
+
+def _reservations(env, scope, items, now) -> list:
+    """Open reservations of `scope`: younger than RESERVATION_S, and no cluster of the name created since."""
+    try:
+        allr = json.load(open(env.reservations))
+    except FileNotFoundError:
+        allr = []
+    except (OSError, ValueError) as e:
+        raise BudgetError(f"{env.reservations} cannot be read: {e}") from None
+    out = []
+    for r in allr if isinstance(allr, list) else []:
+        seen = any(str(c.get("name") or "").startswith(r["name"]) and (_ts(c.get("created")) or 0) >= r["time"] - 120
+                   for c in items)
+        if not seen and now - r["time"] < RESERVATION_S:
+            out.append(r)
+    return [r for r in out if r["scope"] == scope], out
+
+
+def _spend(scope, env, now) -> dict:
+    rec = load_budget(scope, env)
+    m = _measure(rec, env, now)
+    mine, _ = _reservations(env, scope, m["items"], now)
+    rows = m["rows"]
+    used, reserved = sum(r["usd"] for r in rows), sum(r["cap_usd"] for r in mine)
+    return {"scope": scope, "budget_usd": float(rec["usd"]), "start_utc": rec["start_utc"], "note": rec["note"],
+            "expires_utc": rec["expires_utc"], "prefixes": list(rec["prefixes"]), "rate_usd_per_instance_hour":
+            m["median"], "rate_from_clusters": m["rate_from_clusters"], "billed_usd": sum(r["billed_usd"] for r in rows),
+            "used_usd": used, "reserved_usd": reserved, "remaining_usd": float(rec["usd"]) - used - reserved,
+            "clusters": rows, "reservations": mine, "_m": m, "_rec": rec}
 
 
 def spend(scope) -> dict:
-    raise NotImplementedError
+    """The scope's spend: verified budget, clusters, open reservations (see the module doc)."""
+    s = _spend(scope, _ENV, _ENV.clock())
+    s.pop("_m"), s.pop("_rec")
+    return s
+
+
+class _Lock:
+    def __init__(self, path):
+        self.path = path + ".lock"
+
+    def __enter__(self):
+        import fcntl
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.f = open(self.path, "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+        return False
 
 
 def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
-    raise NotImplementedError
+    """ok only if the scope's owner-signed budget verifies and has started, `name` starts with one of its signed
+    prefixes, and used + open reservations + `cap_usd` is within it. With `reserve`, a launch that fits records a
+    reservation of `cap_usd` for `name` (under the same lock). Any error refuses."""
+    env = _ENV
+    try:
+        cap = _num(cap_usd, "cap_usd")
+        if cap <= 0:
+            raise BudgetError(f"cap_usd must be positive, not {cap}")
+        if not isinstance(name, str) or not name:
+            raise BudgetError("a launch names its cluster")
+        with _Lock(env.reservations):
+            now = env.clock()
+            s = _spend(scope, env, now)
+            if now < _ts(s["start_utc"]):
+                return False, f"the {scope} budget starts at {s['start_utc']}: no launch before it"
+            if not name.startswith(tuple(s["prefixes"])):
+                return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}"
+            fits = round(s["used_usd"] + s["reserved_usd"] + cap, 6) <= round(s["budget_usd"], 6)
+            if fits and reserve:
+                _, keep = _reservations(env, scope, s["_m"]["items"], now)
+                inv = os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
+                keep.append({"scope": scope, "cap_usd": cap, "name": name, "invocation": inv, "time": now})
+                os.makedirs(os.path.dirname(env.reservations), exist_ok=True)
+                with open(env.reservations + ".tmp", "w") as f:
+                    json.dump(keep, f, indent=1)
+                os.replace(env.reservations + ".tmp", env.reservations)
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return False, f"budget check failed closed: {type(e).__name__}: {e}"
+    return fits, (f"{scope}: used ${s['used_usd']:.2f} (billed ${s['billed_usd']:.2f}) + reserved "
+                  f"${s['reserved_usd']:.2f} + cap ${cap:.2f} {'<=' if fits else '>'} budget ${s['budget_usd']:.2f}")
 
 
 def job_meter(scope):
-    raise NotImplementedError
+    """fn(cluster id) -> that cluster's USD now (max of billed and the estimate), at the scope's rates."""
+    env = _ENV
+    s = _spend(scope, env, env.clock())
+    m = s["_m"]
+
+    def meter(cid):
+        return _cluster_cost(env.coiled().details(cid), env.clock(), m["start"], m["median"], m["prices"])["usd"]
+    return meter
 
 
 def status_lines(s) -> list[str]:
-    raise NotImplementedError
+    out = [f"budget {s['scope']}: ${s['budget_usd']:.2f} from {s['start_utc']} to {s['expires_utc']} ({s['note']})",
+           f"used: ${s['used_usd']:.2f} (billed ${s['billed_usd']:.2f}); reserved ${s['reserved_usd']:.2f}; "
+           f"remaining ${s['remaining_usd']:.2f}",
+           f"measured rate: ${s['rate_usd_per_instance_hour']:.2f} per instance-hour (median of "
+           f"{s['rate_from_clusters']} stopped cluster(s), floor applied; each VM type's bound applies when higher)",
+           f"{'cluster':<40} {'id':>9} {'state':<9} {'billed':>9} {'estimate':>9} {'counted':>9} {'live VMs':>8}"]
+    out += [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} {r['estimate_usd']:>9.2f} "
+            f"{r['usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
+    return out + [f"reservation {r['name']} ${r['cap_usd']:.2f} ({r['invocation']})" for r in s["reservations"]]
 
 
 # ---- self-test -------------------------------------------------------------------------------
