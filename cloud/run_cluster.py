@@ -194,7 +194,7 @@ class RunConfig:
     # `launch` refuses unless the owner-signed budget of `budget_scope` covers the scope's spend plus it
     # (cloud/budget.py). budget_scope defaults to the scope whose prefix `name` has (cloud/budget_scopes.yaml).
     cap_usd: float | None = None
-    budget_scope: str = ""
+    budget_scope: str = ""     # cloud/launch_watch.py never watches to a higher cap than cap_usd
     # F6 run checkpoints: while main.py runs, the agent VM uploads its run dir every checkpoint_minutes (0: off)
     checkpoint_minutes: float = 15.0
 
