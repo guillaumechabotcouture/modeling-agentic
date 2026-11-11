@@ -79,11 +79,14 @@ REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only w
 
 
 def _open_nofollow(root: str, rel: str) -> int:
-    """A read fd for root/rel opened without following a link at any component under `root` (a planted link raises
-    OSError), and only for a regular file (else OSError)."""
+    """A read fd for root/rel opened without following a link at any component, `root` itself included (a planted
+    link raises OSError), and only for a regular file (else OSError). `rel` is split on "/" only and never
+    translated: a component that is empty, "." or ".." (an absolute or climbing name) is refused (Codex round 2)."""
     import stat
-    parts = [p for p in rel.replace("\\", "/").split("/") if p]
-    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") or "\0" in p for p in parts):
+        raise OSError(f"not a plain relative name: {rel!r}")
+    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for p in parts[:-1]:
             nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
@@ -126,6 +129,7 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
     items = []
+    os.close(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))   # a root that is a link: OSError
     for dp, dirs, files in os.walk(root):
         dirs.sort()
         items += [(root, os.path.relpath(os.path.join(dp, fn), root), None) for fn in sorted(files)]

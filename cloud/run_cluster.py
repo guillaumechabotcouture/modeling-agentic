@@ -55,12 +55,14 @@ and run.log; never _truth/, credential files or links; API keys redacted; each f
 links, and what is scanned is what is archived) every `checkpoint_minutes` (default 15, 0 off). Each checkpoint is a
 new generation, written once: outputs/<storage_prefix>/launch_<id>/checkpoint_<label>_g<N>.tar.gz and its record
 checkpoint_<label>_g<N>.json (time, size, sha256, and, read from the archive, run_state state and round and the
-cached engine batches and rows); then the pointer checkpoint_<label>.json names it. The last two complete generations
-are kept. One at a time (a checkpoint due while the previous one uploads is skipped); one needs free space of
-1.5 x the run dir + 2 GB; a failure is logged on the VM (/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no
-local archive, and never stops the run. `collect` says when a label has only a checkpoint. `checkpoint-now` files a
-request on each agent VM (it returns at once) and waits in storage, under one deadline, for a generation carrying it
-or started after it. Resuming from one:
+cached engine batches and rows); then the pointer checkpoint_<label>.json names it and its `previous`. Generations
+are numbered after every one already stored for the launch and label, and only those older than both the pointer's
+are deleted, after it is published. One at a time (a checkpoint due while the previous one uploads is skipped); one
+needs free space of 2.2 x (largest file + run dir) + run.log + 2 GB; a failure is logged on the VM
+(/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no local archive, and never stops the run. `collect` says when
+a label has only a checkpoint. `checkpoint-now` files a request on every agent VM at once (each returns at once; a
+request survives a skip or failure and is retried within 30 s) and waits in storage, under one deadline that bounds
+every call, for a generation carrying it or started after it. Resuming from one:
   1. `run_cluster.py <cfg> checkpoint [--label L]`: <out_dir>/<L>/checkpoint/runs/<RUN>/ and checkpoint.json
      (the pointer's generation, or the previous one when it does not match its sha256; refused when neither does).
   2. Put the run dir into the launch tree at runs/<RUN> and commit it there (`git add -f runs/<RUN>`: runs/ is
@@ -1410,26 +1412,42 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
     except ImportError:
         pass
     deadline = clock() + timeout_s
-    client, state, reqs = (connect or _connect_recorded)(cfg, cid), {}, {}
-    for label in cfg.labels:
+    left = lambda: max(0.1, deadline - clock())  # noqa: E731 -- every blocking call takes what is left
+    client = _bounded(connect or _connect_recorded, cfg, cid, timeout_s=left())
+    import threading
+    answers, threads, state, reqs = {}, {}, {}, {}
+
+    def ask(label):    # one thread per label, all at once: an unresponsive worker holds up no other label
         try:
-            r = _on_worker(client, ws.checkpoint_now_side, label, worker=assign[label]["worker"])
+            answers[label] = _on_worker(client, ws.checkpoint_now_side, label, worker=assign[label]["worker"])
         except Exception as e:  # noqa: BLE001 -- reported; the caller decides
-            r = {"state": f"unavailable ({type(e).__name__}: {str(e)[:120]})"}
-        if r.get("state") == "requested":
-            reqs[label] = r
-        state[label] = r.get("state")
-    while reqs:
+            answers[label] = {"state": f"unavailable ({type(e).__name__}: {str(e)[:120]})"}
+    for label in cfg.labels:
+        threads[label] = threading.Thread(target=ask, args=(label,), daemon=True)
+        threads[label].start()
+    for t in threads.values():
+        t.join(min(0.5, left()))
+    while True:
+        for label in [lb for lb in threads if lb in answers]:
+            threads.pop(label)
+            r = answers[label]
+            state[label] = r.get("state")
+            if r.get("state") == "requested":
+                reqs[label] = r
         for label in list(reqs):
-            p = checkpoint_record(cfg, store, label, lid) or {}
+            try:
+                p = _bounded(checkpoint_record, cfg, store, label, lid, timeout_s=left()) or {}
+            except TimeoutError:
+                p = {}
             if reqs[label]["token"] in (p.get("requests") or []) or (p.get("started_epoch") or 0) >= reqs[label]["epoch"]:
                 state[label] = f"checkpointed {ws.checkpoint_pointer(cfg.storage_prefix, lid, label)} " \
                                f"(generation {p.get('generation')})"
                 del reqs[label]
-        left = deadline - clock()
-        if not reqs or left <= 0:
+        if not (reqs or threads) or deadline - clock() <= 0:
             break
-        sleep(min(poll_s, left))
+        sleep(min(poll_s, deadline - clock()))
+    for label in threads:
+        state[label] = f"unavailable (no answer within {timeout_s:g} s)"
     for label in reqs:
         state[label] = "timeout"
     for label in cfg.labels:
@@ -3974,8 +3992,10 @@ def _self_test_checkpoint(ok) -> None:
         f.truncate(10 * 2**30)                    # a sparse 10 GiB file: its size, not its disk use
     open(os.path.join(big_dir, "small.txt"), "w").write("x" * 1000)
     need = ws.disk_needed(big_dir, None)
+    need_log = ws.disk_needed(big_dir, os.path.join(big_dir, "small.txt"))
+    os.remove(os.path.join(big_dir, "big.bin"))
     ok(need >= 2.2 * (10 * 2**30 + 10 * 2**30 + 1000) + 2 * 2**30
-       and ws.disk_needed(big_dir, os.path.join(big_dir, "small.txt")) == need + 1000,
+       and need_log == need + 1000,
        f"CK22 (Codex round 2 P2-3) a 10 GiB incompressible file needs 2.2 x (largest + run dir) + run.log + 2 GB "
        f"free: {need / 2**30:.1f} GiB")
     # Codex round 2 P2-4: a request whose checkpoint is skipped or fails is retried within retry_s, not at the next
