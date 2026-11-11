@@ -190,10 +190,20 @@ class RunConfig:
     # Coiled's cluster_timeout (coiled.Cluster(cluster_timeout=...), "40 minutes"): a cluster is shut down that long
     # after it starts, busy or not. "" for none (a real run's length is not known in advance)
     cluster_timeout: str = ""
+    # F6 Stage 2 (2026-11-11: $106 spent of a $100 budget): the most this launch may spend, required to launch;
+    # `launch` refuses unless the owner-signed budget of `budget_scope` covers the scope's spend plus it
+    # (cloud/budget.py). budget_scope defaults to the scope whose prefix `name` has (cloud/budget_scopes.yaml).
+    cap_usd: float | None = None
+    budget_scope: str = ""
     # F6 run checkpoints: while main.py runs, the agent VM uploads its run dir every checkpoint_minutes (0: off)
     checkpoint_minutes: float = 15.0
 
     def __post_init__(self):
+        if self.cap_usd is not None and (isinstance(self.cap_usd, bool) or not isinstance(self.cap_usd, (int, float))
+                                         or not self.cap_usd > 0 or self.cap_usd == float("inf")):
+            raise ValueError(f"cap_usd must be a positive number of USD, not {self.cap_usd!r}")
+        if not self.budget_scope:
+            self.budget_scope = _default_scope(self.name)
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
         self.out_dir = self.out_dir or os.path.expanduser(f"~/modeling-agentic-keep/{self.name}")
         self.labels, self.flags, self.required_files = tuple(self.labels), tuple(self.flags), tuple(self.required_files)
@@ -264,6 +274,30 @@ def adapt_options(cfg, base: dict) -> dict:
     if cfg.target_duration:
         out["target_duration"] = cfg.target_duration
     return out
+
+
+def _default_scope(name) -> str:
+    """The budget scope whose prefix `name` has, or "" (then `launch` refuses)."""
+    try:
+        import budget
+        return budget.scope_for_name(name) or ""
+    except Exception:  # noqa: BLE001 -- an unreadable scopes file: no scope, and the launch refuses
+        return ""
+
+
+def budget_guard(cfg, reserve=True) -> None:
+    """Refuse (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope covers the
+    scope's spend plus it (cloud/budget.py); with `reserve`, the cap is reserved until a cluster of the name appears.
+    Called by every path that creates or keeps paid work: launch, keeper (start_helpers), relaunch."""
+    import budget
+    if cfg.cap_usd is None:
+        raise SystemExit(f"{cfg.name}: the config sets no cap_usd: refusing (a launch states the most it may spend)")
+    if not cfg.budget_scope:
+        raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve)
+    if not ok:
+        raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
+    print(f"budget: {why}", flush=True)
 
 
 def load_config(path: str) -> RunConfig:
@@ -766,6 +800,7 @@ def _launch_locked(cfg, inv) -> int:
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
+    budget_guard(cfg)                             # before any key is read or cluster created
     keys = read_keys()
     compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
@@ -1022,6 +1057,8 @@ def keeper_later(cfg) -> int:
                 _stop_id(cfg.keeper_name, keep_k)
                 clusters.pop("keeper", None)
                 keep_k = None
+        if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
+            budget_guard(cfg)             # a new overflow pool or keeper is paid: checked and reserved only then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
         write_clusters(cfg, clusters)
@@ -1772,6 +1809,7 @@ def relaunch(cfg, label) -> int:
         assign = json.load(open(cfg.state_file))
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
+        budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
         sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         import results_store
         launch_id = assign[label]["launch_id"]
@@ -3687,6 +3725,112 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_budget(ok) -> None:
+    """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
+    (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
+    import types
+    from unittest import mock
+    import budget
+    for bad in (dict(cap_usd=-1), dict(cap_usd=float("nan")), dict(cap_usd=True), dict(cap_usd="5")):
+        try:
+            RunConfig(name="t", question_file="/dev/null", **bad)
+            ok(False, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+        except (ValueError, TypeError):
+            ok(True, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+    ok(RunConfig(name="lw-smoke-x", question_file="q").budget_scope == "f6"
+       and RunConfig(name="t", question_file="q").budget_scope == ""
+       and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
+       "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
+    made, keys = [], []
+    calls = []
+
+    def try_launch(cfg, verdict):
+        made.clear(), keys.clear(), calls.clear()
+        fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
+        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), verdict)[1]  # noqa: E731
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                            "pipeline_preflight": lambda c, code: "v2",
+                                            "read_keys": lambda: keys.append(1) or 1 / 0}):   # stops past the guard
+            try:
+                _launch_locked(cfg, "inv")
+                return None
+            except SystemExit as e:
+                return str(e)
+            except Exception as e:  # noqa: BLE001 -- past the guard, the fakes stop it
+                return f"past the guard: {type(e).__name__}"
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2"), (True, "ok"))
+    ok(msg and "cap_usd" in msg and not made and not keys and not calls,
+       f"BU3 a config without cap_usd is refused before the budget, any key or any cluster: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (False, "over"))
+    ok(msg and "budget" in msg and "over" in msg and not made and not keys and calls == [("f6", 20, "lw-smoke-t")],
+       f"BU4 a launch the budget refuses creates nothing and reads no key: {msg} {calls}")
+    msg = try_launch(RunConfig(name="zz", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
+        cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
+        json.dump({"run": {"name": cfg.name, "id": 5}}, open(cfg.clusters_file, "w"))
+        json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
+        seen, started = [], []
+        lbo = lambda scope, cap, name=None, reserve=True: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
+        for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
+            seen.clear(), started.clear()
+            with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                    mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                                "start_helpers": lambda *a, **k: started.append(1),
+                                                "read_keys": lambda: started.append("keys"),
+                                                "_submit": lambda *a, **k: started.append("submit")}):
+                try:
+                    fn()
+                    msg = None
+                except SystemExit as e:
+                    msg = str(e)
+                except Exception as e:  # noqa: BLE001 -- past the guard, the missing fakes stop it
+                    msg = f"past the guard: {type(e).__name__}: {e}"
+            ok(msg and "over" in msg and not started and seen == ([True] if label == "keeper" else [False]),
+               f"BU5 `{label}` is refused before it creates or submits anything when the budget no longer covers "
+               f"cap_usd: {msg} reserve={seen}")
+        seen.clear(), started.clear()
+        ids = {"overflow": 7, "keeper": 8}
+        with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.object(ws, "attach_existing", lambda *a: object()), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda c, cl, role, n: ids[role],
+                                            "confirm_keeper": lambda *a, **k: True, "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(cfg)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg is None and not seen and started == [{"keep_overflow": 7, "keep_keeper": True}],
+           f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
+    import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
+    ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
+    for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):
+        body = ast.parse(open(os.path.join(ld, f)).read()).body
+        i = 1 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            else 0
+        if i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
+            i += 1
+        guard = body[i:i + 2]
+        good = (len(guard) == 2 and isinstance(guard[0], ast.Import) and isinstance(guard[1], ast.If)
+                and "MA_ALLOW_EXPERIMENT_LAUNCHERS" in ast.unparse(guard[1].test)
+                and isinstance(guard[1].body[0], ast.Raise))
+        refused = False
+        if good:
+            mod = ast.Module(body=guard, type_ignores=[])
+            with mock.patch.dict(os.environ, {"MA_ALLOW_EXPERIMENT_LAUNCHERS": ""}):
+                try:
+                    exec(compile(mod, f, "exec"), {})   # noqa: S102 -- only the guard's two statements
+                except SystemExit:
+                    refused = True
+        ok(good and refused, f"BU6 docs/experiments/launchers/{f} refuses at import unless "
+                             f"MA_ALLOW_EXPERIMENT_LAUNCHERS=1 (its first statements are the guard)")
+
 def _self_test_checkpoint(ok) -> None:
     """CK1-CK20 (F6 run checkpoints, 2026-11-11: a 3-h preview stopped at its cap stored nothing). The agent VM
     uploads a checkpoint of the run dir every checkpoint_minutes while main.py runs; `checkpoint` fetches it,
@@ -4447,6 +4591,11 @@ def _self_test() -> int:
             ok(False, "RC15 a config without CONFIG is refused")
         except SystemExit:
             ok(True, "RC15 a config without CONFIG is refused")
+    try:
+        _self_test_budget(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"BU: {type(e).__name__}: {e}")
+    globals()["budget_guard"] = lambda cfg, reserve=True: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)

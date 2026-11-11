@@ -13,9 +13,17 @@ lock on the job's local directory refuses a second `run` of the job on this mach
 every `up` and `start` option; its polls and stops use the cluster object it created and
 its id, never an attach by name.
 
-    python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> [--workers N]
-        [--every 60] [--keep-on-failure] -- <command ...>
+    python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --cap-usd 20 [--workers N]
+        [--every 60] [--keep-on-failure] [--budget-scope f6] -- <command ...>
     python cloud/vm_job.py down <name> <job_id>      # stop a kept cluster (found through job.json)
+
+Budget (F6 Stage 2; on 2026-11-11 an agent spent $106 of a $100 budget). `run`, `up` and `start` require
+`--cap-usd`. They refuse, before any job is submitted or, for `run`, any cluster listed, unless the owner-signed
+budget of the cluster name's scope (cloud/budget.py, cloud/budget_scopes.yaml) covers the scope's spend plus the
+cap. `run` and `up` reserve the cap; `up` does so only once it will construct a cluster. Each `run` poll saves the
+outputs, then measures the job cluster's USD before it returns any state, the job's loss included. The cluster is
+stopped by id, --keep-on-failure or not, in three cases: at the cap (after one last copy of the outputs), after
+three failed readings in a row, or after a failed reading at a terminal state.
 
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
@@ -318,7 +326,7 @@ def _runner(c, w):
     return lambda fn, *a: c.run(fn, *a, workers=[w], wait=True, on_error="raise")[w]
 
 
-def _create(a, if_live="keep", box=None):
+def _create(a, if_live="keep", box=None, gate=False):
     """Create the cluster once no cluster of that name is live or stopping. A live one is kept
     (`up`: "already up", returns False) or refused (`run`: no second launch on a cluster that
     may hold another job); a stopping one is waited out, never attached to or re-created early.
@@ -338,6 +346,8 @@ def _create(a, if_live="keep", box=None):
         time.sleep(15)    # stopping: never create (or attach) until it has stopped
     else:
         raise SystemExit(f"{a.name} is still stopping; try again later")
+    if gate:                    # `up`: checked and reserved only now that a cluster will be constructed
+        _budget_gate(a, a.name)
     n = int(getattr(a, "workers", 1) or 1)
     if box is not None:
         box["constructing"] = True   # from here a cluster with this (unique, for `run`) name may exist
@@ -354,8 +364,44 @@ def _create(a, if_live="keep", box=None):
     return True
 
 
+def _budget_gate(a, name, meter=False, reserve=True):
+    """Refuse (SystemExit) unless the owner-signed budget of `name`'s scope covers its spend plus --cap-usd (with
+    `reserve`, the cap is reserved until the cluster appears); with `meter`, return fn(cluster id) -> that cluster's
+    USD so far (cloud/budget.py)."""
+    import budget
+    scope = a.budget_scope or budget.scope_for_name(name)
+    if not scope:
+        raise SystemExit(f"{name} matches no budget scope in cloud/budget_scopes.yaml: refusing (its spend would "
+                         "count against no budget)")
+    ok, why = budget.launch_budget_ok(scope, a.cap_usd, name=name, reserve=reserve)
+    if not ok:
+        raise SystemExit(f"{name}: the budget refuses this launch: {why}")
+    print(f"budget: {why}", flush=True)
+    return budget.job_meter(scope) if meter else None
+
+
+def _cap_reading(meter, cid, cap, job_id, misses, final=False):
+    """None while the job cluster's USD is under `cap`; at the cap, or after three failed readings in a row (fail
+    closed), the state that ends `run`. `final` (the job just reached a terminal state, so no later reading
+    follows): a failed reading is not a conclusive cap decision, and stops the cluster."""
+    try:
+        usd = meter(cid)
+        misses[0] = 0
+        print(f"{job_id}: cluster {cid} at ${usd:.2f} of its ${cap:.2f} cap", flush=True)
+        if usd < cap:
+            return None
+        why = f"cost cap reached: cluster {cid} at ${usd:.2f}, cap ${cap:.2f}"
+    except Exception as e:  # noqa: BLE001
+        misses[0] += 1
+        print(f"{job_id}: cost reading failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
+        if misses[0] < 3 and not final:
+            return None
+        why = f"cost cap: the cluster's cost could not be read 3 times in a row ({type(e).__name__}); fail closed"
+    return {"state": {"job_id": job_id, "state": "over_cap", "why": why}, "files": {}, "fetched": [], "log_tail": ""}
+
+
 def cmd_up(a):
-    if _create(a):
+    if _create(a, gate=True):
         # Coiled counts idle time from cluster start, not from the first task: there is no setting for "only after
         # work", so an `up` with no `start` behind it idles out with nothing done (2026-11-03, about two hours lost)
         print(f"WARNING: {a.name} stops after {a.idle_timeout} idle unless `start` follows now. For a single job, "
@@ -368,6 +414,8 @@ def cmd_start(a, cluster=None):
     if not cmd:
         raise SystemExit("no command given (put it after --)")
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
+    if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
+        _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
@@ -417,20 +465,31 @@ def cmd_status(a):
     return st
 
 
-def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None):
+def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=None, flags=None):
     """Poll (saving outputs each time) until the job ends; returns its last status. With
     `gone_ok` (`run`), a cluster that is no longer running (by id `cid`) returns None, and
     every other error (a dropped connection, a failing cluster listing) is retried, up to
     `deadline`. Every poll goes to the job's own worker (job.json); that worker missing from
-    the table on three polls in a row reads as 'lost'."""
-    want, gone_polls = _job_worker(dest), 0
+    the table on three polls in a row reads as 'lost'. With `meter` (`run`), each poll also reads the cluster's
+    USD before anything returns: at --cap-usd it sets flags["over_cap"] and returns the job's terminal state, or
+    'over_cap' while the job still runs."""
+    want, gone_polls, misses = _job_worker(dest), 0, [0]
+
+    def cap(final=False):
+        over = (_cap_reading(meter, cid, a.cap_usd, a.job_id, misses, final)
+                if meter is not None and cid is not None else None)
+        if over is not None and flags is not None:
+            flags["over_cap"] = True
+        return over
     while True:
+        over, checked = None, False
         try:
             try:
                 c, w = _client(a.name, cluster, want)
             except WorkerGone as e:
                 gone_polls += 1
                 if gone_polls >= 3:
+                    cap(final=True)          # a terminal state too: the cap first
                     print(f"{a.job_id}: lost ({e})")
                     return {"state": {"job_id": a.job_id, "state": "lost", "why": str(e)}, "files": {},
                             "fetched": [], "log_tail": ""}
@@ -438,8 +497,14 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None):
             gone_polls = 0
             st = sync_outputs(_runner(c, w), a.job_id, dest)
             _print(st, dest)
+            over, checked = cap(final=st["state"]["state"] in DONE + ("missing", "lost")), True   # outputs, cap, state
             if st["state"]["state"] in DONE + ("missing", "lost"):
                 return st
+            if over is not None:             # at the cap: one last copy of what the job wrote since, then stop
+                try:
+                    sync_outputs(_runner(c, w), a.job_id, dest)
+                except Exception as e2:  # noqa: BLE001 -- best effort; the stop comes regardless
+                    print(f"{a.job_id}: last copy before the stop failed ({type(e2).__name__})")
         except (Exception, SystemExit) as e:  # noqa: BLE001 — a dropped connection is not the end of the job
             if isinstance(e, SystemExit) and not gone_ok:
                 raise     # `wait`/`status`: the attach guard's refusal ends the command
@@ -450,7 +515,14 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None):
                 except Exception as e2:  # noqa: BLE001 -- cannot tell: retry
                     print(f"cluster listing failed ({type(e2).__name__}: {str(e2)[:120]})")
             print(f"poll failed ({type(e).__name__}: {str(e)[:120]}); retrying")
+        if not checked:
+            over = cap()
+        if over is not None:
+            return over
         if deadline is not None and time.time() > deadline:
+            over = cap(final=True)       # no exit without a cap decision: unreadable at the deadline stops it
+            if over is not None:
+                return over
             raise SystemExit(f"{a.job_id}: still not finished {a.max_hours} h after submission (plus 1 h); "
                              f"`status {a.name} {a.job_id}` checks it")
         time.sleep(a.every)
@@ -567,10 +639,11 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
+    base, unique = a.name, run_cluster_name(a.name, a.job_id)
+    meter = _budget_gate(a, unique, meter=True)   # before any listing or cluster; reserved for the exact name it creates
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
     a.shutdown_grace_s = int(2 * a.every + 60)
-    base = a.name
     prefix = run_cluster_name(base, a.job_id, "0" * 6)[:-6]     # <name>-<job_id>-, truncated as real names are
     busy = sorted(f"{c.get('name')} ({c.get('id')})" for c in _all_clusters()
                   if ws.state_of(c) not in _ENDED + ("",)
@@ -578,7 +651,7 @@ def _run_locked(a, dest):
     if busy:
         raise SystemExit(f"{base}: a cluster for this name or job is already running ({', '.join(busy)}); `run` "
                          f"never launches a second one (`status {base} {a.job_id}` or `down`)")
-    a.base_name, a.dest, a.name = base, dest, run_cluster_name(base, a.job_id)
+    a.base_name, a.dest, a.name = base, dest, unique
     print(f"{base}: cluster {a.name} for {a.job_id}")
     box, good, why = {}, False, "interrupted"
     try:
@@ -591,7 +664,7 @@ def _run_locked(a, dest):
         cid = getattr(cl, "cluster_id", None)
         cmd_start(a, cluster=cl)
         deadline = time.time() + a.max_hours * 3600 + 3600
-        st = _poll(a, dest, gone_ok=True, deadline=deadline, cluster=cl, cid=cid)
+        st = _poll(a, dest, gone_ok=True, deadline=deadline, cluster=cl, cid=cid, meter=meter, flags=box)
         good, why = run_outcome(st, True)
     except KeyboardInterrupt:
         print(f"interrupted: {a.job_id} on {a.name}")
@@ -606,7 +679,7 @@ def _run_locked(a, dest):
         cl = box.get("cl")
         if "constructing" not in box:
             pass    # refused or failed before the constructor was called: nothing of ours to stop
-        elif good or not a.keep_on_failure:
+        elif good or not a.keep_on_failure or box.get("over_cap"):
             _stop_by_id(a.name, getattr(cl, "cluster_id", None) if cl is not None else None,
                         f"{a.job_id} done" if good else f"{a.job_id}: {why}"[:200])
         elif cl is not None:
@@ -733,9 +806,11 @@ def _self_test() -> int:
                "RC43 a job id that is running is not restarted")
         finally:
             ws.JOBS = old
+    real_gate = globals().get("_budget_gate")
+    globals()["_budget_gate"] = lambda a, name, meter=False, reserve=True: None   # cases before RN28 predate it
     _self_test_sched(ok)
     _self_test_batch(ok)
-    _self_test_run(ok)
+    _self_test_run(ok, real_gate)
     _self_test_pipeline(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
@@ -948,8 +1023,8 @@ def _self_test_batch(ok) -> None:
         ap_err = []
         with mock.patch("argparse.ArgumentParser.error", lambda self, m: (ap_err.append(m), (_ for _ in ()).throw(
                 SystemExit(2)))):
-            for argv in (["start", "b1", "j", "--shutdown-when-stored", "--", "true"],
-                         ["start", "b1", "j", "--cluster-compute", "--", "true"]):
+            for argv in (["start", "b1", "j", "--cap-usd", "5", "--shutdown-when-stored", "--", "true"],
+                         ["start", "b1", "j", "--cap-usd", "5", "--cluster-compute", "--", "true"]):
                 try:
                     main(argv)
                 except SystemExit:
@@ -1032,7 +1107,7 @@ def _self_test_batch(ok) -> None:
             ws.JOBS = old
 
 
-def _self_test_run(ok) -> None:
+def _self_test_run(ok, real_gate=None) -> None:
     """RN: `run` brings the cluster up, submits at once, waits with status lines, then stops it. On 2026-11-03 an
     agent ran `up`, ended its turn to wait, never sent `start`, and the VM idled out after 20 minutes with no job:
     about two hours lost. No network: a fake coiled module (Cluster, list_clusters, delete_cluster), fake client and
@@ -1054,7 +1129,7 @@ def _self_test_run(ok) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None):
+              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None, gate=None, job_src=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
@@ -1065,10 +1140,10 @@ def _self_test_run(ok) -> None:
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
-        open(os.path.join(src, "job.py"), "w").write(
+        open(os.path.join(src, "job.py"), "w").write(job_src or (
             f"import os, time\ntime.sleep({job_sleep})\n"
             "open(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
-            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n")
+            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n"))
         fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
 
         def stop(cid, who):
@@ -1193,7 +1268,8 @@ def _self_test_run(ok) -> None:
                 raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
             real_sleep(s / 600 if threaded else min(s, 0.01))
 
-        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", *extra]
+        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", "--cap-usd", "5",
+                *extra]
         if store:
             argv += ["--store", f"outputs/t/{jid}"]
         argv += ["--", sys.executable, prog]
@@ -1205,6 +1281,7 @@ def _self_test_run(ok) -> None:
                 mock.patch.object(rc, "attach", no_attach), \
                 mock.patch.object(ws, "_shutdown_cluster", job_down), \
                 mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out), \
+                mock.patch.dict(globals(), {"_budget_gate": gate} if gate else {}), \
                 contextlib.redirect_stderr(io.StringIO()):
             try:
                 main(argv)
@@ -1561,6 +1638,192 @@ def _self_test_run(ok) -> None:
                    f"under shutdown_always; a refused submission stops nothing: stops={len(downs)} "
                    f"raised={type(raised).__name__ if raised else None} refused={refused.get('state')}")
             case("RN27", rn27)
+
+            def rn28():
+                import budget
+                for label, scope, verdict in (("over budget", "f6", (False, "spent 96.00 + cap 5.00 > 100.00")),
+                                              ("no scope", None, (True, "ok"))):
+                    seen = []
+                    lbo = lambda s_, c, name=None, **k: (seen.append((s_, c, name)), verdict)[1]  # noqa: E731
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.object(budget, "scope_for_name", lambda n, *a: scope):
+                        W, msg, out, exc = world(d, f"r28{label[0]}", gate=real_gate)
+                    uniq = f"vm1-r28{label[0]}-"
+                    named = [(s_, c, len(n) == len(uniq) + 6 and n.startswith(uniq)) for s_, c, n in seen]
+                    ok(msg and ("budget" in msg or "scope" in msg) and not W["ctor"] and W["list_calls"] == 0
+                       and "submit" not in W["events"] and named == ([("f6", 5.0, True)] if scope else []),
+                       f"RN28 {label}: `run` refuses before listing or creating any cluster: {msg} {seen}")
+            case("RN28", rn28)
+
+            def rn29():
+                # RN29 (Codex r1 P2 on #189): each reading is of the job's own cluster, and the output the job wrote
+                # just before its cluster crossed the cap is saved before the stop
+                prog = ("import os, time\nout = os.environ['JOB_OUT']\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('a')\ntime.sleep(0.6)\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('b')\ntime.sleep(3)\n")
+                seen = []
+
+                def meter(cid, jid="r29a"):     # over the cap once the job has written 'b' on its VM
+                    seen.append(cid)
+                    if cid != 100:
+                        return 1000.0          # another cluster's cost: reading it would stop the job at once
+                    p = os.path.join(ws.JOBS, jid, "out", "progress.txt")
+                    return 6.0 if os.path.exists(p) and open(p).read() == "b" else 1.0
+                W, msg, out, exc = world(d, "r29a", gate=lambda a, name, meter=False, m=meter: m, threaded=True,
+                                         extra=("--keep-on-failure",), job_src=prog)
+                ev = W["events"]
+                saved = os.path.join(d, "local", "vm1", "r29a", "out", "progress.txt")
+                ok(msg and "cap" in msg and ("delete", 100) in ev and set(seen) == {100}
+                   and os.path.exists(saved) and open(saved).read() == "b" and clean(W),
+                   f"RN29 at the cap, `run` reads its own cluster's cost, saves the output written just before, then "
+                   f"stops the cluster by id under --keep-on-failure: {msg} readings={sorted(set(seen))} "
+                   f"saved={open(saved).read() if os.path.exists(saved) else None!r}")
+                vals = [RuntimeError("api")] * 3
+
+                def bad(cid):
+                    v = vals.pop(0) if vals else 99.0
+                    if isinstance(v, Exception):
+                        raise v
+                    return v
+                W, msg, out, exc = world(d, "r29b", gate=lambda a, name, meter=False, m=bad: m, threaded=True,
+                                         job_sleep=2)
+                ok(msg and "cap" in msg and ("delete", 100) in W["events"] and clean(W),
+                   f"RN29b three failed cost readings in a row stop the cluster (fail closed): {msg}")
+                calls = []
+
+                def late(cid):
+                    calls.append(cid)
+                    return 1.0 if len(calls) == 1 else 6.0
+                W, msg, out, exc = world(d, "r29c", job_rc=3, gate=lambda a, name, meter=False, m=late: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and "rc=3" in msg and len(calls) >= 2 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29c a job that failed past its cap between polls is still stopped under --keep-on-failure "
+                   f"(the cap is read before a terminal state returns): {msg} readings={len(calls)}")
+            case("RN29", rn29)
+
+            def rn29d():
+                calls = []
+
+                def third(cid):
+                    calls.append(cid)
+                    return 6.0 if len(calls) >= 3 else 1.0
+                W, msg, out, exc = world(d, "r29d", after_submit="empty", gate=lambda a, name, meter=False, m=third: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and "lost" in msg and len(calls) >= 3 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29d the third WorkerGone (lost) reads the cost first, and over the cap the cluster is stopped "
+                   f"under --keep-on-failure: {msg} readings={len(calls)}")
+                calls2 = []
+
+                def fails_last(cid):
+                    calls2.append(cid)
+                    if len(calls2) >= 2:
+                        raise RuntimeError("api")
+                    return 1.0
+                W, msg, out, exc = world(d, "r29e", job_rc=3, gate=lambda a, name, meter=False, m=fails_last: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and len(calls2) >= 2 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29e a terminal state whose cost cannot be read stops the cluster (no conclusive cap decision): "
+                   f"{msg} readings={len(calls2)}")
+            case("RN29d", rn29d)
+
+            def rn29f():
+                res = []
+
+                def unreadable(cid):
+                    raise RuntimeError("api")
+                for meter in (unreadable, lambda cid: 1.0):
+                    a = types.SimpleNamespace(name="vmx", job_id="j29f", cap_usd=5.0, every=60, max_hours=0.0)
+                    flags = {}
+                    with mock.patch.dict(globals(), {"_client": lambda *x, **k: (_ for _ in ()).throw(
+                            RuntimeError("drop")), "_gone": lambda n, c: False, "_job_worker": lambda dest: "w"}), \
+                            mock.patch.object(time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            st = _poll(a, d, gone_ok=True, deadline=time.time() - 1, cid=100, meter=meter, flags=flags)
+                            res.append((st["state"]["state"], bool(flags.get("over_cap"))))
+                        except SystemExit:
+                            res.append(("deadline", bool(flags.get("over_cap"))))
+                ok(res == [("over_cap", True), ("deadline", False)],
+                   f"RN29f at the polling deadline an unreadable cost takes the mandatory stop path (a reading under "
+                   f"the cap may end on the deadline): {res}")
+            case("RN29f", rn29f)
+
+            def rn30():
+                import budget
+                a = types.SimpleNamespace(cap_usd=5.0, budget_scope="f6")
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (True, "ok")), \
+                        mock.patch.object(budget, "job_meter", lambda s_: ("meter", s_)):
+                    got = real_gate(a, "lw-smoke-x", meter=True)
+                ok(got == ("meter", "f6"), f"RN30 a covered launch gets the scope's meter: {got}")
+                made = []
+                b = types.SimpleNamespace(name="vm3", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1,
+                                          cap_usd=5.0, budget_scope="f6")
+                calls = []
+                lbo = lambda s_, c, name=None, reserve=True: (calls.append(reserve), (False, "over"))[1]  # noqa: E731
+                for states in ([], ["running"]):
+                    calls.clear(), made.clear()
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(
+                                Cluster=lambda **k: made.append(k))}), \
+                            mock.patch.dict(globals(), {"_budget_gate": real_gate}), \
+                            mock.patch.object(rc, "cluster_states", lambda n, s_=states: s_), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            cmd_up(b)
+                            msg = None
+                        except SystemExit as e:
+                            msg = str(e)
+                    if not states:
+                        ok(msg and "over" in msg and not made and calls == [True],
+                           f"RN30b `up` is refused before the constructor: {msg}")
+                    else:
+                        ok(msg is None and not made and calls == [],
+                           f"RN30d an `up` that finds the cluster already up reserves nothing: {msg} {calls}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    for argv in (["run", "v", "j", "--store", "p", "--", "true"], ["up", "v"]):
+                        try:
+                            main(argv)
+                        except SystemExit:
+                            pass
+                ok(len(errs) == 2 and all("--cap-usd" in e for e in errs), f"RN30c run and up require --cap-usd: {errs}")
+            case("RN30", rn30)
+
+            def rn31():
+                import budget
+                reached = []
+                a = types.SimpleNamespace(name="lw-smoke-v", job_id="j31", command=["true"], cap_usd=5.0,
+                                          budget_scope=None, tree=None, dir=None, anthropic_key=False)
+                with mock.patch.object(budget, "launch_budget_ok",
+                                       lambda s_, c, name=None, reserve=True: (reached.append(reserve), (False, "over"))[1]), \
+                        mock.patch.object(budget, "scope_for_name", lambda n, *x: "f6"), \
+                        mock.patch.dict(globals(), {"_budget_gate": real_gate,
+                                                    "_client": lambda *x, **k: (_ for _ in ()).throw(RuntimeError("client"))}):
+                    try:
+                        cmd_start(a)
+                        msg = None
+                    except SystemExit as e:
+                        msg = str(e)
+                    except RuntimeError as e:
+                        msg = f"reached {e}"
+                    try:
+                        cmd_start(a, cluster=object())
+                        msg2 = None
+                    except BaseException as e:  # noqa: BLE001
+                        msg2 = str(e)
+                ok(msg and "over" in msg and reached == [False],
+                   f"RN31 interactive `start` is refused when the budget no longer covers its cap: {msg} {reached}")
+                ok(msg2 == "client" and reached == [False],
+                   f"RN31b under `run` (its own cluster object) start does not check twice: {msg2}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        main(["start", "v", "j", "--", "true"])
+                    except SystemExit:
+                        pass
+                ok(errs and "--cap-usd" in errs[0], f"RN31c start requires --cap-usd: {errs}")
+            case("RN31", rn31)
         finally:
             ws.JOBS = old
 
@@ -1614,16 +1877,23 @@ def main(argv=None) -> int:
         p.add_argument("--shutdown-when-stored", action="store_true",
                        help="the job stops its cluster once it is done and every output is verified in storage")
 
+    def budget_args(p):
+        p.add_argument("--cap-usd", type=float, required=True, help="the most this cluster may spend (USD)")
+        p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
+
     up = sub.add_parser("up")
     up.add_argument("name")
     up_args(up)
+    budget_args(up)
     st = sub.add_parser("start")
     st.add_argument("name")
     start_args(st)
+    budget_args(st)
     rn = sub.add_parser("run", help="up + start + wait + down in one command (the default for a single job)")
     rn.add_argument("name")
     start_args(rn)
     up_args(rn)
+    budget_args(rn)
     rn.add_argument("--every", type=float, default=60, help="seconds between status polls")
     rn.add_argument("--keep-on-failure", action="store_true",
                     help="leave the cluster up after a failure, for debugging (it then stops after its idle timeout)")

@@ -9,7 +9,8 @@ top), multi-structural LOO-CV, sensitivity analysis. All reduce to:
 given args, collect outputs."
 
 Auth via DefaultAzureCredential (picks up `az login` automatically).
-All pools default to low-priority / spot nodes. Budget guard does a
+Refused unless MA_ALLOW_AZURE_BATCH=1: this spend is outside the owner-signed
+Coiled budget (cloud/budget.py). All pools default to low-priority / spot nodes. Budget guard does a
 pre-flight cost estimate and refuses to submit when over cap. Storage
 round-trips function+args via Azure Blob.
 
@@ -215,6 +216,14 @@ SAS_DEFAULT_HOURS = 3
 # ---------------------------------------------------------------------------
 # Module-level test functions (pickle needs these importable by name)
 # ---------------------------------------------------------------------------
+
+def _require_azure_batch(what: str) -> None:
+    """Azure Batch is billed outside Coiled, so the owner-signed cloud budget (cloud/budget.py) cannot see it: refuse
+    to create pools or submit tasks unless MA_ALLOW_AZURE_BATCH=1 states that this spend is deliberate (F6 Stage 2)."""
+    if os.environ.get("MA_ALLOW_AZURE_BATCH") != "1":
+        raise SystemExit(f"cloud_batch: refusing to {what}: Azure Batch spend is outside the owner-signed budget "
+                         "(cloud/budget.py); set MA_ALLOW_AZURE_BATCH=1 to use it deliberately")
+
 
 def _square(x):
     return x * x
@@ -444,6 +453,7 @@ class BatchRunner:
             ),
             **pool_kwargs,
         )
+        _require_azure_batch("create a pool")
         batch.pool.add(pool)
         self._created_pools[pool_name] = bool(use_low_priority)
         return True
@@ -574,6 +584,8 @@ class BatchRunner:
         Each task downloads the pickled (fn, args), runs fn(args), and
         uploads the result. Returns the job_id for later wait_and_collect.
 
+        Refused unless MA_ALLOW_AZURE_BATCH=1 (see _require_azure_batch).
+
         Pre-flight budget guard: if the estimated cost (based on
         len(args_list), avg_task_seconds, pool max_nodes, vm_size) exceeds
         `budget_usd_cap`, refuses to submit unless `force=True`.
@@ -584,6 +596,7 @@ class BatchRunner:
             root to sys.path so custom user functions (e.g., outcome_fn)
             can be imported by the worker when unpickling.
         """
+        _require_azure_batch("submit tasks")
         self._require_config()
         from azure.batch import models as batch_models
         batch = self._batch_get()
@@ -989,6 +1002,23 @@ def _run_offline_self_test() -> int:
        f"{dd.estimated_usd / lp.estimated_usd:.2f}×")
 
     spec = PoolSpec(name="p-new", max_nodes=2)
+    # AB1 (F6 budget): Azure Batch is not billed through Coiled, so the owner-signed budget cannot see it; pools and
+    # tasks are refused unless MA_ALLOW_AZURE_BATCH=1
+    from unittest import mock as _mock
+    with _mock.patch.dict(os.environ, {"MA_ALLOW_AZURE_BATCH": ""}):
+        for label, fn, existing in (("a pool", lambda r: r.ensure_pool("p-new", max_nodes=2), set()),
+                                    ("tasks", lambda r: r.submit_function_tasks("p-old", _square, [2],
+                                                                                budget_usd_cap=100.0), {"p-old"})):
+            with _FakeAzure(existing_pools=existing) as fa:
+                r = fa.runner()
+                try:
+                    fn(r)
+                    refused = False
+                except SystemExit as e:
+                    refused = "MA_ALLOW_AZURE_BATCH" in str(e)
+                ok(refused and not any(c[0] in ("pool.add", "job.add", "task.add_collection") for c in fa.calls),
+                   f"AB1 {label}: refused unless MA_ALLOW_AZURE_BATCH=1, before any create call; calls {fa.calls}")
+    os.environ["MA_ALLOW_AZURE_BATCH"] = "1"     # the cases below test Batch itself
     # L1: success path deletes the pool this invocation created.
     with _FakeAzure() as fa:
         r = fa.runner()
