@@ -75,6 +75,92 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
     return buf.getvalue(), skipped
 
 
+REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
+
+
+def _has_secret(path: str, secrets: list[bytes]) -> bool:
+    """Chunked scan (with an overlap, so a secret across two chunks is found); memory stays bounded."""
+    keep = max((len(x) for x in secrets), default=0)
+    tail = b""
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(2**20), b""):
+            buf = tail + block
+            if any(x in buf for x in secrets):
+                return True
+            tail = buf[-keep:] if keep else b""
+    return False
+
+
+def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=()) -> list[str]:
+    """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, but a file over
+    REDACT_MAX_MB is streamed from disk and left out (listed) if it holds a secret. `extra`: (path, arcname) pairs
+    added as they are (run.log). Files that vanish while it runs are listed, not fatal. Returns what was left out."""
+    import io
+    import tarfile
+    sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
+    skipped = []
+    with tarfile.open(out_path, mode="w:gz") as t:
+        items = []
+        for dp, dirs, files in os.walk(root):
+            dirs.sort()
+            items += [(os.path.join(dp, fn), os.path.relpath(os.path.join(dp, fn), root)) for fn in sorted(files)]
+        for full, rel in items + [(p, None) for p, _ in extra]:
+            arc = os.path.join(arcname, rel) if rel is not None else dict(extra)[full]
+            try:
+                if rel is not None and (is_sensitive_path(rel) or os.path.islink(full)):
+                    skipped.append(rel)
+                    continue
+                size = os.path.getsize(full)
+                ti = tarfile.TarInfo(arc)
+                ti.mtime = int(os.path.getmtime(full))
+                if size <= REDACT_MAX_MB * 2**20:
+                    data = open(full, "rb").read()
+                    for x in sec:
+                        data = data.replace(x, b"<redacted>")
+                    ti.size = len(data)
+                    t.addfile(ti, io.BytesIO(data))
+                elif _has_secret(full, sec):
+                    skipped.append(rel or arc)
+                else:
+                    ti.size = size
+                    with open(full, "rb") as f:
+                        t.addfile(ti, f)
+            except FileNotFoundError:
+                skipped.append(rel or arc)
+    return skipped
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(2**20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def upload_file(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
+    """upload_retry with bounded memory: the file is streamed up and the read-back verified chunk by chunk."""
+    import time
+    want, size = sha256_file(path), os.path.getsize(path)
+    container, name = _split(blob)
+    last = None
+    for k in range(attempts):
+        try:
+            client = (service or _service(account)).get_blob_client(container, name)
+            with open(path, "rb") as f:
+                client.upload_blob(f, overwrite=True, length=size)
+            h = hashlib.sha256()
+            for block in client.download_blob().chunks():
+                h.update(block)
+            if h.hexdigest() != want:
+                raise RuntimeError(f"upload of {blob} did not verify")
+            return {"blob": blob, "bytes": size, "sha256": want}
+        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
+            last = e
+            time.sleep(2 ** k)
+    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
+
+
 def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
     import time
     last = None
@@ -223,6 +309,28 @@ def _self_test() -> int:
             fails.append(f"S7 a transient failure must be retried: {e}")
         finally:
             _t.sleep = _sleep
+
+        class _Stream(_Svc):        # the Azure call shapes upload_file uses: a stream with its length, chunks back
+            def get_blob_client(self, c, n):
+                st = self.store
+                return type("B", (), {
+                    "upload_blob": lambda _s, f, overwrite=False, length=None: st.__setitem__((c, n), f.read(length)),
+                    "download_blob": lambda _s: type("D", (), {"chunks": lambda _d: iter([st[(c, n)][:5],
+                                                                                         st[(c, n)][5:]])})()})()
+        sv = _Stream()
+        r = upload_file(p, "outputs/ck/r.tar.gz", service=sv)
+        if sv.store.get(("outputs", "ck/r.tar.gz")) != b"result bytes" or r["sha256"] != sha256_file(p):
+            fails.append(f"S8 upload_file streams the file and verifies the read-back by chunks: {r}")
+        big = os.path.join(ar, "models", "big.bin")
+        open(big, "wb").write(b"x" * 100 + b"sk-ant-SECRETSECRET123")
+        _max = globals()["REDACT_MAX_MB"]
+        globals()["REDACT_MAX_MB"] = 0       # every file counts as large: streamed, and left out if it holds a secret
+        try:
+            sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        if "models/big.bin" not in sk or "report.md" not in sk or "_truth/answers.yaml" not in sk:
+            fails.append(f"S9 write_archive leaves out large files holding a secret, and _truth/: {sk}")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

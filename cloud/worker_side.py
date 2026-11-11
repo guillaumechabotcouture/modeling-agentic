@@ -78,8 +78,9 @@ def _hold(d, hold_s, sleep=None, clock=None):
 
 
 def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5,
-                 timeout_s=None):
-    """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball."""
+                 timeout_s=None, on_start=None):
+    """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball.
+    `on_start(work)` is called once the work dir is unpacked, just before main.py starts (the checkpoint thread)."""
     import glob, io, os, shutil, subprocess, sys, tarfile, time, urllib.request
     work = f"{WORK}/{label}"
     shutil.rmtree(work, ignore_errors=True)
@@ -117,6 +118,11 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     t0 = time.time()
     log_path = os.path.join(work, "run.log")
     with open(log_path, "w") as log:
+        if on_start is not None:
+            try:
+                on_start(work)
+            except Exception as e:  # noqa: BLE001 -- checkpoints never stop the run
+                notes.append(f"checkpoints not started: {type(e).__name__}: {e}"[:200])
         returncode = _run_main([sys.executable, "main.py", question, "--max-rounds", str(max_rounds),
                                 "--max-sessions", str(max_sessions), *flags], work, env, log, timeout_s)
     runs = sorted(glob.glob(os.path.join(work, "runs", "*")), key=os.path.getmtime)
@@ -134,6 +140,210 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
             "notes": notes, "tarball": buf.getvalue()}
+
+
+# F6 run checkpoints (2026-11-11: a v2 preview stopped at its credit cap after 3 h; main.py stores the run only when
+# it ends, so its engine batches were lost). While main.py runs, the agent VM uploads its run dir every
+# checkpoint_minutes; `run_cluster.py <cfg> checkpoint` fetches the latest (module doc there: how to resume from it).
+CHECKPOINT_POLL_S = 10.0
+CKDIR = ".checkpoint"        # in the label's work dir, beside runs/: never inside the run dir it archives
+
+
+def checkpoint_blobs(prefix, launch_id, label):
+    """(tarball, record) of a label's latest checkpoint, under the launch that wrote it (as record_blob)."""
+    base = f"outputs/{prefix}/launch_{launch_id}/checkpoint_{label}"
+    return base + ".tar.gz", base + ".json"
+
+
+def checkpoint_summary(run_dir):
+    """run_state.json's state and round, and the engine batches kept in the run dir (a `<out>.summary.json` or the
+    `<out>.partial.jsonl` journal of an interrupted one, scripts/compute.py) with their ok rows."""
+    import json, os
+    out = {"run_state": None, "cached_batches": 0, "cached_rows": 0}
+    try:
+        st = json.load(open(os.path.join(run_dir, "run_state.json")))
+        out["run_state"] = {"state": st.get("state"), "round": st.get("round")}
+    except (OSError, ValueError, AttributeError):
+        pass
+    outs = set()
+    for dp, dirs, fns in os.walk(run_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(("_truth", ".git"))]
+        for f in fns:
+            for ext in (".summary.json", ".partial.jsonl"):
+                if f.endswith(ext) and (ext == ".partial.jsonl" or os.path.exists(os.path.join(dp, f[:-len(ext)]))):
+                    outs.add(os.path.join(dp, f[:-len(ext)]))
+    for o in outs:
+        rows = 0
+        for p in (o, o + ".partial.jsonl"):
+            try:
+                with open(p) as fh:
+                    rows += sum(1 for ln in fh if '"ok": true' in ln)
+            except OSError:
+                pass
+        out["cached_batches"] += 1
+        out["cached_rows"] += rows
+    return out
+
+
+def build_checkpoint(work, run_dir, out_path, store, secrets=()):
+    """The run dir as runs/<RUN>/... plus run.log, streamed to `out_path` through a temporary file (results_store
+    write_archive: no _truth/, no credential files, secrets redacted). Returns its record."""
+    import os, time
+    tmp = out_path + ".tmp"
+    log = os.path.join(work, "run.log")
+    skipped = store.write_archive(run_dir, os.path.join("runs", os.path.basename(run_dir)), tmp, list(secrets),
+                                  extra=[(log, "run.log")] if os.path.exists(log) else [])
+    os.replace(tmp, out_path)
+    return {"time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": time.time(),
+            "run_dir": os.path.basename(run_dir), "bytes": os.path.getsize(out_path),
+            "sha256": store.sha256_file(out_path), "skipped": skipped[:50], **checkpoint_summary(run_dir)}
+
+
+class Checkpointer:
+    """Uploads a checkpoint of the label's run dir every `interval_s` while main.py runs, and on request
+    (checkpoint_now_side). One upload at a time: a checkpoint due while the previous one still uploads is skipped.
+    Every failure is logged (<work>/.checkpoint/checkpoint.log) and never raised: checkpoints never stop the run.
+    The tarball goes up first, then its record (sha256): a reader that finds them out of step refuses, never
+    unpacks a mixed pair. Blob overwrite is atomic in Azure (a reader sees the old or the new blob, never part)."""
+
+    def __init__(self, label, work, prefix, launch_id, account, store, interval_s, secrets=(),
+                 poll_s=CHECKPOINT_POLL_S, log=None):
+        import os, threading, time
+        self.label, self.work, self.account, self.store = label, work, account, store
+        self.interval_s, self.poll_s, self.secrets, self.print = float(interval_s), poll_s, list(secrets), log or print
+        self.blobs, self.dir = checkpoint_blobs(prefix, launch_id, label), os.path.join(work, CKDIR)
+        self.done = self.failed = self.skipped = 0
+        self._busy, self._stop, self._thread, self._up = threading.Lock(), threading.Event(), None, None
+        self._last = time.time()
+        self.launch_id = launch_id
+
+    def log(self, msg):
+        import os, time
+        line = f"{time.strftime('%F %T')} checkpoint {self.label}: {msg}"
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(os.path.join(self.dir, "checkpoint.log"), "a") as f:
+                f.write(line + "\n")
+            self.print(line)
+        except Exception:  # noqa: BLE001 -- logging never stops the run
+            pass
+
+    def start(self):
+        import os, threading
+        os.makedirs(self.dir, exist_ok=True)
+        open(os.path.join(self.dir, "active"), "w").write(str(self.interval_s))
+        self._thread = threading.Thread(target=self._loop, daemon=True, name=f"ma-checkpoint-{self.label}")
+        self._thread.start()
+
+    def stop(self, timeout_s=5.0):
+        """Stop the timer; an upload in flight is left to finish in the background (main.py's own store follows)."""
+        import os
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout_s)
+        try:
+            os.remove(os.path.join(self.dir, "active"))
+        except OSError:
+            pass
+
+    def wait_idle(self, timeout_s):
+        if self._up is not None:
+            self._up.join(timeout_s)
+
+    def _loop(self):
+        import os, time
+        req = os.path.join(self.dir, "request")
+        while not self._stop.wait(self.poll_s):
+            try:
+                if os.path.exists(req):
+                    token = open(req).read().strip()
+                    os.remove(req)
+                    self.trigger("request", token)
+                elif time.time() - self._last >= self.interval_s:
+                    self.trigger("interval")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"timer error: {type(e).__name__}: {e}")
+
+    def trigger(self, why, token=None) -> bool:
+        """Start one checkpoint on its own thread; False (skipped) while the previous one is uploading."""
+        import threading, time
+        if not self._busy.acquire(blocking=False):
+            self.skipped += 1
+            self.log(f"{why}: skipped, the previous checkpoint is still uploading")
+            return False
+        self._last = time.time()
+        self._up = threading.Thread(target=self._upload, args=(why, token), daemon=True)
+        self._up.start()
+        return True
+
+    def _upload(self, why, token):
+        import glob, json, os
+        try:
+            runs = sorted(glob.glob(os.path.join(self.work, "runs", "*")), key=os.path.getmtime)
+            if not runs:
+                self.log(f"{why}: no run dir yet")
+                return
+            os.makedirs(self.dir, exist_ok=True)
+            tgz = os.path.join(self.dir, "checkpoint.tar.gz")
+            rec = build_checkpoint(self.work, runs[-1], tgz, self.store, self.secrets)
+            rec.update({"label": self.label, "launch_id": self.launch_id, "blob": self.blobs[0], "why": why,
+                        "request": token, "seq": self.done + 1})
+            self.store.upload_file(tgz, self.blobs[0], self.account)
+            rp = os.path.join(self.dir, "checkpoint.json")
+            json.dump(rec, open(rp + ".tmp", "w"), indent=1)
+            self.store.upload_file(rp + ".tmp", self.blobs[1], self.account)
+            os.replace(rp + ".tmp", rp)
+            self.done += 1
+            self.log(f"{why}: stored {rec['bytes']} bytes, {rec['cached_batches']} cached batches, "
+                     f"state {rec['run_state']} -> {self.blobs[0]}")
+        except Exception as e:  # noqa: BLE001 -- a failed checkpoint never stops the run
+            self.failed += 1
+            self.log(f"{why}: FAILED {type(e).__name__}: {str(e)[:300]}")
+            try:
+                json.dump({"request": token, "error": f"{type(e).__name__}: {e}"[:300]},
+                          open(os.path.join(self.dir, "error.json"), "w"))
+            except OSError:
+                pass
+        finally:
+            self._busy.release()
+
+
+def checkpoint_starter(label, prefix, launch_id, account, store, checkpoint_s, secrets=()):
+    """run_to_disk's on_start: a started Checkpointer kept in `box`, or None when checkpoints are off (0 / None)."""
+    if not checkpoint_s:
+        return None
+
+    def on_start(work):
+        on_start.box = Checkpointer(label, work, prefix, launch_id, account, store, checkpoint_s, secrets)
+        on_start.box.start()
+    on_start.box = None
+    return on_start
+
+
+def checkpoint_now_side(label, timeout_s=300.0, poll_s=2.0):
+    """client.run on the agent VM (`run_cluster.py <cfg> checkpoint-now`, launch_watch before a stop): ask the
+    running checkpoint thread for one checkpoint and wait for it, at most `timeout_s`."""
+    import json, os, time, uuid
+    d = f"{WORK}/{label}"
+    ck = os.path.join(d, CKDIR)
+    if os.path.exists(f"{d}/result.json"):
+        return {"state": "finished"}             # main.py ended: its own store (or the hold for collect) applies
+    if not os.path.exists(os.path.join(ck, "active")):
+        return {"state": "no checkpointer"}      # checkpoints off, or a launch from before them
+    token = uuid.uuid4().hex
+    open(os.path.join(ck, "request.tmp"), "w").write(token)
+    os.replace(os.path.join(ck, "request.tmp"), os.path.join(ck, "request"))
+    t_end = time.time() + timeout_s
+    while time.time() < t_end:
+        for name, state in (("checkpoint.json", "checkpointed"), ("error.json", "failed")):
+            try:
+                rec = json.load(open(os.path.join(ck, name)))
+            except (OSError, ValueError):
+                continue
+            if rec.get("request") == token:
+                return {"state": state, "record": rec}
+        time.sleep(poll_s)
+    return {"state": "timeout"}
 
 
 def run_stored(tarball):
@@ -185,11 +395,13 @@ def all_stored(store, prefix, account, labels, launch_id):
 
 
 def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
-                max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600):
+                max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600,
+                checkpoint_s=None):
     """The agent VM's task: run, store the run, its transcripts and its result
     record, then (last run of the launch) shut the cluster down. If any upload
     failed, hold the results on disk and stay busy until `collect` takes them:
-    an idle VM is the one an autoscaling pool retires first."""
+    an idle VM is the one an autoscaling pool retires first. While main.py runs,
+    a checkpoint of the run dir goes to storage every `checkpoint_s` (None: off)."""
     import io, json, os, re, subprocess, sys, tarfile, tempfile, time
     td = tempfile.mkdtemp()
     tarfile.open(fileobj=io.BytesIO(code), mode="r:gz").extractall(td)
@@ -203,8 +415,14 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     # Compute service: this VM's scheduler connection for the agent's batches; it takes no compute work itself.
     os.environ.update(compute.export_worker_env(os.path.join(os.path.expanduser("~"), ".ma_tls")))
     os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = get_worker().address
-    res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
-                       timeout_s=run_timeout_s)
+    ck = checkpoint_starter(label, prefix, launch_id, account, results_store, checkpoint_s,
+                            [anthropic_key, openai_key or ""])
+    try:
+        res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
+                           timeout_s=run_timeout_s, on_start=ck)
+    finally:
+        if ck is not None and ck.box is not None:
+            ck.box.stop()
     d = f"{WORK}/{label}"
     try:   # the CLI transcripts (per-stage cost and time) exist only on this VM
         blob, _ = results_store.archive_dir(os.path.expanduser("~/.claude/projects"), "transcripts",

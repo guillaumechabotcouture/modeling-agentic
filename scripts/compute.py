@@ -3541,10 +3541,11 @@ def _self_test_checkpoint_restore(ok) -> None:
         rd = os.path.join(td, "vm", "runs", "R_cp")
         os.makedirs(os.path.join(rd, "models"))
         os.makedirs(os.path.join(rd, "data"))
+        os.makedirs(os.path.join(rd, "analysis", "batch"))      # where the v2 engine batch keeps its rows
         open(os.path.join(rd, "models", "fn.py"), "w").write("def f(p):\n    return {'y': 3 * p['x']}\n")
         open(os.path.join(rd, "data", "u.csv"), "w").write("u\n1\n")
         inputs = [{"x": i} for i in range(3)]
-        done, cut = os.path.join(rd, "models", "done.jsonl"), os.path.join(rd, "models", "cut.jsonl")
+        done, cut = (os.path.join(rd, "analysis", "batch", x) for x in ("done.jsonl", "cut.jsonl"))
         _, s0 = run_map(rd, "models/fn.py::f", inputs, done, backend="local", max_workers=1, ledger=False)
         ok(s0.get("computed") == 3, f"CP0 setup: the batch computes 3 rows ({s0.get('computed')})")
         # an interrupted batch (the VM stopped mid-batch): its journal holds 2 of 4 rows
@@ -3563,12 +3564,13 @@ def _self_test_checkpoint_restore(ok) -> None:
         with _tf.open(tgz, mode="r:gz") as t:
             t.extractall(dest, filter="data")
         rd2 = os.path.join(dest, "runs", "R_cp")
-        _, s1 = run_map(rd2, "models/fn.py::f", inputs, os.path.join(rd2, "models", "done.jsonl"), backend="local",
+        bd2 = os.path.join(rd2, "analysis", "batch")
+        _, s1 = run_map(rd2, "models/fn.py::f", inputs, os.path.join(bd2, "done.jsonl"), backend="local",
                         max_workers=1, ledger=False)
         ok(s1.get("computed") == 0 and s1.get("reused") == 3,
            f"CP2 a restored run dir reuses every row of its finished batch: {s1.get('computed')} computed, "
            f"{s1.get('reused')} reused")
-        _, s2 = run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(4)], os.path.join(rd2, "models", "cut.jsonl"),
+        _, s2 = run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(4)], os.path.join(bd2, "cut.jsonl"),
                         backend="local", max_workers=1, ledger=False)
         ok(s2.get("computed") == 2 and s2.get("reused") == 2,
            f"CP3 an interrupted batch restored from a checkpoint keeps its journal's rows: {s2.get('computed')} "

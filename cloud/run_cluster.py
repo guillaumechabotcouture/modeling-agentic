@@ -23,6 +23,11 @@
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
+    python cloud/run_cluster.py <config.py> checkpoint [--label L]
+                                                              # the latest checkpoint of the latest launch, sha256
+                                                              # verified, into <out_dir>/<label>/checkpoint/
+    python cloud/run_cluster.py <config.py> checkpoint-now [--timeout-s 300]
+                                                              # one checkpoint from each running run, awaited
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
                                                               # Coiled credits per useful core-hour (billing API only)
@@ -42,6 +47,26 @@ If an upload fails, the agent VM holds the results on disk and stays busy
 (up to 24 h) until `collect` fetches them, after which `collect` shuts the
 cluster down. Nothing waits on a laptop: E7 attempt 7 sat idle 9.5 h after
 its results were stored because the launcher waited for a manual collect.
+
+Checkpoints (F6, 2026-11-11: a v2 preview stopped at its credit cap after 3 h had stored nothing, because main.py
+stores the run only when it ends). While main.py runs, the agent VM uploads a tarball of the run dir (runs/<RUN>/...
+and run.log; never _truth/ or credential files; API keys redacted) every `checkpoint_minutes` (default 15, 0 off) to
+outputs/<storage_prefix>/launch_<id>/checkpoint_<label>.tar.gz, then its record checkpoint_<label>.json (time,
+size, sha256, run_state state and round, cached engine batches and rows). Each upload overwrites the last; one at a
+time (a checkpoint due while the previous one uploads is skipped); a failure is logged on the VM
+(/tmp/ab/<label>/.checkpoint/checkpoint.log) and never stops the run. `collect` says when a label has only a
+checkpoint. Resuming from one:
+  1. `run_cluster.py <cfg> checkpoint [--label L]`: <out_dir>/<L>/checkpoint/runs/<RUN>/ and checkpoint.json
+     (refused when the tarball's sha256 is not the record's: run it again).
+  2. Put the run dir into the launch tree at runs/<RUN> and commit it there (`git add -f runs/<RUN>`: runs/ is
+     gitignored, and a launch ships `git archive HEAD`); a resume config sets require_main=False and
+     flags=("--resume", "runs/<RUN>").
+  3. `run_cluster.py <resume cfg> reuse-check <out_dir>/<L>/checkpoint/runs/<RUN> --expect-all`: the shipped code
+     reuses every stored engine row (scripts/compute.py reuse path: `<out>.summary.json` rows and the
+     `<out>.partial.jsonl` journal of a batch the stop interrupted); then launch (or launch_watch.py).
+  Engine rows survive the round trip only where the fingerprint does: a file over 64 MB under models/ or data/ is
+  fingerprinted by size and mtime (ns), which neither the tarball (whole seconds) nor git archive keeps, and a
+  symlink there is not archived: either one changes every batch's fingerprint. reuse-check (step 3) shows it.
 
 Exit codes of `launch` (and `relaunch`), for a watchdog. Once a run is submitted the launch is never
 reported as failed, because the run keeps going whatever happens to this process (F5 resume launch,
@@ -153,6 +178,8 @@ class RunConfig:
     # Coiled's cluster_timeout (coiled.Cluster(cluster_timeout=...), "40 minutes"): a cluster is shut down that long
     # after it starts, busy or not. "" for none (a real run's length is not known in advance)
     cluster_timeout: str = ""
+    # F6 run checkpoints: while main.py runs, the agent VM uploads its run dir every checkpoint_minutes (0: off)
+    checkpoint_minutes: float = 15.0
 
     def __post_init__(self):
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
@@ -172,6 +199,8 @@ class RunConfig:
             raise ValueError("set the pipeline with pipeline='v1' or 'v2', not flags: the launcher passes it to main.py")
         for f in ("scale_down_after", "adapt_interval", "overflow_hold") + (("target_duration",) if self.target_duration else ()):
             seconds(getattr(self, f))   # fail at load, not on the keeper VM
+        if not self.checkpoint_minutes >= 0:
+            raise ValueError("checkpoint_minutes must be 0 (off) or positive")
         if seconds(self.adapt_interval) <= 0:
             raise ValueError("adapt_interval must be positive")
         if self.overflow_max and not self.overflow_vm_types:
@@ -536,7 +565,8 @@ def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=Non
                         cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
                         workers=[worker], allow_other_workers=False, pure=False, key=key,
                         run_timeout_s=cfg.run_timeout_hours * 3600 if cfg.run_timeout_hours else None,
-                        hold_s=cfg.hold_hours * 3600)
+                        hold_s=cfg.hold_hours * 3600,
+                        checkpoint_s=cfg.checkpoint_minutes * 60 if cfg.checkpoint_minutes else None)
     fire_and_forget(fut)
     return key, fut
 
@@ -1261,6 +1291,71 @@ def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = N
     return meta
 
 
+def checkpoint_record(cfg, store, label, launch_id) -> dict | None:
+    """The record of `label`'s latest checkpoint in launch `launch_id` (worker_side.Checkpointer), or None."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            store.download(ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label)[1], os.path.join(td, "r.json"),
+                           cfg.storage_account)
+            rec = json.load(open(os.path.join(td, "r.json")))
+        except Exception:  # noqa: BLE001 -- none stored (or unreadable): no checkpoint to report
+            return None
+    return rec if isinstance(rec, dict) else None
+
+
+def fetch_checkpoint(cfg, store, label) -> dict:
+    """`checkpoint`: the latest checkpoint of the latest launch (assignments.json) into <out_dir>/<label>/checkpoint/
+    with its record (checkpoint.json). The tarball must match the record's sha256, else it is removed and refused
+    (a checkpoint replaced between the two downloads: run `checkpoint` again). An earlier copy is moved aside."""
+    import hashlib
+    launch_id = json.load(open(cfg.state_file))[label]["launch_id"]
+    rec = checkpoint_record(cfg, store, label, launch_id)
+    if rec is None:
+        raise SystemExit(f"{label}: no checkpoint stored for launch {launch_id}")
+    base = os.path.join(cfg.out_dir, label)
+    os.makedirs(base, exist_ok=True)
+    tgz = os.path.join(base, "checkpoint.tar.gz")
+    store.download(ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label)[0], tgz, cfg.storage_account)
+    h = hashlib.sha256()
+    with open(tgz, "rb") as f:
+        for b in iter(lambda: f.read(2**20), b""):
+            h.update(b)
+    if h.hexdigest() != rec.get("sha256"):
+        os.remove(tgz)
+        raise SystemExit(f"{label}: the checkpoint tarball's sha256 {h.hexdigest()[:12]} is not its record's "
+                         f"{str(rec.get('sha256'))[:12]} (replaced while downloading?): removed; run `checkpoint` again")
+    dest = os.path.join(base, "checkpoint")
+    if os.path.exists(dest):
+        os.rename(dest, f"{dest}.before_{int(time.time())}")
+    with tarfile.open(tgz, mode="r:gz") as t:
+        t.extractall(dest, filter="data")
+    json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
+    print(f"{label}: checkpoint of {rec.get('time_utc')} (state {rec.get('run_state')}, {rec.get('cached_batches')} "
+          f"cached batches, {rec.get('bytes')} bytes, sha256 verified) -> {dest}/runs/{rec.get('run_dir')}")
+    return rec
+
+
+def checkpoint_now(cfg, timeout_s: float = 300.0) -> int:
+    """`checkpoint-now`: one checkpoint from each running label's checkpoint thread, awaited at most `timeout_s`
+    (launch_watch before a stop). Attach-only. 0 when every label checkpointed or had finished."""
+    try:   # sent by value: the agent VM's uploaded worker_side may predate this function
+        import cloudpickle
+        cloudpickle.register_pickle_by_value(ws)
+    except ImportError:
+        pass
+    assign = json.load(open(cfg.state_file))
+    client, good = attach(cfg.name).get_client(), True
+    for label in cfg.labels:
+        try:
+            r = _on_worker(client, ws.checkpoint_now_side, label, timeout_s, worker=assign[label]["worker"])
+        except Exception as e:  # noqa: BLE001 -- reported; the caller decides
+            r = {"state": f"unavailable ({type(e).__name__}: {str(e)[:120]})"}
+        good = good and r["state"] in ("checkpointed", "finished")
+        print(f"{label}: {r['state']} {(r.get('record') or {}).get('blob') or ''}".rstrip(), flush=True)
+    return 0 if good else 1
+
+
 def local_is_current(dest: str, launch_id: str) -> bool | None:
     """True: dest holds this launch's collected run; False: an earlier launch's
     (set aside before collecting); None: nothing collected yet."""
@@ -1331,9 +1426,15 @@ def collect(cfg, shutdown_after: bool = True):
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
+            ck = checkpoint_record(cfg, results_store, label, assign[label]["launch_id"])
+            ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
+                       f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
+                       if ck else "")
             if not running:
-                print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped")
+                print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped{ck_note}")
                 continue
+            if ck_note:
+                print(f"{label}: no final result yet{ck_note}")
         if client is None:
             client = attach(cfg.name).get_client()
         w = assign[label]["worker"]
@@ -3601,7 +3702,7 @@ def _self_test_checkpoint(ok) -> None:
         finally:
             c4.stop()
     ok(none.get("state") == "no checkpointer" and now_.get("state") == "checkpointed"
-       and (now_.get("record") or {}).get("blob") == tar_blob,
+       and (now_.get("record") or {}).get("blob") == ws.checkpoint_blobs("runs/t", "L1", "S")[0],
        f"CK9 checkpoint-now: one checkpoint from the running thread, awaited; none without one: {none} {now_}")
     # fetch on the laptop: sha256 verified, extracted under <out_dir>/<label>/checkpoint/
     out = tempfile.mkdtemp()
@@ -3910,6 +4011,13 @@ def main(argv) -> int:
         status(cfg)
     elif cmd == "collect":
         collect(cfg, shutdown_after="--no-shutdown" not in rest)
+    elif cmd == "checkpoint":
+        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
+        import results_store
+        for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
+            fetch_checkpoint(cfg, results_store, label)
+    elif cmd == "checkpoint-now":
+        return checkpoint_now(cfg, float(rest[rest.index("--timeout-s") + 1]) if "--timeout-s" in rest else 300.0)
     elif cmd == "shutdown":
         shutdown(cfg)
     elif cmd == "relaunch":
