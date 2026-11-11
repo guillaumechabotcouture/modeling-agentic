@@ -3707,9 +3707,9 @@ def _self_test_checkpoint(ok) -> None:
         """results_store's archive helpers, uploads into a dict (optionally failing or blocking)."""
         write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
 
-        def __init__(self, fail=False, gate=None, fail_on=None):
+        def __init__(self, fail=False, gate=None, fail_on=None, raise_after=None):
             self.files, self.fail, self.gate, self.uploads, self.downloads = {}, fail, gate, [], []
-            self.fail_on = fail_on
+            self.fail_on, self.raise_after = fail_on, raise_after
 
         def upload_file(self, path, blob, account=None):
             if self.gate is not None:
@@ -3718,6 +3718,8 @@ def _self_test_checkpoint(ok) -> None:
                 raise OSError("storage unreachable")
             self.files[blob] = open(path, "rb").read()
             self.uploads.append(blob)
+            if self.raise_after and self.raise_after(blob):     # committed, then the read-back fails
+                raise RuntimeError(f"upload of {blob} did not verify")
             return {"blob": blob, "bytes": len(self.files[blob])}
 
         def download(self, blob, path, account=None):
@@ -3995,9 +3997,20 @@ def _self_test_checkpoint(ok) -> None:
     need_log = ws.disk_needed(big_dir, os.path.join(big_dir, "small.txt"))
     os.remove(os.path.join(big_dir, "big.bin"))
     ok(need >= 2.2 * (10 * 2**30 + 10 * 2**30 + 1000) + 2 * 2**30
-       and need_log == need + 1000,
-       f"CK22 (Codex round 2 P2-3) a 10 GiB incompressible file needs 2.2 x (largest + run dir) + run.log + 2 GB "
-       f"free: {need / 2**30:.1f} GiB")
+       and abs(need_log - (need + 2.2 * 1000)) < 1,
+       f"CK22 (Codex round 2 P2-3) a 10 GiB incompressible file needs 2.2 x (largest + run dir) + 2 GB free, "
+       f"run.log counted as a file: {need / 2**30:.1f} GiB")
+    small_dir = os.path.join(tempfile.mkdtemp(), "R_s")
+    os.makedirs(small_dir)
+    open(os.path.join(small_dir, "a.txt"), "w").write("a")
+    big_log = os.path.join(os.path.dirname(small_dir), "run.log")
+    with open(big_log, "wb") as f:
+        f.truncate(10 * 2**30)
+    need_b = ws.disk_needed(small_dir, big_log)
+    os.remove(big_log)
+    ok(need_b >= 2.2 * (2 * 10 * 2**30) + 2 * 2**30,
+       f"CK22b (Codex round 3 P2-4) a 10 GiB run.log beside a small run dir counts twice (its copy and the archive): "
+       f"{need_b / 2**30:.1f} GiB")
     # Codex round 2 P2-4: a request whose checkpoint is skipped or fails is retried within retry_s, not at the next
     # interval
     wd3 = os.path.join(tempfile.mkdtemp(), "Q")
@@ -4046,6 +4059,96 @@ def _self_test_checkpoint(ok) -> None:
        and "A: unavailable" in b5.getvalue(),
        f"CK24 (Codex round 2 P2-5) with worker A unresponsive, B is requested at once and the call ends at its "
        f"deadline: B at {sa.when.get('B', 99) - t0:.2f}s, took {took:.1f}s {b5.getvalue()!r}")
+    # Codex round 3 P1-2: a pointer upload that may have committed protects its generation
+    wd9 = os.path.join(tempfile.mkdtemp(), "P")
+    os.makedirs(os.path.join(wd9, "runs", "R_p"))
+    open(os.path.join(wd9, "runs", "R_p", "a.txt"), "w").write("a")
+    ptr9 = ws.checkpoint_pointer("runs/t", "L1", "P")
+    g9 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "P", k)  # noqa: E731
+    st9 = Store()
+    c9 = ws.Checkpointer("P", wd9, "runs/t", "L1", None, st9, 3600, log=lambda m: None)
+    for k in range(3):
+        st9.raise_after = (lambda blob: blob == ptr9) if k else None
+        c9.trigger("t")
+        c9.wait_idle(10)
+    p9 = json.loads(st9.files[ptr9])
+    out9 = tempfile.mkdtemp()
+    cfg9 = RunConfig(name="t", question_file="q", out_dir=out9, labels=("P",), storage_prefix="runs/t")
+    json.dump({"P": {"launch_id": "L1", "worker": "w"}}, open(cfg9.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            f9 = fetch_checkpoint(cfg9, st9, "P").get("generation")
+    except SystemExit as e:
+        f9 = f"refused: {e}"
+    ok(c9.failed == 2 and p9.get("generation") == 3 and p9.get("previous") == 2 and g9(3)[0] in st9.files
+       and g9(2)[0] in st9.files and f9 == 3,
+       f"CK25 (Codex round 3 P1-2) two pointer uploads that committed, then failed their read-back: the generations "
+       f"they name are kept and fetchable: pointer {p9.get('generation')}/{p9.get('previous')} fetch {f9} "
+       f"{sorted(st9.files)}")
+    st9.raise_after = None
+    c9.trigger("t")
+    c9.wait_idle(10)
+    p9 = json.loads(st9.files[ptr9])
+    ok(p9.get("generation") == 4 and p9.get("previous") == 3 and g9(3)[0] in st9.files and g9(1)[0] not in st9.files,
+       f"CK25b the next success names g4 and g3; only older generations are retired: {sorted(st9.files)}")
+    # Codex round 3 P2-3: generations without a pointer: the newest complete one is adopted as the base
+    st10 = Store()
+    g10 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "N", k)  # noqa: E731
+    st10.files[g10(1)[0]] = b"tar one"
+    st10.files[g10(1)[1]] = json.dumps({"generation": 1, "sha256": hashlib.sha256(b"tar one").hexdigest()}).encode()
+    st10.files[g10(2)[0]] = b"tar two, its record never written"
+    wd10 = os.path.join(tempfile.mkdtemp(), "N")
+    os.makedirs(os.path.join(wd10, "runs", "R_n"))
+    open(os.path.join(wd10, "runs", "R_n", "a.txt"), "w").write("a")
+    c10 = ws.Checkpointer("N", wd10, "runs/t", "L1", None, st10, 3600, log=lambda m: None)
+    c10.trigger("t")
+    c10.wait_idle(10)
+    p10 = json.loads(st10.files.get(ws.checkpoint_pointer("runs/t", "L1", "N"), b"{}"))
+    ok(c10.done == 1 and p10.get("generation") == 3 and p10.get("previous") == 1 and st10.files[g10(1)[0]] == b"tar one",
+       f"CK26 (Codex round 3 P2-3) generations but no pointer (the VM died before the first): the newest complete one "
+       f"is the base, and checkpoints go on: {p10.get('generation')}/{p10.get('previous')}")
+
+    class Unreadable(Store):
+        def download(self, blob, path, account=None):
+            if blob.endswith("checkpoint_U.json"):
+                raise PermissionError("pointer unreadable")
+            return super().download(blob, path, account)
+    st11 = Unreadable()
+    st11.files[ws.checkpoint_pointer("runs/t", "L1", "U")] = b"{}"
+    st11.files[ws.checkpoint_blobs("runs/t", "L1", "U", 1)[0]] = b"t"
+    before11 = dict(st11.files)
+    c11 = ws.Checkpointer("U", wd10, "runs/t", "L1", None, st11, 3600, log=lambda m: None)
+    c11.trigger("t")
+    c11.wait_idle(10)
+    ok(c11.failed == 1 and st11.files == before11,
+       "CK26b a pointer that exists but cannot be read: no checkpoint, nothing numbered or deleted")
+    # Codex round 3 P2-5: each request counts its own tries; exhausting one drops only that one
+    c12 = ws.Checkpointer("Z", wd10, "runs/t", "L1", None, Store(), 3600, log=lambda m: None)
+    c12._requeue({"old": (1.0, ws.MAX_REQUEST_TRIES), "new": (2.0, 0)}, "failed")
+    ok(set(c12.pending) == {"new"} and c12.pending["new"][1] == 1,
+       f"CK27 (Codex round 3 P2-5) an exhausted request is dropped; one that arrived meanwhile keeps its tries: "
+       f"{c12.pending}")
+    # Codex round 3 note: the deadline is checked before every blocking call, with no grace after it
+    labels30 = tuple(f"L{k}" for k in range(30))
+    out13 = tempfile.mkdtemp()
+    cfg13 = RunConfig(name="t", question_file="q", out_dir=out13, labels=labels30)
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in labels30}, open(cfg13.state_file, "w"))
+    json.dump({"run": {"name": "t", "id": 77}, "launch_id": "L1", "invocation": "tok"}, open(cfg13.clusters_file, "w"))
+
+    class Fast:
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            return {workers[0]: {"state": "requested", "token": "T", "epoch": 1.0}}
+
+    class Hanging(Store):
+        def download(self, blob, path, account=None):
+            _time.sleep(2)
+            raise FileNotFoundError(blob)
+    t0 = _time.time()
+    with contextlib.redirect_stdout(io.StringIO()):
+        r28 = checkpoint_now(cfg13, timeout_s=0.3, store=Hanging(), connect=lambda c, cid: Fast(), poll_s=0.1)
+    took = _time.time() - t0
+    ok(r28 == 1 and took < 1.0,
+       f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
 
 
 def _self_test() -> int:

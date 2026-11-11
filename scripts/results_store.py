@@ -433,6 +433,24 @@ def _self_test() -> int:
             fails.append(f"S15 a run dir that is a link (into _truth/) is refused: archived {names} {sk}")
         except OSError:
             pass
+        # Codex round 3 P1-1: a link in a parent of the run dir (work/runs -> _truth/) is refused from the trusted base
+        work = os.path.join(d, "work3")
+        os.makedirs(os.path.join(ar, "_truth", "R"))
+        open(os.path.join(ar, "_truth", "R", "answers.yaml"), "w").write("secret answer\n")
+        os.makedirs(work)
+        os.symlink(os.path.join(ar, "_truth"), os.path.join(work, "runs"))
+        try:
+            write_archive(os.path.join(work, "runs", "R"), "runs/R", out, base=work)
+            fails.append(f"S16 a parent link (work/runs -> _truth/) is refused: archived "
+                         f"{_tf.open(out, mode='r:gz').getnames()}")
+        except OSError:
+            pass
+        os.remove(os.path.join(work, "runs"))
+        os.makedirs(os.path.join(work, "runs", "R"))
+        open(os.path.join(work, "runs", "R", "ok.txt"), "w").write("ok\n")
+        write_archive(os.path.join(work, "runs", "R"), "runs/R", out, base=work)
+        if _tf.open(out, mode="r:gz").getnames() != ["runs/R/ok.txt"]:
+            fails.append("S16b real directories under the trusted base are archived")
         sv.store[("outputs", "ck/x")] = b"x"
         sv.get_blob_client = lambda c, n: type("B", (), {"delete_blob": lambda _s: sv.store.pop((c, n))})()
         delete("outputs/ck/x", service=sv)
