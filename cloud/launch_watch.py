@@ -1072,6 +1072,14 @@ def _self_test() -> int:
                      for e in (NotImplementedError("stub"), RuntimeError("x")) for w in ("launch_budget_ok", "job_meter"))
          and refused({"budget_scope": "f6"}, EXIT_BUDGET, budget=_no_module)
          and refused({"budget_scope": ""}, EXIT_BUDGET, budget=_FakeBudget()))
+    case("LW25a", "two failed spend readings, then one that reads: no stop (the watch goes on to its limit)",
+         lambda: (lambda r: r[0] == EXIT_LIMIT and stops(r[1]) == [])(
+             scenario(0, record, running, api=_MeterFlaky(2), max_hours=0.5)))
+    case("LW25b", "three failed spend readings in a row count as the cap: final checkpoint, then the stops, exit 11",
+         lambda: (lambda r: r[0] == EXIT_UNREADABLE and sorted(stops(r[1])) == [100, 101, 102]
+                  and r[1].index(("run", "checkpoint-now")) < r[1].index(("stop", min(stops(r[1]))))
+                  and "collect" in runs(r[1]))(
+             scenario(0, record, running, api=_MeterFlaky(99), max_hours=5.0)))
     case("LW23", "--cap-usd is required; the credit cap and its ratio are gone",
          lambda: all(_raises(lambda a=a: _quiet(main, ["launch_watch.py", "cfg.py", *a]), SystemExit)
                      for a in ([], ["--cap", "650"], ["--cap-usd", "80", "--usd-per-credit", "0.1"],
@@ -1187,6 +1195,20 @@ class _Both(_FakeApi):
 class _MeterFails(_FakeApi):
     def usd_of(self, cid):
         raise OSError("cluster details unavailable")
+
+
+class _MeterFlaky(_FakeApi):
+    """The run cluster's reading fails the first `n` times, then reads $0."""
+    def __init__(self, n):
+        super().__init__()
+        self.n, self.k = n, 0
+
+    def usd_of(self, cid):
+        if cid == 100:
+            self.k += 1
+            if self.k <= self.n:
+                raise OSError("cluster details unavailable")
+        return 0.0
 
 
 class _Growing(_Billed):
