@@ -1,16 +1,21 @@
 """Launch one config with `cloud/run_cluster.py` and watch it to the end (F6 Stage 2).
 
-    python cloud/launch_watch.py <config.py> [--cap CREDITS] [--interval S] [--start-minutes M]
-                                 [--max-hours H] [--credits-per-instance-hour C] [--allow-no-cloud-limits]
+    python cloud/launch_watch.py <config.py> --cap-usd USD [--interval S] [--start-minutes M]
+                                 [--max-hours H] [--allow-no-cloud-limits] [--allow-no-checkpoints]
                                  [--cap-collect-minutes M] [--launch-minutes M] [--relaunch-attempts N]
-                                 [--collect-minutes M] [--collect-attempts N]
-                                 [--cap-usd USD [--usd-per-credit R]] [--checkpoint-minutes M]
+                                 [--collect-minutes M] [--collect-attempts N] [--checkpoint-minutes M]
     python cloud/launch_watch.py --self-test
 
 Replaces the local, per-launch watchdog scripts (F5, 2026-11-04 to 11-09). Every name (cluster, keeper, overflow
 pool, labels, out_dir) comes from the config. It runs `run_cluster.py <config> launch` itself, with
 MA_LAUNCH_INVOCATION set to a fresh token, then:
 
+  0. Before the launch (owner, 2026-11-11: these rules are code, not judgment). A v2 config needs
+     0 < checkpoint_minutes <= 30, else exit 9; --allow-no-checkpoints lifts that only when run_timeout_hours <= 0.5
+     (a smoke). Then cloud/budget.py's launch_budget_ok(the config's budget_scope, the config's cap_usd if set else
+     --cap-usd, name=the config's name) must admit the launch, and its job_meter(scope) is the spend estimator for
+     the cap below; a refusal, a missing module, the stub's NotImplementedError or any error: exit 10, nothing
+     launched.
   1. The launcher's exit code (run_cluster.py module doc). 0, 3, 4, 5: something was submitted, so nothing is
      stopped; it watches. On 5, or 3 with no keeper in clusters.json, it logs that the keeper is not confirmed and
      must be started by hand; it never runs `keeper` itself (its reconcile stops live helpers absent from this
@@ -23,14 +28,13 @@ MA_LAUNCH_INVOCATION set to a fresh token, then:
      with the launch id of this invocation's assignments; `collect` fetches from storage, or from the agent VM when
      the upload failed). Only then does it stop, by id, whatever of this launch is still live. `status` can print
      "done ... stored=None" while the agent VM holds the only copy: unconfirmed, nothing is stopped (exit 4).
-  3. A credit cap (--cap, default 650): billed credits of this launch's clusters (by id from clusters.json) plus,
-     per live recorded cluster, its live instances (Coiled's cluster details: scheduler and workers; else the
-     configured maximum: run 1 + labels + compute_max, overflow 1 + overflow_max, keeper 2) x hours since the launch
-     x --credits-per-instance-hour (Coiled bills an instance when it stops). At the cap it makes one collect attempt
+  3. A spend cap in dollars (--cap-usd, required; the config's cap_usd when it is lower). Every interval, the spend
+     of this launch is cloud/budget.py's estimator summed over the cluster ids clusters.json records: per cluster the
+     larger of billed (total_cost credits x $0.061 + cloud_total_cost) and its conservative per-instance estimate,
+     the same numbers the budget counts. A reading that fails is "unknown" and never a stop. At the cap it makes a
+     final checkpoint and one collect attempt
      bounded by --cap-collect-minutes (default 10), then stops every cluster of the launch by id: the one case where
      stopping without a confirmed collect is right. The cap and --max-hours are also checked between collect retries.
-     --cap-usd gives the cap in dollars instead, converted at --usd-per-credit (default 0.124, measured 2026-11-11:
-     Coiled bills the Azure VM cost on top of credits x $0.061); the log gives credits in both.
      Checkpoints (F6): before the stops at the cap, and at --max-hours (where nothing is stopped), it asks every
      running run for one final checkpoint (`run_cluster.py <cfg> checkpoint-now`, bounded by --checkpoint-minutes,
      default 5; a failure or timeout never delays the stop) and its exit message names the checkpoint blobs. To
@@ -40,7 +44,7 @@ MA_LAUNCH_INVOCATION set to a fresh token, then:
      invocation creating that id. Any other one (name and time alone) is reported and never stopped.
   5. It refuses a config without cloud-side limits (run_timeout_hours None or cluster_timeout empty) unless
      --allow-no-cloud-limits is given: a watchdog on a laptop is not the only bound on spend.
-  6. Network errors (DNS, TLS, timeouts) are retried; an unreadable status, listing or billing reading is
+  6. Network errors (DNS, TLS, timeouts) are retried; an unreadable status, listing or spend reading is
      "unknown", never "not running", and never leads to a stop.
 A label that stays "missing" (its VM never started the run) for --start-minutes gets a `relaunch <label>`
 (run_cluster.py refuses it while the scheduler holds the task); a relaunch counts only when it exits 0 or 4, else it
@@ -64,13 +68,15 @@ Exit codes:
   0 every run collected and confirmed for this launch, and no cluster of the launch left live
   1 the launch failed before submitting anything (this invocation's failed record's ids stopped, or nothing)
   2 a run never started, even after one relaunch (nothing stopped: check and shut down by hand)
-  3 credit cap reached: clusters stopped by id (a collect was attempted first)
+  3 spend cap reached: clusters stopped by id (a final checkpoint and a collect were attempted first)
   4 stored or collected state not confirmed: the run cluster is left up (the agent VM may hold the only copy);
     run `collect` again
   5 every run collected, but a cluster of the launch is still listed live after the stop requests
   6 the watch reached --max-hours (default run_timeout_hours + hold_hours + 1): nothing stopped
   7 refused: the config has no cloud-side limits (see 5 above)
   8 refused: a cluster of the config's names is live before the launch, or the listing could not be read
+  9 refused: a v2 config without checkpoints (checkpoint_minutes 0 or over 30), outside a smoke
+  10 refused by the budget (cloud/budget.py), or the budget check or its meter is unavailable
 """
 from __future__ import annotations
 
@@ -97,23 +103,26 @@ _NET = re.compile(r"gaierror|nodename nor servname|name resolution|Name or servi
                   r"Network is unreachable|RemoteDisconnected|CommClosedError|StreamClosedError|Max retries exceeded")
 
 
-# Coiled bills the Azure VM cost on top of credits x $0.061: measured 2026-11-11, dollars per credit all in
-USD_PER_CREDIT = 0.124
-CAP_CREDITS = 650.0
+EXIT_NO_CHECKPOINTS, EXIT_BUDGET = 9, 10
+MAX_CHECKPOINT_MINUTES, SMOKE_HOURS = 30.0, 0.5
 
 # ---- decisions (pure) -----------------------------------------------------------------------
 
-def cap_credits(cap, cap_usd, usd_per_credit):
-    """(the credit cap, a log line naming it in credits and dollars) from --cap or --cap-usd (not both)."""
-    if not usd_per_credit > 0:
-        raise ValueError("--usd-per-credit must be positive")
-    if cap is not None and cap_usd is not None:
-        raise ValueError("give --cap (credits) or --cap-usd, not both")
-    if cap_usd is not None:
-        c = round(cap_usd / usd_per_credit, 1)
-        return c, f"cap ${cap_usd:.2f} = {c} credits at ${usd_per_credit}/credit"
-    c = CAP_CREDITS if cap is None else cap
-    return c, f"cap {c} credits (~${c * usd_per_credit:.2f} at ${usd_per_credit}/credit)"
+def checkpoint_refusal(cfg, allow_no_checkpoints=False):
+    """Why a v2 config may not be launched for lack of checkpoints, or None. A v2 run needs checkpoint_minutes in
+    (0, 30]; --allow-no-checkpoints lifts it only for a smoke (run_timeout_hours <= 0.5)."""
+    m = getattr(cfg, "checkpoint_minutes", None)
+    if cfg.pipeline != "v2" or (m and 0 < m <= MAX_CHECKPOINT_MINUTES):
+        return None
+    if allow_no_checkpoints and cfg.run_timeout_hours is not None and cfg.run_timeout_hours <= SMOKE_HOURS:
+        return None
+    return (f"{cfg.name}: checkpoint_minutes is {m!r}; a v2 run needs 0 < checkpoint_minutes <= "
+            f"{MAX_CHECKPOINT_MINUTES:g} (--allow-no-checkpoints only with run_timeout_hours <= {SMOKE_HOURS})")
+
+
+def _load_budget():
+    import budget                # cloud/budget.py: the owner-signed budget and its spend estimator (PR #192)
+    return budget
 
 
 def refuse_reason(cfg, allow_no_limits=False):
@@ -219,14 +228,11 @@ def instance_count(details):
     return sum(1 for w in procs if isinstance(w, dict) and rc.ws.state_of(w) not in ("stopped", "error", ""))
 
 
-def projected_credits(billed, counts, hours, rate) -> float:
-    return float(billed) + sum(counts) * max(hours, 0.0) * rate
-
-
 # ---- the watch (I/O through an injected runner and Coiled API) --------------------------------
 
 class CoiledApi:
-    """The Coiled calls the watch makes: the listing, a stop by id, the billing events. Bounded in time."""
+    """The Coiled calls the watch makes: the listing and a stop by id, bounded in time. Spend is read through
+    cloud/budget.py's meter, not here."""
     def list_clusters(self):
         import coiled
         return rc._items(rc._bounded(lambda: coiled.list_clusters(workspace=rc.WORKSPACE), timeout_s=120))
@@ -234,13 +240,6 @@ class CoiledApi:
     def stop(self, name, cid, why):
         import vm_job
         rc._bounded(vm_job._stop_by_id, name, cid, why, timeout_s=120)
-
-    def billing(self, start, end):
-        return rc._bounded(rc.billing_events, start, end, timeout_s=300)
-
-    def instances(self, cid):
-        from coiled.v2 import cluster_details
-        return instance_count(rc._bounded(lambda: cluster_details(cid, workspace=rc.WORKSPACE), timeout_s=120))
 
 
 def shell_runner(cfg_path, prefix=None):
@@ -285,17 +284,18 @@ def shell_runner(cfg_path, prefix=None):
 
 class Watch:
     def __init__(self, cfg, cfg_path, token, runner, api, clock, sleep, cap_usd=650.0, interval_s=300.0,
-                 start_s=300.0, max_hours=None, rate=8.0, allow_no_limits=False, retries=6, retry_s=60.0,
+                 start_s=300.0, max_hours=None, allow_no_limits=False, retries=6, retry_s=60.0,
                  cap_collect_s=600.0, launch_s=2700.0, relaunch_attempts=3, collect_s=1800.0, collect_attempts=6,
-                 checkpoint_s=300.0, usd_per_credit=USD_PER_CREDIT):
-        self.checkpoint_s, self.usd = checkpoint_s, usd_per_credit
+                 checkpoint_s=300.0, allow_no_checkpoints=False, budget=None):
+        self.checkpoint_s, self.allow_no_ck = checkpoint_s, allow_no_checkpoints
+        self.budget, self.meter, self.asked_cap = budget, None, cfg.cap_usd if cfg.cap_usd else cap_usd
         self.cfg, self.cfg_path, self.token, self.runner, self.api = cfg, cfg_path, token, runner, api
-        self.clock, self.sleep, self.cap, self.interval_s, self.start_s = clock, sleep, cap, interval_s, start_s
+        # the watch never stops later than the config allows: the smaller of --cap-usd and the config's cap_usd
+        self.cap = min(cap_usd, cfg.cap_usd) if cfg.cap_usd else cap_usd
+        self.clock, self.sleep, self.interval_s, self.start_s = clock, sleep, interval_s, start_s
         self.max_hours = max_hours if max_hours is not None else (cfg.run_timeout_hours or 48.0) + cfg.hold_hours + 1
-        self.rate, self.allow, self.retries, self.retry_s = rate, allow_no_limits, retries, retry_s
+        self.allow, self.retries, self.retry_s = allow_no_limits, retries, retry_s
         self.names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
-        self.max_sizes = {"run": 1 + len(cfg.labels) + cfg.compute_max, "overflow": 1 + (cfg.overflow_max or 0),
-                          "keeper": 2}                     # the fallback when Coiled gives no live count
         self.cap_collect_s, self.launch_s, self.relaunch_attempts = cap_collect_s, launch_s, relaunch_attempts
         self.collect_s, self.collect_attempts, self.lines = collect_s, collect_attempts, []
         self.env = {**os.environ, "MA_LAUNCH_INVOCATION": token}
@@ -341,6 +341,14 @@ class Watch:
         if why:
             self.log(f"refused: {why}")
             return EXIT_REFUSED
+        why = checkpoint_refusal(self.cfg, self.allow_no_ck)
+        if why:
+            self.log(f"refused: {why}; nothing launched")
+            return EXIT_NO_CHECKPOINTS
+        why = self.budget_refusal()
+        if why:
+            self.log(f"refused by the budget: {why}; nothing launched")
+            return EXIT_BUDGET
         items = None
         for i in range(self.retries):
             items = self.safe(self.api.list_clusters)
@@ -387,15 +395,13 @@ class Watch:
                 return code
             rec = self.record()
             if rec is None:
-                self.log("clusters.json is not this invocation's: no sweep, no credit cap, no stop by id")
+                self.log("clusters.json is not this invocation's: no sweep, no spend cap, no stop by id")
             items = self.safe(self.api.list_clusters) if rec else None
             if items is not None:
                 self.sweep(rec, items)
-                credits = self.credits(rec, items)
-                self.log("credits (billed + projected): " + (f"{credits} (~${credits * self.usd:.2f})"
-                                                             if credits is not None else "unknown"))
-                if credits is not None and credits >= self.cap:
-                    return self.at_cap(rec)
+            usd = self.spend(rec) if rec else None          # every interval, whatever the listing did
+            if usd is not None and usd >= self.cap:
+                return self.at_cap(rec)
             code, out = self.call(["status"])
             st = parse_status(out, self.cfg.labels) if code == 0 else None
             act = decide(st)
@@ -448,22 +454,39 @@ class Watch:
             self.safe(self.api.stop, name, cid, "stray cluster (attach race)")
         self.pending_strays = found          # each stray is stopped on every sighting after its first
 
-    def credits(self, rec, items):
-        roles, t0 = recorded(rec), rc._ts(rec.get("launched_utc"))
-        if t0 is None:
+    def budget_refusal(self):
+        """None when the owner-signed budget admits this launch, else why. Asks cloud/budget.py's
+        launch_budget_ok(scope, the config's cap_usd if set else --cap-usd, name) and takes its spend estimator
+        (job_meter) for the cap; a missing module, the stub's NotImplementedError or any error refuses."""
+        try:
+            b = self.budget if self.budget is not None else _load_budget
+            b = b() if callable(b) and not hasattr(b, "launch_budget_ok") else b
+            self.budget = b
+            scope = self.cfg.budget_scope or (b.scope_for_name(self.cfg.name) if hasattr(b, "scope_for_name") else "")
+            if not scope:
+                return f"{self.cfg.name}: no budget_scope in the config"
+            ok, why = b.launch_budget_ok(scope, self.asked_cap, name=self.cfg.name)
+            if not ok:
+                return why
+            self.meter = b.job_meter(scope)
+        except Exception as e:  # noqa: BLE001 -- ImportError, NotImplementedError (the stub), anything else
+            return f"budget check unavailable ({type(e).__name__}: {str(e)[:160]})"
+        self.log(f"budget: {why}; this watch stops at ${self.cap:.2f}")
+        return None
+
+    def spend(self, rec, items=None):
+        """Dollars this launch has cost so far: cloud/budget.py's estimator (max of billed, total_cost x $0.061 +
+        cloud_total_cost, and its conservative per-instance estimate) summed over the cluster ids clusters.json
+        records; None (unknown: never a stop) when any reading fails."""
+        try:
+            parts = {role: float(self.meter(v["id"])) for role, v in recorded(rec).items()}
+        except Exception as e:  # noqa: BLE001
+            self.log(f"spend: unknown ({type(e).__name__}: {str(e)[:120]})")
             return None
-        events = self.safe(self.api.billing, rec["launched_utc"],
-                           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())))
-        if events is None:
-            return None
-        billed = sum(v["credits"] for v in rc.summarize_billing(events, roles).values())
-        live = {x.get("id") for x in rc._items(items) if _live(x)}
-        counts = []
-        for role, v in roles.items():
-            if v["id"] in live:
-                n = self.safe(self.api.instances, v["id"])
-                counts.append(n if isinstance(n, int) else self.max_sizes.get(role, 1))
-        return round(projected_credits(billed, counts, (self.clock() - t0) / 3600, self.rate), 1)
+        total = round(sum(parts.values()), 2)
+        self.log(f"spend: ${total:.2f} of cap ${self.cap:.2f} ("
+                 + ", ".join(f"{r} ${u:.2f}" for r, u in sorted(parts.items())) + ")")
+        return total
 
     def collected(self):
         """(every label collected for this launch, the labels that are not)."""
@@ -526,10 +549,10 @@ class Watch:
         if self.over_limit():
             self.collect_guard_code = self.leave(rec, EXIT_LIMIT)
         elif rec is not None:
-            credits = self.credits(rec, self.safe(self.api.list_clusters) or [])
-            if credits is not None and credits >= self.cap:
-                self.log(f"credit cap {self.cap} reached ({credits}) during the collect attempts: stopping by id")
-                if not self.stop_all(rec, f"credit cap {self.cap}"):
+            usd = self.spend(rec)
+            if usd is not None and usd >= self.cap:
+                self.log(f"spend cap ${self.cap:.2f} reached (${usd:.2f}) during the collect attempts: stopping by id")
+                if not self.stop_all(rec, f"spend cap ${self.cap:.2f}"):
                     self.log("a cluster of this launch may still be live after the stop requests")
                 self.collect_guard_code = EXIT_CAP
         return self.collect_guard_code
@@ -547,14 +570,14 @@ class Watch:
                 "checkpoint`" if paths else "no launch id recorded: no checkpoint path")
 
     def at_cap(self, rec) -> int:
-        self.log(f"credit cap {self.cap} reached: a final checkpoint (at most {self.checkpoint_s} s), one collect (at "
-                 f"most {self.cap_collect_s} s), then stopping every cluster of this launch by id")
+        self.log(f"spend cap ${self.cap:.2f} reached: a final checkpoint (at most {self.checkpoint_s} s), one collect "
+                 f"(at most {self.cap_collect_s} s), then stopping every cluster of this launch by id")
         where = self.final_checkpoint(rec)
         code, out = self.call(["collect", "--no-shutdown"], retries=1, timeout=self.cap_collect_s)
         self.log(f"collect exit {code}: {str(out).strip()[-300:]}; collected: {self.collected()}")
-        if not self.stop_all(rec, f"credit cap {self.cap}"):
+        if not self.stop_all(rec, f"spend cap ${self.cap:.2f}"):
             self.log("a cluster of this launch may still be live after the stop requests: check the listing")
-        self.log(f"exit {EXIT_CAP} (credit cap): {where}")
+        self.log(f"exit {EXIT_CAP} (spend cap): {where}")
         return EXIT_CAP
 
 
@@ -1212,36 +1235,32 @@ def main(argv) -> int:
         import no_cloud
         with no_cloud.refusing():          # no cloud call from a self-test (cloud/no_cloud.py)
             return _self_test()
-    p = argparse.ArgumentParser(prog="launch_watch.py", description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="launch_watch.py", description=__doc__.split("\n")[0], allow_abbrev=False)
     p.add_argument("config")
-    p.add_argument("--cap", type=float, default=None, help=f"credit cap for this launch (default {CAP_CREDITS:g})")
-    p.add_argument("--cap-usd", type=float, default=None, help="the cap in dollars instead (see --usd-per-credit)")
-    p.add_argument("--usd-per-credit", type=float, default=USD_PER_CREDIT,
-                   help=f"dollars per credit, Azure VM cost included (default {USD_PER_CREDIT}, measured 2026-11-11)")
+    p.add_argument("--cap-usd", type=float, required=True,
+                   help="spend cap for this launch in dollars (required; the config's cap_usd, if lower, wins)")
     p.add_argument("--checkpoint-minutes", type=float, default=5.0,
                    help="the final checkpoint before a stop at the cap or the watch limit")
     p.add_argument("--interval", type=float, default=300.0, help="seconds between status checks")
     p.add_argument("--start-minutes", type=float, default=5.0, help="a run missing this long gets a relaunch")
     p.add_argument("--max-hours", type=float, default=None)
-    p.add_argument("--credits-per-instance-hour", type=float, default=8.0)
     p.add_argument("--allow-no-cloud-limits", action="store_true")
+    p.add_argument("--allow-no-checkpoints", action="store_true",
+                   help="launch a v2 config without checkpoints: only with run_timeout_hours <= 0.5 (smokes)")
     p.add_argument("--cap-collect-minutes", type=float, default=10.0, help="the collect attempt at the cap")
     p.add_argument("--launch-minutes", type=float, default=45.0, help="deadline of the launch subprocess")
     p.add_argument("--relaunch-attempts", type=int, default=3)
     p.add_argument("--collect-minutes", type=float, default=30.0, help="deadline of each collect attempt")
     p.add_argument("--collect-attempts", type=int, default=6)
     a = p.parse_args(argv[1:])
-    try:
-        cap, note = cap_credits(a.cap, a.cap_usd, a.usd_per_credit)
-    except ValueError as e:
-        p.error(str(e))
+    if not a.cap_usd > 0:
+        p.error("--cap-usd must be positive")
     cfg = rc.load_config(a.config)
     token = f"watch-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(3)}"
-    print(f"{time.strftime('%F %T')} {cfg.name}: {note}", flush=True)
     return Watch(cfg, a.config, token, shell_runner(os.path.abspath(a.config)), CoiledApi(), time.time, time.sleep,
-                 cap=cap, usd_per_credit=a.usd_per_credit, checkpoint_s=a.checkpoint_minutes * 60,
+                 cap_usd=a.cap_usd, checkpoint_s=a.checkpoint_minutes * 60, allow_no_checkpoints=a.allow_no_checkpoints,
                  interval_s=a.interval, start_s=a.start_minutes * 60, max_hours=a.max_hours,
-                 rate=a.credits_per_instance_hour, allow_no_limits=a.allow_no_cloud_limits,
+                 allow_no_limits=a.allow_no_cloud_limits,
                  cap_collect_s=a.cap_collect_minutes * 60, launch_s=a.launch_minutes * 60,
                  relaunch_attempts=a.relaunch_attempts, collect_s=a.collect_minutes * 60,
                  collect_attempts=a.collect_attempts).run()

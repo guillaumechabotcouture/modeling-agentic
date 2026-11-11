@@ -192,6 +192,10 @@ class RunConfig:
     cluster_timeout: str = ""
     # F6 run checkpoints: while main.py runs, the agent VM uploads its run dir every checkpoint_minutes (0: off)
     checkpoint_minutes: float = 15.0
+    # F6 launch enforcement: the owner-signed budget scope this launch spends from (cloud/budget.py), and the
+    # launch's own spend cap in dollars (cloud/launch_watch.py never watches to a higher one)
+    budget_scope: str = ""
+    cap_usd: float | None = None
 
     def __post_init__(self):
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
@@ -217,6 +221,8 @@ class RunConfig:
             raise ValueError("adapt_interval must be positive")
         if self.overflow_max and not self.overflow_vm_types:
             raise ValueError("overflow_max needs overflow_vm_types")
+        if self.cap_usd is not None and not (isinstance(self.cap_usd, (int, float)) and self.cap_usd > 0):
+            raise ValueError("cap_usd must be a positive number of dollars when set")
         if self.compute_start < 1 and (self.compute_env or {}).get("MA_COMPUTE_RESOURCE"):
             raise ValueError("compute_start must be at least 1 when compute tasks need a resource tag "
                              "(MA_COMPUTE_RESOURCE): with no tagged worker the autoscaler's target stays at the "
