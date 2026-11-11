@@ -1,0 +1,62 @@
+# Upper-bound USD per instance-hour for live Coiled instances (cloud/budget.py). A running instance counts
+# hours x max(the scope's measured median rate, this bound). A VM type not listed here refuses every launch
+# (fail closed): add it before using it. budget.py's self-test (BR18) checks that every VM type named in cloud/,
+# cloud/configs/ and scripts/compute.py, and every type seen on our clusters (budget.OBSERVED_VM_TYPES), is here.
+#   bound = usd_per_hour x margin + vcpu x credits_per_vcpu_hour x 0.061 (USD per Coiled credit)
+# usd_per_hour: Azure pay-as-you-go Linux list prices (US regions, approximate, 2026), per vCPU-hour: Dv5 and Dsv5
+# $0.048, Dasv5 $0.043, Esv5 $0.063, Easv5 $0.0565, Edsv5 $0.072. coiled 1.135.6 states no per-instance credit
+# charge in its source. Evidence from our own records (read-only, 2026-11-11): the P6 cluster, 25 x Standard_E8s_v5
+# workers + 1 x Standard_D2_v5 scheduler for about 2.6 h, billed 510.3 credits (about 1.0 credit per vCPU-hour)
+# and cloud_total_cost $32.11 (about list price x hours). So credits_per_vcpu_hour 1.5 and margin 1.25 sit about
+# 50% and 25% above what was billed.
+margin: 1.25
+credits_per_vcpu_hour: 1.5
+types:
+  Standard_D2_v5:      {vcpu: 2, usd_per_hour: 0.096}
+  Standard_D4_v5:      {vcpu: 4, usd_per_hour: 0.192}
+  Standard_D8_v5:      {vcpu: 8, usd_per_hour: 0.384}
+  Standard_D16_v5:     {vcpu: 16, usd_per_hour: 0.768}
+  Standard_D32_v5:     {vcpu: 32, usd_per_hour: 1.536}
+  Standard_D48_v5:     {vcpu: 48, usd_per_hour: 2.304}
+  Standard_D64_v5:     {vcpu: 64, usd_per_hour: 3.072}
+  Standard_D96_v5:     {vcpu: 96, usd_per_hour: 4.608}
+  Standard_D2s_v5:     {vcpu: 2, usd_per_hour: 0.096}
+  Standard_D4s_v5:     {vcpu: 4, usd_per_hour: 0.192}
+  Standard_D8s_v5:     {vcpu: 8, usd_per_hour: 0.384}
+  Standard_D16s_v5:    {vcpu: 16, usd_per_hour: 0.768}
+  Standard_D32s_v5:    {vcpu: 32, usd_per_hour: 1.536}
+  Standard_D48s_v5:    {vcpu: 48, usd_per_hour: 2.304}
+  Standard_D64s_v5:    {vcpu: 64, usd_per_hour: 3.072}
+  Standard_D96s_v5:    {vcpu: 96, usd_per_hour: 4.608}
+  Standard_D2as_v5:    {vcpu: 2, usd_per_hour: 0.086}
+  Standard_D4as_v5:    {vcpu: 4, usd_per_hour: 0.172}
+  Standard_D8as_v5:    {vcpu: 8, usd_per_hour: 0.344}
+  Standard_D16as_v5:   {vcpu: 16, usd_per_hour: 0.688}
+  Standard_D32as_v5:   {vcpu: 32, usd_per_hour: 1.376}
+  Standard_D48as_v5:   {vcpu: 48, usd_per_hour: 2.064}
+  Standard_D64as_v5:   {vcpu: 64, usd_per_hour: 2.752}
+  Standard_D96as_v5:   {vcpu: 96, usd_per_hour: 4.128}
+  Standard_E2s_v5:     {vcpu: 2, usd_per_hour: 0.126}
+  Standard_E4s_v5:     {vcpu: 4, usd_per_hour: 0.252}
+  Standard_E8s_v5:     {vcpu: 8, usd_per_hour: 0.504}
+  Standard_E16s_v5:    {vcpu: 16, usd_per_hour: 1.008}
+  Standard_E32s_v5:    {vcpu: 32, usd_per_hour: 2.016}
+  Standard_E48s_v5:    {vcpu: 48, usd_per_hour: 3.024}
+  Standard_E64s_v5:    {vcpu: 64, usd_per_hour: 4.032}
+  Standard_E96s_v5:    {vcpu: 96, usd_per_hour: 6.048}
+  Standard_E2as_v5:    {vcpu: 2, usd_per_hour: 0.113}
+  Standard_E4as_v5:    {vcpu: 4, usd_per_hour: 0.226}
+  Standard_E8as_v5:    {vcpu: 8, usd_per_hour: 0.452}
+  Standard_E16as_v5:   {vcpu: 16, usd_per_hour: 0.904}
+  Standard_E32as_v5:   {vcpu: 32, usd_per_hour: 1.808}
+  Standard_E48as_v5:   {vcpu: 48, usd_per_hour: 2.712}
+  Standard_E64as_v5:   {vcpu: 64, usd_per_hour: 3.616}
+  Standard_E96as_v5:   {vcpu: 96, usd_per_hour: 5.424}
+  Standard_E2ds_v5:    {vcpu: 2, usd_per_hour: 0.144}
+  Standard_E4ds_v5:    {vcpu: 4, usd_per_hour: 0.288}
+  Standard_E8ds_v5:    {vcpu: 8, usd_per_hour: 0.576}
+  Standard_E16ds_v5:   {vcpu: 16, usd_per_hour: 1.152}
+  Standard_E32ds_v5:   {vcpu: 32, usd_per_hour: 2.304}
+  Standard_E48ds_v5:   {vcpu: 48, usd_per_hour: 3.456}
+  Standard_E64ds_v5:   {vcpu: 64, usd_per_hour: 4.608}
+  Standard_E96ds_v5:   {vcpu: 96, usd_per_hour: 6.912}
