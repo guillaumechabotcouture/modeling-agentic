@@ -153,8 +153,18 @@ class RunConfig:
     # Coiled's cluster_timeout (coiled.Cluster(cluster_timeout=...), "40 minutes"): a cluster is shut down that long
     # after it starts, busy or not. "" for none (a real run's length is not known in advance)
     cluster_timeout: str = ""
+    # F6 Stage 2 (2026-11-11: $106 spent of a $100 budget): the most this launch may spend, required to launch;
+    # `launch` refuses unless the owner-signed budget of `budget_scope` covers the scope's spend plus it
+    # (cloud/budget.py). budget_scope defaults to the scope whose prefix `name` has (cloud/budget_scopes.yaml).
+    cap_usd: float | None = None
+    budget_scope: str = ""
 
     def __post_init__(self):
+        if self.cap_usd is not None and (isinstance(self.cap_usd, bool) or not isinstance(self.cap_usd, (int, float))
+                                         or not self.cap_usd > 0 or self.cap_usd == float("inf")):
+            raise ValueError(f"cap_usd must be a positive number of USD, not {self.cap_usd!r}")
+        if not self.budget_scope:
+            self.budget_scope = _default_scope(self.name)
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
         self.out_dir = self.out_dir or os.path.expanduser(f"~/modeling-agentic-keep/{self.name}")
         self.labels, self.flags, self.required_files = tuple(self.labels), tuple(self.flags), tuple(self.required_files)
@@ -223,6 +233,29 @@ def adapt_options(cfg, base: dict) -> dict:
     if cfg.target_duration:
         out["target_duration"] = cfg.target_duration
     return out
+
+
+def _default_scope(name) -> str:
+    """The budget scope whose prefix `name` has, or "" (then `launch` refuses)."""
+    try:
+        import budget
+        return budget.scope_for_name(name) or ""
+    except Exception:  # noqa: BLE001 -- an unreadable scopes file: no scope, and the launch refuses
+        return ""
+
+
+def budget_guard(cfg) -> None:
+    """Refuse the launch (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope
+    covers the scope's spend plus it (cloud/budget.py)."""
+    import budget
+    if cfg.cap_usd is None:
+        raise SystemExit(f"{cfg.name}: the config sets no cap_usd: refusing (a launch states the most it may spend)")
+    if not cfg.budget_scope:
+        raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name)
+    if not ok:
+        raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
+    print(f"budget: {why}", flush=True)
 
 
 def load_config(path: str) -> RunConfig:
@@ -724,6 +757,7 @@ def _launch_locked(cfg, inv) -> int:
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
+    budget_guard(cfg)                             # before any key is read or cluster created
     keys = read_keys()
     compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
