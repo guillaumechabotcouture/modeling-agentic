@@ -768,6 +768,27 @@ def _self_test() -> int:
                "BK6d the same issued time with another nonce is refused")
         case("BK6", bk6)
 
+        def bk7():
+            import pty
+            import select
+            res = []
+            for typed in (b"50\n", b"49\n"):
+                m, sl = pty.openpty()
+                try:
+                    os.write(m, typed)
+                    got = _confirm_on_tty({"scope": "f6", "usd": 50.0, "note": "x"}, tty=os.ttyname(sl))
+                    out = b""
+                    while select.select([m], [], [], 0.2)[0]:
+                        out += os.read(m, 4096)
+                finally:
+                    os.close(m)
+                    os.close(sl)
+                res.append((got, b"Type the amount" in out))
+            ok(res == [(True, True), (False, True)],
+               f"BK7 on a real pseudo-terminal the prompt is written and the typed amount read; a different amount "
+               f"is not a confirmation: {res}")
+        case("BK7", bk7)
+
         def bg7():
             for fn in (launch_budget_ok, spend, job_meter):
                 ps = inspect.signature(fn).parameters
@@ -825,6 +846,8 @@ def _self_test() -> int:
                                     ("an unknown VM type", 2, lambda x: x["scheduler"]["instance"].__setitem__(
                                         "instance_type_id", "vmZ")),
                                     ("a negative cost", 1, lambda x: x.__setitem__("total_cost", -5)),
+                                    ("an invalid creation time", 1, lambda x: x.__setitem__("created", "garbage")),
+                                    ("no creation time", 1, lambda x: x.__setitem__("created", None)),
                                     ("no cost on a stopped cluster", 1, lambda x: x.__setitem__("cloud_total_cost",
                                                                                                 None))):
                 bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
@@ -835,6 +858,17 @@ def _self_test() -> int:
                 ok(refused(lambda: spend("f6")) is not None
                    and not launch_budget_ok("f6", 1, "lw-smoke-z")[0], f"BR9 {label} refuses")
         case("BR8-9", bg8)
+
+        def bg8d():
+            it = items + [_item(8, "lw-smoke-olderr", T0 - 5 * H, "error", T0 - 4 * H)]
+            de = {**dets, 8: _det(8, "lw-smoke-olderr", T0 - 5 * H, 0, 0, state="error",
+                                  insts=[(T0 - 5 * H, None, "vmA")])}
+            with_env(env(r8, source=_FakeSource(it, de)))
+            by = {c["id"]: c for c in spend("f6")["clusters"]}
+            ok(8 in by and abs(by[8]["usd"] - 55.5) < 1e-9,
+               f"BR8d an errored cluster that predates the window but still has a live VM counts from the start: "
+               f"{by.get(8)}")
+        case("BR8d", bg8d)
 
         def bg10():
             seen = {}
@@ -881,24 +915,53 @@ def _self_test() -> int:
         case("BR11", bg11)
 
         def bg12():
-            r = signed("k12", usd=expect + 60)
-            src = _FakeSource(items, dets)
+            r = signed("k12", usd=100.0)
+            src = _FakeSource([], {})
             with_env(env(r, source=src))
-            a = launch_budget_ok("f6", 50, "lw-smoke-new")
-            b = launch_budget_ok("f6", 50, "lw-smoke-two")
-            ok(a[0] and not b[0] and "reserved $50.00" in b[1],
-               f"BR12 a fitting launch reserves its cap, so a concurrent one sees it: {b[1]}")
-            src.items = items + [_item(9, "lw-smoke-new-abc123", clock[0], "running", clock[0])]
-            src.det = {**dets, 9: _det(9, "lw-smoke-new-abc123", clock[0], None, None, "running",
-                                            insts=[(clock[0], None, "vmA")])}
-            c = launch_budget_ok("f6", 50, "lw-smoke-two", reserve=False)
-            ok(c[0], f"BR12b once the reserved cluster is listed, its real spend counts instead of the cap: {c[1]}")
-            src.items, src.det = items, dets
-            launch_budget_ok("f6", 50, "lw-smoke-three")
+            t = clock[0]
+
+            def run(cid, name, credits, cloud, live=True):
+                src.items = [x for x in src.items if x["id"] != cid] + [
+                    _item(cid, name, t + 10, "running" if live else "stopped", t + 20)]
+                src.det[cid] = _det(cid, name, t + 10, credits, cloud, "running" if live else "stopped",
+                                    insts=[(t + 10, None if live else t + 20, "vmA")])
+            a = launch_budget_ok("f6", 80, "lw-smoke-a")
+            run(20, "lw-smoke-a-1f2e3d", None, None)
+            b = launch_budget_ok("f6", 80, "lw-smoke-b", reserve=False)
+            ok(a[0] and not b[0] and "reserved $80.00" in b[1],
+               f"BR12 A's $80 cap, listed at $0, still holds $80, so B's $80 is refused under $100: {b[1]}")
+            run(20, "lw-smoke-a-1f2e3d", 0, 30.0)
+            c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (20, 21))
+            ok(c1 and not c2, "BR12b a listed cluster's reservation counts max(0, cap - its measured spend)")
+            run(21, "lw-smoke-a-1f2e3d-keeper", 0, 10.0)
+            c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (20, 21))
+            ok(c1 and not c2, "BR12c the launch's helpers (named after it) count toward its reservation")
+            run(20, "lw-smoke-a-1f2e3d", 0, 30.0, live=False)
+            g = launch_budget_ok("f6", 50, "lw-smoke-b", reserve=False)
+            run(21, "lw-smoke-a-1f2e3d-keeper", 0, 10.0, live=False)
+            c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (60, 61))
+            ok(not g[0] and c1 and not c2,
+               f"BR12d the reservation is held while any of its clusters runs and released once all are stopped: {g[1]}")
+            launch_budget_ok("f6", 50, "lw-smoke-c")
             clock[0] += RESERVATION_S + 1
-            e = launch_budget_ok("f6", 50, "lw-smoke-four", reserve=False)
+            e = launch_budget_ok("f6", 10, "lw-smoke-d", reserve=False)
             clock[0] -= RESERVATION_S + 1
-            ok("reserved $0.00" in e[1], f"BR12c a reservation with no cluster lapses after 2 h: {e[1]}")
+            ok("reserved $0.00" in e[1], f"BR12e a reservation with no cluster lapses after 2 h: {e[1]}")
+            led = _ENV.reservations
+            good = open(led).read()
+            for label, doc in (("a non-list root", {"reservations": json.loads(good)}),
+                               ("an entry without its cap", [{"scope": "f6", "name": "lw-smoke-x", "invocation": "i",
+                                                              "time": t}])):
+                json.dump(doc, open(led, "w"))
+                v = launch_budget_ok("f6", 1, "lw-smoke-y", reserve=False)
+                ok(not v[0] and "fail" in v[1] and refused(lambda: spend("f6")) is not None,
+                   f"BR12f a malformed reservations ledger refuses ({label}): {v[1][:80]}")
+            open(led, "w").write(good)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = main(["status"])
+            ok(os.path.basename(os.path.dirname(led)) == "reservations" and code == 0 and "budget f6" in out.getvalue(),
+               f"BR12g the ledger lives in reservations/, so a default `status` does not read it as a budget: {code}")
         case("BR12", bg12)
 
         def bg13():
