@@ -196,7 +196,7 @@ def build_checkpoint(work, run_dir, out_path, store, secrets=()):
     log = os.path.join(work, "run.log")
     try:
         skipped = store.write_archive(run_dir, os.path.join("runs", os.path.basename(run_dir)), tmp, list(secrets),
-                                      extra=[(log, "run.log")] if os.path.exists(log) else [])
+                                      extra=[(log, "run.log")] if os.path.exists(log) else [], base=work)
         os.replace(tmp, out_path)
     finally:
         if os.path.exists(tmp):
@@ -209,18 +209,19 @@ def build_checkpoint(work, run_dir, out_path, store, secrets=()):
 def disk_needed(run_dir, log=None):
     """Free bytes a checkpoint needs while it is built (Codex round 2): the archive being written (up to the run
     dir's size, incompressible data does not shrink) beside the temporary copy of the file being added (up to the
-    largest), with a 2.2 margin on both, plus run.log, plus DISK_SPARE for the run itself."""
+    largest), with a 2.2 margin on both, plus DISK_SPARE for the run itself. run.log is archived the same way (a
+    copy, then its compressed bytes), so it counts as one of the files (Codex round 3)."""
     import os
-    total = largest = 0
+    sizes = []
     for dp, _, fns in os.walk(run_dir):
         for fn in fns:
             try:
-                s = os.lstat(os.path.join(dp, fn)).st_size
+                sizes.append(os.lstat(os.path.join(dp, fn)).st_size)
             except OSError:
                 continue
-            total, largest = total + s, max(largest, s)
-    log_b = os.lstat(log).st_size if log and os.path.exists(log) else 0
-    return DISK_FACTOR * (largest + total) + log_b + DISK_SPARE
+    if log and os.path.exists(log):
+        sizes.append(os.lstat(log).st_size)
+    return DISK_FACTOR * (max(sizes, default=0) + sum(sizes)) + DISK_SPARE
 
 
 class Checkpointer:
@@ -242,7 +243,7 @@ class Checkpointer:
         self.prefix, self.launch_id, self.dir = prefix, launch_id, os.path.join(work, CKDIR)
         self.free_bytes = free_bytes or (lambda p: __import__("shutil").disk_usage(p).free)
         self.done = self.failed = self.skipped = 0
-        self.gen, self.pending, self.retry_s, self.tries, self._retry_at = 0, {}, retry_s, 0, 0.0
+        self.gen, self.pending, self.retry_s, self._retry_at = 0, {}, retry_s, 0.0
         self._busy, self._stop, self._thread, self._up = threading.Lock(), threading.Event(), None, None
         self._plock = threading.Lock()
         self._last = time.time()
@@ -290,22 +291,24 @@ class Checkpointer:
             except (OSError, ValueError):
                 continue
             with self._plock:
-                self.pending[str(r.get("token"))] = float(r.get("epoch") or 0)
+                self.pending[str(r.get("token"))] = (float(r.get("epoch") or 0), 0)    # (epoch, tries)
 
     def _requeue(self, tokens, why):
-        """A checkpoint that was skipped or failed keeps its requests: retried after retry_s, a bounded number of
-        times."""
+        """A checkpoint that was skipped or failed keeps its requests: each counts its own tries and is retried after
+        retry_s; one past MAX_REQUEST_TRIES is dropped alone (Codex round 3)."""
         import time
         if not tokens:
             return
         with self._plock:
-            for k, v in tokens.items():
-                self.pending.setdefault(k, v)
-            self.tries += 1
-            if self.tries > MAX_REQUEST_TRIES:
-                self.log(f"requests {sorted(self.pending)} dropped after {MAX_REQUEST_TRIES} tries ({why})")
-                self.pending, self.tries = {}, 0
-            else:
+            dropped = []
+            for k, (epoch, tries) in tokens.items():
+                if tries + 1 >= MAX_REQUEST_TRIES:
+                    dropped.append(k)
+                else:
+                    self.pending.setdefault(k, (epoch, tries + 1))
+            if dropped:
+                self.log(f"requests {dropped} dropped after {MAX_REQUEST_TRIES} tries ({why})")
+            if self.pending:
                 self._retry_at = time.time() + self.retry_s
 
     def _loop(self):
@@ -336,25 +339,51 @@ class Checkpointer:
         return True
 
     def _stored(self):
-        """(the pointer or None, the generation numbers stored) for this launch and label. A listing that fails, or
-        generations without a readable pointer, raise: nothing is numbered or deleted on a guess."""
-        import json, os, re
+        """(the pointer or None, the generation numbers stored) for this launch and label. A listing that fails, or a
+        pointer that is listed but cannot be read, raise: nothing is numbered or deleted on a guess. With no pointer
+        (a VM lost before its first was published), the newest complete generation (its tarball matches its
+        record's sha256) stands in for it (Codex round 3)."""
+        import re
         ptr_blob = checkpoint_pointer(self.prefix, self.launch_id, self.label)
-        base = ptr_blob[:-len(".json")] + "_g"
-        gens = {int(m.group(1)) for b in self.store.list_blobs(base, self.account)
-                for m in [re.match(re.escape(base) + r"(\d+)\.(tar\.gz|json)$", b["name"])] if m}
-        p = os.path.join(self.dir, "pointer.json.tmp")
+        stem = ptr_blob[:-len(".json")]
+        names = {b["name"] for b in self.store.list_blobs(stem, self.account)}
+        gens = {int(m.group(1)) for n in names for m in [re.match(re.escape(stem) + r"_g(\d+)\.(tar\.gz|json)$", n)] if m}
+        if ptr_blob in names:
+            ptr = self._read_json(ptr_blob)
+            if not isinstance(ptr, dict):
+                raise RuntimeError(f"the pointer {ptr_blob} is stored but cannot be read")
+            return ptr, gens
+        for k in sorted(gens, reverse=True):
+            tar_b, json_b = checkpoint_blobs(self.prefix, self.launch_id, self.label, k)
+            rec = self._read_json(json_b) if json_b in names and tar_b in names else None
+            if isinstance(rec, dict) and rec.get("sha256") and rec.get("sha256") == self._remote_sha(tar_b):
+                self.log(f"no pointer: generation {k} is the newest complete one, adopted as the base")
+                return {"generation": k, "previous": None}, gens
+        return None, gens
+
+    def _read_json(self, blob):
+        import json, os
+        p = os.path.join(self.dir, "read.json.tmp")
         try:
-            self.store.download(ptr_blob, p, self.account)
-            ptr = json.load(open(p))
-        except Exception:  # noqa: BLE001
-            if gens:
-                raise RuntimeError(f"generations {sorted(gens)} stored but their pointer cannot be read")
-            ptr = None
+            self.store.download(blob, p, self.account)
+            return json.load(open(p))
+        except Exception:  # noqa: BLE001 -- the caller decides what an unreadable record means
+            return None
         finally:
             if os.path.exists(p):
                 os.remove(p)
-        return ptr, gens
+
+    def _remote_sha(self, blob):
+        import os
+        p = os.path.join(self.dir, "read.tar.tmp")
+        try:
+            self.store.download(blob, p, self.account)
+            return self.store.sha256_file(p)
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            if os.path.exists(p):
+                os.remove(p)
 
     def _upload(self, why, tokens, started):
         import glob, json, os
@@ -381,14 +410,15 @@ class Checkpointer:
             self.store.upload_file(tgz, blobs[0], self.account)
             json.dump(rec, open(rp, "w"), indent=1)
             self.store.upload_file(rp, blobs[1], self.account)
+            blobs = ()      # Codex round 3: from here the pointer may name g (even if its read-back fails): kept
             self.store.upload_file(rp, checkpoint_pointer(self.prefix, self.launch_id, self.label), self.account)
-            os.replace(rp, os.path.join(self.dir, "checkpoint.json"))
-            self.done, self.tries, blobs = self.done + 1, 0, ()
+            self.done += 1
             self.log(f"{why}: generation {g} stored, {rec['bytes']} bytes, {rec['cached_batches']} cached batches, "
                      f"state {rec['run_state']} -> {rec['blob']}")
-            floor = min(g, prev) if prev else g          # the new pointer names g and prev: older ones go
-            for k in sorted(x for x in gens if x < floor):
-                self._delete(checkpoint_blobs(self.prefix, self.launch_id, self.label, k))
+            if prev:                                     # the new pointer names g and prev: only older ones go
+                for k in sorted(x for x in gens if x < min(g, prev)):
+                    self._delete(checkpoint_blobs(self.prefix, self.launch_id, self.label, k))
+            os.replace(rp, os.path.join(self.dir, "checkpoint.json"))
         except Exception as e:  # noqa: BLE001 -- a failed checkpoint never stops the run
             self.failed += 1
             self.log(f"{why}: FAILED {type(e).__name__}: {str(e)[:300]}")

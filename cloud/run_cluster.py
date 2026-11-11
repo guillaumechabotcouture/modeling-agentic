@@ -51,14 +51,16 @@ its results were stored because the launcher waited for a manual collect.
 
 Checkpoints (F6, 2026-11-11: a v2 preview stopped at its credit cap after 3 h had stored nothing, because main.py
 stores the run only when it ends). While main.py runs, the agent VM uploads a tarball of the run dir (runs/<RUN>/...
-and run.log; never _truth/, credential files or links; API keys redacted; each file opened once without following
-links, and what is scanned is what is archived) every `checkpoint_minutes` (default 15, 0 off). Each checkpoint is a
+and run.log; never _truth/, credential files or links; API keys redacted; the run dir reached from the work dir and
+each file opened once, no link followed at any component, and what is scanned is what is archived) every
+`checkpoint_minutes` (default 15, 0 off). Each checkpoint is a
 new generation, written once: outputs/<storage_prefix>/launch_<id>/checkpoint_<label>_g<N>.tar.gz and its record
 checkpoint_<label>_g<N>.json (time, size, sha256, and, read from the archive, run_state state and round and the
 cached engine batches and rows); then the pointer checkpoint_<label>.json names it and its `previous`. Generations
-are numbered after every one already stored for the launch and label, and only those older than both the pointer's
+are numbered after every one already stored for the launch and label (with no pointer, the newest complete one is
+the base); one whose pointer upload was attempted is never deleted, and only those older than both the pointer's
 are deleted, after it is published. One at a time (a checkpoint due while the previous one uploads is skipped); one
-needs free space of 2.2 x (largest file + run dir) + run.log + 2 GB; a failure is logged on the VM
+needs free space of 2.2 x (largest file + run dir, run.log counted as a file) + 2 GB; a failure is logged on the VM
 (/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no local archive, and never stops the run. `collect` says when
 a label has only a checkpoint. `checkpoint-now` files a request on every agent VM at once (each returns at once; a
 request survives a skip or failure and is retried within 30 s) and waits in storage, under one deadline that bounds
@@ -1412,7 +1414,9 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
     except ImportError:
         pass
     deadline = clock() + timeout_s
-    left = lambda: max(0.1, deadline - clock())  # noqa: E731 -- every blocking call takes what is left
+    left = lambda: deadline - clock()  # noqa: E731 -- checked before, and the bound of, every blocking call
+    if left() <= 0:
+        raise SystemExit(f"{cfg.name}: checkpoint-now had no time left (timeout {timeout_s:g} s)")
     client = _bounded(connect or _connect_recorded, cfg, cid, timeout_s=left())
     import threading
     answers, threads, state, reqs = {}, {}, {}, {}
@@ -1426,7 +1430,8 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
         threads[label] = threading.Thread(target=ask, args=(label,), daemon=True)
         threads[label].start()
     for t in threads.values():
-        t.join(min(0.5, left()))
+        if left() > 0:
+            t.join(min(0.5, left()))
     while True:
         for label in [lb for lb in threads if lb in answers]:
             threads.pop(label)
@@ -1435,6 +1440,8 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
             if r.get("state") == "requested":
                 reqs[label] = r
         for label in list(reqs):
+            if left() <= 0:
+                break
             try:
                 p = _bounded(checkpoint_record, cfg, store, label, lid, timeout_s=left()) or {}
             except TimeoutError:
@@ -3866,7 +3873,7 @@ def _self_test_checkpoint(ok) -> None:
 
     class Crafted(Store):
         @staticmethod
-        def write_archive(root, arcname, out_path, secrets=None, extra=()):
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), **kw):
             with tarfile.open(out_path, mode="w:gz") as t:
                 for name, txt in ((f"{arcname}/run_state.json", '{"state": "WRITE", "round": 3}'),
                                   (f"{arcname}/analysis/batch/r.jsonl", '{"ok": true}\n{"ok": true}\n'),
@@ -4147,6 +4154,20 @@ def _self_test_checkpoint(ok) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         r28 = checkpoint_now(cfg13, timeout_s=0.3, store=Hanging(), connect=lambda c, cid: Fast(), poll_s=0.1)
     took = _time.time() - t0
+    # Codex round 3 P1-1 through the checkpointer: work/runs linked into _truth/ is never archived
+    tr = tempfile.mkdtemp()
+    os.makedirs(os.path.join(tr, "_truth", "R_t"))
+    open(os.path.join(tr, "_truth", "R_t", "answers.yaml"), "w").write("answer\n")
+    wd14 = os.path.join(tr, "W")
+    os.makedirs(wd14)
+    os.symlink(os.path.join(tr, "_truth"), os.path.join(wd14, "runs"))
+    st14 = Store()
+    c14 = ws.Checkpointer("W", wd14, "runs/t", "L1", None, st14, 3600, log=lambda m: None)
+    c14.trigger("t")
+    c14.wait_idle(10)
+    ok(c14.failed == 1 and not st14.uploads,
+       f"CK29 (Codex round 3 P1-1) a work dir whose runs/ links into _truth/: nothing archived or uploaded "
+       f"({st14.uploads})")
     ok(r28 == 1 and took < 1.0,
        f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
 

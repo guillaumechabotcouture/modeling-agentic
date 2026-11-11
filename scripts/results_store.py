@@ -78,15 +78,37 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
 REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
 
 
-def _open_nofollow(root: str, rel: str) -> int:
-    """A read fd for root/rel opened without following a link at any component, `root` itself included (a planted
-    link raises OSError), and only for a regular file (else OSError). `rel` is split on "/" only and never
-    translated: a component that is empty, "." or ".." (an absolute or climbing name) is refused (Codex round 2)."""
-    import stat
+def _plain(rel: str) -> list[str]:
     parts = rel.split("/")
     if not rel or any(p in ("", ".", "..") or "\0" in p for p in parts):
         raise OSError(f"not a plain relative name: {rel!r}")
-    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    return parts
+
+
+def _open_tree(base: str, rel: str) -> int:
+    """A directory fd for base/rel, reached from `base` one plain component at a time with no link followed."""
+    cur = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    if rel in ("", "."):
+        return cur
+    try:
+        for p in _plain(rel):
+            nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+    except BaseException:
+        os.close(cur)
+        raise
+    return cur
+
+
+def _open_nofollow(root: str, rel: str, root_fd: int | None = None) -> int:
+    """A read fd for root/rel (or, with `root_fd`, rel under that directory fd) opened without following a link at
+    any component, `root` itself included (a planted link raises OSError), and only for a regular file (else
+    OSError). `rel` is split on "/" only and never translated: a component that is empty, "." or ".." (an absolute
+    or climbing name) is refused (Codex round 2)."""
+    import stat
+    parts = _plain(rel)
+    cur = os.dup(root_fd) if root_fd is not None else os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for p in parts[:-1]:
             nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
@@ -116,26 +138,40 @@ def _copy_scan(fd: int, dst, secrets: list[bytes]) -> bool:
 
 
 def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=(),
-                  _hook=None) -> list[str]:
+                  _hook=None, base: str | None = None) -> list[str]:
     """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, with bounded
-    memory. Each file is opened once, no link followed at any component, regular files only; its bytes are copied
-    to a temporary file, and what is scanned and redacted is that copy, which is what is archived, so a rewrite or a
-    swap for a link after the listing can neither leak a secret nor reach _truth/. A copy up to REDACT_MAX_MB is
-    redacted; a larger one is left out (listed) if it holds a secret. `extra`: (path, arcname) pairs (run.log).
-    `_hook(rel)` runs between the listing and each open (self-test). Returns what was left out."""
-    import io
-    import tarfile
-    import tempfile
+    memory. The run dir is reached from `base` (the trusted job work dir) one component at a time, no link followed
+    (Codex round 3: a parent such as work/runs linked into _truth/ is refused); without `base`, `root` itself must
+    not be a link. Files are listed and opened through that directory fd. Each file is opened once, no link followed
+    at any component, regular files only; its bytes are copied to a temporary file, and what is scanned and redacted
+    is that copy, which is what is archived, so a rewrite or a swap for a link after the listing can neither leak a
+    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted; a larger one is left out (listed) if it holds
+    a secret. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
+    (self-test). Returns what was left out."""
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
     items = []
-    os.close(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))   # a root that is a link: OSError
-    for dp, dirs, files in os.walk(root):
-        dirs.sort()
-        items += [(root, os.path.relpath(os.path.join(dp, fn), root), None) for fn in sorted(files)]
-    items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
+    if base is not None:
+        root_fd = _open_tree(base, os.path.relpath(os.path.abspath(root), os.path.abspath(base)))
+    else:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # a root that is a link: OSError
+    try:
+        for dp, dirs, files, _ in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
+            dirs.sort()
+            items += [(root_fd, os.path.normpath(os.path.join(dp, fn)), None) for fn in sorted(files)]
+        items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
+        _write_items(items, arcname, out_path, sec, skipped, _hook)
+    finally:
+        os.close(root_fd)
+    return skipped
+
+
+def _write_items(items, arcname, out_path, sec, skipped, _hook):
+    import io
+    import tarfile
+    import tempfile
     with tarfile.open(out_path, mode="w:gz") as t:
-        for base, rel, arc in items:
+        for where, rel, arc in items:
             listed = rel if arc is None else arc
             if arc is None and is_sensitive_path(rel):
                 skipped.append(rel)
@@ -143,7 +179,7 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
             if _hook:
                 _hook(rel)
             try:
-                fd = _open_nofollow(base, rel)
+                fd = _open_nofollow(where, rel, root_fd=where) if isinstance(where, int) else _open_nofollow(where, rel)
             except OSError:            # gone, a link, or not a regular file
                 skipped.append(listed)
                 continue
