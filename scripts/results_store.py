@@ -487,6 +487,24 @@ def _self_test() -> int:
         write_archive(os.path.join(work, "runs", "R"), "runs/R", out, base=work)
         if _tf.open(out, mode="r:gz").getnames() != ["runs/R/ok.txt"]:
             fails.append("S16b real directories under the trusted base are archived")
+        # Codex round 4 P2: a blob's sha256 by streaming its chunks; it is never read whole or written to disk
+        block = b"z" * 2**20
+
+        class _Big:
+            def get_blob_client(self, c, n):
+                def readall(_s):
+                    raise AssertionError("readall: the blob would be materialised")
+                return type("B", (), {"download_blob": lambda _s: type("D", (), {
+                    "chunks": lambda _d: (block for _ in range(200)), "readall": readall})()})()
+        want = hashlib.sha256()
+        for _ in range(200):
+            want.update(block)
+        try:
+            got = sha256_blob("outputs/ck/big.tar.gz", service=_Big())
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        if got != want.hexdigest():
+            fails.append(f"S17 sha256_blob streams a 200 MiB blob chunk by chunk: {got}")
         sv.store[("outputs", "ck/x")] = b"x"
         sv.get_blob_client = lambda c, n: type("B", (), {"delete_blob": lambda _s: sv.store.pop((c, n))})()
         delete("outputs/ck/x", service=sv)

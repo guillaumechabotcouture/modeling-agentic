@@ -3741,6 +3741,12 @@ def _self_test_checkpoint(ok) -> None:
         def list_blobs(self, prefix, account=None):
             return [{"name": n} for n in sorted(self.files) if n.startswith(prefix)]
 
+        def sha256_blob(self, blob, account=None):
+            self.streamed = getattr(self, "streamed", []) + [blob]
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            return hashlib.sha256(self.files[blob]).hexdigest()
+
     secret = "sk-ant-TESTSECRET12345"
     main_py = ("import json, os, time\n"
                "rd = 'runs/R_x'\n"
@@ -4129,6 +4135,74 @@ def _self_test_checkpoint(ok) -> None:
     c11.wait_idle(10)
     ok(c11.failed == 1 and st11.files == before11,
        "CK26b a pointer that exists but cannot be read: no checkpoint, nothing numbered or deleted")
+    ok(not any(b.endswith(".tar.gz") for b in st10.downloads) and g10(1)[0] in getattr(st10, "streamed", []),
+       f"CK32 (Codex round 4 P2) adoption checks a tarball's sha256 by streaming it, never downloading it: "
+       f"downloads {st10.downloads}")
+    # Codex round 4 P2: `checkpoint` without a pointer adopts the newest complete generation, as the uploader does
+    st15 = Store()
+    g15 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "R1", k)  # noqa: E731
+    with open(os.path.join(work_root, "g2.tar.gz"), "wb") as f:
+        with tarfile.open(fileobj=f, mode="w:gz") as t:
+            ti = tarfile.TarInfo("runs/R_x/run_state.json")
+            body15 = b'{"state": "ANALYZE", "round": 1}'
+            ti.size = len(body15)
+            t.addfile(ti, _io.BytesIO(body15))
+    tar15 = open(os.path.join(work_root, "g2.tar.gz"), "rb").read()
+    st15.files[g15(2)[0]] = tar15
+    st15.files[g15(2)[1]] = json.dumps({"generation": 2, "sha256": hashlib.sha256(tar15).hexdigest(),
+                                        "run_dir": "R_x"}).encode()
+    st15.files[g15(3)[0]] = b"g3: its record was never written"
+    out15 = tempfile.mkdtemp()
+    cfg15 = RunConfig(name="t", question_file="q", out_dir=out15, labels=("R1",), storage_prefix="runs/t")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg15.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            f15 = fetch_checkpoint(cfg15, st15, "R1").get("generation")
+    except SystemExit as e:
+        f15 = f"refused: {e}"
+    ok(f15 == 2 and os.path.exists(os.path.join(out15, "R1", "checkpoint", "runs", "R_x", "run_state.json")),
+       f"CK31 (Codex round 4 P2) `checkpoint` with generations but no pointer fetches the newest complete one: {f15}")
+    # Codex round 4 P1: a capture during which run_state.json changed (a report quarantined, FINAL written) is
+    # discarded, never uploaded, and retried once on the next tick
+    wd16 = os.path.join(tempfile.mkdtemp(), "F")
+    rd16 = os.path.join(wd16, "runs", "R_f")
+    os.makedirs(rd16)
+    open(os.path.join(rd16, "report.md"), "w").write("# a report the gate will withhold\n")
+    open(os.path.join(rd16, "run_state.json"), "w").write('{"state": "WRITE", "round": 2}')
+    once = []
+
+    def quarantine(rel):
+        if rel == "run_state.json" and not once:     # report.md already copied; main.py then quarantines it
+            once.append(1)
+            os.makedirs(os.path.join(rd16, "quarantine"), exist_ok=True)
+            os.replace(os.path.join(rd16, "report.md"), os.path.join(rd16, "quarantine", "report.md"))
+            open(os.path.join(rd16, "run_state.json"), "w").write(
+                '{"state": "FINAL", "round": 2, "status": "completed_no_report"}')
+
+    class Racing(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), **kw):
+            return results_store.write_archive(root, arcname, out_path, secrets, extra, _hook=quarantine, **kw)
+    st16 = Racing()
+    c16 = ws.Checkpointer("F", wd16, "runs/t", "L1", None, st16, 3600, poll_s=0.05, log=lambda m: None)
+    c16.start()
+    try:
+        c16.trigger("t")
+        for _ in range(100):
+            if c16.done:
+                break
+            _time.sleep(0.05)
+    finally:
+        c16.stop()
+        c16.wait_idle(10)
+    tars16 = [b for b in st16.uploads if b.endswith(".tar.gz")]
+    names16 = (tarfile.open(fileobj=_io.BytesIO(st16.files[tars16[0]]), mode="r:gz").getnames() if tars16 else [])
+    rs16 = (json.load(tarfile.open(fileobj=_io.BytesIO(st16.files[tars16[0]]), mode="r:gz").extractfile(
+        "runs/R_f/run_state.json")) if tars16 else {})
+    ok(len(tars16) == 1 and "runs/R_f/report.md" not in names16 and rs16.get("state") == "FINAL"
+       and c16.done == 1 and "changed" in open(os.path.join(wd16, ws.CKDIR, "checkpoint.log")).read(),
+       f"CK30 (Codex round 4 P1) report copied, then quarantined and FINAL written: that capture is discarded, the "
+       f"retry on the next tick uploads a consistent one: {tars16} {names16} {rs16}")
     # Codex round 3 P2-5: each request counts its own tries; exhausting one drops only that one
     c12 = ws.Checkpointer("Z", wd10, "runs/t", "L1", None, Store(), 3600, log=lambda m: None)
     c12._requeue({"old": (1.0, ws.MAX_REQUEST_TRIES), "new": (2.0, 0)}, "failed")
