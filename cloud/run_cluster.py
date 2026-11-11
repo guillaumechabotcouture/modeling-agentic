@@ -58,7 +58,9 @@ new generation, written once: outputs/<storage_prefix>/launch_<id>/checkpoint_<l
 checkpoint_<label>_g<N>.json (time, size, sha256, and, read from the archive, run_state state and round and the
 cached engine batches and rows); then the pointer checkpoint_<label>.json names it and its `previous`. Generations
 are numbered after every one already stored for the launch and label (with no pointer, the newest complete one is
-the base); one whose pointer upload was attempted is never deleted, and only those older than both the pointer's
+the base, for the uploader and `checkpoint` alike, its sha256 hashed as it streams); a capture during which
+run_state.json changed is discarded and retried once; one whose pointer upload was attempted is never deleted, and
+only those older than both the pointer's
 are deleted, after it is published. One at a time (a checkpoint due while the previous one uploads is skipped); one
 needs free space of 2.2 x (largest file + run dir, run.log counted as a file) + 2 GB; a failure is logged on the VM
 (/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no local archive, and never stops the run. `collect` says when
@@ -1325,8 +1327,15 @@ def fetch_checkpoint(cfg, store, label) -> dict:
     moved aside."""
     launch_id = json.load(open(cfg.state_file))[label]["launch_id"]
     ptr = checkpoint_record(cfg, store, label, launch_id)
-    if ptr is None:
-        raise SystemExit(f"{label}: no checkpoint stored for launch {launch_id}")
+    if ptr is None:     # Codex round 4: no pointer (lost before the first): the newest complete generation
+        stem = ws.checkpoint_pointer(cfg.storage_prefix, launch_id, label)[:-len(".json")]
+        names = {b["name"] for b in store.list_blobs(stem, cfg.storage_account)}
+        k, _ = ws.newest_complete(store, cfg.storage_prefix, launch_id, label, names, cfg.storage_account,
+                                  lambda b: _download_json(store, b, cfg.storage_account))
+        if k is None:
+            raise SystemExit(f"{label}: no checkpoint stored for launch {launch_id}")
+        print(f"{label}: no pointer; generation {k} is the newest complete one")
+        ptr = {"generation": k, "previous": None}
     base = os.path.join(cfg.out_dir, label)
     os.makedirs(base, exist_ok=True)
     tgz, why = os.path.join(base, "checkpoint.tar.gz"), []
@@ -3888,7 +3897,10 @@ def _self_test_checkpoint(ok) -> None:
                     ti.size = len(txt)
                     t.addfile(ti, _io.BytesIO(txt.encode()))
             return []
+    # the live run_state equals the archived one (else the capture is torn, CK30); the live dir has no batch
+    open(os.path.join(wd, "runs", "R_y", "run_state.json"), "w").write('{"state": "WRITE", "round": 3}')
     r17 = ws.build_checkpoint(wd, os.path.join(wd, "runs", "R_y"), os.path.join(wd, "x.tar.gz"), Crafted())
+    os.remove(os.path.join(wd, "runs", "R_y", "run_state.json"))
     ok(r17.get("run_state") == {"state": "WRITE", "round": 3} and r17.get("cached_batches") == 1
        and r17.get("cached_rows") == 2,
        f"CK17 (Codex P1-1) the record's state and counts are read from the archive, not the live dir: {r17}")

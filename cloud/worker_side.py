@@ -163,6 +163,26 @@ def checkpoint_blobs(prefix, launch_id, label, gen):
     return base + ".tar.gz", base + ".json"
 
 
+def newest_complete(store, prefix, launch_id, label, names, account, read_json):
+    """(generation, record) of the newest generation among the listed `names` whose tarball's sha256, hashed as it
+    streams (store.sha256_blob: never read whole, never written to disk), equals its record's; (None, None) when
+    there is none. Used when no pointer exists, by the uploader and by `checkpoint` (Codex rounds 3 and 4)."""
+    import re
+    stem = checkpoint_pointer(prefix, launch_id, label)[:-len(".json")]
+    gens = {int(m.group(1)) for n in names for m in [re.match(re.escape(stem) + r"_g(\d+)\.(tar\.gz|json)$", n)] if m}
+    for k in sorted(gens, reverse=True):
+        tar_b, json_b = checkpoint_blobs(prefix, launch_id, label, k)
+        rec = read_json(json_b) if json_b in names and tar_b in names else None
+        if not (isinstance(rec, dict) and rec.get("sha256")):
+            continue
+        try:
+            if store.sha256_blob(tar_b, account) == rec["sha256"]:
+                return k, rec
+        except Exception:  # noqa: BLE001 -- unreadable: not complete
+            continue
+    return None, None
+
+
 def archive_summary(tgz):
     """run_state.json's state and round, and the engine batches (a results file with its `.summary.json`, or the
     `.partial.jsonl` journal of an interrupted one, scripts/compute.py) with their ok rows, read from the archive
@@ -188,15 +208,45 @@ def archive_summary(tgz):
     return out
 
 
+class TornCapture(RuntimeError):
+    """run_state.json changed while the run dir was being archived: the files may come from two stages."""
+
+
+def _sha_or_none(path):
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _member_sha(tgz, name):
+    import hashlib, tarfile
+    with tarfile.open(tgz, mode="r:gz") as t:
+        try:
+            f = t.extractfile(name)
+        except KeyError:
+            return None
+        return hashlib.sha256(f.read()).hexdigest() if f else None
+
+
 def build_checkpoint(work, run_dir, out_path, store, secrets=()):
     """The run dir as runs/<RUN>/... plus run.log, streamed to `out_path` through a temporary file (results_store
     write_archive: no _truth/, no credential files, no links, secrets redacted). Returns its record."""
     import os, time
     tmp = out_path + ".tmp"
     log = os.path.join(work, "run.log")
+    arc = os.path.join("runs", os.path.basename(run_dir))
     try:
-        skipped = store.write_archive(run_dir, os.path.join("runs", os.path.basename(run_dir)), tmp, list(secrets),
+        before = _sha_or_none(os.path.join(run_dir, "run_state.json"))
+        skipped = store.write_archive(run_dir, arc, tmp, list(secrets),
                                       extra=[(log, "run.log")] if os.path.exists(log) else [], base=work)
+        after = _sha_or_none(os.path.join(run_dir, "run_state.json"))
+        archived = _member_sha(tmp, f"{arc}/run_state.json")
+        if not before == after == archived:      # Codex round 4: a stage moved on while the files were copied
+            raise TornCapture(f"run_state.json changed during the capture ({str(before)[:8]} -> {str(after)[:8]}, "
+                              f"archived {str(archived)[:8]})")
         os.replace(tmp, out_path)
     finally:
         if os.path.exists(tmp):
@@ -244,6 +294,7 @@ class Checkpointer:
         self.free_bytes = free_bytes or (lambda p: __import__("shutil").disk_usage(p).free)
         self.done = self.failed = self.skipped = 0
         self.gen, self.pending, self.retry_s, self._retry_at = 0, {}, retry_s, 0.0
+        self.torn, self._torn_retry, self._torn_streak = 0, False, 0
         self._busy, self._stop, self._thread, self._up = threading.Lock(), threading.Event(), None, None
         self._plock = threading.Lock()
         self._last = time.time()
@@ -318,6 +369,9 @@ class Checkpointer:
                 self._requests()
                 if self.pending and time.time() >= self._retry_at:
                     self.trigger("request")
+                elif self._torn_retry:
+                    self._torn_retry = False
+                    self.trigger("retry after a torn capture")
                 elif time.time() - self._last >= self.interval_s:
                     self.trigger("interval")
             except Exception as e:  # noqa: BLE001
@@ -353,12 +407,11 @@ class Checkpointer:
             if not isinstance(ptr, dict):
                 raise RuntimeError(f"the pointer {ptr_blob} is stored but cannot be read")
             return ptr, gens
-        for k in sorted(gens, reverse=True):
-            tar_b, json_b = checkpoint_blobs(self.prefix, self.launch_id, self.label, k)
-            rec = self._read_json(json_b) if json_b in names and tar_b in names else None
-            if isinstance(rec, dict) and rec.get("sha256") and rec.get("sha256") == self._remote_sha(tar_b):
-                self.log(f"no pointer: generation {k} is the newest complete one, adopted as the base")
-                return {"generation": k, "previous": None}, gens
+        k, _ = newest_complete(self.store, self.prefix, self.launch_id, self.label, names, self.account,
+                               self._read_json)
+        if k is not None:
+            self.log(f"no pointer: generation {k} is the newest complete one, adopted as the base")
+            return {"generation": k, "previous": None}, gens
         return None, gens
 
     def _read_json(self, blob):
@@ -368,18 +421,6 @@ class Checkpointer:
             self.store.download(blob, p, self.account)
             return json.load(open(p))
         except Exception:  # noqa: BLE001 -- the caller decides what an unreadable record means
-            return None
-        finally:
-            if os.path.exists(p):
-                os.remove(p)
-
-    def _remote_sha(self, blob):
-        import os
-        p = os.path.join(self.dir, "read.tar.tmp")
-        try:
-            self.store.download(blob, p, self.account)
-            return self.store.sha256_file(p)
-        except Exception:  # noqa: BLE001
             return None
         finally:
             if os.path.exists(p):
@@ -419,6 +460,13 @@ class Checkpointer:
                 for k in sorted(x for x in gens if x < min(g, prev)):
                     self._delete(checkpoint_blobs(self.prefix, self.launch_id, self.label, k))
             os.replace(rp, os.path.join(self.dir, "checkpoint.json"))
+            self._torn_streak = 0
+        except TornCapture as e:   # never uploaded; one retry on the next tick, then the next interval
+            self.torn += 1
+            self._torn_streak += 1
+            self._torn_retry = self._torn_streak == 1
+            self.log(f"{why}: discarded, {e}" + ("; retrying on the next tick" if self._torn_retry else ""))
+            self._requeue(tokens, "torn capture")
         except Exception as e:  # noqa: BLE001 -- a failed checkpoint never stops the run
             self.failed += 1
             self.log(f"{why}: FAILED {type(e).__name__}: {str(e)[:300]}")

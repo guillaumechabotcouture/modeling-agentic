@@ -238,6 +238,15 @@ def upload_file(path: str, blob: str, account: str | None = None, service=None, 
     raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
 
 
+def sha256_blob(blob: str, account: str | None = None, service=None) -> str:
+    """A blob's sha256, hashed chunk by chunk as it streams: never read whole, never written to disk."""
+    container, name = _split(blob)
+    h = hashlib.sha256()
+    for block in (service or _service(account)).get_blob_client(container, name).download_blob().chunks():
+        h.update(block)
+    return h.hexdigest()
+
+
 def delete(blob: str, account: str | None = None, service=None) -> None:
     """Remove one blob (an old checkpoint generation)."""
     container, name = _split(blob)
