@@ -513,10 +513,25 @@ class Watch:
 
     def stop_all(self, rec, why) -> bool:
         """Stop, by id, every live cluster clusters.json records for this invocation and every stray its journal
-        attributes to it, nothing else; True once none of them is listed live."""
+        attributes to it, nothing else; True once none of them is listed live. A stop needs no listing: when the
+        listing cannot be read, every id clusters.json records, and every id the journal records this invocation
+        creating (with its recorded name), is asked to stop by id, once, each attempt logged; then False
+        (unconfirmed)."""
         ids, owned = self.owners(rec)
+        blind = False
         for _ in range(self.retries):
             items = self.safe(self.api.list_clusters)
+            if items is None and not blind:
+                blind = True
+                named = {v["id"]: v["name"] for v in recorded(rec).values()}
+                named.update({e["id"]: e.get("name") for e in rc.read_journal(self.cfg) if isinstance(e, dict)
+                              and e.get("id") in owned - set(named) and e.get("name") in self.names})
+                for cid, name in sorted(named.items(), key=lambda t: t[0]):
+                    try:
+                        self.api.stop(name, cid, why)
+                        self.log(f"listing unreadable: {name} ({cid}) stop requested by id")
+                    except Exception as e:  # noqa: BLE001 -- logged; the others are still asked
+                        self.log(f"listing unreadable: {name} ({cid}) stop failed: {type(e).__name__}: {str(e)[:120]}")
             if items is not None:
                 live = {(x.get("name"), x.get("id")) for x in rc._items(items) if _live(x) and x.get("id") in ids}
                 live |= set(strays(items, self.names, ids, owned)["stop"])
