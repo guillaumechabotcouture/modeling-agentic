@@ -55,7 +55,8 @@ class BudgetError(Exception):
 
 
 class Keychain:
-    """The only access to the owner's private key: a generic password in the login keychain."""
+    """The only access to the owner's private key: a generic password in the login keychain. `-T ""` trusts no
+    application, so each `get` raises the keychain's password dialog, which only the owner at the screen answers."""
 
     def __init__(self, run=subprocess.run):
         self.run = run
@@ -64,78 +65,292 @@ class Keychain:
         return ["-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT]
 
     def add_command(self, secret_hex):
-        raise NotImplementedError
+        return ["security", "add-generic-password", *self._who(), "-l", "modeling-agentic budget owner key",
+                "-T", "", "-w", secret_hex]
 
-    def exists(self) -> bool:
-        raise NotImplementedError
+    def exists(self) -> bool:     # attributes only: reads no secret, raises no dialog
+        return self.run(["security", "find-generic-password", *self._who()], capture_output=True).returncode == 0
 
     def put(self, secret_hex: str) -> None:
-        raise NotImplementedError
+        r = self.run(self.add_command(secret_hex), capture_output=True, text=True)
+        if r.returncode != 0:
+            raise BudgetError(f"keychain refused the key (security exit {r.returncode}): {r.stderr.strip()[:200]}")
 
     def get(self) -> str:
-        raise NotImplementedError
+        r = self.run(["security", "find-generic-password", *self._who(), "-w"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise BudgetError(f"the keychain read was refused or failed (security exit {r.returncode})")
+        return r.stdout.strip()
+
+
+def _ts(v):
+    """An ISO time as epoch seconds (UTC when it has no zone), or None."""
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _num(x, what) -> float:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise BudgetError(f"{what} is not a number: {x!r}")
+    return float(x)
+
+
+def _canon(record) -> bytes:
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _scope_name(scope) -> str:
+    if not isinstance(scope, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,40}", scope):
+        raise BudgetError(f"bad scope name {scope!r}")
+    return scope
 
 
 def init_key(store, pub_file=PUB_FILE) -> str:
-    raise NotImplementedError
+    """A new key pair: the private half into `store`, the public half (hex) to `pub_file`. Refuses to replace
+    either (a new key is a deliberate act: delete the keychain item and the file first)."""
+    from cryptography.hazmat.primitives import serialization as ser
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    if os.path.exists(pub_file) or store.exists():
+        raise BudgetError(f"a key exists already ({pub_file} or the keychain item {KEYCHAIN_SERVICE}): refusing")
+    k = Ed25519PrivateKey.generate()
+    store.put(k.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption()).hex())
+    pub = k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
+    with open(pub_file, "x") as f:
+        f.write(pub + "\n")
+    return pub
 
 
-def make_record(scope, usd, note, start_utc=None, scopes_file=SCOPES_FILE, now=None) -> dict:
-    raise NotImplementedError
-
-
-def sign_doc(record, store) -> dict:
-    raise NotImplementedError
-
-
-def verify_doc(doc, pub_hex) -> dict:
-    raise NotImplementedError
-
-
-def set_budget(scope, usd, note, store, start_utc=None, budget_dir=None, pub_file=PUB_FILE, scopes_file=SCOPES_FILE):
-    raise NotImplementedError
-
-
-def load_budget(scope, budget_dir=None, pub_file=PUB_FILE) -> dict:
-    raise NotImplementedError
+def _read_pub(pub_file) -> str:
+    try:
+        pub = open(pub_file).read().strip()
+    except OSError as e:
+        raise BudgetError(f"no owner public key at {pub_file} ({e}): the owner runs `budget.py init-key`") from None
+    if not re.fullmatch(r"[0-9a-f]{64}", pub):
+        raise BudgetError(f"{pub_file} is not an Ed25519 public key in hex")
+    return pub
 
 
 def load_scopes(path=SCOPES_FILE) -> dict:
-    raise NotImplementedError
+    import yaml
+    try:
+        y = yaml.safe_load(open(path))
+        floor = _num(y["floor_usd_per_instance_hour"], "floor_usd_per_instance_hour")
+        scopes = {_scope_name(k): list(v) for k, v in y["scopes"].items()}
+    except BudgetError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- any unreadable file refuses
+        raise BudgetError(f"{path} cannot be read: {type(e).__name__}: {e}") from None
+    if floor <= 0 or not all(v and all(isinstance(p, str) and p for p in v) for v in scopes.values()):
+        raise BudgetError(f"{path}: the floor must be positive and every scope needs non-empty prefixes")
+    return {"floor": floor, "scopes": scopes}
 
 
 def scope_for_name(name, path=SCOPES_FILE):
-    raise NotImplementedError
+    """The one scope whose prefix `name` starts with, else None."""
+    hits = [s for s, ps in load_scopes(path)["scopes"].items() if any(str(name).startswith(p) for p in ps)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _check_record(rec) -> dict:
+    if not isinstance(rec, dict) or sorted(rec) != sorted(FIELDS):
+        raise BudgetError(f"the budget record's fields are not {FIELDS}")
+    _scope_name(rec["scope"])
+    if _num(rec["usd"], "usd") <= 0 or _num(rec["floor_usd_per_instance_hour"], "floor") <= 0:
+        raise BudgetError("the budget and the floor must be positive")
+    if _ts(rec["start_utc"]) is None or not (isinstance(rec["prefixes"], list) and rec["prefixes"]
+                                             and all(isinstance(p, str) and p for p in rec["prefixes"])):
+        raise BudgetError("bad start time or prefixes in the budget record")
+    return rec
+
+
+def make_record(scope, usd, note, start_utc=None, scopes_file=SCOPES_FILE, now=None) -> dict:
+    import secrets
+    sc = load_scopes(scopes_file)
+    if _scope_name(scope) not in sc["scopes"]:
+        raise BudgetError(f"scope {scope!r} is not in {scopes_file}")
+    now = time.time() if now is None else now
+    start = _iso(now) if start_utc is None else start_utc
+    return _check_record({"scope": scope, "usd": _num(usd, "usd"), "start_utc": start, "note": str(note or ""),
+                          "issued_utc": _iso(now), "nonce": secrets.token_hex(16), "prefixes": sc["scopes"][scope],
+                          "floor_usd_per_instance_hour": sc["floor"]})
+
+
+def sign_doc(record, store) -> dict:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(store.get()))
+    return {"alg": "ed25519", "record": record, "signature": key.sign(_canon(_check_record(record))).hex()}
+
+
+def verify_doc(doc, pub_hex) -> dict:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        rec, sig = doc["record"], bytes.fromhex(doc["signature"])
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex)).verify(sig, _canon(rec))
+    except (InvalidSignature, KeyError, TypeError, ValueError, AttributeError):
+        raise BudgetError("the budget's signature does not verify against the owner's public key") from None
+    return _check_record(rec)
+
+
+def budget_path(scope, budget_dir=None) -> str:
+    return os.path.join(budget_dir or BUDGET_DIR, f"budget_{_scope_name(scope)}.json")
+
+
+def set_budget(scope, usd, note, store, start_utc=None, budget_dir=None, pub_file=PUB_FILE, scopes_file=SCOPES_FILE):
+    doc = sign_doc(make_record(scope, usd, note, start_utc, scopes_file), store)
+    verify_doc(doc, _read_pub(pub_file))      # the keychain's key is the anchor's pair, or nothing is written
+    p = budget_path(scope, budget_dir)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(json.dumps(doc, indent=1) + "\n")
+    os.replace(tmp, p)
+    return p
+
+
+def load_budget(scope, budget_dir=None, pub_file=PUB_FILE) -> dict:
+    p = budget_path(scope, budget_dir)
+    try:
+        doc = json.load(open(p))
+    except FileNotFoundError:
+        raise BudgetError(f"no budget for {scope} ({p}): the owner sets one with `budget.py set`") from None
+    except (OSError, ValueError) as e:
+        raise BudgetError(f"{p} cannot be read: {e}") from None
+    rec = verify_doc(doc, _read_pub(pub_file))
+    if rec["scope"] != scope:
+        raise BudgetError(f"{p} holds the budget of {rec['scope']!r}, not {scope!r}")
+    return rec
 
 
 class CoiledSource:
-    """All Coiled access for spend: the IDM workspace only."""
+    """All Coiled access for spend: the IDM workspace only, read-only."""
 
     def list_clusters(self) -> list:
-        raise NotImplementedError
+        import coiled
+        cs = coiled.list_clusters(workspace=WORKSPACE, max_pages=None)
+        return cs if isinstance(cs, list) else list(cs.values())
 
     def details(self, cid) -> dict:
-        raise NotImplementedError
+        from coiled.v2.core import CloudV2    # the raw record: coiled.cluster_details drops the cost fields
+        with CloudV2() as cloud:
+            return cloud._get_cluster_details_synced(cluster_id=cid, workspace=WORKSPACE)
+
+
+def _hours(details, now):
+    """(live instances, their hours so far, every instance's hours) from a raw cluster record."""
+    live, live_h, all_h = 0, 0.0, 0.0
+    for p in [details.get("scheduler")] + list(details.get("workers") or []):
+        inst = (p or {}).get("instance")
+        if not inst:
+            continue                      # no VM was given to this process: nothing billed
+        on = (state_of(inst) or state_of(p)) not in ENDED
+        t0, t1 = _ts(inst.get("created")), now if on else _ts((inst.get("current_state") or {}).get("updated"))
+        if t0 is None or t1 is None:
+            raise BudgetError(f"cluster {details.get('id')}: an instance has no start or stop time")
+        h = max(0.0, (t1 - t0) / 3600)
+        all_h += h
+        if on:
+            live, live_h = live + 1, live_h + h
+    return live, live_h, all_h
 
 
 def cluster_usd(details, rate, now) -> dict:
-    raise NotImplementedError
+    """One cluster's billed USD (credits x 0.061 + cloud USD) and, while it is not stopped, the projection."""
+    if not isinstance(details, dict) or "total_cost" not in details or "cloud_total_cost" not in details:
+        raise BudgetError(f"cluster {details.get('id') if isinstance(details, dict) else '?'}: no cost fields")
+    on = state_of(details) not in ENDED
+    tc, cc = details["total_cost"], details["cloud_total_cost"]
+    if on and tc is None and cc is None:
+        tc = cc = 0.0                     # not billed yet: the projection covers it
+    live, live_h, all_h = _hours(details, now)
+    return {"id": details.get("id"), "name": details.get("name"), "state": state_of(details),
+            "billed_usd": _num(tc, "total_cost") * USD_PER_CREDIT + _num(cc, "cloud_total_cost"),
+            "projected_usd": live_h * rate if on else 0.0, "live_instances": live if on else 0,
+            "instance_hours": all_h}
+
+
+def _median(xs):
+    xs, n = sorted(xs), len(xs)
+    return 0.0 if not n else xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
 def spend(scope, source=None, budget=None, now=None, **load) -> dict:
-    raise NotImplementedError
+    """The scope's spend since the signed budget's start, with a per-cluster breakdown (see the module doc)."""
+    rec = budget if budget is not None else load_budget(scope, **load)
+    src, now = source or CoiledSource(), time.time() if now is None else now
+    start, prefixes = _ts(rec["start_utc"]), tuple(rec["prefixes"])
+    items = src.list_clusters()
+    if not isinstance(items, list):
+        raise BudgetError("the cluster listing is not a list")
+    mine = []
+    for c in items:
+        if str(c.get("name") or "").startswith(prefixes):
+            t = _ts(c.get("created"))
+            if t is None:
+                raise BudgetError(f"cluster {c.get('id')} has no creation time")
+            mine.append((t, c))
+    mine.sort(key=lambda x: -x[0])                 # newest first
+    counted = [c for t, c in mine if t >= start]
+    dets = {c["id"]: src.details(c["id"]) for c in counted}
+    stopped = [dets[c["id"]] for c in counted if state_of(c) in ENDED][:RATE_SAMPLE]
+    older = [c for t, c in mine if t < start and state_of(c) in ENDED]
+    stopped += [src.details(c["id"]) for c in older[:RATE_SAMPLE - len(stopped)]]
+    rates = [r["billed_usd"] / r["instance_hours"] for r in (cluster_usd(x, 0.0, now) for x in stopped)
+             if r["instance_hours"] >= 0.05]
+    rate = max(_median(rates), _num(rec["floor_usd_per_instance_hour"], "floor"))
+    rows = [cluster_usd(dets[c["id"]], rate, now) for c in counted]
+    billed, proj = sum(r["billed_usd"] for r in rows), sum(r["projected_usd"] for r in rows)
+    return {"scope": scope, "budget_usd": float(rec["usd"]), "start_utc": rec["start_utc"], "note": rec.get("note", ""),
+            "prefixes": list(prefixes), "rate_usd_per_instance_hour": rate, "rate_from_clusters": len(rates),
+            "billed_usd": billed, "projected_usd": proj, "total_usd": billed + proj,
+            "remaining_usd": float(rec["usd"]) - billed - proj, "clusters": rows}
 
 
 def launch_budget_ok(scope, cap_usd, name=None, **kw) -> tuple[bool, str]:
-    raise NotImplementedError
+    """ok only if the scope's signed budget verifies, `name` (when given) starts with one of its signed prefixes,
+    and the scope's spend plus `cap_usd` is within it. Any error refuses. `kw` goes to spend()."""
+    try:
+        cap = _num(cap_usd, "cap_usd")
+        if cap <= 0:
+            raise BudgetError(f"cap_usd must be positive, not {cap}")
+        s = spend(scope, **kw)
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return False, f"budget check failed closed: {type(e).__name__}: {e}"
+    if name is not None and not str(name).startswith(tuple(s["prefixes"])):
+        return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}: its spend would not count"
+    fits = round(s["total_usd"] + cap, 6) <= round(s["budget_usd"], 6)
+    return fits, (f"{scope}: spent ${s['billed_usd']:.2f} billed + ${s['projected_usd']:.2f} projected, + cap "
+                  f"${cap:.2f} {'<=' if fits else '>'} budget ${s['budget_usd']:.2f}")
 
 
 def job_meter(scope, source=None, clock=time.time, **kw):
-    raise NotImplementedError
+    """fn(cluster id) -> that cluster's billed + projected USD now, at the scope's measured rate."""
+    src = source or CoiledSource()
+    rate = spend(scope, source=src, **kw)["rate_usd_per_instance_hour"]
+
+    def meter(cid):
+        r = cluster_usd(src.details(cid), rate, clock())
+        return r["billed_usd"] + r["projected_usd"]
+    return meter
 
 
 def status_lines(s) -> list[str]:
-    raise NotImplementedError
+    out = [f"budget {s['scope']}: ${s['budget_usd']:.2f} from {s['start_utc']} ({s['note']})",
+           f"spent: ${s['billed_usd']:.2f} billed + ${s['projected_usd']:.2f} projected = ${s['total_usd']:.2f}; "
+           f"remaining ${s['remaining_usd']:.2f}",
+           f"projection rate: ${s['rate_usd_per_instance_hour']:.2f} per live instance-hour (median of "
+           f"{s['rate_from_clusters']} stopped cluster(s), never below the floor)",
+           f"{'cluster':<40} {'id':>9} {'state':<9} {'billed':>9} {'projected':>9} {'live VMs':>8}"]
+    return out + [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} "
+                  f"{r['projected_usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
 
 
 # ---- self-test -------------------------------------------------------------------------------
@@ -171,10 +386,6 @@ class _FakeSource:
         if isinstance(d, Exception):
             raise d
         return d
-
-
-def _iso(t):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 def _det(cid, name, created, credits, cloud, state="stopped", insts=()):
@@ -400,7 +611,43 @@ def main(argv=None) -> int:
         import no_cloud
         with no_cloud.refusing():
             return _self_test()
-    raise NotImplementedError
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init-key", help="once, by the owner: a key pair, the private half into the login keychain")
+    st = sub.add_parser("set", help="by the owner: sign a budget (the keychain asks for the owner's password)")
+    st.add_argument("--scope", required=True)
+    st.add_argument("--usd", type=float, required=True)
+    st.add_argument("--note", required=True)
+    st.add_argument("--start", default=None, help="ISO UTC time spend counts from (default: now)")
+    for nm in ("show", "status"):
+        sub.add_parser(nm).add_argument("--scope", default=None, help="default: every budget file present")
+    for p in sub.choices.values():
+        p.add_argument("--budget-dir", default=BUDGET_DIR)
+        p.add_argument("--pub", default=PUB_FILE)
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "init-key":
+            pub = init_key(Keychain(), a.pub)
+            print(f"owner key created: private half in the login keychain ({KEYCHAIN_SERVICE}), public half in "
+                  f"{a.pub} ({pub[:16]}...). Commit that file.")
+        elif a.cmd == "set":
+            print(f"signed: {set_budget(a.scope, a.usd, a.note, Keychain(), a.start, a.budget_dir, a.pub)}")
+            print(json.dumps(load_budget(a.scope, a.budget_dir, a.pub), indent=1))
+        else:
+            names = os.listdir(a.budget_dir) if os.path.isdir(a.budget_dir) else []
+            scopes = [a.scope] if a.scope else sorted(f[7:-5] for f in names
+                                                      if f.startswith("budget_") and f.endswith(".json"))
+            if not scopes:
+                raise BudgetError(f"no budget in {a.budget_dir}")
+            for sc in scopes:
+                if a.cmd == "show":
+                    print(json.dumps(load_budget(sc, a.budget_dir, a.pub), indent=1))
+                else:
+                    print("\n".join(status_lines(spend(sc, budget_dir=a.budget_dir, pub_file=a.pub))))
+    except (BudgetError, OSError) as e:
+        print(f"refused: {e}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
