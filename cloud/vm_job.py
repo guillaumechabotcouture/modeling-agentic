@@ -781,7 +781,7 @@ def _self_test() -> int:
         finally:
             ws.JOBS = old
     real_gate = globals().get("_budget_gate")
-    globals()["_budget_gate"] = lambda a, name, meter=False: None   # cases before RN28 predate the budget
+    globals()["_budget_gate"] = lambda a, name, meter=False, reserve=True: None   # cases before RN28 predate it
     _self_test_sched(ok)
     _self_test_batch(ok)
     _self_test_run(ok, real_gate)
@@ -997,8 +997,8 @@ def _self_test_batch(ok) -> None:
         ap_err = []
         with mock.patch("argparse.ArgumentParser.error", lambda self, m: (ap_err.append(m), (_ for _ in ()).throw(
                 SystemExit(2)))):
-            for argv in (["start", "b1", "j", "--shutdown-when-stored", "--", "true"],
-                         ["start", "b1", "j", "--cluster-compute", "--", "true"]):
+            for argv in (["start", "b1", "j", "--cap-usd", "5", "--shutdown-when-stored", "--", "true"],
+                         ["start", "b1", "j", "--cap-usd", "5", "--cluster-compute", "--", "true"]):
                 try:
                     main(argv)
                 except SystemExit:
@@ -1103,7 +1103,7 @@ def _self_test_run(ok, real_gate=None) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None, gate=None):
+              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None, gate=None, job_src=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
@@ -1114,10 +1114,10 @@ def _self_test_run(ok, real_gate=None) -> None:
         ev = W["events"]
         src = os.path.join(d, f"src_{jid}")
         os.makedirs(src, exist_ok=True)
-        open(os.path.join(src, "job.py"), "w").write(
+        open(os.path.join(src, "job.py"), "w").write(job_src or (
             f"import os, time\ntime.sleep({job_sleep})\n"
             "open(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
-            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n")
+            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n"))
         fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
 
         def stop(cid, who):
@@ -1628,23 +1628,49 @@ def _self_test_run(ok, real_gate=None) -> None:
             case("RN28", rn28)
 
             def rn29():
-                for label, readings, extra in (("at the cap", [1.0, 6.0], ("--keep-on-failure",)),
-                                               ("unreadable cost", [RuntimeError("api")] * 3, ())):
-                    vals = list(readings)
+                # RN29 (Codex r1 P2 on #189): each reading is of the job's own cluster, and the output the job wrote
+                # just before its cluster crossed the cap is saved before the stop
+                prog = ("import os, time\nout = os.environ['JOB_OUT']\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('a')\ntime.sleep(0.6)\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('b')\ntime.sleep(3)\n")
+                seen = []
 
-                    def meter(cid, vals=vals):
-                        v = vals.pop(0) if vals else 99.0
-                        if isinstance(v, Exception):
-                            raise v
-                        return v
-                    W, msg, out, exc = world(d, f"r29{label[0]}", gate=lambda a, name, meter=False, m=meter: m,
-                                             threaded=True, job_sleep=2, extra=extra)
-                    ev = W["events"]
-                    polls = [i for i, e in enumerate(ev) if e == "poll"]
-                    ok(msg and "cap" in msg and ("delete", 100) in ev and W["stops"] >= 1 and polls
-                       and polls[-1] < ev.index(("delete", 100)) and clean(W),
-                       f"RN29 {label}: `run` saves the outputs, then stops the cluster by id (even under "
-                       f"--keep-on-failure) and exits non-zero: {msg} {ev[-4:]}")
+                def meter(cid, jid="r29a"):     # over the cap once the job has written 'b' on its VM
+                    seen.append(cid)
+                    if cid != 100:
+                        return 1000.0          # another cluster's cost: reading it would stop the job at once
+                    p = os.path.join(ws.JOBS, jid, "out", "progress.txt")
+                    return 6.0 if os.path.exists(p) and open(p).read() == "b" else 1.0
+                W, msg, out, exc = world(d, "r29a", gate=lambda a, name, meter=False, m=meter: m, threaded=True,
+                                         extra=("--keep-on-failure",), job_src=prog)
+                ev = W["events"]
+                saved = os.path.join(d, "local", "vm1", "r29a", "out", "progress.txt")
+                ok(msg and "cap" in msg and ("delete", 100) in ev and set(seen) == {100}
+                   and os.path.exists(saved) and open(saved).read() == "b" and clean(W),
+                   f"RN29 at the cap, `run` reads its own cluster's cost, saves the output written just before, then "
+                   f"stops the cluster by id under --keep-on-failure: {msg} readings={sorted(set(seen))} "
+                   f"saved={open(saved).read() if os.path.exists(saved) else None!r}")
+                vals = [RuntimeError("api")] * 3
+
+                def bad(cid):
+                    v = vals.pop(0) if vals else 99.0
+                    if isinstance(v, Exception):
+                        raise v
+                    return v
+                W, msg, out, exc = world(d, "r29b", gate=lambda a, name, meter=False, m=bad: m, threaded=True,
+                                         job_sleep=2)
+                ok(msg and "cap" in msg and ("delete", 100) in W["events"] and clean(W),
+                   f"RN29b three failed cost readings in a row stop the cluster (fail closed): {msg}")
+                calls = []
+
+                def late(cid):
+                    calls.append(cid)
+                    return 1.0 if len(calls) == 1 else 6.0
+                W, msg, out, exc = world(d, "r29c", job_rc=3, gate=lambda a, name, meter=False, m=late: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and "rc=3" in msg and len(calls) >= 2 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29c a job that failed past its cap between polls is still stopped under --keep-on-failure "
+                   f"(the cap is read before a terminal state returns): {msg} readings={len(calls)}")
             case("RN29", rn29)
 
             def rn30():
@@ -1676,6 +1702,42 @@ def _self_test_run(ok, real_gate=None) -> None:
                             pass
                 ok(len(errs) == 2 and all("--cap-usd" in e for e in errs), f"RN30c run and up require --cap-usd: {errs}")
             case("RN30", rn30)
+
+            def rn31():
+                import budget
+                reached = []
+                a = types.SimpleNamespace(name="lw-smoke-v", job_id="j31", command=["true"], cap_usd=5.0,
+                                          budget_scope=None, tree=None, dir=None, anthropic_key=False)
+                with mock.patch.object(budget, "launch_budget_ok",
+                                       lambda s_, c, name=None, reserve=True: (reached.append(reserve), (False, "over"))[1]), \
+                        mock.patch.object(budget, "scope_for_name", lambda n, *x: "f6"), \
+                        mock.patch.dict(globals(), {"_budget_gate": real_gate,
+                                                    "_client": lambda *x, **k: (_ for _ in ()).throw(RuntimeError("client"))}):
+                    try:
+                        cmd_start(a)
+                        msg = None
+                    except SystemExit as e:
+                        msg = str(e)
+                    except RuntimeError as e:
+                        msg = f"reached {e}"
+                    try:
+                        cmd_start(a, cluster=object())
+                        msg2 = None
+                    except BaseException as e:  # noqa: BLE001
+                        msg2 = str(e)
+                ok(msg and "over" in msg and reached == [False],
+                   f"RN31 interactive `start` is refused when the budget no longer covers its cap: {msg} {reached}")
+                ok(msg2 == "client" and reached == [False],
+                   f"RN31b under `run` (its own cluster object) start does not check twice: {msg2}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        main(["start", "v", "j", "--", "true"])
+                    except SystemExit:
+                        pass
+                ok(errs and "--cap-usd" in errs[0], f"RN31c start requires --cap-usd: {errs}")
+            case("RN31", rn31)
         finally:
             ws.JOBS = old
 

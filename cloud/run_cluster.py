@@ -3549,6 +3549,29 @@ def _self_test_budget(ok) -> None:
     ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
     msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
+        cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
+        json.dump({"run": {"name": cfg.name, "id": 5}}, open(cfg.clusters_file, "w"))
+        json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
+        seen, started = [], []
+        lbo = lambda scope, cap, name=None, reserve=True: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
+        for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
+            seen.clear(), started.clear()
+            with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                    mock.patch.dict(globals(), {"live_id": lambda n: 5, "start_helpers": lambda *a, **k: started.append(1),
+                                                "read_keys": lambda: started.append("keys"),
+                                                "_submit": lambda *a, **k: started.append("submit")}):
+                try:
+                    fn()
+                    msg = None
+                except SystemExit as e:
+                    msg = str(e)
+                except Exception as e:  # noqa: BLE001 -- past the guard, the missing fakes stop it
+                    msg = f"past the guard: {type(e).__name__}: {e}"
+            ok(msg and "over" in msg and not started and seen == ([True] if label == "keeper" else [False]),
+               f"BU5 `{label}` is refused before it creates or submits anything when the budget no longer covers "
+               f"cap_usd: {msg} reserve={seen}")
 
 
 def _self_test() -> int:
