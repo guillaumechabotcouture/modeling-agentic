@@ -26,8 +26,9 @@
     python cloud/run_cluster.py <config.py> checkpoint [--label L]
                                                               # the latest checkpoint of the latest launch, sha256
                                                               # verified, into <out_dir>/<label>/checkpoint/
-    python cloud/run_cluster.py <config.py> checkpoint-now [--timeout-s 300]
-                                                              # one checkpoint from each running run, awaited
+    python cloud/run_cluster.py <config.py> checkpoint-now [--timeout-s 300] [--invocation T] [--launch-id L]
+                                                              # one checkpoint from each running run, awaited in
+                                                              # storage under one deadline (recorded cluster id)
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
                                                               # Coiled credits per useful core-hour (billing API only)
@@ -50,20 +51,25 @@ its results were stored because the launcher waited for a manual collect.
 
 Checkpoints (F6, 2026-11-11: a v2 preview stopped at its credit cap after 3 h had stored nothing, because main.py
 stores the run only when it ends). While main.py runs, the agent VM uploads a tarball of the run dir (runs/<RUN>/...
-and run.log; never _truth/ or credential files; API keys redacted) every `checkpoint_minutes` (default 15, 0 off) to
-outputs/<storage_prefix>/launch_<id>/checkpoint_<label>.tar.gz, then its record checkpoint_<label>.json (time,
-size, sha256, run_state state and round, cached engine batches and rows). Each upload overwrites the last; one at a
-time (a checkpoint due while the previous one uploads is skipped); a failure is logged on the VM
-(/tmp/ab/<label>/.checkpoint/checkpoint.log) and never stops the run. `collect` says when a label has only a
-checkpoint. Resuming from one:
+and run.log; never _truth/, credential files or links; API keys redacted; each file opened once without following
+links, and what is scanned is what is archived) every `checkpoint_minutes` (default 15, 0 off). Each checkpoint is a
+new generation, written once: outputs/<storage_prefix>/launch_<id>/checkpoint_<label>_g<N>.tar.gz and its record
+checkpoint_<label>_g<N>.json (time, size, sha256, and, read from the archive, run_state state and round and the
+cached engine batches and rows); then the pointer checkpoint_<label>.json names it. The last two complete generations
+are kept. One at a time (a checkpoint due while the previous one uploads is skipped); one needs free space of
+1.5 x the run dir + 2 GB; a failure is logged on the VM (/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no
+local archive, and never stops the run. `collect` says when a label has only a checkpoint. `checkpoint-now` files a
+request on each agent VM (it returns at once) and waits in storage, under one deadline, for a generation carrying it
+or started after it. Resuming from one:
   1. `run_cluster.py <cfg> checkpoint [--label L]`: <out_dir>/<L>/checkpoint/runs/<RUN>/ and checkpoint.json
-     (refused when the tarball's sha256 is not the record's: run it again).
+     (the pointer's generation, or the previous one when it does not match its sha256; refused when neither does).
   2. Put the run dir into the launch tree at runs/<RUN> and commit it there (`git add -f runs/<RUN>`: runs/ is
      gitignored, and a launch ships `git archive HEAD`); a resume config sets require_main=False and
      flags=("--resume", "runs/<RUN>").
   3. `run_cluster.py <resume cfg> reuse-check <out_dir>/<L>/checkpoint/runs/<RUN> --expect-all`: the shipped code
      reuses every stored engine row (scripts/compute.py reuse path: `<out>.summary.json` rows and the
-     `<out>.partial.jsonl` journal of a batch the stop interrupted); then launch (or launch_watch.py).
+     `<out>.partial.jsonl` journal of a batch the stop interrupted; a results file whose sha256 is not the one
+     its summary records, as in a snapshot taken between the two writes, is recomputed); then launch.
   Engine rows survive the round trip only where the fingerprint does: a file over 64 MB under models/ or data/ is
   fingerprinted by size and mtime (ns), which neither the tarball (whole seconds) nor git archive keeps, and a
   symlink there is not archived: either one changes every batch's fingerprint. reuse-check (step 3) shows it.
@@ -1291,69 +1297,144 @@ def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = N
     return meta
 
 
-def checkpoint_record(cfg, store, label, launch_id) -> dict | None:
-    """The record of `label`'s latest checkpoint in launch `launch_id` (worker_side.Checkpointer), or None."""
+def _download_json(store, blob, account):
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         try:
-            store.download(ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label)[1], os.path.join(td, "r.json"),
-                           cfg.storage_account)
+            store.download(blob, os.path.join(td, "r.json"), account)
             rec = json.load(open(os.path.join(td, "r.json")))
-        except Exception:  # noqa: BLE001 -- none stored (or unreadable): no checkpoint to report
+        except Exception:  # noqa: BLE001 -- none stored (or unreadable)
             return None
     return rec if isinstance(rec, dict) else None
 
 
+def checkpoint_record(cfg, store, label, launch_id) -> dict | None:
+    """The pointer of `label`'s checkpoints in launch `launch_id` (the latest complete generation's record), or
+    None."""
+    return _download_json(store, ws.checkpoint_pointer(cfg.storage_prefix, launch_id, label), cfg.storage_account)
+
+
 def fetch_checkpoint(cfg, store, label) -> dict:
     """`checkpoint`: the latest checkpoint of the latest launch (assignments.json) into <out_dir>/<label>/checkpoint/
-    with its record (checkpoint.json). The tarball must match the record's sha256, else it is removed and refused
-    (a checkpoint replaced between the two downloads: run `checkpoint` again). An earlier copy is moved aside."""
-    import hashlib
+    with its record (checkpoint.json). The pointer names the latest generation; a generation whose tarball does not
+    match its record's sha256 is removed and the previous complete one is tried; none: refused. An earlier copy is
+    moved aside."""
     launch_id = json.load(open(cfg.state_file))[label]["launch_id"]
-    rec = checkpoint_record(cfg, store, label, launch_id)
-    if rec is None:
+    ptr = checkpoint_record(cfg, store, label, launch_id)
+    if ptr is None:
         raise SystemExit(f"{label}: no checkpoint stored for launch {launch_id}")
     base = os.path.join(cfg.out_dir, label)
     os.makedirs(base, exist_ok=True)
-    tgz = os.path.join(base, "checkpoint.tar.gz")
-    store.download(ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label)[0], tgz, cfg.storage_account)
+    tgz, why = os.path.join(base, "checkpoint.tar.gz"), []
+    for g in [x for x in (ptr.get("generation"), ptr.get("previous")) if x]:
+        tar_b, json_b = ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label, g)
+        rec = _download_json(store, json_b, cfg.storage_account)
+        try:
+            store.download(tar_b, tgz, cfg.storage_account)
+        except Exception as e:  # noqa: BLE001 -- try the previous generation
+            why.append(f"generation {g}: {type(e).__name__}")
+            continue
+        got = ws_sha256(tgz)
+        if rec is None or got != rec.get("sha256"):
+            os.remove(tgz)
+            why.append(f"generation {g}: tarball sha256 {got[:12]} is not its record's "
+                       f"{str((rec or {}).get('sha256'))[:12]}")
+            continue
+        dest = os.path.join(base, "checkpoint")
+        if os.path.exists(dest):
+            os.rename(dest, f"{dest}.before_{int(time.time())}")
+        with tarfile.open(tgz, mode="r:gz") as t:
+            t.extractall(dest, filter="data")
+        json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
+        note = "" if g == ptr.get("generation") else f" (the previous generation: {'; '.join(why)})"
+        print(f"{label}: checkpoint generation {g} of {rec.get('time_utc')} (state {rec.get('run_state')}, "
+              f"{rec.get('cached_batches')} cached batches, {rec.get('bytes')} bytes, sha256 verified){note} -> "
+              f"{dest}/runs/{rec.get('run_dir')}")
+        return rec
+    raise SystemExit(f"{label}: no checkpoint generation matches its record's sha256 ({'; '.join(why)}); run "
+                     "`checkpoint` again later")
+
+
+def ws_sha256(path) -> str:
+    import hashlib
     h = hashlib.sha256()
-    with open(tgz, "rb") as f:
+    with open(path, "rb") as f:
         for b in iter(lambda: f.read(2**20), b""):
             h.update(b)
-    if h.hexdigest() != rec.get("sha256"):
-        os.remove(tgz)
-        raise SystemExit(f"{label}: the checkpoint tarball's sha256 {h.hexdigest()[:12]} is not its record's "
-                         f"{str(rec.get('sha256'))[:12]} (replaced while downloading?): removed; run `checkpoint` again")
-    dest = os.path.join(base, "checkpoint")
-    if os.path.exists(dest):
-        os.rename(dest, f"{dest}.before_{int(time.time())}")
-    with tarfile.open(tgz, mode="r:gz") as t:
-        t.extractall(dest, filter="data")
-    json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
-    print(f"{label}: checkpoint of {rec.get('time_utc')} (state {rec.get('run_state')}, {rec.get('cached_batches')} "
-          f"cached batches, {rec.get('bytes')} bytes, sha256 verified) -> {dest}/runs/{rec.get('run_dir')}")
-    return rec
+    return h.hexdigest()
 
 
-def checkpoint_now(cfg, timeout_s: float = 300.0) -> int:
-    """`checkpoint-now`: one checkpoint from each running label's checkpoint thread, awaited at most `timeout_s`
-    (launch_watch before a stop). Attach-only. 0 when every label checkpointed or had finished."""
+def _connect_recorded(cfg, cid, lister=None, security_fn=None, client_cls=None):
+    """A plain distributed.Client on the run cluster `cid` (recorded in clusters.json), only while the listing shows
+    that id ready or running; never by name (as ack_probe)."""
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    state = next((ws.state_of(c) for c in _items(lister()) if c.get("id") == cid and c.get("name") == cfg.name), None)
+    if state not in ("ready", "running"):
+        raise SystemExit(f"{cfg.name}: the recorded run cluster {cid} is {state or 'not listed'}: refusing")
+    if security_fn is None:
+        def security_fn(cluster_id):
+            from coiled.v2.core import CloudV2
+            with CloudV2() as cloud:
+                return cloud.security(cluster_id, workspace=WORKSPACE)
+    sec, info = security_fn(cid)
+    if client_cls is None:
+        from distributed import Client as client_cls
+    return client_cls(info["address_to_use"], security=sec, timeout="60s")
+
+
+def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=None, store=None, connect=None,
+                   sleep=time.sleep, clock=time.time, poll_s: float = 10.0) -> int:
+    """`checkpoint-now`: one checkpoint of every running label, under one deadline. The run cluster is the id
+    clusters.json records (never by name); a record of another invocation or launch (`invocation`, `launch_id`:
+    launch_watch passes its own) or assignments of another launch are refused. Each label gets a request that
+    returns at once (worker_side.checkpoint_now_side: nothing waits on the worker), then storage is polled for a
+    generation carrying its token or started after it. 0 when every label checkpointed or had finished."""
+    rec, assign = json.load(open(cfg.clusters_file)), json.load(open(cfg.state_file))
+    if invocation and rec.get("invocation") != invocation:
+        raise SystemExit(f"{cfg.name}: clusters.json is invocation {rec.get('invocation')}, not {invocation}: refusing")
+    lid = rec.get("launch_id")
+    if (launch_id and lid != launch_id) or any((assign.get(lb) or {}).get("launch_id") != lid for lb in cfg.labels):
+        raise SystemExit(f"{cfg.name}: clusters.json launch {lid}, asked {launch_id}, assignments "
+                         f"{[(assign.get(lb) or {}).get('launch_id') for lb in cfg.labels]}: refusing")
+    cid = (rec.get("run") or {}).get("id")
+    if cid is None:
+        raise SystemExit(f"{cfg.name}: clusters.json records no run cluster id: refusing")
+    if store is None:
+        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
+        import results_store as store
     try:   # sent by value: the agent VM's uploaded worker_side may predate this function
         import cloudpickle
         cloudpickle.register_pickle_by_value(ws)
     except ImportError:
         pass
-    assign = json.load(open(cfg.state_file))
-    client, good = attach(cfg.name).get_client(), True
+    deadline = clock() + timeout_s
+    client, state, reqs = (connect or _connect_recorded)(cfg, cid), {}, {}
     for label in cfg.labels:
         try:
-            r = _on_worker(client, ws.checkpoint_now_side, label, timeout_s, worker=assign[label]["worker"])
+            r = _on_worker(client, ws.checkpoint_now_side, label, worker=assign[label]["worker"])
         except Exception as e:  # noqa: BLE001 -- reported; the caller decides
             r = {"state": f"unavailable ({type(e).__name__}: {str(e)[:120]})"}
-        good = good and r["state"] in ("checkpointed", "finished")
-        print(f"{label}: {r['state']} {(r.get('record') or {}).get('blob') or ''}".rstrip(), flush=True)
-    return 0 if good else 1
+        if r.get("state") == "requested":
+            reqs[label] = r
+        state[label] = r.get("state")
+    while reqs:
+        for label in list(reqs):
+            p = checkpoint_record(cfg, store, label, lid) or {}
+            if reqs[label]["token"] in (p.get("requests") or []) or (p.get("started_epoch") or 0) >= reqs[label]["epoch"]:
+                state[label] = f"checkpointed {ws.checkpoint_pointer(cfg.storage_prefix, lid, label)} " \
+                               f"(generation {p.get('generation')})"
+                del reqs[label]
+        left = deadline - clock()
+        if not reqs or left <= 0:
+            break
+        sleep(min(poll_s, left))
+    for label in reqs:
+        state[label] = "timeout"
+    for label in cfg.labels:
+        print(f"{label}: {state[label]}", flush=True)
+    return 0 if all(state[lb].startswith(("checkpointed", "finished")) for lb in cfg.labels) else 1
 
 
 def local_is_current(dest: str, launch_id: str) -> bool | None:
@@ -4139,7 +4220,9 @@ def main(argv) -> int:
         for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
             fetch_checkpoint(cfg, results_store, label)
     elif cmd == "checkpoint-now":
-        return checkpoint_now(cfg, float(rest[rest.index("--timeout-s") + 1]) if "--timeout-s" in rest else 300.0)
+        opt = lambda k, d=None: rest[rest.index(k) + 1] if k in rest else d  # noqa: E731
+        return checkpoint_now(cfg, float(opt("--timeout-s", 300.0)), invocation=opt("--invocation"),
+                              launch_id=opt("--launch-id"))
     elif cmd == "shutdown":
         shutdown(cfg)
     elif cmd == "relaunch":

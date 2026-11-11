@@ -2516,8 +2516,16 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
     try:
         prev = json.load(open(out + ".summary.json"))
         if _same_fn(prev, fn_spec, fid) and prev.get("code_fp") == fp:
-            got.update({r["key"]: r for r in (json.loads(l) for l in open(out) if l.strip())
-                        if isinstance(r, dict) and r.get("ok") and r.get("key")})
+            body = open(out, "rb").read()
+            rows = [json.loads(l) for l in body.decode().splitlines() if l.strip()]
+            # Codex round 1 P1-1: a results file and a summary from two different writes (a torn snapshot) are
+            # never trusted. A summary from before out_sha256 must at least count the rows it describes.
+            want = prev.get("out_sha256")
+            if (hashlib.sha256(body).hexdigest() != want) if want else (len(rows) != prev.get("n")):
+                print(f"compute: {out}: results file does not match its summary ("
+                      f"{'sha256' if want else 'row count'}): its rows are not reused", file=sys.stderr)
+                rows = []
+            got.update({r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")})
     except (OSError, ValueError):
         pass
     try:
@@ -2700,10 +2708,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose"),
                "runtime": runtime_versions()}
+    body = "".join(json.dumps(r) + "\n" for r in rows).encode()
+    summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
-        write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+        write_nofollow(base, name, body, atomic=True)
         write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
         try:
             remove_nofollow(base, name + PARTIAL_EXT)

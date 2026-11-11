@@ -536,12 +536,13 @@ class Watch:
 
     def final_checkpoint(self, rec) -> str:
         """Before a stop at the cap or the watch limit: one checkpoint of every running run (`checkpoint-now`, one
-        attempt, at most checkpoint_s on the VM), whatever it returns. Returns where the checkpoints are."""
-        code, out = self.call(["checkpoint-now", "--timeout-s", f"{int(self.checkpoint_s)}"], retries=1,
-                              timeout=self.checkpoint_s + 60)
-        self.log(f"final checkpoint exit {code}: {str(out).strip()[-300:]}")
+        attempt, every label under one deadline of checkpoint_s), whatever it returns; it names this watch's
+        invocation and launch, so checkpoint-now refuses any other record. Returns where the checkpoints are."""
         lid = (rec or {}).get("launch_id")
-        paths = [rc.ws.checkpoint_blobs(self.cfg.storage_prefix, lid, lb)[0] for lb in self.cfg.labels] if lid else []
+        code, out = self.call(["checkpoint-now", "--timeout-s", f"{int(self.checkpoint_s)}", "--invocation", self.token]
+                              + (["--launch-id", lid] if lid else []), retries=1, timeout=self.checkpoint_s + 60)
+        self.log(f"final checkpoint exit {code}: {str(out).strip()[-300:]}")
+        paths = [rc.ws.checkpoint_pointer(self.cfg.storage_prefix, lid, lb) for lb in self.cfg.labels] if lid else []
         return (f"latest checkpoints: {', '.join(paths)}; fetch with `python cloud/run_cluster.py {self.cfg_path} "
                 "checkpoint`" if paths else "no launch id recorded: no checkpoint path")
 
@@ -1000,7 +1001,7 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_LIMIT and "checkpoint-now" in runs(r[1]) and stops(r[1]) == []
                   and any(ck_path in ln for ln in r[4].lines[-3:]))(scenario(0, record, running, max_hours=0.0)))
     case("LW19c", "the final checkpoint is bounded: --checkpoint-minutes reaches the side call and the subprocess",
-         lambda: (lambda r: ["checkpoint-now", "--timeout-s", "120"] in r[3].tails
+         lambda: (lambda r: ["checkpoint-now", "--timeout-s", "120"] in [t[:3] for t in r[3].tails]
                   and ("checkpoint-now", 180.0) in r[3].timeouts)(
              scenario(0, record, running, api=_Billed(700.0), checkpoint_s=120.0)))
     case("LW24", "(Codex P2-6) the final checkpoint names this watch's invocation and launch; the exit names the "

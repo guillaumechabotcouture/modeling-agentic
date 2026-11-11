@@ -78,55 +78,92 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
 REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
 
 
-def _has_secret(path: str, secrets: list[bytes]) -> bool:
-    """Chunked scan (with an overlap, so a secret across two chunks is found); memory stays bounded."""
-    keep = max((len(x) for x in secrets), default=0)
-    tail = b""
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(2**20), b""):
-            buf = tail + block
-            if any(x in buf for x in secrets):
-                return True
-            tail = buf[-keep:] if keep else b""
-    return False
+def _open_nofollow(root: str, rel: str) -> int:
+    """A read fd for root/rel opened without following a link at any component under `root` (a planted link raises
+    OSError), and only for a regular file (else OSError)."""
+    import stat
+    parts = [p for p in rel.replace("\\", "/").split("/") if p]
+    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for p in parts[:-1]:
+            nxt = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=cur)
+    finally:
+        os.close(cur)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"not a regular file: {rel}")
+    return fd
 
 
-def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=()) -> list[str]:
-    """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, but a file over
-    REDACT_MAX_MB is streamed from disk and left out (listed) if it holds a secret. `extra`: (path, arcname) pairs
-    added as they are (run.log). Files that vanish while it runs are listed, not fatal. Returns what was left out."""
+def _copy_scan(fd: int, dst, secrets: list[bytes]) -> bool:
+    """Copy the open file to `dst` in 1 MiB blocks; True if a secret is in what was copied (an overlap carries a
+    secret across two blocks)."""
+    keep, tail, found = max((len(x) for x in secrets), default=0), b"", False
+    while True:
+        block = os.read(fd, 2**20)
+        if not block:
+            return found
+        dst.write(block)
+        buf = tail + block
+        found = found or any(x in buf for x in secrets)
+        tail = buf[-keep:] if keep else b""
+
+
+def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=(),
+                  _hook=None) -> list[str]:
+    """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, with bounded
+    memory. Each file is opened once, no link followed at any component, regular files only; its bytes are copied
+    to a temporary file, and what is scanned and redacted is that copy, which is what is archived, so a rewrite or a
+    swap for a link after the listing can neither leak a secret nor reach _truth/. A copy up to REDACT_MAX_MB is
+    redacted; a larger one is left out (listed) if it holds a secret. `extra`: (path, arcname) pairs (run.log).
+    `_hook(rel)` runs between the listing and each open (self-test). Returns what was left out."""
     import io
     import tarfile
+    import tempfile
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
+    items = []
+    for dp, dirs, files in os.walk(root):
+        dirs.sort()
+        items += [(root, os.path.relpath(os.path.join(dp, fn), root), None) for fn in sorted(files)]
+    items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
     with tarfile.open(out_path, mode="w:gz") as t:
-        items = []
-        for dp, dirs, files in os.walk(root):
-            dirs.sort()
-            items += [(os.path.join(dp, fn), os.path.relpath(os.path.join(dp, fn), root)) for fn in sorted(files)]
-        for full, rel in items + [(p, None) for p, _ in extra]:
-            arc = os.path.join(arcname, rel) if rel is not None else dict(extra)[full]
+        for base, rel, arc in items:
+            listed = rel if arc is None else arc
+            if arc is None and is_sensitive_path(rel):
+                skipped.append(rel)
+                continue
+            if _hook:
+                _hook(rel)
             try:
-                if rel is not None and (is_sensitive_path(rel) or os.path.islink(full)):
-                    skipped.append(rel)
-                    continue
-                size = os.path.getsize(full)
-                ti = tarfile.TarInfo(arc)
-                ti.mtime = int(os.path.getmtime(full))
-                if size <= REDACT_MAX_MB * 2**20:
-                    data = open(full, "rb").read()
-                    for x in sec:
-                        data = data.replace(x, b"<redacted>")
-                    ti.size = len(data)
-                    t.addfile(ti, io.BytesIO(data))
-                elif _has_secret(full, sec):
-                    skipped.append(rel or arc)
-                else:
-                    ti.size = size
-                    with open(full, "rb") as f:
-                        t.addfile(ti, f)
-            except FileNotFoundError:
-                skipped.append(rel or arc)
+                fd = _open_nofollow(base, rel)
+            except OSError:            # gone, a link, or not a regular file
+                skipped.append(listed)
+                continue
+            try:
+                mtime = int(os.fstat(fd).st_mtime)
+                with tempfile.TemporaryFile(dir=os.path.dirname(os.path.abspath(out_path))) as tmp:
+                    found = _copy_scan(fd, tmp, sec)
+                    size = tmp.tell()
+                    tmp.seek(0)
+                    ti = tarfile.TarInfo(os.path.join(arcname, rel) if arc is None else arc)
+                    ti.mtime = mtime
+                    if size <= REDACT_MAX_MB * 2**20:
+                        data = tmp.read()
+                        for x in sec:
+                            data = data.replace(x, b"<redacted>")
+                        ti.size = len(data)
+                        t.addfile(ti, io.BytesIO(data))
+                    elif found:
+                        skipped.append(listed)
+                    else:
+                        ti.size = size
+                        t.addfile(ti, tmp)
+            finally:
+                os.close(fd)
     return skipped
 
 
@@ -159,6 +196,12 @@ def upload_file(path: str, blob: str, account: str | None = None, service=None, 
             last = e
             time.sleep(2 ** k)
     raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
+
+
+def delete(blob: str, account: str | None = None, service=None) -> None:
+    """Remove one blob (an old checkpoint generation)."""
+    container, name = _split(blob)
+    (service or _service(account)).get_blob_client(container, name).delete_blob()
 
 
 def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
