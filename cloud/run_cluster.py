@@ -996,7 +996,6 @@ def keeper_later(cfg) -> int:
     """`keeper`: the overflow pool and keeper of a launch that ended before starting them (exit 3 or 5), for the run
     cluster clusters.json records, and only while that cluster is the live one of its name."""
     with _config_lock(cfg):
-        budget_guard(cfg)                 # the overflow pool and keeper are new paid clusters
         clusters = json.load(open(cfg.clusters_file))
         cid = (clusters.get("run") or {}).get("id")
         live = live_id(cfg.name)
@@ -1016,6 +1015,8 @@ def keeper_later(cfg) -> int:
                 _stop_id(cfg.keeper_name, keep_k)
                 clusters.pop("keeper", None)
                 keep_k = None
+        if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
+            budget_guard(cfg)             # a new overflow pool or keeper is paid: checked and reserved only then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
         write_clusters(cfg, clusters)

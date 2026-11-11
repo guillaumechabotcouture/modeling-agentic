@@ -992,6 +992,8 @@ def main() -> int:
     ap.add_argument("--compute-workers", type=int, default=0,
                     help="coiled: extra workers for compute-service batches (variants with compute: true)")
     ap.add_argument("--max-total-usd", type=float)
+    ap.add_argument("--cloud-cap-usd", type=float, help="coiled: the most the replay cluster may spend (USD); the "
+                    "owner-signed budget (cloud/budget.py) must cover it")
     ap.add_argument("--max-fixture-mb", type=float, default=50)
     ap.add_argument("--max-upload-gb", type=float, default=1.0)
     ap.add_argument("--upload-mbps", type=float, default=10.0)
@@ -1056,7 +1058,7 @@ def main() -> int:
             if not okey:
                 raise SystemExit("OPENAI_API_KEY must be set in the launching shell for crossmodel arms")
         replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent,
-                             openai_key=okey, compute_workers=a.compute_workers)
+                             openai_key=okey, compute_workers=a.compute_workers, cloud_cap_usd=a.cloud_cap_usd)
         print(f"launched; collect with: replay.py collect --batch {batch} --watch")
         return 0
     cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency),

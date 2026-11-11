@@ -18,10 +18,12 @@ its id, never an attach by name.
     python cloud/vm_job.py down <name> <job_id>      # stop a kept cluster (found through job.json)
 
 Budget (F6 Stage 2; on 2026-11-11 an agent spent $106 of a $100 budget). `run`, `up` and `start` require
-`--cap-usd` and refuse, before any cluster is listed or created or any job submitted, unless the owner-signed budget of the cluster name's scope
-(cloud/budget.py, cloud/budget_scopes.yaml) covers the scope's spend plus the cap. Each `run` poll saves the
-outputs, then measures the job cluster's USD before it returns any state; at the cap (or after three failed
-readings in a row) the cluster is stopped by id, --keep-on-failure or not, even if the job has just ended.
+`--cap-usd`. They refuse, before any job is submitted or, for `run`, any cluster listed, unless the owner-signed
+budget of the cluster name's scope (cloud/budget.py, cloud/budget_scopes.yaml) covers the scope's spend plus the
+cap. `run` and `up` reserve the cap; `up` does so only once it will construct a cluster. Each `run` poll saves the
+outputs, then measures the job cluster's USD before it returns any state, the job's loss included. The cluster is
+stopped by id, --keep-on-failure or not, in three cases: at the cap (after one last copy of the outputs), after
+three failed readings in a row, or after a failed reading at a terminal state.
 
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
@@ -324,7 +326,7 @@ def _runner(c, w):
     return lambda fn, *a: c.run(fn, *a, workers=[w], wait=True, on_error="raise")[w]
 
 
-def _create(a, if_live="keep", box=None):
+def _create(a, if_live="keep", box=None, gate=False):
     """Create the cluster once no cluster of that name is live or stopping. A live one is kept
     (`up`: "already up", returns False) or refused (`run`: no second launch on a cluster that
     may hold another job); a stopping one is waited out, never attached to or re-created early.
@@ -344,6 +346,8 @@ def _create(a, if_live="keep", box=None):
         time.sleep(15)    # stopping: never create (or attach) until it has stopped
     else:
         raise SystemExit(f"{a.name} is still stopping; try again later")
+    if gate:                    # `up`: checked and reserved only now that a cluster will be constructed
+        _budget_gate(a, a.name)
     n = int(getattr(a, "workers", 1) or 1)
     if box is not None:
         box["constructing"] = True   # from here a cluster with this (unique, for `run`) name may exist
@@ -376,9 +380,10 @@ def _budget_gate(a, name, meter=False, reserve=True):
     return budget.job_meter(scope) if meter else None
 
 
-def _cap_reading(meter, cid, cap, job_id, misses):
+def _cap_reading(meter, cid, cap, job_id, misses, final=False):
     """None while the job cluster's USD is under `cap`; at the cap, or after three failed readings in a row (fail
-    closed), the state that ends `run`."""
+    closed), the state that ends `run`. `final` (the job just reached a terminal state, so no later reading
+    follows): a failed reading is not a conclusive cap decision, and stops the cluster."""
     try:
         usd = meter(cid)
         misses[0] = 0
@@ -389,15 +394,14 @@ def _cap_reading(meter, cid, cap, job_id, misses):
     except Exception as e:  # noqa: BLE001
         misses[0] += 1
         print(f"{job_id}: cost reading failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
-        if misses[0] < 3:
+        if misses[0] < 3 and not final:
             return None
         why = f"cost cap: the cluster's cost could not be read 3 times in a row ({type(e).__name__}); fail closed"
     return {"state": {"job_id": job_id, "state": "over_cap", "why": why}, "files": {}, "fetched": [], "log_tail": ""}
 
 
 def cmd_up(a):
-    _budget_gate(a, a.name)
-    if _create(a):
+    if _create(a, gate=True):
         # Coiled counts idle time from cluster start, not from the first task: there is no setting for "only after
         # work", so an `up` with no `start` behind it idles out with nothing done (2026-11-03, about two hours lost)
         print(f"WARNING: {a.name} stops after {a.idle_timeout} idle unless `start` follows now. For a single job, "
@@ -471,8 +475,9 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
     'over_cap' while the job still runs."""
     want, gone_polls, misses = _job_worker(dest), 0, [0]
 
-    def cap():
-        over = _cap_reading(meter, cid, a.cap_usd, a.job_id, misses) if meter is not None and cid is not None else None
+    def cap(final=False):
+        over = (_cap_reading(meter, cid, a.cap_usd, a.job_id, misses, final)
+                if meter is not None and cid is not None else None)
         if over is not None and flags is not None:
             flags["over_cap"] = True
         return over
@@ -484,6 +489,7 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
             except WorkerGone as e:
                 gone_polls += 1
                 if gone_polls >= 3:
+                    cap(final=True)          # a terminal state too: the cap first
                     print(f"{a.job_id}: lost ({e})")
                     return {"state": {"job_id": a.job_id, "state": "lost", "why": str(e)}, "files": {},
                             "fetched": [], "log_tail": ""}
@@ -491,9 +497,14 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
             gone_polls = 0
             st = sync_outputs(_runner(c, w), a.job_id, dest)
             _print(st, dest)
-            over, checked = cap(), True      # outputs saved first, then the cap, then any terminal state
+            over, checked = cap(final=st["state"]["state"] in DONE + ("missing", "lost")), True   # outputs, cap, state
             if st["state"]["state"] in DONE + ("missing", "lost"):
                 return st
+            if over is not None:             # at the cap: one last copy of what the job wrote since, then stop
+                try:
+                    sync_outputs(_runner(c, w), a.job_id, dest)
+                except Exception as e2:  # noqa: BLE001 -- best effort; the stop comes regardless
+                    print(f"{a.job_id}: last copy before the stop failed ({type(e2).__name__})")
         except (Exception, SystemExit) as e:  # noqa: BLE001 — a dropped connection is not the end of the job
             if isinstance(e, SystemExit) and not gone_ok:
                 raise     # `wait`/`status`: the attach guard's refusal ends the command
