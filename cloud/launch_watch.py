@@ -486,7 +486,7 @@ class Watch:
             scope = self.cfg.budget_scope or (b.scope_for_name(self.cfg.name) if hasattr(b, "scope_for_name") else "")
             if not scope:
                 return f"{self.cfg.name}: no budget_scope in the config"
-            ok, why = b.launch_budget_ok(scope, self.asked_cap, name=self.cfg.name)
+            ok, why = b.launch_budget_ok(scope, self.asked_cap, name=self.cfg.name, reserve=False)   # `launch` reserves
             if not ok:
                 return why
             self.meter = b.job_meter(scope)
@@ -1142,6 +1142,11 @@ def _self_test() -> int:
          lambda: refused({"checkpoint_minutes": 0}, EXIT_NO_CHECKPOINTS, allow_no_checkpoints=True)
          and checkpoint_refusal(cfg_of(tempfile.mkdtemp(), checkpoint_minutes=0, run_timeout_hours=0.5), True) is None
          and checkpoint_refusal(cfg_of(tempfile.mkdtemp(), checkpoint_minutes=0, run_timeout_hours=0.5)) is not None)
+    fb0 = _FakeBudget(ok=False)
+    case("LW22c", "the watch checks the budget without reserving: run_cluster.py launch reserves the cap itself, so "
+                  "reserving here too would count the launch twice and refuse it",
+         lambda: refused({"budget_scope": "f6", "cap_usd": 90.0}, EXIT_BUDGET, cap_usd=80.0, budget=fb0)
+         and fb0.reserves == [False])
     fb = _FakeBudget(ok=False)
     case("LW22a", "the launch asks the budget for (scope, the config's cap_usd if set, else --cap-usd, name); a "
                   "refusal stops it (exit 10)",
@@ -1201,8 +1206,9 @@ class _FakeBudget:
     def __init__(self, api=None, ok=True):
         self.api, self.ok, self.asked, self.metered = api, ok, [], []
 
-    def launch_budget_ok(self, scope, cap_usd, name=None):
+    def launch_budget_ok(self, scope, cap_usd, name=None, reserve=True):
         self.asked.append((scope, cap_usd, name))
+        self.reserves = getattr(self, "reserves", []) + [reserve]
         return self.ok, "fake budget"
 
     def job_meter(self, scope):

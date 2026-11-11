@@ -680,6 +680,34 @@ def _self_test() -> int:
             ok(False, "C3b compute variant without compute workers launched")
         except SystemExit:
             pass
+        # C7 (F6 budget): the Coiled replay launcher checks and reserves the owner-signed budget before it creates
+        # or grows a cluster
+        sys.path.insert(0, os.path.join(REPO, "cloud"))
+        import budget as _bud
+        from unittest import mock as _mock
+        for label, cap, verdict in (("no --cloud-cap-usd", None, (True, "ok")), ("over budget", 5.0, (False, "over")),
+                                    ("covered", 5.0, (True, "ok"))):
+            made, seen = [], []
+
+            def _ca(*a, **k):
+                made.append(a)
+                raise RuntimeError("stop here")
+            with _mock.patch.object(_bud, "launch_budget_ok",
+                                    lambda s_, c, name=None, reserve=True, v=verdict: (seen.append(reserve), v)[1]), \
+                    _mock.patch.object(_bud, "scope_for_name", lambda n, *x: "f6"), \
+                    _mock.patch.object(rcoil, "create_or_attach", _ca):
+                try:
+                    rcoil.launch(cases_plan, variants, REPO, td, "lw-smoke-rp", 1, None, dry_agent=True,
+                                 cloud_cap_usd=cap)
+                    msg = None
+                except SystemExit as e:
+                    msg = str(e)
+                except Exception as e:  # noqa: BLE001
+                    msg = f"past the guard: {e}"
+            want = (["past the guard: stop here", [True]] if label == "covered"
+                    else [None, [] if cap is None else [True]])
+            ok((msg == want[0] if label == "covered" else (msg and not made and not msg.startswith("past"))) and seen == want[1],
+               f"C7 replay launch, {label}: {'reaches the cluster after reserving' if label == 'covered' else 'refused before any cluster'}: {msg} {seen}")
         pf = os.path.join(vdir, "p.md"); open(pf, "w").write("PROMPT {run_dir}")
         vb = rcoil.variants_bundle([dict(variants[0], prompt_file=pf)])
         names = tarfile.open(fileobj=io.BytesIO(vb), mode="r:gz").getnames()
@@ -964,6 +992,8 @@ def main() -> int:
     ap.add_argument("--compute-workers", type=int, default=0,
                     help="coiled: extra workers for compute-service batches (variants with compute: true)")
     ap.add_argument("--max-total-usd", type=float)
+    ap.add_argument("--cloud-cap-usd", type=float, help="coiled: the most the replay cluster may spend (USD); the "
+                    "owner-signed budget (cloud/budget.py) must cover it")
     ap.add_argument("--max-fixture-mb", type=float, default=50)
     ap.add_argument("--max-upload-gb", type=float, default=1.0)
     ap.add_argument("--upload-mbps", type=float, default=10.0)
@@ -1028,7 +1058,7 @@ def main() -> int:
             if not okey:
                 raise SystemExit("OPENAI_API_KEY must be set in the launching shell for crossmodel arms")
         replay_coiled.launch(planned, variants, REPO, batch, a.cluster_name, a.workers, key, a.dry_agent,
-                             openai_key=okey, compute_workers=a.compute_workers)
+                             openai_key=okey, compute_workers=a.compute_workers, cloud_cap_usd=a.cloud_cap_usd)
         print(f"launched; collect with: replay.py collect --batch {batch} --watch")
         return 0
     cases = asyncio.run(run_batch(a.stage, fixtures, variants, batch, a.seeds, LocalBackend(a.concurrency),
