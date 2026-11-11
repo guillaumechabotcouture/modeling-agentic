@@ -2293,12 +2293,23 @@ _FP_REPO_SKIP = ("scripts/lib/code_commit.txt",)
 # in a v2 run (its spec, decision_spec.yaml, at the run root): a v1 run hashes everything, and every other file
 # (decision_tests/<id>.yaml included: its names are not fixed) is hashed (Codex P2-9 on #161).
 FP_HARNESS_OUTPUTS = ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml")
+# F6 Stage 2: sign-off records under data/, skipped in a v2 run (as FP_HARNESS_OUTPUTS). Exact paths, one reason each.
+# A lead-signed preview and the owner-signed final run of one spec differ only in these, so the final run recomputed
+# every stored batch. Everything a batch reads is still hashed; the self-test (RS4) fails if an engine-batch job
+# module (toolkit/engines/**, toolkit/analysis/batch.py, trajectories.py) names one of them.
+FP_SIGNOFF_RECORDS = (
+    # toolkit/spec/geometry.py SIGNOFF_FILE, written by freeze() at sign-off and `approve`: who signed, when, the
+    # owner's approvals, and a copy of the geometry declaration with sha256 hashes of the boundary, crosswalk and
+    # units files. Those files themselves stay hashed under data/, and only the gate (geometry.check) reads the record.
+    "data/geometry_signoff.json",
+)
 # Dependency manifests at the repo root: a pin change changes what the code computes (Codex P2-8).
 FP_DEP_MANIFESTS = ("requirements.txt", "requirements-cloud.txt", "requirements-agent.txt")
 
 
 def _harness_output(run_dir: str, rel: str) -> bool:
-    return rel.replace(os.sep, "/") in FP_HARNESS_OUTPUTS and os.path.isfile(os.path.join(run_dir, "decision_spec.yaml"))
+    return (rel.replace(os.sep, "/") in FP_HARNESS_OUTPUTS + FP_SIGNOFF_RECORDS
+            and os.path.isfile(os.path.join(run_dir, "decision_spec.yaml")))
 
 
 def runtime_versions() -> dict:
@@ -2330,7 +2341,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
     """What a result depends on besides its params: every file under the run's
     models/ and data/ (following symlinked directories) and the repo's
     scripts/ and toolkit/ (code content only: never the commit stamp, F6 S1-8) and its dependency manifests
-    (FP_DEP_MANIFESTS), except a v2 run's fixed-name analysis outputs (FP_HARNESS_OUTPUTS) and (outside data/) logs,
+    (FP_DEP_MANIFESTS), except a v2 run's fixed-name analysis outputs (FP_HARNESS_OUTPUTS) and sign-off records
+    (FP_SIGNOFF_RECORDS) and (outside data/) logs,
     figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
     detached-job record; files up to 64 MB by content, larger ones by
