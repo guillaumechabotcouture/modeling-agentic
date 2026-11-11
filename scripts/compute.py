@@ -2302,14 +2302,29 @@ FP_SIGNOFF_RECORDS = (
     # owner's approvals, and a copy of the geometry declaration with sha256 hashes of the boundary, crosswalk and
     # units files. Those files themselves stay hashed under data/, and only the gate (geometry.check) reads the record.
     "data/geometry_signoff.json",
+    # toolkit/spec/geometry.py ARTIFACT, written by geometry.run() (stage_machine SIGN refreshes it): the geometry
+    # check report, which copies the sign-off's signed_by / at and the owner's approvals (Codex r1 P2-1). Its other
+    # content derives from the boundary, crosswalk and units files, which stay hashed; only the gate and the sign-off
+    # sheet read it.
+    "data/input_checks.json",
 )
 # Dependency manifests at the repo root: a pin change changes what the code computes (Codex P2-8).
 FP_DEP_MANIFESTS = ("requirements.txt", "requirements-cloud.txt", "requirements-agent.txt")
 
 
+def _v2_run(run_dir: str) -> bool:
+    """A v2 run: a decision spec at the root and metadata.json recording pipeline v2 (Codex r1 P2-2: v1 can hold a
+    spec too). A missing or unreadable record is not v2, so everything is hashed (fail closed)."""
+    if not os.path.isfile(os.path.join(run_dir, "decision_spec.yaml")):
+        return False
+    try:
+        return json.load(open(os.path.join(run_dir, "metadata.json"))).get("pipeline") == "v2"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _harness_output(run_dir: str, rel: str) -> bool:
-    return (rel.replace(os.sep, "/") in FP_HARNESS_OUTPUTS + FP_SIGNOFF_RECORDS
-            and os.path.isfile(os.path.join(run_dir, "decision_spec.yaml")))
+    return rel.replace(os.sep, "/") in FP_HARNESS_OUTPUTS + FP_SIGNOFF_RECORDS and _v2_run(run_dir)
 
 
 def runtime_versions() -> dict:
@@ -3384,12 +3399,14 @@ def _self_test_s18(ok) -> None:
             fp1 = fp()
             ok(fp1 != fp0, "RU2 a change to repo code still changes the fingerprint")
             w(rd, "decision_spec.yaml", "spec: 1\n")       # a v2 run: its spec at the run root
+            w(rd, "metadata.json", json.dumps({"pipeline": "v2"}))     # and its recorded pipeline (Codex r1 P2-2)
             fp1 = fp()
             for rel in ("models/allocation_robustness.yaml", "models/claims_spec.yaml", "models/claims_ledger.yaml",
                         "decision_spec.yaml", "analysis/point.json"):
                 w(rd, rel, "written: 1\n")
             ok(fp() == fp1, "RU3 a v2 run's fixed harness outputs under models/ and the spec keep the fingerprint")
-            for rel in ("models/decision_tests/DT1.yaml", "models/decision_tests/custom.yaml", "data/input_checks.json"):
+            # data/input_checks.json left this list: it is a sign-off-derived report, skipped on purpose (RS0-RS1)
+            for rel in ("models/decision_tests/DT1.yaml", "models/decision_tests/custom.yaml", "data/derived/x.csv"):
                 w(rd, rel, "written: 2\n")
                 fpx = fp()
                 ok(fpx != fp1, f"RU3b (Codex P2-9) no wildcard: {rel} is hashed")
