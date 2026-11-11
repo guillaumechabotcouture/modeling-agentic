@@ -131,8 +131,10 @@ class _Env:
 def _confirm_on_tty(rec, tty="/dev/tty") -> bool:
     """The owner reads the record and types its amount on the terminal; with no terminal, nothing is signed. A
     terminal is not seekable, so it gets separate read and write streams."""
-    try:
-        with open(tty, "r") as rd, open(tty, "w", buffering=1) as wr:
+    try:       # O_NOCTTY: opening a terminal must never make it this process's controlling terminal (CI: a pty
+        # opened by a session leader without one became its controlling terminal, and closing it sent SIGHUP)
+        with os.fdopen(os.open(tty, os.O_RDONLY | os.O_NOCTTY), "r") as rd, \
+                os.fdopen(os.open(tty, os.O_WRONLY | os.O_NOCTTY), "w", buffering=1) as wr:
             wr.write(json.dumps(rec, indent=1) + f"\nType the amount in USD to sign this {rec['scope']} budget: ")
             wr.flush()
             return float(rd.readline().strip()) == float(rec["usd"])
