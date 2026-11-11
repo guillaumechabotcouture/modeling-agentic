@@ -74,9 +74,15 @@ status line every `--every` seconds (outputs saved locally each time), then
 stops the cluster:
 
 ```bash
-python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> \
+python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --cap-usd <USD> \
     [--workers N --cluster-compute] -- <command ...>
 ```
+
+- `--cap-usd` is required (for `up` too): the launch is refused before any
+  cluster exists unless the owner-signed budget of the name's scope
+  (`cloud/budget.py status`) covers the scope's spend plus the cap, and `run`
+  stops the cluster when its cost reaches the cap. Only the owner can set or
+  raise a budget.
 
 - A command that runs `main.py` must name its pipeline (`--v2` or `--v1`);
   `vm_job.py` refuses it otherwise, before anything is created. The job
