@@ -989,6 +989,23 @@ def _run_offline_self_test() -> int:
        f"{dd.estimated_usd / lp.estimated_usd:.2f}×")
 
     spec = PoolSpec(name="p-new", max_nodes=2)
+    # AB1 (F6 budget): Azure Batch is not billed through Coiled, so the owner-signed budget cannot see it; pools and
+    # tasks are refused unless MA_ALLOW_AZURE_BATCH=1
+    from unittest import mock as _mock
+    with _mock.patch.dict(os.environ, {"MA_ALLOW_AZURE_BATCH": ""}):
+        for label, fn, existing in (("a pool", lambda r: r.ensure_pool("p-new", max_nodes=2), set()),
+                                    ("tasks", lambda r: r.submit_function_tasks("p-old", _square, [2],
+                                                                                budget_usd_cap=100.0), {"p-old"})):
+            with _FakeAzure(existing_pools=existing) as fa:
+                r = fa.runner()
+                try:
+                    fn(r)
+                    refused = False
+                except SystemExit as e:
+                    refused = "MA_ALLOW_AZURE_BATCH" in str(e)
+                ok(refused and not any(c[0] in ("pool.add", "job.add", "task.add_collection") for c in fa.calls),
+                   f"AB1 {label}: refused unless MA_ALLOW_AZURE_BATCH=1, before any create call; calls {fa.calls}")
+    os.environ["MA_ALLOW_AZURE_BATCH"] = "1"     # the cases below test Batch itself
     # L1: success path deletes the pool this invocation created.
     with _FakeAzure() as fa:
         r = fa.runner()

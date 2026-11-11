@@ -1645,8 +1645,10 @@ def _self_test_run(ok, real_gate=None) -> None:
                     with mock.patch.object(budget, "launch_budget_ok", lbo), \
                             mock.patch.object(budget, "scope_for_name", lambda n, *a: scope):
                         W, msg, out, exc = world(d, f"r28{label[0]}", gate=real_gate)
+                    uniq = f"vm1-r28{label[0]}-"
+                    named = [(s_, c, len(n) == len(uniq) + 6 and n.startswith(uniq)) for s_, c, n in seen]
                     ok(msg and ("budget" in msg or "scope" in msg) and not W["ctor"] and W["list_calls"] == 0
-                       and "submit" not in W["events"] and seen == ([("f6", 5.0, "vm1")] if scope else []),
+                       and "submit" not in W["events"] and named == ([("f6", 5.0, True)] if scope else []),
                        f"RN28 {label}: `run` refuses before listing or creating any cluster: {msg} {seen}")
             case("RN28", rn28)
 
@@ -1720,6 +1722,27 @@ def _self_test_run(ok, real_gate=None) -> None:
                    f"RN29e a terminal state whose cost cannot be read stops the cluster (no conclusive cap decision): "
                    f"{msg} readings={len(calls2)}")
             case("RN29d", rn29d)
+
+            def rn29f():
+                res = []
+
+                def unreadable(cid):
+                    raise RuntimeError("api")
+                for meter in (unreadable, lambda cid: 1.0):
+                    a = types.SimpleNamespace(name="vmx", job_id="j29f", cap_usd=5.0, every=60, max_hours=0.0)
+                    flags = {}
+                    with mock.patch.dict(globals(), {"_client": lambda *x, **k: (_ for _ in ()).throw(
+                            RuntimeError("drop")), "_gone": lambda n, c: False, "_job_worker": lambda dest: "w"}), \
+                            mock.patch.object(time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            st = _poll(a, d, gone_ok=True, deadline=time.time() - 1, cid=100, meter=meter, flags=flags)
+                            res.append((st["state"]["state"], bool(flags.get("over_cap"))))
+                        except SystemExit:
+                            res.append(("deadline", bool(flags.get("over_cap"))))
+                ok(res == [("over_cap", True), ("deadline", False)],
+                   f"RN29f at the polling deadline an unreadable cost takes the mandatory stop path (a reading under "
+                   f"the cap may end on the deadline): {res}")
+            case("RN29f", rn29f)
 
             def rn30():
                 import budget
