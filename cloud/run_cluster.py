@@ -3471,6 +3471,52 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_budget(ok) -> None:
+    """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
+    (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
+    import types
+    from unittest import mock
+    import budget
+    for bad in (dict(cap_usd=-1), dict(cap_usd=float("nan")), dict(cap_usd=True), dict(cap_usd="5")):
+        try:
+            RunConfig(name="t", question_file="/dev/null", **bad)
+            ok(False, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+        except (ValueError, TypeError):
+            ok(True, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+    ok(RunConfig(name="lw-smoke-x", question_file="q").budget_scope == "f6"
+       and RunConfig(name="t", question_file="q").budget_scope == ""
+       and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
+       "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
+    made, keys = [], []
+    calls = []
+
+    def try_launch(cfg, verdict):
+        made.clear(), keys.clear(), calls.clear()
+        fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
+        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), verdict)[1]  # noqa: E731
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                            "pipeline_preflight": lambda c, code: "v2",
+                                            "read_keys": lambda: keys.append(1) or 1 / 0}):   # stops past the guard
+            try:
+                _launch_locked(cfg, "inv")
+                return None
+            except SystemExit as e:
+                return str(e)
+            except Exception as e:  # noqa: BLE001 -- past the guard, the fakes stop it
+                return f"past the guard: {type(e).__name__}"
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2"), (True, "ok"))
+    ok(msg and "cap_usd" in msg and not made and not keys and not calls,
+       f"BU3 a config without cap_usd is refused before the budget, any key or any cluster: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (False, "over"))
+    ok(msg and "budget" in msg and "over" in msg and not made and not keys and calls == [("f6", 20, "lw-smoke-t")],
+       f"BU4 a launch the budget refuses creates nothing and reads no key: {msg} {calls}")
+    msg = try_launch(RunConfig(name="zz", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3660,6 +3706,11 @@ def _self_test() -> int:
             ok(False, "RC15 a config without CONFIG is refused")
         except SystemExit:
             ok(True, "RC15 a config without CONFIG is refused")
+    try:
+        _self_test_budget(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"BU: {type(e).__name__}: {e}")
+    globals()["budget_guard"] = lambda cfg: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)
