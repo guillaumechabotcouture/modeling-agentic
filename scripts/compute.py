@@ -3510,7 +3510,7 @@ def _self_test_signoff_reuse(ok) -> None:
     from unittest import mock
     g = globals()
     recs = tuple(g.get("FP_SIGNOFF_RECORDS", ()))
-    ok(recs == ("data/geometry_signoff.json",) and all("*" not in r and "?" not in r for r in recs),
+    ok(recs == ("data/geometry_signoff.json", "data/input_checks.json") and all("*" not in r and "?" not in r for r in recs),
        f"RS0 the sign-off exclusion is an exact, named list (no wildcard): {recs}")
     with tempfile.TemporaryDirectory() as td:
         td = os.path.realpath(td)
@@ -3524,6 +3524,9 @@ def _self_test_signoff_reuse(ok) -> None:
         for who in ("lead", "owner"):
             rd = os.path.join(td, f"run_{who}")
             w(rd, "decision_spec.yaml", "spec: 1\n")
+            w(rd, "metadata.json", json.dumps({"pipeline": "v2"}))
+            # Codex r1 P2-1: geometry.check copies the signer into the report it writes to data/input_checks.json
+            w(rd, "data/input_checks.json", json.dumps({"geometry": {"signed_by": who, "findings": []}}))
             w(rd, "models/fn.py", "def f(p):\n    return p\n")
             w(rd, "data/inputs/units.csv", "u,a\n1,2\n")
             w(rd, "data/derived/rates.csv", "u,r\n1,0.5\n")
@@ -3542,6 +3545,13 @@ def _self_test_signoff_reuse(ok) -> None:
                 fx = code_fingerprint(runs["owner"], "models/fn.py::f")
                 ok(fx != fo, f"RS2 any other file under data/ ({rel}) still changes the fingerprint")
                 fo = fx
+            # Codex r1 P2-2: a spec alone is not a v2 run; metadata.json must record pipeline v2
+            w(runs["lead"], "metadata.json", json.dumps({"pipeline": "v1"}))
+            f0 = code_fingerprint(runs["lead"], "models/fn.py::f")
+            w(runs["lead"], "data/geometry_signoff.json", '{"signed_by": "someone else"}')
+            ok(code_fingerprint(runs["lead"], "models/fn.py::f") != f0,
+               "RS3b a run whose metadata records pipeline v1 hashes the record even with a decision_spec.yaml")
+            w(runs["lead"], "metadata.json", json.dumps({"pipeline": "v2"}))
             os.remove(os.path.join(runs["lead"], "decision_spec.yaml"))     # a v1 run hashes everything
             f1 = code_fingerprint(runs["lead"], "models/fn.py::f")
             w(runs["lead"], "data/geometry_signoff.json", '{"signed_by": "owner"}')
