@@ -284,7 +284,7 @@ def shell_runner(cfg_path, prefix=None):
 
 
 class Watch:
-    def __init__(self, cfg, cfg_path, token, runner, api, clock, sleep, cap=650.0, interval_s=300.0,
+    def __init__(self, cfg, cfg_path, token, runner, api, clock, sleep, cap_usd=650.0, interval_s=300.0,
                  start_s=300.0, max_hours=None, rate=8.0, allow_no_limits=False, retries=6, retry_s=60.0,
                  cap_collect_s=600.0, launch_s=2700.0, relaunch_attempts=3, collect_s=1800.0, collect_attempts=6,
                  checkpoint_s=300.0, usd_per_credit=USD_PER_CREDIT):
@@ -587,6 +587,7 @@ def _self_test() -> int:
     def cfg_of(tmp, name="cfg-x", labels=("A", "B"), **kw):
         kw.setdefault("run_timeout_hours", 2.0)
         kw.setdefault("cluster_timeout", "3 hours")
+        kw.setdefault("budget_scope", "f6")
         return rc.RunConfig(name=name, question_file="q.txt", labels=labels, out_dir=tmp, pipeline="v2", **kw)
 
     def record(cfg, token=TOKEN, status="launched", roles=("run", "overflow", "keeper"), launched="2026-11-10T00:00:00Z"):
@@ -646,12 +647,14 @@ def _self_test() -> int:
     def watch(cfg, runner, api, **kw):
         clock, sleep = fake_time()
         kw.setdefault("retry_s", 1.0)
+        kw.setdefault("budget", _FakeBudget(api))     # never the stub or a real cloud/budget.py
         return Watch(cfg, "cfg.py", TOKEN, runner, api, clock, sleep, **kw)
 
-    def scenario(launch_rc, rec, script=None, live=None, name="cfg-x", labels=("A", "B"), journal=(), **kw):
+    def scenario(launch_rc, rec, script=None, live=None, name="cfg-x", labels=("A", "B"), journal=(), cfg_kw=None,
+                 **kw):
         """A full run of the watchdog against fakes: (exit code, call log, cfg, runner, watch)."""
         tmp = tempfile.mkdtemp()
-        cfg = cfg_of(tmp, name=name, labels=labels)
+        cfg = cfg_of(tmp, name=name, labels=labels, **(cfg_kw or {}))
         log = []
         r = rec(cfg) if callable(rec) else rec
         box = {}
@@ -762,17 +765,19 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_SHUTDOWN_UNCONFIRMED)(
              scenario(0, record, done_script, api=_Sticky())))
 
-    # 3. credit cap
-    case("LW3a", "projected_credits: billed plus live instances x hours x rate",
-         lambda: abs(projected_credits(100.0, [4, 2], 2.0, 8.0) - 196.0) < 1e-9)
+    # 3. spend cap, in dollars, from cloud/budget.py's estimator (job_meter) over this launch's recorded ids
+    case("LW3a", "spend: the budget estimator's dollars summed over the recorded ids only, logged every check",
+         lambda: (lambda r: any("spend: $12.50 of cap $650.00" in ln for ln in r[4].lines)
+                  and sorted(set(r[4].budget.metered)) == [100, 101, 102])(
+             scenario(0, record, done_script, api=_Billed(12.5))))
     case("LW3b", "at the cap: a collect is attempted, then every live recorded cluster is stopped by id, exit 3",
          lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102]
                   and r[1].index(("run", "collect")) < r[1].index(next(x for x in r[1] if x[0] == "stop")))(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"}))],
-                                              "collect": [(0, "A: still running")]}, cap=650.0,
+                                              "collect": [(0, "A: still running")]}, cap_usd=650.0,
                       api=_Billed(700.0))))
     case("LW3c", "below the cap the watch goes on (billing by recorded id only)",
-         lambda: (lambda r: r[0] == EXIT_DONE)(scenario(0, record, done_script, cap=650.0, api=_Billed(10.0))))
+         lambda: (lambda r: r[0] == EXIT_DONE)(scenario(0, record, done_script, cap_usd=650.0, api=_Billed(10.0))))
 
     # 5. cloud-side limits
     case("LW5a", "refuse a config with run_timeout_hours None or cluster_timeout empty; the override allows it",
@@ -872,18 +877,9 @@ def _self_test() -> int:
     case("LW10a", "instance_count: the live scheduler and workers of a cluster's details; unreadable -> None",
          lambda: instance_count(det) == 3 and instance_count(None) is None and instance_count({"workers": "x"}) is None)
 
-    def credits_case(counts, want):
-        tmp, log = tempfile.mkdtemp(), []
-        cfg = cfg_of(tmp, compute_start=5, compute_max=24)
-        rec = record(cfg)
-        api = _Counted(counts).bind(cfg, log, {v["id"]: v["name"] for v in recorded(rec).values()})
-        api.up = True
-        w = watch(cfg, Runner({}, log), api)
-        return w.credits(rec, api.list_clusters()) == want
-    case("LW10b", "credits: an autoscaled run cluster's live count from the API (12), overflow at its maximum",
-         lambda: credits_case({100: 12, 102: 2}, round((12 + 25 + 2) * 8 / 6, 1)))
-    case("LW10c", "credits: no count from the API -> configured maxima (1+labels+compute_max, 1+overflow_max, 2)",
-         lambda: credits_case({}, round((27 + 25 + 2) * 8 / 6, 1)))
+    case("LW10b", "spend: a meter reading that fails is 'unknown': no stop, the watch goes on",
+         lambda: (lambda r: r[0] == EXIT_DONE and any("spend: unknown" in ln for ln in r[4].lines))(
+             scenario(0, record, done_script, api=_MeterFails())))
 
     # P1-4: the emergency collect at the cap is one bounded attempt; cap and limit checked between collect retries
     case("LW11a", "at the cap: one collect with the short deadline, then the stops even when it times out",
@@ -1013,17 +1009,50 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102])(
              scenario(0, record, lambda cfg: {**running(cfg), "checkpoint-now": [(None, "TimeoutError")]},
                       api=_Billed(700.0))))
-    case("LW20a", "--cap-usd converts with --usd-per-credit (default 0.124, the measured 2026-11-11 ratio)",
-         lambda: cap_credits(None, 80.6, USD_PER_CREDIT) == (650.0, "cap $80.60 = 650.0 credits at $0.124/credit")
-         and USD_PER_CREDIT == 0.124 and cap_credits(None, None, 0.124)[0] == 650.0
-         and cap_credits(500.0, None, 0.124) == (500.0, "cap 500.0 credits (~$62.00 at $0.124/credit)"))
-    case("LW20b", "--cap and --cap-usd together are refused; a non-positive ratio is refused",
-         lambda: all(_raises(lambda a=a: cap_credits(*a), ValueError) for a in ((500.0, 60.0, 0.124),
-                                                                                (None, 60.0, 0.0))))
-    case("LW20c", "the credits log line gives dollars too",
-         lambda: (lambda r: any((lambda m: m and abs(float(m[2]) - round(float(m[1]) * 0.124, 2)) < 1e-9)(
-             re.search(r"credits \(billed \+ projected\): ([\d.]+) \(~\$([\d.]+)\)", ln)) for ln in r[4].lines))(
-             scenario(0, record, done_script, api=_Billed(10.0))))
+    # Owner rules in code (2026-11-11): dollar caps from cloud/budget.py's estimator, checkpoints, the signed budget
+    case("LW20a", "the watch's cap is the smaller of --cap-usd and the config's cap_usd",
+         lambda: (lambda r: r[4].cap == 40.0 and r[0] == EXIT_CAP)(
+             scenario(0, record, running, api=_Billed(45.0), cfg_kw={"cap_usd": 40.0}))
+         and (lambda r: r[4].cap == 650.0)(scenario(0, record, done_script, cfg_kw={"cap_usd": 900.0})))
+    case("LW20b", "RunConfig: cap_usd must be positive when set; budget_scope is a name",
+         lambda: _raises(lambda: cfg_of(tempfile.mkdtemp(), cap_usd=0), ValueError)
+         and (lambda c: c.cap_usd is None and c.budget_scope == "")(rc.RunConfig(name="n", question_file="q")))
+
+    def refused(cfg_kw, code, **kw):
+        tmp, log = tempfile.mkdtemp(), []
+        cfg = cfg_of(tmp, **cfg_kw)
+        r = watch(cfg, Runner({}, log), Api(cfg, log), **kw).run()
+        return r == code and "launch" not in runs(log)
+    case("LW21a", "a v2 config with checkpoints off or over 30 minutes is refused before the launch (exit 9)",
+         lambda: refused({"checkpoint_minutes": 0}, EXIT_NO_CHECKPOINTS)
+         and refused({"checkpoint_minutes": 45}, EXIT_NO_CHECKPOINTS)
+         and checkpoint_refusal(cfg_of(tempfile.mkdtemp(), checkpoint_minutes=30)) is None)
+    case("LW21b", "--allow-no-checkpoints only for a smoke (run_timeout_hours <= 0.5)",
+         lambda: refused({"checkpoint_minutes": 0}, EXIT_NO_CHECKPOINTS, allow_no_checkpoints=True)
+         and checkpoint_refusal(cfg_of(tempfile.mkdtemp(), checkpoint_minutes=0, run_timeout_hours=0.5), True) is None
+         and checkpoint_refusal(cfg_of(tempfile.mkdtemp(), checkpoint_minutes=0, run_timeout_hours=0.5)) is not None)
+    fb = _FakeBudget(ok=False)
+    case("LW22a", "the launch asks the budget for (scope, the config's cap_usd if set, else --cap-usd, name); a "
+                  "refusal stops it (exit 10)",
+         lambda: refused({"budget_scope": "f6", "cap_usd": 90.0}, EXIT_BUDGET, cap_usd=80.0, budget=fb)
+         and fb.asked == [("f6", 90.0, "cfg-x")]
+         and (lambda b: refused({"budget_scope": "f6"}, EXIT_BUDGET, cap_usd=80.0, budget=b)
+              and b.asked == [("f6", 80.0, "cfg-x")])(_FakeBudget(ok=False)))
+
+    def broken(exc, where):
+        b = _FakeBudget()
+        setattr(b, where, lambda *a, **k: (_ for _ in ()).throw(exc))
+        return b
+    case("LW22b", "fail closed: the budget module missing, not implemented or erring, in the check or the meter, "
+                  "refuses the launch (exit 10)",
+         lambda: all(refused({"budget_scope": "f6"}, EXIT_BUDGET, budget=broken(e, w))
+                     for e in (NotImplementedError("stub"), RuntimeError("x")) for w in ("launch_budget_ok", "job_meter"))
+         and refused({"budget_scope": "f6"}, EXIT_BUDGET, budget=_no_module)
+         and refused({"budget_scope": ""}, EXIT_BUDGET, budget=_FakeBudget()))
+    case("LW23", "--cap-usd is required; the credit cap and its ratio are gone",
+         lambda: all(_raises(lambda a=a: _quiet(main, ["launch_watch.py", "cfg.py", *a]), SystemExit)
+                     for a in ([], ["--cap", "650"], ["--cap-usd", "80", "--usd-per-credit", "0.1"],
+                               ["--cap-usd", "80", "--credits-per-instance-hour", "8"])))
 
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed: {', '.join(fails)}")
@@ -1038,6 +1067,34 @@ def _raises(fn, exc) -> bool:
     except exc:
         return True
     return False
+
+
+def _quiet(fn, *a):
+    import contextlib
+    import io
+    with contextlib.redirect_stderr(io.StringIO()):
+        return fn(*a)
+
+
+class _FakeBudget:
+    """cloud/budget.py's interface (PR #192: launch_budget_ok(scope, cap_usd, name), job_meter(scope) -> fn(cid) ->
+    USD), for the self-test: it never imports the stub or a real budget module. The meter reads the fake API."""
+    def __init__(self, api=None, ok=True):
+        self.api, self.ok, self.asked, self.metered = api, ok, [], []
+
+    def launch_budget_ok(self, scope, cap_usd, name=None):
+        self.asked.append((scope, cap_usd, name))
+        return self.ok, "fake budget"
+
+    def job_meter(self, scope):
+        def meter(cid):
+            self.metered.append(cid)
+            return self.api.usd_of(cid) if self.api is not None else 0.0
+        return meter
+
+
+def _no_module():
+    raise ImportError("No module named 'budget'")
 
 
 class _FakeApi:
@@ -1060,12 +1117,8 @@ class _FakeApi:
         self.log.append(("stop", cid))
         self.live.pop(cid, None)
 
-    def billing(self, start, end):
-        self.log.append(("billing",))
-        return []
-
-    def instances(self, cid):
-        return None
+    def usd_of(self, cid):                      # what the budget's meter reports for a cluster
+        return 0.0
 
 
 class _Sticky(_FakeApi):
@@ -1074,14 +1127,19 @@ class _Sticky(_FakeApi):
 
 
 class _Billed(_FakeApi):
-    def __init__(self, credits):
+    """The run cluster (id 100) has cost `usd`; one reading of it per check."""
+    def __init__(self, usd):
         super().__init__()
-        self.credits = credits
+        self.usd = usd
 
-    def billing(self, start, end):
-        self.log.append(("billing",))
-        return [{"cluster_id": 100, "amount_credits": -self.credits, "instance": "i-1"},
-                {"cluster_id": 555, "amount_credits": -10000.0, "instance": "i-x"}]   # not this launch's
+    def reading(self):
+        pass
+
+    def usd_of(self, cid):
+        if cid != 100:
+            return 0.0
+        self.reading()
+        return self.usd
 
 
 class _Stray(_FakeApi):
@@ -1091,8 +1149,8 @@ class _Stray(_FakeApi):
 
 class _Foreign(_Billed):
     """A later cluster of the run's own name, created after the launch by another invocation."""
-    def __init__(self, credits=0.0):
-        super().__init__(credits)
+    def __init__(self, usd=0.0):
+        super().__init__(usd)
 
     def bind(self, cfg, log, live):
         return super().bind(cfg, log, {**live, 888: cfg.name})
@@ -1103,39 +1161,31 @@ class _Both(_FakeApi):
         return super().bind(cfg, log, {**live, 888: cfg.name, 999: cfg.keeper_name})
 
 
-class _Counted(_FakeApi):
-    def __init__(self, counts):
-        super().__init__()
-        self.counts = counts
-
-    def instances(self, cid):
-        if cid not in self.counts:
-            raise OSError("cluster details unavailable")
-        return self.counts[cid]
+class _MeterFails(_FakeApi):
+    def usd_of(self, cid):
+        raise OSError("cluster details unavailable")
 
 
 class _Growing(_Billed):
-    """Billed credits that pass the cap after the first reading."""
+    """Spend that passes the cap after the first reading."""
     def __init__(self):
         super().__init__(0.0)
         self.n = 0
 
-    def billing(self, start, end):
+    def reading(self):
         self.n += 1
-        self.credits = 0.0 if self.n == 1 else 700.0
-        return super().billing(start, end)
+        self.usd = 0.0 if self.n == 1 else 700.0
 
 
 class _GrowingAt(_Billed):
-    """Billed credits that pass the cap from the n-th billing reading on."""
+    """Spend that passes the cap from the n-th reading on."""
     def __init__(self, n):
         super().__init__(0.0)
         self.n, self.k = n, 0
 
-    def billing(self, start, end):
+    def reading(self):
         self.k += 1
-        self.credits = 700.0 if self.k >= self.n else 0.0
-        return super().billing(start, end)
+        self.usd = 700.0 if self.k >= self.n else 0.0
 
 
 class _PreFailing(_FakeApi):
@@ -1153,7 +1203,7 @@ class _Failing(_FakeApi):
             return []
         raise OSError("Temporary failure in name resolution")
 
-    def billing(self, start, end):
+    def usd_of(self, cid):
         raise OSError("Temporary failure in name resolution")
 
 
