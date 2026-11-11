@@ -36,9 +36,11 @@ max(billed, estimate); one created before the budget's start counts its estimate
 an unknown VM type, missing scheduler, worker or instance data, and a missing or negative cost. A budget whose
 start is in the future refuses launches.
 
-Reservations. `launch_budget_ok` holds an exclusive lock on a reservations file while it measures. When the launch
-fits, it records (scope, cap, name, invocation, time). Spend counts each open reservation until a cluster of that
-name appears, or for 2 h. This guards against concurrent launches from this machine only.
+Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
+ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time). A reservation
+counts its whole cap until a cluster named after it (its helpers included) appears, then max(0, cap - those
+clusters' spend) until all of them are stopped, when it is released; one whose cluster never appears lapses after
+2 h. A malformed ledger refuses. This guards against concurrent launches from this machine only.
 """
 from __future__ import annotations
 
@@ -111,7 +113,7 @@ class _Env:
     def __init__(self, budget_dir=BUDGET_DIR, pub_file=PUB_FILE, store=None, source=None, clock=time.time,
                  reservations=None, scopes=SCOPES_FILE, prices=PRICES_FILE, confirm=None):
         self.budget_dir, self.pub_file, self.store, self.source, self.clock = budget_dir, pub_file, store, source, clock
-        self.reservations = reservations or os.path.join(budget_dir, "budget_reservations.json")
+        self.reservations = reservations or os.path.join(budget_dir, "reservations", "ledger.json")
         self.scopes, self.prices, self.confirm = scopes, prices, confirm or _confirm_on_tty
 
     def path(self, name):
@@ -124,13 +126,14 @@ class _Env:
         return self.source or CoiledSource()
 
 
-def _confirm_on_tty(rec) -> bool:
-    """The owner reads the record and types its amount on the terminal; with no terminal, nothing is signed."""
+def _confirm_on_tty(rec, tty="/dev/tty") -> bool:
+    """The owner reads the record and types its amount on the terminal; with no terminal, nothing is signed. A
+    terminal is not seekable, so it gets separate read and write streams."""
     try:
-        with open("/dev/tty", "r+") as tty:
-            tty.write(json.dumps(rec, indent=1) + f"\nType the amount in USD to sign this {rec['scope']} budget: ")
-            tty.flush()
-            return float(tty.readline().strip()) == float(rec["usd"])
+        with open(tty, "r") as rd, open(tty, "w", buffering=1) as wr:
+            wr.write(json.dumps(rec, indent=1) + f"\nType the amount in USD to sign this {rec['scope']} budget: ")
+            wr.flush()
+            return float(rd.readline().strip()) == float(rec["usd"])
     except (OSError, ValueError):
         return False
 
@@ -403,8 +406,11 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     if live and tc is None and cc is None:
         tc = cc = 0.0                      # not billed yet: the estimate covers it
     billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
-    before = _ts(d["created"]) is None or _ts(d["created"]) < start
-    return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "live_instances": live,
+    created = _ts(d["created"])
+    if created is None:
+        raise BudgetError(f"cluster {d.get('id')}: no valid creation time in its record")
+    before = created < start
+    return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
             "usd": est if before else max(billed, est), "_billed_all": billed}
 
@@ -427,7 +433,7 @@ def _measure(rec, env, now) -> dict:
 
     def overlaps(t, c):
         upd = _ts((c.get("current_state") or {}).get("updated")) if isinstance(c.get("current_state"), dict) else None
-        return t >= start or state_of(c) not in ENDED or upd is None or upd >= start
+        return t >= start or state_of(c) != "stopped" or upd is None or upd >= start
     counted = [c for t, c in mine if overlaps(t, c)]
     dets = {c["id"]: src.details(c["id"]) for c in counted}
     sample = []
@@ -443,46 +449,71 @@ def _measure(rec, env, now) -> dict:
     median = 0.0 if not n else sample[n // 2] if n % 2 else (sample[n // 2 - 1] + sample[n // 2]) / 2
     median = max(median, _num(rec["floor_usd_per_instance_hour"], "floor"))
     rows = [_cluster_cost(dets[c["id"]], now, start, median, prices) for c in counted]
-    for r in rows:
+    for r, c in zip(rows, counted):
         r.pop("_billed_all")
+        r["listed_state"] = state_of(c)
     return {"median": median, "rate_from_clusters": n, "prices": prices, "start": start, "rows": rows,
             "items": items}
 
 
-def _reservations(env, scope, items, now) -> list:
-    """Open reservations of `scope`: younger than RESERVATION_S, and no cluster of the name created since."""
+def _ledger(env) -> list:
+    """The reservations ledger: a list of {scope, cap_usd, name, invocation, time}; anything else refuses."""
     try:
         allr = json.load(open(env.reservations))
     except FileNotFoundError:
-        allr = []
+        return []
     except (OSError, ValueError) as e:
         raise BudgetError(f"{env.reservations} cannot be read: {e}") from None
-    out = []
-    for r in allr if isinstance(allr, list) else []:
-        seen = any(str(c.get("name") or "").startswith(r["name"]) and (_ts(c.get("created")) or 0) >= r["time"] - 120
-                   for c in items)
-        if not seen and now - r["time"] < RESERVATION_S:
-            out.append(r)
-    return [r for r in out if r["scope"] == scope], out
+    ok = isinstance(allr, list) and all(
+        isinstance(r, dict) and set(r) == {"scope", "cap_usd", "name", "invocation", "time"}
+        and isinstance(r["scope"], str) and isinstance(r["name"], str) and r["name"] and isinstance(r["invocation"], str)
+        and not isinstance(r["cap_usd"], bool) and isinstance(r["cap_usd"], (int, float)) and r["cap_usd"] > 0
+        and not isinstance(r["time"], bool) and isinstance(r["time"], (int, float)) for r in allr)
+    if not ok:
+        raise BudgetError(f"{env.reservations} is not a list of reservations: refusing")
+    return allr
+
+
+def _reservations(env, scope, rows, now):
+    """(this scope's open reservations, each with its outstanding USD; the ledger to keep). A reservation holds its
+    cap until a cluster named after it appears, then max(0, cap - those clusters' spend) while any of them runs;
+    it is released once all are stopped, or after RESERVATION_S with none."""
+    mine, keep = [], []
+    for r in _ledger(env):
+        if r["scope"] != scope:
+            keep.append(r)                 # another scope's: measured by its own launches
+            continue
+        match = [x for x in rows if str(x["name"] or "").startswith(r["name"]) and x["created"] >= r["time"] - 120]
+        if match:
+            if not any(x["live_instances"] or x["listed_state"] not in ENDED for x in match):
+                continue                   # every cluster of the launch stopped: released
+            out = max(0.0, r["cap_usd"] - sum(x["usd"] for x in match))
+        elif now - r["time"] < RESERVATION_S:
+            out = r["cap_usd"]
+        else:
+            continue                       # no cluster within 2 h: lapsed
+        keep.append(r)
+        mine.append(dict(r, outstanding_usd=out))
+    return mine, keep
 
 
 def _spend(scope, env, now) -> dict:
     rec = load_budget(scope, env)
     m = _measure(rec, env, now)
-    mine, _ = _reservations(env, scope, m["items"], now)
     rows = m["rows"]
-    used, reserved = sum(r["usd"] for r in rows), sum(r["cap_usd"] for r in mine)
+    mine, keep = _reservations(env, scope, rows, now)
+    used, reserved = sum(r["usd"] for r in rows), sum(r["outstanding_usd"] for r in mine)
     return {"scope": scope, "budget_usd": float(rec["usd"]), "start_utc": rec["start_utc"], "note": rec["note"],
             "expires_utc": rec["expires_utc"], "prefixes": list(rec["prefixes"]), "rate_usd_per_instance_hour":
             m["median"], "rate_from_clusters": m["rate_from_clusters"], "billed_usd": sum(r["billed_usd"] for r in rows),
             "used_usd": used, "reserved_usd": reserved, "remaining_usd": float(rec["usd"]) - used - reserved,
-            "clusters": rows, "reservations": mine, "_m": m, "_rec": rec}
+            "clusters": rows, "reservations": mine, "_m": m, "_rec": rec, "_keep": keep}
 
 
 def spend(scope) -> dict:
     """The scope's spend: verified budget, clusters, open reservations (see the module doc)."""
     s = _spend(scope, _ENV, _ENV.clock())
-    s.pop("_m"), s.pop("_rec")
+    s.pop("_m"), s.pop("_rec"), s.pop("_keep")
     return s
 
 
@@ -522,7 +553,7 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
                 return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}"
             fits = round(s["used_usd"] + s["reserved_usd"] + cap, 6) <= round(s["budget_usd"], 6)
             if fits and reserve:
-                _, keep = _reservations(env, scope, s["_m"]["items"], now)
+                keep = s["_keep"]
                 inv = os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
                 keep.append({"scope": scope, "cap_usd": cap, "name": name, "invocation": inv, "time": now})
                 os.makedirs(os.path.dirname(env.reservations), exist_ok=True)
@@ -555,7 +586,8 @@ def status_lines(s) -> list[str]:
            f"{'cluster':<40} {'id':>9} {'state':<9} {'billed':>9} {'estimate':>9} {'counted':>9} {'live VMs':>8}"]
     out += [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} {r['estimate_usd']:>9.2f} "
             f"{r['usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
-    return out + [f"reservation {r['name']} ${r['cap_usd']:.2f} ({r['invocation']})" for r in s["reservations"]]
+    return out + [f"reservation {r['name']}: cap ${r['cap_usd']:.2f}, outstanding ${r['outstanding_usd']:.2f} "
+                  f"({r['invocation']})" for r in s["reservations"]]
 
 
 # ---- self-test -------------------------------------------------------------------------------
