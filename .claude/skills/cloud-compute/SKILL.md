@@ -106,6 +106,9 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --c
 
 # Legacy: Cloud Compute via Azure Batch (opt-in, `--cloud`)
 
+Azure Batch spend is outside the owner-signed Coiled budget (`cloud/budget.py`), so `scripts/cloud_batch.py`
+refuses to create pools or submit tasks unless `MA_ALLOW_AZURE_BATCH=1` is set. Only the owner sets it.
+
 ## What this skill chose and why
 
 **Azure Batch** is the primary cloud surface for this project. It's the

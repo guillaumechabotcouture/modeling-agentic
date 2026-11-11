@@ -520,6 +520,9 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
         if over is not None:
             return over
         if deadline is not None and time.time() > deadline:
+            over = cap(final=True)       # no exit without a cap decision: unreadable at the deadline stops it
+            if over is not None:
+                return over
             raise SystemExit(f"{a.job_id}: still not finished {a.max_hours} h after submission (plus 1 h); "
                              f"`status {a.name} {a.job_id}` checks it")
         time.sleep(a.every)
@@ -636,11 +639,11 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
-    meter = _budget_gate(a, a.name, meter=True)   # before any listing or cluster
+    base, unique = a.name, run_cluster_name(a.name, a.job_id)
+    meter = _budget_gate(a, unique, meter=True)   # before any listing or cluster; reserved for the exact name it creates
     a.shutdown_when_stored = True
     a.shutdown_always = not a.keep_on_failure
     a.shutdown_grace_s = int(2 * a.every + 60)
-    base = a.name
     prefix = run_cluster_name(base, a.job_id, "0" * 6)[:-6]     # <name>-<job_id>-, truncated as real names are
     busy = sorted(f"{c.get('name')} ({c.get('id')})" for c in _all_clusters()
                   if ws.state_of(c) not in _ENDED + ("",)
@@ -648,7 +651,7 @@ def _run_locked(a, dest):
     if busy:
         raise SystemExit(f"{base}: a cluster for this name or job is already running ({', '.join(busy)}); `run` "
                          f"never launches a second one (`status {base} {a.job_id}` or `down`)")
-    a.base_name, a.dest, a.name = base, dest, run_cluster_name(base, a.job_id)
+    a.base_name, a.dest, a.name = base, dest, unique
     print(f"{base}: cluster {a.name} for {a.job_id}")
     box, good, why = {}, False, "interrupted"
     try:

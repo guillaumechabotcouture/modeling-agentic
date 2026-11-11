@@ -9,7 +9,8 @@ top), multi-structural LOO-CV, sensitivity analysis. All reduce to:
 given args, collect outputs."
 
 Auth via DefaultAzureCredential (picks up `az login` automatically).
-All pools default to low-priority / spot nodes. Budget guard does a
+Refused unless MA_ALLOW_AZURE_BATCH=1: this spend is outside the owner-signed
+Coiled budget (cloud/budget.py). All pools default to low-priority / spot nodes. Budget guard does a
 pre-flight cost estimate and refuses to submit when over cap. Storage
 round-trips function+args via Azure Blob.
 
@@ -215,6 +216,14 @@ SAS_DEFAULT_HOURS = 3
 # ---------------------------------------------------------------------------
 # Module-level test functions (pickle needs these importable by name)
 # ---------------------------------------------------------------------------
+
+def _require_azure_batch(what: str) -> None:
+    """Azure Batch is billed outside Coiled, so the owner-signed cloud budget (cloud/budget.py) cannot see it: refuse
+    to create pools or submit tasks unless MA_ALLOW_AZURE_BATCH=1 states that this spend is deliberate (F6 Stage 2)."""
+    if os.environ.get("MA_ALLOW_AZURE_BATCH") != "1":
+        raise SystemExit(f"cloud_batch: refusing to {what}: Azure Batch spend is outside the owner-signed budget "
+                         "(cloud/budget.py); set MA_ALLOW_AZURE_BATCH=1 to use it deliberately")
+
 
 def _square(x):
     return x * x
@@ -444,6 +453,7 @@ class BatchRunner:
             ),
             **pool_kwargs,
         )
+        _require_azure_batch("create a pool")
         batch.pool.add(pool)
         self._created_pools[pool_name] = bool(use_low_priority)
         return True
@@ -574,6 +584,8 @@ class BatchRunner:
         Each task downloads the pickled (fn, args), runs fn(args), and
         uploads the result. Returns the job_id for later wait_and_collect.
 
+        Refused unless MA_ALLOW_AZURE_BATCH=1 (see _require_azure_batch).
+
         Pre-flight budget guard: if the estimated cost (based on
         len(args_list), avg_task_seconds, pool max_nodes, vm_size) exceeds
         `budget_usd_cap`, refuses to submit unless `force=True`.
@@ -584,6 +596,7 @@ class BatchRunner:
             root to sys.path so custom user functions (e.g., outcome_fn)
             can be imported by the worker when unpickling.
         """
+        _require_azure_batch("submit tasks")
         self._require_config()
         from azure.batch import models as batch_models
         batch = self._batch_get()
