@@ -293,6 +293,7 @@ class Watch:
                  checkpoint_s=300.0, allow_no_checkpoints=False, budget=None):
         self.checkpoint_s, self.allow_no_ck = checkpoint_s, allow_no_checkpoints
         self.budget, self.meter, self.asked_cap = budget, None, cfg.cap_usd if cfg.cap_usd else cap_usd
+        self.ever, self.state_path = {}, os.path.join(cfg.out_dir, f"watch_{token}.json")   # every id recorded
         self.cfg, self.cfg_path, self.token, self.runner, self.api = cfg, cfg_path, token, runner, api
         # the watch never stops later than the config allows: the smaller of --cap-usd and the config's cap_usd
         self.cap = min(cap_usd, cfg.cap_usd) if cfg.cap_usd else cap_usd
@@ -403,7 +404,7 @@ class Watch:
             items = self.safe(self.api.list_clusters) if rec else None
             if items is not None:
                 self.sweep(rec, items)
-            usd = self.spend(rec) if rec else None          # every interval, whatever the listing did
+            usd = self.spend(rec)          # every interval, whatever the listing did; no record is unreadable
             if usd is not None and usd >= self.cap:
                 return self.at_cap(rec)
             if usd is None and getattr(self, "unreadable", 0) >= UNREADABLE_READINGS:
@@ -434,7 +435,21 @@ class Watch:
             self.sleep(self.interval_s)
 
     def owners(self, rec):
-        return {v["id"] for v in recorded(rec).values()}, journal_ids(rc.read_journal(self.cfg), self.token)
+        return ({v["id"] for v in recorded(rec).values()} | set(self.ever),
+                journal_ids(rc.read_journal(self.cfg), self.token))
+
+    def remember(self, rec):
+        """Every cluster id this launch has ever recorded (a replaced helper's spend stays counted), kept in the
+        watch's own state file <out_dir>/watch_<token>.json."""
+        new = {v["id"]: v["name"] for v in recorded(rec).values() if v["id"] not in self.ever}
+        if new:
+            self.ever.update(new)
+            try:
+                tmp = self.state_path + ".tmp"
+                json.dump({"token": self.token, "ids": {str(k): v for k, v in self.ever.items()}}, open(tmp, "w"))
+                os.replace(tmp, self.state_path)
+            except OSError as e:
+                self.log(f"watch state not written ({type(e).__name__}: {e}); ids kept in memory")
 
     def leave(self, rec, code) -> int:
         """Before an exit that leaves clusters up: every live cluster of this launch's names and its ownership."""
@@ -482,10 +497,14 @@ class Watch:
 
     def spend(self, rec, items=None):
         """Dollars this launch has cost so far: cloud/budget.py's estimator (max of billed, total_cost x $0.061 +
-        cloud_total_cost, and its conservative per-instance estimate) summed over the cluster ids clusters.json
-        records; None (unknown: never a stop) when any reading fails."""
+        cloud_total_cost, and its conservative per-instance estimate) summed over every cluster id this launch has
+        ever recorded; None when any reading fails, or when clusters.json is missing, unreadable, empty or not this
+        invocation's (never $0): UNREADABLE_READINGS of those in a row count as the cap."""
         try:
-            parts = {role: float(self.meter(v["id"])) for role, v in recorded(rec).items()}
+            if not recorded(rec):
+                raise RuntimeError("clusters.json is missing, unreadable, empty or not this invocation's")
+            self.remember(rec)
+            parts = {f"{self.ever[cid]} {cid}": float(self.meter(cid)) for cid in sorted(self.ever)}
         except Exception as e:  # noqa: BLE001
             self.unreadable = getattr(self, "unreadable", 0) + 1
             self.log(f"spend: unknown ({type(e).__name__}: {str(e)[:120]}); {self.unreadable} in a row, "
@@ -514,16 +533,14 @@ class Watch:
     def stop_all(self, rec, why) -> bool:
         """Stop, by id, every live cluster clusters.json records for this invocation and every stray its journal
         attributes to it, nothing else; True once none of them is listed live. A stop needs no listing: when the
-        listing cannot be read, every id clusters.json records, and every id the journal records this invocation
-        creating (with its recorded name), is asked to stop by id, once, each attempt logged; then False
-        (unconfirmed)."""
+        listing cannot be read, every id this launch has ever recorded, and every id the journal records this
+        invocation creating (with its recorded name), is asked to stop by id at each retry, each attempt logged,
+        until a listing confirms them stopped; False (unconfirmed) when none does."""
         ids, owned = self.owners(rec)
-        blind = False
         for _ in range(self.retries):
             items = self.safe(self.api.list_clusters)
-            if items is None and not blind:
-                blind = True
-                named = {v["id"]: v["name"] for v in recorded(rec).values()}
+            if items is None:          # Codex on #195: every retry, until a listing confirms them stopped
+                named = {**self.ever, **{v["id"]: v["name"] for v in recorded(rec).values()}}
                 named.update({e["id"]: e.get("name") for e in rc.read_journal(self.cfg) if isinstance(e, dict)
                               and e.get("id") in owned - set(named) and e.get("name") in self.names})
                 for cid, name in sorted(named.items(), key=lambda t: t[0]):
