@@ -1,6 +1,6 @@
 producer: toolkit/engines/malaria/benchmarks/equilibration.py
-engine_version: '0.15'
-code_sha256: 78be305240670fa256dac4ecb4d08fb7c70ae719b5a48ba1283428b7c652b3a0
+engine_version: '0.16'
+code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
 burnin_years: 50
 init_eir_per_m0: 0.6
 criterion:
@@ -888,8 +888,8 @@ levels:
     ID_15p: -0.0046
   max_abs_doubling_rel: 0.021
   max_abs_init_guess_rel: 0.0863
-wall_s: 1340.1
-cpu_s: 20669.7
+wall_s: 365.6
+cpu_s: 12410.9
 problems:
 - 'init_guess: m0 3.5: IC 30p differs -6.5% between the x0.25 and x4 guesses'
 - 'init_guess: m0 9.0: IC 30p differs -7.0% between the x0.25 and x4 guesses'

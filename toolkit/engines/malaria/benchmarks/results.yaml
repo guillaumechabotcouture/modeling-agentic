@@ -1,8 +1,8 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.15'
-  code_sha256: 78be305240670fa256dac4ecb4d08fb7c70ae719b5a48ba1283428b7c652b3a0
+  version: '0.16'
+  code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
   params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
   config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 benchmarks:
@@ -686,6 +686,6 @@ summary:
     band_mis_based: 1
   held_out_in_band: 9
   held_out_total: 12
-engine_version: '0.15'
+engine_version: '0.16'
 fit_rule: joint-v1
-wall_s: 3260.3
+wall_s: 1072.1
