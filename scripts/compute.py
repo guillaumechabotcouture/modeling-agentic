@@ -2516,8 +2516,16 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
     try:
         prev = json.load(open(out + ".summary.json"))
         if _same_fn(prev, fn_spec, fid) and prev.get("code_fp") == fp:
-            got.update({r["key"]: r for r in (json.loads(l) for l in open(out) if l.strip())
-                        if isinstance(r, dict) and r.get("ok") and r.get("key")})
+            body = open(out, "rb").read()
+            rows = [json.loads(l) for l in body.decode().splitlines() if l.strip()]
+            # Codex round 1 P1-1: a results file and a summary from two different writes (a torn snapshot) are
+            # never trusted. A summary from before out_sha256 must at least count the rows it describes.
+            want = prev.get("out_sha256")
+            if (hashlib.sha256(body).hexdigest() != want) if want else (len(rows) != prev.get("n")):
+                print(f"compute: {out}: results file does not match its summary ("
+                      f"{'sha256' if want else 'row count'}): its rows are not reused", file=sys.stderr)
+                rows = []
+            got.update({r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")})
     except (OSError, ValueError):
         pass
     try:
@@ -2700,10 +2708,12 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose"),
                "runtime": runtime_versions()}
+    body = "".join(json.dumps(r) + "\n" for r in rows).encode()
+    summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
-        write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+        write_nofollow(base, name, body, atomic=True)
         write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
         try:
             remove_nofollow(base, name + PARTIAL_EXT)
@@ -3319,6 +3329,10 @@ def _self_test() -> int:
         _self_test_signoff_reuse(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"RS: {type(e).__name__}: {e}")
+    try:
+        _self_test_checkpoint_restore(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CP: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3518,6 +3532,102 @@ def _engine_batch_reads(names, sources=None) -> list[str]:
             needles = (n, base, os.path.splitext(base)[0], "spec import geometry", "spec.geometry", "SIGNOFF_FILE")
             hits += [f"{label}: {x}" for x in needles if x in text]
     return hits
+
+
+def _self_test_checkpoint_restore(ok) -> None:
+    """CP0-CP3 (F6 run checkpoints): a run dir restored from an agent-VM checkpoint tarball (cloud/worker_side.py
+    build_checkpoint, extracted at another path as `run_cluster.py checkpoint` does) reuses its cached engine rows:
+    a finished batch is not recomputed, and an interrupted batch's journal keeps its rows."""
+    import importlib.util as _ilu
+    import tarfile as _tf
+    import tempfile
+    sys.path.insert(0, HERE)
+    import results_store
+    spec = _ilu.spec_from_file_location("_ws_cp", os.path.join(REPO, "cloud", "worker_side.py"))
+    ws = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(ws)
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        rd = os.path.join(td, "vm", "runs", "R_cp")
+        os.makedirs(os.path.join(rd, "models"))
+        os.makedirs(os.path.join(rd, "data"))
+        os.makedirs(os.path.join(rd, "analysis", "batch"))      # where the v2 engine batch keeps its rows
+        open(os.path.join(rd, "models", "fn.py"), "w").write("def f(p):\n    return {'y': 3 * p['x']}\n")
+        open(os.path.join(rd, "data", "u.csv"), "w").write("u\n1\n")
+        inputs = [{"x": i} for i in range(3)]
+        done, cut = (os.path.join(rd, "analysis", "batch", x) for x in ("done.jsonl", "cut.jsonl"))
+        _, s0 = run_map(rd, "models/fn.py::f", inputs, done, backend="local", max_workers=1, ledger=False)
+        ok(s0.get("computed") == 3, f"CP0 setup: the batch computes 3 rows ({s0.get('computed')})")
+        # an interrupted batch (the VM stopped mid-batch): its journal holds 2 of 4 rows
+        fp = code_fingerprint(rd, "models/fn.py::f", exclude=_out_files(cut))
+        keys = input_keys([{"x": i} for i in range(4)])
+        with open(cut + PARTIAL_EXT, "w") as f:
+            f.write(json.dumps({"_partial": {"fn": "models/fn.py::f", "fn_id": fn_id(rd, "models/fn.py::f"),
+                                             "code_fp": fp, "n": 4}}) + "\n")
+            for k in range(2):
+                f.write(json.dumps({"i": k, "ok": True, "result": {"y": 3 * k}, "key": keys[k]}) + "\n")
+        tgz = os.path.join(td, "checkpoint.tar.gz")
+        rec = ws.build_checkpoint(os.path.join(td, "vm"), rd, tgz, results_store)
+        ok(rec.get("cached_batches") == 2 and rec.get("sha256") == results_store.sha256_file(tgz),
+           f"CP1 the checkpoint record counts the cached batches and names the tarball's sha256: {rec}")
+        dest = os.path.join(td, "laptop", "R1", "checkpoint")
+        with _tf.open(tgz, mode="r:gz") as t:
+            t.extractall(dest, filter="data")
+        rd2 = os.path.join(dest, "runs", "R_cp")
+        bd2 = os.path.join(rd2, "analysis", "batch")
+        _, s1 = run_map(rd2, "models/fn.py::f", inputs, os.path.join(bd2, "done.jsonl"), backend="local",
+                        max_workers=1, ledger=False)
+        ok(s1.get("computed") == 0 and s1.get("reused") == 3,
+           f"CP2 a restored run dir reuses every row of its finished batch: {s1.get('computed')} computed, "
+           f"{s1.get('reused')} reused")
+        _, s2 = run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(4)], os.path.join(bd2, "cut.jsonl"),
+                        backend="local", max_workers=1, ledger=False)
+        ok(s2.get("computed") == 2 and s2.get("reused") == 2,
+           f"CP3 an interrupted batch restored from a checkpoint keeps its journal's rows: {s2.get('computed')} "
+           f"computed, {s2.get('reused')} reused")
+        # Codex round 1 P1-1: a torn snapshot (results file of one write, summary of another) is not trusted
+        d2 = os.path.join(bd2, "done.jsonl")
+        summ = json.load(open(d2 + ".summary.json"))
+        ok(summ.get("out_sha256") == results_store.sha256_file(d2),
+           f"CP5 a batch's summary records the sha256 of its results file: {summ.get('out_sha256')}")
+        old_rows = open(d2).read()
+        run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(5)], d2, backend="local", max_workers=1, ledger=False)
+        open(d2, "w").write(old_rows)                  # results A (3 rows) beside summary B (5 rows)
+        import contextlib as _cl
+        import io as _io
+        with _cl.redirect_stderr(_io.StringIO()) as err:
+            _, s5 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s5.get("computed") == 3 and "sha256" in err.getvalue(),
+           f"CP5b results A with summary B: the rows are not reused, the batch recomputes, logged: "
+           f"{s5.get('computed')} computed {err.getvalue()[-160:]!r}")
+        summ = json.load(open(d2 + ".summary.json"))
+        summ.pop("out_sha256", None)
+        json.dump(summ, open(d2 + ".summary.json", "w"))
+        _, s6 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s6.get("computed") == 0, f"CP6 a summary from before the sha256 (no torn snapshot possible) still reuses "
+                                    f"when its row count matches: {s6.get('computed')} computed")
+        # the hop through the launch tree: committed with `add -f`, shipped by archive, extracted on the VM
+        import shutil as _sh
+        import subprocess as _sp
+        vc = _sh.which("git")
+        if vc:
+            tree, ship = os.path.join(td, "tree"), os.path.join(td, "ship")
+            os.makedirs(tree)
+            _sh.copytree(rd2, os.path.join(tree, "runs", "R_cp"))
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@x"}
+            for a in (["init", "-q"], ["add", "-f", "runs"], ["commit", "-q", "-m", "r"]):
+                _sp.run([vc, "-C", tree, *a], check=True, env=env, capture_output=True)
+            blob = _sp.run([vc, "-C", tree, "archive", "--format=tar.gz", "HEAD"], check=True,
+                           capture_output=True).stdout
+            with _tf.open(fileobj=_io.BytesIO(blob), mode="r:gz") as t:
+                t.extractall(ship, filter="data")
+            rd3 = os.path.join(ship, "runs", "R_cp")
+            _, s4 = run_map(rd3, "models/fn.py::f", inputs, os.path.join(rd3, "analysis", "batch", "done.jsonl"),
+                            backend="local", max_workers=1, ledger=False)
+            ok(s4.get("computed") == 0 and s4.get("reused") == 3,
+               f"CP4 after the launch-tree hop (committed, archived, extracted) the rows are reused: "
+               f"{s4.get('computed')} computed")
 
 
 def _self_test_signoff_reuse(ok) -> None:
