@@ -15,18 +15,24 @@ import sys
 
 
 def wrap(cmd, platform=None, which=shutil.which) -> list:
-    raise NotImplementedError
+    """The command, under `caffeinate -i` on macOS when caffeinate is there."""
+    caf = which("caffeinate") if (platform or sys.platform) == "darwin" else None
+    return [caf, "-i", *cmd] if caf else list(cmd)
 
 
 def run(cmd, platform=None, which=shutil.which) -> int:
-    raise NotImplementedError
+    return subprocess.call(wrap(cmd, platform, which))
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    raise NotImplementedError
+    cmd = argv[1:] if argv[:1] == ["--"] else argv
+    if not cmd:
+        print(__doc__)
+        return 2
+    return run(cmd)
 
 
 def _self_test() -> int:

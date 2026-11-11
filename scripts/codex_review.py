@@ -26,26 +26,73 @@ REFUSED = ("-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox", "--f
 
 
 def codex_argv(codex, prompt, out, cd, extra=()) -> list:
-    raise NotImplementedError
+    """`codex exec`, always in the read-only sandbox; an extra argument that touches the sandbox, approvals or the
+    session file is refused."""
+    bad = [x for x in extra if x.split("=")[0] in REFUSED or any(w in x for w in ("sandbox", "approval", "bypass"))]
+    if bad:
+        raise ValueError(f"refused codex arguments {bad}: the review always runs read-only with a session file")
+    return [codex, "exec", "--sandbox", "read-only", "-C", cd, "-o", out, *extra, prompt]
 
 
 def sessions(root, clock=time.time) -> dict:
-    raise NotImplementedError
+    """{path: size} of the session files under root/<YYYY>/<MM>/<DD>/ for today and yesterday (local dates)."""
+    out = {}
+    for t in (clock(), clock() - 86400):
+        d = os.path.join(root, time.strftime("%Y/%m/%d", time.localtime(t)))
+        for f in (os.listdir(d) if os.path.isdir(d) else ()):
+            p = os.path.join(d, f)
+            if os.path.isfile(p):
+                out[p] = os.path.getsize(p)
+    return out
 
 
 def run_once(argv, log_path, root=SESSIONS, window_s=WINDOW_S, poll_s=5.0, clock=time.time):
-    raise NotImplementedError
+    """(exit code, "") once codex is seen alive (a new session file grew) and has finished, or exited by itself;
+    (None, why) when it was killed for showing no life within `window_s`."""
+    before = sessions(root, clock)
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    deadline, prev, alive = clock() + window_s, {}, False
+    while clock() < deadline and proc.poll() is None:
+        new = {p: n for p, n in sessions(root, clock).items() if p not in before}
+        if any(p in prev and n > prev[p] for p, n in new.items()):
+            alive = True
+            break
+        prev = new
+        time.sleep(poll_s)
+    if not alive and proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        return None, (f"no new session file under {root} grew within {window_s:g} s"
+                      if not prev else f"a new session file appeared but did not grow within {window_s:g} s")
+    return proc.wait(), ""
 
 
 def review(prompt, out, cd=".", extra=(), codex="codex", root=SESSIONS, window_s=WINDOW_S, poll_s=5.0) -> int:
-    raise NotImplementedError
+    """Run the review; a hung attempt is killed and retried once, and a second hang exits (SystemExit)."""
+    argv, log = codex_argv(codex, prompt, out, cd, extra), out + ".log"
+    why = ""
+    for attempt in (1, 2):
+        rc, why = run_once(argv, log, root, window_s, poll_s)
+        if rc is not None:
+            print(f"codex exited {rc}: last message in {out}, log in {log}")
+            return rc
+        print(f"attempt {attempt}: codex showed no life ({why}); killed", flush=True)
+    raise SystemExit(f"codex exec hung twice ({why}); nothing reviewed. Log: {log}")
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    raise NotImplementedError
+    own, extra = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--prompt-file", required=True)
+    ap.add_argument("--out", required=True, help="the last message; codex's output goes to <out>.log")
+    ap.add_argument("--cd", default=".", help="the directory codex reviews (read-only)")
+    a = ap.parse_args(own)
+    return review(open(a.prompt_file).read(), a.out, a.cd, extra)
 
 
 _FAKE = r'''
