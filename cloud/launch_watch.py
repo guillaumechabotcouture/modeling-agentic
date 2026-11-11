@@ -865,10 +865,42 @@ def _self_test() -> int:
                       api=_Failing())))
     case("LW6c2", "listing and spend both unreadable: exit 11 after three readings; every recorded id is still "
                   "stopped by id (a stop needs no listing), each attempt logged",
-         lambda: (lambda r: r[0] == EXIT_UNREADABLE and sorted(stops(r[1])) == [100, 101, 102]
-                  and sum("stop requested by id" in ln for ln in r[4].lines) == 3)(
+         lambda: (lambda r: r[0] == EXIT_UNREADABLE and sorted(set(stops(r[1]))) == [100, 101, 102]
+                  and sum("stop requested by id" in ln for ln in r[4].lines) == 3 * r[4].retries)(
              scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError: EOF")]}, max_hours=1.0,
                       api=_FailingAll())))
+
+    # Codex on #195: the spend is never undercounted and the stop never skipped
+    def lose_record(how):
+        def status(cfg):
+            def go(tail):
+                if how == "delete" and os.path.exists(cfg.clusters_file):
+                    os.remove(cfg.clusters_file)
+                elif how != "delete":
+                    open(cfg.clusters_file, "w").write(how)
+                return 0, status_text(cfg, {"A": "running", "B": "running"})
+            return {"status": [go]}
+        return status
+    case("LW26", "(P1-2) clusters.json missing, empty or unreadable after the launch is an unreadable spend reading: "
+                 "three in a row, exit 11, every id seen stopped by id",
+         lambda: all((lambda r: r[0] == EXIT_UNREADABLE and sorted(set(stops(r[1]))) == [100, 101, 102]
+                      and not any("spend: $0.00" in ln for ln in r[4].lines[2:]))(
+             scenario(0, record, lose_record(how), api=_Billed(1.0), max_hours=5.0))
+             for how in ("delete", "{}", "not json")))
+
+    def replace_keeper(cfg):
+        def go(tail):
+            r = json.load(open(cfg.clusters_file))
+            r["keeper"] = {"name": cfg.keeper_name, "id": 202}
+            json.dump(r, open(cfg.clusters_file, "w"))
+            return 0, status_text(cfg, {"A": "running", "B": "running"})
+        return {"status": [go]}
+    case("LW27", "(P1-3) a replaced helper's spend stays in the total: every id ever recorded is summed, and the set "
+                 "is kept in the watch's state file",
+         lambda: (lambda r: any("spend: $6.00" in ln for ln in r[4].lines)
+                  and {"102", "202"} <= set(json.load(open(r[4].state_path)).get("ids", {})))(
+             scenario(0, record, replace_keeper, api=_PerId({100: 0.0, 101: 0.0, 102: 5.0, 202: 1.0}),
+                      max_hours=0.5)))
     case("LW6d", "collect fails with a network error, then succeeds: retried, exit 0",
          lambda: (lambda r: r[0] == EXIT_DONE and runs(r[1]).count("collect") == 2)(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done", "B": "done"}))],
@@ -1234,6 +1266,15 @@ class _Both(_FakeApi):
 class _MeterFails(_FakeApi):
     def usd_of(self, cid):
         raise OSError("cluster details unavailable")
+
+
+class _PerId(_FakeApi):
+    def __init__(self, usd):
+        super().__init__()
+        self.usd = usd
+
+    def usd_of(self, cid):
+        return self.usd.get(cid, 0.0)
 
 
 class _MeterFlaky(_FakeApi):
