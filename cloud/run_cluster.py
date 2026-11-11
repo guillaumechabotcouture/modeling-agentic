@@ -244,15 +244,16 @@ def _default_scope(name) -> str:
         return ""
 
 
-def budget_guard(cfg) -> None:
-    """Refuse the launch (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope
-    covers the scope's spend plus it (cloud/budget.py)."""
+def budget_guard(cfg, reserve=True) -> None:
+    """Refuse (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope covers the
+    scope's spend plus it (cloud/budget.py); with `reserve`, the cap is reserved until a cluster of the name appears.
+    Called by every path that creates or keeps paid work: launch, keeper (start_helpers), relaunch."""
     import budget
     if cfg.cap_usd is None:
         raise SystemExit(f"{cfg.name}: the config sets no cap_usd: refusing (a launch states the most it may spend)")
     if not cfg.budget_scope:
         raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
-    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name)
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve)
     if not ok:
         raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
     print(f"budget: {why}", flush=True)
@@ -995,6 +996,7 @@ def keeper_later(cfg) -> int:
     """`keeper`: the overflow pool and keeper of a launch that ended before starting them (exit 3 or 5), for the run
     cluster clusters.json records, and only while that cluster is the live one of its name."""
     with _config_lock(cfg):
+        budget_guard(cfg)                 # the overflow pool and keeper are new paid clusters
         clusters = json.load(open(cfg.clusters_file))
         cid = (clusters.get("run") or {}).get("id")
         live = live_id(cfg.name)
@@ -1590,6 +1592,7 @@ def relaunch(cfg, label) -> int:
         assign = json.load(open(cfg.state_file))
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
+        budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
         sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         import results_store
         launch_id = assign[label]["launch_id"]
@@ -3767,7 +3770,7 @@ def _self_test() -> int:
         _self_test_budget(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"BU: {type(e).__name__}: {e}")
-    globals()["budget_guard"] = lambda cfg: None   # the launch cases below predate the budget (BU1-BU4 test it)
+    globals()["budget_guard"] = lambda cfg, reserve=True: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)

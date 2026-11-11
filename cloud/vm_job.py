@@ -17,11 +17,11 @@ its id, never an attach by name.
         [--every 60] [--keep-on-failure] [--budget-scope f6] -- <command ...>
     python cloud/vm_job.py down <name> <job_id>      # stop a kept cluster (found through job.json)
 
-Budget (F6 Stage 2; on 2026-11-11 an agent spent $106 of a $100 budget). `run` and `up` require `--cap-usd`
-and refuse, before any cluster is listed or created, unless the owner-signed budget of the cluster name's scope
-(cloud/budget.py, cloud/budget_scopes.yaml) covers the scope's spend plus the cap. Each `run` poll then measures
-the job cluster's USD; at the cap (or after three failed readings in a row) the outputs saved so far stay local
-and the cluster is stopped by id, --keep-on-failure or not.
+Budget (F6 Stage 2; on 2026-11-11 an agent spent $106 of a $100 budget). `run`, `up` and `start` require
+`--cap-usd` and refuse, before any cluster is listed or created or any job submitted, unless the owner-signed budget of the cluster name's scope
+(cloud/budget.py, cloud/budget_scopes.yaml) covers the scope's spend plus the cap. Each `run` poll saves the
+outputs, then measures the job cluster's USD before it returns any state; at the cap (or after three failed
+readings in a row) the cluster is stopped by id, --keep-on-failure or not, even if the job has just ended.
 
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
@@ -360,15 +360,16 @@ def _create(a, if_live="keep", box=None):
     return True
 
 
-def _budget_gate(a, name, meter=False):
-    """Refuse (SystemExit) unless the owner-signed budget of `name`'s scope covers its spend plus --cap-usd; with
-    `meter`, return fn(cluster id) -> that cluster's USD so far (cloud/budget.py)."""
+def _budget_gate(a, name, meter=False, reserve=True):
+    """Refuse (SystemExit) unless the owner-signed budget of `name`'s scope covers its spend plus --cap-usd (with
+    `reserve`, the cap is reserved until the cluster appears); with `meter`, return fn(cluster id) -> that cluster's
+    USD so far (cloud/budget.py)."""
     import budget
     scope = a.budget_scope or budget.scope_for_name(name)
     if not scope:
         raise SystemExit(f"{name} matches no budget scope in cloud/budget_scopes.yaml: refusing (its spend would "
                          "count against no budget)")
-    ok, why = budget.launch_budget_ok(scope, a.cap_usd, name=name)
+    ok, why = budget.launch_budget_ok(scope, a.cap_usd, name=name, reserve=reserve)
     if not ok:
         raise SystemExit(f"{name}: the budget refuses this launch: {why}")
     print(f"budget: {why}", flush=True)
@@ -409,6 +410,8 @@ def cmd_start(a, cluster=None):
     if not cmd:
         raise SystemExit("no command given (put it after --)")
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
+    if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
+        _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
@@ -458,15 +461,23 @@ def cmd_status(a):
     return st
 
 
-def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=None):
+def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=None, flags=None):
     """Poll (saving outputs each time) until the job ends; returns its last status. With
     `gone_ok` (`run`), a cluster that is no longer running (by id `cid`) returns None, and
     every other error (a dropped connection, a failing cluster listing) is retried, up to
     `deadline`. Every poll goes to the job's own worker (job.json); that worker missing from
     the table on three polls in a row reads as 'lost'. With `meter` (`run`), each poll also reads the cluster's
-    USD and returns 'over_cap' at --cap-usd."""
+    USD before anything returns: at --cap-usd it sets flags["over_cap"] and returns the job's terminal state, or
+    'over_cap' while the job still runs."""
     want, gone_polls, misses = _job_worker(dest), 0, [0]
+
+    def cap():
+        over = _cap_reading(meter, cid, a.cap_usd, a.job_id, misses) if meter is not None and cid is not None else None
+        if over is not None and flags is not None:
+            flags["over_cap"] = True
+        return over
     while True:
+        over, checked = None, False
         try:
             try:
                 c, w = _client(a.name, cluster, want)
@@ -480,6 +491,7 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
             gone_polls = 0
             st = sync_outputs(_runner(c, w), a.job_id, dest)
             _print(st, dest)
+            over, checked = cap(), True      # outputs saved first, then the cap, then any terminal state
             if st["state"]["state"] in DONE + ("missing", "lost"):
                 return st
         except (Exception, SystemExit) as e:  # noqa: BLE001 — a dropped connection is not the end of the job
@@ -492,7 +504,8 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
                 except Exception as e2:  # noqa: BLE001 -- cannot tell: retry
                     print(f"cluster listing failed ({type(e2).__name__}: {str(e2)[:120]})")
             print(f"poll failed ({type(e).__name__}: {str(e)[:120]}); retrying")
-        over = _cap_reading(meter, cid, a.cap_usd, a.job_id, misses) if meter is not None and cid is not None else None
+        if not checked:
+            over = cap()
         if over is not None:
             return over
         if deadline is not None and time.time() > deadline:
@@ -637,8 +650,7 @@ def _run_locked(a, dest):
         cid = getattr(cl, "cluster_id", None)
         cmd_start(a, cluster=cl)
         deadline = time.time() + a.max_hours * 3600 + 3600
-        st = _poll(a, dest, gone_ok=True, deadline=deadline, cluster=cl, cid=cid, meter=meter)
-        box["over_cap"] = st is not None and st["state"].get("state") == "over_cap"
+        st = _poll(a, dest, gone_ok=True, deadline=deadline, cluster=cl, cid=cid, meter=meter, flags=box)
         good, why = run_outcome(st, True)
     except KeyboardInterrupt:
         print(f"interrupted: {a.job_id} on {a.name}")
@@ -1774,8 +1786,6 @@ def main(argv=None) -> int:
         p.add_argument("--memory", default="16 GiB")
         p.add_argument("--idle-timeout", default="20 minutes")
         p.add_argument("--workers", type=int, default=1, help="workers of the one cluster (one scheduler for all)")
-        p.add_argument("--cap-usd", type=float, required=True, help="the most this cluster may spend (USD)")
-        p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
 
     def start_args(p):
         p.add_argument("job_id")
@@ -1793,16 +1803,23 @@ def main(argv=None) -> int:
         p.add_argument("--shutdown-when-stored", action="store_true",
                        help="the job stops its cluster once it is done and every output is verified in storage")
 
+    def budget_args(p):
+        p.add_argument("--cap-usd", type=float, required=True, help="the most this cluster may spend (USD)")
+        p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
+
     up = sub.add_parser("up")
     up.add_argument("name")
     up_args(up)
+    budget_args(up)
     st = sub.add_parser("start")
     st.add_argument("name")
     start_args(st)
+    budget_args(st)
     rn = sub.add_parser("run", help="up + start + wait + down in one command (the default for a single job)")
     rn.add_argument("name")
     start_args(rn)
     up_args(rn)
+    budget_args(rn)
     rn.add_argument("--every", type=float, default=60, help="seconds between status polls")
     rn.add_argument("--keep-on-failure", action="store_true",
                     help="leave the cluster up after a failure, for debugging (it then stops after its idle timeout)")
