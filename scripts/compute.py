@@ -3288,6 +3288,10 @@ def _self_test() -> int:
         _self_test_s18(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"RU: {type(e).__name__}: {e}")
+    try:
+        _self_test_signoff_reuse(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RS: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3464,6 +3468,77 @@ def _self_test_s18(ok) -> None:
             summ = json.load(open(out + ".summary.json"))
             ok((summ.get("runtime") or {}).get("python") == ".".join(map(str, sys.version_info[:3])),
                f"RU16 (Codex P2-8) a batch records the runtime versions it ran under: {summ.get('runtime')}")
+
+
+def _engine_batch_reads(names, sources=None) -> list[str]:
+    """Which engine-batch job modules mention a sign-off record (by path, file name or the module that owns it).
+    `sources`: {label: text}; default, every module the v2 engine-batch functions run on a worker
+    (toolkit/engines/**, toolkit/analysis/batch.py and trajectories.py)."""
+    if sources is None:
+        sources = {}
+        roots = [os.path.join(REPO, "toolkit", "engines")]
+        files = [os.path.join(REPO, "toolkit", "analysis", f) for f in ("batch.py", "trajectories.py")]
+        for r in roots:
+            for dp, _, fns in os.walk(r):
+                files += [os.path.join(dp, f) for f in fns if f.endswith(".py")]
+        sources = {os.path.relpath(f, REPO): open(f, encoding="utf-8").read() for f in sorted(files)}
+    hits = []
+    for label, text in sources.items():
+        for n in names:
+            base = os.path.basename(n)
+            needles = (n, base, os.path.splitext(base)[0], "spec import geometry", "spec.geometry", "SIGNOFF_FILE")
+            hits += [f"{label}: {x}" for x in needles if x in text]
+    return hits
+
+
+def _self_test_signoff_reuse(ok) -> None:
+    """RS1-RS5 (F6 Stage 2): a lead-signed preview and the owner-signed final run of one spec differ only in their
+    sign-off records; the engine-batch reuse fingerprint ignores exactly those (FP_SIGNOFF_RECORDS) in a v2 run."""
+    import tempfile
+    from unittest import mock
+    g = globals()
+    recs = tuple(g.get("FP_SIGNOFF_RECORDS", ()))
+    ok(recs == ("data/geometry_signoff.json",) and all("*" not in r and "?" not in r for r in recs),
+       f"RS0 the sign-off exclusion is an exact, named list (no wildcard): {recs}")
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo = os.path.join(td, "repo")
+
+        def w(root, rel, txt):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), "w").write(txt)
+        w(repo, "toolkit/eng/m.py", "def f(p):\n    return p\n")
+        runs = {}
+        for who in ("lead", "owner"):
+            rd = os.path.join(td, f"run_{who}")
+            w(rd, "decision_spec.yaml", "spec: 1\n")
+            w(rd, "models/fn.py", "def f(p):\n    return p\n")
+            w(rd, "data/inputs/units.csv", "u,a\n1,2\n")
+            w(rd, "data/derived/rates.csv", "u,r\n1,0.5\n")
+            w(rd, "data/geometry_signoff.json", json.dumps(
+                {"signed_by": who, "at": f"2026-11-1{len(who)}T00:00:00Z", "declaration": {"enabled": False},
+                 "approvals": {"x": {"approved_by": "owner"}} if who == "owner" else {}}))
+            runs[who] = rd
+        with mock.patch.dict(g, {"REPO": repo}):
+            fl, fo = (code_fingerprint(runs[k], "models/fn.py::f") for k in ("lead", "owner"))
+            ok(fl == fo, "RS1 lead- and owner-signed geometry records: same reuse fingerprint")
+            ok(code_fingerprint(runs["owner"], "models/fn.py::f", confined=True) == fo,
+               "RS1b the confined fingerprint ignores the same record")
+            for rel in ("data/derived/rates.csv", "data/inputs/units.csv", "data/derivations_record.json",
+                        "data/geometry_signoff.json.extra"):
+                w(runs["owner"], rel, "changed\n")
+                fx = code_fingerprint(runs["owner"], "models/fn.py::f")
+                ok(fx != fo, f"RS2 any other file under data/ ({rel}) still changes the fingerprint")
+                fo = fx
+            os.remove(os.path.join(runs["lead"], "decision_spec.yaml"))     # a v1 run hashes everything
+            f1 = code_fingerprint(runs["lead"], "models/fn.py::f")
+            w(runs["lead"], "data/geometry_signoff.json", '{"signed_by": "owner"}')
+            ok(code_fingerprint(runs["lead"], "models/fn.py::f") != f1,
+               "RS3 a v1 run (no decision_spec.yaml): its own model may read the record, so it is hashed")
+    hits = _engine_batch_reads(recs)
+    ok(recs and not hits, f"RS4 no engine-batch job module reads an excluded sign-off record: {hits}")
+    ok(bool(_engine_batch_reads(recs, {"planted.py": "json.load(open('data/geometry_signoff.json'))"})),
+       "RS5 the RS4 scan finds a planted read of an excluded record (it is not vacuous)")
 
 
 def _self_test_wall(ok) -> None:
