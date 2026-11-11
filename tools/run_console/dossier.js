@@ -170,7 +170,7 @@ function evidenceHTML(d) {
   for (const r of d.param_registries || []) {
     h += section(`Staged parameter registry <span class="muted small">${tail(r.file)}</span>`, "Cost, envelope and coverage values staged with the inputs, each with its source. \"Used by the spec\" lists the spec fields that name it.", "no.", r.file,
       !has(r) ? naBox(r) : tbl(["name", ["value"], ["interval"], "kind", "source", "used by the spec"], (r.entries || []).map((e) => ({ cls: e.used_in.length ? "" : "dim", cells: [esc(e.name), num(e.value), e.ci ? e.ci.map(num).join("–") : "—", esc(e.kind || "—"),
-        esc(e.source || "—") + (e.citation_title ? ` <span class="muted">${esc(e.citation_title)}</span>` : "") + (e.subgroup ? `<div class="sub">${more(e.subgroup, 120)}</div>` : ""), e.used_in.length ? e.used_in.map(esc).join("<br>") : '<span class="muted">not named</span>'] }))));
+        esc(e.source || "—") + (e.citation_title ? ` <span class="muted">${esc(e.citation_title)}</span>` : "") + (e.subgroup ? `<div class="sub">${more(e.subgroup, 120)}</div>` : ""), e.used_in.length ? e.used_in.map(esc).join("<br>") : '<span class="muted">not named</span>'] })), "reg"));
   }
   const ci = d.citations || {};
   h += section("Citations", "Sources staged with the inputs. Parameters cite them by id.", "no.", (ci.files || [])[0],

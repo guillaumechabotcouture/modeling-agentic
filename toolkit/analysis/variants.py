@@ -26,10 +26,17 @@ allocatable budget (over or under, never refused for it), the units given a pack
 (with why; kept in the plan, evaluated as given), the caps and group rules it breaks, and, through UQ.run's on_draw
 hook (`Draws`), its outcome and cost quantiles over the uncertainty draws as uncertainty.yaml reports the headline
 plan's. Model corrections bearing on it, at the point or in a draw, stop publication as for every other plan.
+Its value lost mixes a different allocation with a different spend, so it is also compared with the optimum re-solved
+at its own point cost under the unconstrained feasibility (`same_spend`, review A2; not solved, with why, when none).
+A solved variant is followed over the same draws (`solved_plans`, `Draws`): its record carries the same uncertainty
+block, and its share of draws over the allocatable budget is judged against `uncertainty.affordability` when the spec
+declares it (rule_met). The reserve is set for the headline plan, so a variant can fail the rule; it is then reported
+as failing it, not re-solved.
 """
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import sys
@@ -237,10 +244,55 @@ def contract_findings(raw: dict, point: dict, pv) -> list[str]:
                 isinstance(x.get("ineligible_units"), list) and x.get("units_ineligible") == len(x["ineligible_units"])
                 and isinstance(x.get("cost_minus_budget"), (int, float))):
             out.append(f"fixed plan {x.get('id')}: no eligibility report or cost against the budget")
+        if isinstance(x, dict) and types.get(x.get("id")) == "fixed_plan" and x.get("status") == "evaluated":
+            out += _same_spend_findings(x)      # review A2: the comparison at the plan's own cost
     if hv is not None:
         h = next((x for x in pv.get("variants") or [] if isinstance(x, dict) and x.get("id") == hv), {})
         if h.get("status") != "solved" or h.get("plan") != (point or {}).get("plan"):
             out.append(f"the headline plan is not the solved plan of variant {hv}")
+    return out + _affordability_findings(raw, pv, types)
+
+
+def _affordability_findings(raw: dict, pv: dict, types: dict) -> list[str]:
+    """Codex r1 on A6: each variant's affordability record agrees with its own per-draw costs, the spec's rule (a
+    solved variant) or no rule (a fixed plan), one budget and one draw count across variants; when any variant has
+    draws, every solved variant has them. A consistent `rule_met: false` is a result, not a finding."""
+    rule = ((raw.get("uncertainty") or {}).get("affordability") or None)
+    recs = [x for x in pv.get("variants") or [] if isinstance(x, dict)]
+    drawn = [x for x in recs if x.get("uncertainty")]
+    if not drawn:
+        return []
+    out, budgets, counts = [], set(), set()
+    for x in recs:
+        vid, u = x.get("id"), x.get("uncertainty")
+        if not u:
+            if x.get("status") == "solved":
+                out.append(f"plan variant {vid}: solved, but has no uncertainty draws while other variants do")
+            continue
+        a = u.get("affordability") if isinstance(u, dict) else None
+        c = a.get("per_draw_cost") if isinstance(a, dict) else None
+        if not isinstance(c, list) or not c or not all(isinstance(v, (int, float)) for v in c):
+            out.append(f"plan variant {vid}: no per-draw cost in its affordability record")
+            continue
+        b = a.get("budget_allocatable")
+        if not isinstance(b, (int, float)):
+            out.append(f"plan variant {vid}: no allocatable budget in its affordability record")
+            continue
+        over = sum(v > float(b) * (1 + 1e-9) for v in c)
+        want_rule = None if types.get(vid) == "fixed_plan" else rule
+        met = None if not want_rule else over / len(c) <= float(want_rule["max_share_over_budget"]) + 1e-12
+        if not (u.get("draws") == a.get("draws") == len(c)):
+            out.append(f"plan variant {vid}: draw counts disagree ({u.get('draws')}, {a.get('draws')}, {len(c)} costs)")
+        if a.get("draws_over_budget") != over or abs(float(a.get("share_over_budget") or 0) - over / len(c)) > 1e-12:
+            out.append(f"plan variant {vid}: draws over budget are not its per-draw costs' ({over} of {len(c)})")
+        if (a.get("rule") or None) != (dict(want_rule) if want_rule else None) or a.get("rule_met") is not met:
+            out.append(f"plan variant {vid}: rule or rule_met is not the spec's rule applied to its draws "
+                       f"({a.get('rule')}, {a.get('rule_met')!r}; expected {want_rule}, {met!r})")
+        budgets.add(float(b))
+        counts.add(len(c))
+    if len(budgets) > 1 or len(counts) > 1:
+        out.append(f"plan variants: affordability records use different budgets {sorted(budgets)} or draw counts "
+                   f"{sorted(counts)}")
     return out
 
 
@@ -275,13 +327,109 @@ def eligibility(A, fp: dict, feas: dict) -> dict:
             "constraints_broken": MV.infeasible_reasons(A.ids, fp, {i: {fp[i]: 0.0} for i in A.ids}, rest, 0.0)}
 
 
-class Draws:
-    """Each uncertainty draw's outcomes averted and cost of every fixed plan (UQ.run's on_draw hook), guarded against
-    the draw's model corrections."""
+def solved_plans(A, ben0, cost0) -> dict:
+    """{variant id: plan} of each rule variant that solves on the point tables, as run() solves it (within the headline
+    plan's budget), for Draws to follow over the uncertainty draws. A variant with no feasible plan is left out here
+    and reported as not solved by run()."""
+    out = {}
+    for v in config(A.spec.raw).get("variants") or []:
+        if v["type"] == "fixed_plan":
+            continue
+        try:
+            out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
+        except (ValueError, RuntimeError):
+            continue
+    return out
 
-    def __init__(self, A):
+
+def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events, out=None) -> dict:
+    """Review A2: the optimum re-solved on the same point tables and the unconstrained (signed) feasibility `feas`,
+    with the spending cap set to fixed plan `fp`'s own cost `spend`, guarded as every other solve; what moves from
+    the given plan to it. `value_gain` is in undiscounted primary outcomes averted (from the point outcomes `out`;
+    without them, the benefits over the discount factor, which is how they are built); `objective_gain` is the
+    objective difference (discounted). Not solved (with why) when no plan is feasible at that spend; any other solver
+    error raises."""
+    from toolkit.analysis import moves as MV
+    try:
+        s = A.solve(ben0, cost0, budget=spend, feas=feas)
+    except RuntimeError as e:
+        if "infeasible" not in str(e):
+            raise
+        return {"status": "not_solved", "budget": spend, "reason": str(e)}
+    sp, so = dict(s["choice"]), float(s["objective"])
+    A.guard(f"plan variant {vid}: the optimum at its cost", [sp], events=events)
+    m = MV.summarise(A, fp, sp, ben0, cost0, so, budget=spend, feas=feas)
+    if out is not None:
+        av = lambda p: float(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][p[i]][A.primary] for i in A.ids))  # noqa: E731
+    else:
+        av = lambda p: float(sum(ben0[i][p[i]] for i in A.ids)) / float(getattr(A, "dfac", 1.0))  # noqa: E731
+    a1, a0 = av(sp), av(fp)
+    return {"status": "solved", "budget": spend, "objective": so, "cost": float(sum(cost0[i][sp[i]] for i in A.ids)),
+            "objective_gain": so - fo, "averted": a1, "given_averted": a0, "value_gain": a1 - a0,
+            "value_gain_pct": 100.0 * (a1 - a0) / a1 if a1 > 0 else None, **{k: m[k] for k in MOVES}, "plan": sp}
+
+
+def _same_spend_findings(x: dict) -> list[str]:
+    """A fixed plan's same-spend block is present and agrees with its record (Codex r1 P2-2, P2-3): its budget is the
+    plan's cost; not solved only when the plan itself breaks the signed constraints (otherwise it is a feasible plan
+    at that budget); a solved block's plan covers the plan's units with package ids, within the budget, its gains
+    recomputed. Every number must be finite: a bad field is a finding, never an exception. [] when it agrees."""
+    s, vid = x.get("same_spend"), x.get("id")
+    if not isinstance(s, dict) or s.get("status") not in ("solved", "not_solved"):
+        return [f"fixed plan {vid}: no same-spend comparison (status solved or not_solved)"]
+    if not (_fin(s.get("budget")) and _fin(x.get("cost")) and _close(s["budget"], x["cost"])):
+        return [f"fixed plan {vid}: the same-spend budget {s.get('budget')!r} is not the plan's cost {x.get('cost')!r}"]
+    if s["status"] == "not_solved":
+        if not s.get("reason"):
+            return [f"fixed plan {vid}: a same-spend comparison not solved, without why"]
+        if x.get("units_ineligible") == 0 and not x.get("constraints_broken"):
+            return [f"fixed plan {vid}: the same-spend comparison is not solved, but the plan itself is feasible "
+                    "under the signed constraints at that budget"]
+        return []
+    keys = ("objective", "cost", "objective_gain", "averted", "given_averted", "value_gain")
+    bad = [k for k in keys if not _fin(s.get(k))] + (["value_gain_pct"] if s.get("value_gain_pct") is not None
+                                                    and not _fin(s["value_gain_pct"]) else [])
+    if bad or not _fin(x.get("objective")):
+        return [f"fixed plan {vid}: the same-spend comparison's {bad or ['plan objective']} are not finite numbers"]
+    sp, fp = s.get("plan"), x.get("plan")
+    out = []
+    if not (isinstance(sp, dict) and isinstance(fp, dict) and set(sp) == set(fp)
+            and all(isinstance(p, str) and p.strip() for p in sp.values())):
+        out.append(f"fixed plan {vid}: the same-spend plan does not give each of the plan's units a package id")
+    if s["cost"] > s["budget"] * (1 + 1e-9) + 1e-9:
+        out.append(f"fixed plan {vid}: the same-spend optimum costs {s['cost']}, above its budget {s['budget']}")
+    if not _close(s["objective_gain"], s["objective"] - float(x["objective"])):
+        out.append(f"fixed plan {vid}: the same-spend objective gain {s['objective_gain']} is not its objective minus "
+                   f"the plan's ({s['objective']} - {x['objective']})")
+    if not _close(s["value_gain"], s["averted"] - s["given_averted"]):
+        out.append(f"fixed plan {vid}: the same-spend value gain {s['value_gain']} is not its outcomes averted minus "
+                   f"the plan's ({s['averted']} - {s['given_averted']})")
+    pct = 100.0 * s["value_gain"] / s["averted"] if s["averted"] > 0 else None
+    if (pct is None) != (s.get("value_gain_pct") is None) or (pct is not None and not _close(pct, s["value_gain_pct"])):
+        out.append(f"fixed plan {vid}: the same-spend value gain share {s.get('value_gain_pct')} is not {pct}")
+    return out
+
+
+def _fin(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _close(a, b) -> bool:
+    return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))
+
+
+class Draws:
+    """Each uncertainty draw's outcomes averted and cost of every fixed plan and, with `solved` ({variant id: plan},
+    solved_plans()), of every solved variant (UQ.run's on_draw hook), guarded against the draw's model corrections. A
+    solved variant's cost is judged against the spec's affordability rule (rule_met); a fixed plan's is reported,
+    not judged."""
+
+    def __init__(self, A, solved=None):
         self.A, self.n = A, 0
         self.plans = {v["id"]: given_plan(A, v) for v in fixed_variants(A.spec.raw)}
+        self.solved = {k: dict(p) for k, p in (solved or {}).items()}
+        self.follows_solved = solved is not None      # Codex r1: then every variant run() solves must be here
+        self.plans.update(self.solved)
         self.y = {k: {o: [] for o in A.outcomes} for k in self.plans}
         self.cost = {k: [] for k in self.plans}
 
@@ -300,15 +448,17 @@ class Draws:
         from toolkit.analysis import uncertainty as UQ
         from toolkit.analysis.core import q
         lvl = (interval or {}).get("level", 0.95)
+        rule = ((self.A.spec.raw.get("uncertainty") or {}).get("affordability") or None) if k in self.solved else None
         return {"draws": self.n, "interval": interval, "averted": {o: q(v, lvl) for o, v in self.y[k].items()},
-                "affordability": UQ.affordability(self.cost[k], self.A.budget, None, lvl)}
+                "affordability": UQ.affordability(self.cost[k], self.A.budget, rule, lvl)}
 
 
-def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | None:
+def run(A, ben0, cost0, plan, events=None, draws=None, interval=None, outcomes=None) -> dict | None:
     """The plan_variants artifact: the unconstrained plan and every variant, solved on the point tables within the
     headline plan's budget (A.solve: the reserve when enforced), each guarded against the point evaluation's model
     corrections `events` (Codex S1-6 r1 P1-1); every fixed plan evaluated as given, with its draws from `draws` (a
-    Draws fed by the uncertainty step; None: the point estimate only). None when the spec asks for none."""
+    Draws fed by the uncertainty step; None: the point estimate only); `outcomes`, the point outcomes, give the
+    same-spend gain in undiscounted outcomes. None when the spec asks for none."""
     from toolkit.analysis import moves as MV
     cfg = config(A.spec.raw)
     if not cfg:
@@ -335,6 +485,7 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
             m = MV.summarise(A, up, fp, ben0, cost0, fo, feas=bf)
             r, drawn = row(fp, fo), draws is not None and draws.n > 0      # no draws: the point estimate only
             rec.update(r, status="evaluated", column=v["column"], plan=dict(fp), value_lost=uo - fo,
+                       same_spend=same_spend(A, v["id"], fp, fo, r["cost"], ben0, cost0, bf, ev, outcomes),
                        value_lost_pct=100.0 * (uo - fo) / uo if uo > 0 else None, **{k: m[k] for k in MOVES},
                        budget_allocatable=float(A.budget), cost_minus_budget=r["cost"] - float(A.budget),
                        within_budget=r["cost"] <= float(A.budget) * (1 + 1e-9), **eligibility(A, fp, bf),
@@ -356,6 +507,15 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None) -> dict | 
         rec.update(row(vp, vo), status="solved", plan=dict(vp), value_lost=lost,
                    value_lost_pct=100.0 * lost / uo if uo > 0 else None,
                    **{k: m[k] for k in MOVES})
+        if draws is not None and draws.n > 0 and draws.follows_solved and v["id"] not in draws.solved:
+            # Codex r1 P1: its pre-draw solve failed and this one succeeded, so no draw followed (or guarded) it
+            raise RuntimeError(f"plan variant {v['id']}: solved here but not followed over the uncertainty draws")
+        if draws is not None and v["id"] in draws.solved:     # its cost and outcome over the uncertainty draws
+            if draws.solved[v["id"]] != dict(vp):
+                raise RuntimeError(f"plan variant {v['id']}: the uncertainty draws followed another plan than its "
+                                   "solved plan")
+            if draws.n > 0:
+                rec["uncertainty"] = draws.summary(v["id"], interval)
         if v["type"] == "group_rule":       # each group's choice; a shared "none" is allowed unless provide: true
             rec["group_choices"] = group_choices(A, v, vp)
             rec["groups_none"] = sum(c == "none" for c in rec["group_choices"].values())
@@ -560,10 +720,95 @@ def _self_test_fixed(ok, attempt):
        f"{u6})")
     _, e7 = attempt(lambda *a: D.add(*a), out, [{"unit": "u1", "package": "s", "kind": "clip"}], tabs[0])
     ok(isinstance(e7, AnalysisBlocked), f"PV26 a draw's corrections on the given plan stop publication ({e7!r})")
+    # review A6: a solved variant's cost in each draw too, judged against the spec's affordability rule
+    A.spec.raw["uncertainty"] = {"affordability": {"max_share_over_budget": 0.25}}
+    sp, e8 = attempt(g_("solved_plans"), A, ben, cost)
+    D2, e9 = attempt(g_("Draws"), A, sp)
+    for t in tabs:
+        attempt(lambda *a: D2.add(*a), out, [], t)
+    r8, e10 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D2, {"level": 0.9})
+    v8 = {x["id"]: x for x in (r8 or {}).get("variants", [])}
+    n8 = v8.get("nets") or {}
+    a8 = (n8.get("uncertainty") or {}).get("affordability") or {}
+    over8 = sum(m * n8.get("cost", 0.0) > A.budget * (1 + 1e-9) for m in (0.8, 1.2))
+    ok(e8 is None and e9 is None and e10 is None and n8.get("status") == "solved" and (sp or {}).get("nets") == n8.get("plan")
+       and a8.get("draws") == 2 and a8.get("draws_over_budget") == over8 == 1 and a8.get("rule_met") is False
+       and ((v8.get("given") or {}).get("uncertainty") or {}).get("affordability", {}).get("rule_met") is None,
+       f"PV31 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
+       f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
+       f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
+    A.budget = 1.0
+    sp9, e11 = attempt(g_("solved_plans"), A, ben, cost)
+    A.budget = 2.0
+    ok(e11 is None and sp9 == {},
+       f"PV32 a variant the budget makes infeasible has no plan to follow over the draws ({e11!r}, {sp9})")
+    D3, _ = attempt(g_("Draws"), A, {"nets": {i: "none" for i in A.ids}})
+    for t in tabs:
+        attempt(lambda *a: D3.add(*a), out, [], t)
+    _, e12 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D3, {"level": 0.9})
+    ok(isinstance(e12, RuntimeError) and "nets" in str(e12),
+       f"PV33 draws collected for another plan than the variant's solved plan fail closed ({e12!r})")
+    # Codex r1 on A6. P1: a variant left out of the draws (its pre-draw solve failed) and solved later is refused.
+    D4, _ = attempt(g_("Draws"), A, {})
+    for t in tabs:
+        attempt(lambda *a: D4.add(*a), out, [], t)
+    _, e13 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [], D4, {"level": 0.9})
+    ok(isinstance(e13, RuntimeError) and "nets" in str(e13),
+       f"PV34 a solved variant the draws did not follow fails closed, not published without its uncertainty ({e13!r})")
+    # P2: package-specific draw costs and outcomes; the variant's quantiles are its own plan's, not the headline's
+    from toolkit.analysis.core import q as _q
+    mult = ({"none": 1, "n1": 0.5, "n2": 2.0, "s": 1.0}, {"none": 1, "n1": 2.0, "n2": 0.5, "s": 1.5})
+    tabs2 = [{i: {k: m[k] * cost[i][k] for k in A.pk} for i in A.ids} for m in mult]
+    outs2 = [{i: {"y": {k: {"dalys": 10.0 - f * ben[i][k]} for k in A.pk}} for i in A.ids} for f in (1.0, 3.0)]
+    sp5 = solved_plans(A, ben, cost)
+    D5 = Draws(A, sp5)
+    for o_, t in zip(outs2, tabs2):
+        D5.add(o_, [], t)
+    hp5 = A.solve(ben, cost)["choice"]
+    r14, e14 = attempt(run, A, ben, cost, hp5, [], D5, {"level": 0.9})
+    n14 = {x["id"]: x for x in (r14 or {}).get("variants", [])}.get("nets") or {}
+    vp = n14.get("plan") or {}
+    want_c = [sum(t[i][vp[i]] for i in A.ids) for t in tabs2] if vp else []
+    head_c = [sum(t[i][hp5[i]] for i in A.ids) for t in tabs2]
+    want_y = [sum(o_[i]["y"]["none"]["dalys"] - o_[i]["y"][vp[i]]["dalys"] for i in A.ids) for o_ in outs2] if vp else []
+    u14 = n14.get("uncertainty") or {}
+    a14 = u14.get("affordability") or {}
+    ok(e14 is None and vp != dict(hp5) and want_c != head_c
+       and a14.get("per_draw_cost") == want_c and a14.get("fixed_plan_cost") == _q(want_c, 0.9)
+       and u14.get("averted", {}).get("dalys") == _q(want_y, 0.9)
+       and a14.get("draws_over_budget") == sum(c > A.budget * (1 + 1e-9) for c in want_c),
+       f"PV35 a solved variant's draw costs and outcomes are its own plan's, package by package ({e14!r}, "
+       f"{a14.get('per_draw_cost')} vs {want_c}, headline {head_c})")
+    # P2: the contract checks the affordability record against its own draws and the spec's rule
+    pt14 = {"headline_variant": None, "plan": dict(hp5)}
+    c0 = contract_findings(A.spec.raw, pt14, r14) if r14 else ["no record"]
+    bad_recs = []
+    for mutate in (lambda a, u: a.update(rule_met=not a["rule_met"]),
+                   lambda a, u: a.update(draws_over_budget=a["draws_over_budget"] + 1),
+                   lambda a, u: a.update(rule={"max_share_over_budget": 0.99}),
+                   lambda a, u: a.update(budget_allocatable=a["budget_allocatable"] * 2),
+                   lambda a, u: u.update(draws=u["draws"] + 1),
+                   lambda a, u: u.pop("affordability")):
+        rr = copy.deepcopy(r14 or {})
+        nr = next((x for x in rr.get("variants", []) if x.get("id") == "nets"), None)
+        if nr and nr.get("uncertainty"):
+            mutate(nr["uncertainty"].get("affordability", {}), nr["uncertainty"])
+        bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    rr = copy.deepcopy(r14 or {})
+    for x in rr.get("variants", []):
+        if x.get("id") == "nets":
+            x.pop("uncertainty", None)
+    bad_recs.append(contract_findings(A.spec.raw, pt14, rr))
+    ok(c0 == [] and all(bad_recs),
+       f"PV36 a consistent record passes (rule not met included); a verdict, count, rule, budget or draw count that "
+       f"contradicts the draws, or a solved variant missing its draws, is a contract finding ({c0}, "
+       f"{[len(b) for b in bad_recs]})")
+    del A.spec.raw["uncertainty"]
     # contract: a fixed plan is evaluated (never solved), and its record carries its eligibility report
     raw = {"analysis": {"plan_variants": {"variants": [ms, fx]}}}
-    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "ineligible_units": [], "units_ineligible": 0,
-           "cost_minus_budget": 0.5}
+    rec = {"id": "given", "type": "fixed_plan", "status": "evaluated", "units_ineligible": 1, "cost": 2.5,
+           "ineligible_units": [{"unit": "u1", "package": "s", "reasons": ["toy"]}], "cost_minus_budget": 0.5,
+           "same_spend": {"status": "not_solved", "budget": 2.5, "reason": "toy"}}
     art = {"headline": "unconstrained", "variants": [{"id": "nets", "type": "minimum_service", "status": "solved"}, rec]}
     pt = {"plan": {}, "headline_variant": None}
     cf = lambda v: attempt(contract_findings, raw, pt, v)[0]  # noqa: E731
@@ -583,6 +828,138 @@ def _self_test_fixed(ok, attempt):
                     {"none": frozenset(), "a": frozenset({"a"}), "b": frozenset({"b"})}, "id")
     ok(any("within_envelope" in x for x in e9 or []),
        f"PV29 a given package that envelope pruning dropped is refused with why, not as unknown ({e9})")
+
+
+def _self_test_same_spend(ok, attempt):
+    """Review A2: a fixed plan is also compared with the optimum re-solved at its own cost (equal spend)."""
+    import itertools
+    fx = {"id": "given", "type": "fixed_plan", "column": "gc", "text": "the plan as funded"}
+
+    def setup(given):
+        A, ben, cost, _ms, _gr = _toy()
+        for u in A.spec.units():
+            u["gc"] = given[u["id"]]
+        A.spec.raw["analysis"]["plan_variants"] = {"variants": [fx]}
+        return A, ben, cost
+
+    def brute(A, ben, cost, budget):        # every combination of the toy's packages, within budget and eligibility
+        best = None
+        for combo in itertools.product(sorted(A.pk), repeat=len(A.ids)):
+            p = dict(zip(A.ids, combo))
+            if any(not A.feas["feasible"][i].get(p[i], False) for i in A.ids):
+                continue
+            if sum(cost[i][p[i]] for i in A.ids) > budget * (1 + 1e-9):
+                continue
+            o = sum(ben[i][p[i]] for i in A.ids)
+            best = o if best is None or o > best else best
+        return best
+
+    given = {"u1": "none", "u2": "none", "u3": "none", "u4": "s"}        # costs 1.0, below the budget 2.0
+    A, ben, cost = setup(given)
+    r, e = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    f = {x["id"]: x for x in (r or {}).get("variants", [])}.get("given") or {}
+    s = f.get("same_spend") or {}
+    want = brute(A, ben, cost, 1.0)
+    ok(e is None and s.get("status") == "solved" and abs(s.get("budget", -1) - 1.0) < 1e-9
+       and s.get("cost", 9) <= f.get("cost", 0) + 1e-9 and s.get("objective", -1) >= f.get("objective", 9) - 1e-9
+       and abs(s.get("objective", -1) - want) < 1e-9 and abs(s.get("value_gain", -1) - (want - 0.6)) < 1e-9
+       and abs(s.get("value_gain_pct", -1) - 100 * (want - 0.6) / want) < 1e-9
+       and set(MOVES) <= set(s) and isinstance(s.get("plan"), dict),
+       f"PV37 a given plan cheaper than the budget is compared with the optimum at its own cost, as a brute force "
+       f"over the toy's packages finds it ({e!r}, {s.get('objective')} vs {want}, gain {s.get('value_gain')})")
+    up = (r or {}).get("unconstrained", {}).get("plan")
+    ok(e is None and s.get("plan") != up and s.get("objective", 99) < r["unconstrained"]["objective"] - 1e-9
+       and abs(f.get("value_lost", 0) - (14.0 - 0.6)) < 1e-9 and s.get("units_changed") == 3,
+       f"PV38 at a spend below the budget the same-spend optimum is not the unconstrained plan; value_lost is kept "
+       f"as it was ({s.get('plan')} vs {up})")
+    A, ben, cost = setup({i: "none" for i in ("u1", "u2", "u3", "u4")})         # costs 0; u4 must take a package
+    A.feas["feasible"]["u4"]["none"] = False
+    r3, e3 = attempt(run, A, ben, cost, A.solve(ben, cost)["choice"], [])
+    s3 = ({x["id"]: x for x in (r3 or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
+    ok(e3 is None and s3.get("status") == "not_solved" and "infeasible" in str(s3.get("reason")),
+       f"PV39 no feasible plan at the given plan's cost: the same-spend block is not solved, with why, no crash "
+       f"({e3!r}, {s3})")
+    A, ben, cost = setup(given)
+    r4 = run(A, ben, cost, A.solve(ben, cost)["choice"], []) if e is None else {"variants": []}
+    pt, raw = {"plan": {}, "headline_variant": None}, A.spec.raw
+
+    def mut(fn):
+        rr = copy.deepcopy(r4)
+        _, err = attempt(fn, next((y for y in rr["variants"] if y.get("id") == "given"), {}))
+        return None if err else attempt(contract_findings, raw, pt, rr)[0]
+    bad = [mut(lambda x: x.pop("same_spend", None)),
+           mut(lambda x: x["same_spend"].update(budget=x["same_spend"]["budget"] + 1)),
+           mut(lambda x: x["same_spend"].update(value_gain=x["same_spend"]["value_gain"] + 1)),
+           mut(lambda x: x["same_spend"].update(status="maybe")),
+           mut(lambda x: x.update(same_spend="solved"))]
+    good = attempt(contract_findings, raw, pt, r4)[0]
+    ok(good == [] and all(b and any("same" in m for m in b) for b in bad),
+       f"PV40 the contract requires a consistent same-spend block for each evaluated fixed plan ({good}, {bad})")
+    _self_test_same_spend_r1(ok, attempt, setup, mut)
+
+
+def _self_test_same_spend_r1(ok, attempt, setup, mut):
+    """Codex round 1 on the same-spend comparison."""
+    from toolkit.analysis import claims as CL
+    from toolkit.analysis.core import AnalysisBlocked
+    given = {"u1": "none", "u2": "none", "u3": "none", "u4": "s"}
+    # P2-1: the gain in undiscounted outcomes, the objective difference apart
+    A, ben, cost = setup(given)
+    A.dfac = 0.5
+    out = {i: {"y": {k: {"dalys": 100.0 - ben[i][k] / A.dfac} for k in A.pk}} for i in A.ids}
+    r, e = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], [], None, None, out))
+    s = ({x["id"]: x for x in (r or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
+    cl = {c["id"]: c for c in (CL.variant_claims(A, {"plan_variants": "pv"}, r) if r else [])}
+    md = CL.variants_markdown(A, r) if r else ""
+    ok(e is None and abs(s.get("objective_gain", 0) - 7.4) < 1e-9 and abs(s.get("value_gain", 0) - 14.8) < 1e-9
+       and abs(s.get("value_gain_pct", 0) - 100 * 14.8 / 16) < 1e-9
+       and (cl.get("variant.given.same_spend_gain") or {}).get("source_field", "").endswith("same_spend.value_gain")
+       and "undiscounted" in md and "[CLAIM:variant.given.same_spend_gain]" in md,
+       f"PV41 with discounting, the same-spend gain is in undiscounted outcomes and the claim uses it; the objective "
+       f"difference is apart ({e!r}, {s.get('value_gain')}, {s.get('objective_gain')})")
+    # P2-2: not solved is refused for a feasible given plan, and needs the plan's cost as its budget
+    ns = {"status": "not_solved", "reason": "optimizer status infeasible"}
+    feas_ns = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"])))
+    no_b = mut(lambda x: x.update(same_spend=dict(ns), units_ineligible=1, ineligible_units=[{"unit": "u1"}]))
+    bad_b = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"] + 1), units_ineligible=1,
+                                   ineligible_units=[{"unit": "u1"}]))
+    ok_ns = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"]), units_ineligible=1,
+                                   ineligible_units=[{"unit": "u1"}]))
+    broken = mut(lambda x: x.update(same_spend=dict(ns, budget=x["cost"]), constraints_broken=["cap c"]))
+    ok(all(b and any("same" in m for m in b) for b in (feas_ns, no_b, bad_b)) and ok_ns == [] and broken == [],
+       f"PV42 not solved is a finding for a fixed plan feasible under the signed constraints, or without its cost as "
+       f"budget ({feas_ns}, {no_b}, {bad_b}, {ok_ns}, {broken})")
+    # P2-3: the plan covers the fixed plan's units with package ids; numbers finite; never an exception
+    bad = [mut(lambda x: x["same_spend"]["plan"].pop("u1")),
+           mut(lambda x: x["same_spend"]["plan"].update(u9="n1")),
+           mut(lambda x: x["same_spend"]["plan"].update(u1="")),
+           mut(lambda x: x["same_spend"]["plan"].update(u1=3)),
+           mut(lambda x: x["same_spend"].update(objective=float("nan"))),
+           mut(lambda x: x["same_spend"].update(cost="a lot")),
+           mut(lambda x: x["same_spend"].update(value_gain=float("inf"))),
+           mut(lambda x: x.update(cost=None)),
+           mut(lambda x: x.update(objective="high"))]
+    ok(all(b and any("same" in m for m in b) for b in bad),
+       f"PV43 a same-spend plan off the fixed plan's units or without package ids, or a field that is not a finite "
+       f"number, is a finding, not an exception ({bad})")
+    # note: with a headline variant, the same-spend solve uses the unconstrained feasibility
+    A, ben, cost = setup(given)
+    ms = {"id": "nets", "type": "minimum_service", "components": ["n1", "n2"], "text": "a net in every unit"}
+    A.spec.raw["analysis"]["plan_variants"] = {"variants": [ms, A.spec.raw["analysis"]["plan_variants"]["variants"][0]],
+                                               "headline": "nets"}
+    _, eh = attempt(apply_headline, A)
+    r5, e5 = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], []))
+    s5 = ({x["id"]: x for x in (r5 or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
+    ok(eh is None and e5 is None and s5.get("status") == "solved" and abs(s5.get("objective", 0) - 8.0) < 1e-9,
+       f"PV44 with a variant headline the same-spend optimum is solved under the unconstrained feasibility "
+       f"({eh!r}, {e5!r}, {s5.get('status')}, {s5.get('objective')})")
+    # note: a correction on a package only the same-spend optimum uses stops the analysis
+    A, ben, cost = setup({"u1": "none", "u2": "none", "u3": "none", "u4": "s"})
+    ben["u3"]["n1"] = 5.5          # at cost 1 the optimum is n1 in u1 and u3; u3 takes s in the unconstrained plan
+    r6, e6 = attempt(lambda: run(A, ben, cost, A.solve(ben, cost)["choice"], [
+        {"unit": "u3", "package": "n1", "kind": "extrapolation"}]))
+    ok(isinstance(e6, AnalysisBlocked) and "cost" in str(e6),
+       f"PV45 a correction on a package only the same-spend optimum uses stops the analysis ({e6!r})")
 
 
 def _self_test() -> int:
@@ -660,6 +1037,7 @@ def _self_test() -> int:
     ok(validate({"analysis": {}}, set()) == [] if e8 is None else False, "PV11 no plan_variants: nothing to validate")
     _self_test_round1(ok, attempt)
     _self_test_fixed(ok, attempt)
+    _self_test_same_spend(ok, attempt)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
