@@ -3689,13 +3689,14 @@ def _self_test_checkpoint(ok) -> None:
         """results_store's archive helpers, uploads into a dict (optionally failing or blocking)."""
         write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
 
-        def __init__(self, fail=False, gate=None):
+        def __init__(self, fail=False, gate=None, fail_on=None):
             self.files, self.fail, self.gate, self.uploads, self.downloads = {}, fail, gate, [], []
+            self.fail_on = fail_on
 
         def upload_file(self, path, blob, account=None):
             if self.gate is not None:
                 self.gate.wait(10)
-            if self.fail:
+            if self.fail or (self.fail_on and self.fail_on(blob)):
                 raise OSError("storage unreachable")
             self.files[blob] = open(path, "rb").read()
             self.uploads.append(blob)
@@ -3709,6 +3710,9 @@ def _self_test_checkpoint(ok) -> None:
 
         def delete(self, blob, account=None):
             self.files.pop(blob, None)
+
+        def list_blobs(self, prefix, account=None):
+            return [{"name": n} for n in sorted(self.files) if n.startswith(prefix)]
 
     secret = "sk-ant-TESTSECRET12345"
     main_py = ("import json, os, time\n"
@@ -3938,6 +3942,90 @@ def _self_test_checkpoint(ok) -> None:
        and clock[0] - 1000.0 <= 60 + 10 and "A: checkpointed" in out20 and "B: timeout" in out20,
        f"CK20 (Codex P1-3, P2-6, P2-8) by recorded id; every label requested first, then storage polled for the "
        f"token under one deadline: rc={r20} elapsed={clock[0] - 1000.0} {out20!r}")
+    # Codex round 2 P1-2: a checkpointer recreated on a lost work dir continues the stored generations
+    keep = Store(fail_on=lambda blob: blob.endswith(("_g3.json", "_g4.json")))
+    for k in (1, 2):
+        keep.files[gen(k)[0]], keep.files[gen(k)[1]] = f"tar{k}".encode(), json.dumps({"generation": k}).encode()
+    keep.files[pointer] = json.dumps({"generation": 2, "previous": 1}).encode()
+    before = dict(keep.files)
+    wd2 = os.path.join(tempfile.mkdtemp(), "R1")
+    os.makedirs(os.path.join(wd2, "runs", "R_z"))
+    open(os.path.join(wd2, "runs", "R_z", "a.txt"), "w").write("a")
+    c7 = ws.Checkpointer("R1", wd2, "runs/t", "L1", None, keep, 3600, log=lambda m: None)
+    for _ in range(2):
+        c7.trigger("t")
+        c7.wait_idle(10)
+    ok(c7.failed == 2 and all(keep.files.get(b) == v for b, v in before.items())
+       and not any(b.endswith(("_g1.tar.gz", "_g2.tar.gz")) for b in keep.uploads),
+       f"CK21 (Codex round 2 P1-2) recreated on a lost work dir with g1, g2 stored, two failed record uploads: "
+       f"g1, g2 and the pointer intact: uploads {keep.uploads}")
+    keep.fail_on = None
+    c7.trigger("t")
+    c7.wait_idle(10)
+    p21 = json.loads(keep.files[pointer])
+    ok(p21.get("generation") == 5 and p21.get("previous") == 2 and gen(2)[0] in keep.files
+       and gen(1)[0] not in keep.files and gen(5)[0] in keep.files,
+       f"CK21b the next success is g5 with previous g2; only generations older than both are deleted, after the "
+       f"pointer: {p21} {sorted(keep.files)}")
+    # Codex round 2 P2-3: the disk check covers the archive being written and the copy of the largest file
+    big_dir = os.path.join(tempfile.mkdtemp(), "runs", "R_b")
+    os.makedirs(big_dir)
+    with open(os.path.join(big_dir, "big.bin"), "wb") as f:
+        f.truncate(10 * 2**30)                    # a sparse 10 GiB file: its size, not its disk use
+    open(os.path.join(big_dir, "small.txt"), "w").write("x" * 1000)
+    need = ws.disk_needed(big_dir, None)
+    ok(need >= 2.2 * (10 * 2**30 + 10 * 2**30 + 1000) + 2 * 2**30
+       and ws.disk_needed(big_dir, os.path.join(big_dir, "small.txt")) == need + 1000,
+       f"CK22 (Codex round 2 P2-3) a 10 GiB incompressible file needs 2.2 x (largest + run dir) + run.log + 2 GB "
+       f"free: {need / 2**30:.1f} GiB")
+    # Codex round 2 P2-4: a request whose checkpoint is skipped or fails is retried within retry_s, not at the next
+    # interval
+    wd3 = os.path.join(tempfile.mkdtemp(), "Q")
+    os.makedirs(os.path.join(wd3, "runs", "R_q"))
+    open(os.path.join(wd3, "runs", "R_q", "a.txt"), "w").write("a")
+    frees = iter([0] + [2**50] * 50)
+    flaky = Store(fail_on=lambda blob, n=[0]: blob.endswith(".tar.gz") and n.append(1) is None and len(n) == 2)
+    c8 = ws.Checkpointer("Q", wd3, "runs/t", "L1", None, flaky, 3600, poll_s=0.05, log=lambda m: None,
+                         free_bytes=lambda p: next(frees), retry_s=0.2)
+    c8.start()
+    try:
+        with mock.patch.object(ws, "WORK", os.path.dirname(wd3)):
+            req8 = ws.checkpoint_now_side("Q")
+        for _ in range(100):
+            if c8.done:
+                break
+            _time.sleep(0.05)
+    finally:
+        c8.stop()
+        c8.wait_idle(10)
+    p8 = json.loads(flaky.files.get(ws.checkpoint_pointer("runs/t", "L1", "Q"), b"{}"))
+    ok(req8["token"] in (p8.get("requests") or []) and c8.failed == 1 and c8.done == 1,
+       f"CK23 (Codex round 2 P2-4) a request survives a disk skip and a failed upload, met within seconds: "
+       f"done={c8.done} failed={c8.failed} {p8.get('requests')}")
+    # Codex round 2 P2-5: requests go to every worker at once; an unresponsive one does not hold up the others
+
+    class SlowA:
+        def __init__(self):
+            self.when, self.release = {}, threading.Event()
+
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            self.when[a[0]] = _time.time()
+            if a[0] == "A":
+                self.release.wait(10)
+            return {workers[0]: {"state": "requested", "token": f"T{a[0]}", "epoch": 1.0}}
+    sa = SlowA()
+    st5 = Store()
+    st5.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "B")] = json.dumps(
+        {"generation": 1, "requests": ["TB"], "started_epoch": 2.0}).encode()
+    t0 = _time.time()
+    with contextlib.redirect_stdout(io.StringIO()) as b5:
+        r24 = checkpoint_now(cfg4, timeout_s=2, store=st5, connect=lambda c, cid: sa, poll_s=0.1)
+    took = _time.time() - t0
+    sa.release.set()
+    ok(r24 == 1 and sa.when.get("B", 99) - t0 < 1.0 and took < 4 and "B: checkpointed" in b5.getvalue()
+       and "A: unavailable" in b5.getvalue(),
+       f"CK24 (Codex round 2 P2-5) with worker A unresponsive, B is requested at once and the call ends at its "
+       f"deadline: B at {sa.when.get('B', 99) - t0:.2f}s, took {took:.1f}s {b5.getvalue()!r}")
 
 
 def _self_test() -> int:

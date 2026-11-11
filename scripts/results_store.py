@@ -403,6 +403,32 @@ def _self_test() -> int:
             globals()["REDACT_MAX_MB"] = _max
         if "models/late.txt" not in sk:
             fails.append(f"S12 a large file rewritten with a secret after the listing is left out: {sk}")
+        # Codex round 2 P1-1: a name is never translated or allowed to climb out; the root itself is no link
+        esc = os.path.join(d, "esc")
+        os.makedirs(os.path.join(esc, "work", "run"))
+        open(os.path.join(esc, "private.json"), "w").write("OUTSIDE\n")
+        open(os.path.join(esc, "work", "run", "..\\..\\private.json"), "w").write("inside\n")
+        write_archive(os.path.join(esc, "work", "run"), "run", out)
+        tf = _tf.open(out, mode="r:gz")
+        got = tf.extractfile("run/..\\..\\private.json").read() if "run/..\\..\\private.json" in tf.getnames() else b""
+        if got != b"inside\n":
+            fails.append(f"S14 a name holding backslashes is that file, never a path out of the run: {got!r}")
+        refused = []
+        for rel in ("../private.json", "work/../../private.json", "/etc/hosts", "run//x"):
+            try:
+                os.close(_open_nofollow(os.path.join(esc, "work"), rel))
+            except (OSError, ValueError):
+                refused.append(rel)
+        if len(refused) != 4:
+            fails.append(f"S14b names with '..', empty or absolute components are refused: {refused}")
+        link_root = os.path.join(d, "linked_run")
+        os.symlink(os.path.join(ar, "_truth"), link_root)
+        try:
+            sk = write_archive(link_root, "run", out)
+            names = _tf.open(out, mode="r:gz").getnames()
+            fails.append(f"S15 a run dir that is a link (into _truth/) is refused: archived {names} {sk}")
+        except OSError:
+            pass
         sv.store[("outputs", "ck/x")] = b"x"
         sv.get_blob_client = lambda c, n: type("B", (), {"delete_blob": lambda _s: sv.store.pop((c, n))})()
         delete("outputs/ck/x", service=sv)
