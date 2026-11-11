@@ -733,9 +733,11 @@ def _self_test() -> int:
                "RC43 a job id that is running is not restarted")
         finally:
             ws.JOBS = old
+    real_gate = globals().get("_budget_gate")
+    globals()["_budget_gate"] = lambda a, name, meter=False: None   # cases before RN28 predate the budget
     _self_test_sched(ok)
     _self_test_batch(ok)
-    _self_test_run(ok)
+    _self_test_run(ok, real_gate)
     _self_test_pipeline(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
@@ -1032,7 +1034,7 @@ def _self_test_batch(ok) -> None:
             ws.JOBS = old
 
 
-def _self_test_run(ok) -> None:
+def _self_test_run(ok, real_gate=None) -> None:
     """RN: `run` brings the cluster up, submits at once, waits with status lines, then stops it. On 2026-11-03 an
     agent ran `up`, ended its turn to wait, never sent `start`, and the VM idled out after 20 minutes with no job:
     about two hours lost. No network: a fake coiled module (Cluster, list_clusters, delete_cluster), fake client and
@@ -1054,7 +1056,7 @@ def _self_test_run(ok) -> None:
 
     def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
               drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
-              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None):
+              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None, gate=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
         stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
@@ -1193,7 +1195,8 @@ def _self_test_run(ok) -> None:
                 raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
             real_sleep(s / 600 if threaded else min(s, 0.01))
 
-        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", *extra]
+        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", "--cap-usd", "5",
+                *extra]
         if store:
             argv += ["--store", f"outputs/t/{jid}"]
         argv += ["--", sys.executable, prog]
@@ -1205,6 +1208,7 @@ def _self_test_run(ok) -> None:
                 mock.patch.object(rc, "attach", no_attach), \
                 mock.patch.object(ws, "_shutdown_cluster", job_down), \
                 mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out), \
+                mock.patch.dict(globals(), {"_budget_gate": gate} if gate else {}), \
                 contextlib.redirect_stderr(io.StringIO()):
             try:
                 main(argv)
@@ -1561,6 +1565,70 @@ def _self_test_run(ok) -> None:
                    f"under shutdown_always; a refused submission stops nothing: stops={len(downs)} "
                    f"raised={type(raised).__name__ if raised else None} refused={refused.get('state')}")
             case("RN27", rn27)
+
+            def rn28():
+                import budget
+                for label, scope, verdict in (("over budget", "f6", (False, "spent 96.00 + cap 5.00 > 100.00")),
+                                              ("no scope", None, (True, "ok"))):
+                    seen = []
+                    lbo = lambda s_, c, name=None, **k: (seen.append((s_, c, name)), verdict)[1]  # noqa: E731
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.object(budget, "scope_for_name", lambda n, *a: scope):
+                        W, msg, out, exc = world(d, f"r28{label[0]}", gate=real_gate)
+                    ok(msg and ("budget" in msg or "scope" in msg) and not W["ctor"] and W["list_calls"] == 0
+                       and "submit" not in W["events"] and seen == ([("f6", 5.0, "vm1")] if scope else []),
+                       f"RN28 {label}: `run` refuses before listing or creating any cluster: {msg} {seen}")
+            case("RN28", rn28)
+
+            def rn29():
+                for label, readings, extra in (("at the cap", [1.0, 6.0], ("--keep-on-failure",)),
+                                               ("unreadable cost", [RuntimeError("api")] * 3, ())):
+                    vals = list(readings)
+
+                    def meter(cid, vals=vals):
+                        v = vals.pop(0) if vals else 99.0
+                        if isinstance(v, Exception):
+                            raise v
+                        return v
+                    W, msg, out, exc = world(d, f"r29{label[0]}", gate=lambda a, name, meter=False, m=meter: m,
+                                             threaded=True, job_sleep=2, extra=extra)
+                    ev = W["events"]
+                    polls = [i for i, e in enumerate(ev) if e == "poll"]
+                    ok(msg and "cap" in msg and ("delete", 100) in ev and W["stops"] >= 1 and polls
+                       and polls[-1] < ev.index(("delete", 100)) and clean(W),
+                       f"RN29 {label}: `run` saves the outputs, then stops the cluster by id (even under "
+                       f"--keep-on-failure) and exits non-zero: {msg} {ev[-4:]}")
+            case("RN29", rn29)
+
+            def rn30():
+                import budget
+                a = types.SimpleNamespace(cap_usd=5.0, budget_scope="f6")
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (True, "ok")), \
+                        mock.patch.object(budget, "job_meter", lambda s_: ("meter", s_)):
+                    got = real_gate(a, "lw-smoke-x", meter=True)
+                ok(got == ("meter", "f6"), f"RN30 a covered launch gets the scope's meter: {got}")
+                made = []
+                b = types.SimpleNamespace(name="vm3", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1,
+                                          cap_usd=5.0, budget_scope="f6")
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (False, "over")), \
+                        mock.patch.dict(globals(), {"_budget_gate": real_gate}), \
+                        mock.patch.object(rc, "cluster_states", lambda n: made.append(n) or []):
+                    try:
+                        cmd_up(b)
+                        msg = None
+                    except SystemExit as e:
+                        msg = str(e)
+                ok(msg and "over" in msg and not made, f"RN30b `up` is refused before any cluster too: {msg}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    for argv in (["run", "v", "j", "--store", "p", "--", "true"], ["up", "v"]):
+                        try:
+                            main(argv)
+                        except SystemExit:
+                            pass
+                ok(len(errs) == 2 and all("--cap-usd" in e for e in errs), f"RN30c run and up require --cap-usd: {errs}")
+            case("RN30", rn30)
         finally:
             ws.JOBS = old
 
