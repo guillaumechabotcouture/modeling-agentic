@@ -92,6 +92,23 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.16 scope: BR3 at dual-AI nets and 70% use is reported, not judged (owner, 2026-11-10)
+
+**What changed.** No model change. `engine.py` and the card say 0.16, BR3 reports instead of judging one case, and the
+`model.py` note on the old IRS bias is corrected (Codex review of #180, P3). The outputs are byte-identical to v0.15
+(`benchmarks/restamp_proof.py prove`), so the v0.15 evidence (equilibration, guess sensitivity at 96 seeds, joint fit,
+pack results) is re-stamped, not recomputed.
+
+**Why.** BR3 compares the model's lifetime human bites per mosquito (biting rate over mortality) with an exact
+per-attempt chain. That gap is the published model's own approximation; the engine follows the published form exactly
+(BR2 and BR4: model / form 1.000). After the v0.15 refit raised the fitted chlorfenapyr kill (`cfp_kill` 0.415 to 0.485),
+dual-AI nets at 70% use give 1.206 times the exact chain, above BR3's 20% (the PR's earlier run, before the refit:
+1.162). The other net cases are 0.94 to 1.08, and no intervention 0.904. Above 1 means the model gives the mosquito more
+lifetime bites than the exact chain, so it somewhat understates dual-AI nets' effect at high use.
+
+**What follows.** The F6 preview's engine check of the dual-AI versus PBO decision (S3-3) runs at the boundary values,
+and the F6 report states this limitation.
+
 ## v0.15 scope: the 1/W term of the biting rates (F6 engine review of 2026-11-10, finding 1; tests written before the fix)
 
 **The model.** A host-seeking mosquito makes feeding attempts until one ends in a blood meal (Griffin et al. 2010, PLoS Med 7(8): e1000324, Protocol S2). The quantities are:

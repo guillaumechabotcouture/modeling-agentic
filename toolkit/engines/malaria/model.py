@@ -50,8 +50,9 @@ v0.15 (F6 engine review, finding 1): the biting rates carry the 1 / W-bar term o
 2010 Protocol S2; ENGINE_NOTES.md, v0.15). With pi_i a person's share of bites and W-bar the mean probability that a
 feeding attempt ends in a blood meal the mosquito survives (vector.cycle), the EIR on person i per infectious mosquito
 per person is f Q0 pi_i y_i / W-bar, and the force of infection on mosquitoes is f Q0 sum(pi_i w_i c_i) / W-bar.
-v0.2-v0.14 used f Q0 pi_i y_i and f Q0 sum(pi_i y_i c_i): the same without vector control (W-bar = 1), too low under
-nets or IRS (W-bar 0.5-0.8 at 40-70% net use).
+v0.2-v0.14 used f Q0 pi_i y_i and f Q0 sum(pi_i y_i c_i): the same without vector control (W-bar = 1); under nets
+both were too low by W-bar (0.5-0.8 at 40-70% net use); under IRS the human rate was too low by W-bar, while the old
+mosquito rate was W-bar sum(pi y c) / sum(pi w c) times the published one, which can exceed 1 (ENGINE_NOTES.md).
 
 v0.2 (workstream A): households. Agents are grouped into households of mean size
 `hh_size`. Three latent normals drive coverage and exposure:

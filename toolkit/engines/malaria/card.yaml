@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.15'
+version: '0.16'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
