@@ -7,10 +7,16 @@ private key sits in the macOS login keychain with an empty list of trusted appli
 add-generic-password ... -T ""`), so every read of it raises the keychain's own dialog asking for the owner's
 login-keychain password; an agent running in a terminal cannot answer that dialog. The owner must click "Allow",
 never "Always Allow" (that would trust `security` and end the prompt). The trust anchor is the tracked public key
-cloud/budget_owner.pub: a change to it shows in git.
+cloud/budget_owner.pub: a change to it shows in git. `init-key` hands the private key to `security -i` on stdin,
+so it never appears on a command line (`ps`) or in a log.
+
+A record expires (`expires_utc`, default 14 days after it is issued, `set --days N`, at most 60), and a record
+issued before the newest one already seen for its scope is refused. That high-water mark is a local file,
+~/.config/modeling-agentic/budget_<scope>.seen: it raises the bar for putting back an older, higher budget, but
+whoever can write that directory can delete it, so it is not tamper-proof (expiry bounds the replay either way).
 
     python cloud/budget.py init-key                  # once, by the owner
-    python cloud/budget.py set --scope f6 --usd 200 --note "F6 refit + run" [--start 2026-11-11T00:00:00Z]
+    python cloud/budget.py set --scope f6 --usd 200 --note "F6 refit + run" [--start 2026-11-11T00:00:00Z] [--days 14]
     python cloud/budget.py show [--scope f6]         # verify and print the signed record
     python cloud/budget.py status [--scope f6]       # budget, spent (billed / projected), remaining
     python cloud/budget.py --self-test
@@ -21,9 +27,9 @@ file cannot shrink a signed scope). Billed USD of a cluster = total_cost (Coiled
 cloud_total_cost (USD), from the raw cluster record (coiled 1.135.6: CloudV2._get_cluster_details_synced,
 coiled/v2/core.py:976, GET /api/v2/clusters/account/<workspace>/id/<id>; the public coiled.cluster_details,
 core.py:994, drops the cost fields; the fields as Coiled's own widget reads them: coiled/v2/widgets/rich.py:276-283).
-A cluster not yet stopped adds a projection: the hours each live instance has run so far x a USD per
-instance-hour measured as the median over the scope's last stopped clusters, never below the signed floor. This
-adds to whatever Coiled has billed so far, so it errs high. Anything that cannot be read or parsed refuses.
+A cluster not yet stopped counts max(billed, its instance-hours so far x a USD per instance-hour measured as the
+median over the scope's last stopped clusters, never below the signed floor), so a bill that grows while the
+cluster runs is not counted twice. Anything that cannot be read or parsed refuses.
 """
 from __future__ import annotations
 
@@ -47,7 +53,9 @@ KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = "modeling-agentic-budget-owner", "owner"
 USD_PER_CREDIT = 0.061
 RATE_SAMPLE = 5                 # stopped clusters the instance-hour rate is the median of
 ENDED = ("stopped", "error")
-FIELDS = ("scope", "usd", "start_utc", "note", "issued_utc", "nonce", "prefixes", "floor_usd_per_instance_hour")
+FIELDS = ("scope", "usd", "start_utc", "note", "issued_utc", "expires_utc", "nonce", "prefixes",
+          "floor_usd_per_instance_hour")
+MAX_DAYS = 60
 
 
 class BudgetError(Exception):
@@ -64,17 +72,19 @@ class Keychain:
     def _who(self):
         return ["-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT]
 
-    def add_command(self, secret_hex):
-        return ["security", "add-generic-password", *self._who(), "-l", "modeling-agentic budget owner key",
-                "-T", "", "-w", secret_hex]
+    def add_line(self, secret_hex):
+        """The command `security -i` reads on stdin (the key never on a command line)."""
+        return " ".join(["add-generic-password", *self._who(), "-l", "modeling-agentic-budget-owner-key",
+                         "-T", '""', "-w", secret_hex]) + "\n"
 
     def exists(self) -> bool:     # attributes only: reads no secret, raises no dialog
         return self.run(["security", "find-generic-password", *self._who()], capture_output=True).returncode == 0
 
     def put(self, secret_hex: str) -> None:
-        r = self.run(self.add_command(secret_hex), capture_output=True, text=True)
-        if r.returncode != 0:
-            raise BudgetError(f"keychain refused the key (security exit {r.returncode}): {r.stderr.strip()[:200]}")
+        r = self.run(["security", "-i"], input=self.add_line(secret_hex), capture_output=True, text=True)
+        err = (r.stderr or "").replace(secret_hex, "<key>").strip()
+        if r.returncode != 0 or err:      # -i may exit 0 after a failed command: its error text counts
+            raise BudgetError(f"keychain refused the key (security exit {r.returncode}): {err[:200]}")
 
     def get(self) -> str:
         r = self.run(["security", "find-generic-password", *self._who(), "-w"], capture_output=True, text=True)
@@ -122,6 +132,8 @@ def init_key(store, pub_file=PUB_FILE) -> str:
         raise BudgetError(f"a key exists already ({pub_file} or the keychain item {KEYCHAIN_SERVICE}): refusing")
     k = Ed25519PrivateKey.generate()
     store.put(k.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption()).hex())
+    if not store.exists():
+        raise BudgetError("the key store does not hold the new key: no public key written")
     pub = k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
     with open(pub_file, "x") as f:
         f.write(pub + "\n")
@@ -165,21 +177,25 @@ def _check_record(rec) -> dict:
     _scope_name(rec["scope"])
     if _num(rec["usd"], "usd") <= 0 or _num(rec["floor_usd_per_instance_hour"], "floor") <= 0:
         raise BudgetError("the budget and the floor must be positive")
+    if None in (_ts(rec["issued_utc"]), _ts(rec["expires_utc"])) or _ts(rec["expires_utc"]) <= _ts(rec["issued_utc"]):
+        raise BudgetError("bad issued or expiry time in the budget record")
     if _ts(rec["start_utc"]) is None or not (isinstance(rec["prefixes"], list) and rec["prefixes"]
                                              and all(isinstance(p, str) and p for p in rec["prefixes"])):
         raise BudgetError("bad start time or prefixes in the budget record")
     return rec
 
 
-def make_record(scope, usd, note, start_utc=None, scopes_file=SCOPES_FILE, now=None) -> dict:
+def make_record(scope, usd, note, start_utc=None, scopes_file=SCOPES_FILE, now=None, days=14) -> dict:
     import secrets
     sc = load_scopes(scopes_file)
     if _scope_name(scope) not in sc["scopes"]:
         raise BudgetError(f"scope {scope!r} is not in {scopes_file}")
+    if not 0 < _num(days, "days") <= MAX_DAYS:
+        raise BudgetError(f"--days must be 1 to {MAX_DAYS}, not {days}")
     now = time.time() if now is None else now
     start = _iso(now) if start_utc is None else start_utc
     return _check_record({"scope": scope, "usd": _num(usd, "usd"), "start_utc": start, "note": str(note or ""),
-                          "issued_utc": _iso(now), "nonce": secrets.token_hex(16), "prefixes": sc["scopes"][scope],
+                          "issued_utc": _iso(now), "expires_utc": _iso(now + days * 86400), "nonce": secrets.token_hex(16), "prefixes": sc["scopes"][scope],
                           "floor_usd_per_instance_hour": sc["floor"]})
 
 
@@ -204,8 +220,9 @@ def budget_path(scope, budget_dir=None) -> str:
     return os.path.join(budget_dir or BUDGET_DIR, f"budget_{_scope_name(scope)}.json")
 
 
-def set_budget(scope, usd, note, store, start_utc=None, budget_dir=None, pub_file=PUB_FILE, scopes_file=SCOPES_FILE):
-    doc = sign_doc(make_record(scope, usd, note, start_utc, scopes_file), store)
+def set_budget(scope, usd, note, store, start_utc=None, budget_dir=None, pub_file=PUB_FILE, scopes_file=SCOPES_FILE,
+               now=None, days=14):
+    doc = sign_doc(make_record(scope, usd, note, start_utc, scopes_file, now, days), store)
     verify_doc(doc, _read_pub(pub_file))      # the keychain's key is the anchor's pair, or nothing is written
     p = budget_path(scope, budget_dir)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -213,10 +230,29 @@ def set_budget(scope, usd, note, store, start_utc=None, budget_dir=None, pub_fil
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write(json.dumps(doc, indent=1) + "\n")
     os.replace(tmp, p)
+    _seen(scope, budget_dir, doc["record"]["issued_utc"])
     return p
 
 
-def load_budget(scope, budget_dir=None, pub_file=PUB_FILE) -> dict:
+def _seen(scope, budget_dir, issued) -> None:
+    """Refuse a record issued before the newest one seen for the scope; raise the mark to `issued`."""
+    p = os.path.join(budget_dir or BUDGET_DIR, f"budget_{_scope_name(scope)}.seen")
+    try:
+        mark = open(p).read().strip()
+    except FileNotFoundError:
+        mark = ""
+    if mark and _ts(mark) is None:
+        raise BudgetError(f"{p} is not a time: refusing")
+    if mark and _ts(issued) < _ts(mark):
+        raise BudgetError(f"this {scope} budget was issued {issued}, before one already seen ({mark}): an older "
+                          "record put back is refused")
+    if not mark or _ts(issued) > _ts(mark):
+        with open(p + ".tmp", "w") as f:
+            f.write(issued + "\n")
+        os.replace(p + ".tmp", p)
+
+
+def load_budget(scope, budget_dir=None, pub_file=PUB_FILE, now=None) -> dict:
     p = budget_path(scope, budget_dir)
     try:
         doc = json.load(open(p))
@@ -227,6 +263,9 @@ def load_budget(scope, budget_dir=None, pub_file=PUB_FILE) -> dict:
     rec = verify_doc(doc, _read_pub(pub_file))
     if rec["scope"] != scope:
         raise BudgetError(f"{p} holds the budget of {rec['scope']!r}, not {scope!r}")
+    if (time.time() if now is None else now) >= _ts(rec["expires_utc"]):
+        raise BudgetError(f"the {scope} budget expired at {rec['expires_utc']}: the owner signs a new one")
+    _seen(scope, budget_dir, rec["issued_utc"])
     return rec
 
 
@@ -271,10 +310,10 @@ def cluster_usd(details, rate, now) -> dict:
     if on and tc is None and cc is None:
         tc = cc = 0.0                     # not billed yet: the projection covers it
     live, live_h, all_h = _hours(details, now)
-    return {"id": details.get("id"), "name": details.get("name"), "state": state_of(details),
-            "billed_usd": _num(tc, "total_cost") * USD_PER_CREDIT + _num(cc, "cloud_total_cost"),
-            "projected_usd": live_h * rate if on else 0.0, "live_instances": live if on else 0,
-            "instance_hours": all_h}
+    billed = _num(tc, "total_cost") * USD_PER_CREDIT + _num(cc, "cloud_total_cost")
+    return {"id": details.get("id"), "name": details.get("name"), "state": state_of(details), "billed_usd": billed,
+            "projected_usd": max(0.0, all_h * rate - billed) if on else 0.0,   # total = max(billed, hours x rate)
+            "live_instances": live if on else 0, "instance_hours": all_h}
 
 
 def _median(xs):
@@ -284,8 +323,9 @@ def _median(xs):
 
 def spend(scope, source=None, budget=None, now=None, **load) -> dict:
     """The scope's spend since the signed budget's start, with a per-cluster breakdown (see the module doc)."""
-    rec = budget if budget is not None else load_budget(scope, **load)
-    src, now = source or CoiledSource(), time.time() if now is None else now
+    now = time.time() if now is None else now
+    rec = budget if budget is not None else load_budget(scope, now=now, **load)
+    src = source or CoiledSource()
     start, prefixes = _ts(rec["start_utc"]), tuple(rec["prefixes"])
     items = src.list_clusters()
     if not isinstance(items, list):
@@ -655,6 +695,7 @@ def main(argv=None) -> int:
     st.add_argument("--usd", type=float, required=True)
     st.add_argument("--note", required=True)
     st.add_argument("--start", default=None, help="ISO UTC time spend counts from (default: now)")
+    st.add_argument("--days", type=float, default=14, help=f"days until the budget expires (at most {MAX_DAYS})")
     for nm in ("show", "status"):
         sub.add_parser(nm).add_argument("--scope", default=None, help="default: every budget file present")
     for p in sub.choices.values():
@@ -667,7 +708,7 @@ def main(argv=None) -> int:
             print(f"owner key created: private half in the login keychain ({KEYCHAIN_SERVICE}), public half in "
                   f"{a.pub} ({pub[:16]}...). Commit that file.")
         elif a.cmd == "set":
-            print(f"signed: {set_budget(a.scope, a.usd, a.note, Keychain(), a.start, a.budget_dir, a.pub)}")
+            print(f"signed: {set_budget(a.scope, a.usd, a.note, Keychain(), a.start, a.budget_dir, a.pub, days=a.days)}")
             print(json.dumps(load_budget(a.scope, a.budget_dir, a.pub), indent=1))
         else:
             names = os.listdir(a.budget_dir) if os.path.isdir(a.budget_dir) else []
