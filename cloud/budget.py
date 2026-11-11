@@ -880,6 +880,10 @@ def _self_test() -> int:
                                     ("a negative cost", 1, lambda x: x.__setitem__("total_cost", -5)),
                                     ("an invalid creation time", 1, lambda x: x.__setitem__("created", "garbage")),
                                     ("no creation time", 1, lambda x: x.__setitem__("created", None)),
+                                    ("an instance stopped before it started", 1, lambda x: x["scheduler"]["instance"][
+                                        "current_state"].__setitem__("updated", _iso(T0))),
+                                    ("a live instance created in the future", 2, lambda x: x["scheduler"]["instance"]
+                                        .__setitem__("created", _iso(now + 3600))),
                                     ("no cost on a stopped cluster", 1, lambda x: x.__setitem__("cloud_total_cost",
                                                                                                 None))):
                 bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
@@ -958,19 +962,19 @@ def _self_test() -> int:
                 src.det[cid] = _det(cid, name, t + 10, credits, cloud, "running" if live else "stopped",
                                     insts=[(t + 10, None if live else t + 20, "vmA")])
             a = launch_budget_ok("f6", 80, "lw-smoke-a")
-            run(20, "lw-smoke-a-1f2e3d", None, None)
+            run(20, "lw-smoke-a", None, None)
             b = launch_budget_ok("f6", 80, "lw-smoke-b", reserve=False)
             ok(a[0] and not b[0] and "reserved $80.00" in b[1],
                f"BR12 A's $80 cap, listed at $0, still holds $80, so B's $80 is refused under $100: {b[1]}")
-            run(20, "lw-smoke-a-1f2e3d", 0, 30.0)
+            run(20, "lw-smoke-a", 0, 30.0)
             c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (20, 21))
             ok(c1 and not c2, "BR12b a listed cluster's reservation counts max(0, cap - its measured spend)")
-            run(21, "lw-smoke-a-1f2e3d-keeper", 0, 10.0)
+            run(21, "lw-smoke-a-keeper", 0, 10.0)
             c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (20, 21))
             ok(c1 and not c2, "BR12c the launch's helpers (named after it) count toward its reservation")
-            run(20, "lw-smoke-a-1f2e3d", 0, 30.0, live=False)
+            run(20, "lw-smoke-a", 0, 30.0, live=False)
             g = launch_budget_ok("f6", 50, "lw-smoke-b", reserve=False)
-            run(21, "lw-smoke-a-1f2e3d-keeper", 0, 10.0, live=False)
+            run(21, "lw-smoke-a-keeper", 0, 10.0, live=False)
             c1, c2 = (launch_budget_ok("f6", x, "lw-smoke-b", reserve=False)[0] for x in (60, 61))
             ok(not g[0] and c1 and not c2,
                f"BR12d the reservation is held while any of its clusters runs and released once all are stopped: {g[1]}")
@@ -983,12 +987,39 @@ def _self_test() -> int:
             good = open(led).read()
             for label, doc in (("a non-list root", {"reservations": json.loads(good)}),
                                ("an entry without its cap", [{"scope": "f6", "name": "lw-smoke-x", "invocation": "i",
-                                                              "time": t}])):
+                                                              "time": t}]),
+                               ("a NaN time", [{"scope": "f6", "cap_usd": 80, "name": "lw-smoke-x", "invocation": "i",
+                                                "time": float("nan")}]),
+                               ("a time in the future", [{"scope": "f6", "cap_usd": 80, "name": "lw-smoke-x",
+                                                          "invocation": "i", "time": t + 86400}]),
+                               ("an infinite cap", [{"scope": "f6", "cap_usd": float("inf"), "name": "lw-smoke-x",
+                                                     "invocation": "i", "time": t}])):
                 json.dump(doc, open(led, "w"))
                 v = launch_budget_ok("f6", 1, "lw-smoke-y", reserve=False)
                 ok(not v[0] and "fail" in v[1] and refused(lambda: spend("f6")) is not None,
                    f"BR12f a malformed reservations ledger refuses ({label}): {v[1][:80]}")
             open(led, "w").write(good)
+            r2 = signed("k12h", usd=100.0)
+            src2 = _FakeSource([], {})
+            with_env(env(r2, source=src2))
+            launch_budget_ok("f6", 80, "lw-smoke-a")
+            launch_budget_ok("f6", 20, "lw-smoke-a2")
+            src2.items = [_item(30, "lw-smoke-a2", t + 10, "running", t + 20)]
+            src2.det = {30: _det(30, "lw-smoke-a2", t + 10, 0, 20.0, "running", insts=[(t + 10, None, "vmA")])}
+            h = launch_budget_ok("f6", 1, "lw-smoke-z", reserve=False)
+            ok(not h[0] and "reserved $80.00" in h[1],
+               f"BR12h a cluster counts only against the reservation of its exact name (lw-smoke-a2 is not lw-smoke-a's): "
+               f"{h[1]}")
+            r3 = signed("k12i", usd=100.0)
+            src3 = _FakeSource([_item(31, "lw-smoke-r", t - 60, "error", t - 50)],
+                               {31: _det(31, "lw-smoke-r", t - 60, 0, 0.0, "error", insts=[(t - 60, t - 50, "vmA")])})
+            with_env(env(r3, source=src3))
+            launch_budget_ok("f6", 80, "lw-smoke-r")
+            i2 = launch_budget_ok("f6", 80, "lw-smoke-b", reserve=False)
+            ok(not i2[0] and "reserved $80.00" in i2[1],
+               f"BR12i a retry's reservation is not released by the earlier, errored attempt's cluster of the same "
+               f"name: {i2[1]}")
+            with_env(env(r, source=src))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 code = main(["status"])
