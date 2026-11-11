@@ -5,6 +5,11 @@ lead signs the decision brief (--signoff lead), and --crash kills session 1.
 2) main.py on a tiny question, every agent on Haiku with a small turn cap,
    1 round, hard $8 budget: must reach the final gate AND produce report.md.
 Synchronous (short); the cluster shuts down at the end."""
+import os as _os  # noqa: E402 -- F6 budget: this archived launcher has no budget check
+if _os.environ.get("MA_ALLOW_EXPERIMENT_LAUNCHERS") != "1":
+    raise SystemExit("docs/experiments/launchers: archived launchers create paid Coiled clusters without the "
+                     "owner-signed budget check (cloud/budget.py); set MA_ALLOW_EXPERIMENT_LAUNCHERS=1 to run one "
+                     "deliberately")
 import io, json, os, sys, tarfile, time
 import coiled
 

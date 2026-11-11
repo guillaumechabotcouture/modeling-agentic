@@ -525,10 +525,27 @@ def pick_case_workers(cluster, client, want, n, log=print):
     return box[0], sorted(w)[:n]
 
 
+def budget_guard(cluster_name, cap_usd, log=print):
+    """Refuse (SystemExit) unless the owner-signed budget of the cluster name's scope covers its spend plus `cap_usd`,
+    and reserve the cap (cloud/budget.py, F6 Stage 2)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cloud"))
+    import budget
+    if cap_usd is None:
+        raise SystemExit("--cloud-cap-usd is required for --backend coiled: a launch states the most it may spend")
+    scope = budget.scope_for_name(cluster_name)
+    if not scope:
+        raise SystemExit(f"{cluster_name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    ok, why = budget.launch_budget_ok(scope, cap_usd, name=cluster_name, reserve=True)
+    if not ok:
+        raise SystemExit(f"{cluster_name}: the budget refuses this replay launch: {why}")
+    log(f"budget: {why}")
+
+
 def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_key, dry_agent=False,
-           workspace=WORKSPACE, log=print, openai_key=None, compute_workers=0):
+           workspace=WORKSPACE, log=print, openai_key=None, compute_workers=0, cloud_cap_usd=None):
     """compute_workers: extra workers that run no case, only compute-service
-    batches from cases whose variant sets `compute: true` (Phase 24)."""
+    batches from cases whose variant sets `compute: true` (Phase 24). cloud_cap_usd: the most the cluster may
+    spend; the owner-signed budget must cover it before any cluster is created, attached or grown."""
     import uuid
     from distributed import fire_and_forget
     store = {"account": os.environ.get("MA_STORAGE_ACCOUNT"),
@@ -542,6 +559,7 @@ def launch(cases, variants, repo, batch_dir, cluster_name, workers, anthropic_ke
     code, code_info = code_tarball(repo)
     vbundle = variants_bundle(variants)
     log(f"code {code_info} ({len(code) >> 20} MB); variants {len(vbundle) >> 10} KB; {len(cases)} cases on {n} workers")
+    budget_guard(cluster_name, cloud_cap_usd, log)
     cluster = create_or_attach(cluster_name, n + compute_workers, workspace)
     client = size_pool(cluster, cluster.get_client(), n + compute_workers, log)
     client.upload_file(os.path.abspath(__file__))
