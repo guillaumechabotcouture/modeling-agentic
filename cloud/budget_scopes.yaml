@@ -1,0 +1,6 @@
+# Budget scopes (cloud/budget.py). A scope's spend is every Coiled cluster in the IDM workspace created at or after
+# the budget's start whose name starts with one of its prefixes. `budget.py set` copies the prefixes and the floor
+# into the owner-signed record, so an edit here takes effect only at the owner's next `set`.
+floor_usd_per_instance_hour: 1.0   # the projection's lowest USD per live instance-hour (a measured median is used when higher)
+scopes:
+  f6: [v2-nigeria-gf13-, f6-refit-, f6-prep-, lw-smoke-]

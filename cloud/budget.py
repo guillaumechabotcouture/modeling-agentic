@@ -1,0 +1,618 @@
+"""Owner-signed cloud budget, measured spend, and the launch check (F6 Stage 2).
+
+Why. On 2026-11-11 an agent operating this repo spent $106 of the owner's $100 cloud budget: the budget, the
+dollar conversion and the spend checks lived in the agent's memory and judgment. Here they are code. The threat
+is the agent's mistakes and forgetfulness, not deliberate circumvention: a bypass needs an edit that shows in git
+(the tracked public key, this module, a launcher), and guarding against that is out of scope.
+
+The budget is a record signed with the owner's Ed25519 key. The private key lives in the macOS login keychain with
+an empty trusted-application list: `init-key` passes `add-generic-password ... -T "" -w <key>` to `security -i` on
+stdin, so the key never appears on a command line. Every read raises the keychain's password dialog; the owner
+clicks "Allow", never "Always Allow". The key is read only inside one signing call (`_sign`), which signs exactly
+the record the owner confirmed on the terminal (/dev/tty), never returns or stores the key, and zeroes the buffer
+it was read into. Residual: Python and `cryptography` make copies of the key while signing that cannot be zeroed,
+and they stay in that process's memory until it exits. The trust anchor is the tracked public key
+cloud/budget_owner.pub.
+
+    python3 cloud/budget.py init-key            # once, by the owner; then commit cloud/budget_owner.pub
+    python3 cloud/budget.py set --scope f6 --usd 200 --note "F6 refit + run" [--start <ISO UTC>] [--days 14]
+    python3 cloud/budget.py show [--scope f6]   # verify and print the signed record
+    python3 cloud/budget.py status [--scope f6] # budget, used (billed / estimated), reserved, remaining
+    python3 cloud/budget.py --self-test
+
+The record goes to ~/.config/modeling-agentic/budget_<scope>.json. It expires (default 14 days after it is issued,
+`--days` at most 60). A record issued before the newest one already seen for its scope is refused, and so is the
+same issued time with another nonce. The mark is ~/.config/modeling-agentic/budget_<scope>.seen, a local file:
+it catches an older record restored by mistake, but it is not tamper-proof.
+
+Spend. Every Coiled cluster in the IDM workspace whose name starts with one of the scope's prefixes
+(cloud/budget_scopes.yaml, copied into the signed record) and that ran inside the budget's window. Billed USD of a
+cluster = total_cost (Coiled credits) x 0.061 + cloud_total_cost (USD), from the raw cluster record (coiled
+1.135.6: CloudV2._get_cluster_details_synced, coiled/v2/core.py:976; the public coiled.cluster_details,
+core.py:994, drops the cost fields). A cluster's estimate is the sum over its instances, counted from instance
+states rather than the cluster's, of hours in the window x max(the scope's median USD per instance-hour over its
+last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A cluster counts
+max(billed, estimate); one created before the budget's start counts its estimate from the start only. These refuse:
+an unknown VM type, missing scheduler, worker or instance data, and a missing or negative cost. A budget whose
+start is in the future refuses launches.
+
+Reservations. `launch_budget_ok` holds an exclusive lock on a reservations file while it measures. When the launch
+fits, it records (scope, cap, name, invocation, time). Spend counts each open reservation until a cluster of that
+name appears, or for 2 h. This guards against concurrent launches from this machine only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from worker_side import WORKSPACE, state_of  # noqa: E402
+
+PUB_FILE = os.path.join(HERE, "budget_owner.pub")
+BUDGET_DIR = os.path.expanduser("~/.config/modeling-agentic")
+SCOPES_FILE = os.path.join(HERE, "budget_scopes.yaml")
+PRICES_FILE = os.path.join(HERE, "vm_prices.yaml")
+KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = "modeling-agentic-budget-owner", "owner"
+USD_PER_CREDIT = 0.061
+RATE_SAMPLE = 5                 # stopped clusters the measured rate is the median of
+RESERVATION_S = 2 * 3600        # a reservation lapses this long after it was made, if no cluster of its name appears
+MAX_DAYS = 60
+# VM types seen on our clusters' instance records (read-only check, 2026-11-11): every scheduler and keeper, the
+# P6 compute workers, and vm_job --cpu 32 / --cpu 64. vm_job sizes by --cpu, and Coiled picked Standard_D<cpu>_v5.
+OBSERVED_VM_TYPES = ("Standard_D2_v5", "Standard_E8s_v5", "Standard_D32_v5", "Standard_D64_v5")
+ENDED = ("stopped", "error")
+FIELDS = ("scope", "usd", "start_utc", "note", "issued_utc", "expires_utc", "nonce", "prefixes",
+          "floor_usd_per_instance_hour")
+
+
+class BudgetError(Exception):
+    """A budget that cannot be verified or measured: the caller refuses."""
+
+
+class Keychain:
+    """The only access to the owner's private key: a generic password in the login keychain, trusted by no
+    application (`-T ""`), so each read raises the keychain's password dialog."""
+
+    def __init__(self, run=subprocess.run):
+        self.run = run
+
+    def _who(self):
+        return ["-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT]
+
+    def exists(self) -> bool:     # attributes only: reads no secret, raises no dialog
+        return self.run(["security", "find-generic-password", *self._who()], capture_output=True).returncode == 0
+
+    def put(self, secret_hex: str) -> None:
+        line = " ".join(["add-generic-password", *self._who(), "-l", "modeling-agentic-budget-owner-key",
+                         "-T", '""', "-w", secret_hex]) + "\n"
+        r = self.run(["security", "-i"], input=line, capture_output=True, text=True)
+        err = (r.stderr or "").replace(secret_hex, "<key>").strip()
+        if r.returncode != 0 or err:      # -i may exit 0 after a failed command: its error text counts
+            raise BudgetError(f"keychain refused the key (security exit {r.returncode}): {err[:200]}")
+
+    def read_into(self) -> bytearray:
+        """The key's hex in a bytearray the caller zeroes (the prompted read)."""
+        r = self.run(["security", "find-generic-password", *self._who(), "-w"], capture_output=True)
+        if r.returncode != 0:
+            raise BudgetError(f"the keychain read was refused or failed (security exit {r.returncode})")
+        return bytearray(r.stdout.strip())
+
+
+class _Env:
+    """Where the budget lives and what reads Coiled. Production uses the defaults; only --self-test swaps it."""
+
+    def __init__(self, budget_dir=BUDGET_DIR, pub_file=PUB_FILE, store=None, source=None, clock=time.time,
+                 reservations=None, scopes=SCOPES_FILE, prices=PRICES_FILE, confirm=None):
+        self.budget_dir, self.pub_file, self.store, self.source, self.clock = budget_dir, pub_file, store, source, clock
+        self.reservations = reservations or os.path.join(budget_dir, "budget_reservations.json")
+        self.scopes, self.prices, self.confirm = scopes, prices, confirm or _confirm_on_tty
+
+    def path(self, name):
+        return os.path.join(self.budget_dir, name)
+
+    def keys(self):
+        return self.store or Keychain()
+
+    def coiled(self):
+        return self.source or CoiledSource()
+
+
+def _confirm_on_tty(rec) -> bool:
+    """The owner reads the record and types its amount on the terminal; with no terminal, nothing is signed."""
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(json.dumps(rec, indent=1) + f"\nType the amount in USD to sign this {rec['scope']} budget: ")
+            tty.flush()
+            return float(tty.readline().strip()) == float(rec["usd"])
+    except (OSError, ValueError):
+        return False
+
+
+_ENV = _Env()
+
+
+# ---- implementation --------------------------------------------------------------------------
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def init_key(env=None) -> str:
+    raise NotImplementedError
+
+
+def _sign(rec, store) -> dict:
+    raise NotImplementedError("read_into")
+
+
+def set_budget(scope, usd, note, start_utc=None, days=14, env=None) -> str:
+    raise NotImplementedError
+
+
+def load_budget(scope, env=None) -> dict:
+    raise NotImplementedError
+
+
+def scope_for_name(name, path=SCOPES_FILE):
+    raise NotImplementedError
+
+
+def load_prices(path=PRICES_FILE) -> dict:
+    raise NotImplementedError
+
+
+class CoiledSource:
+    def list_clusters(self) -> list:
+        raise NotImplementedError
+
+    def details(self, cid) -> dict:
+        raise NotImplementedError
+
+
+def spend(scope) -> dict:
+    raise NotImplementedError
+
+
+def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
+    raise NotImplementedError
+
+
+def job_meter(scope):
+    raise NotImplementedError
+
+
+def status_lines(s) -> list[str]:
+    raise NotImplementedError
+
+
+# ---- self-test -------------------------------------------------------------------------------
+
+class _FakeKeys:
+    def __init__(self, secret=None):
+        self.secret, self.reads, self.handed = secret, 0, []
+
+    def exists(self):
+        return self.secret is not None
+
+    def put(self, s):
+        self.secret = s
+
+    def read_into(self):
+        self.reads += 1
+        if self.secret is None:
+            raise BudgetError("no key")
+        b = bytearray(self.secret.encode())
+        self.handed.append(b)
+        return b
+
+
+class _FakeSource:
+    def __init__(self, items, details):
+        self.items, self.det, self.calls = items, details, []
+
+    def list_clusters(self):
+        self.calls.append("list")
+        return [dict(c) for c in self.items]
+
+    def details(self, cid):
+        self.calls.append(cid)
+        d = self.det[cid]
+        if isinstance(d, Exception):
+            raise d
+        return json.loads(json.dumps(d))
+
+
+def _det(cid, name, created, credits, cloud, state="stopped", insts=()):
+    """A raw cluster record; insts: (created, end or None while live, VM type); the first is the scheduler's."""
+    procs = [{"current_state": {"state": "stopped" if e else "started", "updated": _iso(e or c)},
+              "instance": {"created": _iso(c), "instance_type_id": vm,
+                           "current_state": {"state": "stopped" if e else "ready", "updated": _iso(e or c)}}}
+             for c, e, vm in insts]
+    return {"id": cid, "name": name, "created": _iso(created), "current_state": {"state": state},
+            "total_cost": credits, "cloud_total_cost": cloud, "scheduler": procs[0] if procs else None,
+            "workers": procs[1:]}
+
+
+def _item(cid, name, created, state="stopped", updated=None):
+    return {"id": cid, "name": name, "created": _iso(created),
+            "current_state": {"state": state, "updated": _iso(updated if updated is not None else created + 3 * 3600)}}
+
+
+def _self_test() -> int:
+    global _ENV
+    import contextlib
+    import inspect
+    import io
+    import tempfile
+    fails = []
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    def refused(fn):
+        try:
+            fn()
+        except BudgetError as e:
+            return str(e)
+        return None
+
+    real_env = _ENV
+    T0 = 1_762_819_200.0   # 2025-11-11T00:00:00Z
+    H = 3600
+    with tempfile.TemporaryDirectory() as d:
+        sc, pr = os.path.join(d, "scopes.yaml"), os.path.join(d, "prices.yaml")
+        open(sc, "w").write("floor_usd_per_instance_hour: 1.0\nscopes:\n  f6: [f6-refit-, lw-smoke-]\n  other: [ev-]\n")
+        open(pr, "w").write("margin: 1.0\ncredits_per_vcpu_hour: 0\ntypes:\n  vmA: {vcpu: 1, usd_per_hour: 2.0}\n"
+                            "  vmB: {vcpu: 1, usd_per_hour: 10.0}\n")
+        clock, stores = [T0 + 10 * H], {}
+
+        def env(root, store=None, source=None, confirm=lambda rec: True, pub=None):
+            return _Env(budget_dir=root, pub_file=pub or os.path.join(root, "owner.pub"), store=store or stores.get(root),
+                        source=source, clock=lambda: clock[0], scopes=sc, prices=pr, confirm=confirm)
+
+        def root(name):
+            p = os.path.join(d, name)
+            os.makedirs(p)
+            return p
+
+        def signed(name, usd=200.0, start=T0, days=14):
+            r = root(name)
+            stores[r] = _FakeKeys()
+            init_key(env(r))
+            set_budget("f6", usd, "test", _iso(start), days, env(r))
+            return r
+
+        def bk1():
+            r = root("k1")
+            st = stores[r] = _FakeKeys()
+            init_key(env(r))
+            ok(st.secret and len(open(os.path.join(r, "owner.pub")).read().strip()) == 64 and st.reads == 0,
+               "BK1 init-key puts the private key in the key store (no read) and writes the public key")
+            ok(refused(lambda: init_key(env(r))) is not None
+               and refused(lambda: init_key(env(r, store=_FakeKeys("ab"), pub=os.path.join(r, "p2")))) is not None,
+               "BK1b init-key refuses when the public key file or the keychain item already exists")
+        case("BK1", bk1)
+
+        def bk2():
+            import types
+            calls, inputs = [], []
+            secret = "cd" * 32
+
+            def run(argv, **kw):
+                calls.append(argv)
+                inputs.append(kw.get("input"))
+                hit = argv[1:2] != ["find-generic-password"] or "-w" in argv
+                return types.SimpleNamespace(returncode=0 if hit else 44, stdout=(secret + "\n").encode(), stderr="")
+            k = Keychain(run=run)
+            k.put(secret)
+            buf, ex = k.read_into(), k.exists()
+            line = str(inputs[0] or "")
+            toks = line.split()
+            ok(calls[0] == ["security", "-i"] and not any(secret in a for c in calls for a in c)
+               and toks[:1] == ["add-generic-password"] and secret in toks and toks[toks.index("-T") + 1] == '""'
+               and "-A" not in toks and "-U" not in toks and toks[toks.index("-s") + 1] == KEYCHAIN_SERVICE,
+               f"BK2 the key goes to `security -i` on stdin, never on a command line, with an empty trusted-application "
+               f"list (-T \"\"), never -A or -U: {line.replace(secret, '<key>')[:100]}")
+            ok(isinstance(buf, bytearray) and bytes(buf) == secret.encode() and "-w" in calls[1] and ex is False
+               and "-w" not in calls[2],
+               "BK2b the key is read with find-generic-password -w into a bytearray; exists reads no secret")
+            k2 = Keychain(run=lambda argv, **kw: types.SimpleNamespace(returncode=51, stdout=b"", stderr="denied"))
+            ok(refused(k2.read_into) is not None, "BK2c a refused or failed keychain read raises (no key, no signature)")
+        case("BK2", bk2)
+
+        def bk3():
+            r = root("k3")
+            st = stores[r] = _FakeKeys()
+            init_key(env(r))
+            ok(refused(lambda: set_budget("f6", 50, "x", None, 14, env(r, confirm=lambda rec: False))) is not None
+               and st.reads == 0 and not os.path.exists(os.path.join(r, "budget_f6.json")),
+               "BK3 set reads no key and signs nothing unless the owner confirms the record on the terminal")
+            shown = []
+            p = set_budget("f6", 50, "x", _iso(T0), 14, env(r, confirm=lambda rec: shown.append(dict(rec)) or True))
+            rec = load_budget("f6", env(r))
+            ok(st.reads == 1 and all(b == 0 for b in st.handed[0]) and st.secret not in open(p).read()
+               and rec == shown[0] and oct(os.stat(p).st_mode)[-3:] == "600",
+               "BK3b one keychain read signs exactly the record shown; the key buffer is zeroed and never written out")
+            ok("/dev/tty" in inspect.getsource(_confirm_on_tty) and "read_into" in inspect.getsource(_sign)
+               and "read_into" not in inspect.getsource(set_budget),
+               "BK3c the confirmation comes from the terminal; only _sign reads the key")
+        case("BK3", bk3)
+
+        def bk4():
+            r = signed("k4")
+            p = os.path.join(r, "budget_f6.json")
+            doc = json.load(open(p))
+            for label, mut in (("a raised usd", lambda x: x.__setitem__("usd", 1000)),
+                               ("a dropped prefix", lambda x: x["prefixes"].pop()),
+                               ("an added field", lambda x: x.__setitem__("x", 1))):
+                bad = json.loads(json.dumps(doc))
+                mut(bad["record"])
+                json.dump(bad, open(p, "w"))
+                ok(refused(lambda: load_budget("f6", env(r))) is not None, f"BK4 a changed record is refused: {label}")
+            json.dump(doc, open(p, "w"))
+            other = os.path.join(d, "other.pub")
+            init_key(env(root("k4o"), store=_FakeKeys(), pub=other))
+            ok(refused(lambda: load_budget("f6", env(r, pub=other))) is not None,
+               "BK4b a record signed by another key than the tracked public key's is refused")
+            ok(refused(lambda: load_budget("other", env(r))) is not None
+               and refused(lambda: load_budget("f6", env(r, pub=os.path.join(d, "none.pub")))) is not None
+               and refused(lambda: load_budget("../f6", env(r))) is not None,
+               "BK5 a missing budget file or public key, or a bad scope name, is refused")
+            open(p, "w").write("{not json")
+            ok(refused(lambda: load_budget("f6", env(r))) is not None, "BK5b an unparsable budget file is refused")
+            json.dump(doc, open(p, "w"))
+            clock[0] += 15 * 86400
+            ok(refused(lambda: load_budget("f6", env(r))) is not None, "BK5c an expired budget is refused")
+            clock[0] -= 15 * 86400
+            ok(refused(lambda: set_budget("f6", 5, "", None, 61, env(r))) is not None
+               and refused(lambda: set_budget("f6", 5, "", None, 0, env(r))) is not None,
+               "BK5d set refuses --days outside 1-60")
+        case("BK4-5", bk4)
+
+        def bk6():
+            r = signed("k6")
+            p, seen = os.path.join(r, "budget_f6.json"), os.path.join(r, "budget_f6.seen")
+            old = open(p).read()
+            ok(refused(lambda: set_budget("f6", 20, "same second", None, 14, env(r))) is not None,
+               "BK6 a second record issued in the same second is refused at signing")
+            clock[0] += 5
+            set_budget("f6", 20, "lower", None, 14, env(r))
+            ok(load_budget("f6", env(r))["usd"] == 20, "BK6b the newer record verifies")
+            clock[0] -= 5
+            open(p, "w").write(old)
+            ok(refused(lambda: load_budget("f6", env(r))) is not None,
+               "BK6c an older, higher record restored after a newer one was seen is refused (budget_<scope>.seen)")
+            json.dump({"issued_utc": json.loads(old)["record"]["issued_utc"], "nonce": "0" * 32}, open(seen, "w"))
+            ok(refused(lambda: load_budget("f6", env(r))) is not None,
+               "BK6d the same issued time with another nonce is refused")
+        case("BK6", bk6)
+
+        def bg7():
+            for fn in (launch_budget_ok, spend, job_meter):
+                ps = inspect.signature(fn).parameters
+                ok(not any(p.kind == p.VAR_KEYWORD for p in ps.values())
+                   and not {"budget", "source", "now", "pub_file", "budget_dir", "env"} & set(ps),
+                   f"BR7 {fn.__name__} takes no injection: {list(ps)}")
+            ok(list(inspect.signature(launch_budget_ok).parameters)[:3] == ["scope", "cap_usd", "name"]
+               and real_env.pub_file == PUB_FILE and real_env.budget_dir == BUDGET_DIR and real_env.store is None
+               and real_env.source is None,
+               "BR7b the production path verifies against the tracked public key and reads the real Coiled source")
+        case("BR7", bg7)
+
+        now = T0 + 10 * H
+        items = [_item(1, "f6-refit-a", T0 + 60), _item(2, "lw-smoke-b", T0 + 120, "running", now),
+                 _item(3, "f6-refit-old", T0 - 86400, updated=T0 - 86400 + 4 * H), _item(4, "ev-x", T0 + 60),
+                 _item(5, "xf6-refit-", T0 + 60), _item(6, "lw-smoke-err", T0 + 300, "error", T0 + 400),
+                 _item(7, "f6-refit-early", T0 - 2 * H, "running", now)]
+        dets = {1: _det(1, "f6-refit-a", T0 + 60, 100, 4.0, insts=[(T0 + 60, T0 + 2 * H + 60, "vmA")]),
+                2: _det(2, "lw-smoke-b", T0 + 120, 10, 1.0, state="running",
+                        insts=[(now - 3 * H, None, "vmA"), (now - H, None, "vmB"), (T0 + 120, T0 + 1200, "vmA")]),
+                3: _det(3, "f6-refit-old", T0 - 86400, 200, 12.0, insts=[(T0 - 86400, T0 - 86400 + 4 * H, "vmA")]),
+                6: _det(6, "lw-smoke-err", T0 + 300, 0, 0, state="error", insts=[(now - 2 * H, None, "vmA")]),
+                7: _det(7, "f6-refit-early", T0 - 2 * H, 500, 50.0, state="running", insts=[(T0 - 2 * H, None, "vmA")]),
+                4: ValueError("not this scope"), 5: ValueError("not this scope")}
+        # rate: cluster 1 $10.10 / 2 h = 5.05, cluster 3 $24.20 / 4 h = 6.05 -> median 5.55 (vmA's bound is 2.0,
+        # vmB's 10.0). 1: max(10.10, 2 x 5.55) = 11.10; 2: 3 x 5.55 + 1 x 10 + 0.3 x 5.55 = 28.315 (billed 1.61);
+        # 6: an errored cluster with a live VM, 2 x 5.55 = 11.10; 7: created before the start, 10 h from it x 5.55.
+        expect = 11.1 + 28.315 + 11.1 + 55.5
+        try:
+            r8 = signed("k8")
+        except Exception as e:  # noqa: BLE001 -- before the change the setup fails; the cases below report it
+            r8 = os.path.join(d, "k8")
+            ok(False, f"BR8 setup: {type(e).__name__}: {e}")
+
+        def with_env(e):
+            global _ENV
+            _ENV = e
+
+        def bg8():
+            with_env(env(r8, source=_FakeSource(items, dets)))
+            s = spend("f6")
+            by = {c["id"]: c for c in s["clusters"]}
+            ok(sorted(by) == [1, 2, 6, 7] and abs(by[1]["billed_usd"] - 10.1) < 1e-9 and abs(by[1]["usd"] - 11.1) < 1e-9
+               and abs(by[2]["usd"] - 28.315) < 1e-9 and abs(by[2]["billed_usd"] - 1.61) < 1e-9,
+               f"BR8 a cluster counts max(billed = credits x 0.061 + cloud USD, instance-hours x max(median, the VM "
+               f"type's bound)); other scopes and look-alike names are left out: {by}")
+            ok(by[6]["live_instances"] == 1 and abs(by[6]["usd"] - 11.1) < 1e-9,
+               f"BR8b an errored cluster with a live instance still counts: {by[6]}")
+            ok(abs(by[7]["usd"] - 55.5) < 1e-9 and by[7]["billed_usd"] == 0 and abs(s["used_usd"] - expect) < 1e-9,
+               f"BR8c a cluster created before the start and still running counts from the start: {by[7]}, "
+               f"used {s['used_usd']}")
+            for label, cid, mut in (("no scheduler key", 2, lambda x: x.pop("scheduler")),
+                                    ("a running process without instance data",
+                                     2, lambda x: x["workers"][0].__setitem__("instance", None)),
+                                    ("an unknown VM type", 2, lambda x: x["scheduler"]["instance"].__setitem__(
+                                        "instance_type_id", "vmZ")),
+                                    ("a negative cost", 1, lambda x: x.__setitem__("total_cost", -5)),
+                                    ("no cost on a stopped cluster", 1, lambda x: x.__setitem__("cloud_total_cost",
+                                                                                                None))):
+                bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+                mut(bad[str(cid)])
+                bad = {int(k): v for k, v in bad.items()}
+                bad[4] = bad[5] = ValueError("not this scope")
+                with_env(env(r8, source=_FakeSource(items, bad)))
+                ok(refused(lambda: spend("f6")) is not None
+                   and not launch_budget_ok("f6", 1, "lw-smoke-z")[0], f"BR9 {label} refuses")
+        case("BR8-9", bg8)
+
+        def bg10():
+            seen = {}
+
+            class CloudV2:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def _get_cluster_details_synced(self, cluster_id, workspace=None):
+                    seen["details"] = workspace
+                    return {"id": cluster_id}
+
+            def lc(workspace=None, max_pages=20, account=None, just_mine=False):
+                seen["list"], seen["pages"] = workspace, max_pages
+                return []
+            import types
+            from unittest import mock
+            core = types.SimpleNamespace(CloudV2=CloudV2)
+            with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(list_clusters=lc),
+                                               "coiled.v2": types.SimpleNamespace(core=core), "coiled.v2.core": core}):
+                CoiledSource().list_clusters()
+                CoiledSource().details(7)
+            ok(seen == {"list": WORKSPACE, "pages": None, "details": WORKSPACE} and WORKSPACE == "idm-coiled-idmad-r2",
+               f"BR10 every Coiled read names the IDM workspace (all listing pages): {seen}")
+        case("BR10", bg10)
+
+        def bg11():
+            r = signed("k11", usd=expect + 50)
+            with_env(env(r, source=_FakeSource(items, dets)))
+            ok(launch_budget_ok("f6", 50, "lw-smoke-x1", reserve=False)[0]
+               and not launch_budget_ok("f6", 50.01, "lw-smoke-x1", reserve=False)[0],
+               "BR11 ok exactly when used + reserved + cap <= budget")
+            bad = [launch_budget_ok("f6", c, "lw-smoke-x1")[0] for c in (0, -1, float("nan"), None, "x", True)]
+            ok(not any(bad) and not launch_budget_ok("f6", 1, "ev-z")[0] and not launch_budget_ok("f6", 1, "")[0],
+               f"BR11b a cap that is not a positive number, or a name outside the signed prefixes, is refused: {bad}")
+            r2 = signed("k11b", start=clock[0] + 86400)
+            with_env(env(r2, source=_FakeSource(items, dets)))
+            ok(not launch_budget_ok("f6", 1, "lw-smoke-x1")[0], "BR11c a budget that starts in the future refuses")
+            with_env(env(os.path.join(d, "none"), source=_FakeSource(items, dets)))
+            ok(not launch_budget_ok("f6", 1, "lw-smoke-x1")[0], "BR11d no signed budget, no launch")
+        case("BR11", bg11)
+
+        def bg12():
+            r = signed("k12", usd=expect + 60)
+            src = _FakeSource(items, dets)
+            with_env(env(r, source=src))
+            a = launch_budget_ok("f6", 50, "lw-smoke-new")
+            b = launch_budget_ok("f6", 50, "lw-smoke-two")
+            ok(a[0] and not b[0] and "reserved $50.00" in b[1],
+               f"BR12 a fitting launch reserves its cap, so a concurrent one sees it: {b[1]}")
+            src.items = items + [_item(9, "lw-smoke-new-abc123", clock[0], "running", clock[0])]
+            src.det = {**dets, 9: _det(9, "lw-smoke-new-abc123", clock[0], None, None, "running",
+                                            insts=[(clock[0], None, "vmA")])}
+            c = launch_budget_ok("f6", 50, "lw-smoke-two", reserve=False)
+            ok(c[0], f"BR12b once the reserved cluster is listed, its real spend counts instead of the cap: {c[1]}")
+            src.items, src.det = items, dets
+            launch_budget_ok("f6", 50, "lw-smoke-three")
+            clock[0] += RESERVATION_S + 1
+            e = launch_budget_ok("f6", 50, "lw-smoke-four", reserve=False)
+            clock[0] -= RESERVATION_S + 1
+            ok("reserved $0.00" in e[1], f"BR12c a reservation with no cluster lapses after 2 h: {e[1]}")
+        case("BR12", bg12)
+
+        def bg13():
+            with_env(env(r8, source=_FakeSource(items, dets)))
+            m = job_meter("f6")
+            ok(abs(m(2) - 28.315) < 1e-9 and abs(m(6) - 11.1) < 1e-9 and abs(m(1) - 11.1) < 1e-9,
+               "BR13 the job meter reads each cluster by id at the scope's rates")
+            txt = "\n".join(status_lines(spend("f6")))
+            ok("remaining" in txt and "200.00" in txt and "f6-refit-a" in txt, f"BR14 status prints the table: {txt}")
+            ok(scope_for_name("lw-smoke-gcc", sc) == "f6" and scope_for_name("ev-q", sc) == "other"
+               and scope_for_name("dev-vm", sc) is None, "BR15 a cluster name resolves to the scope of its prefix")
+            with_env(env(os.path.join(d, "none"), source=_FakeSource(items, dets)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["status", "--scope", "f6"])
+            ok(rc != 0 and "refus" in out.getvalue().lower(), f"BR16 status with no budget exits non-zero: {out.getvalue()}")
+            p = load_prices(PRICES_FILE)
+            ok(p and all(v > 0 for v in p.values()) and "Standard_D8s_v5" in p,
+               f"BR17 the tracked price table loads: {len(p)} VM types")
+        case("BR13-17", bg13)
+
+        def bg18():
+            prices, repo = load_prices(PRICES_FILE), os.path.dirname(HERE)
+            files = [os.path.join(HERE, f) for f in os.listdir(HERE) if f.endswith(".py")]
+            files += [os.path.join(HERE, "configs", f) for f in os.listdir(os.path.join(HERE, "configs"))
+                      if f.endswith(".py")]
+            named = set()
+            for f in files + [os.path.join(repo, "scripts", "compute.py")]:
+                named |= set(re.findall(r"Standard_[A-Za-z0-9]+_v[0-9]+", open(f).read()))
+            sized = {f"Standard_D{n}_v5" for n in (2, 4, 8, 16, 32, 48, 64, 96)}   # vm_job --cpu sizing
+            missing = sorted((named | sized | set(OBSERVED_VM_TYPES)) - set(prices))
+            ok(not missing and {"Standard_D8s_v5", "Standard_E8s_v5"} <= named,
+               f"BR18 every VM type the configs, launchers and vm_job sizing can request, and every type seen on our "
+               f"clusters, has a price bound ({len(named)} named in code): missing {missing}")
+        case("BR18", bg18)
+    _ENV = real_env
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--self-test"]:
+        import no_cloud
+        with no_cloud.refusing():
+            return _self_test()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init-key", help="once, by the owner: the key pair (private half into the login keychain)")
+    st = sub.add_parser("set", help="by the owner: confirm the record on the terminal, then the keychain asks for the password")
+    st.add_argument("--scope", required=True)
+    st.add_argument("--usd", type=float, required=True)
+    st.add_argument("--note", required=True)
+    st.add_argument("--start", default=None, help="ISO UTC time spend counts from (default: now)")
+    st.add_argument("--days", type=float, default=14, help=f"days until the budget expires (at most {MAX_DAYS})")
+    for nm in ("show", "status"):
+        sub.add_parser(nm).add_argument("--scope", default=None, help="default: every budget present")
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "init-key":
+            print(f"owner key created: private half in the login keychain, public half in {_ENV.pub_file} "
+                  f"({init_key()[:16]}...). Commit that file.")
+        elif a.cmd == "set":
+            print(f"signed: {set_budget(a.scope, a.usd, a.note, a.start, a.days)}")
+        else:
+            names = os.listdir(_ENV.budget_dir) if os.path.isdir(_ENV.budget_dir) else []
+            scopes = [a.scope] if a.scope else sorted(f[7:-5] for f in names
+                                                      if f.startswith("budget_") and f.endswith(".json"))
+            if not scopes:
+                raise BudgetError(f"no budget in {_ENV.budget_dir}")
+            for sc in scopes:
+                print(json.dumps(load_budget(sc), indent=1) if a.cmd == "show" else "\n".join(status_lines(spend(sc))))
+    except (BudgetError, OSError) as e:
+        print(f"refused: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
