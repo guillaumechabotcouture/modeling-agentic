@@ -31,7 +31,8 @@ MA_LAUNCH_INVOCATION set to a fresh token, then:
   3. A spend cap in dollars (--cap-usd, required; the config's cap_usd when it is lower). Every interval, the spend
      of this launch is cloud/budget.py's estimator summed over the cluster ids clusters.json records: per cluster the
      larger of billed (total_cost credits x $0.061 + cloud_total_cost) and its conservative per-instance estimate,
-     the same numbers the budget counts. A reading that fails is "unknown" and never a stop. At the cap it makes a
+     the same numbers the budget counts. A reading that fails is "unknown"; three in a row count as the cap (exit 11).
+     At the cap it makes a
      final checkpoint and one collect attempt
      bounded by --cap-collect-minutes (default 10), then stops every cluster of the launch by id: the one case where
      stopping without a confirmed collect is right. The cap and --max-hours are also checked between collect retries.
@@ -77,6 +78,8 @@ Exit codes:
   8 refused: a cluster of the config's names is live before the launch, or the listing could not be read
   9 refused: a v2 config without checkpoints (checkpoint_minutes 0 or over 30), outside a smoke
   10 refused by the budget (cloud/budget.py), or the budget check or its meter is unavailable
+  11 spend unreadable: 3 failed spend readings in a row count as the cap (final checkpoint, one collect, clusters
+     stopped by id); a single failure stops nothing
 """
 from __future__ import annotations
 
@@ -103,7 +106,8 @@ _NET = re.compile(r"gaierror|nodename nor servname|name resolution|Name or servi
                   r"Network is unreachable|RemoteDisconnected|CommClosedError|StreamClosedError|Max retries exceeded")
 
 
-EXIT_NO_CHECKPOINTS, EXIT_BUDGET = 9, 10
+EXIT_NO_CHECKPOINTS, EXIT_BUDGET, EXIT_UNREADABLE = 9, 10, 11
+UNREADABLE_READINGS = 3          # consecutive failed spend readings that count as the cap
 MAX_CHECKPOINT_MINUTES, SMOKE_HOURS = 30.0, 0.5
 
 # ---- decisions (pure) -----------------------------------------------------------------------
@@ -402,6 +406,8 @@ class Watch:
             usd = self.spend(rec) if rec else None          # every interval, whatever the listing did
             if usd is not None and usd >= self.cap:
                 return self.at_cap(rec)
+            if usd is None and getattr(self, "unreadable", 0) >= UNREADABLE_READINGS:
+                return self.at_cap(rec, unreadable=True)
             code, out = self.call(["status"])
             st = parse_status(out, self.cfg.labels) if code == 0 else None
             act = decide(st)
@@ -481,8 +487,11 @@ class Watch:
         try:
             parts = {role: float(self.meter(v["id"])) for role, v in recorded(rec).items()}
         except Exception as e:  # noqa: BLE001
-            self.log(f"spend: unknown ({type(e).__name__}: {str(e)[:120]})")
+            self.unreadable = getattr(self, "unreadable", 0) + 1
+            self.log(f"spend: unknown ({type(e).__name__}: {str(e)[:120]}); {self.unreadable} in a row, "
+                     f"{UNREADABLE_READINGS} count as the cap")
             return None
+        self.unreadable = 0
         total = round(sum(parts.values()), 2)
         self.log(f"spend: ${total:.2f} of cap ${self.cap:.2f} ("
                  + ", ".join(f"{r} ${u:.2f}" for r, u in sorted(parts.items())) + ")")
@@ -550,7 +559,12 @@ class Watch:
             self.collect_guard_code = self.leave(rec, EXIT_LIMIT)
         elif rec is not None:
             usd = self.spend(rec)
-            if usd is not None and usd >= self.cap:
+            if usd is None and getattr(self, "unreadable", 0) >= UNREADABLE_READINGS:
+                self.log(f"spend unreadable {self.unreadable} times in a row during the collect attempts: stopping by id")
+                if not self.stop_all(rec, "spend unreadable"):
+                    self.log("a cluster of this launch may still be live after the stop requests")
+                self.collect_guard_code = EXIT_UNREADABLE
+            elif usd is not None and usd >= self.cap:
                 self.log(f"spend cap ${self.cap:.2f} reached (${usd:.2f}) during the collect attempts: stopping by id")
                 if not self.stop_all(rec, f"spend cap ${self.cap:.2f}"):
                     self.log("a cluster of this launch may still be live after the stop requests")
@@ -569,16 +583,20 @@ class Watch:
         return (f"latest checkpoints: {', '.join(paths)}; fetch with `python cloud/run_cluster.py {self.cfg_path} "
                 "checkpoint`" if paths else "no launch id recorded: no checkpoint path")
 
-    def at_cap(self, rec) -> int:
-        self.log(f"spend cap ${self.cap:.2f} reached: a final checkpoint (at most {self.checkpoint_s} s), one collect "
+    def at_cap(self, rec, unreadable=False) -> int:
+        """At the cap, or (`unreadable`) after UNREADABLE_READINGS failed spend readings in a row, which count as the
+        cap (an unknown spend is never ignored for long): checkpoint, one collect, stop by id."""
+        why, code_ = ((f"spend unreadable {UNREADABLE_READINGS} times in a row", EXIT_UNREADABLE) if unreadable
+                      else (f"spend cap ${self.cap:.2f}", EXIT_CAP))
+        self.log(f"{why} reached: a final checkpoint (at most {self.checkpoint_s} s), one collect "
                  f"(at most {self.cap_collect_s} s), then stopping every cluster of this launch by id")
         where = self.final_checkpoint(rec)
         code, out = self.call(["collect", "--no-shutdown"], retries=1, timeout=self.cap_collect_s)
         self.log(f"collect exit {code}: {str(out).strip()[-300:]}; collected: {self.collected()}")
-        if not self.stop_all(rec, f"spend cap ${self.cap:.2f}"):
+        if not self.stop_all(rec, why):
             self.log("a cluster of this launch may still be live after the stop requests: check the listing")
-        self.log(f"exit {EXIT_CAP} (spend cap): {where}")
-        return EXIT_CAP
+        self.log(f"exit {code_} ({why}): {where}")
+        return code_
 
 
 # ---- self-test ------------------------------------------------------------------------------
@@ -826,10 +844,15 @@ def _self_test() -> int:
                                                          (1, "nodename nor servname provided"),
                                                          (0, status_text(cfg, {"A": "done", "B": "done"}))],
                                               "collect": [collected(cfg)]})))
-    case("LW6c", "the cluster listing raises a network error: no stop, no cap, the watch goes on",
+    case("LW6c", "the cluster listing raises a network error (spend still read): no stop, the watch goes on",
          lambda: (lambda r: r[0] == EXIT_LIMIT and stops(r[1]) == [])(
              scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError: EOF")]}, max_hours=1.0,
                       api=_Failing())))
+    case("LW6c2", "listing and spend both unreadable: exit 11 after three readings; nothing is stopped on a listing "
+                  "that cannot be read",
+         lambda: (lambda r: r[0] == EXIT_UNREADABLE and stops(r[1]) == [])(
+             scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError: EOF")]}, max_hours=1.0,
+                      api=_FailingAll())))
     case("LW6d", "collect fails with a network error, then succeeds: retried, exit 0",
          lambda: (lambda r: r[0] == EXIT_DONE and runs(r[1]).count("collect") == 2)(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "done", "B": "done"}))],
@@ -1248,6 +1271,8 @@ class _Failing(_FakeApi):
             return []
         raise OSError("Temporary failure in name resolution")
 
+
+class _FailingAll(_Failing):
     def usd_of(self, cid):
         raise OSError("Temporary failure in name resolution")
 
