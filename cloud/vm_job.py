@@ -1685,6 +1685,31 @@ def _self_test_run(ok, real_gate=None) -> None:
                    f"(the cap is read before a terminal state returns): {msg} readings={len(calls)}")
             case("RN29", rn29)
 
+            def rn29d():
+                calls = []
+
+                def third(cid):
+                    calls.append(cid)
+                    return 6.0 if len(calls) >= 3 else 1.0
+                W, msg, out, exc = world(d, "r29d", after_submit="empty", gate=lambda a, name, meter=False, m=third: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and "lost" in msg and len(calls) >= 3 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29d the third WorkerGone (lost) reads the cost first, and over the cap the cluster is stopped "
+                   f"under --keep-on-failure: {msg} readings={len(calls)}")
+                calls2 = []
+
+                def fails_last(cid):
+                    calls2.append(cid)
+                    if len(calls2) >= 2:
+                        raise RuntimeError("api")
+                    return 1.0
+                W, msg, out, exc = world(d, "r29e", job_rc=3, gate=lambda a, name, meter=False, m=fails_last: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and len(calls2) >= 2 and ("delete", 100) in W["events"] and W["stops"] >= 1,
+                   f"RN29e a terminal state whose cost cannot be read stops the cluster (no conclusive cap decision): "
+                   f"{msg} readings={len(calls2)}")
+            case("RN29d", rn29d)
+
             def rn30():
                 import budget
                 a = types.SimpleNamespace(cap_usd=5.0, budget_scope="f6")
@@ -1695,15 +1720,27 @@ def _self_test_run(ok, real_gate=None) -> None:
                 made = []
                 b = types.SimpleNamespace(name="vm3", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1,
                                           cap_usd=5.0, budget_scope="f6")
-                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (False, "over")), \
-                        mock.patch.dict(globals(), {"_budget_gate": real_gate}), \
-                        mock.patch.object(rc, "cluster_states", lambda n: made.append(n) or []):
-                    try:
-                        cmd_up(b)
-                        msg = None
-                    except SystemExit as e:
-                        msg = str(e)
-                ok(msg and "over" in msg and not made, f"RN30b `up` is refused before any cluster too: {msg}")
+                calls = []
+                lbo = lambda s_, c, name=None, reserve=True: (calls.append(reserve), (False, "over"))[1]  # noqa: E731
+                for states in ([], ["running"]):
+                    calls.clear(), made.clear()
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(
+                                Cluster=lambda **k: made.append(k))}), \
+                            mock.patch.dict(globals(), {"_budget_gate": real_gate}), \
+                            mock.patch.object(rc, "cluster_states", lambda n, s_=states: s_), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            cmd_up(b)
+                            msg = None
+                        except SystemExit as e:
+                            msg = str(e)
+                    if not states:
+                        ok(msg and "over" in msg and not made and calls == [True],
+                           f"RN30b `up` is refused before the constructor: {msg}")
+                    else:
+                        ok(msg is None and not made and calls == [],
+                           f"RN30d an `up` that finds the cluster already up reserves nothing: {msg} {calls}")
                 errs = []
                 with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
                         SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):

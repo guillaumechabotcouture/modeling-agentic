@@ -3562,7 +3562,8 @@ def _self_test_budget(ok) -> None:
         for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
             seen.clear(), started.clear()
             with mock.patch.object(budget, "launch_budget_ok", lbo), \
-                    mock.patch.dict(globals(), {"live_id": lambda n: 5, "start_helpers": lambda *a, **k: started.append(1),
+                    mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                                "start_helpers": lambda *a, **k: started.append(1),
                                                 "read_keys": lambda: started.append("keys"),
                                                 "_submit": lambda *a, **k: started.append("submit")}):
                 try:
@@ -3575,6 +3576,43 @@ def _self_test_budget(ok) -> None:
             ok(msg and "over" in msg and not started and seen == ([True] if label == "keeper" else [False]),
                f"BU5 `{label}` is refused before it creates or submits anything when the budget no longer covers "
                f"cap_usd: {msg} reserve={seen}")
+        seen.clear(), started.clear()
+        ids = {"overflow": 7, "keeper": 8}
+        with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.object(ws, "attach_existing", lambda *a: object()), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda c, cl, role, n: ids[role],
+                                            "confirm_keeper": lambda *a, **k: True, "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(cfg)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg is None and not seen and started == [{"keep_overflow": 7, "keep_keeper": True}],
+           f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
+    import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
+    ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
+    for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):
+        body = ast.parse(open(os.path.join(ld, f)).read()).body
+        i = 1 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            else 0
+        if i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
+            i += 1
+        guard = body[i:i + 2]
+        good = (len(guard) == 2 and isinstance(guard[0], ast.Import) and isinstance(guard[1], ast.If)
+                and "MA_ALLOW_EXPERIMENT_LAUNCHERS" in ast.unparse(guard[1].test)
+                and isinstance(guard[1].body[0], ast.Raise))
+        refused = False
+        if good:
+            mod = ast.Module(body=guard, type_ignores=[])
+            with mock.patch.dict(os.environ, {"MA_ALLOW_EXPERIMENT_LAUNCHERS": ""}):
+                try:
+                    exec(compile(mod, f, "exec"), {})   # noqa: S102 -- only the guard's two statements
+                except SystemExit:
+                    refused = True
+        ok(good and refused, f"BU6 docs/experiments/launchers/{f} refuses at import unless "
+                             f"MA_ALLOW_EXPERIMENT_LAUNCHERS=1 (its first statements are the guard)")
 
 
 def _self_test() -> int:
