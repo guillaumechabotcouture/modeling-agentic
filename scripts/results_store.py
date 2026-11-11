@@ -331,6 +331,40 @@ def _self_test() -> int:
             globals()["REDACT_MAX_MB"] = _max
         if "models/big.bin" not in sk or "report.md" not in sk or "_truth/answers.yaml" not in sk:
             fails.append(f"S9 write_archive leaves out large files holding a secret, and _truth/: {sk}")
+        # Codex round 1 P1-2: each file is opened once, without following links, and what is scanned is what is
+        # archived. The hook runs between the listing and the open, as a concurrent writer would.
+        os.remove(big)
+        swap = os.path.join(ar, "models", "swap.txt")
+        open(swap, "w").write("plain\n")
+        open(os.path.join(ar, "models", "late.txt"), "w").write("plain\n")
+
+        def race(rel):
+            if rel == "models/swap.txt":
+                os.remove(swap)
+                os.symlink(os.path.join(ar, "_truth", "answers.yaml"), swap)
+            if rel == "models/late.txt":
+                open(os.path.join(ar, "models", "late.txt"), "w").write("now sk-ant-SECRETSECRET123\n")
+        out = os.path.join(d, "r.tar.gz")
+        sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
+        tf = _tf.open(out, mode="r:gz")
+        late = tf.extractfile("run/models/late.txt").read()
+        if "run/models/swap.txt" in tf.getnames() or "models/swap.txt" not in sk:
+            fails.append(f"S10 a file swapped for a link to _truth/ after the listing is refused: {tf.getnames()} {sk}")
+        if b"SECRETSECRET" in late or b"<redacted>" not in late:
+            fails.append(f"S11 a file rewritten with a secret after the listing is archived redacted: {late!r}")
+        os.remove(swap)
+        globals()["REDACT_MAX_MB"] = 0
+        try:
+            sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        if "models/late.txt" not in sk:
+            fails.append(f"S12 a large file rewritten with a secret after the listing is left out: {sk}")
+        sv.store[("outputs", "ck/x")] = b"x"
+        sv.get_blob_client = lambda c, n: type("B", (), {"delete_blob": lambda _s: sv.store.pop((c, n))})()
+        delete("outputs/ck/x", service=sv)
+        if ("outputs", "ck/x") in sv.store:
+            fails.append("S13 delete removes a blob")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

@@ -3573,9 +3573,10 @@ def _self_test_collect_no_shutdown(ok) -> None:
 
 
 def _self_test_checkpoint(ok) -> None:
-    """CK1-CK12 (F6 run checkpoints, 2026-11-11: a 3-h preview stopped at its cap stored nothing). The agent VM
+    """CK1-CK20 (F6 run checkpoints, 2026-11-11: a 3-h preview stopped at its cap stored nothing). The agent VM
     uploads a checkpoint of the run dir every checkpoint_minutes while main.py runs; `checkpoint` fetches it,
-    sha256-verified; `collect` says when only a checkpoint exists. Fake store, fake main.py, no cloud."""
+    sha256-verified; `collect` says when only a checkpoint exists. CK13-CK20: Codex round 1 (generations, disk,
+    requests that never block a worker, ownership, one deadline). Fake store, fake main.py, no cloud."""
     import hashlib
     import tempfile
     import threading
@@ -3608,7 +3609,7 @@ def _self_test_checkpoint(ok) -> None:
         write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
 
         def __init__(self, fail=False, gate=None):
-            self.files, self.fail, self.gate, self.uploads = {}, fail, gate, []
+            self.files, self.fail, self.gate, self.uploads, self.downloads = {}, fail, gate, [], []
 
         def upload_file(self, path, blob, account=None):
             if self.gate is not None:
@@ -3620,9 +3621,13 @@ def _self_test_checkpoint(ok) -> None:
             return {"blob": blob, "bytes": len(self.files[blob])}
 
         def download(self, blob, path, account=None):
+            self.downloads.append(blob)
             if blob not in self.files:
                 raise FileNotFoundError(blob)
             open(path, "wb").write(self.files[blob])
+
+        def delete(self, blob, account=None):
+            self.files.pop(blob, None)
 
     secret = "sk-ant-TESTSECRET12345"
     main_py = ("import json, os, time\n"
@@ -3641,9 +3646,11 @@ def _self_test_checkpoint(ok) -> None:
         ti.size = len(main_py.encode())
         t.addfile(ti, _io.BytesIO(main_py.encode()))
     code = b.getvalue()
-    tar_blob, json_blob = ws.checkpoint_blobs("runs/t", "L1", "R1")
-    ok((tar_blob, json_blob) == ("outputs/runs/t/launch_L1/checkpoint_R1.tar.gz",
-                                 "outputs/runs/t/launch_L1/checkpoint_R1.json"), f"CK3 the blob names: {tar_blob}")
+    pointer = ws.checkpoint_pointer("runs/t", "L1", "R1")
+    gen = lambda n, lb="R1": ws.checkpoint_blobs("runs/t", "L1", lb, n)  # noqa: E731
+    ok(pointer == "outputs/runs/t/launch_L1/checkpoint_R1.json"
+       and gen(2) == ("outputs/runs/t/launch_L1/checkpoint_R1_g2.tar.gz", "outputs/runs/t/launch_L1/checkpoint_R1_g2.json"),
+       f"CK3 the blob names: a pointer, and immutable generations: {pointer} {gen(2)}")
 
     def run(store, interval_s=0.25):
         cps = []
@@ -3656,55 +3663,118 @@ def _self_test_checkpoint(ok) -> None:
         with mock.patch.object(ws, "WORK", work_root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
             res = ws.run_job_impl("R1", code, "q", [], "k", None, on_start=on_start)
         cps[0].stop()
+        cps[0].wait_idle(10)
         return res, cps[0]
     work_root = tempfile.mkdtemp()
     store = Store()
     res, c = run(store)
-    rec = json.loads(store.files.get(json_blob, b"{}"))
-    data = store.files.get(tar_blob, b"")
-    ok(res["exit_code"] == 0 and c.done >= 2 and store.uploads[:2] == [tar_blob, json_blob],
-       f"CK4 while main.py runs the thread uploads the tarball, then its record, every interval: done={c.done} "
-       f"{store.uploads[:4]}")
+    rec = json.loads(store.files.get(pointer, b"{}"))
+    n = rec.get("generation") or 0
+    data = store.files.get(gen(n)[0], b"")
+    ok(res["exit_code"] == 0 and c.done >= 2 and store.uploads[:3] == [gen(1)[0], gen(1)[1], pointer],
+       f"CK4 while main.py runs: each interval a new generation (tarball, record), then the pointer: done={c.done} "
+       f"{store.uploads[:3]}")
     ok(rec.get("sha256") == hashlib.sha256(data).hexdigest() and rec.get("bytes") == len(data)
        and rec.get("run_state") == {"state": "ANALYZE", "round": 2} and rec.get("cached_batches") == 1
-       and rec.get("cached_rows") == 1 and rec.get("run_dir") == "R_x" and rec.get("time_utc"),
-       f"CK5 the record: time, size, sha256, run_state state and round, cached batches: {rec}")
+       and rec.get("cached_rows") == 1 and rec.get("run_dir") == "R_x" and rec.get("time_utc")
+       and json.loads(store.files[gen(n)[1]]).get("sha256") == rec["sha256"],
+       f"CK5 the pointer names the latest generation; its record: time, size, sha256, state and round, batches: {rec}")
     with tarfile.open(fileobj=_io.BytesIO(data), mode="r:gz") as t:
         names = t.getnames()
         body = t.extractfile("runs/R_x/notes.md").read() if "runs/R_x/notes.md" in names else b""
     ok("runs/R_x/run_state.json" in names and "run.log" in names and not any("_truth" in n for n in names)
        and secret.encode() not in body and b"<redacted>" in body,
        f"CK6 the tarball holds the run dir and run.log, never _truth/, secrets redacted: {names}")
+    ckdir = os.path.join(work_root, "R1", ws.CKDIR)
+    ok(n >= 3 and gen(n - 2)[0] not in store.files and gen(n - 2)[1] not in store.files
+       and gen(n - 1)[0] in store.files and rec.get("previous") == n - 1,
+       f"CK13 (Codex P2-4) the last two generations are kept, older ones deleted: n={n} {sorted(store.files)}")
+    ok(not any(f.endswith((".tar.gz", ".tmp")) or f.startswith("copy") for f in os.listdir(ckdir)),
+       f"CK14 (Codex P2-5) the local archive is deleted after a successful upload: {os.listdir(ckdir)}")
     bad = Store(fail=True)
     res2, c2 = run(bad)
     ok(res2["exit_code"] == 0 and c2.failed >= 1 and c2.done == 0
-       and "storage unreachable" in open(os.path.join(work_root, "R1", ".checkpoint", "checkpoint.log")).read(),
+       and "storage unreachable" in open(os.path.join(ckdir, "checkpoint.log")).read(),
        f"CK7 an upload failure is logged and never kills the run: exit={res2['exit_code']} failed={c2.failed}")
-    gate = threading.Event()
-    slow = Store(gate=gate)
+    ok(not any(f.endswith((".tar.gz", ".tmp")) for f in os.listdir(ckdir)),
+       f"CK14b (Codex P2-5) a failed checkpoint leaves no partial or local archive: {os.listdir(ckdir)}")
     wd = os.path.join(work_root, "S")
     os.makedirs(os.path.join(wd, "runs", "R_y"))
     open(os.path.join(wd, "runs", "R_y", "a.txt"), "w").write("a")
+    full = Store()
+    c5 = ws.Checkpointer("S", wd, "runs/t", "L1", None, full, 3600, log=lambda m: None, free_bytes=lambda p: 2 * 2**30)
+    c5.trigger("t")
+    c5.wait_idle(10)
+    ok(c5.done == 0 and not full.uploads and "free space" in open(os.path.join(wd, ws.CKDIR, "checkpoint.log")).read()
+       and not any(f.endswith((".tar.gz", ".tmp")) for f in os.listdir(os.path.join(wd, ws.CKDIR))),
+       "CK14c (Codex P2-5) less free space than 1.5 x the run dir + 2 GB: the checkpoint is skipped, logged")
+    gate = threading.Event()
+    slow = Store(gate=gate)
     c3 = ws.Checkpointer("S", wd, "runs/t", "L1", None, slow, 3600, log=lambda m: None)
     first, second = c3.trigger("t1"), c3.trigger("t2")
     gate.set()
     c3.wait_idle(10)
     ok(first and not second and c3.skipped == 1 and c3.done == 1,
        f"CK8 a checkpoint while the previous upload runs is skipped: {first} {second} skipped={c3.skipped}")
-    # checkpoint-now: the side function asks the running thread for one checkpoint and waits, bounded
-    c4 = ws.Checkpointer("S", wd, "runs/t", "L1", None, Store(), 3600, poll_s=0.05, log=lambda m: None)
-    with mock.patch.object(ws, "WORK", work_root):
-        none = ws.checkpoint_now_side("S", timeout_s=1, poll_s=0.05)
-        c4.start()
-        try:
-            open(os.path.join(wd, "run.log"), "w").write("x")
-            now_ = ws.checkpoint_now_side("S", timeout_s=10, poll_s=0.05)
-        finally:
-            c4.stop()
-    ok(none.get("state") == "no checkpointer" and now_.get("state") == "checkpointed"
-       and (now_.get("record") or {}).get("blob") == ws.checkpoint_blobs("runs/t", "L1", "S")[0],
-       f"CK9 checkpoint-now: one checkpoint from the running thread, awaited; none without one: {none} {now_}")
-    # fetch on the laptop: sha256 verified, extracted under <out_dir>/<label>/checkpoint/
+    # checkpoint-now: the side function only files a request and returns; it never sleeps on the worker
+    import time as _time
+
+    def no_sleep(*a):
+        raise AssertionError("checkpoint_now_side slept on the worker")
+    with mock.patch.object(ws, "WORK", work_root), mock.patch.object(_time, "sleep", no_sleep):
+        none = ws.checkpoint_now_side("S")
+        open(os.path.join(wd, ws.CKDIR, "active"), "w").write("1")
+        t0 = _time.time()
+        req = ws.checkpoint_now_side("S")
+        dt_ = _time.time() - t0
+    ok(none.get("state") == "no checkpointer" and req.get("state") == "requested" and req.get("token")
+       and isinstance(req.get("epoch"), float) and dt_ < 0.5
+       and os.path.exists(os.path.join(wd, ws.CKDIR, f"request_{req['token']}")),
+       f"CK15 (Codex P1-3) checkpoint-now's side call files a request and returns at once: {none} {req} {dt_:.3f}s")
+    # a request filed while an upload is busy stays pending; only a checkpoint started after it satisfies it
+    gate2 = threading.Event()
+    busy = Store(gate=gate2)
+    for f in os.listdir(os.path.join(wd, ws.CKDIR)):
+        if f.startswith("request_"):
+            os.remove(os.path.join(wd, ws.CKDIR, f))
+    c6 = ws.Checkpointer("S", wd, "runs/t", "L1", None, busy, 3600, poll_s=0.05, log=lambda m: None)
+    c6.start()
+    try:
+        c6.trigger("interval")
+        with mock.patch.object(ws, "WORK", work_root):
+            req = ws.checkpoint_now_side("S")
+        _time.sleep(0.4)
+        gate2.set()
+        for _ in range(100):
+            if c6.done >= 2:
+                break
+            _time.sleep(0.05)
+    finally:
+        c6.stop()
+        c6.wait_idle(10)
+    g1, g2 = (json.loads(busy.files.get(ws.checkpoint_blobs("runs/t", "L1", "S", k)[1], b"{}")) for k in (1, 2))
+    ok(req["token"] not in (g1.get("requests") or []) and req["token"] in (g2.get("requests") or [])
+       and g2.get("started_epoch", 0) >= req["epoch"],
+       f"CK16 (Codex P2-7) a request made during a busy upload is met only by a checkpoint started after it: "
+       f"{g1.get('requests')} {g2.get('requests')}")
+    # the record's state and counts come from the archived files, not the live run dir
+
+    class Crafted(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=()):
+            with tarfile.open(out_path, mode="w:gz") as t:
+                for name, txt in ((f"{arcname}/run_state.json", '{"state": "WRITE", "round": 3}'),
+                                  (f"{arcname}/analysis/batch/r.jsonl", '{"ok": true}\n{"ok": true}\n'),
+                                  (f"{arcname}/analysis/batch/r.jsonl.summary.json", "{}")):
+                    ti = tarfile.TarInfo(name)
+                    ti.size = len(txt)
+                    t.addfile(ti, _io.BytesIO(txt.encode()))
+            return []
+    r17 = ws.build_checkpoint(wd, os.path.join(wd, "runs", "R_y"), os.path.join(wd, "x.tar.gz"), Crafted())
+    ok(r17.get("run_state") == {"state": "WRITE", "round": 3} and r17.get("cached_batches") == 1
+       and r17.get("cached_rows") == 2,
+       f"CK17 (Codex P1-1) the record's state and counts are read from the archive, not the live dir: {r17}")
+    # fetch on the laptop: through the pointer, sha256 verified, extracted under <out_dir>/<label>/checkpoint/
     out = tempfile.mkdtemp()
     cfg = RunConfig(name="t", question_file="q", out_dir=out, labels=("R1",))
     json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
@@ -3713,19 +3783,28 @@ def _self_test_checkpoint(ok) -> None:
     dest = os.path.join(out, "R1", "checkpoint")
     ok(got.get("sha256") == rec["sha256"] and os.path.exists(os.path.join(dest, "runs", "R_x", "run_state.json"))
        and json.load(open(os.path.join(dest, "checkpoint.json"))).get("sha256") == rec["sha256"],
-       f"CK10 `checkpoint` downloads, verifies and extracts the latest checkpoint with its record: {got}")
-    store.files[tar_blob] = data + b"tampered"
+       f"CK10 `checkpoint` reads the pointer, downloads, verifies and extracts the latest generation: {got}")
+    store.files[gen(n)[0]] = data + b"tampered"
+    out3 = tempfile.mkdtemp()
+    cfg3 = RunConfig(name="t", question_file="q", out_dir=out3, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg3.state_file, "w"))
+    with contextlib.redirect_stdout(io.StringIO()) as buf3:
+        got3 = fetch_checkpoint(cfg3, store, "R1")
+    ok(got3.get("generation") == n - 1 and "previous" in buf3.getvalue()
+       and os.path.exists(os.path.join(out3, "R1", "checkpoint", "runs", "R_x", "run_state.json")),
+       f"CK18 (Codex P2-4) a latest generation that does not verify: the previous complete one is fetched: {got3}")
+    store.files[gen(n - 1)[0]] = b"tampered too"
     out2 = tempfile.mkdtemp()
     cfg2 = RunConfig(name="t", question_file="q", out_dir=out2, labels=("R1",))
     json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg2.state_file, "w"))
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             fetch_checkpoint(cfg2, store, "R1")
-        ok(False, "CK11 a tarball whose sha256 differs from its record is refused")
+        ok(False, "CK11 no generation whose tarball matches its record: refused")
     except SystemExit as e:
         ok("sha256" in str(e) and not os.path.exists(os.path.join(out2, "R1", "checkpoint")),
-           f"CK11 a tarball whose sha256 differs from its record is refused, nothing extracted: {e}")
-    store.files[tar_blob] = data
+           f"CK11 no generation whose tarball matches its record: refused, nothing extracted: {e}")
+    store.files[gen(n)[0]] = data
     with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: False,
                                      "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("x")),
                                      "checkpoint_record": lambda c, s, lb, lid: rec}), \
@@ -3734,7 +3813,50 @@ def _self_test_checkpoint(ok) -> None:
     ok("only a checkpoint" in buf.getvalue() and "checkpoint --label R1" in buf.getvalue(),
        f"CK12 `collect` reports a run with only a checkpoint (no final result): {buf.getvalue()!r}")
     ok(checkpoint_record(cfg2, store, "R1", "L1") == rec and checkpoint_record(cfg2, store, "R1", "L9") is None,
-       "CK12b the checkpoint record of a launch, None when there is none")
+       "CK12b the checkpoint record of a launch (its pointer), None when there is none")
+    # checkpoint-now on the laptop: the recorded run cluster by id, this launch only; all labels, one deadline
+    out4 = tempfile.mkdtemp()
+    cfg4 = RunConfig(name="t", question_file="q", out_dir=out4, labels=("A", "B"))
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in "AB"}, open(cfg4.state_file, "w"))
+    json.dump({"run": {"name": "t", "id": 77}, "launch_id": "L1", "invocation": "tok"}, open(cfg4.clusters_file, "w"))
+    log4, clock = [], [1000.0]
+
+    class Client:
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            log4.append(("run", fn.__name__, a[0]))
+            return {workers[0]: {"state": "requested", "token": f"T{a[0]}", "epoch": 500.0}}
+    st4 = Store()
+    st4.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "A")] = json.dumps(
+        {"generation": 4, "requests": ["TA"], "started_epoch": 501.0}).encode()
+    st4.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "B")] = json.dumps(
+        {"generation": 2, "requests": [], "started_epoch": 400.0}).encode()
+
+    def sleep4(s):
+        log4.append(("sleep", s))
+        clock[0] += s
+
+    def cnow(**kw):
+        with mock.patch.dict(globals(), {"attach": lambda *a: (_ for _ in ()).throw(AssertionError("attach by name"))}), \
+                contextlib.redirect_stdout(io.StringIO()) as b4:
+            try:
+                rc_ = checkpoint_now(cfg4, **{"timeout_s": 60, "store": st4, "sleep": sleep4, "clock": lambda: clock[0],
+                                              "connect": lambda c, cid: log4.append(("connect", cid)) or Client(),
+                                              "poll_s": 10, **kw})
+            except SystemExit as e:
+                rc_ = f"refused: {e}"
+        return rc_, b4.getvalue()
+    for kw, why in (({"invocation": "other"}, "another invocation's clusters.json"),
+                    ({"launch_id": "L0"}, "another launch id")):
+        r19, _ = cnow(**kw)
+        ok(isinstance(r19, str) and "refused" in r19 and not any(e[0] == "run" for e in log4),
+           f"CK19 (Codex P2-6) checkpoint-now refuses {why}, sends nothing: {r19}")
+    r20, out20 = cnow(invocation="tok", launch_id="L1")
+    runs_ = [i for i, e in enumerate(log4) if e[0] == "run"]
+    sleeps = [i for i, e in enumerate(log4) if e[0] == "sleep"]
+    ok(("connect", 77) in log4 and len(runs_) == 2 and max(runs_) < min(sleeps) and r20 == 1
+       and clock[0] - 1000.0 <= 60 + 10 and "A: checkpointed" in out20 and "B: timeout" in out20,
+       f"CK20 (Codex P1-3, P2-6, P2-8) by recorded id; every label requested first, then storage polled for the "
+       f"token under one deadline: rc={r20} elapsed={clock[0] - 1000.0} {out20!r}")
 
 
 def _self_test() -> int:

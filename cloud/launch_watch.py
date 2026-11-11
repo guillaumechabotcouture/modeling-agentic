@@ -990,7 +990,7 @@ def _self_test() -> int:
 
     # F6 run checkpoints (2026-11-11: the preview stopped at its cap after 3 h with nothing stored)
     running = lambda cfg: {"status": [(0, status_text(cfg, {"A": "running", "B": "running"}))]}  # noqa: E731
-    ck_path = "outputs/runs/cfg-x/launch_L1/checkpoint_A.tar.gz"
+    ck_path = "outputs/runs/cfg-x/launch_L1/checkpoint_A.json"     # the pointer to the latest generation
     case("LW19a", "at the cap: one final checkpoint is requested and awaited before any stop; the exit names it",
          lambda: (lambda r: r[0] == EXIT_CAP and "checkpoint-now" in runs(r[1]) and stops(r[1])
                   and r[1].index(("run", "checkpoint-now")) < r[1].index(("stop", min(stops(r[1]))))
@@ -1003,6 +1003,11 @@ def _self_test() -> int:
          lambda: (lambda r: ["checkpoint-now", "--timeout-s", "120"] in r[3].tails
                   and ("checkpoint-now", 180.0) in r[3].timeouts)(
              scenario(0, record, running, api=_Billed(700.0), checkpoint_s=120.0)))
+    case("LW24", "(Codex P2-6) the final checkpoint names this watch's invocation and launch; the exit names the "
+                 "pointer",
+         lambda: (lambda r: ["checkpoint-now", "--timeout-s", "300", "--invocation", TOKEN, "--launch-id", "L1"]
+                  in r[3].tails and any("outputs/runs/cfg-x/launch_L1/checkpoint_A.json" in ln for ln in r[4].lines))(
+             scenario(0, record, running, api=_Billed(700.0))))
     case("LW19d", "a failed or timed-out final checkpoint never blocks the stop at the cap",
          lambda: (lambda r: r[0] == EXIT_CAP and sorted(stops(r[1])) == [100, 101, 102])(
              scenario(0, record, lambda cfg: {**running(cfg), "checkpoint-now": [(None, "TimeoutError")]},

@@ -3575,6 +3575,49 @@ def _self_test_checkpoint_restore(ok) -> None:
         ok(s2.get("computed") == 2 and s2.get("reused") == 2,
            f"CP3 an interrupted batch restored from a checkpoint keeps its journal's rows: {s2.get('computed')} "
            f"computed, {s2.get('reused')} reused")
+        # Codex round 1 P1-1: a torn snapshot (results file of one write, summary of another) is not trusted
+        d2 = os.path.join(bd2, "done.jsonl")
+        summ = json.load(open(d2 + ".summary.json"))
+        ok(summ.get("out_sha256") == results_store.sha256_file(d2),
+           f"CP5 a batch's summary records the sha256 of its results file: {summ.get('out_sha256')}")
+        old_rows = open(d2).read()
+        run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(5)], d2, backend="local", max_workers=1, ledger=False)
+        open(d2, "w").write(old_rows)                  # results A (3 rows) beside summary B (5 rows)
+        import contextlib as _cl
+        import io as _io
+        with _cl.redirect_stderr(_io.StringIO()) as err:
+            _, s5 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s5.get("computed") == 3 and "sha256" in err.getvalue(),
+           f"CP5b results A with summary B: the rows are not reused, the batch recomputes, logged: "
+           f"{s5.get('computed')} computed {err.getvalue()[-160:]!r}")
+        summ = json.load(open(d2 + ".summary.json"))
+        summ.pop("out_sha256", None)
+        json.dump(summ, open(d2 + ".summary.json", "w"))
+        _, s6 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s6.get("computed") == 0, f"CP6 a summary from before the sha256 (no torn snapshot possible) still reuses "
+                                    f"when its row count matches: {s6.get('computed')} computed")
+        # the hop through the launch tree: committed with `add -f`, shipped by archive, extracted on the VM
+        import shutil as _sh
+        import subprocess as _sp
+        vc = _sh.which("git")
+        if vc:
+            tree, ship = os.path.join(td, "tree"), os.path.join(td, "ship")
+            os.makedirs(tree)
+            _sh.copytree(rd2, os.path.join(tree, "runs", "R_cp"))
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@x"}
+            for a in (["init", "-q"], ["add", "-f", "runs"], ["commit", "-q", "-m", "r"]):
+                _sp.run([vc, "-C", tree, *a], check=True, env=env, capture_output=True)
+            blob = _sp.run([vc, "-C", tree, "archive", "--format=tar.gz", "HEAD"], check=True,
+                           capture_output=True).stdout
+            with _tf.open(fileobj=_io.BytesIO(blob), mode="r:gz") as t:
+                t.extractall(ship, filter="data")
+            rd3 = os.path.join(ship, "runs", "R_cp")
+            _, s4 = run_map(rd3, "models/fn.py::f", inputs, os.path.join(rd3, "analysis", "batch", "done.jsonl"),
+                            backend="local", max_workers=1, ledger=False)
+            ok(s4.get("computed") == 0 and s4.get("reused") == 3,
+               f"CP4 after the launch-tree hop (committed, archived, extracted) the rows are reused: "
+               f"{s4.get('computed')} computed")
 
 
 def _self_test_signoff_reuse(ok) -> None:
