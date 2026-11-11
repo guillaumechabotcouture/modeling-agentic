@@ -1,13 +1,13 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.14'
-  code_sha256: 58bc770fdecf72b6f8835ee1a4b07b410f5a2e5f1e7b2843cebf93f866fa3324
-  params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
+  version: '0.16'
+  code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
+  params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
   config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 engine: toolkit.engines.malaria.engine:MalariaEngine
-engine_version: '0.14'
-fitted_at: '2026-11-05 17:51:22'
+engine_version: '0.16'
+fitted_at: '2026-11-11 05:16:56'
 seeds:
 - 11
 - 12
@@ -18,12 +18,19 @@ seeds:
 - 17
 - 18
 n_sims: 1748
-wall_s: 4037.9
+wall_s: 1774.1
+band_declarations:
+  B10: aed4319d37415d33af2028be21710a55d213fa8e90f12504c2812e291a02ef77
+  B11: 7bbe4f331dd56dcb61f0aaf2031f1744624e496aed39a1c2ced5c530c2b4e351
+  B12: 9894dcae933cb233230fb10a3e5efa1b9655d5fcce3e8d056cf74641f15023a8
+  B12b: 47ebb01b28033fbc3efd1111f1ae3ef57a1875159502a48abe81ba440f206df2
+  B12m: 16cbd951d1b5cb7a1f81394a487324530fcf50d5b4a637f23a0fd06ff1e90442
+  fit_rule: 948d4ab12ee14bdcacc5db79bb63b8ec97a990d8891c28e3fce61570a4d0627b
 parameters:
   cfp_kill:
-    value: 0.405
-    lo: 0.405
-    hi: 0.545
+    value: 0.485
+    lo: 0.465
+    hi: 0.585
     box:
     - 0.0
     - 0.8
@@ -34,9 +41,9 @@ parameters:
     - B12b
     - B12m
   irs_kill:
-    value: 0.433438
-    lo: 0.3087
-    hi: 0.5641
+    value: 0.45125
+    lo: 0.38
+    hi: 0.45125
     box:
     - 0.0
     - 0.95
@@ -75,57 +82,57 @@ feasibility:
   feasibility_verified: true
 surrogate:
   B10:
-    loo_rmse_log: 0.0174
+    loo_rmse_log: 0.019
   B11:
-    loo_rmse_log: 0.0188
+    loo_rmse_log: 0.0171
   B12:
-    loo_rmse_log: 0.0098
+    loo_rmse_log: 0.0094
   B12b:
-    loo_rmse_log: 0.0089
+    loo_rmse_log: 0.0092
   B12m:
-    loo_rmse_log: 0.0139
+    loo_rmse_log: 0.0165
 calibration:
   at_box_centre:
-    benin: 15.4021
-    irs_added: 37.5908
-    misungwi: 11.898
-    muleba: 115.874
+    benin: 10.5447
+    irs_added: 22.6785
+    misungwi: 10.9285
+    muleba: 64.9967
   at_fitted_value:
-    benin: 15.4021
-    irs_added: 37.5908
-    misungwi: 11.898
-    muleba: 115.874
+    benin: 10.5447
+    irs_added: 22.6785
+    misungwi: 10.9285
+    muleba: 64.9967
 verification:
   B10:
-    computed: 0.6671
-    predicted: 0.6691
+    computed: 0.6477
+    predicted: 0.6562
     in_band: true
-    seed_min: 0.6208
-    seed_max: 0.7229
+    seed_min: 0.5438
+    seed_max: 0.7205
   B11:
-    computed: 0.4979
-    predicted: 0.4944
+    computed: 0.4865
+    predicted: 0.4902
     in_band: true
-    seed_min: 0.4527
-    seed_max: 0.5526
+    seed_min: 0.4565
+    seed_max: 0.5282
   B12:
-    computed: 0.8037
-    predicted: 0.8086
+    computed: 0.8296
+    predicted: 0.8262
     in_band: true
-    seed_min: 0.77
-    seed_max: 0.8295
+    seed_min: 0.7698
+    seed_max: 0.8818
   B12b:
-    computed: 0.5794
-    predicted: 0.5803
+    computed: 0.618
+    predicted: 0.6137
     in_band: true
-    seed_min: 0.5548
-    seed_max: 0.6275
+    seed_min: 0.6062
+    seed_max: 0.6339
   B12m:
-    computed: 0.451
-    predicted: 0.4405
+    computed: 0.4891
+    predicted: 0.4907
     in_band: true
-    seed_min: 0.4112
-    seed_max: 0.4717
+    seed_min: 0.4315
+    seed_max: 0.5425
 design:
   x:
   - cfp_kill: 0.250152
@@ -180,367 +187,132 @@ design:
     irs_kill: 0.475
   computed:
     B10:
-    - 0.7902
-    - 0.5393
-    - 0.8551
-    - 0.919
-    - 0.7437
-    - 0.8745
-    - 0.4337
-    - 0.9855
-    - 0.419
-    - 0.4908
-    - 0.7215
-    - 0.9575
-    - 0.9548
-    - 0.6809
-    - 0.5776
-    - 0.6882
-    - 0.4387
-    - 0.7538
-    - 0.6297
-    - 0.5726
-    - 0.8229
-    - 0.6081
-    - 0.5136
-    - 0.4632
-    - 0.6769
+    - 0.8239
+    - 0.5743
+    - 0.8582
+    - 0.9134
+    - 0.7697
+    - 0.8685
+    - 0.4869
+    - 0.9771
+    - 0.4983
+    - 0.5647
+    - 0.7472
+    - 0.9415
+    - 0.9157
+    - 0.7122
+    - 0.6358
+    - 0.6991
+    - 0.5191
+    - 0.7933
+    - 0.6752
+    - 0.6384
+    - 0.844
+    - 0.6576
+    - 0.5811
+    - 0.5417
+    - 0.7206
     B11:
-    - 0.6582
-    - 0.3554
-    - 0.7414
-    - 0.84
-    - 0.5727
-    - 0.7632
-    - 0.255
-    - 0.9728
-    - 0.239
+    - 0.6949
+    - 0.4117
+    - 0.7818
+    - 0.8679
+    - 0.6202
+    - 0.8012
+    - 0.3282
+    - 0.9708
     - 0.3095
-    - 0.5651
-    - 0.909
-    - 0.8738
-    - 0.4973
-    - 0.3969
-    - 0.4971
-    - 0.2689
-    - 0.5856
-    - 0.466
-    - 0.4056
-    - 0.6981
-    - 0.4263
-    - 0.3314
-    - 0.2952
-    - 0.4931
+    - 0.3849
+    - 0.6266
+    - 0.9251
+    - 0.9121
+    - 0.5616
+    - 0.4622
+    - 0.5534
+    - 0.3382
+    - 0.6583
+    - 0.5175
+    - 0.4433
+    - 0.7547
+    - 0.478
+    - 0.4086
+    - 0.3669
+    - 0.5557
     B12:
-    - 0.6198
-    - 0.6438
-    - 0.8398
-    - 0.8794
-    - 0.7992
-    - 0.9898
-    - 0.9385
-    - 0.911
-    - 0.621
-    - 0.7225
-    - 0.6966
-    - 0.7561
-    - 0.7487
-    - 0.7411
-    - 0.791
-    - 0.815
-    - 0.684
-    - 0.9768
-    - 0.8212
-    - 0.9349
-    - 0.8629
-    - 0.6439
-    - 0.7173
-    - 0.8958
-    - 0.7975
+    - 0.6678
+    - 0.7002
+    - 0.8739
+    - 0.9029
+    - 0.8276
+    - 1.0119
+    - 0.9666
+    - 0.9376
+    - 0.6724
+    - 0.7353
+    - 0.7221
+    - 0.7853
+    - 0.7741
+    - 0.7792
+    - 0.8096
+    - 0.8445
+    - 0.7153
+    - 0.9971
+    - 0.8563
+    - 0.9504
+    - 0.8906
+    - 0.6749
+    - 0.7568
+    - 0.9142
+    - 0.8216
     B12b:
-    - 0.3051
-    - 0.3508
-    - 0.6463
-    - 0.7257
-    - 0.5837
-    - 0.9467
-    - 0.8698
-    - 0.8019
-    - 0.3187
-    - 0.4194
-    - 0.4021
-    - 0.4925
-    - 0.4884
-    - 0.4638
-    - 0.538
-    - 0.6028
-    - 0.3801
-    - 0.929
-    - 0.6097
-    - 0.8232
-    - 0.688
-    - 0.3297
-    - 0.4469
-    - 0.78
-    - 0.553
+    - 0.3531
+    - 0.4019
+    - 0.6903
+    - 0.7553
+    - 0.6216
+    - 0.9646
+    - 0.8845
+    - 0.8267
+    - 0.3719
+    - 0.4675
+    - 0.46
+    - 0.5413
+    - 0.5313
+    - 0.5196
+    - 0.586
+    - 0.6426
+    - 0.4361
+    - 0.9656
+    - 0.6499
+    - 0.8687
+    - 0.7323
+    - 0.3873
+    - 0.492
+    - 0.795
+    - 0.5976
     B12m:
-    - 0.2215
-    - 0.252
-    - 0.5122
-    - 0.6209
-    - 0.4395
-    - 0.9411
-    - 0.8134
-    - 0.7218
-    - 0.2281
-    - 0.3009
-    - 0.2884
-    - 0.3601
-    - 0.3518
-    - 0.3299
-    - 0.3996
-    - 0.4669
-    - 0.2637
-    - 0.9174
-    - 0.4698
-    - 0.7497
-    - 0.5668
-    - 0.237
-    - 0.3173
-    - 0.6717
-    - 0.4097
-restamped:
-  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-  proof_identical: true
-  scope:
-    pack_settings:
-    - benin
-    - ce_ref
-    - ce_res
-    - cochrane_itn
-    - eir_1
-    - eir_10
-    - eir_100
-    - eir_3
-    - eir_30
-    - eir_300
-    - irs_added
-    - misungwi
-    - muleba
-    - sahel_smc
-    pack_arms: every arm of each setting, in one run_batch per setting and seed
-    seeds:
-    - 11
-    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
-      sensitivity the card's 4000
-    burnin_years: the card's (50), the pack's own
-    evidence_cases:
-    - - equilibration
-      - - 3.5
-        - base
-        - burnin_years: 50
-        - 1
-    - - equilibration
-      - - 28.0
-        - doubled
-        - burnin_years: 100
-        - 1
-    - - equilibration
-      - - 9.0
-        - guess_hi
-        - burnin_years: 50
-          init_eir_per_m0: 2.4
-        - 2
-    - - guess_sensitivity
-      - - 3.5
-        - x1
-        - 1
-        - 50
-    - - guess_sensitivity
-      - - 28.0
-        - x0.25
-        - 2
-        - 50
-    scenarios:
-      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-      heterogeneous: 5 members, seed 23, delivery None
-      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-    not_repeated: calibration-grid runs (same code path at other attribute values)
-    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-      dicts exactly
-    added_window_metrics:
-    - severe_u5
-    - severe_5_14
-    - severe_15p
-    - severe_all
-    - deaths_u5
-    - deaths_5_14
-    - deaths_15p
-    - deaths_all
-  old_engine_version: '0.13'
-  proof_script_commit: 0d6d1f73696fb27ef0a9c3314327c04230998e47
-  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
-    is pending.
-  confirmation:
-    validate_once: pending
-    evidence: null
-  old_identity:
-    name: malaria-starsim
-    version: '0.13'
-    code_sha256: 2310408557d9d9dd70db1e8673af2e1b71c3aabdb4115f88266bf6204e76dad7
-    params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-    config_sha256: f582a35071dd288069a265401d672aac33b85fab1a1aedeb60b832030f620619
-  previous:
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-        past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.12'
-    proof_script_commit: 4f0f9609a89ee448e4f6ae20ae924b0b417c3b3f
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_identity:
-      name: malaria-starsim
-      version: '0.12'
-      code_sha256: defb2d87b65f8210f7f04ec413687eaaf50104f3637975556d4e3cce675abbd5
-      params_sha256: d5f861745e28d3add03d6e9e4995c6b4873a7d459e60c91977e5b24be581a694
-      config_sha256: 04b9eedeaec5d5f1bce0674f816a6f5890dd1fa751368bd61cfb440256a33398
-  - by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
-    proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
-    proof_identical: true
-    scope:
-      pack_settings:
-      - benin
-      - ce_ref
-      - ce_res
-      - cochrane_itn
-      - eir_1
-      - eir_10
-      - eir_100
-      - eir_3
-      - eir_30
-      - eir_300
-      - irs_added
-      - misungwi
-      - muleba
-      - sahel_smc
-      pack_arms: every arm of each setting, in one run_batch per setting and seed
-      seeds:
-      - 11
-      n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000;
-        guess sensitivity the card's 4000
-      burnin_years: the card's (50), the pack's own
-      evidence_cases:
-      - - equilibration
-        - - 3.5
-          - base
-          - burnin_years: 50
-          - 1
-      - - equilibration
-        - - 28.0
-          - doubled
-          - burnin_years: 100
-          - 1
-      - - equilibration
-        - - 9.0
-          - guess_hi
-          - burnin_years: 50
-            init_eir_per_m0: 2.4
-          - 2
-      - - guess_sensitivity
-        - - 3.5
-          - x1
-          - 1
-          - 50
-      - - guess_sensitivity
-        - - 28.0
-          - x0.25
-          - 2
-          - 50
-      scenarios:
-        gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
-        boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
-        heterogeneous: 5 members, seed 23, delivery None
-        empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
-      not_repeated: calibration-grid runs (same code path at other attribute values)
-      compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
-        dicts exactly
-    old_engine_version: '0.11'
-    proof_script_commit: 1b0c74ff6aa4a0a0aab3f83f56f247642abaef1d
-    note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
-      on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation
-      below is pending.
-    confirmation:
-      validate_once: pending
-      evidence: null
-    old_identity:
-      name: malaria-starsim
-      version: '0.11'
-      code_sha256: d57925281508ad1045d4a058051f568170baeab154ff3c30ade940a21885003c
-      params_sha256: 507912ed97660d905d0cfa2ed2e898383a3debc37858c68be18ddaa18d6ecfbb
-      config_sha256: 1694e825f0588e97301a23da1f77482b14253482220f1306b66ed5906c832fc3
+    - 0.2497
+    - 0.2887
+    - 0.5922
+    - 0.6841
+    - 0.5019
+    - 0.9761
+    - 0.8394
+    - 0.7585
+    - 0.2583
+    - 0.3538
+    - 0.3358
+    - 0.4174
+    - 0.4102
+    - 0.3845
+    - 0.4542
+    - 0.5283
+    - 0.3151
+    - 0.9461
+    - 0.535
+    - 0.8092
+    - 0.643
+    - 0.2684
+    - 0.359
+    - 0.7301
+    - 0.4689

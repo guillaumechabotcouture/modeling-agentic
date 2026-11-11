@@ -212,7 +212,7 @@ benchmarks:
      source: "C27 Thwing 2024 AJTMH (PMC10793029)",
      published: {lower: 0.25, upper: 0.29, level: 0.95, scale: ratio, table: "abstract; Figure 4 (8 randomised studies, fixed effect, I2 94%)"},
      estimand_type: rate_ratio, diagnostic: "diagnostically confirmed parasitaemia", age_band: "under 5 years",
-     band_override: {band: [0.14, 0.40], status: pending_owner_review,
+     band_override: {band: [0.14, 0.40], status: owner_accepted_2026-11-09,
        reason: "the pooled fixed-effect CI (0.25-0.29) understates heterogeneity across study settings (I2 94%;
          study rate ratios 0.14-0.62); one simulated setting is compared with the pooled estimate"},
      estimand: {type: ratio, num: smc_on, den: smc_off, value: windows.m0_24.inc_u5_smc}}

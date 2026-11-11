@@ -112,6 +112,18 @@ For each named window, severe_<g> and deaths_<g> (g in u5, 5_14, 15p, all) are t
 deaths of the window's new infections per person of the group, over its mean population in the window:
 the per-capita outcomes' count, for any window (ENGINE_NOTES.md, v0.14). Every other output is byte-identical to
 v0.13 (benchmarks/restamp_proof.py). Self-tests W0-W4 (selftest_late.py).
+
+v0.15 (F6 engine review, finding 1): the biting rates carry the 1 / W-bar term of the feeding-cycle model (Griffin
+2010 Protocol S2): bites on person i per infectious mosquito f Q0 pi_i y_i / W-bar, force of infection on mosquitoes
+f Q0 sum(pi_i w_i c_i) / W-bar (model.py; ENGINE_NOTES.md, v0.15). v0.2-v0.14 left out 1 / W-bar and weighted the
+mosquito side by y. Without vector control the rates are the same (W-bar = 1); under nets or IRS every output
+changes, so the stored benchmark evidence and fitted values are v0.14's until the pack is refitted. No parameter is
+added or removed. Self-tests BR0-BR4 (selftest_late.py) and V29-V30 (vector.py).
+
+v0.16 (owner, 2026-11-10): outputs byte-identical to v0.15 (benchmarks/restamp_proof.yaml). BR3 reports, and no longer
+judges, the lifetime human bites per mosquito under dual-AI nets at 70% use: after the v0.15 refit (cfp_kill 0.485)
+the published model's approximation gives 1.206 times the exact per-attempt chain there, above BR3's 20%, so dual-AI's
+effect at high use is somewhat understated (ENGINE_NOTES.md, v0.16). The other cases stay judged at 20%.
 """
 from __future__ import annotations
 
@@ -140,7 +152,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.14"
+VERSION = "0.16"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -496,7 +508,9 @@ class MalariaEngine:
             name="malaria-starsim", version=VERSION,
             mechanisms=[
                 "Griffin-lite human natural history and immunity (fixed: " + GRIFFIN + ")",
-                "species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed)",
+                "species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed); feeding cycle "
+                "under vector control with biting rates f Q0 pi y / W-bar on people and f Q0 sum(pi w c) / W-bar on "
+                "mosquitoes (Griffin 2010 Protocol S2; v0.15)",
                 "ITN: repeating, killing and feeding per attempt from published hut-trial relationships by bioassay "
                 "mortality and species complex, pyrethroid and PBO, with resistance-dependent decay (" + V.CHURCHER_SOURCE
                 + "); dual-AI adds a fitted chlorfenapyr kill",
@@ -3086,6 +3100,118 @@ def _self_test_v014(ok, e, unit) -> None:
            "W5d each of cfr_severe_untreated, cfr_severe_treated and severe_access_add alone separates the key under "
            "the condition, and none does otherwise")
     case("W5", w5)
+
+
+def _self_test_v015(ok, e, unit) -> None:
+    """v0.15 (F6 engine review, finding 1): the biting rates carry the 1/W-bar term of the published feeding-cycle
+    model (Griffin 2010 Protocol S2; ENGINE_NOTES.md, v0.15). Each case reads the model's realised rates on the last
+    step of a short one-species run and compares them with the published forms and with the exact per-attempt chain,
+    both computed here from the per-person feeding probabilities that step used."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    G = M.G
+
+    def probe(net, use, irs=False):
+        # the feeding-cycle call is the seam: its arguments are the per-person probabilities the step used, and the
+        # state it is called in (human states, susceptible mosquitoes) is the state the step's rates used
+        a = dict(unit.attributes, species={"gambiae": 1.0}, itn_use=use, hist_net=net,
+                 itn_hist_years=[] if net == "none" else [2014.9])
+        if irs:
+            a["irs_month"] = 1
+        h = Horizon(2015.0, 2015.2, (2015.0, 2015.2), {})
+        sim, P = e.build_sim({"n_agents": 1000, "burnin_years": 1}, UnitSpec("t", a),
+                             Package("irs", {"irs": 1}) if irs else Package("none", {}), h, 3)
+        last, real = {}, V.cycle
+
+        def spy(b, w0, y, w, z, tau1, tau2):
+            dz = sim.diseases.malaria
+            u = sim.people.auids
+            st = dz.st[u]
+            c = np.zeros(len(u))                     # infectiousness to mosquitoes, as the step computes it
+            c[st == M.D_], c[st == M.T_], c[st == M.U_] = G['cD'], G['cT'], G['cU']
+            isA = st == M.A_
+            c[isA] = G['cU'] + (G['cD'] - G['cU']) * dz._detect(sim.people.age[u] * 365)[isA] ** G['gam1']
+            out = real(b, w0, y, w, z, tau1, tau2)
+            last.update(b=b, c=c, tau=(tau1, tau2), mu=float(out[1]), S=float(dz.mos[0]['S']), ti=int(dz.ti),
+                        **{k: np.asarray(v, float).copy() for k, v in (("w0", w0), ("y", y), ("w", w), ("z", z))})
+            return out
+        V.cycle = spy
+        try:
+            sim.init()
+            sim.run()
+        finally:
+            V.cycle = real
+        dz, ti = sim.diseases.malaria, last["ti"]
+        b, c, w0, y, w, z = (last[k] for k in ("b", "c", "w0", "y", "w", "z"))
+        pi, Q0, (tau1, tau2) = w0 / w0.sum(), b["Q0"], last["tau"]
+        W = 1 - Q0 + Q0 * (pi * w).sum()             # a feeding attempt ends in a blood meal the mosquito survives
+        Z = Q0 * (pi * z).sum()                      # ... or in a deflection and a new attempt
+        f = 1 / (tau1 / (1 - Z) + tau2)
+        p10, p2 = np.exp(-b["mu0"] * tau1), np.exp(-b["mu0"] * tau2)
+        P_cyc = W * p10 / (1 - Z * p10) * p2         # the mosquito survives one feeding cycle
+        mo = dz.mos[0]
+        # the model's rates: bites on humans per infectious mosquito per day (the mean EIR without the imported part,
+        # over the infectious mosquitoes per person), and the force of infection on susceptible mosquitoes
+        human = (dz.daily['eir'][ti] - P["import_eir"] / 365 * w0.mean()) / mo['I']
+        mosq = -np.log(1 - mo['q'][ti % G['eip']] / last["S"])
+        return dict(W=W, used=float(dz.daily['net_use'][ti]), y_w=float((pi * (y - w)).sum()),
+                    human=human, human_pub=f * Q0 * (pi * y).sum() / W,
+                    mosq=mosq, mosq_pub=f * Q0 * (pi * w * c).sum() / W,
+                    # lifetime human bites per mosquito: the model's (rate / mortality) and the exact chain's
+                    # (bites per cycle started / probability of not surviving the cycle)
+                    life=human / last["mu"], exact=Q0 * (pi * y).sum() * p10 / (1 - Z * p10) / (1 - P_cyc))
+
+    nets = [(n, u) for n in ("pyr", "pbo", "dual") for u in (0.4, 0.7)]
+    R = {}
+    rel = lambda a, b: abs(a / b - 1)  # noqa: E731
+
+    def br0():
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 15),
+           f"BR0 engine v0.15 or later: the biting rates changed every output under vector control (VERSION {VERSION})")
+    case("BR0", br0)
+
+    def br1():
+        r = R["none"] = probe("none", 0.6)
+        ok(abs(r["W"] - 1) < 1e-6 and rel(r["human"], r["human_pub"]) < 1e-5 and rel(r["mosq"], r["mosq_pub"]) < 1e-5,
+           f"BR1 with no intervention W-bar is 1 and both rates are unchanged: f Q0 on humans, f Q0 sum(pi c) on "
+           f"mosquitoes (W-bar {r['W']:.6f}; model / form {r['human'] / r['human_pub']:.6f}, "
+           f"{r['mosq'] / r['mosq_pub']:.6f})")
+    case("BR1", br1)
+
+    def br2():
+        for n, u in nets:
+            R[n, u] = probe(n, u)
+        worst = max(nets, key=lambda k: rel(R[k]["human"], R[k]["human_pub"]))
+        ok(all(rel(R[k]["human"], R[k]["human_pub"]) < 1e-5 and R[k]["W"] < 0.9 for k in nets),
+           "BR2 under nets the model's bites on humans per infectious mosquito equal f Q0 sum(pi y) / W-bar (pyr, PBO, "
+           f"dual at 40% and 70% use; furthest: {worst[0]} at {worst[1]:.0%}, model / form "
+           f"{R[worst]['human'] / R[worst]['human_pub']:.4f}, W-bar {R[worst]['W']:.3f})")
+    case("BR2", br2)
+
+    REPORTED = ("dual 70%",)    # v0.16 (owner, 2026-11-10): the published approximation; reported, not judged
+
+    def br3():
+        got = {f"{n} {u:.0%}": round(R[n, u]["life"] / R[n, u]["exact"], 3) for n, u in nets}
+        judged = {k: v for k, v in got.items() if k not in REPORTED}
+        ok(all(abs(v - 1) < 0.20 for v in judged.values()) and abs(R["none"]["life"] / R["none"]["exact"] - 1) < 0.20,
+           "BR3 under nets the model's lifetime human bites per mosquito (rate / mortality) are within 20% of the exact "
+           f"per-attempt chain (model / exact {judged}; no intervention {R['none']['life'] / R['none']['exact']:.3f}; "
+           f"reported, not judged: {({k: got[k] for k in REPORTED})})")
+    case("BR3", br3)
+
+    def br4():
+        r = R["irs"] = probe("pyr", 0.7, irs=True)
+        keys = nets + ["irs"]
+        got = {k if k == "irs" else f"{k[0]} {k[1]:.0%}": round(R[k]["mosq"] / R[k]["mosq_pub"], 4) for k in keys}
+        ok(r["y_w"] > 0.05 and all(rel(R[k]["mosq"], R[k]["mosq_pub"]) < 1e-5 for k in keys)
+           and rel(r["human"], r["human_pub"]) < 1e-5,
+           "BR4 the force of infection on mosquitoes is f Q0 sum(pi w c) / W-bar: the bites the mosquito survives "
+           f"(under nets, and under nets with IRS where bites and surviving bites differ; model / form {got})")
+    case("BR4", br4)
 
 
 def write_card(path: str) -> None:

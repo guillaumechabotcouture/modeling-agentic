@@ -683,8 +683,11 @@ def _self_test() -> int:
            and fitted_problems({}, toy) == ["refit required: T1, fit_rule"],
            "BS42 fitted values bound to their targets' declarations: a changed or missing digest is 'refit required'")
         mf = yaml.safe_load(open(os.path.join(root, "malaria", "benchmarks", "fitted.yaml")))
-        ok(fitted_problems(mf, pk) == ["refit required: B10, B11, B12, B12b, B12m, fit_rule"],
-           f"BS43 the stored malaria fitted values report refit required: {fitted_problems(mf, pk)}")
+        # F6 engine v0.16 (run v016a): the refit binds the stored fit to the pack's band declarations and fit rule; before
+        # it, the stored values predated them and this case asserted "refit required"
+        ok(fitted_problems(mf, pk) == [],
+           f"BS43 the stored malaria fitted values are bound to the pack's current band declarations and fit rule: "
+           f"{fitted_problems(mf, pk)}")
     case("BS36-43", r1_2)
 
     def r1_2b():

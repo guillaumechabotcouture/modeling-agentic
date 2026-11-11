@@ -1,9 +1,11 @@
 name: malaria-starsim
-version: '0.14'
+version: '0.16'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
-- species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed)
+- species-specific vectors (Q0, phi_I, phi_B, mu0 from the D6 prior; endophily assumed); feeding cycle under vector
+  control with biting rates f Q0 pi y / W-bar on people and f Q0 sum(pi w c) / W-bar on mosquitoes (Griffin 2010
+  Protocol S2; v0.15)
 - 'ITN: repeating, killing and feeding per attempt from published hut-trial relationships by bioassay mortality
   and species complex, pyrethroid and PBO, with resistance-dependent decay (Churcher et al. 2016 eLife 10.7554/eLife.16090,
   Table 6 (PMC5025277)); dual-AI adds a fitted chlorfenapyr kill'

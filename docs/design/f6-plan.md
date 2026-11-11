@@ -187,6 +187,7 @@ runs for a sample of LGAs at the boundary values.
 | S2-5b burden window, report-only rows, no published interval | lead | PR by 2026-11-10 | in review: `validation.burden.window` with `window_metrics` (past years from engine window metrics in the same runs; deaths and DALYs need an engine change); `role`, `interval` columns |
 | S2-5c age-banded rows under the burden window | lead | PR by 2026-11-10 | in review: an age-banded row is its population group's window metric x population; `window_metrics` may map only the groups the rows reference |
 | S2-6 funded plan beside the optimised plan | lead | PR by 2026-11-11 | in review (#170: `fixed_plan` plan variant) |
+| Engine review, finding 1: biting rates (engine v0.15) | engine agent | fix branch 2026-11-10; evidence with the next refit | fix and tests on branch `f6-engine-biting-rate` (both rates carry 1/W of the feeding-cycle model; no parameter change); the fit and benchmark pack are to be re-run on v0.15 before any run uses it, and the engine self-tests V7 and V8 fail until then |
 | S3, S4 | lead | after Stage 2; cost quoted before launch | |
 
 Cost: Stage 1 is laptop and review time. The F6 run needs a full recalibration (the benchmark and error-model changes

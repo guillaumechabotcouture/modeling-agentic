@@ -1,12 +1,17 @@
-# Malaria engine v0.14: benchmark notes
+# Malaria engine v0.15: benchmark notes
 
-Engine `malaria-starsim` v0.14 (workstream A of architecture v2). Design note:
+Engine `malaria-starsim` v0.15 (workstream A of architecture v2). Design note:
 `docs/design/v2a-malaria-engine.md`. Every number in the tables block is rendered from
 `benchmarks/results.yaml`, `benchmarks/fitted.yaml`, `benchmarks/b15_mechanisms.yaml`,
 `benchmarks/equilibration.yaml` and `benchmarks/runtime.yaml`, with the spike
 (`history/results_v0.1-spike.yaml`) and the earlier rounds (`history/results_v0.2.yaml`,
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
+
+**v0.15 changes every output under nets or IRS. The numbers on this page are still v0.14's.** v0.15 corrects the biting rates of the feeding-cycle model (section below).
+- **Not refitted yet.** The fit and the benchmark pack have not run on v0.15. The tables block, `benchmarks/results.yaml`, `fitted.yaml`, `equilibration.yaml`, `guess_sensitivity.yaml` and the benchmark rows of `card.yaml` describe v0.14.
+- **Refused for v0.15.** The harness does not accept these files for v0.15 (the messages are in the section below). The engine self-tests V7 and V8 fail until they are recomputed.
+- **Recomputed, not re-stamped.** The next fit and pack run (`validate_once.sh`) regenerates them. `restamp_proof.py` does not apply: the outputs differ.
 
 **v0.14 numbers are v0.13's.** v0.14 adds window metrics for severe cases and deaths (section below), and changes no output v0.13 reports.
 - **Proof.** `benchmarks/restamp_proof.py` compared v0.13 (origin/v2 at 59471d5; the engine code is that of #172) and v0.14 (tree at 17b6314). It found 24 of 24 cases identical, with the eight added window metrics left out of the new side only.
@@ -86,6 +91,114 @@ with a delivery period, routine nets and SMC, boundary dates and heterogeneous b
 Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 records under `previous`. The
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
+
+## v0.16 scope: BR3 at dual-AI nets and 70% use is reported, not judged (owner, 2026-11-10)
+
+**What changed.** No model change. `engine.py` and the card say 0.16, BR3 reports instead of judging one case, and the
+`model.py` note on the old IRS bias is corrected (Codex review of #180, P3). The outputs are byte-identical to v0.15
+(`benchmarks/restamp_proof.py prove`), so the v0.15 evidence (equilibration, guess sensitivity at 96 seeds, joint fit,
+pack results) is re-stamped, not recomputed.
+
+**Why.** BR3 compares the model's lifetime human bites per mosquito (biting rate over mortality) with an exact
+per-attempt chain. That gap is the published model's own approximation; the engine follows the published form exactly
+(BR2 and BR4: model / form 1.000). After the v0.15 refit raised the fitted chlorfenapyr kill (`cfp_kill` 0.415 to 0.485),
+dual-AI nets at 70% use give 1.206 times the exact chain, above BR3's 20% (the PR's earlier run, before the refit:
+1.162). The other net cases are 0.94 to 1.08, and no intervention 0.904. Above 1 means the model gives the mosquito more
+lifetime bites than the exact chain, so it somewhat understates dual-AI nets' effect at high use.
+
+**What follows.** The F6 preview's engine check of the dual-AI versus PBO decision (S3-3) runs at the boundary values,
+and the F6 report states this limitation.
+
+## v0.15 scope: the 1/W term of the biting rates (F6 engine review of 2026-11-10, finding 1; tests written before the fix)
+
+**The model.** A host-seeking mosquito makes feeding attempts until one ends in a blood meal (Griffin et al. 2010, PLoS Med 7(8): e1000324, Protocol S2). The quantities are:
+- Q0: the share of attempts made on humans without interventions.
+- π_i: person i's share of the attempts on humans.
+- y_i, w_i, z_i: the probability that an attempt on person i ends in a bite, in a bite the mosquito survives, or in a repeat. Without interventions y = w = 1 and z = 0.
+- W = 1 − Q0 + Q0 Σ π_i w_i: the mean probability that an attempt ends in a blood meal the mosquito survives.
+- Z = Q0 Σ π_i z_i: the mean probability that an attempt is repeated.
+- f = 1 / (τ1 / (1 − Z) + τ2): feeding cycles per day (τ1 days seeking a host, τ2 days resting).
+- p10, p2: the probability of surviving the host-seeking and the resting period without interventions. p1 = W p10 / (1 − Z p10) is the first under interventions. The mortality is −f ln(p1 p2).
+- c_i: the infectiousness of person i to mosquitoes.
+
+**The published rates, per mosquito per day.**
+- Bites on person i: f Q0 π_i y_i / W.
+- Infection of a susceptible mosquito: f Q0 Σ π_i w_i c_i / W.
+
+The 1/W term is there because f counts completed cycles, and a cycle is completed by a blood meal. Given that a meal was taken, it was taken on person i with probability Q0 π_i w_i / W. Summed over people this is the human blood index under interventions, Q = 1 − (1 − Q0) / W.
+
+**The defect.** v0.2 to v0.14 used f Q0 π_i y_i for people and f Q0 Σ π_i y_i c_i for mosquitoes. Two things differ from the published form:
+- Both rates lack 1/W.
+- The mosquito side weights by y, not w. With nets only, y = w in this model (a mosquito killed by a net has not fed), so this second difference acts only with IRS, where a fed mosquito can die while resting.
+
+Without nets or IRS, W = 1 and both rates were right. With nets only, both rates were too low by the factor W, while the mosquito's mortality and cycle length were already the published ones, so the model gave nets more effect than the published model does. With IRS the human rate was still too low by W, but the old mosquito rate is W × Σ π_i y_i c_i / Σ π_i w_i c_i times the published one, which is not W and can exceed 1. Example (Codex review of #180): one *An. gambiae* species, no nets, complete fresh IRS, irs_kill 0.55, default deterrence and diversion: y = 0.955, w = 0.5986, W = 0.6307, so the old mosquito rate was 1.006 times the published one. The comment on the mosquito rate in `model.py` still says "too low by W" for both rates; it is corrected with the next engine version, because any change to an engine `.py` file changes the engine's code fingerprint and the stamped evidence.
+
+**The fix.** `vector.cycle` returns W with f and the mortality. `model.py` divides both rates by W and weights the mosquito side by w. No parameter is added or removed, so the parameter table and the burn-in key (parameters and unit attributes, held in memory within one batch) are unchanged.
+
+**Size of the defect (measured by the self-test probes).** Each probe has one species (*An. gambiae* s.s.), 1,000 people and nets given 0.1 years before, read on the last simulated day. The first column is the old rate over the published rate, which equals W for nets. The last two columns compare the lifetime human bites per mosquito (the rate on humans over the mortality) with the exact per-attempt chain described below.
+
+| Nets, use | Old rate / published rate | Lifetime bites, v0.14 / exact | Lifetime bites, v0.15 / exact |
+|---|---|---|---|
+| none | 1.000 | 0.904 | 0.904 |
+| pyrethroid, 40% | 0.763 | 0.746 | 0.978 |
+| pyrethroid, 70% | 0.573 | 0.615 | 1.083 |
+| PBO, 40% | 0.736 | 0.690 | 0.939 |
+| PBO, 70% | 0.522 | 0.515 | 0.981 |
+| dual-AI, 40% | 0.732 | 0.750 | 1.015 |
+| dual-AI, 70% | 0.542 | 0.634 | 1.162 |
+
+With pyrethroid nets and IRS together, the old mosquito-side rate was 0.618 of the published one. The v0.14 and v0.15 columns come from separate runs, which differ in their random draws once nets act.
+
+**The exact chain, and what the published form still approximates.** Counting attempt by attempt, a mosquito's expected human bites per cycle are B = Q0 (Σ π_i y_i) p10 / (1 − Z p10), and it survives a whole cycle with probability P = p1 p2, so it takes B / (1 − P) human bites in its life. The model, like the published ones, works with rates: f cycles per day and a mortality of −f ln P. The model's lifetime bites over the exact chain's are (1 − P) / (p1 (−ln P)):
+- 0.904 with no intervention, in every version;
+- 0.939 to 1.162 in the six net probes above after the fix.
+
+So v0.15 follows the published form, and the published form itself understates lifetime bites by 10% with no intervention and overstates them by up to 16% in these probes, at high use of nets that kill many mosquitoes. v0.15 does not change that approximation. It is listed here so that a later reader does not take "matches the published form" for "matches the exact chain".
+
+**Sources, and one difference between them.**
+- Griffin 2010, Protocol S2 (doi 10.1371/journal.pmed.1000324.s006). The text was read. Its equations are embedded objects that the text extraction did not return, so the form was confirmed against the same group's model code, below.
+- The Imperial College deterministic model (`mrc-ide/deterministic-malaria-model`, `inst/odin/odin_model.R`): `wbar <- 1 - Q0 + Q0*wh`, `Q <- 1-(1-Q0)/wbar`, `av <- fv*Q`, `av_human <- av*yy/wh`, `av_mosq <- av*w/wh`. With Q = Q0 `wh` / `wbar` these are f Q0 y_i / W and f Q0 w_i / W.
+- `malariasimulation` (`R/biting_process.R`), read as a formula reference only. Its rate on people is the same. Its rate on mosquitoes multiplies the mean biting rate on humans by the bite-weighted mean infectiousness: f Q0 (Σ π_i w_i / W) (Σ π_i c_i). It does not weight each person's infectiousness by that person's own w_i.
+
+The engine implements the Griffin 2010 form, as the deterministic model codes it. In the probes above, the `malariasimulation` mosquito-side form is 0.89 to 1.04 times the implemented one. The two forms agree when infectiousness does not vary with w_i across people.
+
+**Effect on outputs (an illustration, not a benchmark).** One seed, 1,000 agents, a 2-year burn-in, the self-test unit, outcomes over 2016, at the v0.14 fitted values.
+
+| Case | Metric | v0.14 | v0.15 |
+|---|---|---|---|
+| No nets | EIR per year | 12.44 | 12.44 |
+| One past net campaign in mid-2015 (use 0.45) | EIR per year | 2.35 | 4.24 |
+| | clinical incidence, all ages | 0.206 | 0.354 |
+| | clinical incidence, under 5 | 0.270 | 0.567 |
+| | deaths per person under 5 | 0.00194 | 0.00407 |
+| Dual-AI campaign at 2016.0 (use 0.57) | EIR per year | 0.63 | 1.30 |
+| | clinical incidence, all ages | 0.050 | 0.074 |
+| | clinical incidence, under 5 | 0.121 | 0.128 |
+| | deaths per person under 5 | 0.00054 | 0.00095 |
+
+- With no nets, every window metric was the same except the annual EIR, which differed by 3 parts in a billion. The outputs are not byte-identical: the arrays are single precision, W is 1 only to about 1e-8, and the rates are now divided by it. A difference that small can, rarely, change a random draw.
+- In the two net cases the runs also differ in their random draws once nets act (the model has one random stream), so part of each difference is noise at this population size.
+- These values use parameters fitted with the old rates. The refit will move them.
+
+**Held-out benchmarks.** At v0.14 the held-out net-trial benchmarks were out of band on the side of too much effect: B7 0.50 against a band of 0.68 to 0.98, and B8 0.41 against 0.46 to 0.64 (Pryce 2018). The defect acts in that direction. Whether the fix closes the gap, and by how much, is to be measured by the next refit. The form was taken from the published model, not chosen for those benchmarks: held-out benchmarks never drive a choice.
+
+**What is stale, and how the harness refuses it (run on the v0.15 tree).**
+- `benchmark.verified_results`: "results.yaml was computed for another engine identity or code: re-run the pack". Decision tests read benchmark ratios only through it.
+- The fitted values (`benchmark_sources`): "refit required: the fit ran on another engine revision (version, code_sha256 differ)".
+- `equilibration.yaml` and `guess_sensitivity.yaml` carry `engine_version` 0.14: the engine self-tests V7 and V8 check them against the engine version and fail. `engine.py --self-test` therefore fails on this version until the evidence is recomputed.
+- `runtime.yaml` (stamped 0.11), `b15_mechanisms.yaml` (no version stamp) and `restamp_proof.yaml` (the v0.13 to v0.14 record) describe earlier code. The benchmark rows and `fit_rule` in `card.yaml` are copied from the stale files.
+- Before this change the results file was already refused on origin/v2 (76bec21) for another reason: its rows no longer matched the pack's declarations ("rerun required" for 17 benchmarks, "refit required" for 5 and the fit rule), and that refit was pending.
+
+**Tests (written first, failing on v0.14; `vector.py` and `selftest_late.py`, section `_self_test_v015`).**
+- V29: `cycle` returns W, which is 1 without interventions and 1 − Q0 + Q0 mean(w) under nets.
+- V30: with 1/W, the surviving bites on humans per cycle are the human blood index Q.
+- BR0: the engine version is 0.15 or later.
+- BR1: with no intervention, W is 1 and both model rates equal the published forms (it passed before the fix too).
+- BR2: under pyrethroid, PBO and dual-AI nets at 40% and 70% use, the model's rate on humans equals f Q0 Σ π_i y_i / W within 1e-5.
+- BR3: in the same six cases, lifetime human bites per mosquito are within 20% of the exact chain. The tolerance covers the rate approximation above (0.94 to 1.16); the old code gave 0.52 to 0.75.
+- BR4: the rate on mosquitoes equals f Q0 Σ π_i w_i c_i / W within 1e-5, in the six net cases and with nets and IRS, where y and w differ.
+
+**What this does not do.** It does not touch the other findings of the engine review: the case-management link, the fatality link, how nets are redistributed, and larval density dependence. It does not refit, and it changes no evidence file.
 
 ## v0.14 scope: severe cases and deaths as window metrics (F6 S2-5b; written with the v0.14 code)
 
