@@ -848,9 +848,10 @@ def _self_test() -> int:
          lambda: (lambda r: r[0] == EXIT_LIMIT and stops(r[1]) == [])(
              scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError: EOF")]}, max_hours=1.0,
                       api=_Failing())))
-    case("LW6c2", "listing and spend both unreadable: exit 11 after three readings; nothing is stopped on a listing "
-                  "that cannot be read",
-         lambda: (lambda r: r[0] == EXIT_UNREADABLE and stops(r[1]) == [])(
+    case("LW6c2", "listing and spend both unreadable: exit 11 after three readings; every recorded id is still "
+                  "stopped by id (a stop needs no listing), each attempt logged",
+         lambda: (lambda r: r[0] == EXIT_UNREADABLE and sorted(stops(r[1])) == [100, 101, 102]
+                  and sum("stop requested by id" in ln for ln in r[4].lines) == 3)(
              scenario(0, record, lambda cfg: {"status": [(1, "ssl.SSLError: EOF")]}, max_hours=1.0,
                       api=_FailingAll())))
     case("LW6d", "collect fails with a network error, then succeeds: retried, exit 0",
