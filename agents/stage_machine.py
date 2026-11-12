@@ -1522,6 +1522,8 @@ def analysis_failure_cause(rep: dict, run_dir: str | None = None) -> str | None:
 
 # Where the analysis's engine batch keeps compute.py's per-call summaries (toolkit/analysis/batch.py).
 BATCH_DIR = os.path.join("analysis", "batch")
+# ... and the joint calibration's (toolkit/analysis/joint_calibration.py OUT_REL)
+JC_DIR = os.path.join("analysis", "joint_calibration")
 
 
 def _infra_batch(run_dir: str, rep: dict) -> bool:
@@ -1529,21 +1531,35 @@ def _infra_batch(run_dir: str, rep: dict) -> bool:
     kind infra (lost workers; scripts/compute.py has already retried them within the call). Read from the summaries
     compute.py wrote under analysis/batch/ during this run, i.e. after the run's start (the report's mtime minus its
     `seconds`, on the same clock as theirs): at least one has failed rows, and every one with failed rows has only
-    infra ones. Never read from the error text. Anything unreadable is False (not resumable)."""
+    infra ones. Never read from the error text. Anything unreadable is False (not resumable).
+    F6 (2026-11-11): also the joint calibration's primary batches (JC_DIR: bench_call*_phase*.jsonl and
+    call<N>/points.jsonl or results.jsonl directly under it; never sensitivity_* or another subdirectory, whose
+    batches the failing step does not depend on). When the report carries `pipeline_run`, only summaries with the
+    same id count (untagged ones are ignored), so a run dir copied or restored from a checkpoint (mtimes reset) is
+    still classified; the mtime rule applies only to a report without an id."""
+    run_id = rep.get("pipeline_run") if isinstance(rep, dict) else None
     try:
         started = os.path.getmtime(os.path.join(run_dir, "models", "pipeline_report.json")) - float(rep["seconds"]) - 2.0
-        d = os.path.join(run_dir, BATCH_DIR)
-        names = sorted(n for n in os.listdir(d) if n.endswith(".summary.json"))
     except (OSError, KeyError, TypeError, ValueError):
         return False
+    import glob
+    import re
+    paths = sorted(glob.glob(os.path.join(run_dir, BATCH_DIR, "*.summary.json")))
+    jc = os.path.join(run_dir, JC_DIR)   # Codex on #200: only the primary calibration's batches, never sensitivity_*
+    paths += sorted(glob.glob(os.path.join(jc, "bench_call*_phase*.jsonl.summary.json")))
+    paths += sorted(p for p in glob.glob(os.path.join(jc, "call*", "*.jsonl.summary.json"))
+                    if re.fullmatch(r"call\d+", os.path.basename(os.path.dirname(p)))
+                    and os.path.basename(p) in ("points.jsonl.summary.json", "results.jsonl.summary.json"))
     failed = 0
-    for n in names:
-        p = os.path.join(d, n)
+    for p in paths:
         try:
-            if os.path.getmtime(p) < started:
-                continue                          # an earlier pipeline run's batch
             with open(p) as f:
                 summ = json.load(f)
+            if run_id:                            # Codex on #200: the run id decides; an untagged summary is not ours
+                if summ.get("pipeline_run") != run_id:
+                    continue
+            elif os.path.getmtime(p) < started:
+                continue                          # an earlier pipeline run's batch (no run id: the mtime rule)
             kinds, n_failed = summ.get("failed_by_kind"), int(summ.get("n_failed") or 0)
         except (OSError, ValueError, TypeError, AttributeError):
             return False
@@ -2861,6 +2877,55 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     ok(got == ["infra", None, None, None, None, None, None],
        f"T61c infra only, in a summary written during this pipeline run, is resumable; a model or stopped row, no "
        f"failed row, an older summary, no summary, or no run dir is not ({got})")
+    # T62 (F6 preview, 2026-11-11): the joint calibration's bench batch lost one task to infra, in a run dir restored
+    # from a checkpoint (every mtime reset); "this pipeline run's" summaries are known by the pipeline run id
+    r = os.path.join(td, "restored")
+    for sub in ("models", "analysis/batch", "analysis/joint_calibration/call2"):
+        os.makedirs(os.path.join(r, sub), exist_ok=True)
+    rep2 = dict(rep1, pipeline_run="P1")
+    files = {"models/pipeline_report.json": rep2,
+             "analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json":
+                 {"pipeline_run": "P1", "n": 42, "n_failed": 1, "failed_by_kind": {"infra": 1}},
+             "analysis/joint_calibration/call2/points.jsonl.summary.json":
+                 {"pipeline_run": "P1", "n": 64, "n_failed": 0, "failed_by_kind": {}},
+             "analysis/batch/results.jsonl.summary.json":            # an earlier pipeline run's: never read now
+                 {"pipeline_run": "P0", "n": 8, "n_failed": 1, "failed_by_kind": {"model": 1}}}
+
+    def restored(report_age=0.0, **over):
+        for rel, obj in {**files, **over}.items():
+            json.dump(obj, open(os.path.join(r, rel), "w"))
+            os.utime(os.path.join(r, rel), (1e9, 1e9))
+        os.utime(os.path.join(r, "models", "pipeline_report.json"), (1e9 + report_age, 1e9 + report_age))
+        return analysis_failure_cause(rep2, r)
+    got2 = [restored(), restored(report_age=3600.0),
+            restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json":
+                        {"pipeline_run": "P1", "n": 42, "n_failed": 1, "failed_by_kind": {"model": 1}}})]
+    # T62b (Codex on #200): an optional batch (a sensitivity run under its own subdirectory) that lost rows to infra
+    # does not make a model rejection resumable; only the primary joint-calibration batches and analysis/batch count
+    ok_bench = {"pipeline_run": "P1", "n": 42, "n_failed": 0, "failed_by_kind": {}}
+    sens = os.path.join(r, "analysis", "joint_calibration", "sensitivity_s1", "call1")
+    os.makedirs(sens, exist_ok=True)
+    json.dump({"pipeline_run": "P1", "n": 9, "n_failed": 2, "failed_by_kind": {"infra": 2}},
+              open(os.path.join(sens, "points.jsonl.summary.json"), "w"))
+    optional = restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json": ok_bench})
+    os.remove(os.path.join(sens, "points.jsonl.summary.json"))
+    # T62c (Codex on #200): when the report has a pipeline run id, an untagged summary never counts, however new
+    untagged = os.path.join(r, "analysis", "batch", "old.jsonl.summary.json")
+    json.dump({"n": 4, "n_failed": 1, "failed_by_kind": {"infra": 1}}, open(untagged, "w"))
+    old_only = restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json": ok_bench})
+    os.utime(untagged, None)
+    old_only_fresh = analysis_failure_cause(rep2, r)
+    os.remove(untagged)
+    ok(optional is None and old_only is None and old_only_fresh is None,
+       f"T62b-c an infra-only optional (sensitivity) batch, or an untagged summary when the report has a run id, "
+       f"never makes the failure resumable: {optional} {old_only} {old_only_fresh}")
+    st2 = RunState(question="q", state="FINAL", status="run_failed",
+                   history=[{"from": "ANALYZE", "to": "FINAL", "why": "analysis failed"}])
+    restored()
+    ok(got2 == ["infra", "infra", None] and resumable_failure(r, st2) == "infra",
+       f"T62 a restored run dir whose joint-calibration bench batch lost one task to infra is resumable 'infra' "
+       f"(summaries matched by pipeline run id, not mtimes; an earlier run's model failure is ignored; a model "
+       f"failure in this run is not resumable), so --resume reopens it at ANALYZE: {got2}")
 
 
 def _self_test_geometry(ok, td: str) -> None:

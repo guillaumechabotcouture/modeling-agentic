@@ -97,6 +97,7 @@ REPO = os.path.dirname(HERE)
 SPEC = os.path.join("models", "pipeline.yaml")
 STATE = os.path.join("models", "pipeline_state.json")
 REPORT = os.path.join("models", "pipeline_report.json")
+_RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
@@ -752,6 +753,8 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
 def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -> tuple[int | None, str]:
     env = script_env()
     env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
+    if _RUN_ID:
+        env["MA_PIPELINE_RUN"] = _RUN_ID     # compute.py records it in each batch summary (stage_machine._infra_batch)
     # A fresh bytecode cache per step: Python trusts a .pyc whose source has the same
     # size and mtime second, so an edit made within a second of the last run would
     # otherwise run the old code (seen in this file's self-test).
@@ -930,10 +933,15 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     ArtifactIntegrity) the run holds a harness grant for the outputs of the
     steps it runs, and marks each file those steps wrote as harness-written.
     `only` + `force` run one step regardless of staleness (scratch mode)."""
+    global _RUN_ID
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
     steps, errs = load(run_dir)
-    report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errs, "plan": [], "steps": [], "ok": not errs}
+    # F6: an id for this run of the pipeline, in its report and in its steps' environment, so a reader knows which
+    # batch summaries this run wrote without trusting mtimes (a run dir copied or restored from a checkpoint)
+    _RUN_ID = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.urandom(4).hex()}"
+    report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errs, "plan": [], "steps": [], "ok": not errs,
+              "pipeline_run": _RUN_ID}
     if errs:
         _finish_granted(run_dir, report, t0, integrity)
         return report
@@ -1886,6 +1894,15 @@ def _self_test() -> int:
            and os.path.exists(os.path.join(d, REPORT)) and os.path.exists(os.path.join(d, STATE)),
            f"PL3 the first run builds every step and records it: {summary_line(rep)} {rep['steps']}")
         ok(plan(d) == [] and run(d)["steps"] == [], f"PL4 nothing changed: nothing reruns: {plan(d)}")
+        with tempfile.TemporaryDirectory() as d2:   # F6: each pipeline run has an id its steps see (MA_PIPELINE_RUN)
+            d2 = os.path.realpath(d2)
+            w(d2, "models/e.py", "import os\nopen('models/e.out', 'w').write(os.environ.get('MA_PIPELINE_RUN', ''))\n")
+            spec(d2, [{"id": "e", "run": f"{py} models/e.py", "inputs": [], "outputs": ["models/e.out"]}])
+            r2 = run(d2)
+            on_disk = json.load(open(os.path.join(d2, REPORT))).get("pipeline_run")
+            ok(r2.get("pipeline_run") and rd(d2, "models/e.out") == r2["pipeline_run"] == on_disk,
+               f"PL3b a pipeline run's id is in its report and in its steps' environment (MA_PIPELINE_RUN): "
+               f"{r2.get('pipeline_run')} {rd(d2, 'models/e.out')} {on_disk}")
         w(d, "data/y.csv", "20\n")
         ok([p["id"] for p in plan(d)] == ["b", "c"], f"PL5 a changed input: only its step and downstream: {plan(d)}")
         rep = run(d)

@@ -799,6 +799,15 @@ def change_findings(raw, data, expected=None) -> list:
 
 
 # --------------------------------------------------------------------------- simulation
+INFRA_KIND = "infra"      # scripts/compute.py's kind for a row lost with its machine (never a model failure)
+
+
+def _infra_only(rows) -> bool:
+    """Some rows failed, and every failed one was lost to infrastructure (not the model)."""
+    bad = [r for r in rows if not r.get("ok")]
+    return bool(bad) and all(r.get("kind") == INFRA_KIND for r in bad)
+
+
 class _Deferred(Exception):
     """A benchmark runner needs engine jobs that are not in the cache yet (recorded; run them as a batch)."""
 
@@ -932,8 +941,14 @@ class Simulator:
         tasks = [[list(x) for x in g] for g in groups.values()]
         outp = os.path.join(self.run_dir, OUT_REL, f"bench_call{self.calls}_phase{phase}.jsonl")
         kw = {k: v for k, v in self.kw.items() if k in ("max_workers", "max_core_hours", "timeout_s")}
-        rows, summ = compute.run_map(self.run_dir, os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list",
-                                     tasks, outp, purpose="v2 joint calibration: benchmark settings", **kw)
+        fn = os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list"
+        rows, summ = compute.run_map(self.run_dir, fn, tasks, outp, purpose="v2 joint calibration: benchmark settings",
+                                     **kw)
+        if _infra_only(rows):        # F6 preview 2026-11-11: once more, same file: done rows are reused
+            self.log(f"benchmark batch: {sum(not r.get('ok') for r in rows)} task(s) lost to infra after compute's "
+                     "own retries; running the batch once more (finished tasks are reused)")
+            rows, summ = compute.run_map(self.run_dir, fn, tasks, outp,
+                                         purpose="v2 joint calibration: benchmark settings (infra rerun)", **kw)
         bad = [n for n, r in enumerate(rows) if not r.get("ok")]
         if bad:
             raise HM.CalibrationInputError([f"benchmark batch: {len(bad)} of {len(rows)} tasks failed (e.g. "
@@ -959,8 +974,14 @@ class Simulator:
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
             jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
-            b = Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
-                       **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            def run_once():
+                return Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
+                              **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            b = run_once()
+            kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
+            if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
+                self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
+                b = run_once()
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
@@ -2046,6 +2067,73 @@ def _self_test() -> int:
         ok(len(got) == 1 and got[0].get("rho") == 0.0 and "independent" in got[0].get("note", ""),
            f"JA23 a mixed pair combines the rounds' sampling errors as independent and states it ({got})")
     safe(ja23, "JA23")
+
+    def ja24():          # 2026-11-11 F6 preview: 1 of 42 benchmark tasks lost with its worker ended a 2.5-h run
+        from unittest import mock
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        from toolkit.engines import benchmark as BM
+        with tempfile.TemporaryDirectory() as d:
+            sim = Simulator.__new__(Simulator)
+            sim.run_dir, sim.calls, sim.kw, sim.log = d, 1, {}, lambda m: None
+            pending = [("ref", "cfg", {"a": 1}, "u1", "pk", 5, 1), ("ref", "cfg", {"a": 2}, "u1", "pk", 5, 1)]
+
+            def fake(script):
+                seq, outs = list(script), []
+
+                def run_map(run_dir, fn, tasks, out, **kw):
+                    outs.append(out)
+                    bad = seq.pop(0) if seq else None
+                    return [{"ok": False, "kind": bad, "error": f"{bad} failure"} if (n == 0 and bad) else
+                            {"ok": True, "result": [{"v": n}]} for n in range(len(tasks))], {}
+                return run_map, outs
+
+            def go(script):
+                cache = {}
+                rm, outs = fake(script)
+                with mock.patch.object(compute, "run_map", rm), mock.patch.object(BM, "shares_state", lambda e: False), \
+                        mock.patch.object(BM, "_engine_of", lambda j: None):
+                    try:
+                        sim._bench_batch(pending, cache, 0)
+                        return "ok", outs, cache
+                    except HM.CalibrationInputError as e:
+                        return f"raised: {e}", outs, cache
+            r1, o1, c1 = go([INFRA_KIND])
+            ok(r1 == "ok" and len(o1) == 2 and o1[0] == o1[1] and len(c1) == 2,
+               f"JA24 a benchmark batch whose only failures are infra (after compute's own retries) is run once more "
+               f"on the same results file (done rows reused) and completes: {r1} {o1}")
+            r2, o2, _ = go(["model"])
+            ok(r2.startswith("raised") and len(o2) == 1,
+               f"JA24b a model failure is never rerun: it fails closed at once: {r2} {len(o2)} calls")
+            r3, o3, _ = go([INFRA_KIND, INFRA_KIND])
+            ok(r3.startswith("raised") and len(o3) == 2,
+               f"JA24c infra that persists through the rerun fails closed: {r3} {len(o3)} calls")
+
+        class FakeBt:
+            def __init__(self, script):
+                self.script, self.calls = list(script), 0
+
+            def run(self, run_dir, jobs, eng, out_rel=None, **kw):
+                self.calls += 1
+                bad = self.script.pop(0) if self.script else None
+                res = {j["id"]: {"windows": {"w": {"m": 1.0}}} for n, j in enumerate(jobs) if not (n == 0 and bad)}
+                return {"results": res, "problems": [], "summary": {"n_failed": 1 if bad else 0,
+                                                                   "failed_by_kind": {bad: 1} if bad else {}}}
+        sim = Simulator.__new__(Simulator)
+        sim.run_dir, sim.calls, sim.kw, sim.eng, sim.log = "/nonexistent", 1, {}, None, lambda m: None
+        sim.job = lambda p, k: {"id": f"j{k}"}
+        pts = [{"kind": "unit", "unit": "u1"}, {"kind": "unit", "unit": "u2"}]
+        for script, want, calls, cid in (([INFRA_KIND], "ok", 2, "JA24d infra only on the unit batch: rerun once, completes"),
+                                         (["model"], "raised", 1, "JA24e a model failure on the unit batch: no rerun"),
+                                         ([INFRA_KIND, INFRA_KIND], "raised", 2, "JA24f persistent infra: fails closed")):
+            bt, out = FakeBt(script), [None, None]
+            try:
+                sim._units(pts, [0, 1], out, "attr", bt)
+                got = "ok"
+            except HM.CalibrationInputError:
+                got = "raised"
+            ok(got == want and bt.calls == calls, f"{cid}: {got}, {bt.calls} calls")
+    safe(ja24, "JA24")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
