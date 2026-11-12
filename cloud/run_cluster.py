@@ -285,7 +285,7 @@ def _default_scope(name) -> str:
         return ""
 
 
-def budget_guard(cfg, reserve=True) -> None:
+def budget_guard(cfg, reserve=True, inv=None) -> None:
     """Refuse (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope covers the
     scope's spend plus it (cloud/budget.py); with `reserve`, the cap is reserved until a cluster of the name appears.
     Called by every path that creates or keeps paid work: launch, keeper (start_helpers), relaunch."""
@@ -294,7 +294,8 @@ def budget_guard(cfg, reserve=True) -> None:
         raise SystemExit(f"{cfg.name}: the config sets no cap_usd: refusing (a launch states the most it may spend)")
     if not cfg.budget_scope:
         raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
-    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve)
+    bind = {"invocation": inv, "clusters_file": cfg.clusters_file} if reserve and inv else {}   # binds the reservation
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve, **bind)
     if not ok:
         raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
     print(f"budget: {why}", flush=True)
@@ -800,7 +801,7 @@ def _launch_locked(cfg, inv) -> int:
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
-    budget_guard(cfg)                             # before any key is read or cluster created
+    budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
     keys = read_keys()
     compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
@@ -1058,7 +1059,7 @@ def keeper_later(cfg) -> int:
                 clusters.pop("keeper", None)
                 keep_k = None
         if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
-            budget_guard(cfg)             # a new overflow pool or keeper is paid: checked and reserved only then
+            budget_guard(cfg, inv=clusters.get("invocation"))   # a new overflow pool or keeper is paid: reserved then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
         write_clusters(cfg, clusters)
@@ -3741,13 +3742,13 @@ def _self_test_budget(ok) -> None:
        and RunConfig(name="t", question_file="q").budget_scope == ""
        and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
        "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
-    made, keys = [], []
+    made, keys, kws = [], [], []
     calls = []
 
     def try_launch(cfg, verdict):
         made.clear(), keys.clear(), calls.clear()
         fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
-        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), verdict)[1]  # noqa: E731
+        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), kws.append(kw), verdict)[2]  # noqa: E731
         with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
                 mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
                                             "pipeline_preflight": lambda c, code: "v2",
@@ -3769,13 +3770,15 @@ def _self_test_budget(ok) -> None:
     ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
     msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+    ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
+       f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
     import tempfile
     with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
         cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
         json.dump({"run": {"name": cfg.name, "id": 5}}, open(cfg.clusters_file, "w"))
         json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
         seen, started = [], []
-        lbo = lambda scope, cap, name=None, reserve=True: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
+        lbo = lambda scope, cap, name=None, reserve=True, **k: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
         for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
             seen.clear(), started.clear()
             with mock.patch.object(budget, "launch_budget_ok", lbo), \
@@ -4595,7 +4598,7 @@ def _self_test() -> int:
         _self_test_budget(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"BU: {type(e).__name__}: {e}")
-    globals()["budget_guard"] = lambda cfg, reserve=True: None   # the launch cases below predate the budget (BU1-BU4 test it)
+    globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)
