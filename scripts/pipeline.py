@@ -1886,6 +1886,15 @@ def _self_test() -> int:
            and os.path.exists(os.path.join(d, REPORT)) and os.path.exists(os.path.join(d, STATE)),
            f"PL3 the first run builds every step and records it: {summary_line(rep)} {rep['steps']}")
         ok(plan(d) == [] and run(d)["steps"] == [], f"PL4 nothing changed: nothing reruns: {plan(d)}")
+        with tempfile.TemporaryDirectory() as d2:   # F6: each pipeline run has an id its steps see (MA_PIPELINE_RUN)
+            d2 = os.path.realpath(d2)
+            w(d2, "models/e.py", "import os\nopen('models/e.out', 'w').write(os.environ.get('MA_PIPELINE_RUN', ''))\n")
+            spec(d2, [{"id": "e", "run": f"{py} models/e.py", "inputs": [], "outputs": ["models/e.out"]}])
+            r2 = run(d2)
+            on_disk = json.load(open(os.path.join(d2, REPORT))).get("pipeline_run")
+            ok(r2.get("pipeline_run") and rd(d2, "models/e.out") == r2["pipeline_run"] == on_disk,
+               f"PL3b a pipeline run's id is in its report and in its steps' environment (MA_PIPELINE_RUN): "
+               f"{r2.get('pipeline_run')} {rd(d2, 'models/e.out')} {on_disk}")
         w(d, "data/y.csv", "20\n")
         ok([p["id"] for p in plan(d)] == ["b", "c"], f"PL5 a changed input: only its step and downstream: {plan(d)}")
         rep = run(d)

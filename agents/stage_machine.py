@@ -2861,6 +2861,36 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     ok(got == ["infra", None, None, None, None, None, None],
        f"T61c infra only, in a summary written during this pipeline run, is resumable; a model or stopped row, no "
        f"failed row, an older summary, no summary, or no run dir is not ({got})")
+    # T62 (F6 preview, 2026-11-11): the joint calibration's bench batch lost one task to infra, in a run dir restored
+    # from a checkpoint (every mtime reset); "this pipeline run's" summaries are known by the pipeline run id
+    r = os.path.join(td, "restored")
+    for sub in ("models", "analysis/batch", "analysis/joint_calibration/call2"):
+        os.makedirs(os.path.join(r, sub), exist_ok=True)
+    rep2 = dict(rep1, pipeline_run="P1")
+    files = {"models/pipeline_report.json": rep2,
+             "analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json":
+                 {"pipeline_run": "P1", "n": 42, "n_failed": 1, "failed_by_kind": {"infra": 1}},
+             "analysis/joint_calibration/call2/points.jsonl.summary.json":
+                 {"pipeline_run": "P1", "n": 64, "n_failed": 0, "failed_by_kind": {}},
+             "analysis/batch/results.jsonl.summary.json":            # an earlier pipeline run's: never read now
+                 {"pipeline_run": "P0", "n": 8, "n_failed": 1, "failed_by_kind": {"model": 1}}}
+
+    def restored(report_age=0.0, **over):
+        for rel, obj in {**files, **over}.items():
+            json.dump(obj, open(os.path.join(r, rel), "w"))
+            os.utime(os.path.join(r, rel), (1e9, 1e9))
+        os.utime(os.path.join(r, "models", "pipeline_report.json"), (1e9 + report_age, 1e9 + report_age))
+        return analysis_failure_cause(rep2, r)
+    got2 = [restored(), restored(report_age=3600.0),
+            restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json":
+                        {"pipeline_run": "P1", "n": 42, "n_failed": 1, "failed_by_kind": {"model": 1}}})]
+    st2 = RunState(question="q", state="FINAL", status="run_failed",
+                   history=[{"from": "ANALYZE", "to": "FINAL", "why": "analysis failed"}])
+    restored()
+    ok(got2 == ["infra", "infra", None] and resumable_failure(r, st2) == "infra",
+       f"T62 a restored run dir whose joint-calibration bench batch lost one task to infra is resumable 'infra' "
+       f"(summaries matched by pipeline run id, not mtimes; an earlier run's model failure is ignored; a model "
+       f"failure in this run is not resumable), so --resume reopens it at ANALYZE: {got2}")
 
 
 def _self_test_geometry(ok, td: str) -> None:
