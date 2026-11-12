@@ -1532,29 +1532,32 @@ def _infra_batch(run_dir: str, rep: dict) -> bool:
     compute.py wrote under analysis/batch/ during this run, i.e. after the run's start (the report's mtime minus its
     `seconds`, on the same clock as theirs): at least one has failed rows, and every one with failed rows has only
     infra ones. Never read from the error text. Anything unreadable is False (not resumable).
-    F6 (2026-11-11): also the joint calibration's batches (JC_DIR, recursively: bench_call*_phase*.jsonl and
-    call*/points.jsonl), and a summary carrying `pipeline_run` belongs to this run when it equals the report's, so a
-    run dir copied or restored from a checkpoint (mtimes reset) is still classified; one without it falls back to
-    the mtime rule."""
+    F6 (2026-11-11): also the joint calibration's primary batches (JC_DIR: bench_call*_phase*.jsonl and
+    call<N>/points.jsonl or results.jsonl directly under it; never sensitivity_* or another subdirectory, whose
+    batches the failing step does not depend on). When the report carries `pipeline_run`, only summaries with the
+    same id count (untagged ones are ignored), so a run dir copied or restored from a checkpoint (mtimes reset) is
+    still classified; the mtime rule applies only to a report without an id."""
     run_id = rep.get("pipeline_run") if isinstance(rep, dict) else None
     try:
         started = os.path.getmtime(os.path.join(run_dir, "models", "pipeline_report.json")) - float(rep["seconds"]) - 2.0
     except (OSError, KeyError, TypeError, ValueError):
         return False
-    paths = []
-    for sub in (BATCH_DIR, JC_DIR):
-        for dp, dirs, fns in os.walk(os.path.join(run_dir, sub)):
-            dirs.sort()
-            paths += [os.path.join(dp, n) for n in sorted(fns) if n.endswith(".summary.json")]
+    import glob
+    import re
+    paths = sorted(glob.glob(os.path.join(run_dir, BATCH_DIR, "*.summary.json")))
+    jc = os.path.join(run_dir, JC_DIR)   # Codex on #200: only the primary calibration's batches, never sensitivity_*
+    paths += sorted(glob.glob(os.path.join(jc, "bench_call*_phase*.jsonl.summary.json")))
+    paths += sorted(p for p in glob.glob(os.path.join(jc, "call*", "*.jsonl.summary.json"))
+                    if re.fullmatch(r"call\d+", os.path.basename(os.path.dirname(p)))
+                    and os.path.basename(p) in ("points.jsonl.summary.json", "results.jsonl.summary.json"))
     failed = 0
     for p in paths:
         try:
             with open(p) as f:
                 summ = json.load(f)
-            mine = summ.get("pipeline_run")
-            if run_id and mine:
-                if mine != run_id:
-                    continue                      # an earlier pipeline run's batch
+            if run_id:                            # Codex on #200: the run id decides; an untagged summary is not ours
+                if summ.get("pipeline_run") != run_id:
+                    continue
             elif os.path.getmtime(p) < started:
                 continue                          # an earlier pipeline run's batch (no run id: the mtime rule)
             kinds, n_failed = summ.get("failed_by_kind"), int(summ.get("n_failed") or 0)
