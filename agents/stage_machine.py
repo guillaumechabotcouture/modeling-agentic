@@ -2897,6 +2897,25 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     got2 = [restored(), restored(report_age=3600.0),
             restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json":
                         {"pipeline_run": "P1", "n": 42, "n_failed": 1, "failed_by_kind": {"model": 1}}})]
+    # T62b (Codex on #200): an optional batch (a sensitivity run under its own subdirectory) that lost rows to infra
+    # does not make a model rejection resumable; only the primary joint-calibration batches and analysis/batch count
+    ok_bench = {"pipeline_run": "P1", "n": 42, "n_failed": 0, "failed_by_kind": {}}
+    sens = os.path.join(r, "analysis", "joint_calibration", "sensitivity_s1", "call1")
+    os.makedirs(sens, exist_ok=True)
+    json.dump({"pipeline_run": "P1", "n": 9, "n_failed": 2, "failed_by_kind": {"infra": 2}},
+              open(os.path.join(sens, "points.jsonl.summary.json"), "w"))
+    optional = restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json": ok_bench})
+    os.remove(os.path.join(sens, "points.jsonl.summary.json"))
+    # T62c (Codex on #200): when the report has a pipeline run id, an untagged summary never counts, however new
+    untagged = os.path.join(r, "analysis", "batch", "old.jsonl.summary.json")
+    json.dump({"n": 4, "n_failed": 1, "failed_by_kind": {"infra": 1}}, open(untagged, "w"))
+    old_only = restored(**{"analysis/joint_calibration/bench_call3_phase1.jsonl.summary.json": ok_bench})
+    os.utime(untagged, None)
+    old_only_fresh = analysis_failure_cause(rep2, r)
+    os.remove(untagged)
+    ok(optional is None and old_only is None and old_only_fresh is None,
+       f"T62b-c an infra-only optional (sensitivity) batch, or an untagged summary when the report has a run id, "
+       f"never makes the failure resumable: {optional} {old_only} {old_only_fresh}")
     st2 = RunState(question="q", state="FINAL", status="run_failed",
                    history=[{"from": "ANALYZE", "to": "FINAL", "why": "analysis failed"}])
     restored()
