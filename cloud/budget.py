@@ -39,11 +39,13 @@ worker or instance data, a negative cost, and a missing cost while an instance i
 the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
-ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time). A reservation
-names the exact cluster its launch creates and counts its whole cap until that cluster, or one of its helpers
-(<name>-keeper, <name>-overflow), created after the reservation appears; then max(0, cap - those clusters' spend)
-until all of them are stopped, when it is released; one whose cluster never appears lapses after
-2 h. A malformed ledger refuses. This guards against concurrent launches from this machine only.
+ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time, and the
+launcher's clusters.json when given). A reservation counts its whole cap until its launch's clusters appear, then
+max(0, cap - their spend) until all of them are stopped, when it is released; one whose clusters never appear
+lapses after 2 h. Its launch's clusters are the ids its clusters.json records for its invocation, when it does.
+Otherwise they are the exact cluster it names and its helpers (<name>-keeper, <name>-overflow), created after the
+reservation and before the next reservation of the same name, so a relaunch's clusters never hold an earlier
+launch's reservation. A malformed ledger refuses. This guards against concurrent launches from this machine only.
 """
 from __future__ import annotations
 
@@ -479,7 +481,8 @@ def _measure(rec, env, now) -> dict:
 
 
 def _ledger(env, now) -> list:
-    """The reservations ledger: a list of {scope, cap_usd, name, invocation, time}; anything else refuses."""
+    """The reservations ledger: a list of {scope, cap_usd, name, invocation, time[, clusters_file]}; anything else
+    refuses."""
     try:
         allr = json.load(open(env.reservations))
     except FileNotFoundError:
@@ -489,7 +492,8 @@ def _ledger(env, now) -> list:
     def num(x):
         return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
     ok = isinstance(allr, list) and all(
-        isinstance(r, dict) and set(r) == {"scope", "cap_usd", "name", "invocation", "time"}
+        isinstance(r, dict) and set(r) - {"clusters_file"} == {"scope", "cap_usd", "name", "invocation", "time"}
+        and isinstance(r.get("clusters_file", ""), str)
         and isinstance(r["scope"], str) and isinstance(r["name"], str) and r["name"] and isinstance(r["invocation"], str)
         and num(r["cap_usd"]) and r["cap_usd"] > 0 and num(r["time"]) and 0 < r["time"] <= now + CLOCK_SKEW_S
         for r in allr)
@@ -498,18 +502,41 @@ def _ledger(env, now) -> list:
     return allr
 
 
+def _launch_ids(r):
+    """The cluster ids the reservation's launch recorded in its clusters.json for its invocation, or None (no file,
+    another invocation's record, or no id yet)."""
+    try:
+        rec = json.load(open(r["clusters_file"])) if r.get("clusters_file") else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("invocation") != r["invocation"]:
+        return None
+    ids = {v.get("id") for k, v in rec.items() if k in ("run", "keeper", "overflow") and isinstance(v, dict)} - {None}
+    return ids or None
+
+
 def _reservations(env, scope, rows, now):
     """(this scope's open reservations, each with its outstanding USD; the ledger to keep). A reservation names the
     exact cluster its launch creates (helpers: <name>-keeper, <name>-overflow); it holds its cap until such a cluster
     created after the reservation appears, then max(0, cap - those clusters' spend) while any of them runs;
-    it is released once all are stopped, or after RESERVATION_S with none."""
+    it is released once all are stopped, or after RESERVATION_S with none. Its launch's clusters: the ids its
+    clusters.json records for its invocation, when it does; otherwise those of its names created after it and before
+    the next reservation of the same name (a relaunch's clusters never hold an earlier launch's reservation)."""
     mine, keep = [], []
-    for r in _ledger(env, now):
+    ledger = _ledger(env, now)
+    for r in ledger:
         if r["scope"] != scope:
             keep.append(r)                 # another scope's: measured by its own launches
             continue
-        own = {r["name"], r["name"] + "-keeper", r["name"] + "-overflow"}   # the launch's cluster and its helpers
-        match = [x for x in rows if x["name"] in own and x["created"] >= r["time"] - CLOCK_SKEW_S]
+        ids = _launch_ids(r)
+        if ids is not None:
+            match = [x for x in rows if x["id"] in ids]
+        else:
+            own = {r["name"], r["name"] + "-keeper", r["name"] + "-overflow"}   # the launch's cluster and its helpers
+            nxt = min((q["time"] for q in ledger if q is not r and q["scope"] == scope and q["name"] == r["name"]
+                       and q["time"] > r["time"]), default=math.inf)
+            match = [x for x in rows if x["name"] in own and r["time"] - CLOCK_SKEW_S <= x["created"]
+                     < nxt - CLOCK_SKEW_S]
         if match:
             if not any(x["live_instances"] or x["listed_state"] not in ENDED for x in match):
                 continue                   # every cluster of the launch stopped: released
@@ -559,10 +586,11 @@ class _Lock:
         return False
 
 
-def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
+def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, clusters_file=None) -> tuple[bool, str]:
     """ok only if the scope's owner-signed budget verifies and has started, `name` starts with one of its signed
     prefixes, and used + open reservations + `cap_usd` is within it. With `reserve`, a launch that fits records a
-    reservation of `cap_usd` for `name` (under the same lock). Any error refuses."""
+    reservation of `cap_usd` for `name` (under the same lock), under `invocation` (default MA_LAUNCH_INVOCATION) and,
+    when given, the launcher's clusters.json, whose ids for that invocation bind the reservation. Any error refuses."""
     env = _ENV
     try:
         cap = _num(cap_usd, "cap_usd")
@@ -580,8 +608,11 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
             fits = round(s["used_usd"] + s["reserved_usd"] + cap, 6) <= round(s["budget_usd"], 6)
             if fits and reserve:
                 keep = s["_keep"]
-                inv = os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
-                keep.append({"scope": scope, "cap_usd": cap, "name": name, "invocation": inv, "time": now})
+                inv = invocation or os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
+                entry = {"scope": scope, "cap_usd": cap, "name": name, "invocation": str(inv), "time": now}
+                if clusters_file:
+                    entry["clusters_file"] = os.path.abspath(str(clusters_file))
+                keep.append(entry)
                 os.makedirs(os.path.dirname(env.reservations), exist_ok=True)
                 with open(env.reservations + ".tmp", "w") as f:
                     json.dump(keep, f, indent=1)
@@ -1156,8 +1187,9 @@ def _self_test() -> int:
             ok([x["invocation"] for x in s20b["reservations"]] == ["inv-b"],
                f"BR20b a reservation whose launch's clusters.json names its cluster ids reconciles only against those "
                f"ids (two concurrent launches of one name): {[x['invocation'] for x in s20b['reservations']]}")
-            ok([x["invocation"] for x in s20c["reservations"]] == ["inv-b"],
-               f"BR20c a clusters.json rewritten by another invocation falls back to the name-and-time rule: "
+            ok([x["invocation"] for x in s20c["reservations"]] == ["inv-a", "inv-b"],
+               f"BR20c a clusters.json rewritten by another invocation falls back to the name-and-time rule, which "
+               f"cannot tell two same-second reservations apart and holds both (safe): "
                f"{[x['invocation'] for x in s20c['reservations']]}")
         case("BR20", bg20)
 
