@@ -35,8 +35,11 @@ last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.y
 process stopped or errored, with its stop time) counts what it billed, or the estimate if a cost is missing; its VM
 records end with their processes. A cluster with a live instance counts max(billed, estimate). One created before
 the budget's start counts its estimate from the start only. These refuse: an unknown VM type, missing scheduler,
-worker or instance data, a negative cost, and a missing cost while an instance is live. A budget whose start is in
-the future refuses launches.
+worker or instance data, a negative cost, and a missing cost while an instance is live. A VM with no type yet
+(still being provisioned) is priced at the bound of the VM type its cluster's other workers have (an untyped
+scheduler: the highest among the scope's recent schedulers), or the table's highest when none is typed; a VM that
+Azure never created (ended, no type, "Failed to create ..." or no time passed) counts $0. Both are stated as
+assumptions in the breakdown. A named type that is not in the table refuses. A budget whose start is in the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
 ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time, and the
@@ -387,7 +390,20 @@ class CoiledSource:
 _RUNNING = ("started", "running", "ready")
 
 
-def _cluster_cost(d, now, start, median, prices) -> dict:
+def _never_ran(inst) -> bool:
+    """An ended VM record with no type that never ran: Azure refused to create it (quota), or no time passed."""
+    cs = inst.get("current_state") or {}
+    return (state_of(inst) in ENDED and not inst.get("instance_type_id")
+            and (str(cs.get("reason") or "").startswith("Failed to create")
+                 or _ts(cs.get("updated")) == _ts(inst.get("created"))))
+
+
+def _vm_type(p):
+    inst = (p or {}).get("instance") if isinstance(p, dict) else None
+    return (inst or {}).get("instance_type_id") or None
+
+
+def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
     """One cluster: billed USD, the estimate in the window, and the count. A finished cluster (every process stopped
     or errored, with its stop time) counts what it billed; its VM records end with their processes, even one Coiled
     left non-final (a VM refused for quota stays `queued`), and the conservative estimate stands in only for a
@@ -399,13 +415,20 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     procs = [d["scheduler"]] + d["workers"]
     done = all(isinstance(p, dict) and state_of(p) in ENDED and _ts((p.get("current_state") or {}).get("updated"))
                is not None for p in procs)
-    live, hours, est = 0, 0.0, 0.0
+    live, hours, est, untyped, failed = 0, 0.0, 0.0, 0, 0
+    top = max(prices.values())
+    worker_typed = [prices[t] for t in map(_vm_type, d["workers"]) if t in prices]
+    worker_bound = max(worker_typed) if worker_typed else top     # an untyped worker: like the cluster's other workers
+    sched_bound = top if sched_bound is None else sched_bound     # an untyped scheduler: like the scope's schedulers
     for p in procs:
         inst = p.get("instance") if isinstance(p, dict) else None
         if not inst:
             if not isinstance(p, dict) or state_of(p) in _RUNNING or not state_of(p):
                 raise BudgetError(f"cluster {d.get('id')}: a process without instance data")
             continue                       # a process that never got a VM (pending, refused)
+        if _never_ran(inst):
+            failed += 1                    # Azure never created it (e.g. quota): nothing ran, nothing billed
+            continue
         t0, vm = _ts(inst.get("created")), inst.get("instance_type_id")
         ended = state_of(inst) in ENDED
         on = not done and not ended
@@ -415,10 +438,15 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
             raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
         if (not on and t1 < t0) or t0 > now + CLOCK_SKEW_S:
             raise BudgetError(f"cluster {d.get('id')}: an instance stopped before it started, or starts in the future")
-        if vm not in prices:
+        if vm is None or vm == "":        # a VM still being provisioned has no type yet
+            bound = sched_bound if p is d["scheduler"] else worker_bound
+            untyped += 1
+        elif vm not in prices:
             raise BudgetError(f"cluster {d.get('id')}: VM type {vm!r} is not in cloud/vm_prices.yaml")
+        else:
+            bound = prices[vm]
         hours += max(0.0, t1 - t0) / 3600
-        est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, prices[vm])
+        est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, bound)
         live += on
     tc, cc = d["total_cost"], d["cloud_total_cost"]
     if live and tc is None and cc is None:
@@ -436,7 +464,11 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     before = created < start
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
-            "usd": est if before else count, "_billed_all": None if fallback else billed}
+            "usd": est if before else count, "_billed_all": None if fallback else billed,
+            "assumptions": ([f"{untyped} instance(s) with no VM type yet (still provisioning), priced at the bound "
+                             f"of the cluster's other workers' VM type (an untyped scheduler: the scope's schedulers'), "
+                             f"or the table's highest, ${top:.2f} per hour, when none is typed"] if untyped else [])
+            + ([f"{failed} instance(s) failed to create, counted $0"] if failed else [])}
 
 
 def _measure(rec, env, now) -> dict:
@@ -472,11 +504,15 @@ def _measure(rec, env, now) -> dict:
     n = len(sample)
     median = 0.0 if not n else sample[n // 2] if n % 2 else (sample[n // 2 - 1] + sample[n // 2]) / 2
     median = max(median, _num(rec["floor_usd_per_instance_hour"], "floor"))
-    rows = [_cluster_cost(dets[c["id"]], now, start, median, prices) for c in counted]
+    seen = [prices[t] for t in (_vm_type(x.get("scheduler")) for x in dets.values() if isinstance(x, dict))
+            if t in prices]
+    sched_bound = max(seen) if seen else None
+    rows = [_cluster_cost(dets[c["id"]], now, start, median, prices, sched_bound) for c in counted]
     for r, c in zip(rows, counted):
         r.pop("_billed_all")
         r["listed_state"] = state_of(c)
     return {"median": median, "rate_from_clusters": n, "prices": prices, "start": start, "rows": rows,
+            "sched_bound": sched_bound,
             "items": items}
 
 
@@ -630,7 +666,8 @@ def job_meter(scope):
     m = s["_m"]
 
     def meter(cid):
-        return _cluster_cost(env.coiled().details(cid), env.clock(), m["start"], m["median"], m["prices"])["usd"]
+        return _cluster_cost(env.coiled().details(cid), env.clock(), m["start"], m["median"], m["prices"],
+                             m["sched_bound"])["usd"]
     return meter
 
 
@@ -643,6 +680,7 @@ def status_lines(s) -> list[str]:
            f"{'cluster':<40} {'id':>9} {'state':<9} {'billed':>9} {'estimate':>9} {'counted':>9} {'live VMs':>8}"]
     out += [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} {r['estimate_usd']:>9.2f} "
             f"{r['usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
+    out += [f"  assumption, {r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", [])]
     return out + [f"reservation {r['name']}: cap ${r['cap_usd']:.2f}, outstanding ${r['outstanding_usd']:.2f} "
                   f"({r['invocation']})" for r in s["reservations"]]
 
@@ -1192,6 +1230,65 @@ def _self_test() -> int:
                f"cannot tell two same-second reservations apart and holds both (safe): "
                f"{[x['invocation'] for x in s20c['reservations']]}")
         case("BR20", bg20)
+
+        def bg21():
+            # 2026-11-11 21:17 (canary, cluster 2366111 scaling 5 -> 48 workers): VMs still being provisioned report
+            # instance_type_id None; three refused readings in a row stopped the run as spend-unreadable. Seven of
+            # them were workers in `error` that Azure never created (quota).
+            X = 40
+
+            def cluster(sched, workers, extra=()):
+                d_ = _det(X, "lw-smoke-scale", now - 3 * H, 0, 0.0, "running",
+                          insts=[(now - 2 * H, None, sched)] + [(now - H, None, w) for w in workers])
+                d_["workers"] += [json.loads(json.dumps(e)) for e in extra]
+                return d_
+
+            def usd(det_x, base=True):
+                it = (items if base else []) + [_item(X, "lw-smoke-scale", now - 3 * H, "running", now)]
+                de = ({k: v for k, v in dets.items()} if base else {})
+                de[X] = det_x
+                with_env(env(r8, source=_FakeSource(it, de)))
+                s_ = spend("f6")
+                return {c["id"]: c for c in s_["clusters"]}[X], "\n".join(status_lines(s_))
+
+            pend = [None, None]
+            got, txt = usd(cluster("vmA", ["vmA", "vmA"] + pend))
+            want, _ = usd(cluster("vmA", ["vmA"] * 4))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and any("no VM type" in x for x in got["assumptions"])
+               and "no VM type" in txt,
+               f"BR21 untyped pending workers are priced at the bound of the VM type the cluster's other workers have "
+               f"(not the table maximum), stated as an assumption: {got['usd']:.3f} == {want['usd']:.3f}; "
+               f"{got['assumptions']}")
+            got, _ = usd(cluster("vmA", [None] * 4))
+            want, _ = usd(cluster("vmA", ["vmB"] * 4))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9,
+               f"BR21c with no typed worker yet, untyped workers take the table maximum: {got['usd']:.3f} == "
+               f"{want['usd']:.3f}")
+            got, _ = usd(cluster(None, ["vmA"] * 2))
+            want, _ = usd(cluster("vmA", ["vmA"] * 2))
+            got2, _ = usd(cluster(None, ["vmA"] * 2), base=False)
+            want2, _ = usd(cluster("vmB", ["vmA"] * 2), base=False)
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and abs(got2["usd"] - want2["usd"]) < 1e-9,
+               f"BR21d an untyped scheduler takes the highest scheduler bound among the scope's recent clusters "
+               f"(vmA here), else the table maximum: {got['usd']:.3f} == {want['usd']:.3f}, "
+               f"{got2['usd']:.3f} == {want2['usd']:.3f}")
+            failed = {"current_state": {"state": "error", "updated": _iso(now - H)},
+                      "instance": {"created": _iso(now - H), "instance_type_id": None,
+                                   "current_state": {"state": "error", "updated": _iso(now - H),
+                                                     "reason": "Failed to create VM -- (OperationNotAllowed) Operation "
+                                                               "could not be completed as it results in exceeding "
+                                                               "approved standardESv5Family Cores quota."}}}
+            got, txt = usd(cluster("vmA", ["vmA", "vmA"], extra=[failed] * 7))
+            want, _ = usd(cluster("vmA", ["vmA", "vmA"]))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and any("7 instance(s) failed to create, counted $0" in x
+                                                              for x in got["assumptions"]) and "failed to create" in txt,
+               f"BR21e workers in error that Azure never created (no type, quota) count $0 and are listed: "
+               f"{got['usd']:.3f} == {want['usd']:.3f}; {got['assumptions']}")
+            with_env(env(r8, source=_FakeSource(items + [_item(X, "lw-smoke-scale", now - 3 * H, "running", now)],
+                                                {**dets, X: cluster("vmA", ["Azure_Z99"])})))
+            ok(refused(lambda: spend("f6")) is not None and not launch_budget_ok("f6", 1, "lw-smoke-z")[0],
+               "BR21b a named VM type that is not in the table still refuses")
+        case("BR21", bg21)
 
         def bg13():
             with_env(env(r8, source=_FakeSource(items, dets)))
