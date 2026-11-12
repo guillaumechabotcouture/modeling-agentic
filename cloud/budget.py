@@ -35,8 +35,9 @@ last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.y
 process stopped or errored, with its stop time) counts what it billed, or the estimate if a cost is missing; its VM
 records end with their processes. A cluster with a live instance counts max(billed, estimate). One created before
 the budget's start counts its estimate from the start only. These refuse: an unknown VM type, missing scheduler,
-worker or instance data, a negative cost, and a missing cost while an instance is live. A budget whose start is in
-the future refuses launches.
+worker or instance data, a negative cost, and a missing cost while an instance is live. A VM with no type yet
+(still being provisioned) is priced at the table's highest bound, stated as an assumption in the breakdown; a named
+type that is not in the table refuses. A budget whose start is in the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
 ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time, and the
@@ -399,7 +400,7 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     procs = [d["scheduler"]] + d["workers"]
     done = all(isinstance(p, dict) and state_of(p) in ENDED and _ts((p.get("current_state") or {}).get("updated"))
                is not None for p in procs)
-    live, hours, est = 0, 0.0, 0.0
+    live, hours, est, untyped = 0, 0.0, 0.0, 0
     for p in procs:
         inst = p.get("instance") if isinstance(p, dict) else None
         if not inst:
@@ -415,10 +416,15 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
             raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
         if (not on and t1 < t0) or t0 > now + CLOCK_SKEW_S:
             raise BudgetError(f"cluster {d.get('id')}: an instance stopped before it started, or starts in the future")
-        if vm not in prices:
+        if vm is None or vm == "":        # a VM still being provisioned has no type yet: the highest bound
+            bound = max(prices.values())
+            untyped += 1
+        elif vm not in prices:
             raise BudgetError(f"cluster {d.get('id')}: VM type {vm!r} is not in cloud/vm_prices.yaml")
+        else:
+            bound = prices[vm]
         hours += max(0.0, t1 - t0) / 3600
-        est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, prices[vm])
+        est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, bound)
         live += on
     tc, cc = d["total_cost"], d["cloud_total_cost"]
     if live and tc is None and cc is None:
@@ -436,7 +442,9 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     before = created < start
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
-            "usd": est if before else count, "_billed_all": None if fallback else billed}
+            "usd": est if before else count, "_billed_all": None if fallback else billed,
+            "assumptions": ([f"{untyped} instance(s) with no VM type yet (still provisioning), priced at the table's "
+                             f"highest bound, ${max(prices.values()):.2f} per hour"] if untyped else [])}
 
 
 def _measure(rec, env, now) -> dict:
@@ -643,6 +651,7 @@ def status_lines(s) -> list[str]:
            f"{'cluster':<40} {'id':>9} {'state':<9} {'billed':>9} {'estimate':>9} {'counted':>9} {'live VMs':>8}"]
     out += [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} {r['estimate_usd']:>9.2f} "
             f"{r['usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
+    out += [f"  assumption, {r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", [])]
     return out + [f"reservation {r['name']}: cap ${r['cap_usd']:.2f}, outstanding ${r['outstanding_usd']:.2f} "
                   f"({r['invocation']})" for r in s["reservations"]]
 
