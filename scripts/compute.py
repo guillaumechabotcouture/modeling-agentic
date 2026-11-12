@@ -2354,11 +2354,15 @@ FP_DISPATCH_EXEMPT = (
     "register_compute_tags", "_guard_registration", "BusyWorkerGuard", "ComputeTagPlugin",
     "WORKER_OPTIONS", "ADAPT_OPTIONS", "DEMAND_RESOURCE",
     "RETIRED_EVENTS", "SCALEDOWN_RETRIES", "INFRA_RETRIES", "INFRA_BACKOFF_S", "NO_WORKER_WAIT_S",
-    # the ledger, progress records and heartbeats (accounting, never a row)
-    "_LedgerLock", "_note", "_write_note", "_write_note_locked", "_rows_done", "_settle_dead",
+    # the ledger, progress records and heartbeats (accounting, never a row; _rows_done is not here: it handles
+    # rows on their way to the reusable journal, Codex review of #205)
+    "_LedgerLock", "_note", "_write_note", "_write_note_locked", "_settle_dead",
     "_live_reservations", "_start_heartbeat", "_progress_path", "_foreign_dead", "_drop_progress",
     "_known_core_s",
 )
+# Functions nested in an exempt definition that stay hashed (Codex review of #205): _map_dask's submit builds
+# the params each _remote_task receives.
+FP_DISPATCH_KEEP_NESTED = {"_map_dask": ("submit",)}
 
 
 def _fp_compute_source(text: str) -> bytes:
@@ -2371,17 +2375,36 @@ def _fp_compute_source(text: str) -> bytes:
     except SyntaxError:
         return text.encode()
     lines = text.splitlines(True)
+    exempt = set(FP_DISPATCH_EXEMPT)
+    rows_of = {}                                   # line -> top-level nodes on it (a `;` puts two on one line)
+    for n in body:
+        for ln in range(n.lineno, n.end_lineno + 1):
+            rows_of.setdefault(ln, []).append(n)
     spans, prev_end = [], 0
     for n in body:
-        names = ({n.name} if hasattr(n, "name") else
-                 {t.id for t in getattr(n, "targets", []) if isinstance(t, ast.Name)})
-        hit = sorted(names & set(FP_DISPATCH_EXEMPT))
-        if hit:
-            spans.append((prev_end, n.end_lineno, hit[0]))
+        start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = n.name if n.name in exempt else None
+        elif isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
+            # Every name it sets is exempt, and no other statement shares its lines (Codex review of #205).
+            ids = {t.id for t in n.targets}
+            alone = all(rows_of[ln] == [n] for ln in range(n.lineno, n.end_lineno + 1))
+            name = sorted(ids)[0] if ids <= exempt and alone else None
+        else:
+            name = None
+        if name:
+            gap = lines[prev_end:start - 1]
+            a = prev_end if all(not g.strip() or g.lstrip().startswith("#") for g in gap) else start - 1
+            kept = []
+            for nested in FP_DISPATCH_KEEP_NESTED.get(name, ()):
+                for sub in ast.walk(n):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == nested:
+                        kept += lines[sub.lineno - 1:sub.end_lineno]
+            spans.append((a, n.end_lineno, name, kept))
         prev_end = n.end_lineno
     out, at = [], 0
-    for a, b, name in spans:
-        out += lines[at:a] + [f"<exempt {name}>\n"]
+    for a, b, name, kept in spans:
+        out += lines[at:a] + [f"<exempt {name}>\n"] + kept
         at = b
     return "".join(out + lines[at:]).encode()
 
@@ -3798,13 +3821,34 @@ def _self_test_fp_dispatch(ok) -> None:
             for text in (src, edit("_sched_view", "pass"), edit("_call", "pass")):
                 open(cp, "w").write(text)
                 fps.append(code_fingerprint(rd, "models/m.py::f"))
+            # Codex review of #205 (P3): another file already present, edited between two fingerprints in an
+            # exempt-named function, still changes the fingerprint (a new path alone would have).
+            open(cp, "w").write(src)
             other = os.path.join(repo, "scripts", "other.py")
+            open(other, "w").write(src)
+            fp_o1 = code_fingerprint(rd, "models/m.py::f")
             open(other, "w").write(edit("_sched_view", "pass"))
-            fp_other = code_fingerprint(rd, "models/m.py::f")
+            fp_o2 = code_fingerprint(rd, "models/m.py::f")
         finally:
             globals()["REPO"] = saved
-        ok(fps[0] == fps[1] and fps[0] != fps[2] and fp_other != fps[2] and fp_other != fps[0],
-           f"FPX5 code_fingerprint applies the exemption to scripts/compute.py only: {fps} {fp_other}")
+        ok(fps[0] == fps[1] and fps[0] != fps[2] and fp_o1 != fp_o2,
+           f"FPX5 code_fingerprint applies the exemption to scripts/compute.py only: {fps} {fp_o1} {fp_o2}")
+    # Codex review of #205 (P2): what reaches a worker and what reaches the reusable journal stays hashed:
+    # _map_dask's nested submit (the params sent to _remote_task) and _rows_done (rows before the journal).
+    t_ = ast.parse(src)
+    md = next(n for n in t_.body if getattr(n, "name", None) == "_map_dask")
+    sub = next(n for n in ast.walk(md) if isinstance(n, ast.FunctionDef) and n.name == "submit")
+    lines_ = src.splitlines(True)
+    at_ = sub.body[-1].lineno - 1
+    src_sub = "".join(lines_[:at_] + [" " * (sub.col_offset + 4) + "ch = list(ch)\n"] + lines_[at_:])
+    ok(_fp_compute_source(src_sub) != base and _fp_compute_source(edit("_rows_done", "pass")) != base,
+       "FPX6 a change to _map_dask's nested submit or to _rows_done changes the fingerprint")
+    # Codex review of #205 (P2): an exempt name sharing an assignment or a line with a non-exempt one is hashed.
+    multi = lambda v: src.replace("INFRA_RETRIES = 3 ", f"INFRA_RETRIES = FPX_OTHER = {v} ", 1)
+    semi = lambda v: src.replace("INFRA_RETRIES = 3 ", f"INFRA_RETRIES = 3; FPX_OTHER = {v} ", 1)
+    ok(_fp_compute_source(multi(3)) != _fp_compute_source(multi(4))
+       and _fp_compute_source(semi(3)) != _fp_compute_source(semi(4)),
+       "FPX7 an exempt name in a shared assignment or on a shared line does not hide the other name's change")
 
 
 def _self_test_signoff_reuse(ok) -> None:
