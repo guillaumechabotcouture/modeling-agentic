@@ -403,27 +403,33 @@ def _archive_member(code: bytes, name: str) -> bytes | None:
 SHEET_SOURCES_MARK = "<!-- signoff-sheet-sources: "   # toolkit/spec/signoff.py SHEET_SOURCES, the sheet's last line
 
 
-def stale_sheet_problems(code: bytes, flags) -> list[str]:
+def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
     """For a resumed run (--resume <run dir>) still at SIGN in the archive that ships: the sign-off sheet must
     record the sha256 of the shipped decision_spec.yaml and data/derivations_record.json ("none" when absent),
     as toolkit/spec/signoff.py write_sheet wrote them; the signer refuses otherwise, so the run would stop at
     SIGN after the cluster is paid for (2026-11-12 canary). Fail closed: a missing or unparsable sheet is a
-    problem. A run past SIGN, or a launch that resumes no run, has nothing to check here."""
+    problem. A run past SIGN, a launch that resumes no run, or a v1 launch (no run_state.json, no sheet) has
+    nothing to check here. `--resume <dir>` and `--resume=<dir>` are both read, the dir normalised as main.py
+    resolves it (Codex review of #207)."""
     import hashlib
-    flags = list(flags or ())
+    if pipeline != "v2":
+        return []
+    flags = [str(f) for f in (flags or ())]
     runs = [flags[i + 1] for i, f in enumerate(flags[:-1]) if f == "--resume"]
+    runs += [f.split("=", 1)[1] for f in flags if f.startswith("--resume=")]
     out = []
     for rel in runs:
-        rel = rel.rstrip("/")
+        rel = os.path.normpath(rel).replace(os.sep, "/")
         raw = _archive_member(code, f"{rel}/run_state.json")
         try:
-            state = json.loads(raw.decode()).get("state") if raw else None
-        except (ValueError, UnicodeDecodeError, AttributeError):
+            st = json.loads(raw.decode()) if raw is not None else None
+            state = st.get("state") if isinstance(st, dict) else None
+        except (ValueError, UnicodeDecodeError):
             state = None
-        if raw is not None and state != "SIGN":
-            continue
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
+            continue
+        if state != "SIGN":
             continue
         spec = _archive_member(code, f"{rel}/decision_spec.yaml")
         sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
@@ -849,7 +855,7 @@ def _launch_locked(cfg, inv) -> int:
     question = open(cfg.question_file).read().strip()
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
-    stale = stale_sheet_problems(code, cfg.flags)   # a run that would stop at SIGN once the cluster is paid for
+    stale = stale_sheet_problems(code, cfg.flags, pipeline)   # a run that would stop at SIGN once paid for
     if stale:
         raise SystemExit("refusing: " + "; ".join(stale))
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
@@ -4631,6 +4637,16 @@ def _self_test_sheet(ok) -> None:
        f"command that regenerates the sheet: {stale} {stale_rec}")
     ok(len(nosheet) == 1 and len(garbled) == 1,
        f"RC80c fail closed: no sheet, or a sheet without recorded sources, is refused: {nosheet} {garbled}")
+    # Codex review of #207 (both reviewers, P2): v2 only; ./ and --resume= forms are checked; an unreadable
+    # run state is refused, not skipped.
+    stale_tar = tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"})
+    v1 = stale_sheet_problems(stale_tar, flags, pipeline="v1")
+    dot = stale_sheet_problems(stale_tar, ("--resume", "./" + R))
+    eq = stale_sheet_problems(stale_tar, ("--resume=" + R,))
+    bad_state = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": b"{not json"}), flags)
+    ok(v1 == [] and len(dot) == 1 and len(eq) == 1 and len(bad_state) == 1 and "unreadable" in bad_state[0],
+       f"RC80d v1 launches are not checked; ./ and --resume= are; an unreadable run state is refused: "
+       f"{v1} {dot} {eq} {bad_state}")
 
 
 def _self_test() -> int:
