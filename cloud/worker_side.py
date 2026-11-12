@@ -734,6 +734,47 @@ def sync_observed(cluster, workers):
         merge()
 
 
+def guarded_adaptive(base=None):
+    """The keeper's Adaptive class: `base` (Coiled's CoiledAdaptive) with two checks around each decision.
+
+    Codex review round 2 of #203: refreshing the view once per keeper tick (60 s) leaves a window,
+    since Adaptive decides every `interval` (15 s), in which a worker that joined after the tick, with
+    close votes from its boot, is retired as "not yet arrived" without BusyWorkerGuard. Before each
+    decision the view gets every worker the scheduler has (added, never replaced: `sync_observed`).
+    After it, each worker to retire that the scheduler has goes only if `workers_to_close` (filtered
+    by BusyWorkerGuard) offers it; one the scheduler does not have (never joined) goes. A scheduler
+    that cannot be read retires nothing."""
+    if base is None:
+        try:
+            from coiled.cluster import CoiledAdaptive as base
+        except ImportError as e:   # a coiled without it (or a test's stand-in): dask's own, said in the log
+            from distributed.deploy.adaptive import Adaptive as base
+            print(f"keeper: coiled.cluster.CoiledAdaptive unavailable ({e}); guarding dask's Adaptive", flush=True)
+
+    class GuardedAdaptive(base):
+        async def recommendations(self, target):
+            comm = self.cluster.scheduler_comm
+            try:
+                info = await comm.identity(n_workers=-1)
+                table = self.cluster.scheduler_info.setdefault("workers", {})
+                table.update({a: w for a, w in (info.get("workers") or {}).items() if a not in table})
+            except Exception:  # noqa: BLE001 — unverifiable: no scale-down this round
+                return {"status": "same"}
+            rec = await super().recommendations(target)
+            if rec.get("status") != "down":
+                return rec
+            try:
+                info = await comm.identity(n_workers=-1)
+                present = {w.get("name") for w in (info.get("workers") or {}).values()}
+                safe = set(await comm.workers_to_close(target=0, attribute="name"))
+            except Exception:  # noqa: BLE001
+                return {"status": "same"}
+            keep = [w for w in rec.get("workers") or [] if w not in present or w in safe]
+            return {"status": "down", "workers": keep} if keep else {"status": "same"}
+
+    return GuardedAdaptive
+
+
 def scheduler_workers(get_client, attempts=6, delay_s=5.0, max_delay_s=60.0, min_workers=0, sleep=None, log=None):
     """The scheduler's worker table {address: info}, from client.scheduler_info()["workers"].
     distributed returns {} there (no "workers" key) whenever the client is not connected:
@@ -1023,7 +1064,7 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                 except SystemExit as e:
                     print(f"{time.strftime('%T')} {e}; keeper exiting", flush=True)
                     return "keeper exited"
-                cl.adapt(minimum=lo, maximum=hi, **adapt_options)
+                cl.adapt(Adaptive=guarded_adaptive(), minimum=lo, maximum=hi, **adapt_options)
                 box = [cl.get_client()]
 
                 def run_client():   # the inner loop keeps one client; a closed one is replaced

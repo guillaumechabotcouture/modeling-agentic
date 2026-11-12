@@ -2396,6 +2396,62 @@ def _self_test_52(ok) -> None:
        f"RC52l the merge runs on the Cluster's loop, adds only, and leaves every reported worker removable: "
        f"{len(calls)} {before} {cl2.scheduler_info['workers']}")
 
+    # Codex review round 2 of #203: a per-tick refresh leaves a window (Adaptive decides every 15 s, the
+    # keeper ticks every 60 s) in which a worker that joined after the tick, with close votes from its
+    # boot, is retired as "not yet arrived". The keeper's Adaptive refreshes the view before every
+    # decision and checks every worker it would retire against the scheduler: a worker the scheduler has
+    # goes only if workers_to_close (BusyWorkerGuard) offers it; an unreadable scheduler retires nothing.
+    import asyncio
+
+    class FakeComm:
+        def __init__(self, present, safe, fail=False):
+            self.present, self.safe, self.fail = present, safe, fail
+
+        async def identity(self, n_workers=-1):
+            if self.fail:
+                raise OSError("down")
+            return {"workers": {f"tls://{n}:1": {"name": n} for n in self.present}}
+
+        async def workers_to_close(self, target=None, attribute="address"):
+            if self.fail:
+                raise OSError("down")
+            return list(self.safe)
+
+    class Base:                                    # what AdaptiveCore does with a stale view
+        def __init__(self, cluster):
+            self.cluster = cluster
+
+        async def recommendations(self, target):
+            arrived = {w["name"] for w in self.cluster.scheduler_info["workers"].values()}
+            gone = sorted(set(self.cluster.requested) - arrived)
+            return {"status": "down", "workers": gone} if gone else {"status": "same"}
+
+    def decide(present, safe, view, requested, fail=False):
+        cl3 = types.SimpleNamespace(scheduler_info={"workers": {f"tls://{n}:1": {"name": n} for n in view}},
+                                    requested=set(requested), scheduler_comm=FakeComm(present, safe, fail))
+        return asyncio.run(ws.guarded_adaptive(Base)(cl3).recommendations(1)), cl3
+    # "late" joined after the keeper's tick and runs a chunk: the refresh sees it, nothing is retired.
+    r1, c1 = decide(["a", "late"], [], ["a"], ["a", "late"])
+    # Both now look not yet arrived (a stale view): "busy" is on the scheduler and not offered by
+    # workers_to_close, so it stays; "idle" is offered and goes; "boot" is not on the scheduler and goes.
+    class StaleBase(Base):
+        async def recommendations(self, target):
+            return {"status": "down", "workers": ["busy", "idle", "boot"]}
+    cl4 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy", "idle", "boot"},
+                                scheduler_comm=FakeComm(["busy", "idle"], ["idle"]))
+    r2 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl4).recommendations(1))
+    cl5 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy"},
+                                scheduler_comm=FakeComm(["busy"], [], fail=True))
+    r3 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl5).recommendations(1))
+    ok(r1 == {"status": "same"} and "tls://late:1" in c1.scheduler_info["workers"],
+       f"RC52p the keeper's Adaptive refreshes the worker view before each decision: a worker that joined "
+       f"after the tick is observed and not retired: {r1} {sorted(c1.scheduler_info['workers'])}")
+    ok(r2 == {"status": "down", "workers": ["idle", "boot"]},
+       f"RC52q every worker it would retire is checked against the scheduler: a busy one (not offered by "
+       f"workers_to_close) stays; an idle one and one that never joined go: {r2}")
+    ok(r3 == {"status": "same"},
+       f"RC52r with the scheduler unreadable it retires nothing: {r3}")
+
 
 def _self_test_51c(ok) -> None:
     """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""
