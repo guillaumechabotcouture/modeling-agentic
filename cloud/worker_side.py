@@ -707,6 +707,90 @@ def live_client(cluster, client):
     return cluster.get_client()
 
 
+def sync_observed(cluster, workers):
+    """Replace the attached Cluster's worker view with the scheduler's table `workers`.
+
+    dask's Adaptive closes workers it counts as requested but not yet arrived (`requested -
+    observed`) without asking `workers_to_close`, so BusyWorkerGuard never sees them. On
+    2026-11-12 (P6) the keeper's Cluster kept the 5 workers present when it attached while the
+    pool grew to 41: Adaptive retired workers in the middle of their chunks.
+
+    It only adds the workers the view lacks, never replaces or removes (Codex review of #203):
+    a worker that joined after the snapshot stays observed, and the Cluster's own status
+    stream still finds every worker it removes (its `del` on a missing key would end that
+    stream). The change runs on the Cluster's event loop, where that stream and Adaptive
+    read the table."""
+    info = getattr(cluster, "scheduler_info", None)
+    if not (isinstance(info, dict) and isinstance(info.get("workers"), dict) and isinstance(workers, dict)):
+        return
+
+    def merge():
+        table = info["workers"]
+        table.update({a: w for a, w in workers.items() if a not in table})
+    loop = getattr(cluster, "loop", None)
+    if loop is not None and hasattr(loop, "add_callback"):
+        loop.add_callback(merge)
+    else:
+        merge()
+
+
+def guarded_adaptive(base=None):
+    """The keeper's Adaptive class: `base` (Coiled's CoiledAdaptive) with two checks around each decision.
+
+    Codex review round 2 of #203: refreshing the view once per keeper tick (60 s) leaves a window,
+    since Adaptive decides every `interval` (15 s), in which a worker that joined after the tick, with
+    close votes from its boot, is retired as "not yet arrived" without BusyWorkerGuard. Before each
+    decision the view gets every worker the scheduler has (added, never replaced: `sync_observed`).
+    After it, one scheduler-side call keeps, of the workers to retire, those that have not joined and
+    those that are idle and kept by BusyWorkerGuard. A scheduler that cannot be read retires nothing.
+    Left: the gap between that call and Coiled's retire_workers call, the same gap dask's own
+    workers_to_close-then-retire path has."""
+    if base is None:
+        try:
+            from coiled.cluster import CoiledAdaptive as base
+        except ImportError as e:   # a coiled without it (or a test's stand-in): dask's own, said in the log
+            from distributed.deploy.adaptive import Adaptive as base
+            print(f"keeper: coiled.cluster.CoiledAdaptive unavailable ({e}); guarding dask's Adaptive", flush=True)
+
+    def retirable(names, dask_scheduler=None):
+        """On the scheduler, in one call (Codex round 3: two calls left a window in which a worker could
+        join and take a chunk): the names that have not joined, or that are idle and that every scheduler
+        plugin's valid_workers_downscaling (BusyWorkerGuard) keeps. Nested, so it is pickled by value."""
+        s_ = dask_scheduler
+        by = {str(w.name): w for w in s_.workers.values()}
+        cand = [by[str(n)] for n in names if str(n) in by and not by[str(n)].long_running]
+        for plugin in list(s_.plugins.values()):
+            if hasattr(plugin, "valid_workers_downscaling"):
+                cand = plugin.valid_workers_downscaling(s_, cand)
+        ok_ = {str(w.name) for w in cand if not w.processing}
+        return [n for n in names if str(n) not in by or str(n) in ok_]
+
+    class GuardedAdaptive(base):
+        async def recommendations(self, target):
+            comm = self.cluster.scheduler_comm
+            try:
+                info = await comm.identity(n_workers=-1)
+                table = self.cluster.scheduler_info.setdefault("workers", {})
+                table.update({a: w for a, w in (info.get("workers") or {}).items() if a not in table})
+            except Exception:  # noqa: BLE001 — unverifiable: no scale-down this round
+                return {"status": "same"}
+            rec = await super().recommendations(target)
+            if rec.get("status") != "down":
+                return rec
+            try:
+                from distributed.protocol.pickle import dumps
+                got = await comm.run_function(function=dumps(retirable), args=dumps((list(rec.get("workers") or []),)),
+                                              kwargs=dumps({}), wait=True)
+                if not isinstance(got, dict) or got.get("status") != "OK":
+                    return {"status": "same"}
+                keep = list(got.get("result") or [])
+            except Exception:  # noqa: BLE001
+                return {"status": "same"}
+            return {"status": "down", "workers": keep} if keep else {"status": "same"}
+
+    return GuardedAdaptive
+
+
 def scheduler_workers(get_client, attempts=6, delay_s=5.0, max_delay_s=60.0, min_workers=0, sleep=None, log=None):
     """The scheduler's worker table {address: info}, from client.scheduler_info()["workers"].
     distributed returns {} there (no "workers" key) whenever the client is not connected:
@@ -996,7 +1080,7 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                 except SystemExit as e:
                     print(f"{time.strftime('%T')} {e}; keeper exiting", flush=True)
                     return "keeper exited"
-                cl.adapt(minimum=lo, maximum=hi, **adapt_options)
+                cl.adapt(Adaptive=guarded_adaptive(), minimum=lo, maximum=hi, **adapt_options)
                 box = [cl.get_client()]
 
                 def run_client():   # the inner loop keeps one client; a closed one is replaced
@@ -1012,6 +1096,7 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                     # Not yet populated (start-up, reconnect): retried with backoff; past the
                     # bound the error goes to the reconnect path below with a log line.
                     winfo = scheduler_workers(run_client, attempts=6, delay_s=5.0, log=print)
+                    sync_observed(cl, winfo)
                     c = box[0]
                     n_ovf = sum(str(w.get("name", "")).startswith(OVERFLOW_PREFIX) for w in winfo.values())
                     status.update(updated=now, workers=len(winfo), primary_workers=len(winfo) - n_ovf,
