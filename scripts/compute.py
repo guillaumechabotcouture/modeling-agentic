@@ -1337,11 +1337,14 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 progress.setdefault("chunks", []).append(
                     {"n": len(ch), "attempt": attempt, "losses": max(losses.get(i, 0) for i, _ in ch),
                      "scaled_down": True, "error": msg[:200], "worker": pinned.get(f), "procs": used,
-                     "retried_with_procs": used, "core_s": round(min(f_share, busy), 1) if f_share else None,
+                     "retried_with_procs": used, "requeued_attempt": attempt,
+                     "core_s": round(min(f_share, busy), 1) if f_share else None,
                      "wall_s": round(time.time() - started.get(f, time.time()), 1)})
                 print(f"compute: {len(ch)} input(s) back in the queue: a scale-down retired their worker "
                       f"({n_scaled} of {SCALEDOWN_RETRIES})", file=sys.stderr, flush=True)
-                queue.insert(0, (ch, TAIL if attempt == TAIL else 1, used))
+                # The attempt is kept: a first out-of-memory death after this still reruns with half
+                # the processes (that path needs attempt 0; Codex review of #204).
+                queue.insert(0, (ch, attempt, used))
                 progress["resubmitted"] = progress.get("resubmitted", 0) + 1
                 progress["scaled_down"] = progress.get("scaled_down", 0) + 1
                 return
@@ -1391,6 +1394,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 markers.append(c.submit(_demand_marker, key=f"{funcname(_remote_task)}-{uuid.uuid4().hex}",
                                         resources={res: 1, DEMAND_RESOURCE: 1}, pure=False))
         pending, rows, stop, lost = set(), [], None, 0
+        n_compute = len(workers)                    # compute workers in the last scheduler view
         no_w = None                                 # since when no compute worker has been taking work
         try:
             while queue or pending:
@@ -1398,6 +1402,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 got_v, free = view(), []
                 if got_v is not None:
                     ok_w, allw, held_b, retired_w = got_v
+                    n_compute = len(ok_w)
                     for a in [a for a in ok_w if a not in seen_w]:       # joined since the call started
                         seen_w.add(a)
                         try:
@@ -1487,7 +1492,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 if res:
                     # One marker stays while chunks wait with the pool full (2026-11-12, P6): with
                     # none, the autoscaler saw no waiting work and shrank the pool as chunks finished.
-                    demand(0 if starved or not queue else min(len(queue), max(1, pool - len(pending))))
+                    # The held marker counts as more work, so it stays only while the pool is at most its
+                    # target: past it, the pool may shrink back (Codex review of #204).
+                    demand(0 if starved or not queue else
+                           min(len(queue), max(1 if n_compute <= pool else 0, pool - len(pending))))
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 if not pending:
                     if starved and queue:
@@ -4221,6 +4229,15 @@ def _self_test_p45d(ok) -> None:
                 ok(st2 is not None and st2["target"] >= 5,
                    f"P45D-2b with the pool full and chunks queued, one demand marker holds the autoscaler's "
                    f"target at the pool (>= 5 workers): {st2}")
+                # Codex review of #204: the held marker counts as more work, so the target asks for a VM
+                # beyond the pool; once the pool is past its target the marker goes, so the pool never
+                # grows a worker per joined VM.
+                lc.scale(6)                        # a fifth compute worker joins: past the target of 4
+                cc.wait_for_workers(6, timeout=60)
+                st2c = until(lambda: (lambda v: v if v["unrunnable"] == 0 else None)(cc.run_on_scheduler(state)), 30)
+                ok(st2c is not None,
+                   f"P45D-2c with more compute workers than the pool's target, no marker stays: "
+                   f"{cc.run_on_scheduler(state)}")
                 open(os.path.join(rd, "go"), "w").close()
                 th.join(120)
                 rows, s = box.get("r", ([], {}))
@@ -4243,7 +4260,7 @@ def _self_test_p45d(ok) -> None:
                 serial = 8 * s_task
                 ok(len(rows) == 8 and all(r["ok"] for r in rows) and [r["result"] for r in rows] == list(range(8))
                    and w_run not in used and len(used) >= 4 and s.get("workers") == len(used)
-                   and s.get("workers_seen") == 4,
+                   and s.get("workers_seen") == 5,
                    f"P45D-3 every chunk done on {len(used)} compute workers, none on the run worker, "
                    f"and the ledger's worker count is the workers used: {used} {s}")
                 ok(len(spans) == 8 and peak >= 2,
@@ -4635,8 +4652,11 @@ def _self_test_infra(ok) -> None:
                 # nothing about memory or a failing VM: the chunk goes back with the processes it had,
                 # without a backoff, and does not use one of its infra retries.
                 ok(len(lost3) == 1 and lost3[0].get("scaled_down") is True and lost3[0].get("losses") == 0
-                   and lost3[0].get("retried_with_procs") == lost3[0].get("procs") and not lost3[0].get("backoff_s"),
-                   f"IR3b a chunk lost to a scale-down keeps its processes and its infra retries: {lost3}")
+                   and lost3[0].get("retried_with_procs") == lost3[0].get("procs") and not lost3[0].get("backoff_s")
+                   and lost3[0].get("requeued_attempt") == lost3[0].get("attempt") == 0,
+                   f"IR3b a chunk lost to a scale-down keeps its processes, its infra retries and its attempt (so "
+                   f"a first out-of-memory death after it still reruns with half the processes: Codex review of "
+                   f"#204): {lost3}")
                 # IR4/IR5: the retries are bounded per input (INFRA_RETRIES = 2): a chunk lost twice
                 # still finishes; one lost three times is an infra row, after exactly three attempts.
                 real_task = _remote_task
