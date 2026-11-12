@@ -372,6 +372,10 @@ def _sensitivity_problems(s, targets, w) -> list:
                 bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's sampling error comes from its band; only "
                            "discrepancy_sd can change")
                 continue
+            if tid in ids and isinstance(ov, dict) and "bias_sd" in ov and t0.get("bias_sd_by_group") is not None:
+                bad.append(f"{ww}[{n}].targets.{tid}: bias_sd cannot override a target whose offset sd comes from "
+                           "bias_sd_by_group (Codex review of #206); change sd or discrepancy_sd")
+                continue
             if tid in ids and isinstance(ov, dict) and "sd" in ov and any(
                     k in t0 for k in ("sd_column", "ci_columns", "n_column", "ci")):
                 bad.append(f"{ww}[{n}].targets.{tid}: sd cannot override a target whose sampling error comes from "
@@ -1245,9 +1249,13 @@ def block_hits(rep) -> list:
 
 
 def inputs(spec) -> list:
-    """The files the joint calibration reads beyond the units table: its group-target tables."""
+    """The files the joint calibration reads beyond the units table: its group-target tables and its unit targets'
+    bias_sd_by_group interval tables (Codex review of #206)."""
     j = declared(spec) or {}
-    return sorted({spec.resolve(t["csv"]) for t in j.get("targets") or [] if t.get("kind") == "group"})
+    ts = [t for t in j.get("targets") or [] if isinstance(t, dict)]
+    return sorted({spec.resolve(t["csv"]) for t in ts if t.get("kind") == "group"}
+                  | {spec.resolve(t["bias_sd_by_group"]["csv"]) for t in ts
+                     if isinstance(t.get("bias_sd_by_group"), dict) and t["bias_sd_by_group"].get("csv")})
 
 
 def block_reason(rep) -> str:
@@ -1973,6 +1981,19 @@ def _self_test() -> int:
                 except HM.CalibrationInputError as e:
                     raised = str(e)[:160]
                 ok(raised is not None, f"JA25c {why} in the interval table is an input error ({raised})")
+            # Codex review of #206 (both reviewers, P2): the interval table is an input the artifact records, and a
+            # sensitivity that sets bias_sd on such a target is refused up front (it could only fail when rebuilt).
+            open(os.path.join(d, "bias_ci.csv"), "w").write(
+                "region,survey,lo,hi\nr0,s,0.2,0.3\nr1,s,0.04,0.37\nr2,s,0.18,0.32\n")
+            ok(os.path.realpath(os.path.join(d, "bias_ci.csv")) in {os.path.realpath(x) for x in inputs(schema.load(p))},
+               f"JA25d the interval table is one of the calibration's recorded inputs ({inputs(schema.load(p))})")
+            r4 = yaml.safe_load(open(p))
+            r4["calibration"]["joint"]["sensitivity"] = [{"id": "b", "label": "b", "targets": {"unit_t": {"bias_sd": 0.3}}}]
+            p4 = os.path.join(d, "s4.yaml")
+            yaml.safe_dump(r4, open(p4, "w"), sort_keys=False)
+            bad4 = spec_problems(schema.load(p4))
+            ok(any("bias_sd_by_group" in x for x in bad4),
+               f"JA25e a bias_sd sensitivity on a target with bias_sd_by_group is refused at validation ({bad4[:2]})")
     safe(ja25, "JA25")
 
     def ja17():          # the gate findings of the change diagnostic
