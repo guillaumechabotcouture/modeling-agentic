@@ -2348,8 +2348,11 @@ _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.jso
 # not found is hashed whole (never fewer bytes); FPX1 checks every name exists. Add a definition here only if
 # no row value can depend on it.
 FP_DISPATCH_EXEMPT = (
-    # dask dispatch, pool and scheduler plugins
-    "_map_dask", "_sched_view", "_demand_marker", "_gone_workers", "_cancel_remote", "_sched_workers",
+    # dask dispatch helpers, pool and scheduler plugins. _map_dask itself is hashed (Codex review round 2 of
+    # #205): it decides which params an index stands for and which returned rows reach the reusable journal.
+    # Its scheduling-only parts (lost-chunk handling, demand markers) are nested in it, so they are hashed
+    # too until they are extracted into top-level definitions listed here.
+    "_sched_view", "_demand_marker", "_gone_workers", "_cancel_remote", "_sched_workers",
     "_claim", "_revoke_chunk", "_same_process", "_stop_chunk", "_cancel_call", "_worker_side", "_security",
     "register_compute_tags", "_guard_registration", "BusyWorkerGuard", "ComputeTagPlugin",
     "WORKER_OPTIONS", "ADAPT_OPTIONS", "DEMAND_RESOURCE",
@@ -2360,9 +2363,9 @@ FP_DISPATCH_EXEMPT = (
     "_live_reservations", "_start_heartbeat", "_progress_path", "_foreign_dead", "_drop_progress",
     "_known_core_s",
 )
-# Functions nested in an exempt definition that stay hashed (Codex review of #205): _map_dask's submit builds
-# the params each _remote_task receives.
-FP_DISPATCH_KEEP_NESTED = {"_map_dask": ("submit",)}
+# Functions nested in an exempt definition that stay hashed (none since _map_dask is hashed; kept as the
+# mechanism for a future exempt definition with a nested part that reaches rows).
+FP_DISPATCH_KEEP_NESTED = {}
 
 
 def _fp_compute_source(text: str) -> bytes:
@@ -3800,9 +3803,9 @@ def _self_test_fp_dispatch(ok) -> None:
         indent = " " * (node.col_offset + 4)
         return "".join(lines[:at] + [indent + line + "\n"] + lines[at:])
     ok(_fp_compute_source(edit("_sched_view", "pass")) == base
-       and _fp_compute_source(edit("_map_dask", "pass")) == base
+       and _fp_compute_source(edit("BusyWorkerGuard", "pass")) == base
        and _fp_compute_source(src.replace("INFRA_RETRIES = 3 ", "INFRA_RETRIES = 4 ", 1)) == base,
-       "FPX2 a change inside exempt dispatch code (_sched_view, _map_dask, INFRA_RETRIES) leaves the fingerprint")
+       "FPX2 a change inside exempt dispatch code (_sched_view, BusyWorkerGuard, INFRA_RETRIES) leaves the fingerprint")
     ok(_fp_compute_source(edit("_call", "pass")) != base and _fp_compute_source(edit("_remote_task", "pass")) != base
        and _fp_compute_source(src.replace("_FP_HASH_MB = 64 ", "_FP_HASH_MB = 65 ", 1)) != base
        and _fp_compute_source(src + "\n# a comment\n") != base,
@@ -3849,6 +3852,12 @@ def _self_test_fp_dispatch(ok) -> None:
     ok(_fp_compute_source(multi(3)) != _fp_compute_source(multi(4))
        and _fp_compute_source(semi(3)) != _fp_compute_source(semi(4)),
        "FPX7 an exempt name in a shared assignment or on a shared line does not hide the other name's change")
+    # Codex review round 2 of #205 (P1): _map_dask decides which params an index stands for and which returned rows
+    # reach the reusable journal, so it stays hashed; a change to its input enumeration changes the fingerprint.
+    ok(src.count("_chunks(list(enumerate(inputs))") >= 1
+       and _fp_compute_source(src.replace("_chunks(list(enumerate(inputs))", "_chunks(list(enumerate(reversed(inputs)))"))
+       != base and "_map_dask" not in FP_DISPATCH_EXEMPT,
+       "FPX8 _map_dask is hashed: a change to how its inputs map to keys changes the fingerprint")
 
 
 def _self_test_signoff_reuse(ok) -> None:
