@@ -2352,7 +2352,9 @@ def _self_test_52(ok) -> None:
         def __init__(self, **kw):
             super().__init__(**kw)
             self.client = FakeClient([{"workers": table}] * 6)
-            self.scheduler_info = {"workers": {"tls://10.0.0.5:1": {"name": "a"}}, "id": "s"}
+            # One worker the snapshot has, one it lacks (joined after it was taken: Codex review of #203).
+            self.scheduler_info = {"workers": {"tls://10.0.0.5:1": {"name": "a"}, "tls://10.0.0.9:1": {"name": "late"}},
+                                   "id": "s"}
             StaleCluster.last = self
 
     ticks = iter([True] * 4)
@@ -2374,9 +2376,25 @@ def _self_test_52(ok) -> None:
             else:
                 sys.modules["coiled"] = real_coiled
     view = (StaleCluster.last.scheduler_info or {}).get("workers") if StaleCluster.last else None
-    ok(view == table and StaleCluster.last.scheduler_info.get("id") == "s" and "keeper error" not in log,
-       f"RC52k each keeper tick replaces the attached Cluster's worker view with the scheduler's table, so "
-       f"Adaptive sees every worker that joined: {view} log={log[-300:]!r}")
+    ok(view is not None and set(table) <= set(view) and "tls://10.0.0.9:1" in view
+       and StaleCluster.last.scheduler_info.get("id") == "s" and "keeper error" not in log,
+       f"RC52k each keeper tick adds the scheduler's workers the attached Cluster's view lacks, so Adaptive "
+       f"sees every worker that joined, and keeps a worker that joined after the snapshot: {view} "
+       f"log={log[-300:]!r}")
+    # The Cluster's own status stream still removes what it reports (a `del` on a missing key would end it),
+    # and on a Cluster with an event loop the merge runs there.
+    calls = []
+    lp = types.SimpleNamespace(add_callback=lambda fn: calls.append(fn))
+    cl2 = types.SimpleNamespace(scheduler_info={"workers": {"tls://10.0.0.7:1": {"name": "gone"}}}, loop=lp)
+    ws.sync_observed(cl2, {"tls://10.0.0.8:1": {"name": "new"}})
+    before = dict(cl2.scheduler_info["workers"])
+    for fn in calls:
+        fn()
+    del cl2.scheduler_info["workers"]["tls://10.0.0.7:1"]          # the stream's remove
+    ok(len(calls) == 1 and before == {"tls://10.0.0.7:1": {"name": "gone"}}
+       and cl2.scheduler_info["workers"] == {"tls://10.0.0.8:1": {"name": "new"}},
+       f"RC52l the merge runs on the Cluster's loop, adds only, and leaves every reported worker removable: "
+       f"{len(calls)} {before} {cl2.scheduler_info['workers']}")
 
 
 def _self_test_51c(ok) -> None:

@@ -713,11 +713,25 @@ def sync_observed(cluster, workers):
     dask's Adaptive closes workers it counts as requested but not yet arrived (`requested -
     observed`) without asking `workers_to_close`, so BusyWorkerGuard never sees them. On
     2026-11-12 (P6) the keeper's Cluster kept the 5 workers present when it attached while the
-    pool grew to 41: Adaptive retired workers in the middle of their chunks. One reference swap,
-    so Adaptive never iterates a table being changed."""
+    pool grew to 41: Adaptive retired workers in the middle of their chunks.
+
+    It only adds the workers the view lacks, never replaces or removes (Codex review of #203):
+    a worker that joined after the snapshot stays observed, and the Cluster's own status
+    stream still finds every worker it removes (its `del` on a missing key would end that
+    stream). The change runs on the Cluster's event loop, where that stream and Adaptive
+    read the table."""
     info = getattr(cluster, "scheduler_info", None)
-    if isinstance(info, dict) and isinstance(workers, dict):
-        info["workers"] = dict(workers)
+    if not (isinstance(info, dict) and isinstance(info.get("workers"), dict) and isinstance(workers, dict)):
+        return
+
+    def merge():
+        table = info["workers"]
+        table.update({a: w for a, w in workers.items() if a not in table})
+    loop = getattr(cluster, "loop", None)
+    if loop is not None and hasattr(loop, "add_callback"):
+        loop.add_callback(merge)
+    else:
+        merge()
 
 
 def scheduler_workers(get_client, attempts=6, delay_s=5.0, max_delay_s=60.0, min_workers=0, sleep=None, log=None):
