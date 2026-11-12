@@ -31,10 +31,12 @@ cluster = total_cost (Coiled credits) x 0.061 + cloud_total_cost (USD), from the
 1.135.6: CloudV2._get_cluster_details_synced, coiled/v2/core.py:976; the public coiled.cluster_details,
 core.py:994, drops the cost fields). A cluster's estimate is the sum over its instances, counted from instance
 states rather than the cluster's, of hours in the window x max(the scope's median USD per instance-hour over its
-last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A cluster counts
-max(billed, estimate); one created before the budget's start counts its estimate from the start only. These refuse:
-an unknown VM type, missing scheduler, worker or instance data, and a missing or negative cost. A budget whose
-start is in the future refuses launches.
+last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A finished cluster (every
+process stopped or errored, with its stop time) counts what it billed, or the estimate if a cost is missing; its VM
+records end with their processes. A cluster with a live instance counts max(billed, estimate). One created before
+the budget's start counts its estimate from the start only. These refuse: an unknown VM type, missing scheduler,
+worker or instance data, a negative cost, and a missing cost while an instance is live. A budget whose start is in
+the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
 ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time). A reservation
@@ -384,21 +386,29 @@ _RUNNING = ("started", "running", "ready")
 
 
 def _cluster_cost(d, now, start, median, prices) -> dict:
-    """One cluster: billed USD, the estimate in the window, and the count (max of the two; the estimate alone for a
-    cluster created before `start`). Refuses incomplete or negative data."""
+    """One cluster: billed USD, the estimate in the window, and the count. A finished cluster (every process stopped
+    or errored, with its stop time) counts what it billed; its VM records end with their processes, even one Coiled
+    left non-final (a VM refused for quota stays `queued`), and the conservative estimate stands in only for a
+    missing cost. A cluster with a live instance counts max(billed, estimate). One created before `start` counts
+    the estimate in the window. Refuses incomplete or negative data."""
     if not isinstance(d, dict) or not {"scheduler", "workers", "total_cost", "cloud_total_cost", "created"} <= set(d) \
             or not isinstance(d["workers"], list) or not isinstance(d["scheduler"], dict):
         raise BudgetError(f"cluster {d.get('id') if isinstance(d, dict) else '?'}: incomplete record")
+    procs = [d["scheduler"]] + d["workers"]
+    done = all(isinstance(p, dict) and state_of(p) in ENDED and _ts((p.get("current_state") or {}).get("updated"))
+               is not None for p in procs)
     live, hours, est = 0, 0.0, 0.0
-    for p in [d["scheduler"]] + d["workers"]:
+    for p in procs:
         inst = p.get("instance") if isinstance(p, dict) else None
         if not inst:
             if not isinstance(p, dict) or state_of(p) in _RUNNING or not state_of(p):
                 raise BudgetError(f"cluster {d.get('id')}: a process without instance data")
             continue                       # a process that never got a VM (pending, refused)
         t0, vm = _ts(inst.get("created")), inst.get("instance_type_id")
-        on = state_of(inst) not in ENDED
-        t1 = now if on else _ts((inst.get("current_state") or {}).get("updated"))
+        ended = state_of(inst) in ENDED
+        on = not done and not ended
+        t1 = (now if on else _ts((inst.get("current_state") or {}).get("updated")) if ended
+              else _ts(p["current_state"]["updated"]))          # a finished cluster's VM ends with its process
         if t0 is None or t1 is None or not state_of(inst):
             raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
         if (not on and t1 < t0) or t0 > now + CLOCK_SKEW_S:
@@ -411,14 +421,20 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     tc, cc = d["total_cost"], d["cloud_total_cost"]
     if live and tc is None and cc is None:
         tc = cc = 0.0                      # not billed yet: the estimate covers it
-    billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
+    fallback = done and (tc is None or cc is None)
+    if fallback:                           # a finished cluster missing a cost: the conservative estimate stands in
+        billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT if tc is not None else 0.0
+        _num(cc, "cloud_total_cost", 0.0) if cc is not None else None
+    else:
+        billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
+    count = billed if done and not fallback else max(billed, est)
     created = _ts(d["created"])
     if created is None:
         raise BudgetError(f"cluster {d.get('id')}: no valid creation time in its record")
     before = created < start
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
-            "usd": est if before else max(billed, est), "_billed_all": billed}
+            "usd": est if before else count, "_billed_all": None if fallback else billed}
 
 
 def _measure(rec, env, now) -> dict:
@@ -448,7 +464,7 @@ def _measure(rec, env, now) -> dict:
             break
         if state_of(c) in ENDED:
             r = _cluster_cost(dets[c["id"]] if c["id"] in dets else src.details(c["id"]), now, -math.inf, 0.0, prices)
-            if not r["live_instances"] and r["instance_hours"] >= 0.05:
+            if not r["live_instances"] and r["instance_hours"] >= 0.05 and r["_billed_all"] is not None:
                 sample.append(r["_billed_all"] / r["instance_hours"])
     sample.sort()
     n = len(sample)
@@ -924,8 +940,9 @@ def _self_test() -> int:
             nc[4] = nc[5] = ValueError("not this scope")
             with_env(env(r8, source=_FakeSource(items, nc)))
             by = {c["id"]: c for c in spend("f6")["clusters"]}
-            ok(abs(by[1]["usd"] - 11.1) < 1e-9,
-               f"BR8e a fully stopped cluster with no cloud cost counts the conservative estimate: {by[1]['usd']}")
+            ok(abs(by[1]["usd"] - 2 * 6.05) < 1e-9,
+               f"BR8e a fully stopped cluster with no cloud cost counts the conservative estimate, and its partial bill "
+               f"is left out of the measured rate (2 h x cluster 3's $6.05): {by[1]['usd']}")
         case("BR8e", bg8e)
 
         def bg10():
