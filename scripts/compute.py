@@ -2341,6 +2341,51 @@ _FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg",
 # no model reads them, and the runner rewrites them when a step fails or its limit changes, which would discard the
 # partial rows of the batch that step was running (Nigeria v2 full run, 2026-11-02).
 _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.json")
+# 2026-11-12 (owner): the top-level definitions of this module that only place, retry, account for or watch
+# chunks. No row a reuse takes comes from them (only ok rows are reused, and a chunk's rows come from
+# _remote_task / _call, which stay hashed), so code_fingerprint hashes this file with each of them replaced by
+# a placeholder: PR #204 changed only these and still changed the fingerprint of every stored batch. A name
+# not found is hashed whole (never fewer bytes); FPX1 checks every name exists. Add a definition here only if
+# no row value can depend on it.
+FP_DISPATCH_EXEMPT = (
+    # dask dispatch, pool and scheduler plugins
+    "_map_dask", "_sched_view", "_demand_marker", "_gone_workers", "_cancel_remote", "_sched_workers",
+    "_claim", "_revoke_chunk", "_same_process", "_stop_chunk", "_cancel_call", "_worker_side", "_security",
+    "register_compute_tags", "_guard_registration", "BusyWorkerGuard", "ComputeTagPlugin",
+    "WORKER_OPTIONS", "ADAPT_OPTIONS", "DEMAND_RESOURCE",
+    "RETIRED_EVENTS", "SCALEDOWN_RETRIES", "INFRA_RETRIES", "INFRA_BACKOFF_S", "NO_WORKER_WAIT_S",
+    # the ledger, progress records and heartbeats (accounting, never a row)
+    "_LedgerLock", "_note", "_write_note", "_write_note_locked", "_rows_done", "_settle_dead",
+    "_live_reservations", "_start_heartbeat", "_progress_path", "_foreign_dead", "_drop_progress",
+    "_known_core_s",
+)
+
+
+def _fp_compute_source(text: str) -> bytes:
+    """compute.py's source for the fingerprint: each FP_DISPATCH_EXEMPT top-level definition, with the lines
+    between it and the definition before it (its comments), replaced by `<exempt NAME>`. A source that does
+    not parse is returned whole."""
+    import ast
+    try:
+        body = ast.parse(text).body
+    except SyntaxError:
+        return text.encode()
+    lines = text.splitlines(True)
+    spans, prev_end = [], 0
+    for n in body:
+        names = ({n.name} if hasattr(n, "name") else
+                 {t.id for t in getattr(n, "targets", []) if isinstance(t, ast.Name)})
+        hit = sorted(names & set(FP_DISPATCH_EXEMPT))
+        if hit:
+            spans.append((prev_end, n.end_lineno, hit[0]))
+        prev_end = n.end_lineno
+    out, at = [], 0
+    for a, b, name in spans:
+        out += lines[at:a] + [f"<exempt {name}>\n"]
+        at = b
+    return "".join(out + lines[at:]).encode()
+
+
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 # F6 S1-8: the fingerprint covers code content only. The launch commit stamp changes with every commit (git archive
 # fills it in, .gitattributes export-subst), so with it any launch commit invalidated every stored batch (F5, 2026-11-08).
@@ -2483,7 +2528,10 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
             continue
         rel = os.path.relpath(f, run_dir) if f.startswith(run_dir) else "repo:" + os.path.relpath(f, REPO)
         h.update(rel.encode() + b"\0")
-        if st.st_size <= _FP_HASH_MB * 2**20:
+        if os.path.realpath(f) == os.path.realpath(os.path.join(REPO, "scripts", "compute.py")):
+            with open(f, encoding="utf-8", errors="surrogateescape") as fh:
+                h.update(_fp_compute_source(fh.read()))      # dispatch code is not hashed (FP_DISPATCH_EXEMPT)
+        elif st.st_size <= _FP_HASH_MB * 2**20:
             with open(f, "rb") as fh:
                 for block in iter(lambda: fh.read(2**20), b""):
                     h.update(block)
@@ -3392,6 +3440,10 @@ def _self_test() -> int:
         _self_test_checkpoint_restore(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CP: {type(e).__name__}: {e}")
+    try:
+        _self_test_fp_dispatch(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"FPX: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3699,6 +3751,60 @@ def _self_test_checkpoint_restore(ok) -> None:
             ok(s4.get("computed") == 0 and s4.get("reused") == 3,
                f"CP4 after the launch-tree hop (committed, archived, extracted) the rows are reused: "
                f"{s4.get('computed')} computed")
+
+
+def _self_test_fp_dispatch(ok) -> None:
+    """2026-11-12 (owner): dispatch code in this module is not part of the reuse fingerprint. PR #204 changed
+    only how chunks are placed and retried (no row a reuse can take: only ok rows are reused), yet changed the
+    fingerprint of every stored batch, so a run on it would have recomputed every finished batch."""
+    import ast
+    import tempfile
+    src = open(os.path.join(HERE, "compute.py")).read()
+    top = {getattr(n, "name", None) for n in ast.parse(src).body} | {
+        t.id for n in ast.parse(src).body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    missing = sorted(set(FP_DISPATCH_EXEMPT) - top)
+    ok(not missing, f"FPX1 every exempt dispatch name is a top-level definition of compute.py: missing {missing}")
+    base = _fp_compute_source(src)
+
+    def edit(name, line):
+        """`src` with `line` added as the first statement of top-level function `name`."""
+        t = ast.parse(src)
+        node = next(n for n in t.body if getattr(n, "name", None) == name)
+        lines = src.splitlines(True)
+        first = node.body[0]
+        at = (first.end_lineno if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant)
+              else first.lineno - 1)
+        indent = " " * (node.col_offset + 4)
+        return "".join(lines[:at] + [indent + line + "\n"] + lines[at:])
+    ok(_fp_compute_source(edit("_sched_view", "pass")) == base
+       and _fp_compute_source(edit("_map_dask", "pass")) == base
+       and _fp_compute_source(src.replace("INFRA_RETRIES = 3 ", "INFRA_RETRIES = 4 ", 1)) == base,
+       "FPX2 a change inside exempt dispatch code (_sched_view, _map_dask, INFRA_RETRIES) leaves the fingerprint")
+    ok(_fp_compute_source(edit("_call", "pass")) != base and _fp_compute_source(edit("_remote_task", "pass")) != base
+       and _fp_compute_source(src.replace("_FP_HASH_MB = 64 ", "_FP_HASH_MB = 65 ", 1)) != base
+       and _fp_compute_source(src + "\n# a comment\n") != base,
+       "FPX3 a change anywhere else (_call, _remote_task, a constant, a comment) changes the fingerprint")
+    ok(_fp_compute_source("def broken(:\n") == b"def broken(:\n",
+       "FPX4 a source that does not parse is hashed whole (fail closed: never fewer bytes)")
+    # FPX5: code_fingerprint uses it for this file, and only for this file.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as rd:
+        os.makedirs(os.path.join(repo, "scripts")); os.makedirs(os.path.join(rd, "models"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return p\n")
+        saved = globals()["REPO"]
+        try:
+            globals()["REPO"] = repo
+            cp = os.path.join(repo, "scripts", "compute.py")
+            fps = []
+            for text in (src, edit("_sched_view", "pass"), edit("_call", "pass")):
+                open(cp, "w").write(text)
+                fps.append(code_fingerprint(rd, "models/m.py::f"))
+            other = os.path.join(repo, "scripts", "other.py")
+            open(other, "w").write(edit("_sched_view", "pass"))
+            fp_other = code_fingerprint(rd, "models/m.py::f")
+        finally:
+            globals()["REPO"] = saved
+        ok(fps[0] == fps[1] and fps[0] != fps[2] and fp_other != fps[2] and fp_other != fps[0],
+           f"FPX5 code_fingerprint applies the exemption to scripts/compute.py only: {fps} {fp_other}")
 
 
 def _self_test_signoff_reuse(ok) -> None:
