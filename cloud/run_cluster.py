@@ -414,9 +414,14 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
     import hashlib
     if pipeline != "v2":
         return []
-    flags = [str(f) for f in (flags or ())]
-    runs = [flags[i + 1] for i, f in enumerate(flags[:-1]) if f == "--resume"]
-    runs += [f.split("=", 1)[1] for f in flags if f.startswith("--resume=")]
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)       # as main.py's parser: abbreviations, the last value wins
+    ap.add_argument("--resume")
+    try:
+        got, _ = ap.parse_known_args([str(f) for f in (flags or ())])
+    except SystemExit:
+        return ["the launch flags' --resume value cannot be read"]
+    runs = [got.resume] if got.resume else []
     out = []
     for rel in runs:
         rel = os.path.normpath(rel).replace(os.sep, "/")
@@ -429,7 +434,7 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if state != "SIGN":
+        if state != "SIGN" or st.get("signoff") == "none":   # signoff none: h_SIGN does not sign
             continue
         spec = _archive_member(code, f"{rel}/decision_spec.yaml")
         sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
@@ -4647,6 +4652,14 @@ def _self_test_sheet(ok) -> None:
     ok(v1 == [] and len(dot) == 1 and len(eq) == 1 and len(bad_state) == 1 and "unreadable" in bad_state[0],
        f"RC80d v1 launches are not checked; ./ and --resume= are; an unreadable run state is refused: "
        f"{v1} {dot} {eq} {bad_state}")
+    # Codex review round 2 of #207 (P2): a run whose saved sign-off mode is none skips SIGN (not checked); the
+    # resume flag is read as main.py's argparse reads it (an abbreviation, the last value wins).
+    none_mode = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "SIGN",
+                                     "signoff": "none"}).encode(), f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    abbrev = stale_sheet_problems(stale_tar, ("--res", R))
+    last = stale_sheet_problems(stale_tar, ("--resume", "runs/old", "--resume=" + R))
+    ok(none_mode == [] and len(abbrev) == 1 and len(last) == 1 and "runs/old" not in last[0],
+       f"RC80e signoff none is not checked; --res is read; only the last --resume counts: {none_mode} {abbrev} {last}")
 
 
 def _self_test() -> int:
