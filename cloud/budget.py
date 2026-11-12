@@ -1193,6 +1193,37 @@ def _self_test() -> int:
                f"{[x['invocation'] for x in s20c['reservations']]}")
         case("BR20", bg20)
 
+        def bg21():
+            # 2026-11-11 21:17 (canary, cluster 2366111 scaling 5 -> 48 workers): VMs still being provisioned report
+            # instance_type_id None; three refused readings in a row stopped the run as spend-unreadable.
+            def variant(vm_of):
+                v = json.loads(json.dumps({k: x for k, x in dets.items() if not isinstance(x, Exception)}))
+                v = {int(k): x for k, x in v.items()}
+                for p_ in [v[2]["scheduler"]] + v[2]["workers"]:
+                    if p_["instance"]["current_state"]["state"] not in ENDED:
+                        p_["instance"]["instance_type_id"] = vm_of(p_["instance"]["instance_type_id"])
+                v[4] = v[5] = ValueError("not this scope")
+                return v
+            with_env(env(r8, source=_FakeSource(items, dets)))
+            typed = {c["id"]: c for c in spend("f6")["clusters"]}[2]
+            with_env(env(r8, source=_FakeSource(items, variant(lambda vm: None))))
+            try:
+                s21 = spend("f6")
+                row = {c["id"]: c for c in s21["clusters"]}[2]
+                meter = job_meter("f6")(2)
+                txt = "\n".join(status_lines(s21))
+            except BudgetError as e:
+                row, meter, txt = {"usd": None, "assumptions": [str(e)]}, None, ""
+            ok(row["usd"] is not None and row["usd"] >= typed["usd"] and meter == row["usd"]
+               and any("no VM type" in a for a in row.get("assumptions", [])) and "no VM type" in txt,
+               f"BR21 live VMs with no type yet (still provisioning) are priced at the highest bound in the table, "
+               f"stated as an assumption, instead of refusing: {row.get('usd')} >= {typed['usd']}, "
+               f"{row.get('assumptions')}")
+            with_env(env(r8, source=_FakeSource(items, variant(lambda vm: "Azure_Z99"))))
+            ok(refused(lambda: spend("f6")) is not None and not launch_budget_ok("f6", 1, "lw-smoke-z")[0],
+               "BR21b a named VM type that is not in the table still refuses")
+        case("BR21", bg21)
+
         def bg13():
             with_env(env(r8, source=_FakeSource(items, dets)))
             m = job_meter("f6")
