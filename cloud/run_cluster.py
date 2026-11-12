@@ -2404,8 +2404,21 @@ def _self_test_52(ok) -> None:
     import asyncio
 
     class FakeComm:
-        def __init__(self, present, safe, fail=False):
+        def __init__(self, present, safe, fail=False, sched=None):
             self.present, self.safe, self.fail = present, safe, fail
+            # The scheduler's state at the retirement check: {name: processing}; default: `present`,
+            # busy unless in `safe`.
+            self.sched = sched if sched is not None else {n: n not in safe for n in present}
+
+        async def run_function(self, function, args, kwargs, wait=True):
+            from distributed.protocol.pickle import loads
+            if self.fail:
+                raise OSError("down")
+            wss = {f"tls://{n}:1": types.SimpleNamespace(name=n, processing={"t"} if busy_ else set(),
+                                                          long_running=set())
+                   for n, busy_ in self.sched.items()}
+            sch = types.SimpleNamespace(workers=wss, plugins={})
+            return {"status": "OK", "result": loads(function)(*loads(args), dask_scheduler=sch, **loads(kwargs))}
 
         async def identity(self, n_workers=-1):
             if self.fail:
@@ -2443,6 +2456,12 @@ def _self_test_52(ok) -> None:
     cl5 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy"},
                                 scheduler_comm=FakeComm(["busy"], [], fail=True))
     r3 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl5).recommendations(1))
+    # Codex review round 3 of #203: "boot" was not on the scheduler at the refresh but joined and took a
+    # chunk before the retirement check; the check is one scheduler-side call, so it is kept.
+    cl6 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy", "idle", "boot"},
+                                scheduler_comm=FakeComm(["busy", "idle"], ["idle"],
+                                                        sched={"busy": True, "idle": False, "boot": True}))
+    r4 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl6).recommendations(1))
     ok(r1 == {"status": "same"} and "tls://late:1" in c1.scheduler_info["workers"],
        f"RC52p the keeper's Adaptive refreshes the worker view before each decision: a worker that joined "
        f"after the tick is observed and not retired: {r1} {sorted(c1.scheduler_info['workers'])}")
@@ -2451,6 +2470,9 @@ def _self_test_52(ok) -> None:
        f"workers_to_close) stays; an idle one and one that never joined go: {r2}")
     ok(r3 == {"status": "same"},
        f"RC52r with the scheduler unreadable it retires nothing: {r3}")
+    ok(r4 == {"status": "down", "workers": ["idle"]},
+       f"RC52s a worker that joined and took a chunk after the refresh is kept: the retirement check is one "
+       f"scheduler-side call on the scheduler's own state: {r4}")
 
 
 def _self_test_51c(ok) -> None:

@@ -741,15 +741,29 @@ def guarded_adaptive(base=None):
     since Adaptive decides every `interval` (15 s), in which a worker that joined after the tick, with
     close votes from its boot, is retired as "not yet arrived" without BusyWorkerGuard. Before each
     decision the view gets every worker the scheduler has (added, never replaced: `sync_observed`).
-    After it, each worker to retire that the scheduler has goes only if `workers_to_close` (filtered
-    by BusyWorkerGuard) offers it; one the scheduler does not have (never joined) goes. A scheduler
-    that cannot be read retires nothing."""
+    After it, one scheduler-side call keeps, of the workers to retire, those that have not joined and
+    those that are idle and kept by BusyWorkerGuard. A scheduler that cannot be read retires nothing.
+    Left: the gap between that call and Coiled's retire_workers call, the same gap dask's own
+    workers_to_close-then-retire path has."""
     if base is None:
         try:
             from coiled.cluster import CoiledAdaptive as base
         except ImportError as e:   # a coiled without it (or a test's stand-in): dask's own, said in the log
             from distributed.deploy.adaptive import Adaptive as base
             print(f"keeper: coiled.cluster.CoiledAdaptive unavailable ({e}); guarding dask's Adaptive", flush=True)
+
+    def retirable(names, dask_scheduler=None):
+        """On the scheduler, in one call (Codex round 3: two calls left a window in which a worker could
+        join and take a chunk): the names that have not joined, or that are idle and that every scheduler
+        plugin's valid_workers_downscaling (BusyWorkerGuard) keeps. Nested, so it is pickled by value."""
+        s_ = dask_scheduler
+        by = {str(w.name): w for w in s_.workers.values()}
+        cand = [by[str(n)] for n in names if str(n) in by and not by[str(n)].long_running]
+        for plugin in list(s_.plugins.values()):
+            if hasattr(plugin, "valid_workers_downscaling"):
+                cand = plugin.valid_workers_downscaling(s_, cand)
+        ok_ = {str(w.name) for w in cand if not w.processing}
+        return [n for n in names if str(n) not in by or str(n) in ok_]
 
     class GuardedAdaptive(base):
         async def recommendations(self, target):
@@ -764,12 +778,14 @@ def guarded_adaptive(base=None):
             if rec.get("status") != "down":
                 return rec
             try:
-                info = await comm.identity(n_workers=-1)
-                present = {w.get("name") for w in (info.get("workers") or {}).values()}
-                safe = set(await comm.workers_to_close(target=0, attribute="name"))
+                from distributed.protocol.pickle import dumps
+                got = await comm.run_function(function=dumps(retirable), args=dumps((list(rec.get("workers") or []),)),
+                                              kwargs=dumps({}), wait=True)
+                if not isinstance(got, dict) or got.get("status") != "OK":
+                    return {"status": "same"}
+                keep = list(got.get("result") or [])
             except Exception:  # noqa: BLE001
                 return {"status": "same"}
-            keep = [w for w in rec.get("workers") or [] if w not in present or w in safe]
             return {"status": "down", "workers": keep} if keep else {"status": "same"}
 
     return GuardedAdaptive
