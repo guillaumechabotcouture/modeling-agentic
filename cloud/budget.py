@@ -31,17 +31,21 @@ cluster = total_cost (Coiled credits) x 0.061 + cloud_total_cost (USD), from the
 1.135.6: CloudV2._get_cluster_details_synced, coiled/v2/core.py:976; the public coiled.cluster_details,
 core.py:994, drops the cost fields). A cluster's estimate is the sum over its instances, counted from instance
 states rather than the cluster's, of hours in the window x max(the scope's median USD per instance-hour over its
-last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A cluster counts
-max(billed, estimate); one created before the budget's start counts its estimate from the start only. These refuse:
-an unknown VM type, missing scheduler, worker or instance data, and a missing or negative cost. A budget whose
-start is in the future refuses launches.
+last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A finished cluster (every
+process stopped or errored, with its stop time) counts what it billed, or the estimate if a cost is missing; its VM
+records end with their processes. A cluster with a live instance counts max(billed, estimate). One created before
+the budget's start counts its estimate from the start only. These refuse: an unknown VM type, missing scheduler,
+worker or instance data, a negative cost, and a missing cost while an instance is live. A budget whose start is in
+the future refuses launches.
 
 Reservations. `launch_budget_ok` holds an exclusive lock on the ledger (~/.config/modeling-agentic/reservations/
-ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time). A reservation
-names the exact cluster its launch creates and counts its whole cap until that cluster, or one of its helpers
-(<name>-keeper, <name>-overflow), created after the reservation appears; then max(0, cap - those clusters' spend)
-until all of them are stopped, when it is released; one whose cluster never appears lapses after
-2 h. A malformed ledger refuses. This guards against concurrent launches from this machine only.
+ledger.json) while it measures. When the launch fits, it records (scope, cap, name, invocation, time, and the
+launcher's clusters.json when given). A reservation counts its whole cap until its launch's clusters appear, then
+max(0, cap - their spend) until all of them are stopped, when it is released; one whose clusters never appear
+lapses after 2 h. Its launch's clusters are the ids its clusters.json records for its invocation, when it does.
+Otherwise they are the exact cluster it names and its helpers (<name>-keeper, <name>-overflow), created after the
+reservation and before the next reservation of the same name, so a relaunch's clusters never hold an earlier
+launch's reservation. A malformed ledger refuses. This guards against concurrent launches from this machine only.
 """
 from __future__ import annotations
 
@@ -384,21 +388,29 @@ _RUNNING = ("started", "running", "ready")
 
 
 def _cluster_cost(d, now, start, median, prices) -> dict:
-    """One cluster: billed USD, the estimate in the window, and the count (max of the two; the estimate alone for a
-    cluster created before `start`). Refuses incomplete or negative data."""
+    """One cluster: billed USD, the estimate in the window, and the count. A finished cluster (every process stopped
+    or errored, with its stop time) counts what it billed; its VM records end with their processes, even one Coiled
+    left non-final (a VM refused for quota stays `queued`), and the conservative estimate stands in only for a
+    missing cost. A cluster with a live instance counts max(billed, estimate). One created before `start` counts
+    the estimate in the window. Refuses incomplete or negative data."""
     if not isinstance(d, dict) or not {"scheduler", "workers", "total_cost", "cloud_total_cost", "created"} <= set(d) \
             or not isinstance(d["workers"], list) or not isinstance(d["scheduler"], dict):
         raise BudgetError(f"cluster {d.get('id') if isinstance(d, dict) else '?'}: incomplete record")
+    procs = [d["scheduler"]] + d["workers"]
+    done = all(isinstance(p, dict) and state_of(p) in ENDED and _ts((p.get("current_state") or {}).get("updated"))
+               is not None for p in procs)
     live, hours, est = 0, 0.0, 0.0
-    for p in [d["scheduler"]] + d["workers"]:
+    for p in procs:
         inst = p.get("instance") if isinstance(p, dict) else None
         if not inst:
             if not isinstance(p, dict) or state_of(p) in _RUNNING or not state_of(p):
                 raise BudgetError(f"cluster {d.get('id')}: a process without instance data")
             continue                       # a process that never got a VM (pending, refused)
         t0, vm = _ts(inst.get("created")), inst.get("instance_type_id")
-        on = state_of(inst) not in ENDED
-        t1 = now if on else _ts((inst.get("current_state") or {}).get("updated"))
+        ended = state_of(inst) in ENDED
+        on = not done and not ended
+        t1 = (now if on else _ts((inst.get("current_state") or {}).get("updated")) if ended
+              else _ts(p["current_state"]["updated"]))          # a finished cluster's VM ends with its process
         if t0 is None or t1 is None or not state_of(inst):
             raise BudgetError(f"cluster {d.get('id')}: an instance has no state, start or stop time")
         if (not on and t1 < t0) or t0 > now + CLOCK_SKEW_S:
@@ -411,14 +423,20 @@ def _cluster_cost(d, now, start, median, prices) -> dict:
     tc, cc = d["total_cost"], d["cloud_total_cost"]
     if live and tc is None and cc is None:
         tc = cc = 0.0                      # not billed yet: the estimate covers it
-    billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
+    fallback = done and (tc is None or cc is None)
+    if fallback:                           # a finished cluster missing a cost: the conservative estimate stands in
+        billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT if tc is not None else 0.0
+        _num(cc, "cloud_total_cost", 0.0) if cc is not None else None
+    else:
+        billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT + _num(cc, "cloud_total_cost", 0.0)
+    count = billed if done and not fallback else max(billed, est)
     created = _ts(d["created"])
     if created is None:
         raise BudgetError(f"cluster {d.get('id')}: no valid creation time in its record")
     before = created < start
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
-            "usd": est if before else max(billed, est), "_billed_all": billed}
+            "usd": est if before else count, "_billed_all": None if fallback else billed}
 
 
 def _measure(rec, env, now) -> dict:
@@ -448,7 +466,7 @@ def _measure(rec, env, now) -> dict:
             break
         if state_of(c) in ENDED:
             r = _cluster_cost(dets[c["id"]] if c["id"] in dets else src.details(c["id"]), now, -math.inf, 0.0, prices)
-            if not r["live_instances"] and r["instance_hours"] >= 0.05:
+            if not r["live_instances"] and r["instance_hours"] >= 0.05 and r["_billed_all"] is not None:
                 sample.append(r["_billed_all"] / r["instance_hours"])
     sample.sort()
     n = len(sample)
@@ -463,7 +481,8 @@ def _measure(rec, env, now) -> dict:
 
 
 def _ledger(env, now) -> list:
-    """The reservations ledger: a list of {scope, cap_usd, name, invocation, time}; anything else refuses."""
+    """The reservations ledger: a list of {scope, cap_usd, name, invocation, time[, clusters_file]}; anything else
+    refuses."""
     try:
         allr = json.load(open(env.reservations))
     except FileNotFoundError:
@@ -473,7 +492,8 @@ def _ledger(env, now) -> list:
     def num(x):
         return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
     ok = isinstance(allr, list) and all(
-        isinstance(r, dict) and set(r) == {"scope", "cap_usd", "name", "invocation", "time"}
+        isinstance(r, dict) and set(r) - {"clusters_file"} == {"scope", "cap_usd", "name", "invocation", "time"}
+        and isinstance(r.get("clusters_file", ""), str)
         and isinstance(r["scope"], str) and isinstance(r["name"], str) and r["name"] and isinstance(r["invocation"], str)
         and num(r["cap_usd"]) and r["cap_usd"] > 0 and num(r["time"]) and 0 < r["time"] <= now + CLOCK_SKEW_S
         for r in allr)
@@ -482,18 +502,41 @@ def _ledger(env, now) -> list:
     return allr
 
 
+def _launch_ids(r):
+    """The cluster ids the reservation's launch recorded in its clusters.json for its invocation, or None (no file,
+    another invocation's record, or no id yet)."""
+    try:
+        rec = json.load(open(r["clusters_file"])) if r.get("clusters_file") else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("invocation") != r["invocation"]:
+        return None
+    ids = {v.get("id") for k, v in rec.items() if k in ("run", "keeper", "overflow") and isinstance(v, dict)} - {None}
+    return ids or None
+
+
 def _reservations(env, scope, rows, now):
     """(this scope's open reservations, each with its outstanding USD; the ledger to keep). A reservation names the
     exact cluster its launch creates (helpers: <name>-keeper, <name>-overflow); it holds its cap until such a cluster
     created after the reservation appears, then max(0, cap - those clusters' spend) while any of them runs;
-    it is released once all are stopped, or after RESERVATION_S with none."""
+    it is released once all are stopped, or after RESERVATION_S with none. Its launch's clusters: the ids its
+    clusters.json records for its invocation, when it does; otherwise those of its names created after it and before
+    the next reservation of the same name (a relaunch's clusters never hold an earlier launch's reservation)."""
     mine, keep = [], []
-    for r in _ledger(env, now):
+    ledger = _ledger(env, now)
+    for r in ledger:
         if r["scope"] != scope:
             keep.append(r)                 # another scope's: measured by its own launches
             continue
-        own = {r["name"], r["name"] + "-keeper", r["name"] + "-overflow"}   # the launch's cluster and its helpers
-        match = [x for x in rows if x["name"] in own and x["created"] >= r["time"] - CLOCK_SKEW_S]
+        ids = _launch_ids(r)
+        if ids is not None:
+            match = [x for x in rows if x["id"] in ids]
+        else:
+            own = {r["name"], r["name"] + "-keeper", r["name"] + "-overflow"}   # the launch's cluster and its helpers
+            nxt = min((q["time"] for q in ledger if q is not r and q["scope"] == scope and q["name"] == r["name"]
+                       and q["time"] > r["time"]), default=math.inf)
+            match = [x for x in rows if x["name"] in own and r["time"] - CLOCK_SKEW_S <= x["created"]
+                     < nxt - CLOCK_SKEW_S]
         if match:
             if not any(x["live_instances"] or x["listed_state"] not in ENDED for x in match):
                 continue                   # every cluster of the launch stopped: released
@@ -543,10 +586,11 @@ class _Lock:
         return False
 
 
-def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
+def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, clusters_file=None) -> tuple[bool, str]:
     """ok only if the scope's owner-signed budget verifies and has started, `name` starts with one of its signed
     prefixes, and used + open reservations + `cap_usd` is within it. With `reserve`, a launch that fits records a
-    reservation of `cap_usd` for `name` (under the same lock). Any error refuses."""
+    reservation of `cap_usd` for `name` (under the same lock), under `invocation` (default MA_LAUNCH_INVOCATION) and,
+    when given, the launcher's clusters.json, whose ids for that invocation bind the reservation. Any error refuses."""
     env = _ENV
     try:
         cap = _num(cap_usd, "cap_usd")
@@ -564,8 +608,11 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True) -> tuple[bool, str]:
             fits = round(s["used_usd"] + s["reserved_usd"] + cap, 6) <= round(s["budget_usd"], 6)
             if fits and reserve:
                 keep = s["_keep"]
-                inv = os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
-                keep.append({"scope": scope, "cap_usd": cap, "name": name, "invocation": inv, "time": now})
+                inv = invocation or os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
+                entry = {"scope": scope, "cap_usd": cap, "name": name, "invocation": str(inv), "time": now}
+                if clusters_file:
+                    entry["clusters_file"] = os.path.abspath(str(clusters_file))
+                keep.append(entry)
                 os.makedirs(os.path.dirname(env.reservations), exist_ok=True)
                 with open(env.reservations + ".tmp", "w") as f:
                     json.dump(keep, f, indent=1)
@@ -858,7 +905,7 @@ def _self_test() -> int:
         # rate: cluster 1 $10.10 / 2 h = 5.05, cluster 3 $24.20 / 4 h = 6.05 -> median 5.55 (vmA's bound is 2.0,
         # vmB's 10.0). 1: max(10.10, 2 x 5.55) = 11.10; 2: 3 x 5.55 + 1 x 10 + 0.3 x 5.55 = 28.315 (billed 1.61);
         # 6: an errored cluster with a live VM, 2 x 5.55 = 11.10; 7: created before the start, 10 h from it x 5.55.
-        expect = 11.1 + 28.315 + 11.1 + 55.5
+        expect = 10.1 + 28.315 + 11.1 + 55.5     # cluster 1 is fully stopped: what it billed
         try:
             r8 = signed("k8")
         except Exception as e:  # noqa: BLE001 -- before the change the setup fails; the cases below report it
@@ -873,10 +920,11 @@ def _self_test() -> int:
             with_env(env(r8, source=_FakeSource(items, dets)))
             s = spend("f6")
             by = {c["id"]: c for c in s["clusters"]}
-            ok(sorted(by) == [1, 2, 6, 7] and abs(by[1]["billed_usd"] - 10.1) < 1e-9 and abs(by[1]["usd"] - 11.1) < 1e-9
+            ok(sorted(by) == [1, 2, 6, 7] and abs(by[1]["billed_usd"] - 10.1) < 1e-9 and abs(by[1]["usd"] - 10.1) < 1e-9
                and abs(by[2]["usd"] - 28.315) < 1e-9 and abs(by[2]["billed_usd"] - 1.61) < 1e-9,
-               f"BR8 a cluster counts max(billed = credits x 0.061 + cloud USD, instance-hours x max(median, the VM "
-               f"type's bound)); other scopes and look-alike names are left out: {by}")
+               f"BR8 a fully stopped cluster counts what it billed (credits x 0.061 + cloud USD); one with a live "
+               f"instance counts max(billed, instance-hours x max(median, the VM type's bound)); other scopes and "
+               f"look-alike names are left out: {by}")
             ok(by[6]["live_instances"] == 1 and abs(by[6]["usd"] - 11.1) < 1e-9,
                f"BR8b an errored cluster with a live instance still counts: {by[6]}")
             ok(abs(by[7]["usd"] - 55.5) < 1e-9 and by[7]["billed_usd"] == 0 and abs(s["used_usd"] - expect) < 1e-9,
@@ -894,8 +942,8 @@ def _self_test() -> int:
                                         "current_state"].__setitem__("updated", _iso(T0))),
                                     ("a live instance created in the future", 2, lambda x: x["scheduler"]["instance"]
                                         .__setitem__("created", _iso(now + 3600))),
-                                    ("no cost on a stopped cluster", 1, lambda x: x.__setitem__("cloud_total_cost",
-                                                                                                None))):
+                                    ("no cost on a cluster with a live instance", 2,
+                                     lambda x: x.__setitem__("cloud_total_cost", None))):
                 bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
                 mut(bad[str(cid)])
                 bad = {int(k): v for k, v in bad.items()}
@@ -915,6 +963,18 @@ def _self_test() -> int:
                f"BR8d an errored cluster that predates the window but still has a live VM counts from the start: "
                f"{by.get(8)}")
         case("BR8d", bg8d)
+
+        def bg8e():
+            nc = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+            nc = {int(k): v for k, v in nc.items()}
+            nc[1]["cloud_total_cost"] = None
+            nc[4] = nc[5] = ValueError("not this scope")
+            with_env(env(r8, source=_FakeSource(items, nc)))
+            by = {c["id"]: c for c in spend("f6")["clusters"]}
+            ok(abs(by[1]["usd"] - 2 * 6.05) < 1e-9,
+               f"BR8e a fully stopped cluster with no cloud cost counts the conservative estimate, and its partial bill "
+               f"is left out of the measured rate (2 h x cluster 3's $6.05): {by[1]['usd']}")
+        case("BR8e", bg8e)
 
         def bg10():
             seen = {}
@@ -1037,10 +1097,106 @@ def _self_test() -> int:
                f"BR12g the ledger lives in reservations/, so a default `status` does not read it as a budget: {code}")
         case("BR12", bg12)
 
+        def bg19():
+            # 2026-11-11 18:20 (F6 P6): run, keeper and overflow all stopped, yet `status` showed $306 used against
+            # $191.68 billed and $67 still reserved. The records of a stopped cluster can keep an instance in a
+            # non-final state (an overflow VM refused for quota stays queued), which read as live: projected to now,
+            # and holding the reservation. A cluster whose every process is stopped or errored is finished.
+            r = signed("k19", usd=2000.0)
+            t = clock[0]
+            names = ("lw-smoke-gf13-p6", "lw-smoke-gf13-p6-keeper", "lw-smoke-gf13-p6-overflow")   # v2-nigeria-gf13-p6 in f6
+            src = _FakeSource([], {})
+            with_env(env(r, source=src))
+            got = launch_budget_ok("f6", 1000, names[0])
+            later = t + 4 * H
+            clock[0] = later
+            for cid, nm, cr, cl in ((2364928, names[0], 2000, 70.0), (2364962, names[1], 50, 1.5),
+                                    (2364947, names[2], 400, 0.0)):
+                src.items.append(_item(cid, nm, t + 60, "stopped", t + 3 * H))
+                d_ = _det(cid, nm, t + 60, cr, cl, "stopped", insts=[(t + 60, t + 3 * H, "vmA")])
+                if nm.endswith("-overflow"):       # a worker whose VM never left the queue
+                    d_["workers"].append({"current_state": {"state": "stopped", "updated": _iso(t + 3 * H)},
+                                          "instance": {"created": _iso(t + 120), "instance_type_id": "vmA",
+                                                       "current_state": {"state": "queued", "updated": _iso(t + 120)}}})
+                src.det[cid] = d_
+            s19 = spend("f6")
+            billed = sum(c["billed_usd"] for c in s19["clusters"])
+            clock[0] = t
+            ok(got[0] and s19["reserved_usd"] == 0 and abs(s19["used_usd"] - billed) < 1e-9
+               and abs(billed - (2450 * 0.061 + 71.5)) < 1e-9 and not s19["reservations"],
+               f"BR19 a launch whose run, keeper and overflow clusters are all stopped releases its reservation, and "
+               f"they count what they billed: used {s19['used_usd']:.2f}, billed {billed:.2f}, "
+               f"reserved {s19['reserved_usd']:.2f}")
+        case("BR19", bg19)
+
+        def bg20():
+            # 2026-11-11 18:30 (F6 P6, live): reserved $209.83 while only the 18:21 relaunch (cap $120) was live. The
+            # 13:03 and 15:35 launches of the same config name were stopped, but the relaunch's clusters, of the same
+            # names and created after them, matched their reservations too.
+            r = signed("k20", usd=2000.0)
+            t = clock[0]
+            names = ("lw-smoke-p6", "lw-smoke-p6-keeper", "lw-smoke-p6-overflow")
+            src = _FakeSource([], {})
+            with_env(env(r, source=src))
+            cid, trios = [100], []
+
+            def trio(at):
+                ids = []
+                for nm in names:
+                    cid[0] += 1
+                    ids.append(cid[0])
+                    src.items.append(_item(cid[0], nm, at + 60, "running", at + 120))
+                    src.det[cid[0]] = _det(cid[0], nm, at + 60, 10, 1.0, "running", insts=[(at + 60, None, "vmA")])
+                trios.append((at, ids))
+
+            def stop(k):
+                at, ids = trios[k]
+                for i_ in ids:
+                    nm = src.det[i_]["name"]
+                    src.items = [x for x in src.items if x["id"] != i_] + [_item(i_, nm, at + 60, "stopped", at + 4 * H)]
+                    src.det[i_] = _det(i_, nm, at + 60, 10, 1.0, "stopped", insts=[(at + 60, at + 4 * H, "vmA")])
+            for k, cap in enumerate((100, 100, 120)):     # each relaunch reserves while the one before still runs
+                clock[0] = t + k * 3 * H
+                launch_budget_ok("f6", cap, names[0])
+                trio(clock[0])
+            clock[0] = t + 7 * H + 1800
+            stop(0), stop(1)
+            s20 = spend("f6")
+            clock[0] = t
+            held = [(x["cap_usd"], round(x["time"] - t)) for x in s20["reservations"]]
+            ok(held == [(120, 6 * H)] and s20["reserved_usd"] <= 120,
+               f"BR20 three launches of one name, the first two stopped and the third live: only the third's "
+               f"reservation is held (each reconciles only against clusters created before the next one): {held}")
+            r2 = signed("k20b", usd=2000.0)
+            src2 = _FakeSource([], {})
+            with_env(env(r2, source=src2))
+            fa, fb = os.path.join(r2, "a.json"), os.path.join(r2, "b.json")
+            launch_budget_ok("f6", 100, "lw-smoke-q", invocation="inv-a", clusters_file=fa)
+            launch_budget_ok("f6", 100, "lw-smoke-q", invocation="inv-b", clusters_file=fb)
+            for i_, (f_, inv, live) in enumerate(((fa, "inv-a", False), (fb, "inv-b", True))):
+                n_ = 60 + i_
+                src2.items.append(_item(n_, "lw-smoke-q", t + 60, "running" if live else "stopped", t + 120))
+                src2.det[n_] = _det(n_, "lw-smoke-q", t + 60, 10, 1.0, "running" if live else "stopped",
+                                    insts=[(t + 60, None if live else t + 600, "vmA")])
+                json.dump({"run": {"name": "lw-smoke-q", "id": n_}, "invocation": inv}, open(f_, "w"))
+            clock[0] = t + 1800
+            s20b = spend("f6")
+            json.dump({"run": {"name": "lw-smoke-q", "id": 99}, "invocation": "inv-c"}, open(fa, "w"))
+            s20c = spend("f6")
+            clock[0] = t
+            ok([x["invocation"] for x in s20b["reservations"]] == ["inv-b"],
+               f"BR20b a reservation whose launch's clusters.json names its cluster ids reconciles only against those "
+               f"ids (two concurrent launches of one name): {[x['invocation'] for x in s20b['reservations']]}")
+            ok([x["invocation"] for x in s20c["reservations"]] == ["inv-a", "inv-b"],
+               f"BR20c a clusters.json rewritten by another invocation falls back to the name-and-time rule, which "
+               f"cannot tell two same-second reservations apart and holds both (safe): "
+               f"{[x['invocation'] for x in s20c['reservations']]}")
+        case("BR20", bg20)
+
         def bg13():
             with_env(env(r8, source=_FakeSource(items, dets)))
             m = job_meter("f6")
-            ok(abs(m(2) - 28.315) < 1e-9 and abs(m(6) - 11.1) < 1e-9 and abs(m(1) - 11.1) < 1e-9,
+            ok(abs(m(2) - 28.315) < 1e-9 and abs(m(6) - 11.1) < 1e-9 and abs(m(1) - 10.1) < 1e-9,
                "BR13 the job meter reads each cluster by id at the scope's rates")
             txt = "\n".join(status_lines(spend("f6")))
             ok("remaining" in txt and "200.00" in txt and "f6-refit-a" in txt, f"BR14 status prints the table: {txt}")
