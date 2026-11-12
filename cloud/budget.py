@@ -858,7 +858,7 @@ def _self_test() -> int:
         # rate: cluster 1 $10.10 / 2 h = 5.05, cluster 3 $24.20 / 4 h = 6.05 -> median 5.55 (vmA's bound is 2.0,
         # vmB's 10.0). 1: max(10.10, 2 x 5.55) = 11.10; 2: 3 x 5.55 + 1 x 10 + 0.3 x 5.55 = 28.315 (billed 1.61);
         # 6: an errored cluster with a live VM, 2 x 5.55 = 11.10; 7: created before the start, 10 h from it x 5.55.
-        expect = 11.1 + 28.315 + 11.1 + 55.5
+        expect = 10.1 + 28.315 + 11.1 + 55.5     # cluster 1 is fully stopped: what it billed
         try:
             r8 = signed("k8")
         except Exception as e:  # noqa: BLE001 -- before the change the setup fails; the cases below report it
@@ -873,10 +873,11 @@ def _self_test() -> int:
             with_env(env(r8, source=_FakeSource(items, dets)))
             s = spend("f6")
             by = {c["id"]: c for c in s["clusters"]}
-            ok(sorted(by) == [1, 2, 6, 7] and abs(by[1]["billed_usd"] - 10.1) < 1e-9 and abs(by[1]["usd"] - 11.1) < 1e-9
+            ok(sorted(by) == [1, 2, 6, 7] and abs(by[1]["billed_usd"] - 10.1) < 1e-9 and abs(by[1]["usd"] - 10.1) < 1e-9
                and abs(by[2]["usd"] - 28.315) < 1e-9 and abs(by[2]["billed_usd"] - 1.61) < 1e-9,
-               f"BR8 a cluster counts max(billed = credits x 0.061 + cloud USD, instance-hours x max(median, the VM "
-               f"type's bound)); other scopes and look-alike names are left out: {by}")
+               f"BR8 a fully stopped cluster counts what it billed (credits x 0.061 + cloud USD); one with a live "
+               f"instance counts max(billed, instance-hours x max(median, the VM type's bound)); other scopes and "
+               f"look-alike names are left out: {by}")
             ok(by[6]["live_instances"] == 1 and abs(by[6]["usd"] - 11.1) < 1e-9,
                f"BR8b an errored cluster with a live instance still counts: {by[6]}")
             ok(abs(by[7]["usd"] - 55.5) < 1e-9 and by[7]["billed_usd"] == 0 and abs(s["used_usd"] - expect) < 1e-9,
@@ -894,8 +895,8 @@ def _self_test() -> int:
                                         "current_state"].__setitem__("updated", _iso(T0))),
                                     ("a live instance created in the future", 2, lambda x: x["scheduler"]["instance"]
                                         .__setitem__("created", _iso(now + 3600))),
-                                    ("no cost on a stopped cluster", 1, lambda x: x.__setitem__("cloud_total_cost",
-                                                                                                None))):
+                                    ("no cost on a cluster with a live instance", 2,
+                                     lambda x: x.__setitem__("cloud_total_cost", None))):
                 bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
                 mut(bad[str(cid)])
                 bad = {int(k): v for k, v in bad.items()}
@@ -915,6 +916,17 @@ def _self_test() -> int:
                f"BR8d an errored cluster that predates the window but still has a live VM counts from the start: "
                f"{by.get(8)}")
         case("BR8d", bg8d)
+
+        def bg8e():
+            nc = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+            nc = {int(k): v for k, v in nc.items()}
+            nc[1]["cloud_total_cost"] = None
+            nc[4] = nc[5] = ValueError("not this scope")
+            with_env(env(r8, source=_FakeSource(items, nc)))
+            by = {c["id"]: c for c in spend("f6")["clusters"]}
+            ok(abs(by[1]["usd"] - 11.1) < 1e-9,
+               f"BR8e a fully stopped cluster with no cloud cost counts the conservative estimate: {by[1]['usd']}")
+        case("BR8e", bg8e)
 
         def bg10():
             seen = {}
@@ -1037,10 +1049,42 @@ def _self_test() -> int:
                f"BR12g the ledger lives in reservations/, so a default `status` does not read it as a budget: {code}")
         case("BR12", bg12)
 
+        def bg19():
+            # 2026-11-11 18:20 (F6 P6): run, keeper and overflow all stopped, yet `status` showed $306 used against
+            # $191.68 billed and $67 still reserved. The records of a stopped cluster can keep an instance in a
+            # non-final state (an overflow VM refused for quota stays queued), which read as live: projected to now,
+            # and holding the reservation. A cluster whose every process is stopped or errored is finished.
+            r = signed("k19", usd=2000.0)
+            t = clock[0]
+            names = ("lw-smoke-gf13-p6", "lw-smoke-gf13-p6-keeper", "lw-smoke-gf13-p6-overflow")   # v2-nigeria-gf13-p6 in f6
+            src = _FakeSource([], {})
+            with_env(env(r, source=src))
+            got = launch_budget_ok("f6", 1000, names[0])
+            later = t + 4 * H
+            clock[0] = later
+            for cid, nm, cr, cl in ((2364928, names[0], 2000, 70.0), (2364962, names[1], 50, 1.5),
+                                    (2364947, names[2], 400, 0.0)):
+                src.items.append(_item(cid, nm, t + 60, "stopped", t + 3 * H))
+                d_ = _det(cid, nm, t + 60, cr, cl, "stopped", insts=[(t + 60, t + 3 * H, "vmA")])
+                if nm.endswith("-overflow"):       # a worker whose VM never left the queue
+                    d_["workers"].append({"current_state": {"state": "stopped", "updated": _iso(t + 3 * H)},
+                                          "instance": {"created": _iso(t + 120), "instance_type_id": "vmA",
+                                                       "current_state": {"state": "queued", "updated": _iso(t + 120)}}})
+                src.det[cid] = d_
+            s19 = spend("f6")
+            billed = sum(c["billed_usd"] for c in s19["clusters"])
+            clock[0] = t
+            ok(got[0] and s19["reserved_usd"] == 0 and abs(s19["used_usd"] - billed) < 1e-9
+               and abs(billed - (2450 * 0.061 + 71.5)) < 1e-9 and not s19["reservations"],
+               f"BR19 a launch whose run, keeper and overflow clusters are all stopped releases its reservation, and "
+               f"they count what they billed: used {s19['used_usd']:.2f}, billed {billed:.2f}, "
+               f"reserved {s19['reserved_usd']:.2f}")
+        case("BR19", bg19)
+
         def bg13():
             with_env(env(r8, source=_FakeSource(items, dets)))
             m = job_meter("f6")
-            ok(abs(m(2) - 28.315) < 1e-9 and abs(m(6) - 11.1) < 1e-9 and abs(m(1) - 11.1) < 1e-9,
+            ok(abs(m(2) - 28.315) < 1e-9 and abs(m(6) - 11.1) < 1e-9 and abs(m(1) - 10.1) < 1e-9,
                "BR13 the job meter reads each cluster by id at the scope's rates")
             txt = "\n".join(status_lines(spend("f6")))
             ok("remaining" in txt and "200.00" in txt and "f6-refit-a" in txt, f"BR14 status prints the table: {txt}")
