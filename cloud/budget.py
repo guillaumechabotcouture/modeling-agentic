@@ -449,8 +449,9 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
         est += max(0.0, t1 - max(t0, start)) / 3600 * max(median, bound)
         live += on
     tc, cc = d["total_cost"], d["cloud_total_cost"]
-    if live and tc is None and cc is None:
-        tc = cc = 0.0                      # not billed yet: the estimate covers it
+    partial = live and (tc is None or cc is None)
+    if partial:                            # not (fully) billed yet: the estimate, at the bound, covers it
+        tc, cc = (0.0 if tc is None else tc), (0.0 if cc is None else cc)
     fallback = done and (tc is None or cc is None)
     if fallback:                           # a finished cluster missing a cost: the conservative estimate stands in
         billed = _num(tc, "total_cost", 0.0) * USD_PER_CREDIT if tc is not None else 0.0
@@ -464,11 +465,13 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
     before = created < start
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
-            "usd": est if before else count, "_billed_all": None if fallback else billed,
+            "usd": est if before else count, "_billed_all": None if fallback or partial else billed,
             "assumptions": ([f"{untyped} instance(s) with no VM type yet (still provisioning), priced at the bound "
                              f"of the cluster's other workers' VM type (an untyped scheduler: the scope's schedulers'), "
                              f"or the table's highest, ${top:.2f} per hour, when none is typed"] if untyped else [])
-            + ([f"{failed} instance(s) failed to create, counted $0"] if failed else [])}
+            + ([f"{failed} instance(s) failed to create, counted $0"] if failed else [])
+            + (["a cost field is missing on this live cluster; counted max(the part billed, the estimate at the "
+                "VM bound)"] if partial and (d["total_cost"] is not None or d["cloud_total_cost"] is not None) else [])}
 
 
 def _measure(rec, env, now) -> dict:
@@ -980,8 +983,7 @@ def _self_test() -> int:
                                         "current_state"].__setitem__("updated", _iso(T0))),
                                     ("a live instance created in the future", 2, lambda x: x["scheduler"]["instance"]
                                         .__setitem__("created", _iso(now + 3600))),
-                                    ("no cost on a cluster with a live instance", 2,
-                                     lambda x: x.__setitem__("cloud_total_cost", None))):
+                                    ):
                 bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
                 mut(bad[str(cid)])
                 bad = {int(k): v for k, v in bad.items()}
@@ -990,6 +992,19 @@ def _self_test() -> int:
                 ok(refused(lambda: spend("f6")) is not None
                    and not launch_budget_ok("f6", 1, "lw-smoke-z")[0], f"BR9 {label} refuses")
         case("BR8-9", bg8)
+
+        def bg8f():
+            for field in ("cloud_total_cost", "total_cost"):
+                nc = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+                nc = {int(k): v for k, v in nc.items()}
+                nc[2][field] = None
+                nc[4] = nc[5] = ValueError("not this scope")
+                with_env(env(r8, source=_FakeSource(items, nc)))
+                by = {c["id"]: c for c in spend("f6")["clusters"]}
+                ok(abs(by[2]["usd"] - 28.315) < 1e-9 and any("missing" in a for a in by[2]["assumptions"]),
+                   f"BR8f a live cluster missing {field} counts the estimate at the VM bound, with a warning, "
+                   f"instead of refusing: {by[2]}")
+        case("BR8f", bg8f)
 
         def bg8d():
             it = items + [_item(8, "lw-smoke-olderr", T0 - 5 * H, "error", T0 - 4 * H)]
