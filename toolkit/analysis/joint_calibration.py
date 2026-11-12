@@ -266,9 +266,9 @@ def spec_problems(spec) -> list[str]:
             src = t.get("bias_source", t.get("id"))      # Codex r1 P2-4: the survey, shared by its targets
             if not _text(src):
                 bad.append(f"{tw}.bias_source: the survey's name (text)")
-            other = surveys.setdefault(src, (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True),
+            other = surveys.setdefault(src, (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str),
                                              t["bias_by"]))
-            if other != (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True), t["bias_by"]):
+            if other != (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str), t["bias_by"]):
                 bad.append(f"{tw}: survey {src!r} is declared with two bias_sd or bias_by values ({other})")
         elif "bias_source" in t:
             bad.append(f"{tw}.bias_source: needs bias_by")
@@ -1994,6 +1994,17 @@ def _self_test() -> int:
             bad4 = spec_problems(schema.load(p4))
             ok(any("bias_sd_by_group" in x for x in bad4),
                f"JA25e a bias_sd sensitivity on a target with bias_sd_by_group is refused at validation ({bad4[:2]})")
+            # Codex review round 2 of #206: a YAML date in the filter (loaded as a date) does not crash validation.
+            r5 = yaml.safe_load(open(p))
+            r5["calibration"]["joint"]["targets"][0]["bias_sd_by_group"]["filter"] = {"survey": "s", "when": "2021-11-01"}
+            p5 = os.path.join(d, "s5.yaml")
+            open(p5, "w").write(yaml.safe_dump(r5, sort_keys=False).replace("'2021-11-01'", "2021-11-01"))
+            try:
+                bad5 = spec_problems(schema.load(p5))
+                crash = None
+            except TypeError as e:
+                bad5, crash = None, str(e)[:120]
+            ok(crash is None, f"JA25f a date-valued filter is validated, not a crash ({crash}, {bad5 and bad5[:1]})")
     safe(ja25, "JA25")
 
     def ja17():          # the gate findings of the change diagnostic
