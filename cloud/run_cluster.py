@@ -400,6 +400,55 @@ def _archive_member(code: bytes, name: str) -> bytes | None:
         return None
 
 
+SHEET_SOURCES_MARK = "<!-- signoff-sheet-sources: "   # toolkit/spec/signoff.py SHEET_SOURCES, the sheet's last line
+
+
+def stale_sheet_problems(code: bytes, flags) -> list[str]:
+    """For a resumed run (--resume <run dir>) still at SIGN in the archive that ships: the sign-off sheet must
+    record the sha256 of the shipped decision_spec.yaml and data/derivations_record.json ("none" when absent),
+    as toolkit/spec/signoff.py write_sheet wrote them; the signer refuses otherwise, so the run would stop at
+    SIGN after the cluster is paid for (2026-11-12 canary). Fail closed: a missing or unparsable sheet is a
+    problem. A run past SIGN, or a launch that resumes no run, has nothing to check here."""
+    import hashlib
+    flags = list(flags or ())
+    runs = [flags[i + 1] for i, f in enumerate(flags[:-1]) if f == "--resume"]
+    out = []
+    for rel in runs:
+        rel = rel.rstrip("/")
+        raw = _archive_member(code, f"{rel}/run_state.json")
+        try:
+            state = json.loads(raw.decode()).get("state") if raw else None
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            state = None
+        if raw is not None and state != "SIGN":
+            continue
+        if raw is None or state is None:
+            out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
+            continue
+        spec = _archive_member(code, f"{rel}/decision_spec.yaml")
+        sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
+        rec = _archive_member(code, f"{rel}/data/derivations_record.json")
+        regen = f"regenerate it: python toolkit/spec/signoff.py sheet {rel} --write"
+        src = None
+        for line in reversed((sheet or b"").decode("utf-8", "replace").splitlines()):
+            if line.startswith(SHEET_SOURCES_MARK) and line.endswith(" -->"):
+                try:
+                    src = json.loads(line[len(SHEET_SOURCES_MARK):-4])
+                except ValueError:
+                    src = None
+                break
+        if spec is None:
+            out.append(f"{rel}: decision_spec.yaml is missing in the code to launch")
+        elif not isinstance(src, dict):
+            out.append(f"{rel}: at SIGN with no sign-off sheet recording its sources; {regen}")
+        elif src.get("spec_sha256") != hashlib.sha256(spec).hexdigest():
+            out.append(f"{rel}: the sign-off sheet was generated from another decision_spec.yaml "
+                       f"({str(src.get('spec_sha256'))[:12]}, shipped {hashlib.sha256(spec).hexdigest()[:12]}); {regen}")
+        elif src.get("derivations_sha256") != (hashlib.sha256(rec).hexdigest() if rec is not None else "none"):
+            out.append(f"{rel}: the sign-off sheet was generated from another data/derivations_record.json; {regen}")
+    return out
+
+
 def archive_commit(code: bytes) -> str | None:
     """The 7-character commit git archive stamped into scripts/lib/code_commit.txt, or None."""
     raw = (_archive_member(code, "scripts/lib/" + pipeline_id.COMMIT_FILE) or b"").decode("ascii", "replace").strip()
@@ -800,6 +849,9 @@ def _launch_locked(cfg, inv) -> int:
     question = open(cfg.question_file).read().strip()
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
+    stale = stale_sheet_problems(code, cfg.flags)   # a run that would stop at SIGN once the cluster is paid for
+    if stale:
+        raise SystemExit("refusing: " + "; ".join(stale))
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
     budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
     keys = read_keys()
@@ -4537,6 +4589,50 @@ def _self_test_checkpoint(ok) -> None:
        f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
 
 
+def _self_test_sheet(ok) -> None:
+    """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
+    generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
+    sheet does not record the shipped spec's and derivation record's sha256."""
+    import hashlib
+
+    def tar_of(files: dict) -> bytes:
+        bio = io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w:gz") as t:
+            for n, data in files.items():
+                ti = tarfile.TarInfo(n)
+                ti.size = len(data)
+                t.addfile(ti, io.BytesIO(data))
+        return bio.getvalue()
+
+    spec, rec = b"spec: 1\n", b'{"r": 1}'
+    def sheet_for(sp, rc):
+        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
+            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest()})
+            + " -->\n").encode()
+    R = "runs/r1"
+    flags = ("--resume", R, "--signoff", "lead")
+    st = lambda s_: json.dumps({"state": s_}).encode()      # noqa: E731
+    base = {f"{R}/run_state.json": st("SIGN"), f"{R}/decision_spec.yaml": spec,
+            f"{R}/data/derivations_record.json": rec, f"{R}/decision_spec.signoff_sheet.md": sheet_for(spec, rec)}
+    fresh = stale_sheet_problems(tar_of(base), flags)
+    stale = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    stale_rec = stale_sheet_problems(tar_of({**base, f"{R}/data/derivations_record.json": b'{"r": 2}'}), flags)
+    nosheet = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".md")}), flags)
+    garbled = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.signoff_sheet.md": b"# no sources\n"}), flags)
+    signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
+                                          f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
+    ok(fresh == [] and signed == [] and norun == [],
+       f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
+    ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
+       and len(stale_rec) == 1
+       and "derivation" in stale_rec[0],
+       f"RC80b a resumed run at SIGN whose spec or derivation record changed after its sheet is refused, with the "
+       f"command that regenerates the sheet: {stale} {stale_rec}")
+    ok(len(nosheet) == 1 and len(garbled) == 1,
+       f"RC80c fail closed: no sheet, or a sheet without recorded sources, is refused: {nosheet} {garbled}")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -4734,6 +4830,7 @@ def _self_test() -> int:
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)
+    _self_test_sheet(ok)
     _self_test_attach(ok)
     _self_test_sign(ok)
     _self_test_pipeline(ok, tb)
