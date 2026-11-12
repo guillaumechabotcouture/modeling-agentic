@@ -1204,31 +1204,59 @@ def _self_test() -> int:
 
         def bg21():
             # 2026-11-11 21:17 (canary, cluster 2366111 scaling 5 -> 48 workers): VMs still being provisioned report
-            # instance_type_id None; three refused readings in a row stopped the run as spend-unreadable.
-            def variant(vm_of):
-                v = json.loads(json.dumps({k: x for k, x in dets.items() if not isinstance(x, Exception)}))
-                v = {int(k): x for k, x in v.items()}
-                for p_ in [v[2]["scheduler"]] + v[2]["workers"]:
-                    if p_["instance"]["current_state"]["state"] not in ENDED:
-                        p_["instance"]["instance_type_id"] = vm_of(p_["instance"]["instance_type_id"])
-                v[4] = v[5] = ValueError("not this scope")
-                return v
-            with_env(env(r8, source=_FakeSource(items, dets)))
-            typed = {c["id"]: c for c in spend("f6")["clusters"]}[2]
-            with_env(env(r8, source=_FakeSource(items, variant(lambda vm: None))))
-            try:
-                s21 = spend("f6")
-                row = {c["id"]: c for c in s21["clusters"]}[2]
-                meter = job_meter("f6")(2)
-                txt = "\n".join(status_lines(s21))
-            except BudgetError as e:
-                row, meter, txt = {"usd": None, "assumptions": [str(e)]}, None, ""
-            ok(row["usd"] is not None and row["usd"] >= typed["usd"] and meter == row["usd"]
-               and any("no VM type" in a for a in row.get("assumptions", [])) and "no VM type" in txt,
-               f"BR21 live VMs with no type yet (still provisioning) are priced at the highest bound in the table, "
-               f"stated as an assumption, instead of refusing: {row.get('usd')} >= {typed['usd']}, "
-               f"{row.get('assumptions')}")
-            with_env(env(r8, source=_FakeSource(items, variant(lambda vm: "Azure_Z99"))))
+            # instance_type_id None; three refused readings in a row stopped the run as spend-unreadable. Seven of
+            # them were workers in `error` that Azure never created (quota).
+            X = 40
+
+            def cluster(sched, workers, extra=()):
+                d_ = _det(X, "lw-smoke-scale", now - 3 * H, 0, 0.0, "running",
+                          insts=[(now - 2 * H, None, sched)] + [(now - H, None, w) for w in workers])
+                d_["workers"] += [json.loads(json.dumps(e)) for e in extra]
+                return d_
+
+            def usd(det_x, base=True):
+                it = (items if base else []) + [_item(X, "lw-smoke-scale", now - 3 * H, "running", now)]
+                de = ({k: v for k, v in dets.items()} if base else {})
+                de[X] = det_x
+                with_env(env(r8, source=_FakeSource(it, de)))
+                s_ = spend("f6")
+                return {c["id"]: c for c in s_["clusters"]}[X], "\n".join(status_lines(s_))
+
+            pend = [None, None]
+            got, txt = usd(cluster("vmA", ["vmA", "vmA"] + pend))
+            want, _ = usd(cluster("vmA", ["vmA"] * 4))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and any("no VM type" in x for x in got["assumptions"])
+               and "no VM type" in txt,
+               f"BR21 untyped pending workers are priced at the bound of the VM type the cluster's other workers have "
+               f"(not the table maximum), stated as an assumption: {got['usd']:.3f} == {want['usd']:.3f}; "
+               f"{got['assumptions']}")
+            got, _ = usd(cluster("vmA", [None] * 4))
+            want, _ = usd(cluster("vmA", ["vmB"] * 4))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9,
+               f"BR21c with no typed worker yet, untyped workers take the table maximum: {got['usd']:.3f} == "
+               f"{want['usd']:.3f}")
+            got, _ = usd(cluster(None, ["vmA"] * 2))
+            want, _ = usd(cluster("vmA", ["vmA"] * 2))
+            got2, _ = usd(cluster(None, ["vmA"] * 2), base=False)
+            want2, _ = usd(cluster("vmB", ["vmA"] * 2), base=False)
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and abs(got2["usd"] - want2["usd"]) < 1e-9,
+               f"BR21d an untyped scheduler takes the highest scheduler bound among the scope's recent clusters "
+               f"(vmA here), else the table maximum: {got['usd']:.3f} == {want['usd']:.3f}, "
+               f"{got2['usd']:.3f} == {want2['usd']:.3f}")
+            failed = {"current_state": {"state": "error", "updated": _iso(now - H)},
+                      "instance": {"created": _iso(now - H), "instance_type_id": None,
+                                   "current_state": {"state": "error", "updated": _iso(now - H),
+                                                     "reason": "Failed to create VM -- (OperationNotAllowed) Operation "
+                                                               "could not be completed as it results in exceeding "
+                                                               "approved standardESv5Family Cores quota."}}}
+            got, txt = usd(cluster("vmA", ["vmA", "vmA"], extra=[failed] * 7))
+            want, _ = usd(cluster("vmA", ["vmA", "vmA"]))
+            ok(abs(got["usd"] - want["usd"]) < 1e-9 and any("7 instance(s) failed to create, counted $0" in x
+                                                              for x in got["assumptions"]) and "failed to create" in txt,
+               f"BR21e workers in error that Azure never created (no type, quota) count $0 and are listed: "
+               f"{got['usd']:.3f} == {want['usd']:.3f}; {got['assumptions']}")
+            with_env(env(r8, source=_FakeSource(items + [_item(X, "lw-smoke-scale", now - 3 * H, "running", now)],
+                                                {**dets, X: cluster("vmA", ["Azure_Z99"])})))
             ok(refused(lambda: spend("f6")) is not None and not launch_budget_ok("f6", 1, "lw-smoke-z")[0],
                "BR21b a named VM type that is not in the table still refuses")
         case("BR21", bg21)
