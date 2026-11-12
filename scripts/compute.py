@@ -194,6 +194,8 @@ MEM_USABLE = 0.85          # share of the memory available at start that the poo
 # resubmitted once each, and both resubmissions were lost the same way: 16 rows infra, the analysis failed.
 # 2026-11-11 (F6 preview): 1 of 42 benchmark tasks was lost with its worker after its resubmission too, and the
 # 2.5-h run ended; three resubmissions, each after a doubling backoff, ride out a pool that is still settling.
+RETIRED_EVENTS = 500       # scheduler events read for workers removed on purpose (_sched_view)
+SCALEDOWN_RETRIES = 8      # resubmissions per input after a scale-down retired its worker, before they count as losses
 INFRA_RETRIES = 3          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
 INFRA_BACKOFF_S = 10.0     # MA_COMPUTE_INFRA_BACKOFF_S when unset: wait before the first resubmission, doubled after
 NO_WORKER_WAIT_S = 1800    # MA_COMPUTE_NO_WORKER_WAIT_S when unset: how long a call waits with no compute worker
@@ -1158,12 +1160,21 @@ def _demand_marker():
 def _sched_view(res=None, key=None, dask_scheduler=None) -> dict:
     """Runs on the scheduler (Phase 45 δ): {"workers": {address: [carries the
     resource tag, tasks processing there, accepting work]}, "held": whether
-    some worker still holds `key` (the scattered bundle)}."""
+    some worker still holds `key` (the scattered bundle), "retired": the
+    recently removed workers whose removal the scheduler records as expected
+    (a scale-down or retire, not a crash)}."""
     ts = dask_scheduler.tasks.get(key) if key is not None else None
+    retired = set()
+    try:
+        for _t, e in tuple(dask_scheduler.get_events("all"))[-RETIRED_EVENTS:]:
+            if isinstance(e, dict) and e.get("action") == "remove-worker" and e.get("worker"):
+                (retired.add if e.get("expected") else retired.discard)(e["worker"])
+    except Exception:  # noqa: BLE001 — unknown: every departure counts as a loss
+        retired = set()
     return {"workers": {a: [res is None or res in (ws.resources or {}), len(ws.processing),
                             getattr(ws.status, "name", str(ws.status)) == "running"]
                         for a, ws in dask_scheduler.workers.items()},
-            "held": bool(ts is not None and ts.who_has)}
+            "held": bool(ts is not None and ts.who_has), "retired": sorted(retired)}
 
 
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
@@ -1298,14 +1309,19 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             return f
         futs, queue, started, errors = {}, [(ch, 0, None) for ch in chunks], {}, {}
         losses = {}                                 # input -> times its chunk was lost (chunk_lost)
+        scaledowns = {}                             # input -> times a scale-down retired its chunk's worker
 
         def halved(used, worker=None):
             return max(1, int(used or cpus.get(worker) or cores_per_slot) // 2)
 
-        def chunk_lost(f, ch, attempt, used, f_share, msg):
+        def chunk_lost(f, ch, attempt, used, f_share, msg, scaled_down=False):
             """A chunk whose result is lost (its worker died or left, or the task
             failed): charge it, then resubmit it on the remaining or new workers,
-            up to `retries` times per input, the first time with half the processes."""
+            up to `retries` times per input, the first time with half the processes.
+            A worker the scheduler removed on purpose (`scaled_down`: an autoscaler
+            scale-down) says nothing about memory or a failing VM: the chunk goes
+            back with the processes it had, without a backoff, and uses none of its
+            infra retries, up to SCALEDOWN_RETRIES times per input (2026-11-12, P6)."""
             nonlocal lost
             # Its work is unknown: charge the share it was allowed
             # (chunks enforce their share), or estimate it at the end.
@@ -1315,11 +1331,25 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 progress["core_s"] += min(f_share, busy)
             else:
                 lost += 1
+            n_scaled = 1 + max(scaledowns.get(i, 0) for i, _ in ch)
+            if scaled_down and n_scaled <= SCALEDOWN_RETRIES and (deadline is None or time.time() < deadline):
+                scaledowns.update({i: n_scaled for i, _ in ch})
+                progress.setdefault("chunks", []).append(
+                    {"n": len(ch), "attempt": attempt, "losses": max(losses.get(i, 0) for i, _ in ch),
+                     "scaled_down": True, "error": msg[:200], "worker": pinned.get(f), "procs": used,
+                     "retried_with_procs": used, "core_s": round(min(f_share, busy), 1) if f_share else None,
+                     "wall_s": round(time.time() - started.get(f, time.time()), 1)})
+                print(f"compute: {len(ch)} input(s) back in the queue: a scale-down retired their worker "
+                      f"({n_scaled} of {SCALEDOWN_RETRIES})", file=sys.stderr, flush=True)
+                queue.insert(0, (ch, TAIL if attempt == TAIL else 1, used))
+                progress["resubmitted"] = progress.get("resubmitted", 0) + 1
+                progress["scaled_down"] = progress.get("scaled_down", 0) + 1
+                return
             n_lost = 1 + max(losses.get(i, 0) for i, _ in ch)
             losses.update({i: n_lost for i, _ in ch})
             progress.setdefault("chunks", []).append(
                 {"n": len(ch), "attempt": attempt, "losses": n_lost, "error": msg[:200], "worker": pinned.get(f),
-                 "core_s": round(min(f_share, busy), 1) if f_share else None,
+                 "procs": used, "core_s": round(min(f_share, busy), 1) if f_share else None,
                  "wall_s": round(time.time() - started.get(f, time.time()), 1)})
             errors.update({i: msg for i, _ in ch})
             if n_lost <= retries and (deadline is None or time.time() < deadline):
@@ -1346,7 +1376,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 return None
             ok_w = {a: s for a, s in allw.items()
                     if a not in exclude and (s[0] if res else a in fixed)}
-            return ok_w, allw, v["held"]
+            return ok_w, allw, v["held"], set(v.get("retired") or ())
 
         def demand(n):
             """Keep `n` demand markers queued: the autoscaler counts them as tasks
@@ -1367,7 +1397,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 _note(progress, inflight(), call_id=call_id)
                 got_v, free = view(), []
                 if got_v is not None:
-                    ok_w, allw, held_b = got_v
+                    ok_w, allw, held_b, retired_w = got_v
                     for a in [a for a in ok_w if a not in seen_w]:       # joined since the call started
                         seen_w.add(a)
                         try:
@@ -1386,7 +1416,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         ch, attempt, used = futs[f]
                         f.cancel()
                         chunk_lost(f, ch, attempt, used, held.pop(f, None),
-                                   f"chunk failed: its worker {pinned[f]} left the cluster")
+                                   f"chunk failed: its worker {pinned[f]} left the cluster",
+                                   scaled_down=pinned[f] in retired_w)
                     # A chunk that has not started on a worker that has stopped taking
                     # work (closing, paused) or that runs something else (another call
                     # picked the same idle worker from the same snapshot) is revoked
@@ -1454,7 +1485,9 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     queue.pop(k_q)
                     pending.add(f)
                 if res:
-                    demand(0 if starved else min(len(queue), max(0, pool - len(pending))))
+                    # One marker stays while chunks wait with the pool full (2026-11-12, P6): with
+                    # none, the autoscaler saw no waiting work and shrank the pool as chunks finished.
+                    demand(0 if starved or not queue else min(len(queue), max(1, pool - len(pending))))
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 if not pending:
                     if starved and queue:
@@ -4177,9 +4210,17 @@ def _self_test_p45d(ok) -> None:
                 lc.scale(5)                        # 3 tagged workers join mid-batch
                 cc.wait_for_workers(5, timeout=60)
                 st2 = until(lambda: (lambda v: v if sum(1 for n in v["proc"].values() if n == 1) == 4
-                                     and v["unrunnable"] == 0 else None)(cc.run_on_scheduler(state)), 30)
+                                     and v["unrunnable"] == 1 else None)(cc.run_on_scheduler(state)), 30)
                 ok(st2 is not None and not st2["proc"].get(w_run),
-                   f"P45D-2 each joining worker got a chunk at once and the demand markers were withdrawn: {st2}")
+                   f"P45D-2 each joining worker got a chunk at once and the demand markers were withdrawn down to "
+                   f"one: {st2}")
+                # 2026-11-12 (P6): with every slot of the pool busy and chunks still queued, no marker
+                # was left, so the autoscaler saw no waiting work and shrank the pool as chunks finished,
+                # retiring the worker a queued chunk was about to be pinned to. One marker stays while
+                # chunks wait, so the target holds the pool.
+                ok(st2 is not None and st2["target"] >= 5,
+                   f"P45D-2b with the pool full and chunks queued, one demand marker holds the autoscaler's "
+                   f"target at the pool (>= 5 workers): {st2}")
                 open(os.path.join(rd, "go"), "w").close()
                 th.join(120)
                 rows, s = box.get("r", ([], {}))
@@ -4590,6 +4631,12 @@ def _self_test_infra(ok) -> None:
                    and s3.get("estimated_core_s", 0) > 0 and not s3.get("failed_by_kind"),
                    f"IR3 a chunk whose worker was retired under it is charged and finished on the remaining "
                    f"worker within the call: {r3} {s3}")
+                # 2026-11-12 (P6): a scale-down (the scheduler records the removal as expected) says
+                # nothing about memory or a failing VM: the chunk goes back with the processes it had,
+                # without a backoff, and does not use one of its infra retries.
+                ok(len(lost3) == 1 and lost3[0].get("scaled_down") is True and lost3[0].get("losses") == 0
+                   and lost3[0].get("retried_with_procs") == lost3[0].get("procs") and not lost3[0].get("backoff_s"),
+                   f"IR3b a chunk lost to a scale-down keeps its processes and its infra retries: {lost3}")
                 # IR4/IR5: the retries are bounded per input (INFRA_RETRIES = 2): a chunk lost twice
                 # still finishes; one lost three times is an infra row, after exactly three attempts.
                 real_task = _remote_task

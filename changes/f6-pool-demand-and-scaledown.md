@@ -1,0 +1,9 @@
+---
+phase: "F6"
+commit: "S2-KP2"
+status_group: "F6 Stage 2"
+---
+
+## Changelog
+
+**A full pool with chunks waiting keeps one demand marker, and a chunk lost to a scale-down keeps its processes and retries.** Two pool problems seen on the P6 preview (2026-11-12), alongside the keeper's stale worker view (S2-KP1). First, `scripts/compute.py` showed the autoscaler `min(queued, pool - pending)` demand markers, so with every slot of the pool busy and chunks still queued (42 one-hour benchmark runs on 40 workers) it showed none; the autoscaler then saw no waiting work, shrank the pool as chunks finished, and retired the worker a queued chunk was about to be pinned to. One marker now stays while chunks wait (`max(1, pool - pending)`), so the target holds the pool; none when the queue is empty or the allowance is used. Second, every chunk whose worker left was a loss: it used one of the input's infra retries (`MA_COMPUTE_INFRA_RETRIES`), waited a backoff and, the first time, went back with half the processes (a memory heuristic). The scheduler view (`_sched_view`) now names the workers whose removal the scheduler recorded as expected (`remove-worker` events with `expected`, a scale-down or retire, not a crash); a chunk whose worker was one of them is charged as before, then goes back with the processes it had, without a backoff, and without using an infra retry, up to `SCALEDOWN_RETRIES` (8) times per input, after which it counts as a loss. A crash (`expected` false) or an unreadable event log is handled as before. Lost-chunk records now carry `procs`; scale-down records carry `scaled_down: true`. Self-tests, written first and failing before the change: P45D-2 (changed: one marker left, not none), P45D-2b (the target holds the pool with chunks queued), IR3b (a retired worker's chunk keeps its processes and its retries). `scripts/compute.py --self-test` passes. No cloud run.
