@@ -40,8 +40,9 @@ is used; --timeout-s stops it at a wall-clock limit.
 Phase 35, failures handled by the service (no agent troubleshooting):
 memory is measured per process and concurrency lowered to fit; a process
 death (out of memory) reruns the affected inputs at lower concurrency; a chunk
-lost with its VM is resubmitted up to MA_COMPUTE_INFRA_RETRIES (2) times per
-input, and the autoscaler never retires a worker that is running one
+lost with its VM is resubmitted up to MA_COMPUTE_INFRA_RETRIES (3) times per
+input, each after a doubling backoff (MA_COMPUTE_INFRA_BACKOFF_S, 10 s first; logged), never for a model error, and
+the autoscaler never retires a worker that is running one
 (`BusyWorkerGuard`); a model error repeating on most rows stops the batch early.
 Failed rows carry `kind`: model | infra | stopped. The CLI reuses rows of an
 earlier run of the same command (same function, code, data and params), so
@@ -191,7 +192,10 @@ MEM_HEADROOM = 1.2         # a process may grow 20% past the largest peak seen
 MEM_USABLE = 0.85          # share of the memory available at start that the pool may use
 # 2026-11-02 (Nigeria v2 full run F3): two chunks lost when the autoscaler retired their workers were
 # resubmitted once each, and both resubmissions were lost the same way: 16 rows infra, the analysis failed.
-INFRA_RETRIES = 2          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
+# 2026-11-11 (F6 preview): 1 of 42 benchmark tasks was lost with its worker after its resubmission too, and the
+# 2.5-h run ended; three resubmissions, each after a doubling backoff, ride out a pool that is still settling.
+INFRA_RETRIES = 3          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
+INFRA_BACKOFF_S = 10.0     # MA_COMPUTE_INFRA_BACKOFF_S when unset: wait before the first resubmission, doubled after
 NO_WORKER_WAIT_S = 1800    # MA_COMPUTE_NO_WORKER_WAIT_S when unset: how long a call waits with no compute worker
 
 
@@ -1217,6 +1221,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             guard = f"not installed: {type(e).__name__}: {e}"[:200]
             print(f"compute: busy-worker guard {guard}", file=sys.stderr, flush=True)
         retries = int(os.environ.get("MA_COMPUTE_INFRA_RETRIES") or INFRA_RETRIES)
+        backoff0 = float(os.environ.get("MA_COMPUTE_INFRA_BACKOFF_S") or INFRA_BACKOFF_S)
+        not_before = {}                             # id(chunk) -> earliest resubmission time (the backoff)
         no_worker_wait = float(os.environ.get("MA_COMPUTE_NO_WORKER_WAIT_S") or NO_WORKER_WAIT_S)
         winfo = _sched_workers(c)
         # Phase 30: on an autoscaling pool, compute workers carry a resource tag
@@ -1317,7 +1323,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                  "wall_s": round(time.time() - started.get(f, time.time()), 1)})
             errors.update({i: msg for i, _ in ch})
             if n_lost <= retries and (deadline is None or time.time() < deadline):
-                # A rerun tail stays one (no chunk breaker); a lost VM says nothing more about memory.
+                # A rerun tail stays one (no chunk breaker); a lost VM says nothing more about memory. Each
+                # resubmission waits a doubling backoff (infra only: a model error never comes here).
+                wait_s = round(backoff0 * 2 ** (n_lost - 1), 3)
+                progress["chunks"][-1]["backoff_s"] = wait_s
+                not_before[id(ch)] = time.time() + wait_s
+                print(f"compute: {len(ch)} input(s) lost with their chunk ({msg[:120]}); resubmission {n_lost} of "
+                      f"{retries} in {wait_s:g} s", file=sys.stderr, flush=True)
                 queue.insert(0, (ch, TAIL if attempt == TAIL else 1, halved(used) if n_lost == 1 else used))
                 progress["resubmitted"] = progress.get("resubmitted", 0) + 1
                 return
@@ -1431,11 +1443,15 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     break
                 starved = allowance_s is not None and allowance_s - progress["core_s"] - sum(held.values()) <= 0
                 while queue and free and len(pending) < slots and not starved:
-                    f = submit(*queue[0], worker=free.pop(0))
+                    k_q = next((k for k, q in enumerate(queue) if not_before.get(id(q[0]), 0.0) <= time.time()), None)
+                    if k_q is None:                 # every queued chunk is waiting out its backoff
+                        break
+                    f = submit(*queue[k_q], worker=free.pop(0))
                     if f is None:
                         starved = True
                         break
-                    queue.pop(0)
+                    not_before.pop(id(queue[k_q][0]), None)
+                    queue.pop(k_q)
                     pending.add(f)
                 if res:
                     demand(0 if starved else min(len(queue), max(0, pool - len(pending))))
@@ -3606,6 +3622,18 @@ def _self_test_checkpoint_restore(ok) -> None:
         _, s6 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
         ok(s6.get("computed") == 0, f"CP6 a summary from before the sha256 (no torn snapshot possible) still reuses "
                                     f"when its row count matches: {s6.get('computed')} computed")
+        from unittest import mock as _mock
+        with _mock.patch.dict(os.environ, {"MA_PIPELINE_RUN": "P9"}):
+            run_map(rd2, "models/fn.py::f", [{"x": 9}], os.path.join(bd2, "p.jsonl"), backend="local", max_workers=1,
+                    ledger=False)
+        with _mock.patch.dict(os.environ):
+            os.environ.pop("MA_PIPELINE_RUN", None)
+            run_map(rd2, "models/fn.py::f", [{"x": 9}], os.path.join(bd2, "q.jsonl"), backend="local", max_workers=1,
+                    ledger=False)
+        p9 = json.load(open(os.path.join(bd2, "p.jsonl.summary.json"))).get("pipeline_run")
+        q9 = json.load(open(os.path.join(bd2, "q.jsonl.summary.json"))).get("pipeline_run", "absent")
+        ok(p9 == "P9" and q9 == "absent",
+           f"CP7 (F6) a batch run inside a pipeline step records that pipeline run's id in its summary: {p9} {q9}")
         # the hop through the launch tree: committed with `add -f`, shipped by archive, extracted on the VM
         import shutil as _sh
         import subprocess as _sp

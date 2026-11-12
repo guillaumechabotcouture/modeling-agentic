@@ -264,7 +264,8 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
         summ = dict(summ, tasks=len(groups), n=len(jobs), n_failed=sum(not r["ok"] for r in rows))
     res, problems = verify_rows([dict(r, id=j["id"]) for j, r in zip(jobs, rows) if r.get("ok")], jobs, engine)
     return {"results": res, "problems": problems,
-            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s", "tasks")}, "path": out}
+            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind", "wall_s",
+                                                 "tasks")}, "path": out}
 
 
 def verify_rows(rows: list[dict], jobs: list[dict], engine) -> tuple[dict, list[str]]:

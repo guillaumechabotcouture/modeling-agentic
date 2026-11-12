@@ -799,6 +799,15 @@ def change_findings(raw, data, expected=None) -> list:
 
 
 # --------------------------------------------------------------------------- simulation
+INFRA_KIND = "infra"      # scripts/compute.py's kind for a row lost with its machine (never a model failure)
+
+
+def _infra_only(rows) -> bool:
+    """Some rows failed, and every failed one was lost to infrastructure (not the model)."""
+    bad = [r for r in rows if not r.get("ok")]
+    return bool(bad) and all(r.get("kind") == INFRA_KIND for r in bad)
+
+
 class _Deferred(Exception):
     """A benchmark runner needs engine jobs that are not in the cache yet (recorded; run them as a batch)."""
 
@@ -932,8 +941,14 @@ class Simulator:
         tasks = [[list(x) for x in g] for g in groups.values()]
         outp = os.path.join(self.run_dir, OUT_REL, f"bench_call{self.calls}_phase{phase}.jsonl")
         kw = {k: v for k, v in self.kw.items() if k in ("max_workers", "max_core_hours", "timeout_s")}
-        rows, summ = compute.run_map(self.run_dir, os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list",
-                                     tasks, outp, purpose="v2 joint calibration: benchmark settings", **kw)
+        fn = os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list"
+        rows, summ = compute.run_map(self.run_dir, fn, tasks, outp, purpose="v2 joint calibration: benchmark settings",
+                                     **kw)
+        if _infra_only(rows):        # F6 preview 2026-11-11: once more, same file: done rows are reused
+            self.log(f"benchmark batch: {sum(not r.get('ok') for r in rows)} task(s) lost to infra after compute's "
+                     "own retries; running the batch once more (finished tasks are reused)")
+            rows, summ = compute.run_map(self.run_dir, fn, tasks, outp,
+                                         purpose="v2 joint calibration: benchmark settings (infra rerun)", **kw)
         bad = [n for n, r in enumerate(rows) if not r.get("ok")]
         if bad:
             raise HM.CalibrationInputError([f"benchmark batch: {len(bad)} of {len(rows)} tasks failed (e.g. "
@@ -959,8 +974,14 @@ class Simulator:
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
             jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
-            b = Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
-                       **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            def run_once():
+                return Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
+                              **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            b = run_once()
+            kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
+            if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
+                self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
+                b = run_once()
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
