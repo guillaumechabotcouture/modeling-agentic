@@ -3741,13 +3741,13 @@ def _self_test_budget(ok) -> None:
        and RunConfig(name="t", question_file="q").budget_scope == ""
        and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
        "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
-    made, keys = [], []
+    made, keys, kws = [], [], []
     calls = []
 
     def try_launch(cfg, verdict):
         made.clear(), keys.clear(), calls.clear()
         fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
-        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), verdict)[1]  # noqa: E731
+        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), kws.append(kw), verdict)[2]  # noqa: E731
         with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
                 mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
                                             "pipeline_preflight": lambda c, code: "v2",
@@ -3769,13 +3769,15 @@ def _self_test_budget(ok) -> None:
     ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
     msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+    ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
+       f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
     import tempfile
     with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
         cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
         json.dump({"run": {"name": cfg.name, "id": 5}}, open(cfg.clusters_file, "w"))
         json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
         seen, started = [], []
-        lbo = lambda scope, cap, name=None, reserve=True: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
+        lbo = lambda scope, cap, name=None, reserve=True, **k: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
         for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
             seen.clear(), started.clear()
             with mock.patch.object(budget, "launch_budget_ok", lbo), \

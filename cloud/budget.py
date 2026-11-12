@@ -1098,6 +1098,69 @@ def _self_test() -> int:
                f"reserved {s19['reserved_usd']:.2f}")
         case("BR19", bg19)
 
+        def bg20():
+            # 2026-11-11 18:30 (F6 P6, live): reserved $209.83 while only the 18:21 relaunch (cap $120) was live. The
+            # 13:03 and 15:35 launches of the same config name were stopped, but the relaunch's clusters, of the same
+            # names and created after them, matched their reservations too.
+            r = signed("k20", usd=2000.0)
+            t = clock[0]
+            names = ("lw-smoke-p6", "lw-smoke-p6-keeper", "lw-smoke-p6-overflow")
+            src = _FakeSource([], {})
+            with_env(env(r, source=src))
+            cid, trios = [100], []
+
+            def trio(at):
+                ids = []
+                for nm in names:
+                    cid[0] += 1
+                    ids.append(cid[0])
+                    src.items.append(_item(cid[0], nm, at + 60, "running", at + 120))
+                    src.det[cid[0]] = _det(cid[0], nm, at + 60, 10, 1.0, "running", insts=[(at + 60, None, "vmA")])
+                trios.append((at, ids))
+
+            def stop(k):
+                at, ids = trios[k]
+                for i_ in ids:
+                    nm = src.det[i_]["name"]
+                    src.items = [x for x in src.items if x["id"] != i_] + [_item(i_, nm, at + 60, "stopped", at + 4 * H)]
+                    src.det[i_] = _det(i_, nm, at + 60, 10, 1.0, "stopped", insts=[(at + 60, at + 4 * H, "vmA")])
+            for k, cap in enumerate((100, 100, 120)):     # each relaunch reserves while the one before still runs
+                clock[0] = t + k * 3 * H
+                launch_budget_ok("f6", cap, names[0])
+                trio(clock[0])
+            clock[0] = t + 7 * H + 1800
+            stop(0), stop(1)
+            s20 = spend("f6")
+            clock[0] = t
+            held = [(x["cap_usd"], round(x["time"] - t)) for x in s20["reservations"]]
+            ok(held == [(120, 6 * H)] and s20["reserved_usd"] <= 120,
+               f"BR20 three launches of one name, the first two stopped and the third live: only the third's "
+               f"reservation is held (each reconciles only against clusters created before the next one): {held}")
+            r2 = signed("k20b", usd=2000.0)
+            src2 = _FakeSource([], {})
+            with_env(env(r2, source=src2))
+            fa, fb = os.path.join(r2, "a.json"), os.path.join(r2, "b.json")
+            launch_budget_ok("f6", 100, "lw-smoke-q", invocation="inv-a", clusters_file=fa)
+            launch_budget_ok("f6", 100, "lw-smoke-q", invocation="inv-b", clusters_file=fb)
+            for i_, (f_, inv, live) in enumerate(((fa, "inv-a", False), (fb, "inv-b", True))):
+                n_ = 60 + i_
+                src2.items.append(_item(n_, "lw-smoke-q", t + 60, "running" if live else "stopped", t + 120))
+                src2.det[n_] = _det(n_, "lw-smoke-q", t + 60, 10, 1.0, "running" if live else "stopped",
+                                    insts=[(t + 60, None if live else t + 600, "vmA")])
+                json.dump({"run": {"name": "lw-smoke-q", "id": n_}, "invocation": inv}, open(f_, "w"))
+            clock[0] = t + 1800
+            s20b = spend("f6")
+            json.dump({"run": {"name": "lw-smoke-q", "id": 99}, "invocation": "inv-c"}, open(fa, "w"))
+            s20c = spend("f6")
+            clock[0] = t
+            ok([x["invocation"] for x in s20b["reservations"]] == ["inv-b"],
+               f"BR20b a reservation whose launch's clusters.json names its cluster ids reconciles only against those "
+               f"ids (two concurrent launches of one name): {[x['invocation'] for x in s20b['reservations']]}")
+            ok([x["invocation"] for x in s20c["reservations"]] == ["inv-b"],
+               f"BR20c a clusters.json rewritten by another invocation falls back to the name-and-time rule: "
+               f"{[x['invocation'] for x in s20c['reservations']]}")
+        case("BR20", bg20)
+
         def bg13():
             with_env(env(r8, source=_FakeSource(items, dets)))
             m = job_meter("f6")
