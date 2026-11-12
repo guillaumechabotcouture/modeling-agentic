@@ -2342,6 +2342,42 @@ def _self_test_52(ok) -> None:
        f"RC52g the keeper loop waits out an unpopulated scheduler identity without dropping its adapt(): "
        f"adapts={len(FakeCluster.adapts)} log={log[-300:]!r}")
 
+    # 2026-11-12 (P6): the attached Cluster's own worker view stayed at the 5 workers present when the keeper
+    # started while the pool grew to 41, so dask's Adaptive took the other workers as requested but never
+    # arrived and closed them without asking workers_to_close (BusyWorkerGuard): busy workers were retired.
+    # Each tick the keeper copies the scheduler's worker table into the Cluster's view.
+    class StaleCluster(FakeCluster):
+        last = None
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.client = FakeClient([{"workers": table}] * 6)
+            self.scheduler_info = {"workers": {"tls://10.0.0.5:1": {"name": "a"}}, "id": "s"}
+            StaleCluster.last = self
+
+    ticks = iter([True] * 4)
+    fake.list_clusters = lambda workspace: ([{"name": "x", "id": 7, "current_state": {"state": "running"}}]
+                                            if next(ticks, False) else [])
+    fake.Cluster = StaleCluster
+    with tempfile.TemporaryDirectory() as d:
+        ws.KEEPER_STATUS, ws.KEEPER_LOG = os.path.join(d, "st.json"), os.path.join(d, "keeper.log")
+        sys.modules["coiled"] = fake
+        time.sleep = lambda s: None
+        try:
+            ws._keeper_loop("tok", "x", "ws", 3, 9, 1.0, {}, cluster_id=7, tick_s=0)
+            log = open(ws.KEEPER_LOG).read()
+        finally:
+            time.sleep = real_sleep
+            ws.KEEPER_STATUS, ws.KEEPER_LOG = paths
+            if real_coiled is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = real_coiled
+    view = (StaleCluster.last.scheduler_info or {}).get("workers") if StaleCluster.last else None
+    ok(view == table and StaleCluster.last.scheduler_info.get("id") == "s" and "keeper error" not in log,
+       f"RC52k each keeper tick replaces the attached Cluster's worker view with the scheduler's table, so "
+       f"Adaptive sees every worker that joined: {view} log={log[-300:]!r}")
+
 
 def _self_test_51c(ok) -> None:
     """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""

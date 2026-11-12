@@ -707,6 +707,19 @@ def live_client(cluster, client):
     return cluster.get_client()
 
 
+def sync_observed(cluster, workers):
+    """Replace the attached Cluster's worker view with the scheduler's table `workers`.
+
+    dask's Adaptive closes workers it counts as requested but not yet arrived (`requested -
+    observed`) without asking `workers_to_close`, so BusyWorkerGuard never sees them. On
+    2026-11-12 (P6) the keeper's Cluster kept the 5 workers present when it attached while the
+    pool grew to 41: Adaptive retired workers in the middle of their chunks. One reference swap,
+    so Adaptive never iterates a table being changed."""
+    info = getattr(cluster, "scheduler_info", None)
+    if isinstance(info, dict) and isinstance(workers, dict):
+        info["workers"] = dict(workers)
+
+
 def scheduler_workers(get_client, attempts=6, delay_s=5.0, max_delay_s=60.0, min_workers=0, sleep=None, log=None):
     """The scheduler's worker table {address: info}, from client.scheduler_info()["workers"].
     distributed returns {} there (no "workers" key) whenever the client is not connected:
@@ -1012,6 +1025,7 @@ def _keeper_loop(token, name, workspace, lo, hi, hours, adapt_options, cluster_i
                     # Not yet populated (start-up, reconnect): retried with backoff; past the
                     # bound the error goes to the reconnect path below with a log line.
                     winfo = scheduler_workers(run_client, attempts=6, delay_s=5.0, log=print)
+                    sync_observed(cl, winfo)
                     c = box[0]
                     n_ovf = sum(str(w.get("name", "")).startswith(OVERFLOW_PREFIX) for w in winfo.values())
                     status.update(updated=now, workers=len(winfo), primary_workers=len(winfo) - n_ovf,
