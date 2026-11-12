@@ -2726,6 +2726,8 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "runtime": runtime_versions()}
     body = "".join(json.dumps(r) + "\n" for r in rows).encode()
     summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
+    if os.environ.get("MA_PIPELINE_RUN"):        # the pipeline run that computed it (scripts/pipeline.py)
+        summary["pipeline_run"] = os.environ["MA_PIPELINE_RUN"]
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:

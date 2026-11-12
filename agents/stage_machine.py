@@ -1522,6 +1522,8 @@ def analysis_failure_cause(rep: dict, run_dir: str | None = None) -> str | None:
 
 # Where the analysis's engine batch keeps compute.py's per-call summaries (toolkit/analysis/batch.py).
 BATCH_DIR = os.path.join("analysis", "batch")
+# ... and the joint calibration's (toolkit/analysis/joint_calibration.py OUT_REL)
+JC_DIR = os.path.join("analysis", "joint_calibration")
 
 
 def _infra_batch(run_dir: str, rep: dict) -> bool:
@@ -1529,21 +1531,32 @@ def _infra_batch(run_dir: str, rep: dict) -> bool:
     kind infra (lost workers; scripts/compute.py has already retried them within the call). Read from the summaries
     compute.py wrote under analysis/batch/ during this run, i.e. after the run's start (the report's mtime minus its
     `seconds`, on the same clock as theirs): at least one has failed rows, and every one with failed rows has only
-    infra ones. Never read from the error text. Anything unreadable is False (not resumable)."""
+    infra ones. Never read from the error text. Anything unreadable is False (not resumable).
+    F6 (2026-11-11): also the joint calibration's batches (JC_DIR, recursively: bench_call*_phase*.jsonl and
+    call*/points.jsonl), and a summary carrying `pipeline_run` belongs to this run when it equals the report's, so a
+    run dir copied or restored from a checkpoint (mtimes reset) is still classified; one without it falls back to
+    the mtime rule."""
+    run_id = rep.get("pipeline_run") if isinstance(rep, dict) else None
     try:
         started = os.path.getmtime(os.path.join(run_dir, "models", "pipeline_report.json")) - float(rep["seconds"]) - 2.0
-        d = os.path.join(run_dir, BATCH_DIR)
-        names = sorted(n for n in os.listdir(d) if n.endswith(".summary.json"))
     except (OSError, KeyError, TypeError, ValueError):
         return False
+    paths = []
+    for sub in (BATCH_DIR, JC_DIR):
+        for dp, dirs, fns in os.walk(os.path.join(run_dir, sub)):
+            dirs.sort()
+            paths += [os.path.join(dp, n) for n in sorted(fns) if n.endswith(".summary.json")]
     failed = 0
-    for n in names:
-        p = os.path.join(d, n)
+    for p in paths:
         try:
-            if os.path.getmtime(p) < started:
-                continue                          # an earlier pipeline run's batch
             with open(p) as f:
                 summ = json.load(f)
+            mine = summ.get("pipeline_run")
+            if run_id and mine:
+                if mine != run_id:
+                    continue                      # an earlier pipeline run's batch
+            elif os.path.getmtime(p) < started:
+                continue                          # an earlier pipeline run's batch (no run id: the mtime rule)
             kinds, n_failed = summ.get("failed_by_kind"), int(summ.get("n_failed") or 0)
         except (OSError, ValueError, TypeError, AttributeError):
             return False
