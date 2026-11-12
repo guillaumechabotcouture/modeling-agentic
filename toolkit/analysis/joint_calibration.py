@@ -2047,6 +2047,73 @@ def _self_test() -> int:
            f"JA23 a mixed pair combines the rounds' sampling errors as independent and states it ({got})")
     safe(ja23, "JA23")
 
+    def ja24():          # 2026-11-11 F6 preview: 1 of 42 benchmark tasks lost with its worker ended a 2.5-h run
+        from unittest import mock
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        from toolkit.engines import benchmark as BM
+        with tempfile.TemporaryDirectory() as d:
+            sim = Simulator.__new__(Simulator)
+            sim.run_dir, sim.calls, sim.kw, sim.log = d, 1, {}, lambda m: None
+            pending = [("ref", "cfg", {"a": 1}, "u1", "pk", 5, 1), ("ref", "cfg", {"a": 2}, "u1", "pk", 5, 1)]
+
+            def fake(script):
+                seq, outs = list(script), []
+
+                def run_map(run_dir, fn, tasks, out, **kw):
+                    outs.append(out)
+                    bad = seq.pop(0) if seq else None
+                    return [{"ok": False, "kind": bad, "error": f"{bad} failure"} if (n == 0 and bad) else
+                            {"ok": True, "result": [{"v": n}]} for n in range(len(tasks))], {}
+                return run_map, outs
+
+            def go(script):
+                cache = {}
+                rm, outs = fake(script)
+                with mock.patch.object(compute, "run_map", rm), mock.patch.object(BM, "shares_state", lambda e: False), \
+                        mock.patch.object(BM, "_engine_of", lambda j: None):
+                    try:
+                        sim._bench_batch(pending, cache, 0)
+                        return "ok", outs, cache
+                    except HM.CalibrationInputError as e:
+                        return f"raised: {e}", outs, cache
+            r1, o1, c1 = go([INFRA_KIND])
+            ok(r1 == "ok" and len(o1) == 2 and o1[0] == o1[1] and len(c1) == 2,
+               f"JA24 a benchmark batch whose only failures are infra (after compute's own retries) is run once more "
+               f"on the same results file (done rows reused) and completes: {r1} {o1}")
+            r2, o2, _ = go(["model"])
+            ok(r2.startswith("raised") and len(o2) == 1,
+               f"JA24b a model failure is never rerun: it fails closed at once: {r2} {len(o2)} calls")
+            r3, o3, _ = go([INFRA_KIND, INFRA_KIND])
+            ok(r3.startswith("raised") and len(o3) == 2,
+               f"JA24c infra that persists through the rerun fails closed: {r3} {len(o3)} calls")
+
+        class FakeBt:
+            def __init__(self, script):
+                self.script, self.calls = list(script), 0
+
+            def run(self, run_dir, jobs, eng, out_rel=None, **kw):
+                self.calls += 1
+                bad = self.script.pop(0) if self.script else None
+                res = {j["id"]: {"windows": {"w": {"m": 1.0}}} for n, j in enumerate(jobs) if not (n == 0 and bad)}
+                return {"results": res, "problems": [], "summary": {"n_failed": 1 if bad else 0,
+                                                                   "failed_by_kind": {bad: 1} if bad else {}}}
+        sim = Simulator.__new__(Simulator)
+        sim.run_dir, sim.calls, sim.kw, sim.eng, sim.log = "/nonexistent", 1, {}, None, lambda m: None
+        sim.job = lambda p, k: {"id": f"j{k}"}
+        pts = [{"kind": "unit", "unit": "u1"}, {"kind": "unit", "unit": "u2"}]
+        for script, want, calls, cid in (([INFRA_KIND], "ok", 2, "JA24d infra only on the unit batch: rerun once, completes"),
+                                         (["model"], "raised", 1, "JA24e a model failure on the unit batch: no rerun"),
+                                         ([INFRA_KIND, INFRA_KIND], "raised", 2, "JA24f persistent infra: fails closed")):
+            bt, out = FakeBt(script), [None, None]
+            try:
+                sim._units(pts, [0, 1], out, "attr", bt)
+                got = "ok"
+            except HM.CalibrationInputError:
+                got = "raised"
+            ok(got == want and bt.calls == calls, f"{cid}: {got}, {bt.calls} calls")
+    safe(ja24, "JA24")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

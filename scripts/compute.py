@@ -4475,7 +4475,8 @@ def _self_test_infra(ok) -> None:
         return th
 
     keys = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS", "MA_COMPUTE_PROCS_PER_WORKER",
-            "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S")
+            "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S",
+            "MA_COMPUTE_INFRA_BACKOFF_S")
     saved = {k: os.environ.get(k) for k in keys}
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as tmpb, \
             dask.config.set({"distributed.scheduler.active-memory-manager.start": False}):
@@ -4501,7 +4502,7 @@ def _self_test_infra(ok) -> None:
                 cc.register_plugin(ComputeTagPlugin("compute"))
                 os.environ.update(MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
                                   MA_COMPUTE_TARGET_WORKERS="2", MA_COMPUTE_PROCS_PER_WORKER="1",
-                                  MA_COMPUTE_DISPATCH_S="0.2")
+                                  MA_COMPUTE_DISPATCH_S="0.2", MA_COMPUTE_INFRA_BACKOFF_S="0.1")
                 os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
                 w = sorted(cc.run_on_scheduler(nproc))
                 # IR1: the hazard. Asked for fewer workers than are busy (Coiled's adapt passes
@@ -4576,21 +4577,28 @@ def _self_test_infra(ok) -> None:
                     return _remote_task_stub
                 outs = {}
                 try:
-                    for n_loss in (2, 3):
+                    for n_loss in (2, 3, 4):
                         _remote_task = lossy(n_loss, f"b{n_loss}")
                         outs[n_loss] = map_fn(rd, "models/ir.py::f", [{"k": 0, "dir": rd, "tag": f"b{n_loss}"}],
                                               ledger=False)
                 finally:
                     _remote_task = real_task
-                (r4, s4), (r5, s5) = outs.get(2, ([], {})), outs.get(3, ([], {}))
+                (r4, s4), (r5, s5), (r7, s7) = (outs.get(k, ([], {})) for k in (2, 3, 4))
                 lost4 = [c_ for c_ in s4.get("chunks", []) if c_.get("error")]
                 lost5 = [c_ for c_ in s5.get("chunks", []) if c_.get("error")]
-                marks5 = [f_ for f_ in os.listdir(rd) if f_.startswith("loss_b3_")]
+                lost7 = [c_ for c_ in s7.get("chunks", []) if c_.get("error")]
+                marks7 = [f_ for f_ in os.listdir(rd) if f_.startswith("loss_b4_")]
                 ok(len(r4) == 1 and r4[0]["ok"] and len(lost4) == 2 and len(calls(rd, "b2")) == 1,
                    f"IR4 a chunk lost twice is resubmitted twice and finishes: {r4} {lost4}")
-                ok(len(r5) == 1 and not r5[0]["ok"] and r5[0].get("kind") == INFRA and len(lost5) == 3
-                   and len(marks5) == 3 and not calls(rd, "b3") and s5.get("failed_by_kind") == {INFRA: 1},
-                   f"IR5 a chunk lost three times is an infra row after three attempts, no more: {r5} {lost5} {marks5}")
+                ok(INFRA_RETRIES == 3 and len(r5) == 1 and r5[0]["ok"] and len(lost5) == 3 and len(calls(rd, "b3")) == 1,
+                   f"IR5 (F6 preview, 2026-11-11) three resubmissions by default: a chunk lost three times finishes: "
+                   f"{INFRA_RETRIES} {r5} {lost5}")
+                ok(len(r7) == 1 and not r7[0]["ok"] and r7[0].get("kind") == INFRA and len(lost7) == 4
+                   and len(marks7) == 4 and not calls(rd, "b4") and s7.get("failed_by_kind") == {INFRA: 1},
+                   f"IR5b a chunk lost four times is an infra row after four attempts, no more: {r7} {lost7} {marks7}")
+                bo = [c_.get("backoff_s") for c_ in lost5]
+                ok(bo[:3] == [0.1, 0.2, 0.4],
+                   f"IR7 each resubmission waits a doubling backoff (MA_COMPUTE_INFRA_BACKOFF_S) and records it: {bo}")
                 # IR6: no compute worker at all (none carries the resource): the call waits for the
                 # pool within MA_COMPUTE_NO_WORKER_WAIT_S, then gives up with infra rows and no demand left.
                 os.environ.update(MA_COMPUTE_RESOURCE="ma-selftest-none", MA_COMPUTE_NO_WORKER_WAIT_S="1")
