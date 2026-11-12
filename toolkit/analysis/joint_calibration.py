@@ -33,6 +33,10 @@ The spec field (signed with the spec; without it nothing changes):
              # paired by group (F6 S2-3b, survey_changes in the artifact)
              # bias_by: a units column (e.g. the region); bias_sd is then one offset per survey (bias_source,
              # default the target id) and group, shared by the group's units and the survey's targets (F6 S2-3)
+             # bias_sd_by_group (instead of bias_sd, with bias_by): {csv, filter: {col: value}, key: <csv column
+             # of the group>, ci: [lo_col, hi_col], ci_level, multiplier}: each group's offset sd is the sd of
+             # its own interval on the target's scale (the survey's own error for that group; owner, 2026-11-12).
+             # Every calibrated group needs exactly one row; anything else is an input error
           - {id, kind: group, csv, filter: {col: value}, key: {csv: col, units: col}, value, multiplier,
              ci: [lo_col, hi_col], ci_level, weights: <units column>, window, metric, scale, bias_sd, discrepancy_sd,
              source}
@@ -240,18 +244,31 @@ def spec_problems(spec) -> list[str]:
         for q in ("bias_sd", "sd"):
             if q in t and not (_isnum(t[q]) and t[q] >= 0):
                 bad.append(f"{tw}.{q}: a number >= 0")
+        bg = t.get("bias_sd_by_group")
+        if bg is not None:
+            if k != "unit" or "bias_by" not in t:
+                bad.append(f"{tw}.bias_sd_by_group: for a unit target with bias_by")
+            if "bias_sd" in t:
+                bad.append(f"{tw}.bias_sd_by_group: instead of bias_sd, not with it")
+            if not (isinstance(bg, dict) and _text(bg.get("csv")) and _text(bg.get("key"))
+                    and isinstance(bg.get("ci"), list) and len(bg["ci"]) == 2 and all(_text(c) for c in bg["ci"])
+                    and isinstance(bg.get("filter", {}), dict)
+                    and (_isnum(bg.get("ci_level", 0.95)) and 0 < bg.get("ci_level", 0.95) < 1)
+                    and (_isnum(bg.get("multiplier", 1.0)) and bg.get("multiplier", 1.0) > 0)):
+                bad.append(f"{tw}.bias_sd_by_group: {{csv, key, ci: [lo, hi], filter?, ci_level?, multiplier?}}")
         if "bias_by" in t:          # F6 S2-3: one offset per source and group, shared by the group's units
             if k != "unit":
                 bad.append(f"{tw}.bias_by: for unit targets (a group target's bias is its own)")
             elif t["bias_by"] not in cols:
                 bad.append(f"{tw}.bias_by: no units column {t['bias_by']!r}")
-            if not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
-                bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset)")
+            if bg is None and not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
+                bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset) or bias_sd_by_group")
             src = t.get("bias_source", t.get("id"))      # Codex r1 P2-4: the survey, shared by its targets
             if not _text(src):
                 bad.append(f"{tw}.bias_source: the survey's name (text)")
-            other = surveys.setdefault(src, (t.get("bias_sd"), t["bias_by"]))
-            if other != (t.get("bias_sd"), t["bias_by"]):
+            other = surveys.setdefault(src, (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str),
+                                             t["bias_by"]))
+            if other != (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str), t["bias_by"]):
                 bad.append(f"{tw}: survey {src!r} is declared with two bias_sd or bias_by values ({other})")
         elif "bias_source" in t:
             bad.append(f"{tw}.bias_source: needs bias_by")
@@ -354,6 +371,10 @@ def _sensitivity_problems(s, targets, w) -> list:
             if tid in ids and t0.get("kind") == "benchmark" and isinstance(ov, dict) and set(ov) - {"discrepancy_sd"}:
                 bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's sampling error comes from its band; only "
                            "discrepancy_sd can change")
+                continue
+            if tid in ids and isinstance(ov, dict) and "bias_sd" in ov and t0.get("bias_sd_by_group") is not None:
+                bad.append(f"{ww}[{n}].targets.{tid}: bias_sd cannot override a target whose offset sd comes from "
+                           "bias_sd_by_group (Codex review of #206); change sd or discrepancy_sd")
                 continue
             if tid in ids and isinstance(ov, dict) and "sd" in ov and any(
                     k in t0 for k in ("sd_column", "ci_columns", "n_column", "ci")):
@@ -481,6 +502,33 @@ def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, j, n, x) -> dic
 
 
 # --------------------------------------------------------------------------- problem
+def _bias_sd_by_group(spec, t, scale, groups) -> dict:
+    """{group: offset sd} for a unit target's bias_sd_by_group: each group's interval in the table, as an sd on
+    the target's scale (HM.sd_from_ci). Fail closed: a calibrated group with no row or two rows, or an interval
+    that is not increasing on the scale, is an input error."""
+    bg = t["bias_sd_by_group"]
+    mult, level = float(bg.get("multiplier", 1.0)), float(bg.get("ci_level", 0.95))
+    with open(spec.resolve(bg["csv"]), newline="", encoding="utf-8") as f:
+        tab = [r for r in csv.DictReader(f) if all(str(r.get(k)) == str(v) for k, v in (bg.get("filter") or {}).items())]
+    by, bad = {}, []
+    for r in tab:
+        by.setdefault(str(r.get(bg["key"])), []).append(r)
+    out = {}
+    for g in sorted(groups):
+        rs = by.get(g, [])
+        if len(rs) != 1:
+            bad.append(f"target {t['id']}: bias_sd_by_group has {len(rs)} rows for group {g!r} in {bg['csv']} "
+                       f"(filter {bg.get('filter')}): exactly one is needed")
+            continue
+        try:
+            out[g] = HM.sd_from_ci(mult * float(rs[0][bg["ci"][0]]), mult * float(rs[0][bg["ci"][1]]), scale, level)
+        except (TypeError, ValueError, KeyError) as e:
+            bad.append(f"target {t['id']}: bias_sd_by_group interval for group {g!r}: {e}")
+    if bad:
+        raise HM.CalibrationInputError(bad)
+    return out
+
+
 def theta0(spec) -> dict:
     """The point parameter values every simulation starts from (as toolkit/analysis/core.py Analysis.theta0)."""
     from toolkit.analysis.batch import fitted_ranges
@@ -548,10 +596,14 @@ def build(spec, units=None) -> tuple:
         if t["kind"] == "unit":
             col = t.get("column", cal.get("target_column"))
             sc = t.get("scale", "logit")
+            gsd = _bias_sd_by_group(spec, t, sc, {str(rows[i][t["bias_by"]]) for i in ids}) \
+                if t.get("bias_sd_by_group") else None
             for i in ids:
                 v = float(rows[i][col])
                 targets.append(HM.Target(f"{t['id']}:{i}", "unit", _observable(t, wins), v, sc,
-                                         sd_obs=_unit_sd(t, rows[i], sc, v), sd_bias=float(t.get("bias_sd", 0.0)),
+                                         sd_obs=_unit_sd(t, rows[i], sc, v),
+                                         sd_bias=(gsd[str(rows[i][t["bias_by"]])] if gsd is not None
+                                                  else float(t.get("bias_sd", 0.0))),
                                          sd_md=md, unit=i, source=t["source"],
                                          bias_key=f"{t.get('bias_source', t['id'])}|{rows[i][t['bias_by']]}"
                                          if t.get("bias_by") else None))
@@ -1197,9 +1249,13 @@ def block_hits(rep) -> list:
 
 
 def inputs(spec) -> list:
-    """The files the joint calibration reads beyond the units table: its group-target tables."""
+    """The files the joint calibration reads beyond the units table: its group-target tables and its unit targets'
+    bias_sd_by_group interval tables (Codex review of #206)."""
     j = declared(spec) or {}
-    return sorted({spec.resolve(t["csv"]) for t in j.get("targets") or [] if t.get("kind") == "group"})
+    ts = [t for t in j.get("targets") or [] if isinstance(t, dict)]
+    return sorted({spec.resolve(t["csv"]) for t in ts if t.get("kind") == "group"}
+                  | {spec.resolve(t["bias_sd_by_group"]["csv"]) for t in ts
+                     if isinstance(t.get("bias_sd_by_group"), dict) and t["bias_sd_by_group"].get("csv")})
 
 
 def block_reason(rep) -> str:
@@ -1877,6 +1933,79 @@ def _self_test() -> int:
             ok(exp == {x["id"] for x in sc.get("pairs") or []},
                f"JA16g the gate rebuilds the expected pair ids from the spec and targets ({sorted(exp)})")
     safe(ja16, "JA16")
+
+    def ja25():          # F6 P6 (owner, 2026-11-12): a shared offset's sd per group, from the survey's own interval
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d, group=False)
+            ci = {"r0": (0.20, 0.30), "r1": (0.04, 0.37), "r2": (0.18, 0.32)}
+            with open(os.path.join(d, "bias_ci.csv"), "w") as f:
+                f.write("region,survey,lo,hi\n" + "".join(f"{g},s,{lo},{hi}\n" for g, (lo, hi) in ci.items())
+                        + "r1,other,0.1,0.2\n")
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            by = {"csv": "bias_ci.csv", "filter": {"survey": "s"}, "key": "region", "ci": ["lo", "hi"], "ci_level": 0.95}
+            j["targets"][0].update(bias_by="region", bias_source="survey_a", bias_sd_by_group=by)
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            bad0 = spec_problems(schema.load(p))
+            P, _ = build(schema.load(p))
+            units = {r["id"] if "id" in r else r[list(r)[0]]: r for r in csv.DictReader(open(os.path.join(d, "units.csv")))}
+            want = {g: HM.sd_from_ci(lo, hi, "logit", 0.95) for g, (lo, hi) in ci.items()}
+            got = {t.bias_key: t.sd_bias for t in P.targets if t.kind == "unit"}
+            ok(not bad0 and got and all(abs(got[f"survey_a|{g}"] - want[g]) < 1e-12 for g in want if f"survey_a|{g}" in got)
+               and len({round(v, 9) for v in got.values()}) == len(got),
+               f"JA25a bias_sd_by_group: each group's offset sd is its own interval's sd on the target's scale "
+               f"({bad0[:2]}, {got}, {want})")
+            bad_cases = [("bias_sd and bias_sd_by_group together", lambda t: t.update(bias_sd=0.2)),
+                         ("bias_sd_by_group without bias_by", lambda t: t.pop("bias_by")),
+                         ("bias_sd_by_group without ci", lambda t: t["bias_sd_by_group"].pop("ci")),
+                         ("bias_sd_by_group without csv", lambda t: t["bias_sd_by_group"].pop("csv")),
+                         ("bias_sd_by_group on a group target", lambda t: t.update(kind="group"))]
+            for why, mut in bad_cases:
+                r2 = yaml.safe_load(open(p))
+                mut(r2["calibration"]["joint"]["targets"][0])
+                p2 = os.path.join(d, "s2.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                bad = spec_problems(schema.load(p2))
+                ok(bool(bad), f"JA25b refused: {why} ({bad[:2]})")
+            # Fail closed: a group of calibrated units with no row (or two rows) in the table is an input error.
+            for why, text in (("a group with no row", "region,survey,lo,hi\nr0,s,0.2,0.3\nr2,s,0.18,0.32\n"),
+                              ("a group with two rows", "region,survey,lo,hi\nr0,s,0.2,0.3\nr0,s,0.2,0.3\n"
+                                                        "r1,s,0.04,0.37\nr2,s,0.18,0.32\n"),
+                              ("an interval that is not increasing", "region,survey,lo,hi\nr0,s,0.3,0.2\n"
+                                                                     "r1,s,0.04,0.37\nr2,s,0.18,0.32\n")):
+                open(os.path.join(d, "bias_ci.csv"), "w").write(text)
+                try:
+                    build(schema.load(p))
+                    raised = None
+                except HM.CalibrationInputError as e:
+                    raised = str(e)[:160]
+                ok(raised is not None, f"JA25c {why} in the interval table is an input error ({raised})")
+            # Codex review of #206 (both reviewers, P2): the interval table is an input the artifact records, and a
+            # sensitivity that sets bias_sd on such a target is refused up front (it could only fail when rebuilt).
+            open(os.path.join(d, "bias_ci.csv"), "w").write(
+                "region,survey,lo,hi\nr0,s,0.2,0.3\nr1,s,0.04,0.37\nr2,s,0.18,0.32\n")
+            ok(os.path.realpath(os.path.join(d, "bias_ci.csv")) in {os.path.realpath(x) for x in inputs(schema.load(p))},
+               f"JA25d the interval table is one of the calibration's recorded inputs ({inputs(schema.load(p))})")
+            r4 = yaml.safe_load(open(p))
+            r4["calibration"]["joint"]["sensitivity"] = [{"id": "b", "label": "b", "targets": {"unit_t": {"bias_sd": 0.3}}}]
+            p4 = os.path.join(d, "s4.yaml")
+            yaml.safe_dump(r4, open(p4, "w"), sort_keys=False)
+            bad4 = spec_problems(schema.load(p4))
+            ok(any("bias_sd_by_group" in x for x in bad4),
+               f"JA25e a bias_sd sensitivity on a target with bias_sd_by_group is refused at validation ({bad4[:2]})")
+            # Codex review round 2 of #206: a YAML date in the filter (loaded as a date) does not crash validation.
+            r5 = yaml.safe_load(open(p))
+            r5["calibration"]["joint"]["targets"][0]["bias_sd_by_group"]["filter"] = {"survey": "s", "when": "2021-11-01"}
+            p5 = os.path.join(d, "s5.yaml")
+            open(p5, "w").write(yaml.safe_dump(r5, sort_keys=False).replace("'2021-11-01'", "2021-11-01"))
+            try:
+                bad5 = spec_problems(schema.load(p5))
+                crash = None
+            except TypeError as e:
+                bad5, crash = None, str(e)[:120]
+            ok(crash is None, f"JA25f a date-valued filter is validated, not a crash ({crash}, {bad5 and bad5[:1]})")
+    safe(ja25, "JA25")
 
     def ja17():          # the gate findings of the change diagnostic
         pair = {"id": "s:a->b:r0", "survey": "s", "group": "r0", "from": "a", "to": "b", "observed": -0.4,
