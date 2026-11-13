@@ -1342,6 +1342,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         bad += FT.problems(s, cols)
     from toolkit.analysis import variants as _V      # F6 S1-6: operational plan variants
     bad += _V.validate(s.raw, cols, s.units(), pk, s.uid)
+    from toolkit.analysis import value_of_information as _VOI      # F6: analysis.value_of_information
+    bad += _VOI.validate(s.raw)
     for name, d in (an.get("diagnostics") or {}).items():
         if (d or {}).get("metric") not in card.outputs.get("windows", []):
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
