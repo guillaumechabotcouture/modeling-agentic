@@ -1,0 +1,327 @@
+beliefs:
+- id: B1
+  mechanism: A campaign starting in week 3 with a high-efficacy live vaccine (seroconversion near 99% after one
+    dose) pushes R_t below 1 in most settings before more than a generation or two of transmission has occurred,
+    so it averts most of the year's infections relative to no campaign.
+  about:
+    package: fast
+  direction: reduces
+  magnitude:
+    band:
+    - 0.75
+    - 1.0
+    scale: relative_reduction
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: 'Gotuzzo E, Yactayo S, Cordova E. Efficacy and duration of immunity after yellow fever vaccination:
+      systematic review on the need for a booster every 10 years. Am J Trop Med Hyg 2013'
+    location: Results, seroconversion after a single dose (location within the paper not verified)
+  - citation: Zhao S, Stone L, Gao D, He D. Modelling the large-scale yellow fever outbreak in Luanda, Angola, and
+      the impact of vaccination. PLoS Negl Trop Dis 2018
+    location: Results, reproduction number and vaccination impact (table number not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: A campaign starting in week 8 averts slightly less than one starting in week 3, because about two extra
+    generations of transmission occur before it; with seeds of at most ~3e-4 of the population, cumulative incidence
+    by week 8 is usually a small share of the unmitigated final size, so the relative reduction stays high but with
+    a lower floor than FAST.
+  about:
+    package: standard
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: Johansson MA, Arana-Vizcarrondo N, Biggerstaff BJ, Staples JE. Incubation periods of yellow fever
+      virus. Am J Trop Med Hyg 2010
+    location: Results, intrinsic and extrinsic incubation period estimates (sets a generation interval of roughly
+      2-3 weeks; table not verified)
+  - citation: 'Kraemer MUG, Faria NR, Reiner RC, et al. Spread of yellow fever virus outbreak in Angola and the
+      Democratic Republic of the Congo 2015-16: a modelling study. Lancet Infect Dis 2017'
+    location: Results (growth of the outbreak before the reactive campaigns; page not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The larger the share already infected at the start, the more infections occur before week 8 and the
+    less of the year's burden the delayed campaign can avert; the cost of delay is concentrated in high-seed towns.
+  about:
+    package: standard
+    feature: seed_share
+  direction: decreases
+  magnitude:
+    band:
+    - 0.0
+    - 0.3
+    scale: relative_reduction_loss_across_seed_range
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results, impact of the delay of outbreak response vaccination (figure number not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: A higher susceptible share raises the effective reproduction number, which both speeds growth before
+    the campaign and keeps R_t (1 - effect) closer to or above 1 after it, so the share of infections averted falls
+    as s0 rises.
+  about:
+    package: fast
+    feature: s0 (calibration scale)
+  direction: decreases
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: Massad E, Coutinho FAB, Burattini MN, Lopez LF. The risk of yellow fever in a dengue-infested area.
+      Trans R Soc Trop Med Hyg 2001
+    location: Results, threshold dependence of urban yellow fever on R0 (page not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: low
+- id: B5
+  mechanism: 'In a closed, deterministic renewal model seeded as a share of the population, the epidemic is scale-invariant:
+    population size scales burden and cost equally and does not change the relative reduction.'
+  about:
+    package: standard
+    feature: pop
+  direction: negligible
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods, renewal equation (incidence as a function of past incidence and the generation interval)
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B6
+  mechanism: The campaign's multiplier on R_t is (1 - effect); a larger effect lowers post-campaign R_t and shortens
+    the tail, so the relative reduction of FAST rises with its effect.
+  about:
+    package: fast
+    feature: effect:fast
+  direction: increases
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One
+      2007
+    location: Methods, renewal equation formulation
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: At the budget's shadow price, the FAST upgrade (+US$1.50 per resident) pays only where the infections
+    in weeks 3 to 8 and their offspring are numerous, i.e. at high seed share; the choice between FAST and STANDARD
+    flips from STANDARD to FAST somewhere in the upper part of the seed-share range.
+  about:
+    pair:
+    - fast
+    - standard
+  direction: flips
+  conditions:
+  - feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.00033053
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Discussion, value of earlier response depends on outbreak stage (page not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: 'Where the outbreak has barely started (seed share near 1e-6 to 2e-5), a week-8 campaign misses very
+    few infections that a week-3 campaign would avert, so STANDARD''s lower price dominates: its net benefit at
+    the shadow price exceeds FAST''s.'
+  about:
+    pair:
+    - fast
+    - standard
+  direction: raises
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: Zhao S, Stone L, Gao D, He D. Modelling the large-scale yellow fever outbreak in Luanda, Angola, and
+      the impact of vaccination. PLoS Negl Trop Dis 2018
+    location: Results, vaccination timing scenarios (location not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+hypotheses:
+- id: H1
+  belief: B1
+  claim: FAST averts 75% or more of the year's infections relative to no campaign at at least 70% of usable points.
+  test:
+    kind: effect_band
+    package: fast
+    band:
+    - 0.75
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: STANDARD averts 60% or more of the year's infections relative to no campaign at at least 70% of usable
+    points.
+  test:
+    kind: effect_band
+    package: standard
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: STANDARD's relative reduction falls as seed_share rises (Spearman interval below 0).
+  test:
+    kind: effect_direction
+    package: standard
+    feature: seed_share
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: FAST's relative reduction falls as the susceptible share (s0 calibration scale) rises.
+  test:
+    kind: effect_direction
+    package: fast
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Population size has no material association with STANDARD's relative reduction (|rho| bound within 0.15).
+  test:
+    kind: effect_direction
+    package: standard
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+- id: H6
+  belief: B6
+  claim: FAST's relative reduction rises with its effect parameter.
+  test:
+    kind: effect_direction
+    package: fast
+    feature: effect:fast
+    direction: increases
+- id: H7
+  belief: B7
+  claim: The FAST/STANDARD choice flips along seed_share within its upper range, 3e-5 to 3.3e-4 (STANDARD below,
+    FAST above).
+  test:
+    kind: flip_in
+    a: fast
+    b: standard
+    feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.00033053
+- id: H8
+  belief: B8
+  claim: At low seed_share (1.09e-6 to 2e-5), STANDARD's net benefit at the shadow price exceeds FAST's at at least
+    75% of usable points.
+  test:
+    kind: paired_sign
+    a: standard
+    b: fast
+    feature: seed_share
+    range:
+    - 1.09e-06
+    - 2.0e-05
+    sign: positive
+    min_share: 0.75
+open_questions:
+- id: Q1
+  question: Is the post-campaign reproduction number, R0 x s0 x (1 - effect), below 1 in most towns? If not, both
+    campaigns only slow the epidemic, the relative reductions are far lower than B1/B2 expect, and the timing gap
+    matters less than the coverage achieved.
+  beliefs:
+  - B1
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Does the emergency-stockpile campaign achieve the same effect as the standard one (for example, if it
+    uses fractional doses or reaches lower coverage)? A lower FAST effect would erase its timing advantage.
+  beliefs:
+  - B1
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q3
+  question: What is the generation interval and the true R0 of urban (Aedes aegypti) transmission in these towns?
+    A short interval and high R0 make weeks 3 to 8 cover more generations and raise the cost of delay.
+  beliefs:
+  - B2
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: What shadow price does the budget imply? A low value favours FAST more widely and moves the flip of
+    B7 toward lower seed shares; a high value can make STANDARD win everywhere (no flip).
+  beliefs:
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q5
+  question: Does the multiplier start at full strength on the campaign start week, or does protection ramp up over
+    the ~10 days to seroconversion and the campaign's delivery period? A ramp penalises both options and narrows
+    the real gap between week 3 and week 8 less than it appears.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q6
+  question: Do epidemics in low-s0 towns finish within 2026 without a campaign? If not, the in-year burden of no
+    campaign is truncated and relative reductions there are not comparable with high-s0 towns.
+  beliefs:
+  - B4
+  decision_relevant: false
