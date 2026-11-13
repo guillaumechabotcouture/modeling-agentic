@@ -2246,6 +2246,24 @@ def _self_test() -> int:
                f"WT19d the summary counts circular, prior-echo and engine-blind tests: {q}")
     tryit("WT19 prior echo and engine-blind", wt19)
 
+    def wt19e():
+        with tempfile.TemporaryDirectory() as d:
+            tpl = os.path.join(d, "tpl")
+            _indep_template(tpl, None)
+            with open(os.path.join(tpl, ENGINE_READS), "w") as f:
+                yaml.safe_dump({"features_read_via": {"cov": "x"}}, f)
+            ok(engine_unread_features(tpl) == set(),
+               "WT19e a declared feature that reaches the engine through a derived bound attribute (engine_reads.yaml "
+               "features_read_via) is read, not engine-blind")
+            with open(os.path.join(tpl, ENGINE_READS), "w") as f:
+                yaml.safe_dump({"features_read_via": {"cov": "nothing_bound"}}, f)
+            try:
+                engine_unread_features(tpl)
+                ok(False, "WT19f a features_read_via naming no engine attribute or bound column is refused")
+            except TrialError:
+                ok(True, "WT19f a features_read_via naming no engine attribute or bound column is refused")
+    tryit("WT19e engine reads", wt19e)
+
     def wt20():
         with tempfile.TemporaryDirectory() as d:
             repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
