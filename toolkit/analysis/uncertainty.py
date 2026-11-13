@@ -639,7 +639,7 @@ def _self_test_posterior(ok):
     rows = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.35 + 0.3 * v, 6)} for v in x]
     box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8]}
     with tempfile.TemporaryDirectory() as d:
-        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
+        NEF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
         # NP1: recorded before this change (branch f6-netfit-adopt): the first draw at seed 9 without the field
         th0 = {"net_kill_shift": 0.11657722739764786, "use_rate": 0.87768660115964, "cfp_kill": 0.6480996815880338}
         D0, D1 = Drawer(fake(d), 9), Drawer(fake(d, "net_effect_fit.yaml"), 9)
@@ -660,7 +660,7 @@ def _self_test_posterior(ok):
         # Codex r1 P2-4: the file is read once; the manifest, the engine artifact and the drawer use those bytes
         A5 = fake(d, sig)
         i1 = posterior_input(A5.spec)                   # run.py's read, before the manifest is written
-        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)      # the file is replaced after
+        NEF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)      # the file is replaced after
         D5 = Drawer(A5, 9)
         try:
             posterior_input(fake(d, sig).spec)          # a fresh read of the replaced file under the signed digest

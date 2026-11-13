@@ -345,7 +345,7 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
     return BM.stamp(dict({"purpose": PURPOSE, "smoke": smoke, "plan": q}, **rest, joint_region=reg), eng)
 
 
-def placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
     pt = {"point": rows[0], "all_in_band": gate_ok, "calibration_check": {}}
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"all_in_band": True, "disproved_by_verification": [],
@@ -686,7 +686,7 @@ def _self_test() -> int:
         dg = lambda q: hashlib.sha256(open(q, "rb").read()).hexdigest()  # noqa: E731 -- the owner's signed digest
         with tempfile.TemporaryDirectory() as d:
             good = os.path.join(d, "net_effect_fit.yaml")
-            placeholder(good, e, rows, box)
+            _fixture_placeholder(good, e, rows, box)
             P = load_posterior(good, e, rg, dg(good))
             ok(P["names"] == list(box) and P["rows"].shape == (40, 4) and P["sha256"] == dg(good)
                and np.allclose(P["rows"][:, 0], [r["net_kill_shift"] for r in rows])
@@ -728,7 +728,7 @@ def _self_test() -> int:
                 open(os.path.join(d, "t.yaml"), "w").write(text)
                 refuse(label, os.path.join(d, "t.yaml"))
             bad_gate = os.path.join(d, "gate.yaml")
-            placeholder(bad_gate, e, rows, box, gate_ok=False)
+            _fixture_placeholder(bad_gate, e, rows, box, gate_ok=False)
             refuse("acceptance gate failed (finalize)", bad_gate)
             variant("a smoke", lambda x: x.update(smoke=True))
             variant("another producer", lambda x: x.update(producer="someone"))
@@ -743,7 +743,7 @@ def _self_test() -> int:
             rows2 = [dict(r) for r in rows]
             rows2[1]["cfp_half"] = 701.0
             other = os.path.join(d, "other.yaml")
-            placeholder(other, e, rows2, box)
+            _fixture_placeholder(other, e, rows2, box)
             sha2 = load_posterior(other, e, rg, dg(other))["sha256"]
         gate = ("acceptance gate failed (finalize)", "a verified point out of band", "the chosen point out of band",
                 "no verified point", "a clamped calibration grid", "no calibration grid record",
