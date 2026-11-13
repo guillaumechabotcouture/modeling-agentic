@@ -1,0 +1,247 @@
+beliefs:
+- id: B1
+  mechanism: 'A third MMR dose offered during a campus outbreak lowers transmission among two-dose students: individual
+    protection of the third dose relative to two doses is high (on the order of 60-80%), but the population effect
+    is that times uptake (often 20-80% in campus campaigns), so the multiplier on R_t is roughly 0.1-0.6 and the
+    relative reduction of infections over the half-year from an early start is substantial but well below 100%.'
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.75
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Cardemil CV et al. Effectiveness of a Third Dose of MMR Vaccine for Mumps Outbreak Control. N Engl
+      J Med 2017
+    location: Results, adjusted relative risk third vs two doses (table number not verified)
+  - citation: Ogbuanu IU et al. Impact of a third dose of measles-mumps-rubella vaccine on a mumps outbreak. Pediatrics
+      2012
+    location: Results, attack rates before and after the campaign (page not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Timing: with a mumps generation interval of roughly 2.5-3 weeks (serial interval ~18 days), a campaign
+    starting in week 6 instead of week 2 arrives about 1.5 generations later, after a larger share of the outbreak''s
+    infections have already been generated. At equal cost early therefore averts at least as many infections as
+    late wherever the outbreak grows, unless the late (student-health-service) route reaches much higher coverage
+    than the emergency clinics.'
+  about:
+    pair:
+    - early
+    - late
+    feature: seed_share
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table 1 (mumps row; value recalled approximately)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'Susceptible depletion and threshold: effective R = R0 x s0. Where s0 is high the outbreak overshoots
+    and burns through most susceptibles within the horizon even with a partial reduction in R_t, so the relative
+    reduction is small; near the threshold (R0 s0 close to 1) a modest multiplier pushes R below 1 and averts most
+    of the outbreak; below threshold the outbreak ends anyway and absolute benefit is small. Relative reduction
+    of a campaign therefore falls as s0 rises over most of the range; absolute averted burden is hump-shaped.'
+  about:
+    package: early
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 4, final-size relation (page not verified)
+  - citation: Lewnard JA, Grad YH. Vaccine waning and mumps re-emergence in the United States. Sci Transl Med 2018
+    location: Results, waning of vaccine-derived protection (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'In a homogeneous renewal model of one closed population where seeding is a share of students, the
+    epidemic in shares is scale-free: campus size does not change the relative reduction (or infections averted
+    per student). Size only matters through how much of the budget a campus consumes.'
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods, renewal equation
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B5
+  mechanism: 'A larger initial infected share means the outbreak is further along by week 6, so a late campaign
+    misses more of it: the late campaign''s relative reduction falls as seed_share rises.'
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table 1 (mumps row; value recalled approximately)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'Late campaign magnitude: same per-dose protection as early but started about 1.5 generations later,
+    so its relative reduction is clearly smaller, and near zero where the outbreak has peaked by week 6.'
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.03
+    - 0.55
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Cardemil CV et al. Effectiveness of a Third Dose of MMR Vaccine for Mumps Outbreak Control. N Engl
+      J Med 2017
+    location: Discussion, timing of the campaign relative to the outbreak (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: 'Budget binds: US$2M / US$12 covers ~167k students, likely about half of all students on the 24 campuses,
+    so campuses must be ranked. Ranking is by infections averted per student (burden x avertable share), not by
+    campus size or infections at the start alone; campuses whose outbreak will end anyway or has already peaked
+    rank last.'
+  about:
+    package: early
+    feature: pop
+  direction: none
+  source_type: data
+  evidence:
+  - dossier_entry: 'units.csv: pop (sum of students vs 2,000,000 / 12)'
+  confidence: medium
+  decision_relevant: true
+open_questions:
+- id: Q1
+  question: What is R0 for mumps among two-dose students on a campus (dense housing), and hence the s0 threshold
+    below which the outbreak ends anyway?
+  beliefs:
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: Does the late (student health service) route reach different uptake than the early emergency clinics,
+    enough to offset the 4-week delay?
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: What is the true remaining susceptibility s0 per campus (waning since the second dose), and does it
+    differ by campus?
+  beliefs:
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Is reported seed_share complete, or are infections at the start of 2026 under-ascertained (subclinical
+    mumps in vaccinated adults), making outbreaks further along than they appear?
+  beliefs:
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: An early campaign reduces campus infections over the horizon by 15-75% in most design points.
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.15
+    - 0.75
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: At equal cost, early beats late in net benefit across the whole seed_share range in at least 80% of points.
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 0.0001
+    - 0.002
+    sign: positive
+    min_share: 0.8
+- id: H3
+  belief: B5
+  claim: The late campaign's relative reduction decreases as seed_share increases.
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: Campus size has no effect on the early campaign's relative reduction (|Spearman rho| bounded within 0.2).
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H5
+  belief: B3
+  claim: The early campaign's relative reduction decreases as remaining susceptibility s0 increases (marginal association;
+    s0 is not sampled independently).
+  test:
+    kind: effect_direction
+    package: early
+    feature: s0 (calibration scale)
+    direction: decreases
+    scope: marginal
+- id: H6
+  belief: B6
+  claim: A late campaign reduces campus infections by 3-55% in most design points, clearly below early.
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.03
+    - 0.55
+    min_share: 0.7
