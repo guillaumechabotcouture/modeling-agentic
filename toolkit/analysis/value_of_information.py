@@ -13,8 +13,10 @@ where it overspends): a lower bound on the value of deciding now, labelled so.
 Perfect information: in each draw the best plan feasible there (its own optimum within the budget, solved at the full
 budget when the draws were re-optimised within a reserve). Costs are then known, so no overspend is needed; with an
 allowance, perfect information may overspend in as many draws as the plan chosen now may (floor(share x draws)), where
-the draw's plan solved without the budget (or the best candidate) gains most. So EVPI >= 0 and is never inflated by
-overspending.
+the draw's plan solved without the budget (or the best candidate) gains most. Identical draws get the same decision
+(overspending goes to whole classes of identical draws), so perfect information gains nothing from draws it cannot
+tell apart. A per-draw solve that a model correction bears on is replaced by the best plan in that draw without the
+corrected packages. So EVPI >= 0 and is never inflated by overspending.
 Candidates: the headline plan, every declared plan variant, the plan decided now, each draw's optimum, and the plan
 decided within the budget on each bin of each valued input and group, built on one half of the draws and valued,
 for that input only, on the other half (cross-fitting, so its fit to the input reaches neither the draws it is valued
@@ -172,6 +174,25 @@ def _bins(Xm, G):
     return np.searchsorted(edges, u, side="left")
 
 
+def _knapsack(cls, gain, k):
+    """Classes of identical draws to overspend in: the most total gain with at most k draws in all (0/1 knapsack)."""
+    ids, w = np.unique(cls, return_counts=True)
+    g = np.array([gain[cls == c].sum() for c in ids])
+    dp, take = np.zeros(k + 1), np.zeros((len(ids), k + 1), bool)
+    for i in range(len(ids)):
+        if w[i] <= k and g[i] > 0:
+            cand = np.full(k + 1, -np.inf)
+            cand[w[i]:] = dp[: k + 1 - w[i]] + g[i]
+            take[i] = cand > dp + 1e-12
+            dp = np.maximum(dp, cand)
+    out, c = [], int(np.argmax(dp))
+    for i in range(len(ids) - 1, -1, -1):
+        if take[i, c]:
+            out.append(ids[i])
+            c -= int(w[i])
+    return np.array(out, dtype=cls.dtype)
+
+
 INTERVAL_NOTE = ("No interval is published: a percentile bootstrap around a maximisation does not cover its target "
                  "near ties. Regression EVPPI is biased upward at small draw counts by fitting noise (about its "
                  "noise_mean); the value of deciding now is a maximum of sample means, so EVPI is biased downward "
@@ -242,7 +263,9 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
         if nb_free is not None:
             free = np.maximum(free, np.asarray(nb_free, float))
         gain = np.maximum(free - star, 0.0)
-        star = star + np.where(np.isin(np.arange(n), np.argsort(-gain, kind="stable")[:k]), gain, 0.0)
+        M = np.column_stack([nb, feas.astype(float), nb_opt, free] + [X[x] for x in sorted(X)])
+        cls = np.unique(np.where(np.isfinite(M), M, -1e300), axis=0, return_inverse=True)[1].ravel()
+        star = star + np.where(np.isin(cls, _knapsack(cls, gain, k)), gain, 0.0)
     v_pi = float(star.mean())
     evpi = max(v_pi - v_now, 0.0)
     pct = (lambda v: 100.0 * v / v_now if v_now > 0 else None)
@@ -325,9 +348,10 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
         conds = cmap.get(name, [])
         v, df, kn, psh, strict = value(Xm, conds)
         if v is None:
-            out["inputs"].append(dict(rec, status="too_many_inputs", evppi=None, supported=False,
-                                      reason=f"a linear fit on {len(mem)} inputs needs more than {md} degrees of "
-                                             f"freedom at {n} draws"))
+            md_ = max(2, int(th["max_df_share"] * n))
+            out["inputs"].append(dict(rec, status="too_many_inputs", evppi=None, supported=False, df_needed=1 + len(mem),
+                                      df_allowed=md_, reason=f"a linear fit on {len(mem)} inputs needs {1 + len(mem)} "
+                                                             f"degrees of freedom; {md_} are allowed at {n} draws"))
             continue
         perm = np.array([value(Xm[shuffled()], conds)[0] for _ in range(int(th["permutations"]))])
         fl = float(np.quantile(perm, float(th["noise_quantile"])))
@@ -473,16 +497,38 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
     if gap > 1e-6 * max(1.0, float(np.max(np.abs(obj)))):
         raise ValueError(f"value of information: a draw's re-optimised objective is not its benefit table summed at its "
                          f"plan (gap {gap:.3g})")
+    def clean(d, budget):
+        """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
+        corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
+        plan, on the comparator or a whole unit)."""
+        sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
+        try:
+            A.guard(f"uncertainty draw {d}", [sol["choice"]], rows[d]["events"])
+            return sol
+        except AnalysisBlocked:
+            pass
+        ev = rows[d]["events"]
+        if any(e.get("package") in ("*", getattr(A, "comp", None)) for e in ev):
+            return None
+        f = dict(A.feas, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
+        for e in ev:
+            if str(e.get("unit")) in f["feasible"] and e.get("package") in f["feasible"][str(e.get("unit"))]:
+                f["feasible"][str(e["unit"])][e["package"]] = False
+        try:
+            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget, feas=f)
+            A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
+            return sol
+        except (AnalysisBlocked, RuntimeError, ValueError):
+            return None
     pi = obj.copy()
     if getattr(A, "plan_budget", None) is not None and abs(float(A.plan_budget) - B) > 1e-9 * max(1.0, B):
         # the draws were re-optimised within a reserve; with perfect information costs are known: the full budget
-        for d, r in enumerate(rows):
-            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=B)
-            try:
-                A.guard(f"uncertainty draw {d}", [sol["choice"]], r["events"])
-                pi[d] = max(pi[d], float(sol["objective"]))
-            except AnalysisBlocked:
+        for d in range(n):
+            sol = clean(d, B)
+            if sol is None:
                 notes.setdefault("perfect_information_kept_reserve", []).append(d)
+            else:
+                pi[d] = max(pi[d], float(sol["objective"]))
     excluded = {}
     ben0, cost0 = tab(Bn[0]), tab(Cs[0])
     for cid, ix in cand:
@@ -500,13 +546,12 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
     nb_free = None
     if s > 0:          # perfect information may overspend: each draw's best plan without the budget (round 2 P2)
         nb_free = np.full(n, -np.inf)
-        for d, r in enumerate(rows):
-            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=float(Cs[d].max(1).sum()) + 1.0)
-            try:
-                A.guard(f"uncertainty draw {d}", [sol["choice"]], r["events"])
-                nb_free[d] = float(sol["objective"])
-            except AnalysisBlocked:
+        for d in range(n):
+            sol = clean(d, float(Cs[d].max(1).sum()) + 1.0)
+            if sol is None:
                 notes.setdefault("unbudgeted_left_out", []).append(d)
+            else:
+                nb_free[d] = float(sol["objective"])
     res = analyse(nb, pi, cost > B * (1 + 1e-9), inputs, groups, s, level, thr=th, seed=seed,
                   ids=[c[0] for c in cand], excluded=excluded, exact_id="robust" if rb is not None else None,
                   nb_free=nb_free, cond=cond, halves=hv)
@@ -561,14 +606,27 @@ def contract_findings(raw: dict, unc, voi) -> list[str]:
         return ["value_of_information: the candidate list is missing"]
     cl = {x.get("id"): x for x in cd["list"]}
     n_el = sum(x.get("eligible") is True for x in cd["list"])
-    if st == "no_eligible_plan":
-        return [] if (voi.get("evpi") is None and n_el == 0 and cd.get("eligible") == 0) else [
-            "value_of_information: no_eligible_plan with eligible candidates or an EVPI"]
-    if st != want:
-        bad.append(f"value_of_information: status {st} at {draws} draws (expected {want})")
 
     def num(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    sh = ((raw or {}).get("uncertainty") or {}).get("affordability") or {}
+    sh = sh.get("max_share_over_budget", 0.0) if isinstance(sh, dict) else None
+    if not num(sh) or not num(voi.get("max_share_over_budget")) or abs(voi["max_share_over_budget"] - sh) > 1e-12:
+        return [f"value_of_information: the affordability allowance {voi.get('max_share_over_budget')!r} is not the "
+                f"signed spec's ({sh!r})"]
+    n_want = 0
+    for x in cd["list"]:
+        want_e = (num(x.get("draws_over_budget")) and "excluded" not in x
+                  and x["draws_over_budget"] / draws <= sh + 1e-12)
+        n_want += bool(want_e)
+        if x.get("eligible") is not bool(want_e) or not num(x.get("expected_value")):
+            bad.append(f"value_of_information: candidate {x.get('id')!r}: eligibility or value disagrees with its "
+                       f"budget count and exclusion")
+    if st == "no_eligible_plan":
+        return bad + ([] if (voi.get("evpi") is None and n_el == 0 and n_want == 0 and cd.get("eligible") == 0) else [
+            "value_of_information: no_eligible_plan with eligible candidates or an EVPI"])
+    if st != want:
+        bad.append(f"value_of_information: status {st} at {draws} draws (expected {want})")
     ev, v0, vp = voi.get("evpi"), voi.get("expected_value_decide_now"), voi.get("expected_value_perfect_information")
     if not (isinstance(ev, dict) and num(ev.get("value")) and num(ev.get("se_paired")) and num(v0) and num(vp)):
         return bad + ["value_of_information: EVPI, its standard error or a value is missing or not finite"]
@@ -578,13 +636,6 @@ def contract_findings(raw: dict, unc, voi) -> list[str]:
                    f"deciding now ({vp} - {v0})")
     if ev["value"] < -at or ev["se_paired"] < 0:
         bad.append("value_of_information: a negative EVPI or standard error")
-    sh = voi.get("max_share_over_budget", 0.0)
-    for x in cd["list"]:
-        want = (num(x.get("draws_over_budget")) and "excluded" not in x and num(sh)
-                and x["draws_over_budget"] / draws <= sh + 1e-12)
-        if x.get("eligible") is not bool(want) or not num(x.get("expected_value")):
-            bad.append(f"value_of_information: candidate {x.get('id')!r}: eligibility or value disagrees with its "
-                       f"budget count and exclusion")
     ch = cl.get(voi.get("decide_now")) or {}
     best = max((x["expected_value"] for x in cd["list"] if x.get("eligible") is True
                 and num(x.get("expected_value"))), default=None)
@@ -666,7 +717,7 @@ def results_lines(data) -> list[str]:
           "allows. Value of partial perfect information by input (regression method, Strong, Oakley & Brennan 2014; "
           f"over {data.get('evppi_over') or 'the candidate set'}):", "",
           "| Input | Kind | EVPPI | Share of the value chosen now |", "|---|---|---|---|"]
-    for r in data["inputs"][:TOP_SHOWN]:
+    for r in sup + [x for x in data["inputs"] if not x.get("supported")][:3]:
         if r in sup:
             k = sup.index(r)
             L.append(f"| {r['input']} | {r['kind']} | [CLAIM:voi.top{k}.evppi] | "
@@ -1052,6 +1103,85 @@ def _self_test() -> int:
         for label, m in muts:
             ok(bool(contract_findings(raw, unc, m(copy.deepcopy(doc)))), f"E5 {label} is a finding (fail closed)")
 
+    def f1():
+        # F1 (round 3, P1): six regional shifts at 32 draws: the automatic calibration-shift group needs 7 degrees of
+        # freedom for a linear fit, above the 6 allowed. It is recorded as not computed, with why, and the run goes on.
+        rng = np.random.default_rng(9)
+        n = 32
+        ben = [{"a": float(rng.normal()), "b": float(rng.normal())} for _ in range(n)]
+        cost = [{"a": 0.0, "b": 0.0} for _ in range(n)]
+        smp = [{f"shift:r{k}": float(rng.normal()) for k in range(6)} for _ in range(n)]
+        r = _fake_run(["a", "b"], ben, cost, 1.0, "a", smp, thr={"permutations": 10})
+        g = {x["input"]: x for x in r["inputs"]}.get("calibration shifts") or {}
+        ok(g.get("status") == "too_many_inputs" and g.get("supported") is False and g.get("df_needed") == 7
+           and g.get("df_allowed") == 6 and len(r["inputs"]) == 7,
+           f"F1 a group too large for the draws is recorded as not computed and the run continues ({g})")
+
+    def f2():
+        # F2 (round 3, P2): 40 identical draws (treatment costs 2, budget 1, worth 10; 25% may overspend). Nothing is
+        # learned, so perfect information cannot overspend in some identical draws and not others: EVPI 0.
+        n = 40
+        nb = np.column_stack([np.zeros(n), np.full(n, 10.0)])
+        over = np.column_stack([np.zeros(n, bool), np.ones(n, bool)])
+        r = analyse(nb, np.zeros(n), over, {"x": np.zeros(n)}, max_share=0.25, nb_free=np.full(n, 10.0),
+                    thr=dict(thresholds(), min_draws=4, permutations=10), ids=["none", "treat"])
+        ok(abs(r["evpi"]["value"]) < 1e-12, f"F2 identical draws get the same decision under perfect information: "
+                                            f"EVPI {r['evpi']['value']} (0)")
+
+    def f3():
+        # F3 (round 3, P2): budget 1, two treatments cost 2; in ten of 40 draws the clean one is worth 10 and the
+        # clipped one 20 (a model correction bears on it in every draw); elsewhere both are worth 0; 25% may
+        # overspend. Perfect information treats cleanly in those ten draws: EVPI 2.5.
+        n = 40
+        ben = [{"none": 0.0, "clean": 10.0 if d < 10 else 0.0, "clip": 20.0 if d < 10 else 0.0} for d in range(n)]
+        cost = [{"none": 0.0, "clean": 2.0, "clip": 2.0} for _ in range(n)]
+        ev = {d: [{"unit": "u", "package": "clip", "kind": "clip"}] for d in range(n)}
+        r = _fake_run(["none", "clean", "clip"], ben, cost, 1.0, "none", [{"x": float(d < 10)} for d in range(n)],
+                      events=ev, raw={"uncertainty": {"affordability": {"max_share_over_budget": 0.25}}},
+                      thr={"permutations": 10})
+        ok(abs((r.get("evpi") or {}).get("value", -1) - 2.5) < 1e-9,
+           f"F3 a corrected unbudgeted optimum is replaced by the best clean plan in that draw: EVPI 2.5 "
+           f"({r.get('evpi')})")
+
+    def f4():
+        # F4 (round 3, P2 gate): the allowance comes from the signed spec, not the artifact
+        import copy
+        unc = {"draws": 64}
+        for label, sh, over in (("an allowance of 1 and every plan over in every draw", 1.0, 64),
+                                ("an allowance of 0.5 and the chosen plan over in half the draws", 0.5, 32)):
+            d = copy.deepcopy(_valid_doc())
+            d["max_share_over_budget"] = sh
+            for x in d["candidates"]["list"]:
+                x["draws_over_budget"] = over
+            ok(bool(contract_findings({}, unc, d)), f"F4 {label}, against a signed allowance of 0, is a finding")
+
+    def f5():
+        # F5 (round 3, P2 gate): no_eligible_plan is accepted only when the counts and exclusions say so
+        import copy
+        d = copy.deepcopy(_valid_doc())
+        d.update(status="no_eligible_plan", evpi=None)
+        d["candidates"]["eligible"] = 0
+        for x in d["candidates"]["list"]:
+            x["eligible"] = False
+        ok(bool(contract_findings({}, {"draws": 64}, d)),
+           "F5 no_eligible_plan with candidates within the budget in every draw is a finding")
+
+    def f6():
+        # F6 (round 3, P3): five unsupported values rank above a supported one; the table shows the supported row
+        # with the claim it cites
+        rows = [{"input": f"x{k}", "kind": "input", "evppi": 10.0 - k, "pct": 1.0, "supported": False,
+                 "status": "computed", "exceeds_evpi": True, "above_noise_floor": True} for k in range(5)]
+        rows.append({"input": "good", "kind": "input", "evppi": 1.0, "pct": 0.5, "supported": True,
+                     "status": "computed", "exceeds_evpi": False, "above_noise_floor": True})
+        data = {"status": "indicative", "draws": 64, "outcome": "y", "decide_now": "point", "inputs": rows,
+                "evpi": {"value": 2.0, "pct": 1.0, "se_paired": 0.1}, "expected_value_decide_now": 100.0,
+                "informative_draws": 500, "not_drawn": []}
+        cl = {c_["id"]: c_ for c_ in claims(lambda cid, kind, art, field, *a, **kw: {"id": cid, "field": field}, "a", data)}
+        txt = "\n".join(results_lines(data))
+        ok("| good | input | [CLAIM:voi.top0.evppi]" in txt and cl.get("voi.top0.evppi", {}).get("field")
+           == "data.inputs[5].evppi",
+           f"F6 the table shows the supported rows the claims cite ({[x for x in txt.splitlines() if x.startswith('| ')]})")
+
     def gate():
         doc = _valid_doc()
         raw = {"uncertainty": {"draws": 64}}
@@ -1091,7 +1221,8 @@ def _self_test() -> int:
                       ("VI11-13 floors", floors), ("D1", d1), ("D2", d2), ("D3", d3), ("D4", d4),
                       ("D5", d5), ("D6", d6), ("D7", d7),
                       ("D8", d8), ("D9", d9), ("D10", d10), ("E1", e1), ("E2", e2), ("E3", e3), ("E4", e4),
-                      ("E5", e5), ("VG gate", gate)):
+                      ("E5", e5), ("F1", f1), ("F2", f2), ("F3", f3), ("F4", f4), ("F5", f5), ("F6", f6),
+                      ("VG gate", gate)):
         run_case(label, fn)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
