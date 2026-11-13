@@ -1,0 +1,138 @@
+# World model v0 (seed), written before any simulation. Built from first principles and literature only.
+# Decision: fund a pre-season DENV-2 control campaign for 2026 (package `control`) or not (comparator `none`),
+# primary outcome 2026 infections. The choice turns on whether 2026 transmission is above threshold
+# (R_eff_2026 = R0 x S_2026). In a closed SIR population with constant transmissibility, an epidemic that peaked
+# and declined by susceptible depletion leaves S below the threshold (overshoot), so R_eff_2026 < 1 and the burden
+# a campaign can avert in 2026 is small. The growth rate of the 2025 curve plus the generation interval pins
+# R_eff at the start of 2025 (R0 x s0); reported counts cannot separate s0 from the reporting ratio, so the 2025
+# attack rate (as a share of the whole population) scales with the unknown s0, while R_eff_2026 hardly does.
+
+beliefs:
+  - id: B1
+    mechanism: >-
+      Overshoot: with constant transmissibility and no waning, births or migration, a completed 2025 epidemic
+      ends with susceptibles below 1/R0, so R_eff at the start of 2026 is below 1 and no large DENV-2 outbreak
+      is expected in 2026 (only short, seeded chains). The control campaign therefore acts on a small,
+      sub-threshold 2026 burden.
+    about: {package: control, feature: "s0 (calibration scale)"}
+    direction: reduces
+    magnitude: {band: [0.3, 0.95], scale: reff_2026}
+    conditions: [{feature: "s0 (calibration scale)", range: [0.3061709347181022, 0.9862406306900084]}]
+    source_type: literature
+    evidence:
+      - {citation: "Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond A 1927;115:700-721", location: "final-size relation, main text (exact equation numbering not recalled)"}
+      - {citation: "Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious disease. Bull Math Biol 2006;68:679-702", location: "main result (final size independent of generation-interval shape); page not recalled"}
+      - {citation: "Ferguson NM et al. Countering the Zika epidemic in Latin America. Science 2016;353:353-354", location: "main text: post-epidemic herd immunity makes renewed large outbreaks unlikely for years"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B2
+    mechanism: >-
+      Identifiability: the 2025 growth rate and the generation interval fix R0 x s0 (Wallinga-Lipsitch), and
+      the final-size relation then fixes the fraction of initial susceptibles infected and the end-of-season
+      S/s0. Hence R_eff_2026 = (R0 s0)(S_end/s0) is nearly invariant to s0, and the relative reduction from
+      control in 2026 should depend little on the calibrated s0. The 2025 attack rate as a share of the whole
+      population is proportional to s0 and is not determined by the data without a serosurvey or a known
+      reporting ratio (1 in 3 to 1 in 30 is a 10-fold range).
+    about: {package: control, feature: "s0 (calibration scale)"}
+    direction: negligible
+    conditions: [{feature: "s0 (calibration scale)", range: [0.3061709347181022, 0.9862406306900084]}]
+    source_type: literature
+    evidence:
+      - {citation: "Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive numbers. Proc R Soc B 2007;274:599-604", location: "Eq. for R = 1/M(-r); main text"}
+      - {citation: "Bhatt S et al. The global distribution and burden of dengue. Nature 2013;496:504-507", location: "main text: inapparent infections roughly three times apparent; exact table not recalled"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B3
+    mechanism: >-
+      Control acts as a multiplier (1 - effect) on R_t. Below threshold, 2026 infections from seeding scale
+      about as 1/(1 - R_eff), so the relative reduction is about e R/(1 - R + e R): it increases with the
+      control effect and is amplified as R_eff_2026 approaches 1, but stays well short of total elimination of
+      seeded infections.
+    about: {package: control, feature: "effect:control"}
+    direction: increases
+    magnitude: {band: [0.05, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One 2007;2:e758", location: "renewal-equation formulation, main text"}
+      - {citation: "Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying reproduction numbers during epidemics. Am J Epidemiol 2013;178:1505-1512", location: "renewal model, methods"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B4
+    mechanism: >-
+      Value for money: because 2026 is sub-threshold, infections averted per person by a pre-season campaign
+      are small (on the order of seeded chains, not a fraction of the city), so at a positive shadow price on
+      spending the campaign's net benefit is likely below that of no campaign, across the plausible s0 range.
+      Uncertain because the campaign cost and the seeding size are withheld.
+    about: {pair: [none, control]}
+    direction: none
+    conditions: [{feature: "s0 (calibration scale)", range: [0.3061709347181022, 0.9862406306900084]}]
+    source_type: literature
+    evidence:
+      - {citation: "Ferguson NM et al. Countering the Zika epidemic in Latin America. Science 2016;353:353-354", location: "main text: control after herd immunity yields little near-term benefit"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B5
+    mechanism: >-
+      What the model omits can reverse B1: seasonal forcing (the 2025 decline may be partly climatic, not
+      depletion, leaving more susceptibles), waning cross-protection, births and migration, spatial
+      heterogeneity (unaffected neighbourhoods) and a more transmissible 2026 season. Under the declared
+      constant-transmissibility model these are absent, so the sweep cannot test them; they are open questions.
+    about: {component: control}
+    direction: none
+    source_type: literature
+    evidence:
+      - {citation: "Reich NG et al. Interactions between serotypes of dengue highlight epidemiological impact of cross-immunity. J R Soc Interface 2013;10:20130414", location: "main text: temporary cross-protection of roughly 1-3 years; value uncertain"}
+    confidence: low
+    decision_relevant: false
+
+  - id: B6
+    mechanism: >-
+      Data anchors: total reported 2025 cases and the peak week constrain the epidemic's timing and size in
+      reported units; with an unknown reporting ratio, infections = reported / ratio, consistent with a wide
+      band of s0. The s0_mid column is a central assumption, not a measurement.
+    about: {component: control}
+    direction: none
+    source_type: data
+    evidence:
+      - {dossier_entry: "city.csv", file: city.csv, column: reported_cases_2025}
+      - {dossier_entry: "city.csv", file: city.csv, column: peak_week_2025}
+      - {dossier_entry: "city.csv", file: city.csv, column: s0_mid}
+    confidence: medium
+    decision_relevant: false
+
+open_questions:
+  - {id: Q1, question: "What fraction of the city was DENV-2 susceptible before 2025 (s0)? Only a serosurvey can determine it; it sets attack_rate_2025 almost proportionally.", beliefs: [B2, B6], decision_relevant: false}
+  - {id: Q2, question: "Did the 2025 epidemic end by susceptible depletion or by seasonal decline in transmission? If seasonal, R_eff_2026 may exceed 1 and the campaign could be worthwhile.", beliefs: [B1, B5], decision_relevant: true}
+  - {id: Q3, question: "What is the reporting ratio (1 in 3 to 1 in 30), and did it change over the epidemic?", beliefs: [B2, B6], decision_relevant: false}
+  - {id: Q4, question: "What does the campaign cost per person and how large is its effect on R_t, relative to the size of seeded 2026 transmission?", beliefs: [B3, B4], decision_relevant: true}
+  - {id: Q5, question: "Is 2026 transmissibility the same as 2025 (climate, vector density), and is the city spatially heterogeneous enough that pockets remain above threshold?", beliefs: [B1, B5], decision_relevant: true}
+
+hypotheses:
+  - id: H1
+    belief: B3
+    claim: "Across the sweep, control reduces 2026 infections by between 5% and 60% relative to none at most points; refuted if fewer than 30% of usable points fall in that band."
+    test: {kind: effect_band, package: control, band: [0.05, 0.6], min_share: 0.7}
+  - id: H2
+    belief: B3
+    claim: "The relative reduction from control increases with the control effect parameter; refuted if the rank correlation is reliably negative or null."
+    test: {kind: effect_direction, package: control, feature: "effect:control", direction: increases, scope: marginal}
+  - id: H3
+    belief: B2
+    claim: "The relative reduction from control is nearly unaffected by the calibrated s0, because R_eff_2026 is pinned by the growth rate and final size; refuted if |rho| bound exceeds 0.3."
+    test: {kind: effect_direction, package: control, feature: "s0 (calibration scale)", direction: negligible, equivalence: 0.3, scope: marginal}
+  - id: H4
+    belief: B4
+    claim: "At the budget's shadow price, no campaign has higher net benefit than the campaign at at least 70% of points across the full s0 range; refuted if control wins at 70% or more."
+    test: {kind: paired_sign, a: none, b: control, feature: "s0 (calibration scale)", range: [0.3061709347181022, 0.9862406306900084], sign: positive, min_share: 0.7}
+  - id: H5
+    belief: B4
+    claim: "The verdict of H4 holds in the low-s0 half too (s0 0.306-0.65), where the 2025 epidemic was smallest in absolute terms; refuted if control wins at 70% of those points."
+    test: {kind: paired_sign, a: none, b: control, feature: "s0 (calibration scale)", range: [0.3061709347181022, 0.65], sign: positive, min_share: 0.7}
+  - id: H6
+    belief: B1
+    claim: "In the high-s0 region (s0 0.65-0.986) the 2026 relative reduction from control also stays below 60% at most points, since R_eff_2026 stays sub-threshold whatever s0; refuted if fewer than 30% of those points are in [0.05, 0.6]."
+    test: {kind: effect_band, package: control, band: [0.05, 0.6], min_share: 0.7, where: {"s0 (calibration scale)": [0.65, 0.9862406306900084]}}
