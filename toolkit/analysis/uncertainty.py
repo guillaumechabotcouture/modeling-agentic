@@ -611,7 +611,15 @@ def _self_test_posterior(ok):
         def resolve(s, p):
             return p if os.path.isabs(p) else os.path.join(s.base, p)
 
+    import hashlib
+
+    def signed(d, name, digest=None):       # the spec field: the path and the owner-signed sha256 of its bytes
+        p = os.path.join(d, name)
+        return {"path": name, "sha256": digest or (hashlib.sha256(open(p, "rb").read()).hexdigest()
+                                                   if os.path.exists(p) else "0" * 64)}
+
     def fake(d, post=None, sources=("engine_parameters",), cal=()):
+        post = signed(d, post) if isinstance(post, str) else post
         u = dict({"sources": [{"kind": k} for k in sources]}, **({"net_effect_posterior": post} if post else {}))
         A = types.SimpleNamespace(spec=Sp({"uncertainty": u, "calibration": {"method": "none", "parameters": list(cal)}},
                                           d), eng=e, region=None, method="none", joint=None, lik=None, model=None,
@@ -638,15 +646,25 @@ def _self_test_posterior(ok):
            f"{c1:.3f}; independent draws {c0:.3f}); a parameter without a sample (use_rate) is drawn from its prior "
            "exactly as without it, and without the field the draws are unchanged")
         pv = D1.posterior_provenance()
-        ok(pv["sha256"] == NEF.load_posterior(os.path.join(d, "net_effect_fit.yaml"), e,
-                                              {"net_kill_shift": (-1, 1), "cfp_kill": (0, 1)})["sha256"]
-           and len(pv["rows"]) == 60 and pv["names"] == list(box) and posterior_input(fake(d).spec) is None,
-           "NP2 the uncertainty report records the sample's sha256, names and the row of every draw")
-        i1 = posterior_input(fake(d, "net_effect_fit.yaml").spec)
-        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)
-        i2 = posterior_input(fake(d, "net_effect_fit.yaml").spec)
-        ok(i1["sha256"] != i2["sha256"] and i1["path"] == os.path.join(d, "net_effect_fit.yaml"),
-           "NP3 the manifest input (path, sha256) of the sample changes when the sample changes")
+        sig = signed(d, "net_effect_fit.yaml")
+        ok(pv["sha256"] == sig["sha256"] and len(pv["rows"]) == 60 and pv["names"] == list(box)
+           and posterior_input(fake(d).spec) is None,
+           "NP2 the uncertainty report records the signed sha256, the names and the row of every draw")
+        # Codex r1 P2-4: the file is read once; the manifest, the engine artifact and the drawer use those bytes
+        A5 = fake(d, sig)
+        i1 = posterior_input(A5.spec)                   # run.py's read, before the manifest is written
+        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)      # the file is replaced after
+        D5 = Drawer(A5, 9)
+        try:
+            posterior_input(fake(d, sig).spec)          # a fresh read of the replaced file under the signed digest
+            fresh = "accepted"
+        except NEF.PosteriorRefused as ex:
+            fresh = str(ex)
+        ok(i1["sha256"] == sig["sha256"] == D5.posterior_provenance()["sha256"] and len(D5.ne["rows"]) == 30
+           and "signed sha256" in fresh,
+           f"NP3 the sample is read once: the drawer uses the bytes whose signed sha256 the manifest records (30 rows, "
+           f"not the replacement's {len(rows) - 1}); a file whose bytes differ from the signed sha256 is refused "
+           f"({fresh[:90]})")
         refused = []
         for label, A, why in (("a missing file", fake(d, "absent.yaml"), "unreadable"),
                               ("a calibrated parameter", fake(d, "net_effect_fit.yaml", cal=("cfp_kill",)),
