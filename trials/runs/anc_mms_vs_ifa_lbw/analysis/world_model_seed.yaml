@@ -1,0 +1,308 @@
+beliefs:
+- id: B1
+  mechanism: Daily iron-folic acid in pregnancy reduces low birthweight relative to no iron by roughly 16%, with
+    a 95% CI that includes no effect (Cochrane RR 0.84, 0.69-1.03), so IFA vs none has a modest and uncertain relative
+    reduction
+  about:
+    package: ifa
+  direction: reduces
+  magnitude:
+    band:
+    - 0.0
+    - 0.31
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Pena-Rosas JP, De-Regil LM, Garcia-Casal MN, Dowswell T. Daily oral iron supplementation during pregnancy.
+      Cochrane Database of Systematic Reviews 2015
+    location: 'Summary of findings table 1 (low birthweight, iron vs no iron: RR 0.84, 95% CI 0.69-1.03)'
+  - citation: 'Haider BA, Olofin I, Wang M, et al. Anaemia, prenatal iron use, and risk of adverse pregnancy outcomes:
+      systematic review and meta-analysis. BMJ 2013'
+    location: Results, iron use and low birthweight (RR about 0.81); value from memory, check
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: MMS reduces LBW about 12% relative to IFA (RR 0.88, 0.85-0.91, tightly estimated). Because the comparator
+    is none and the engine states MMS's effect is relative to IFA, MMS vs none should be IFA's effect times MMS's,
+    about 0.84 x 0.88, a relative reduction of about 0.26 (roughly 0.12-0.38 given IFA's uncertainty). If the engine
+    instead applies the MMS-vs-IFA ratio directly against none, MMS vs none is only about 0.09-0.15 and MMS is dominated
+    by IFA
+  about:
+    package: mms
+  direction: reduces
+  magnitude:
+    band:
+    - 0.12
+    - 0.38
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Keats EC, Haider BA, Tam E, Bhutta ZA. Multiple-micronutrient supplementation for women during pregnancy.
+      Cochrane Database of Systematic Reviews 2019
+    location: 'Summary of findings for the main comparison (MMN with iron and folic acid vs iron with or without
+      folic acid, low birthweight: RR 0.88, 95% CI 0.85-0.91)'
+  - citation: 'Smith ER, Shankar AH, Wu LS, et al. Modifiers of the effect of maternal multiple micronutrient supplementation
+      on stillbirth, birth outcomes, and infant mortality: a meta-analysis of individual patient data from 17 randomised
+      trials in low-income and middle-income countries. Lancet Global Health 2017'
+    location: Results, overall effect on low birthweight (RR 0.88, 0.85-0.91)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The engine applies a constant relative risk per product (multiplicative, reads only baseline_rate),
+    so MMS's relative reduction does not vary with maternal anaemia prevalence. In the IPD meta-analysis the trials
+    showed some larger MMS benefits among anaemic women, but mainly for preterm birth and mortality rather than
+    LBW, so the evidence for modification of the LBW effect is weak
+  about:
+    package: mms
+    feature: anaemia
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Smith ER, Shankar AH, Wu LS, et al. Modifiers of the effect of maternal multiple micronutrient supplementation
+      on stillbirth, birth outcomes, and infant mortality: a meta-analysis of individual patient data from 17 randomised
+      trials in low-income and middle-income countries. Lancet Global Health 2017'
+    location: Subgroup analyses by maternal anaemia (figure location not recalled; low confidence)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: A relative risk applied multiplicatively to the baseline gives the same relative reduction for IFA
+    in every district whatever its LBW share; only the absolute number averted scales with lbw
+  about:
+    package: ifa
+    feature: lbw
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Pena-Rosas JP, De-Regil LM, Garcia-Casal MN, Dowswell T. Daily oral iron supplementation during pregnancy.
+      Cochrane Database of Systematic Reviews 2015
+    location: Summary of findings table 1 (a single pooled RR, applied as a constant ratio)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B5
+  mechanism: 'Under a binding budget, the MMS-over-IFA upgrade is worth its extra $1.50 per pregnancy only where
+    the baseline LBW share is high: net benefit (mms - ifa) = lbw x (r_mms - r_ifa) - 1.5 x lambda rises linearly
+    with lbw. With lambda set by the marginal IFA district (about lbw 0.14 x 0.16 / $2), the switch falls around
+    lbw 0.15-0.19, so MMS is preferred in the upper part of the lbw range and IFA below it. Location very uncertain:
+    it depends on the declared shadow price and on whether MMS stacks on IFA (B2)'
+  about:
+    pair:
+    - mms
+    - ifa
+    feature: lbw
+  direction: flips
+  conditions:
+  - feature: lbw
+    range:
+    - 0.13
+    - 0.2191
+  source_type: literature
+  evidence:
+  - citation: Keats EC, Haider BA, Tam E, Bhutta ZA. Multiple-micronutrient supplementation for women during pregnancy.
+      Cochrane Database of Systematic Reviews 2019
+    location: Summary of findings (LBW RR 0.88 MMS vs IFA); threshold is derived arithmetic, not a reported value
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Below the switch, IFA beats MMS on net benefit at the shadow price: in low-LBW districts the $1.50
+    upgrade averts too few LBW births (lbw x ~0.10) to cover its cost at lambda'
+  about:
+    pair:
+    - mms
+    - ifa
+    feature: lbw
+  direction: decreases
+  conditions:
+  - feature: lbw
+    range:
+    - 0.0851
+    - 0.12
+  source_type: literature
+  evidence:
+  - citation: Keats EC, Haider BA, Tam E, Bhutta ZA. Multiple-micronutrient supplementation for women during pregnancy.
+      Cochrane Database of Systematic Reviews 2019
+    location: Summary of findings (LBW RR 0.88 MMS vs IFA); sign at low lbw is derived arithmetic
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: low
+- id: B7
+  mechanism: In the highest-LBW districts IFA beats no supplement at the shadow price, because IFA is the most efficient
+    first purchase (about 0.16 relative reduction for $2) and the budget is spent first where the baseline LBW share
+    is highest
+  about:
+    pair:
+    - ifa
+    - none
+    feature: lbw
+  direction: increases
+  conditions:
+  - feature: lbw
+    range:
+    - 0.18
+    - 0.2191
+  source_type: literature
+  evidence:
+  - citation: Pena-Rosas JP, De-Regil LM, Garcia-Casal MN, Dowswell T. Daily oral iron supplementation during pregnancy.
+      Cochrane Database of Systematic Reviews 2015
+    location: Summary of findings table 1 (LBW RR 0.84, 0.69-1.03); the sign at the shadow price is derived arithmetic
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: Does the engine apply MMS's LBW relative risk on top of IFA's (MMS vs none = RR_ifa x RR_mms_vs_ifa)
+    or directly against no supplement? If directly, MMS is costlier and less effective than IFA, so it is dominated
+    and the rule collapses to IFA vs none.
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: How large is the true IFA vs none effect on LBW in this setting? The Cochrane CI includes no effect,
+    and its trials are largely from settings unlike this one. A small IFA effect pushes the plan toward MMS in fewer,
+    higher-burden districts.
+  beliefs:
+  - B1
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Is the effect larger where anaemia prevalence is high (iron deficiency)? The engine ignores anaemia.
+    If the effect is truly modified, district ranking should weight anaemia as well as lbw.
+  beliefs:
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: What shadow price does the declared budget imply? It sets where IFA vs none and MMS vs IFA switch along
+    lbw.
+  beliefs:
+  - B5
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q5
+  question: Do baseline LBW shares come from comparable measurements across districts (survey birthweight recall
+    or card vs facility records, heaping, missing weights)? Differential ascertainment would misrank districts.
+  beliefs:
+  - B5
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: IFA's relative reduction in LBW vs none lies in [0.0, 0.31] (the Cochrane 95% CI with the slightly harmful
+    tail excluded) in at least 80% of usable points; refuted if 20% or fewer do
+  test:
+    kind: effect_band
+    package: ifa
+    band:
+    - 0.0
+    - 0.31
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: MMS's relative reduction in LBW vs none lies in [0.12, 0.38] (IFA's effect stacked with the MMS-vs-IFA
+    effect) in at least 80% of usable points; refuted if 20% or fewer do, for example if MMS is applied directly
+    against none at about 0.12
+  test:
+    kind: effect_band
+    package: mms
+    band:
+    - 0.12
+    - 0.38
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: 'MMS''s relative reduction does not vary with anaemia prevalence: |Spearman rho| bound within 0.2'
+  test:
+    kind: effect_direction
+    package: mms
+    feature: anaemia
+    direction: negligible
+    equivalence: 0.2
+- id: H4
+  belief: B4
+  claim: 'IFA''s relative reduction does not vary with the baseline LBW share: |Spearman rho| bound within 0.2'
+  test:
+    kind: effect_direction
+    package: ifa
+    feature: lbw
+    direction: negligible
+    equivalence: 0.2
+- id: H5
+  belief: B5
+  claim: The MMS/IFA net-benefit switch along lbw lies within [0.13, 0.2191], with MMS preferred above it
+  test:
+    kind: flip_in
+    a: mms
+    b: ifa
+    feature: lbw
+    range:
+    - 0.13
+    - 0.2191
+- id: H6
+  belief: B6
+  claim: At low LBW shares (lbw 0.0851-0.12) IFA beats MMS on net benefit at the shadow price in at least 70% of
+    usable points
+  test:
+    kind: paired_sign
+    a: mms
+    b: ifa
+    feature: lbw
+    range:
+    - 0.0851
+    - 0.12
+    sign: negative
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: At the highest LBW shares (lbw 0.18-0.2191) IFA beats no supplement on net benefit at the shadow price
+    in at least 70% of usable points
+  test:
+    kind: paired_sign
+    a: ifa
+    b: none
+    feature: lbw
+    range:
+    - 0.18
+    - 0.2191
+    sign: positive
+    min_share: 0.7
