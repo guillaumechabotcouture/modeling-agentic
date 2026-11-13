@@ -1,0 +1,248 @@
+beliefs:
+- id: B1
+  mechanism: Two annual DA rounds at ~65% swallowed coverage cut community mf prevalence partially; averaged over
+    the two-year window the mf person-years fall by a moderate share (DA clears mf in only part of treated people
+    and microfilariae return within a year)
+  about:
+    package: da
+  direction: reduces
+  magnitude:
+    band:
+    - 0.2
+    - 0.55
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: King CL et al. A Trial of a Triple-Drug Treatment for Lymphatic Filariasis. N Engl J Med 2018
+    location: Results, mf clearance by arm (DA single dose clearance at 12 and 36 months well below IDA); exact
+      table not recalled
+  - citation: "Bjerum CM et al. Efficacy and Safety of a Single Dose of Ivermectin, Diethylcarbamazine, and Albendazole\
+      \ for Treatment of Lymphatic Filariasis in C\xF4te d'Ivoire: An Open-label Randomized Controlled Trial. Clin\
+      \ Infect Dis 2020"
+    location: Results, mf clearance at 12 months by arm; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: IDA (adding ivermectin) clears microfilariae in most treated people for at least a year, so two IDA
+    rounds at ~65% coverage reduce mf person-years substantially more than DA, though coverage (35% untreated each
+    round) caps the community reduction
+  about:
+    package: ida
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: King CL et al. A Trial of a Triple-Drug Treatment for Lymphatic Filariasis. N Engl J Med 2018
+    location: Results, IDA mf clearance ~96% at 36 months vs ~34% after single DA (from memory; check table)
+  - citation: 'Weil GJ et al. The safety of double- and triple-drug community mass drug administration for lymphatic
+      filariasis: A multicenter, open-label, cluster-randomized study. PLoS Med 2019'
+    location: community MDA setting; safety, not efficacy, endpoint
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: In a multiplicative package-rate model the relative reduction does not depend on the unit's baseline
+    mf prevalence; heterogeneity in relative effect by endemicity seen in transmission models (worse at high prevalence,
+    slower bounce-back at low) is not represented over a two-year window
+  about:
+    package: ida
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Irvine MA et al. Effectiveness of a triple-drug regimen for global elimination of lymphatic filariasis:
+      a modelling study. Lancet Infect Dis 2017'
+    location: transmission-model projections by baseline prevalence; location uncertain
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Past MDA history and past coverage change baseline prevalence (already in inc) but, as an engine input,
+    not the relative reduction of the next rounds; the engine reads only baseline_rate per unit
+  about:
+    package: da
+    feature: coverage_past
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Irvine MA et al. Effectiveness of a triple-drug regimen for global elimination of lymphatic filariasis:
+      a modelling study. Lancet Infect Dis 2017'
+    location: role of prior MDA in projections; location uncertain
+  confidence: low
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'IDA vs DA net benefit at the shadow price rises with baseline mf prevalence: incremental mf-years
+    averted scale with inc while the incremental cost (US$1.2 per person over the window) does not, so IDA wins
+    in high-prevalence units and DA in low-prevalence units; the flip lies in the middle of the inc range'
+  about:
+    pair:
+    - ida
+    - da
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.02
+    - 0.055
+  source_type: literature
+  evidence:
+  - citation: King CL et al. A Trial of a Triple-Drug Treatment for Lymphatic Filariasis. N Engl J Med 2018
+    location: relative efficacy IDA vs DA (drives the incremental effect)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Relative reduction of IDA falls as its trial log rate ratio rises (weaker drug effect); the trial prior
+    on lrr:ida is the main uncertainty of the IDA-vs-DA choice
+  about:
+    package: ida
+    feature: lrr:ida:mf_person_years
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: King CL et al. A Trial of a Triple-Drug Treatment for Lymphatic Filariasis. N Engl J Med 2018
+    location: confidence intervals of clearance by arm
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+hypotheses:
+- id: H1
+  belief: B1
+  claim: DA relative reduction of mf person-years lies in [0.2, 0.55] at most design points
+  test:
+    kind: effect_band
+    package: da
+    band:
+    - 0.2
+    - 0.55
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: IDA relative reduction of mf person-years lies in [0.4, 0.8] at most design points
+  test:
+    kind: effect_band
+    package: ida
+    band:
+    - 0.4
+    - 0.8
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: IDA relative reduction is unrelated to baseline mf prevalence (|rho| < 0.1)
+  test:
+    kind: effect_direction
+    package: ida
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: DA relative reduction is unrelated to past coverage (|rho| < 0.1)
+  test:
+    kind: effect_direction
+    package: da
+    feature: coverage_past
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: In high-prevalence units (inc 0.055-0.0785) IDA beats DA on net benefit at the shadow price
+  test:
+    kind: paired_sign
+    a: ida
+    b: da
+    feature: inc
+    range:
+    - 0.055
+    - 0.0785
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: In low-prevalence units (inc 0.011-0.02) DA beats IDA on net benefit at the shadow price
+  test:
+    kind: paired_sign
+    a: da
+    b: ida
+    feature: inc
+    range:
+    - 0.011
+    - 0.02
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B5
+  claim: The IDA/DA transition along baseline prevalence lies within inc 0.02-0.055
+  test:
+    kind: flip_in
+    a: ida
+    b: da
+    feature: inc
+    range:
+    - 0.02
+    - 0.055
+- id: H8
+  belief: B6
+  claim: IDA relative reduction decreases as lrr:ida rises
+  test:
+    kind: effect_direction
+    package: ida
+    feature: lrr:ida:mf_person_years
+    direction: decreases
+open_questions:
+- id: Q1
+  question: What is the shadow price of the US$6M budget? It sets where along inc the IDA/DA flip falls, and whether
+    the lowest-prevalence units get no MDA at all.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Is the incremental relative effect of IDA over DA at 65% community coverage at least ~1.75x DA's (the
+    price ratio)? Trials measure individual clearance in treated people, not community mf person-years at partial
+    coverage.
+  beliefs:
+  - B1
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Is baseline mf prevalence from the last survey current? Units with recent MDA rounds may have lower
+    prevalence now than surveyed, which would re-rank units.
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Does relative effect vary with endemicity or systematic non-compliance (the same 35% missing each round),
+    which a multiplicative engine ignores?
+  beliefs:
+  - B3
+  decision_relevant: false
