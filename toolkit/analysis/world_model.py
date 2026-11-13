@@ -5,8 +5,10 @@ its numbers are bands and rough locations, never decision numbers (those come fr
 throughout: absence of evidence, weak evidence or too few usable points is `inconclusive`, never `supported`.
 
     python3 toolkit/analysis/world_model.py validate <seed.yaml>
+    python3 toolkit/analysis/world_model.py register <seed.yaml> <run_dir>      # before the evidence exists
     python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml or a world_model.yaml> [--out DIR]
-        [--hypotheses hypotheses.yaml] [--engine-identity current|recorded] [--shadow-price LAMBDA]
+        [--hypotheses hypotheses.yaml] [--registry ledger.jsonl] [--engine-identity current|recorded]
+        [--shadow-price LAMBDA] [--without-plan]
     python3 toolkit/analysis/world_model.py --self-test
 
 Simulation beliefs are screened: every direction (package x feature) and flip (pair x feature) of the summary is one
@@ -16,14 +18,24 @@ with), not mechanisms: a hypothesis claims a conditional mechanism by default (`
 correlated (|rho| >= 0.5) with another in the tested points makes its direction or flip test inconclusive, never
 supported or refuted. Pre-registered hypotheses are single tests and are not corrected.
 
-Track record: each confrontation is identified by (sha256 of the test, sha256 of the evidence: the sweep tables or
-the plan). A replay or an alias of a confrontation already recorded counts once and moves no confidence; counters are
-recomputed from the history, never taken from the seed (`reconciled` records a difference). A hypothesis counts only
-if `registered_at` (ISO 8601 with a time zone) is before the evidence existed (the analysis manifest's finished_at,
-or point.yaml's written_at for plan tests); otherwise it is `post_hoc`, reported separately and never in the share
-confirmed. A produced world model can seed the next build: its simulation beliefs are replaced (`version`,
+Track record (PROVISIONAL: its scores are not to be relied on until the follow-up on evidence identity, evidence
+first-availability time and verified history lands). Each confrontation is identified by the sha256 of its canonical
+test (defaults resolved, numbers as floats, the belief's conditions applied; unknown test fields are refused) and the
+sha256 of its evidence. A replay or an alias counts once and moves no confidence; counters are recomputed from the
+history, never taken from the seed (`reconciled` records a difference). Registration is a separate, append-only
+ledger (`register`, analysis/hypotheses_registry.jsonl): each line holds a canonical test, its sha256, the time it
+was registered, the previous line's sha256 and its own, and the chain is verified on every read (an edited, removed,
+reordered or backdated line is refused). A hypothesis is pre-registered only when its current canonical test sha256
+is in the ledger with a time before its evidence existed; an edit after registration, a test not in the ledger, or a
+`registered_at` written in the seed alone is `post_hoc`: reported separately and never in the share confirmed.
+A produced world model can seed the next build: its simulation beliefs are replaced (`version`,
 `superseded_simulation`), literature and data beliefs kept, and hypotheses reloaded with --hypotheses. Ids starting
 `sim.` are reserved for generated beliefs. Nothing is wired into the analysis or the stage machine. No LLM calls.
+
+Small samples: below perm_n_max (50) usable points, a direction's p-value is a permutation p-value (20,000
+resamples, so the smallest attainable p, about 5e-5, still reaches the first Benjamini-Hochberg threshold of
+1,000 tests at q 0.05), and no interval is reported (an equivalence claim is then inconclusive); from 50 points on,
+Fisher's z interval and p-value.
 
 Seed (YAML), and the beliefs of analysis/world_model.yaml:
 
@@ -70,8 +82,10 @@ The comparison measure is net benefit per person at the budget's shadow price, d
 records that its budget does not bind (solver.budget_slack: true); otherwise there is none and paired tests are
 untestable. No value is inferred from average benefit / cost. A lower lambda favours the costlier option, so a
 paired test or flip between options of different cost moves with it (the value used is in every result).
-analysis/point.yaml is used only when bound to this run: its spec sha256, engine identity and recorded inputs must
-match, else the build is refused. Every data and settings file consumed (the units table, the settings file, the
+analysis/point.yaml is used only when bound to this run: its spec sha256 and engine identity must match, and its
+inputs (it must record some) must verify all the way down the artifact graph (point.yaml -> calibration.yaml -> the
+units table and the files that artifact records ...), else the build is refused; --without-plan builds without it.
+Every data and settings file consumed (the units table, the settings file, the
 engine choice) is fingerprinted in the output.
 
 Fail closed: a belief without evidence, a hypothesis without a refutation test or threshold, a non-finite value,
@@ -99,6 +113,11 @@ STATUSES = ("open", "supported", "refuted", "inconclusive", "untestable")
 TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("package", "feature", "direction"),
          "paired_sign": ("a", "b", "feature", "range", "sign", "min_share"), "flip_in": ("a", "b", "feature", "range"),
          "plan_share": ("where", "min_share")}
+OPTIONAL = {"effect_band": ("where",), "effect_direction": ("equivalence", "where", "scope"), "paired_sign": ("where",),
+            "flip_in": ("where", "scope"), "plan_share": ("component", "package")}
+LEDGER = "analysis/hypotheses_registry.jsonl"
+PROVISIONAL = ("provisional: the track record's scores are not to be relied on until evidence identity, evidence "
+               "first-availability time and verified history land (follow-up PR)")
 # Settings (recorded in the output): bands are 10th-90th percentiles; a direction needs its 95% interval to exclude 0
 # and |rho| >= 0.1, on at least 10 usable points with 3 or more distinct feature values; a flip needs each option to
 # win at >= 5% of the non-tied points, no reversal of more than 0.25 in the winning share across 5 quantile bins,
@@ -106,7 +125,8 @@ TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("
 # transition widened to the nearest sampled points on either side. At most 3 features are displayed per pair.
 SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
             "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3,
-            "fdr_q": 0.05, "correlated": 0.5, "tie_share_max": 0.5}
+            "fdr_q": 0.05, "correlated": 0.5, "tie_share_max": 0.5,
+            "alpha": 0.05, "perm_n_max": 50, "perm_resamples": 20000, "perm_seed": 0}
 
 
 class WorldModelError(ValueError):
@@ -323,6 +343,10 @@ def validate_seed(seed) -> dict:
         if not isinstance(t, dict) or t.get("kind") not in TESTS:
             errs.append(f"{w}: a machine-checkable refutation test, kind one of {sorted(TESTS)}")
             continue
+        extra = sorted(set(t) - {"kind"} - set(TESTS[t["kind"]]) - set(OPTIONAL[t["kind"]]))
+        if extra:
+            errs.append(f"{w}: test {t['kind']} has unknown fields {extra} (they would change its identity, not its "
+                        "check)")
         miss = [f for f in TESTS[t["kind"]] if t.get(f) in (None, "", [])]
         if miss:
             errs.append(f"{w}: test {t['kind']} needs {miss} (every test declares its pass threshold)")
@@ -370,13 +394,23 @@ def direction(x, y):
     tied = max(np.unique(v, return_counts=True)[1].max() for v in (x, y)) / n
     if tied > SETTINGS["tie_share_max"]:
         return {"direction": "inconclusive", "n": n, "why": f"heavily tied: one value holds {tied:.0%} of the points"}
-    rho = float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
+    rx, ry = rankdata(x), rankdata(y)
+    rho = float(np.corrcoef(rx, ry)[0, 1])
+    rmin = SETTINGS["rho_min"]
+    if n < SETTINGS["perm_n_max"]:                 # small samples: a permutation p-value, no interval
+        B = SETTINGS["perm_resamples"]
+        yp = ry[np.argsort(np.random.default_rng(SETTINGS["perm_seed"]).random((B, n)), axis=1)]
+        yc, xc = yp - yp.mean(1, keepdims=True), rx - rx.mean()
+        rc = (yc @ xc) / (np.sqrt((yc ** 2).sum(1)) * math.sqrt(float((xc ** 2).sum())))
+        p = float((1 + np.sum(np.abs(rc) >= abs(rho) - 1e-12)) / (B + 1))
+        d = "increases" if p <= SETTINGS["alpha"] and rho >= rmin else \
+            "decreases" if p <= SETTINGS["alpha"] and rho <= -rmin else "inconclusive"
+        return {"direction": d, "rho": _r(rho), "ci": None, "n": n, "p": p, "p_method": "permutation"}
     zr, se = math.atanh(max(min(rho, 1 - 1e-12), -1 + 1e-12)), 1 / math.sqrt(n - 3)
     lo, hi = math.tanh(zr - SETTINGS["z"] * se), math.tanh(zr + SETTINGS["z"] * se)
-    rmin = SETTINGS["rho_min"]
     d = "increases" if lo > 0 and rho >= rmin else "decreases" if hi < 0 and rho <= -rmin else "inconclusive"
     return {"direction": d, "rho": _r(rho), "ci": [_r(lo), _r(hi)], "n": n,
-            "p": _r(math.erfc(abs(zr) / se / math.sqrt(2)))}
+            "p": _r(math.erfc(abs(zr) / se / math.sqrt(2))), "p_method": "fisher"}
 
 
 def _logistic(x, s, lam=1e-2):
@@ -652,13 +686,34 @@ def _constrained(t, b):
     return dict(t, where=w)
 
 
+def _canon(v):
+    if v is None or isinstance(v, (bool, str)):
+        return v
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, (list, tuple)):
+        return [_canon(e) for e in v]
+    return {k: _canon(x) for k, x in sorted(v.items())} if isinstance(v, dict) else v
+
+
+def canonical_test(t, belief=None):
+    """The test exactly as checked: its belief's conditions applied, defaults resolved (scope), an empty `where`
+    dropped and numbers as floats. Its sha256 is the test's identity in the ledger and the track record."""
+    c = dict(_constrained(t, belief))
+    if c["kind"] in ("effect_direction", "flip_in"):
+        c.setdefault("scope", "conditional")
+    if not c.get("where"):
+        c.pop("where", None)
+    return {k: _canon(v) for k, v in sorted(c.items()) if v is not None}
+
+
 def check(hyps, ctx):
     """Evaluate each hypothesis' refutation test, constrained by its belief's conditions (ctx["beliefs"]), against
     the run's artifacts; returns the hypotheses with status and result (observed value, artifact, the test as
     applied, ids of the points or units used)."""
     out, by = [], ctx.get("beliefs") or {}
     for h in hyps:
-        t = _constrained(h["test"], by.get(h.get("belief")))
+        t = canonical_test(h["test"], by.get(h.get("belief")))
         st, obs, art, ids = _test(t, ctx)
         out.append(dict(h, status=st, result={"observed": obs, "artifact": art or "analysis/batch/results.jsonl",
                                               "test_applied": t, "points": ids}))
@@ -758,6 +813,48 @@ def _prior(seed, hypotheses):
 NAMES = {"supported": "confirmed", "refuted": "contradicted"}
 
 
+def _line_sha(e):
+    return _sha({k: v for k, v in e.items() if k != "line_sha"})
+
+
+def verify_ledger(lines):
+    """The registration ledger's lines when its chain verifies: each line's own sha256, the previous line's sha256,
+    its canonical test's sha256 and a registration time no earlier than the line before. Otherwise refused."""
+    prev, t0 = "0" * 64, None
+    for k, e in enumerate(lines):
+        t = _when(e.get("registered_at")) if isinstance(e, dict) else None
+        if t is None or e.get("prev") != prev or e.get("line_sha") != _line_sha(e) or \
+                e.get("test_sha") != _sha(e.get("test")):
+            raise WorldModelError(f"registration ledger line {k + 1}: edited, reordered, removed or malformed")
+        if t0 is not None and t < t0:
+            raise WorldModelError(f"registration ledger line {k + 1}: dated before the line it follows (backdated)")
+        prev, t0 = e["line_sha"], t
+    return lines
+
+
+def register(seed, ledger, at=None):
+    """The ledger with every hypothesis of the seed whose canonical test is not yet in it appended, registered at
+    `at` (default now; never before the ledger's last line). The ledger is verified first."""
+    import datetime as dt
+    led = list(verify_ledger([dict(e) for e in ledger or []]))
+    seed = validate_seed(_prior(seed, None))
+    by = {b["id"]: b for b in seed["beliefs"]}
+    at = at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    if _when(at) is None or (led and _when(at) < _when(led[-1]["registered_at"])):
+        raise WorldModelError(f"registration time {at!r}: an ISO 8601 time with a zone, not before the ledger's last")
+    have = {e["test_sha"] for e in led}
+    for h in seed.get("hypotheses") or []:
+        c = canonical_test(h["test"], by.get(h["belief"]))
+        if _sha(c) in have:
+            continue
+        e = {"hypothesis": h["id"], "belief": h["belief"], "test": c, "test_sha": _sha(c), "registered_at": at,
+             "prev": led[-1]["line_sha"] if led else "0" * 64}
+        e["line_sha"] = _line_sha(e)
+        led.append(e)
+        have.add(e["test_sha"])
+    return led
+
+
 def _record(hist, seed_tr):
     """Counts from the identified confrontations (first occurrence of each (test, evidence) pair): pre-registered
     ones in the main counts and the share confirmed, post-hoc ones apart. Seed counters are reconciled, not used."""
@@ -782,7 +879,7 @@ def _record(hist, seed_tr):
     return tr
 
 
-def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_time=None):
+def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_time=None, registry=None):
     """(world model, hypotheses): the validated seed (or the previous world model), the sweep's screened
     simulation beliefs, conflicts, every hypothesis checked, the confrontations identified and recorded, confidence
     moved only by new pre-registered ones, contradictions as open questions, and where to look next."""
@@ -799,18 +896,22 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
     hist = [e for e in (seed.get("track_record") or {}).get("history") or [] if isinstance(e, dict)]
     seen = {(e.get("test_sha"), e.get("evidence_sha")) for e in hist if e.get("test_sha")}
     plan_sha = _sha([plan, units]) if plan else None
+    led = verify_ledger(list(registry or []))
+    first = {}
+    for e in led:
+        first.setdefault(e["test_sha"], e)
     by = {b["id"]: b for b in beliefs}
     qs = list(seed.get("open_questions") or [])
     for h in checked:
         on_plan = h["test"]["kind"] == "plan_share"
         ev_sha, ev_time = (plan_sha, plan_time) if on_plan else (sw.evidence_sha, sw.evidence_time)
         key = (_sha(h["result"]["test_applied"]), ev_sha)
-        reg, at = _when(h.get("registered_at")), _when(ev_time)
-        post = reg is None or at is None or reg >= at
+        e, at = first.get(key[0]), _when(ev_time)
+        post = e is None or at is None or _when(e["registered_at"]) >= at
         again = key in seen
         seen.add(key)
         h["confrontation"] = {"test_sha": key[0], "evidence_sha": ev_sha, "evidence_time": ev_time,
-                              "post_hoc": post, "repeat": again}
+                              "post_hoc": post, "repeat": again, "registration": e["line_sha"] if e else None}
         hist.append(dict({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]}, **h["confrontation"]))
         b = by[h["belief"]]
         if again:
@@ -830,7 +931,8 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
         if j != i:
             b.setdefault("confidence_seed", b["confidence"])
             b["confidence"] = CONFIDENCE[min(max(j, 0), 2)]
-    tr = _record(hist, seed.get("track_record"))
+    tr = dict(_record(hist, seed.get("track_record")), provisional=PROVISIONAL,
+              registry={"lines": len(led), "head": led[-1]["line_sha"] if led else None})
     wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "version": seed.get("version", 0) + 1,
           "inputs": inputs or sw.artifacts, "superseded_simulation": seed.get("superseded_simulation") or [],
           "structure": {"comparator": sw.comparator, "packages": sorted(sw.packages),
@@ -980,10 +1082,34 @@ def point_doc(run_dir, ident):
         raise WorldModelError(f"{rel}: not an analysis artifact")
     bad = [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
     bad += [] if doc["data"].get("engine_identity") == ident else ["the engine identity"]
-    bad += [p for p, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(run_dir, p)) != h]
+    bad += _input_problems(run_dir, rel, doc, set())
     if bad:
         raise WorldModelError(f"{rel} is not bound to this run: {bad} differ from what it was computed with")
     return doc
+
+
+def _input_problems(run_dir, rel, doc, seen):
+    """What does not verify in an artifact's recorded inputs, recursively through the harness artifacts among them:
+    each must exist with its recorded sha256, and the artifact must record at least one."""
+    import yaml
+    from toolkit.analysis.artifacts import sha256
+    inp = doc.get("inputs") if isinstance(doc, dict) else None
+    if not isinstance(inp, dict) or not inp:
+        return [f"{rel}: records no inputs"]
+    bad = []
+    for q_rel, h in sorted(inp.items()):
+        q = os.path.normpath(os.path.join(run_dir, q_rel))
+        if sha256(q) != h:
+            bad.append(f"{rel} -> {q_rel}: {'changed' if os.path.exists(q) else 'missing'}")
+        elif q_rel.endswith((".yaml", ".yml")) and q not in seen:
+            seen.add(q)
+            try:
+                sub = yaml.safe_load(open(q))
+            except (OSError, yaml.YAMLError):
+                sub = None
+            if isinstance(sub, dict) and "inputs" in sub:
+                bad += _input_problems(run_dir, q_rel, sub, seen)
+    return bad
 
 
 def consumed_inputs(spec, run_dir):
@@ -999,7 +1125,7 @@ def consumed_inputs(spec, run_dir):
     return out
 
 
-def load_sweep(run_dir, identity="current", lam=None):
+def load_sweep(run_dir, identity="current", lam=None, use_plan=True):
     """The per-person sweep tables of a run's engine batch (analysis/batch/design.json and results.jsonl, rows bound
     to the stored design's jobs) and the signed spec (packages, populations, cost items). `identity`: the engine
     identity the rows must carry: `current` (the spec's engine as now) or `recorded` (analysis/point.yaml's
@@ -1067,7 +1193,7 @@ def load_sweep(run_dir, identity="current", lam=None):
     groups = {c: (d or {}).get("group") for c, d in spec["options"]["components"].items() if (d or {}).get("group")}
     kinds = {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
     arts = dict({rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}, **consumed_inputs(spec, run_dir))
-    point = point_doc(run_dir, ident)
+    point = point_doc(run_dir, ident) if use_plan else None
     lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price((point or {}).get("data"))
     try:        # when the evidence existed: the analysis manifest's finish time, else the results file's mtime
         et, ets = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))["finished_at"], "manifest"
@@ -1118,6 +1244,9 @@ def _cli(argv):
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate")
     v.add_argument("seed")
+    g = sub.add_parser("register")
+    g.add_argument("seed")
+    g.add_argument("run_dir", help=f"the run whose ledger ({LEDGER}) receives the registrations")
     b = sub.add_parser("build")
     b.add_argument("run_dir")
     b.add_argument("--seed", required=True)
@@ -1125,6 +1254,8 @@ def _cli(argv):
     b.add_argument("--engine-identity", default="current", choices=("current", "recorded"))
     b.add_argument("--shadow-price", type=float)
     b.add_argument("--hypotheses", help="a hypotheses.yaml to reload (with a world_model.yaml as --seed)")
+    b.add_argument("--registry", help=f"the registration ledger (default: <run_dir>/{LEDGER} when present)")
+    b.add_argument("--without-plan", action="store_true", help="build without analysis/point.yaml")
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
@@ -1132,7 +1263,15 @@ def _cli(argv):
         print(f"OK: {len(seed['beliefs'])} beliefs, {len(seed.get('hypotheses') or [])} hypotheses")
         return 0
     from toolkit.analysis.artifacts import _safe_io, sha256
-    sw, spec = load_sweep(a.run_dir, a.engine_identity, a.shadow_price)
+    jsonl = lambda q: [json.loads(x) for x in open(q) if x.strip()] if q and os.path.isfile(q) else []  # noqa: E731
+    if a.cmd == "register":
+        old = jsonl(os.path.join(a.run_dir, LEDGER))
+        new = register(seed, old)[len(old):]
+        _safe_io().write_nofollow(a.run_dir, LEDGER, "".join(json.dumps(e, sort_keys=True) + "\n"
+                                                             for e in new).encode(), append=True)
+        print(f"registered {len(new)} test(s) in {a.run_dir}/{LEDGER} ({len(old) + len(new)} lines)")
+        return 0
+    sw, spec = load_sweep(a.run_dir, a.engine_identity, a.shadow_price, use_plan=not a.without_plan)
     plan, units, plan_time = load_plan(a.run_dir, spec, sw)
     hyps = (yaml.safe_load(open(a.hypotheses)) or {}).get("hypotheses") if a.hypotheses else None
     inputs = dict({k: v for k, v in sw.artifacts.items() if k != "results"}, seed=sha256(a.seed))
@@ -1140,7 +1279,10 @@ def _cli(argv):
         inputs["analysis/point.yaml"] = sha256(os.path.join(a.run_dir, "analysis", "point.yaml"))
     if a.hypotheses:
         inputs["hypotheses"] = sha256(a.hypotheses)
-    wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time)
+    reg_path = a.registry or os.path.join(a.run_dir, LEDGER)
+    if os.path.isfile(reg_path):
+        inputs["registry"] = sha256(reg_path)
+    wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time, registry=jsonl(reg_path))
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
     for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)
@@ -1333,7 +1475,7 @@ def _self_test() -> int:
            "WM15 a plan hypothesis without a plan is untestable, never supported")
         sd = _seed()
         sd["beliefs"][3].update(decision_relevant=True, confidence="high")
-        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
+        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
         ok(any(x["belief"] == "B4" and x["kind"] == "contradiction" for x in where_to_look(wm2, top=0)),
            "WM33 where_to_look always lists a contradicted decision-relevant belief, even with no conditions or "
            "conflicts and top=0")
