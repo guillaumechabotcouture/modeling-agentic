@@ -75,7 +75,12 @@ BRANCH, REMOTE = "wm-trials", "origin"
 HYPOTHESES = (5, 8)
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STEPS = ("prepare", "seed", "register", "anchor", "engine", "build")
-_CLI_LOCK = threading.Lock()                      # world_model CLI calls print; their capture swaps sys.stdout
+NUMBER_RE = re.compile(r"(?<![A-Za-z_\d.])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?")    # a standalone number
+# files the harness writes or hands to a task: never a data belief's evidence (a dataset of the run is)
+HARNESS_NAMES = ("_task_input.json", "_task_output.json", TRIAL, "analysis/", "run_state.json", "budget_ledger.json",
+                 SEED_FILE)
+CIRCULAR_R2 = 0.99           # a package's reduction explained this well by its own declared effect parameters alone
+_CLI_LOCK = threading.Lock()                     # world_model CLI calls print; their capture swaps sys.stdout
 CLOUD_ENV = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS")
 
 
@@ -362,13 +367,31 @@ def prepare(q, run_dir, root=REPO, max_engine_runs=50) -> dict:
     feats = {}
     for n, v in F.items():
         f = {"kind": "calibration" if attr and n == f"{attr} (calibration scale)" else kinds[n],
-             "range": [min(v), max(v)], "distinct_values": len(set(v))}
+             "distinct_values": len(set(v))}
+        if f["kind"] != "parameter":          # an engine effect's or prior's range is a spec input: withheld
+            f["range"] = [min(v), max(v)]
+        else:
+            f["range_withheld"] = "an engine effect or prior value is a spec input"
         if f["kind"] == "calibration":
             f["read_by_engine"] = attr in (card.get("unit_attributes") or {})
         feats[n] = f
-    return {"question": q["question"], "spec": "decision_spec.yaml",
-            "engine": {k: card.get(k) for k in ("name", "version", "mechanisms", "components", "unit_attributes",
-                                                 "notes")},
+    datasets = []
+    for dp, dn, fn in os.walk(run_dir):
+        dn[:] = [x for x in dn if x != "analysis"]
+        for name in sorted(fn):
+            if name.endswith(".csv"):
+                rel = os.path.relpath(os.path.join(dp, name), run_dir)
+                with open(os.path.join(dp, name), newline="") as fh:
+                    head = fh.readline().strip()
+                datasets.append({"file": rel, "columns": [c.strip() for c in head.split(",") if c.strip()]})
+    return {"question": q["question"],
+            "withheld": "the spec's values, the engine's effect values and priors and the input data values are "
+                        "withheld: the world model is built from literature and reasoning, then confronted with the "
+                        "simulation, never with its own inputs",
+            "engine": {"name": card.get("name"), "components": card.get("components"),
+                       "mechanisms": [NUMBER_RE.sub("<value>", m) for m in card.get("mechanisms") or []],
+                       "unit_attributes": sorted(card.get("unit_attributes") or {})},
+            "datasets": datasets,
             "packages": {k: sorted(v) for k, v in spec.packages().items()}, "comparator": spec.comparator,
             "primary_outcome": spec.outcomes()[0],
             "sweep": {"design_points": len(design["points"]), "engine_runs": len(jobs), "features": feats,
@@ -404,7 +427,74 @@ def seed_problems(seed, ctx) -> list[str]:
         for n in names:
             if n not in ft:
                 bad.append(f"hypothesis {h['id']}: feature {n!r} is not one of the sweep's {sorted(ft)}")
+    files = [x["file"] for x in ctx.get("datasets") or []]
+    for b in seed.get("beliefs") or []:
+        if b.get("source_type") != "data":
+            continue
+        for e in b.get("evidence") or []:
+            de = str(e.get("dossier_entry") or "")
+            harness = [x for x in HARNESS_NAMES if x in de]
+            if harness:
+                bad.append(f"belief {b['id']}: data evidence {de[:80]!r} cites {harness}, a file the harness writes; a "
+                           f"data belief cites a dataset of the run ({files}) and its column")
+            elif not any(f in de for f in files):
+                bad.append(f"belief {b['id']}: data evidence {de[:80]!r} names no dataset of the run ({files}); cite "
+                           "the file and column, or make it a literature belief with its citation")
     return bad
+
+
+def _own(name, comps) -> bool:
+    """Is design parameter `name` one of these components' own effect parameters? By the engines' parameter naming
+    (<kind>:<component>[:<outcome>], <a>+<b> for an interaction, or <kind>_<component>): a classification heuristic of
+    the trials' scoring, documented as such."""
+    toks = set(re.split(r"[:+]", name))
+    return any(c in toks or name.endswith("_" + c) for c in comps)
+
+
+def circular_tests(run_dir, seed, q) -> dict:
+    """{hypothesis id: why} for tests whose verdict a spec input fixes, from the spec's inputs and the engine's own
+    sweep (world_model.load_sweep, canonical_test and the sweep's reduction, as the build reads them):
+      - a test of a package's effect against one of its own effect parameters (feature, region or adjustment);
+      - an effect band on a package whose relative reduction its own declared effect parameters explain alone
+        (R^2 >= CIRCULAR_R2 of a quadratic fit, linear below twice the quadratic's columns of points) and whose
+        range over the design (which spans the declared ranges) lies inside the band.
+    Applied in world_model build (--circular): reported, counted apart, never a confirmation, never moving confidence."""
+    import numpy as np
+    from toolkit.analysis import world_model as W
+    sw, _ = W.load_sweep(run_dir, "current", q.get("shadow_price"), use_plan=False)
+    by = {b["id"]: b for b in seed.get("beliefs") or []}
+    out = {}
+    for h in seed.get("hypotheses") or []:
+        t = W.canonical_test(h["test"], by.get(h["belief"]))
+        if t["kind"] == "plan_share":
+            continue
+        pk = [t[x] for x in ("package", "a", "b") if t.get(x)]
+        comps = {c for p in pk for c in sw.packages.get(p, [])}
+        own = [f for f in sw.features if sw.kinds.get(f) == "parameter" and _own(f, comps)]
+        named = [n for n in [t.get("feature")] + list(t.get("where") or {}) + list(t.get("adjust_for") or []) if n]
+        hit = [n for n in named if n in own]
+        if hit:
+            out[h["id"]] = f"tests {pk}'s effect against its own effect parameter(s) {hit}"
+            continue
+        if t["kind"] != "effect_band" or not own:
+            continue
+        red = sw.reduction(t["package"])
+        m = W._region(sw, t.get("where")) & np.isfinite(red)
+        X = np.column_stack([sw.features[f][m] for f in own])
+        y, n = red[m], int(m.sum())
+        if n < W.SETTINGS["min_points"]:
+            continue
+        cols = [np.ones(n)] + [X[:, i] for i in range(X.shape[1])]
+        quad = cols + [X[:, i] * X[:, j] for i in range(X.shape[1]) for j in range(i, X.shape[1])]
+        A = np.column_stack(quad if n >= 2 * len(quad) else cols)
+        res = y - A @ np.linalg.lstsq(A, y, rcond=None)[0]
+        r2 = 1.0 - float(res @ res) / float(((y - y.mean()) ** 2).sum()) if np.ptp(y) > 0 else 1.0
+        lo, hi = float(y.min()), float(y.max())
+        if r2 >= CIRCULAR_R2 and t["band"][0] <= lo and hi <= t["band"][1]:
+            out[h["id"]] = (f"{t['package']}'s relative reduction is fixed by its declared effect parameter(s) {own} "
+                            f"(R^2 {r2:.4f}); its range over the design [{lo:.3g}, {hi:.3g}] lies inside the band "
+                            f"{t['band']}")
+    return out
 
 
 def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
@@ -493,7 +583,12 @@ def engine_step(q, run_dir, max_engine_runs=50, workers=2) -> dict:
 def build_step(q, run_dir, anchor_ref=None) -> dict:
     import yaml
     from toolkit.analysis import world_model as W
-    argv = ["build", run_dir, "--seed", os.path.join(run_dir, SEED), "--without-plan"]
+    seed = yaml.safe_load(open(os.path.join(run_dir, SEED)))
+    circ = circular_tests(run_dir, seed, q)
+    _sio().write_nofollow(run_dir, "analysis/circular.json", json.dumps(circ, indent=1, sort_keys=True).encode(),
+                          atomic=True)
+    argv = ["build", run_dir, "--seed", os.path.join(run_dir, SEED), "--without-plan",
+            "--circular", os.path.join(run_dir, "analysis", "circular.json")]
     if q.get("shadow_price") is not None:
         argv += ["--shadow-price", repr(float(q["shadow_price"]))]
     if anchor_ref:
@@ -505,7 +600,7 @@ def build_step(q, run_dir, anchor_ref=None) -> dict:
     st = {}
     for h in hy["hypotheses"]:
         st[h["status"]] = st.get(h["status"], 0) + 1
-    return {"statuses": st, "note": buf.getvalue().strip()}
+    return {"statuses": st, "circular": sorted(circ), "note": buf.getvalue().strip()}
 
 
 def _wait_past(at):
@@ -545,7 +640,8 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
         t = _trial(rd)
         if t.get("status") == "complete":
             return record(q["id"], dict(t, skipped=True))
-        t = dict(t, id=q["id"], engine_ref=q["engine"], steps=dict(t.get("steps") or {}), status="running")
+        t = dict(t, id=q["id"], engine_ref=q["engine"], rerun_of=q.get("rerun_of"),
+                 steps=dict(t.get("steps") or {}), status="running")
         try:
             if "prepare" not in t["steps"]:
                 t["context"] = prepare(q, rd, root, max_engine_runs)
@@ -629,7 +725,7 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
 SCORING = {"lenient_width": 0.6, "lenient_share": 0.6, "lenient_equivalence": 0.3}
 YEAR_RE = re.compile(r"\b(19|20)\d\d\b")
 LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix)", re.I)
-MODES = ("untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
+MODES = ("circular", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
          "inert_feature", "high_confidence_refuted", "contradiction_without_open_question", "citation_not_verifiable")
 
 
@@ -644,6 +740,8 @@ def failure_modes(hyps, seed, wm, ctx=None) -> dict:
         b = by.get(h.get("belief")) or {}
         if st == "untestable":
             out["untestable"].append(h["id"])
+        if (h.get("confrontation") or {}).get("circular"):
+            out["circular"].append(h["id"])
         if (h.get("confrontation") or {}).get("post_hoc"):
             out["post_hoc"].append(h["id"])
         if isinstance(obs, dict) and obs.get("marginal_only"):
@@ -687,7 +785,7 @@ def _yaml(p):
 
 def score_question(run_dir) -> dict:
     t = _trial(run_dir)
-    out = {"status": t.get("status", "not_started"), "engine": t.get("engine_ref"),
+    out = {"status": t.get("status", "not_started"), "engine": t.get("engine_ref"), "rerun_of": t.get("rerun_of"),
            "seed": {k: (t.get("seed") or {}).get(k) for k in ("sessions", "repairs", "usd", "status")}}
     seed, hy, wm = (_yaml(os.path.join(run_dir, p)) for p in (SEED, "analysis/hypotheses.yaml",
                                                               "analysis/world_model.yaml"))
@@ -700,7 +798,7 @@ def score_question(run_dir) -> dict:
     by = {b["id"]: b for b in seed["beliefs"]}
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     for h in hs:
-        if (h.get("confrontation") or {}).get("post_hoc"):
+        if (h.get("confrontation") or {}).get("post_hoc") or (h.get("confrontation") or {}).get("circular"):
             continue
         c = by[h["belief"]]["confidence"]
         conf[c][h["status"] if h["status"] in ("supported", "refuted") else "other"] += 1
@@ -715,7 +813,8 @@ def score_question(run_dir) -> dict:
     wl = (wm.get("where_to_look") or [None])[0]
     wb = {b["id"]: b for b in wm["beliefs"]}.get((wl or {}).get("belief")) or {}
     out.update(hypotheses={"written": len(hs), "testable": sum(h["status"] != "untestable" for h in hs),
-                           "by_status": st, "post_hoc": sum(bool((h.get("confrontation") or {}).get("post_hoc"))
+                           "by_status": st, "circular": sum(bool((h.get("confrontation") or {}).get("circular")) for h in hs),
+                           "post_hoc": sum(bool((h.get("confrontation") or {}).get("post_hoc"))
                                                             for h in hs)},
                confidence=conf, contradictions=contra, conflicts=conflicts,
                where_to_look={"top": wl, "decision_relevant": bool(wb.get("decision_relevant"))},
@@ -739,14 +838,18 @@ def score(trials_root) -> dict:
         spend = L.by_question()
         for i, q in Q.items():
             q["spend_usd"] = spend.get(i, {"llm_usd": 0.0, "compute_usd": 0.0})
-    tot = {"written": 0, "testable": 0, "post_hoc": 0, "by_status": {}}
+    tot = {"written": 0, "testable": 0, "circular": 0, "post_hoc": 0, "by_status": {}}
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     fm, wtl = {}, {"decision_relevant": 0, "questions": 0}
+    sup = {q["rerun_of"]: i for i, q in Q.items() if q.get("rerun_of") and q["status"] == "complete"}
     for i, q in Q.items():
+        if i in sup:                    # an earlier run of a question rerun under newer rules: listed, not scored
+            q["superseded_by"] = sup[i]
+            continue
         h = q.get("hypotheses")
         if not h:
             continue
-        for k in ("written", "testable", "post_hoc"):
+        for k in ("written", "testable", "circular", "post_hoc"):
             tot[k] += h[k]
         for s, n in h["by_status"].items():
             tot["by_status"][s] = tot["by_status"].get(s, 0) + n
@@ -785,18 +888,21 @@ def summary_md(S) -> str:
          f"Questions by status: {', '.join(f'{k} {v}' for k, v in sorted(o['questions'].items()))}. "
          f"Spend: LLM ${o['spend_usd']['llm']:.2f}, compute ${o['spend_usd']['compute']:.2f}.", "",
          "Verdicts are the world model build's own (toolkit/analysis/world_model.py). Post hoc means not anchored "
-         "in remote git before the evidence existed; post-hoc results are not in the confirmation shares.", "",
+         "in remote git before the evidence existed; post-hoc results are not in the confirmation shares. "
+         "Circular means the verdict is fixed by a spec input (analysis/circular.json): reported, never a confirmation, never moving confidence. "
+         f"Circular tests: {o['hypotheses']['circular']} of {o['hypotheses']['written']}.", "",
          "## Per question", "",
          "| Question | Engine | Status | Written | Testable | Supported | Refuted | Inconclusive | Untestable | "
-         "Post hoc | Repairs | Spend (USD) |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         "Circular | Post hoc | Repairs | Spend (USD) |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for i, q in S["questions"].items():
         h = q.get("hypotheses") or {}
         b = h.get("by_status") or {}
         sp = q.get("spend_usd") or {}
-        L.append(f"| {i} | {str(q.get('engine') or '').split(':')[-1]} | {q['status']} | {h.get('written', '')} | "
+        st = q["status"] + (f" (superseded by {q['superseded_by']})" if q.get("superseded_by") else "")
+        L.append(f"| {i} | {str(q.get('engine') or '').split(':')[-1]} | {st} | {h.get('written', '')} | "
                  f"{h.get('testable', '')} | {b.get('supported', 0) if h else ''} | {b.get('refuted', 0) if h else ''}"
                  f" | {b.get('inconclusive', 0) if h else ''} | {b.get('untestable', 0) if h else ''} | "
-                 f"{h.get('post_hoc', '')} | {(q.get('seed') or {}).get('repairs') or 0} | "
+                 f"{h.get('circular', '')} | {h.get('post_hoc', '')} | {(q.get('seed') or {}).get('repairs') or 0} | "
                  f"{sp.get('llm_usd', 0) + sp.get('compute_usd', 0):.2f} |")
     L += ["", "## Confirmation by the seed's confidence (pre-registered only)", "",
           "| Confidence | Supported | Refuted | Other | Share confirmed |", "|---|---|---|---|---|"]
@@ -1054,7 +1160,7 @@ def _self_test() -> int:
             except TrialError:
                 ok(True, "WT2b refused: a duplicate id")
         real = load_questions(os.path.join(REPO, "scripts", "world_model_trials_questions.yaml"))
-        evals = [q for q in real if q.get("eval_question")]
+        evals = [q for q in real if q.get("eval_question") and not q.get("rerun_of")]
         ok(len(real) >= 10 and len(evals) == 5 and len({q["engine"] for q in real}) >= 3,
            f"WT2c the shipped questions file: {len(real)} questions, {len(evals)} from the eval suite, engines "
            f"{sorted({q['engine'].split(':')[-1] for q in real})}")
@@ -1265,7 +1371,7 @@ def _self_test() -> int:
             rd = os.path.join(troot, "runs", "toy0")
             par = {n: f for n, f in ctx["sweep"]["features"].items() if f["kind"] == "parameter"}
             ok(par and all("range" not in f for f in par.values()) and "notes" not in ctx["engine"]
-               and not any(re.search(r"\d", m) for m in ctx["engine"].get("mechanisms") or []),
+               and not any(NUMBER_RE.search(m) for m in ctx["engine"].get("mechanisms") or []),
                f"WT10 the seed context withholds the engine's effect and prior values: no parameter range "
                f"({par}), no card notes, mechanisms in words")
             vals = set()
@@ -1314,7 +1420,8 @@ def _self_test() -> int:
             ok(q["hypotheses"]["circular"] == 4 and sorted(q["failure_modes"].get("circular") or []) == sorted(circ)
                and S["overall"]["hypotheses"]["circular"] == 4,
                f"WT11d the summary counts circular tests ({q['hypotheses']}) and lists them as a failure mode")
-            ok(all(v["supported"] + v["refuted"] <= len(sup) for v in q["confidence"].values()),
+            dec = [h["id"] for h in hy["hypotheses"] if h["id"] not in circ and h["status"] in ("supported", "refuted")]
+            ok(sum(v["supported"] + v["refuted"] for v in q["confidence"].values()) == len(dec),
                f"WT11e the confirmation-by-confidence table leaves circular verdicts out: {q['confidence']}")
     tryit("WT11 circular", wt11)
 

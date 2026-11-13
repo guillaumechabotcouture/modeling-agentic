@@ -228,3 +228,31 @@ questions:
     sweep)
   inputs: 'synthetic (seed 37): 4 districts x 3 groups; incidence log-uniform per group; adherence score 0.3-0.8
     (a feature the engine does not read)'
+- id: tb_acf_r2
+  batch: 1
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
+    for this test; none describes a real place. A TB programme has US$1.1 million for one round of active case finding
+    among high-risk adults in 10 districts in 2026. For each district choose one screening algorithm: none; SYM
+    (symptom screening, with Xpert MTB/RIF Ultra for people with presumptive TB); CXR (chest X-ray for everyone
+    screened, with Xpert if the X-ray is abnormal). A round reaches 70% of each district''s target population, and
+    costs are per person screened. Input files: data/evals/tb_acf/districts.csv (target population), data/evals/tb_acf/acf_records_2022_2025.csv
+    (people screened and bacteriologically confirmed cases detected, by district, year and algorithm; assume the
+    prevalence of undiagnosed TB in the target population was stable over 2022-2025 and is unchanged in 2026), data/evals/tb_acf/algorithm_costs.csv,
+    data/evals/tb_acf/national_reference_yields.csv. Choose the algorithms that maximise bacteriologically confirmed
+    TB cases detected within the budget, report the total with a 95% uncertainty interval, and state the decision
+    rule. Deliverables: allocation_optimized.csv in the run directory with columns district, package (none, SYM
+    or CXR) and cases_detected; and the uncertainty analysis must report the total as an output named total_cases_detected.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/tb_acf
+  shadow_price: 0.001
+  shadow_price_basis: about 1 / US$1,000 per additional case detected (SYM about US$930, CXR about US$1,400 per
+    case in the sweep)
+  inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
+    = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
+    from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
+  rerun_of: tb_acf
+  rerun_reason: the tb_acf smoke (2026-11-13) let the seed read the spec's effect priors, so its band tests confirmed
+    the engine's own inputs; rerun with the spec's values, the engine's effect values and priors and the input data
+    values withheld from the seed task, and circular tests classified

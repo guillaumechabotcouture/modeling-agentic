@@ -154,13 +154,16 @@ decision spec's options (each package and its components, the comparator, the pr
 names your tests may use), their ranges, the number of design points, which features the design samples
 independently of the others, and whether a shadow price and an optimised plan will exist. No results exist yet,
 and the harness refuses any read of analysis/ or of other runs: nothing you write can depend on a simulation
-output. You may read decision_spec.yaml and the files it cites in the run directory.
+output. The spec's values, the engine's effect values and priors and the input data values are withheld on
+purpose: the world model is built from literature and reasoning, then confronted with the simulation, never with its
+own inputs. In the run directory only {out_in} and your own seed file are readable; the repository's code and
+documentation (toolkit/, docs/, .claude/) are readable, its data/ and scripts/ are not.
 
 Write """ + SEED_FILE + """ in the world model's format, documented below by toolkit/analysis/world_model.py itself:
 - beliefs: the mechanisms that drive this decision, each with its direction, a rough magnitude band on a stated
   scale (a band, never a point value), the conditions or branching points where the answer changes, roughly
-  located, its basis (literature: the citation and its table or page; data: the dossier entry, here the input file
-  and column) and your confidence. Mark decision_relevant: true on the beliefs the choice turns on. Cite only
+  located, its basis (literature: the citation and its table or page; data: a dataset of the run listed in
+  {out_in}, its file and column, never a file the harness writes such as {out_in}) and your confidence. Mark decision_relevant: true on the beliefs the choice turns on. Cite only
   sources you know, with authors, journal and year; when unsure of a value or a location say so and set confidence
   low; never invent a citation or a table.
 - open_questions: what is unknown and would change the choice if known.
@@ -182,6 +185,10 @@ OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/der
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
         "seed_world_model": (SEED_FILE,)}
+
+
+SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
+SEED_REPO_READABLE = ("toolkit", "docs", ".claude")
 
 
 def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
@@ -213,15 +220,18 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
         return "the world-model seed is written before any result: analysis/ is not readable"
     repo = os.path.realpath(_REPO)
     if not _within(base, root) and _within(base, repo) and not _within(root, base):
-        # the repository's code and docs, but no other run (runs and trials live under the repository too)
-        rel = os.path.relpath(base, repo).replace(os.sep, "/").lower()
-        if rel.split("/")[0] in ("runs", "trials"):
-            return "another run is not readable by the seed task"
+        # the repository's code and documentation only: no run, no template, no input data, no driver files
+        rel = os.path.relpath(base, repo).replace(os.sep, "/")
+        if rel.split("/")[0] not in SEED_REPO_READABLE:
+            return (f"the seed task may read the repository's {', '.join(SEED_REPO_READABLE)} only: inputs, "
+                    "templates and runs are withheld")
         return None
     if not _within(base, root):
-        return "the seed task may read only its run directory and the repository's code"
-    if tool in ("Grep", "Glob") and os.path.isdir(base) and _within(analysis, base):
-        return "a search from here would reach analysis/ (results): search a narrower directory"
+        return "the seed task may read only its run directory's input and the repository's code"
+    rel = os.path.relpath(base, root).replace(os.sep, "/")
+    if rel not in SEED_RUN_READABLE:
+        return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
+                "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
     return None
 
 
@@ -782,18 +792,19 @@ def _self_test() -> int:
                 "results": _seed_read_denied("Read", {"file_path": "analysis/batch/results.jsonl"}, rd),
                 "analysis glob": _seed_read_denied("Glob", {"pattern": "analysis/**"}, rd),
                 "grep root": _seed_read_denied("Grep", {"pattern": "rho"}, rd) is None,
-                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd) is None,
+                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd),
+                "input": _seed_read_denied("Read", {"file_path": "_task_input.json"}, rd) is None,
                 "sibling run": _seed_read_denied("Read", {"file_path": os.path.join(d, "other", "analysis",
                                                                                      "hypotheses.yaml")}, rd),
                 "climb": _seed_read_denied("Glob", {"pattern": "../**/world_model.yaml"}, rd),
                 "repo world model": _seed_read_denied("Read", {"file_path": os.path.join(
                     _REPO, "toolkit", "analysis", "world_model.py")}, rd) is None,
             }
-            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "sibling run": True,
+            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "input": True, "sibling run": True,
                     "climb": True, "repo world model": True}
             ok({k: bool(v) for k, v in got.items()} == want,
-               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) and can read "
-               f"the run's spec and the repository's code: {got}")
+               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) or the spec, and "
+               f"can read its input and the repository's code: {got}")
             # a recursive search at the run root would reach analysis/: refused unless it is confined elsewhere
             ok(_allowed(SEED_FILE, rd, OWNS["seed_world_model"]) is None
                and _allowed("analysis/world_model_seed.yaml", rd, OWNS["seed_world_model"]) is not None,
