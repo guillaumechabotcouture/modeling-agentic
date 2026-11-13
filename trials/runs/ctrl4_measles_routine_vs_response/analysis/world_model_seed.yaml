@@ -1,0 +1,256 @@
+beliefs:
+- id: B1
+  mechanism: Final size is a threshold function of Reff = R0 x susceptible share; an intervention that pushes Reff
+    below 1 averts nearly all infections, one that leaves Reff above 1 averts only part (the final-size relation
+    is steep just above 1)
+  about:
+    component: routine
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 (final size and herd immunity threshold); page not checked
+  - citation: 'Fine PEM. Herd immunity: history, theory, practice. Epidemiologic Reviews 1993'
+    location: threshold 1 - 1/R0 discussion; page not checked
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: 'Routine reaches only under-fives, so its relative reduction falls as the 5-9 immunity gap grows: the
+    unreached 5-9 susceptibles keep Reff above 1 after routine'
+  about:
+    package: routine
+    feature: gap_5_9
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infectious Diseases 2017'
+    location: abstract (R0 commonly 12-18)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Same as B2 for the 10-14 gap, weaker because that gap is smaller in range (0.01-0.12) and neither option
+    reaches 10-14
+  about:
+    package: routine
+    feature: gap_10_14
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4; page not checked
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: Response at day 42 arrives after only ~3-4 measles generations (serial interval ~12 days) from one
+    importation, so few infections precede it; reaching 85% of 1-9 at one-dose effectiveness ~85-95% leaves mainly
+    infants and 10-14 susceptible, usually below threshold, so it averts most of the outbreak
+  about:
+    package: response
+  direction: reduces
+  magnitude:
+    band:
+    - 0.75
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. American Journal of Epidemiology 2014'
+    location: measles serial interval ~11.7 days (table of pooled estimates; table number not checked)
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. Journal of Infectious Diseases 2011'
+    location: abstract (median one-dose effectiveness ~84% under 12 months, ~92-93% at 12 months or older)
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. Journal of the Royal Society Interface 2008'
+    location: abstract (benefit of response falls with delay); exact year uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'Net benefit routine minus response at the shadow price: where the older-child gaps are small, routine
+    alone stops (or there is no) outbreak and its lower price wins; where gap_5_9 is large, routine leaves Reff
+    > 1 and response wins by percent-of-population infections'
+  about:
+    pair:
+    - routine
+    - response
+  direction: flips
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.07
+    - 0.17
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4; page not checked
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. Journal of the Royal Society Interface 2008'
+    location: abstract
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Routine''s relative reduction rises with the 1-4 gap: a larger share of all susceptibles then sits
+    in the band routine reaches'
+  about:
+    package: routine
+    feature: gap_1_4
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4; page not checked
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What age structure (share of population under 1, 1-4, 5-9, 10-14) does the engine use? It sets where
+    1/R0 is crossed and so where the routine/response flip sits along gap_5_9.
+  beliefs:
+  - B1
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: How many infections occur before day 42 at the high end of contact_rate, and does response leave infants
+    + 10-14 above threshold at high R0 and high gap_10_14?
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Does routine's 60% of under-fives include infants under 9 months, and at what efficacy (maternal antibody
+    interference)?
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: How many districts have baseline Reff below 1 (no outbreak, so 'none' is best), given the low end of
+    the gaps?
+  beliefs:
+  - B1
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B2
+  claim: Routine's relative reduction of infections decreases as gap_5_9 rises (unreached 5-9 susceptibles sustain
+    transmission)
+  p: 0.75
+  test:
+    kind: effect_direction
+    package: routine
+    feature: gap_5_9
+    direction: decreases
+- id: H2
+  belief: B3
+  claim: Routine's relative reduction of infections decreases as gap_10_14 rises
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: routine
+    feature: gap_10_14
+    direction: decreases
+- id: H3
+  belief: B4
+  claim: Response averts 75-100% of infections at at least 70% of points with a baseline outbreak
+  p: 0.6
+  test:
+    kind: effect_band
+    package: response
+    band:
+    - 0.75
+    - 1.0
+    min_share: 0.7
+- id: H4
+  belief: B5
+  claim: At low 5-9 gaps (0.0202-0.07) routine beats response on net benefit at the shadow price at at least 70%
+    of points (both stop or there is no outbreak; routine is cheaper)
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: routine
+    b: response
+    feature: gap_5_9
+    range:
+    - 0.0202
+    - 0.07
+    sign: positive
+    min_share: 0.7
+- id: H5
+  belief: B5
+  claim: At high 5-9 gaps (0.13-0.1927) response beats routine on net benefit at at least 60% of points
+  p: 0.5
+  test:
+    kind: paired_sign
+    a: response
+    b: routine
+    feature: gap_5_9
+    range:
+    - 0.13
+    - 0.1927
+    sign: positive
+    min_share: 0.6
+- id: H6
+  belief: B5
+  claim: The routine/response transition along gap_5_9 lies within 0.07-0.17
+  p: 0.4
+  test:
+    kind: flip_in
+    a: routine
+    b: response
+    feature: gap_5_9
+    range:
+    - 0.07
+    - 0.17
+- id: H7
+  belief: B6
+  claim: Routine's relative reduction increases with gap_1_4
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: routine
+    feature: gap_1_4
+    direction: increases
