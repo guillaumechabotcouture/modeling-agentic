@@ -1,0 +1,293 @@
+beliefs:
+- id: B1
+  mechanism: Final size of a single-introduction epidemic in a homogeneously mixing population is a threshold function
+    of Reff = R0 x susceptible share; below Reff 1 only a minor outbreak occurs, above it the attack among susceptibles
+    rises steeply (z = 1 - exp(-Reff z))
+  about:
+    component: C_9to59m
+  direction: flips
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 50.23869687691331
+    - 79.82864039950073
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: chapter on the final size of an epidemic and the herd-immunity threshold (chapter location from memory,
+      uncertain)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: main result (final size relation)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: D (9m-14y) removes ~77% of susceptibles in both child pools, leaving mainly under-9-month infants;
+    residual Reff falls below 1 in nearly every district, so D averts almost all infections relative to none
+  about:
+    package: D_9mto14y
+  direction: reduces
+  magnitude:
+    band:
+    - 0.9
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: abstract (R0 commonly 12-18)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: herd-immunity threshold 1 - 1/R0 (location from memory)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: C (9-59m) leaves the 5-14y susceptibles untouched; its relative reduction is near 1 where the 5-14y
+    gap is small and drops (to roughly 0.3-0.7) where 5-14y susceptibility keeps residual Reff above 1
+  about:
+    package: C_9to59m
+    feature: susc_5_14y
+  direction: decreases
+  magnitude:
+    band:
+    - 0.3
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation (applied to residual susceptible share)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: Higher transmission (contact rate, i.e. higher R0) raises residual Reff after C, so C's relative reduction
+    falls as contact rate rises
+  about:
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: abstract (range of R0 estimates)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: At the shadow price the incremental cost of D over C (~US$0.4 per capita, ~0.0003-0.0005 infections
+    per capita) is small relative to a major outbreak averted; D wins where post-C residual Reff > 1 (high 5-14y
+    gap), C wins where C alone suppresses transmission (low 5-14y gap), so the choice flips along susc_5_14y, the
+    flip moving lower with higher susc_9_59m and contact rate
+  about:
+    pair:
+    - C_9to59m
+    - D_9mto14y
+  direction: flips
+  magnitude:
+    band:
+    - 0.05
+    - 0.13
+    scale: susc_5_14y_at_flip
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation
+  - citation: Hutubessy R, Chisholm D, Tan-Torres Edejer T. Generalized cost-effectiveness analysis for national-level
+      priority-setting in the health sector. Cost Eff Resour Alloc 2003
+    location: threshold convention used for the shadow price
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Any campaign that brings Reff near or below 1 averts far more infections than its cost at the shadow
+    price; C beats none almost everywhere because R0 10-16 makes every district outbreak-prone at baseline
+  about:
+    pair:
+    - C_9to59m
+    - none
+  direction: raises
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: abstract
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: Vaccine efficacy per reached susceptible (all-or-nothing, ~85-95% at >=9 months) scales the susceptibles
+    removed; C's relative reduction rises with efficacy where residual Reff is near 1
+  about:
+    package: C_9to59m
+    feature: efficacy:C_9to59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: summary of median effectiveness by age at vaccination (location uncertain)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: Where exactly along susc_5_14y (given susc_9_59m and contact rate) does post-C residual Reff cross 1,
+    i.e. where does the C/D choice flip?
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: District population sizes and age shares set both the per-capita cost of D and the susceptible share;
+    with small districts the US$18,000 fixed cost could make 'none' competitive. How heterogeneous are they?
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: With a US$2.9M budget, can D be afforded in all the districts where it beats C, or must the budget ration
+    D to the districts with the largest 5-14y gaps?
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Does the engine report a deterministic final size or weight by p_major? Near Reff 1 this changes how
+    sharp the threshold is.
+  beliefs:
+  - B1
+  - B3
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B2
+  claim: D_9mto14y averts 90-100% of infections relative to none in at least 75% of design points
+  p: 0.6
+  test:
+    kind: effect_band
+    package: D_9mto14y
+    band:
+    - 0.9
+    - 1.0
+    min_share: 0.75
+- id: H2
+  belief: B3
+  claim: C_9to59m's relative reduction falls as susc_5_14y rises
+  p: 0.8
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_5_14y
+    direction: decreases
+- id: H3
+  belief: B4
+  claim: C_9to59m's relative reduction falls as the contact rate (R0) rises
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H4
+  belief: B5
+  claim: Where the 5-14y immunity gap is large (susc_5_14y >= 0.13), D_9mto14y beats C_9to59m on net benefit at
+    the shadow price in at least 70% of points
+  p: 0.6
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.13
+    - 0.1861
+    sign: positive
+    min_share: 0.7
+- id: H5
+  belief: B5
+  claim: Where the 5-14y gap is small (susc_5_14y <= 0.05) and the under-5 gap is moderate (susc_9_59m <= 0.35),
+    C_9to59m beats D_9mto14y in at least 70% of points
+  p: 0.5
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.0179
+    - 0.05
+    sign: positive
+    min_share: 0.7
+    where:
+      susc_9_59m:
+      - 0.1869
+      - 0.35
+- id: H6
+  belief: B5
+  claim: The C/D transition along susc_5_14y lies between 0.05 and 0.13
+  p: 0.4
+  test:
+    kind: flip_in
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.05
+    - 0.13
+- id: H7
+  belief: B6
+  claim: C_9to59m beats none on net benefit at the shadow price in at least 85% of points across the whole susc_9_59m
+    range
+  p: 0.85
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: none
+    feature: susc_9_59m
+    range:
+    - 0.1869
+    - 0.5468
+    sign: positive
+    min_share: 0.85
