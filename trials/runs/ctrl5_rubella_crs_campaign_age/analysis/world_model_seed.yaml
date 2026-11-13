@@ -1,0 +1,291 @@
+beliefs:
+- id: B1
+  mechanism: CHILDREN (85% reach, ~95% seroconversion) removes ~80% of child susceptibles. Children carry most of
+    the population's susceptibility, so post-campaign Reff = R0 x weighted susceptible share falls below 1 in most
+    districts and the outbreak in women is largely prevented (herd effect). CRS falls by close to the whole outbreak
+    burden.
+  about:
+    package: children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Camb) 1983;90:259-325'
+    location: sections on herd immunity threshold and policy comparison (exact page uncertain)
+  - citation: 'WHO. Rubella vaccines: WHO position paper - July 2020. Wkly Epidemiol Rec 2020;95:306-324'
+    location: seroconversion >=95% after one dose (section on immunogenicity; page uncertain)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006;68:679-702
+    location: final size relation, main theorem
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: WIDE protects ~80% of susceptible women directly (all-or-nothing) and also gives the CHILDREN herd
+    effect. CRS falls by at least the direct share even when residual transmission continues, so its relative reduction
+    is high and uniform across districts.
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.88
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'WHO. Rubella vaccines: WHO position paper - July 2020. Wkly Epidemiol Rec 2020;95:306-324'
+    location: recommendation for wide age-range campaign (9 months-14 years, and women of childbearing age) at introduction
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, Reef SE, Navar AM, Simons E, et al. Using seroprevalence and immunisation
+      coverage data to estimate the global burden of congenital rubella syndrome, 1996-2010: a systematic review.
+      PLoS One 2016;11:e0149160'
+    location: methods, CRS from force of infection on women 15-44 (page uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The CHILDREN herd effect breaks down where adult susceptibles are many. Higher s0_women (and s0_other)
+    adds residual susceptibility that keeps post-campaign Reff above 1. The outbreak then runs among adults and
+    CHILDREN's relative CRS reduction falls. This is the branching point at which women must be vaccinated directly
+    (roughly where R0 x residual weighted susceptible share is about 1; its location in s0_women depends on population
+    shares and R0 and is uncertain).
+  about:
+    package: children
+    feature: s0_women
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Camb) 1983;90:259-325'
+    location: analysis of residual adult susceptibility under childhood-only policies (page uncertain)
+  - citation: 'Panagiotopoulos T, Antoniadou I, Valassi-Adam E. Increase in congenital rubella occurrence after
+      immunisation in Greece: retrospective survey and systematic review. BMJ 1999;319:1462-1467'
+    location: 'results: CRS increase when susceptible adult women remain after childhood-only vaccination'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: Higher transmissibility (contact_rate, i.e. R0 4-7) raises the herd threshold 1 - 1/R0 from 0.75 to
+    0.86. The ~80% child-only susceptible removal then leaves Reff closer to or above 1, so CHILDREN's relative
+    CRS reduction decreases with contact_rate.
+  about:
+    package: children
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: chapter on rubella and herd immunity threshold (chapter/page uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: WIDE's direct protection of women makes its relative CRS reduction largely insensitive to s0_women.
+    The share of women's susceptibles removed is fixed by reach x efficacy, whatever the baseline susceptible level.
+  about:
+    package: wide
+    feature: s0_women
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Camb) 1983;90:259-325'
+    location: reasoning by analogy to direct protection under all-or-nothing vaccination (page uncertain)
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Price and the shadow price decide CHILDREN vs WIDE. WIDE costs US$1.10 more per woman 15-39 targeted
+    (about US$0.2 per capita). Its extra CRS averted per capita is bounded by the residual CRS left after CHILDREN,
+    which is at most of order 1e-4 to 1e-3 per capita (women ~20% of population x s0_women x attack rate x CRS risk
+    per infection). At lambda = 0.032 outcome per USD, the extra cost (~0.007 per capita) exceeds that extra benefit
+    everywhere, so CHILDREN beats WIDE on net benefit. At a value per CRS near US$32,000 (lambda ~3e-5) WIDE would
+    win in the high-residual districts.
+  about:
+    pair:
+    - children
+    - wide
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Miller E, Cradock-Watson JE, Pollock TM. Consequences of confirmed maternal rubella at successive
+      stages of pregnancy. Lancet 1982;2:781-784
+    location: 'Table on congenital infection and defects by gestational week: CRS risk per maternal infection high
+      only in first 16 weeks'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: At the stated shadow price (0.032 outcome per USD), CHILDREN's cost (~US$0.4 per capita) times lambda
+    (~0.013) is one to two orders of magnitude above the CRS averted per capita. So on net benefit at this lambda,
+    none beats CHILDREN, even though CHILDREN averts most of the CRS. This is an artefact of lambda's units, not
+    a finding about vaccination value.
+  about:
+    pair:
+    - children
+    - none
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, Reef SE, Navar AM, Simons E, et al. Using seroprevalence and immunisation
+      coverage data to estimate the global burden of congenital rubella syndrome, 1996-2010: a systematic review.
+      PLoS One 2016;11:e0149160'
+    location: CRS incidence per 100,000 live births in unvaccinated settings (order 10-200; table of regional estimates,
+      location uncertain)
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What are the population shares of children, women 15-39 and others in each district (units.csv), and
+    so the weighted susceptible share? That share decides whether baseline Reff exceeds 1 and whether CHILDREN alone
+    drives it below 1.
+  beliefs:
+  - B1
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Is the shadow price 0.032 meant as CRS per USD, or as DALYs per USD with CRS converted at 32 DALYs/case?
+    At 0.032 CRS per USD no campaign passes the net-benefit test. At ~3e-5 CRS per USD WIDE wins where residual
+    transmission is high.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: What vaccine efficacy (seroconversion) prior does the engine use? Values below ~0.9 would leave post-campaign
+    Reff above 1 in many more CHILDREN districts.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: In districts where baseline Reff is below 1 (only minor chains), is the CRS burden near zero? If so,
+    no campaign is worth funding there and the budget would go to the high-Reff districts.
+  beliefs:
+  - B1
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CHILDREN reduces CRS vs none by 80-100% in at least 60% of usable points (herd effect blocks most outbreaks).
+  p: 0.6
+  test:
+    kind: effect_band
+    package: children
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: WIDE reduces CRS vs none by 88-100% in at least 80% of usable points (direct protection of women plus herd
+    effect).
+  p: 0.7
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.88
+    - 1.0
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: CHILDREN's relative CRS reduction decreases as s0_women rises (more adult susceptibles sustain transmission
+    after a child-only campaign).
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_women
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: CHILDREN's relative CRS reduction decreases with contact_rate (higher R0 raises the herd threshold above
+    the ~80% child susceptible removal).
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: children
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: WIDE's relative CRS reduction is essentially unrelated to s0_women (|rho| bound within 0.3).
+  p: 0.4
+  test:
+    kind: effect_direction
+    package: wide
+    feature: s0_women
+    direction: negligible
+    equivalence: 0.3
+- id: H6
+  belief: B6
+  claim: At the harness shadow price, CHILDREN beats WIDE on net benefit in at least 80% of usable points across
+    the full s0_women range.
+  p: 0.8
+  test:
+    kind: paired_sign
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.0617
+    - 0.2925
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: At the harness shadow price (0.032 outcome per USD), none beats CHILDREN on net benefit in at least 80%
+    of usable points (the cost term dominates CRS averted per capita).
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: children
+    b: none
+    feature: s0_children
+    range:
+    - 0.2069
+    - 0.5999
+    sign: negative
+    min_share: 0.8
