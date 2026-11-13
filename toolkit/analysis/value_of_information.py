@@ -201,7 +201,7 @@ INTERVAL_NOTE = ("No interval is published: a percentile bootstrap around a maxi
 
 # --------------------------------------------------------------------------- the analysis
 def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, thr=None, seed=0, ids=None,
-            excluded=None, exact_id=None, nb_free=None, cond=None, halves=None) -> dict:
+            excluded=None, exact_id=None, nb_free=None, cond=None, halves=None, state=None) -> dict:
     """EVPI and EVPPI from per-draw net benefits `nb` (draws x candidates), each draw's own optimum within the budget
     `nb_opt`, the over-budget mask `over` (draws x candidates) and the drawn inputs {name: values per draw}.
     `excluded` {candidate id: why}: candidates that break the signed feasibility or carry model corrections, reported
@@ -210,7 +210,9 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
     solved without the budget (the plans perfect information may overspend with). `cond` {input: [(candidate, half)]}:
     plans decided within that input's bins on one half of the draws (`halves`, 0/1 per draw); each is valued only for
     that input and only on the other half (cross-fitting), so its fit to the input never reaches the draws it is
-    valued on, nor the noise floor. Bad input fails closed."""
+    valued on, nor the noise floor. `state` (draws x anything): what tells two draws apart for perfect information
+    (run() passes the full benefit and cost tables); without it, the candidates' values and the inputs. Bad input
+    fails closed."""
     th = dict(thresholds(), **(thr or {}))
     nb, nb_opt, over = np.asarray(nb, float), np.asarray(nb_opt, float), np.asarray(over, bool)
     if nb.ndim != 2 or nb.shape[0] < 2 or nb.shape[1] < 1 or nb_opt.shape != (nb.shape[0],) or over.shape != nb.shape:
@@ -263,7 +265,8 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
         if nb_free is not None:
             free = np.maximum(free, np.asarray(nb_free, float))
         gain = np.maximum(free - star, 0.0)
-        M = np.column_stack([nb, feas.astype(float), nb_opt, free] + [X[x] for x in sorted(X)])
+        M = np.column_stack([nb, feas.astype(float), nb_opt, free] + [X[x] for x in sorted(X)]
+                            + ([np.asarray(state, float).reshape(n, -1)] if state is not None else []))
         cls = np.unique(np.where(np.isfinite(M), M, -1e300), axis=0, return_inverse=True)[1].ravel()
         star = star + np.where(np.isin(cls, _knapsack(cls, gain, k)), gain, 0.0)
     v_pi = float(star.mean())
@@ -342,6 +345,7 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
         rec = {"input": name, "kind": kind, "members": mem, "bins": G}
         if np.all(Xm.std(0) == 0):
             out["inputs"].append(dict(rec, status="constant", evppi=0.0, pct=pct(0.0), share_of_evpi=None, df=1,
+                                      policy_share_over_budget=0.0,
                                       knots=None, noise_floor=0.0, noise_mean=0.0, above_noise_floor=False,
                                       exceeds_evpi=False, supported=False))
             continue
@@ -438,10 +442,17 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         (one budget row per draw, beside the signed caps); None when no plan is proven optimal."""
         caps = list(A.feas.get("caps") or []) + [{"name": f"voi_draw_{d}", "max": B, "weights": tab(Cs[d])}
                                                  for d in np.flatnonzero(mask)]
+        f = dict(A.feas, caps=caps, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
+        for d in np.flatnonzero(mask):       # packages a model correction bears on in these draws are left out first
+            for e in rows[d]["events"]:
+                if e.get("package") in ("*", getattr(A, "comp", None)):
+                    return None
+                if e.get("package") in f["feasible"].get(str(e.get("unit")), {}):
+                    f["feasible"][str(e["unit"])][e["package"]] = False
         notes["solves"] += 1
         try:
-            return A.solve(tab(Bn[mask].mean(0)), tab(Cs[mask].mean(0)), budget=B, feas=dict(A.feas, caps=caps))["choice"]
-        except RuntimeError as e:
+            return A.solve(tab(Bn[mask].mean(0)), tab(Cs[mask].mean(0)), budget=B, feas=f)["choice"]
+        except (RuntimeError, ValueError) as e:
             notes.setdefault("not_solved", []).append(str(e))
             return None
     add("point", [at[plan[i]] for i in ids_u], False)
@@ -554,7 +565,7 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
                 nb_free[d] = float(sol["objective"])
     res = analyse(nb, pi, cost > B * (1 + 1e-9), inputs, groups, s, level, thr=th, seed=seed,
                   ids=[c[0] for c in cand], excluded=excluded, exact_id="robust" if rb is not None else None,
-                  nb_free=nb_free, cond=cond, halves=hv)
+                  nb_free=nb_free, cond=cond, halves=hv, state=np.column_stack([Bn.reshape(n, -1), Cs.reshape(n, -1)]))
     res.update(outcome=A.primary, discount_factor=float(A.dfac), budget_allocatable=B, groups=groups,
                groups_not_computed=skipped, not_drawn=not_drawn(report, A), solves=notes,
                consistency={"objective_max_abs_gap": gap},
@@ -604,6 +615,12 @@ def contract_findings(raw: dict, unc, voi) -> list[str]:
     cd = voi.get("candidates")
     if not (isinstance(cd, dict) and isinstance(cd.get("list"), list) and all(isinstance(x, dict) for x in cd["list"])):
         return ["value_of_information: the candidate list is missing"]
+    cids = [x.get("id") for x in cd["list"]]
+    if not all(isinstance(i, str) for i in cids) or len(set(cids)) != len(cids):
+        return ["value_of_information: candidate ids are not unique strings"]
+    if not all(isinstance(x.get("draws_over_budget"), int) and not isinstance(x.get("draws_over_budget"), bool)
+               and 0 <= x["draws_over_budget"] <= draws for x in cd["list"]):
+        return [f"value_of_information: a candidate's draws_over_budget is not an integer in [0, {draws}]"]
     cl = {x.get("id"): x for x in cd["list"]}
     n_el = sum(x.get("eligible") is True for x in cd["list"])
 
@@ -659,6 +676,10 @@ def contract_findings(raw: dict, unc, voi) -> list[str]:
             bad.append(f"value_of_information: {r['input']}: diagnostics missing or not finite ({miss})")
         elif e < -at:
             bad.append(f"value_of_information: {r['input']}: EVPPI {e} is negative")
+        elif r.get("status") == "computed" and not (num(r.get("policy_share_over_budget"))
+                                                    and 0 <= r["policy_share_over_budget"] <= sh + 1e-12):
+            bad.append(f"value_of_information: {r['input']}: the learned policy's share over budget "
+                       f"{r.get('policy_share_over_budget')!r} is not within the signed allowance {sh}")
         elif (r["exceeds_evpi"] is not bool(e > ev["value"] + tol)
               or r["above_noise_floor"] is not bool(e > r["noise_floor"])
               or r["supported"] is not bool(r["above_noise_floor"] and not r["exceeds_evpi"] and ev["value"] > tol)):
@@ -1182,6 +1203,65 @@ def _self_test() -> int:
            == "data.inputs[5].evppi",
            f"F6 the table shows the supported rows the claims cite ({[x for x in txt.splitlines() if x.startswith('| ')]})")
 
+    def g1():
+        # G1 (round 4, P2): budget 1, treatments A and B cost 2; benefits (A, B) are (10, 0) in ten draws and (0, 10)
+        # in thirty; 25% may overspend; no scalar input is recorded (as for per-unit calibration attributes). Every
+        # candidate is worth 0 in every draw, yet the draws differ: perfect information treats with A in the ten.
+        n = 40
+        ben = [{"none": 0.0, "a": 10.0 if d < 10 else 0.0, "b": 0.0 if d < 10 else 10.0} for d in range(n)]
+        cost = [{"none": 0.0, "a": 2.0, "b": 2.0} for _ in range(n)]
+        r = _fake_run(["none", "a", "b"], ben, cost, 1.0, "none", [{} for _ in range(n)],
+                      raw={"uncertainty": {"affordability": {"max_share_over_budget": 0.25}}}, thr={"permutations": 10})
+        ok(abs((r.get("evpi") or {}).get("value", -1) - 2.5) < 1e-9,
+           f"G1 draws with the same summaries but different tables are told apart: EVPI 2.5 ({r.get('evpi')})")
+
+    def g2():
+        # G2 (round 4, P2): budget 1; P (cost 0) is worth 1, C (cost 0.5) 5, X (cost 0.5) 6 with a model correction in
+        # draw 0; A and B are worth 10 and cost 0.5 / 1.5 in alternate draws. Within the budget in every draw the best
+        # clean plan is C: deciding now is exact at 5 and EVPI is 10 - 5 = 5.
+        n = 8
+        ben = [{"P": 1.0, "C": 5.0, "X": 6.0, "A": 10.0, "B": 10.0} for _ in range(n)]
+        cost = [{"P": 0.0, "C": 0.5, "X": 0.5, "A": 0.5 if d % 2 == 0 else 1.5, "B": 1.5 if d % 2 == 0 else 0.5}
+                for d in range(n)]
+        r = _fake_run(["P", "C", "X", "A", "B"], ben, cost, 1.0, "P", [{"x": float(d)} for d in range(n)],
+                      events={0: [{"unit": "u", "package": "X", "kind": "clip"}]}, thr={"permutations": 10})
+        ok(r.get("decide_now") == "robust" and r.get("decide_now_method") == "exact"
+           and abs((r.get("evpi") or {}).get("value", -1) - 5.0) < 1e-9,
+           f"G2 the decide-now solve leaves out corrected packages first: exact, EVPI 5 ({r.get('decide_now')}, "
+           f"{r.get('decide_now_method')}, {r.get('evpi')})")
+
+    def g3():
+        # G3 (round 4, gate): the learned policy's share over budget, the budget counts and the candidate ids
+        import copy
+        unc, base = {"draws": 64}, _valid_doc()
+
+        def rows(d, **kw):
+            return dict(d, inputs=[dict(x, **kw) if x.get("status") == "computed" else x for x in d["inputs"]])
+
+        def counts(d, v):
+            return dict(d, candidates=dict(d["candidates"], list=[dict(x, draws_over_budget=v)
+                                                                   for x in d["candidates"]["list"]]))
+
+        def ids(d, f):
+            return dict(d, candidates=dict(d["candidates"], list=[dict(x, id=f(k, x["id"]))
+                                                                   for k, x in enumerate(d["candidates"]["list"])]))
+        muts = [("a policy share missing", lambda d: dict(d, inputs=[{k: v for k, v in x.items()
+                                                                     if k != "policy_share_over_budget"}
+                                                                    for x in d["inputs"]])),
+                ("a non-finite policy share", lambda d: rows(d, policy_share_over_budget=float("nan"))),
+                ("a policy share above the signed allowance", lambda d: rows(d, policy_share_over_budget=1.0)),
+                ("a negative budget count", lambda d: counts(d, -1)),
+                ("a fractional budget count", lambda d: counts(d, 0.5)),
+                ("a budget count above the draws", lambda d: counts(d, 65)),
+                ("a candidate id that is not a string", lambda d: ids(d, lambda k, i: ["oops"] if k == 0 else i)),
+                ("duplicate candidate ids", lambda d: ids(d, lambda k, i: "same"))]
+        for label, m in muts:
+            try:
+                f = contract_findings({}, unc, m(copy.deepcopy(base)))
+            except Exception as e:  # noqa: BLE001 -- a crash is a failing case
+                f, label = [], f"{label} (raised {type(e).__name__})"
+            ok(bool(f), f"G3 {label} is a finding (fail closed)")
+
     def gate():
         doc = _valid_doc()
         raw = {"uncertainty": {"draws": 64}}
@@ -1222,7 +1302,7 @@ def _self_test() -> int:
                       ("D5", d5), ("D6", d6), ("D7", d7),
                       ("D8", d8), ("D9", d9), ("D10", d10), ("E1", e1), ("E2", e2), ("E3", e3), ("E4", e4),
                       ("E5", e5), ("F1", f1), ("F2", f2), ("F3", f3), ("F4", f4), ("F5", f5), ("F6", f6),
-                      ("VG gate", gate)):
+                      ("G1", g1), ("G2", g2), ("G3", g3), ("VG gate", gate)):
         run_case(label, fn)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
