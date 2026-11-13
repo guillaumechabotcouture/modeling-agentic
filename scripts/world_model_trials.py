@@ -427,15 +427,19 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
         out["sessions"] += 1
         out["usd"] += usd
         out["notes"].append(getattr(r, "note", ""))
-        path = os.path.join(run_dir, SEED_FILE)
-        try:
-            seed = yaml.safe_load(open(path)) if r is not None and r.ok else None
-        except (OSError, yaml.YAMLError) as e:
-            seed, feedback = None, [f"{SEED_FILE} is not readable YAML: {e}"]
-        if seed is not None:
-            feedback = seed_problems(seed, ctx) if isinstance(seed, dict) else [f"{SEED_FILE}: a mapping"]
-        elif feedback is None or attempt == 0 and not os.path.isfile(path):
-            feedback = [f"no {SEED_FILE} was written" + (f" ({r.note})" if r is not None and r.note else "")]
+        # the seed file is what the harness judges, fresh on every attempt (a session that ran out of budget after
+        # writing a valid seed still gives a valid seed; its missing notes file does not matter)
+        path, seed = os.path.join(run_dir, SEED_FILE), None
+        if not os.path.isfile(path) or os.path.islink(path):
+            feedback = [f"no {SEED_FILE} was written" + (f" (the session: {r.note})" if r is not None and r.note
+                                                         else "")]
+        else:
+            try:
+                data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
+                seed = yaml.safe_load(data.decode("utf-8"))
+                feedback = seed_problems(seed, ctx) if isinstance(seed, dict) else [f"{SEED_FILE}: a mapping"]
+            except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+                feedback = [f"{SEED_FILE} is not readable YAML: {e}"[:300]]
         if not feedback:
             data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
             _sio().write_nofollow(run_dir, SEED, data, atomic=True)
