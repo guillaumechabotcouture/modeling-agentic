@@ -1,0 +1,245 @@
+beliefs:
+- id: B1
+  mechanism: Annual mass azithromycin reduces ocular chlamydia infection prevalence in children; averaged over the
+    two-year window (infection falls sharply after each round, then returns), the person-time reduction is large
+    but incomplete
+  about:
+    package: annual
+  direction: reduces
+  magnitude:
+    band:
+    - 0.45
+    - 0.85
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Melese M et al. Comparison of annual and biannual mass antibiotic administration for elimination of
+      infectious trachoma. JAMA 2008
+    location: Results, infection prevalence by survey time (location from memory; unsure of the exact table)
+  - citation: 'Gebre T et al. Comparison of annual versus twice-yearly mass azithromycin treatment for hyperendemic
+      trachoma in Ethiopia: a cluster-randomised trial. Lancet 2012'
+    location: Results, infection prevalence at 42 months (table location unsure)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Biannual MDA averts more infection person-time than annual by cutting the post-treatment return of
+    infection, but the gain over annual is modest; in TANA the end-of-trial difference was small and not clearly
+    significant
+  about:
+    package: biannual
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Gebre T et al. Comparison of annual versus twice-yearly mass azithromycin treatment for hyperendemic
+      trachoma in Ethiopia: a cluster-randomised trial. Lancet 2012'
+    location: Results, primary outcome comparison of arms (location unsure)
+  - citation: Melese M et al. Comparison of annual and biannual mass antibiotic administration for elimination of
+      infectious trachoma. JAMA 2008
+    location: Results (location unsure)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Diminishing returns of the second round: biannual costs twice annual while adding only the gap between
+    the two relative reductions, so under a hard-binding budget the shadow price makes annual''s net benefit exceed
+    biannual''s in nearly every district; biannual could only win in the highest-burden districts if the budget
+    were loose'
+  about:
+    pair:
+    - annual
+    - biannual
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.0912
+    - 0.3969
+  source_type: literature
+  evidence:
+  - citation: 'Lietman T et al. Global elimination of trachoma: how frequently should we administer mass chemotherapy?
+      Nature Medicine 1999'
+    location: model results on treatment frequency vs prevalence (location from memory)
+  - citation: 'Gebre T et al. Comparison of annual versus twice-yearly mass azithromycin treatment for hyperendemic
+      trachoma in Ethiopia: a cluster-randomised trial. Lancet 2012'
+    location: Discussion
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Relative burden ranks districts: the absolute infection averted per dollar of annual MDA scales with
+    baseline infection prevalence, so annual beats none above an inc threshold set by the budget; with roughly a
+    third to a half of the population affordable, the threshold sits in the middle-upper part of the inc range'
+  about:
+    pair:
+    - annual
+    - none
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.17
+    - 0.32
+  source_type: literature
+  evidence:
+  - citation: 'Lietman T et al. Global elimination of trachoma: how frequently should we administer mass chemotherapy?
+      Nature Medicine 1999'
+    location: general argument; threshold location is my arithmetic, not from the paper
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: Higher endemicity means faster return of infection after each round, so the time-averaged relative
+    reduction of annual MDA is smaller where TF/infection is higher (the reason guidelines raise frequency in hyperendemic
+    areas). The engine's card applies a fixed rate ratio per package, so it may not reproduce this; a refutation
+    would be an engine structural limitation, not new evidence
+  about:
+    package: annual
+    feature: tf_prevalence
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Lietman T et al. Global elimination of trachoma: how frequently should we administer mass chemotherapy?
+      Nature Medicine 1999'
+    location: results on return of infection by prevalence (location unsure)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Household water access does not materially modify the relative effect of azithromycin MDA on ocular
+    infection over two years; a WASH cluster trial found no effect of WASH on infection
+  about:
+    package: biannual
+    feature: water_access
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Aragie S et al. Water, sanitation, and hygiene for control of trachoma in Ethiopia (WUHA): a two-arm,
+      parallel-group, cluster-randomised trial. Lancet Global Health 2022'
+    location: Results, primary outcome (location unsure)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: How large is the difference between annual and biannual time-averaged relative reduction in infection
+    person-years (not end-of-trial prevalence)? Trials report point prevalence at survey times, not person-time,
+    so the conversion is model-dependent.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: Is the budget binding tightly enough that no district gets biannual, or is there a high-inc tier where
+    the biannual increment beats the marginal annual district? This depends on total population and the inc distribution.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Does the relative effect of MDA fall with endemicity (faster reinfection), which would weaken the case
+    for targeting only the highest-inc districts with annual and strengthen biannual there? The engine's fixed rate
+    ratio cannot represent this.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Is the district inc (ocular infection) measured comparably across districts, and how well does it agree
+    with TF prevalence? TF lags infection after MDA, so ranking on TF and on inc may differ.
+  beliefs:
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Annual MDA's relative reduction in ocular infection person-years lies in [0.45, 0.85] at most design points
+  test:
+    kind: effect_band
+    package: annual
+    band:
+    - 0.45
+    - 0.85
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Biannual MDA's relative reduction lies in [0.6, 0.95] at most design points
+  test:
+    kind: effect_band
+    package: biannual
+    band:
+    - 0.6
+    - 0.95
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: At the budget's shadow price annual has higher net benefit than biannual across the whole inc range; refuted
+    if biannual wins at most points
+  test:
+    kind: paired_sign
+    a: annual
+    b: biannual
+    feature: inc
+    range:
+    - 0.0912
+    - 0.3969
+    sign: positive
+    min_share: 0.7
+- id: H4
+  belief: B4
+  claim: 'The annual-vs-none choice flips along inc inside [0.17, 0.32]: annual wins in high-burden districts, none
+    in low-burden ones'
+  test:
+    kind: flip_in
+    a: annual
+    b: none
+    feature: inc
+    range:
+    - 0.17
+    - 0.32
+- id: H5
+  belief: B5
+  claim: Annual MDA's relative reduction decreases with TF prevalence
+  test:
+    kind: effect_direction
+    package: annual
+    feature: tf_prevalence
+    direction: decreases
+- id: H6
+  belief: B6
+  claim: Biannual MDA's relative reduction does not vary with water access (Spearman rho within +/-0.1)
+  test:
+    kind: effect_direction
+    package: biannual
+    feature: water_access
+    direction: negligible
+    equivalence: 0.1
