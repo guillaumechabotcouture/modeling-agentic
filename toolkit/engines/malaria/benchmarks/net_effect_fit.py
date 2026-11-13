@@ -673,6 +673,79 @@ def _self_test() -> int:
            f"subsample ({r2['hull']}, edges {r2['at_box_edge']})")
     case("F12", f12)
 
+    def f16():
+        import json
+        import tempfile
+        from toolkit.engines.contract import ToyEngine
+        hz = {"start": 0.0, "stop": 2.0, "window": [0.0, 2.0]}
+        jobs = [("toolkit.engines.contract:ToyEngine", {}, {"eff_a": 0.4 + 0.01 * i, "noise": 0.1}, {"x": 0.1 * i},
+                 {"a": i % 2}, hz, s) for i in range(6) for s in (1, 2)]
+
+        def mk():
+            r = RecalRunner.__new__(RecalRunner)      # only what _map reads: the engine and the worker count
+            r.engine, r.workers = ToyEngine(), 1
+            return r
+        plain = mk()._map(jobs)                       # no checkpoint: benchmark.Runner's own path
+        with tempfile.TemporaryDirectory() as d:
+            dirs = {k: os.path.join(d, k) for k in ("full", "cut", "res")}
+            full = mk()
+            full.checkpoint(out_dir=dirs["full"])
+            r_full = full._map(jobs)
+            cut, n = mk(), [0]
+            cut.checkpoint(out_dir=dirs["cut"])
+
+            def boom(t):                              # the cap stops the job after five engine tasks
+                n[0] += 1
+                if n[0] > 5:
+                    raise KeyboardInterrupt
+                return BM._job_list(t)
+            cut.task_fn = boom
+            try:
+                cut._map(jobs)
+            except KeyboardInterrupt:
+                pass
+            kept = open(os.path.join(dirs["cut"], CACHE_NAME)).read().count("\n")
+            res, ran = mk(), []
+            res.checkpoint(out_dir=dirs["res"], resume_from=dirs["cut"])
+            res.task_fn = lambda t: (ran.append(1), BM._job_list(t))[1]
+            r_res = res._map(jobs)
+            dump = lambda x: yaml.safe_dump(json.loads(json.dumps(x)), sort_keys=False)  # noqa: E731
+            same = r_res == r_full == plain and dump(r_res) == dump(plain) and json.dumps(r_res) == json.dumps(plain)
+            ok(kept == 5 and len(ran) == len(jobs) - 5 and same,
+               f"F16 (checkpoint) each finished engine task is appended to {CACHE_NAME} as it lands ({kept} rows after "
+               f"the stop); a relaunch with --resume-from reruns only the {len(ran)} missing tasks, and its results "
+               f"equal an uninterrupted run's, with or without a checkpoint ({same})")
+            rows = [json.loads(x) for x in open(os.path.join(dirs["full"], CACHE_NAME))]
+            code = mk().code_sha256()
+            got = {}
+
+            def bad(label, lines, tail=""):
+                q = os.path.join(d, label.replace(" ", "_"))
+                os.makedirs(q)
+                open(os.path.join(q, CACHE_NAME), "w").write("".join(json.dumps(x) + "\n" for x in lines) + tail)
+                try:
+                    got[label] = len(load_cache(q, code))
+                except ValueError as ex:
+                    got[label] = str(ex)
+            bad("other engine code", [dict(rows[0], code_sha256="0" * 64)] + rows[1:])
+            bad("an edited task", [dict(rows[0], task=rows[1]["task"])] + rows[1:])
+            bad("an edited result", [dict(rows[0], result=rows[1]["result"])] + rows[1:])
+            bad("a malformed middle row", rows[:2], tail="{not json\n" + json.dumps(rows[2]) + "\n")
+            bad("a truncated last row", rows[:3], tail=json.dumps(rows[3])[:20])
+            try:
+                load_cache(os.path.join(d, "absent"), code)
+                got["no cache file"] = 0
+            except ValueError as ex:
+                got["no cache file"] = str(ex)
+        want = {"other engine code": "code_sha256", "an edited task": "key", "an edited result": "result_sha256",
+                "a malformed middle row": "malformed", "no cache file": "no cache"}
+        wrong = sorted(k for k, w in want.items() if w not in str(got.get(k)))
+        ok(not wrong and got.get("a truncated last row") == 3,
+           f"F17 (checkpoint) a cache row from other engine code, with an edited task or result, a malformed row and a "
+           f"missing cache are refused (fail closed); a last row cut by the stop is dropped ({got.get('a truncated '
+           f'last row')} rows kept; refused for another reason or not at all: {wrong or 'none'})")
+    case("F16", f16)
+
     def f14():
         import tempfile
         box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
