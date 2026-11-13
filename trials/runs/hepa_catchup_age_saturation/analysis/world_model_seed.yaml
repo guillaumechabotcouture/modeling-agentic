@@ -1,0 +1,298 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold: the relative reduction from removing a fixed share of child susceptibles shrinks
+    as transmission (R0, on the contact_rate calibration scale) rises, because the remaining susceptibles are infected
+    almost regardless'
+  about:
+    package: wide
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  magnitude:
+    band:
+    - 0.45
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 12.559674219228327
+    - 19.957160099875182
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5 (herd immunity and vaccination; final size); exact pages not verified
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology, 2006
+    location: final size relation, Section 2
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: 'YOUNG works almost entirely through indirect protection (under-fives are about 10% symptomatic), so
+    its relative reduction in symptomatic cases collapses as R0 rises: large near the threshold, small (about 0.1)
+    at high R0 with high adult susceptibility'
+  about:
+    package: young
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  magnitude:
+    band:
+    - 0.05
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Armstrong GL, Bell BP. Hepatitis A virus infections in the United States: model-based estimates and
+      implications for childhood immunization. Pediatrics, 2002'
+    location: age-specific symptomatic share assumptions, Methods; table location not verified
+  - citation: Van Effelterre TP et al. A mathematical model of hepatitis A transmission in the United States indicates
+      value of universal childhood immunization. Clinical Infectious Diseases, 2006
+    location: Results (indirect effects of childhood vaccination); table location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: medium
+- id: B3
+  mechanism: Adult susceptibles are not reached by either campaign. A larger adult susceptible share keeps the post-campaign
+    Reff high and puts more of the symptomatic burden where vaccination acts only indirectly, so WIDE's relative
+    reduction falls as s_15p rises
+  about:
+    package: wide
+    feature: s_15p
+  direction: decreases
+  magnitude:
+    band:
+    - 0.45
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Jacobsen KH, Wiersma ST. Hepatitis A virus seroprevalence by age and world region, 1990 and 2005.
+      Vaccine, 2010
+    location: regional age-seroprevalence curves (transition shifts susceptibility to adults); figure location not
+      verified
+  - citation: Lednar WM, Lemon SM, Kirkpatrick JW, Redfield RR, Fields ML, Kelley PW. Frequency of illness associated
+      with epidemic hepatitis A virus infections in adults. American Journal of Epidemiology, 1985
+    location: Results (about 75% or more of adult infections icteric/symptomatic)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: WIDE removes about 80% x efficacy of susceptibles under 15, which pushes Reff near or below 1 in most
+    districts, so its relative reduction in symptomatic cases is high (mostly 0.55-1.0). Efficacy is near-complete
+    for inactivated HAV vaccine in children
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.55
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Werzberger A et al. A controlled trial of a formalin-inactivated hepatitis A vaccine in healthy children.
+      New England Journal of Medicine, 1992
+    location: Results (protective efficacy 100% in the Kiryas Joel trial)
+  - citation: Innis BL et al. Protection against hepatitis A by an inactivated vaccine. JAMA, 1994
+    location: Results (efficacy about 94% after two doses, Thailand)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Per-capita final size in a closed, homogeneously mixing population does not depend on population size,
+    so relative reduction (and net benefit per person) should not vary with district population
+  about:
+    package: wide
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology, 2006
+    location: final size relation is per capita, independent of N
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: More susceptible under-fives means YOUNG removes a larger share of susceptibility. Each unit of s_u5
+    raises the baseline Reff by its full weight but the post-YOUNG Reff by only the unvaccinated remainder (about
+    20%), so YOUNG's relative reduction rises with s_u5
+  about:
+    package: young
+    feature: s_u5
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; exact pages not verified
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: Under a binding budget, the extra $1.00 per resident for WIDE is not worth it where YOUNG alone already
+    brings Reff near or below 1 (low adult susceptibility, low R0). There YOUNG beats WIDE on net benefit at the
+    shadow price
+  about:
+    pair:
+    - young
+    - wide
+  direction: flips
+  conditions:
+  - feature: s_15p
+    range:
+    - 0.1266
+    - 0.25
+  - feature: contact_rate (calibration scale)
+    range:
+    - 12.559674219228327
+    - 15.5
+  source_type: literature
+  evidence:
+  - citation: Van Effelterre TP et al. A mathematical model of hepatitis A transmission in the United States indicates
+      value of universal childhood immunization. Clinical Infectious Diseases, 2006
+    location: Results (herd effects from vaccinating young children); location not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is the shadow price of the $8M budget? It sets how much extra benefit WIDE's extra $1.00 per resident
+    must buy, and so where the YOUNG/WIDE choice flips
+  beliefs:
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: Which age weights (population shares under 5, 5-14 and 15+) does each district use? They set how much
+    susceptibility each campaign removes and are not in my reasoning except as an assumption
+  beliefs:
+  - B1
+  - B2
+  - B4
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Where does R0 sit within 2.5-4? Its uncertainty is shared across districts, so it moves every district's
+    threshold position together and may dominate the interval on the total cases averted
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: Does the engine count doses given to already-immune children as wasted (targets_susceptible not declared)?
+    Cost per resident is fixed either way, but the susceptibles removed per dollar depend on it
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: false
+- id: Q5
+  question: 'Districts with baseline Reff below 1 have no major epidemic: is their burden zero (so they are excluded)
+    or a small seeded outbreak? Spending there buys nearly nothing'
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: WIDE's relative reduction in symptomatic cases falls as the contact rate (R0) rises
+  test:
+    kind: effect_direction
+    package: wide
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H2
+  belief: B2
+  claim: YOUNG's relative reduction falls as the contact rate (R0) rises, more steeply than WIDE's, because its
+    benefit is almost all indirect
+  test:
+    kind: effect_direction
+    package: young
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: WIDE's relative reduction falls as adult susceptibility (s_15p) rises
+  test:
+    kind: effect_direction
+    package: wide
+    feature: s_15p
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: At least 75% of usable points show a relative reduction from WIDE between 0.55 and 1.0; refuted if 25%
+    or fewer do
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.55
+    - 1.0
+    min_share: 0.75
+- id: H5
+  belief: B5
+  claim: District population has no material association with WIDE's relative reduction (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: wide
+    feature: pop
+    direction: negligible
+    equivalence: 0.1
+- id: H6
+  belief: B6
+  claim: YOUNG's relative reduction rises with the under-five susceptible share
+  test:
+    kind: effect_direction
+    package: young
+    feature: s_u5
+    direction: increases
+- id: H7
+  belief: B7
+  claim: Where adult susceptibility is low (s_15p 0.13-0.25) and the contact rate is in its lower part, YOUNG beats
+    WIDE on net benefit at the shadow price at 60% or more of points
+  test:
+    kind: paired_sign
+    a: young
+    b: wide
+    feature: s_15p
+    range:
+    - 0.1266
+    - 0.25
+    sign: positive
+    min_share: 0.6
