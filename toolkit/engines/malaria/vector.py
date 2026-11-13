@@ -35,6 +35,12 @@ pyrethroid bioassay mortality x (1 = susceptible), tau = 0.5:
                         with j' = m j + 1 - m, l' = m l
   decay                 logit(gamma_wash) = -2.36 - 3.05 (l - tau);  H_y = H_w / H_w(l=1) x 2.64 y
                         r(t) = (r0 - r_M) exp(-gamma t) + r_M, r_M = 0.24;  d(t) = d0 exp(-gamma t)
+v0.17 net-effect parameters (NET_DEFAULTS; the defaults reproduce the lines above bit for bit, self-test V31):
+  net_kill_shift  delta:  logit(l) = 0.63 + delta + 4.00 (x - tau), every net type (Results: alpha1 0.634, 95% CrI
+                  0.012-1.29); m, k, j, the per-attempt outcomes and gamma_wash then follow from l as above
+  pbo_gain_scale  s:      logit(f_s) = logit(x) + s (logit(f) - logit(x)); s = 1 is Equation 4, s = 0 no PBO gain
+  pbo_adv_decay   lambda: a PBO net of age t gives r_p(t) + exp(-lambda t)(r_b(t) - r_p(t)) (and d, insecticide
+                  content alike), r_p a pyrethroid net of the same age; lambda = 0 keeps Churcher's PBO net
 Note: Table 6 gives the funestus PBO row as two coefficients (2.53, 0.89); the linear form
 used for it is our reading of the table (flagged unverified in the engine card).
 
@@ -96,6 +102,11 @@ CHURCHER = dict(tau=0.5, a1=0.63, a2=4.00, d1=0.071, d2=1.26, d3=1.52, th1=0.02,
                 mu=-2.36, rho=-3.05, k0=0.70, Hys=2.64, rM=0.24,
                 pbo={"gambiae": (3.41, 5.88, 0.78), "funestus": (2.53, 0.89, 0.0)})
 CHURCHER_SOURCE = "Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277)"
+# v0.17 (ENGINE_NOTES.md, v0.17): the net-type relative effects as engine parameters. Defaults reproduce v0.16:
+#   net_kill_shift  added to alpha1 (hut-mortality logit, Equation 2) for every net type
+#   pbo_gain_scale  multiplies PBO's gain in bioassay-mortality logit (Equation 4)
+#   pbo_adv_decay   per year: a PBO net's outcomes move toward a same-age pyrethroid net's, weight exp(-decay t)
+NET_DEFAULTS = {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0}
 
 # Briet et al. 2020 Malar J, Additional file 2 Table S9 (PermaNet 2.0): (b0, b1 holes, b2 insecticide, b3 interaction).
 BRIET = {
@@ -218,21 +229,102 @@ def resistance_of(resistance, species: str) -> float:
     return float(resistance)
 
 
-def pbo_bioassay(x, complex_: str = "gambiae"):
-    """Churcher 2016 Equation 4 (MathML in PMC5025277): logit(f) = b1 + b2 (x - tau) / (1 + b3 (x - tau))."""
+def net_check(P) -> None:
+    """v0.17: the net-effect parameters' domain (fail closed): a finite kill shift, a PBO gain scale and a PBO
+    advantage decay that are finite and >= 0."""
+    v = {k: P.get(k, d) for k, d in NET_DEFAULTS.items()}
+    if not all(isinstance(x, (int, float)) and np.isfinite(x) for x in v.values()):
+        raise ValueError(f"net-effect parameters must be finite numbers: {v}")
+    if v["pbo_gain_scale"] < 0 or v["pbo_adv_decay"] < 0:
+        raise ValueError(f"pbo_gain_scale and pbo_adv_decay must be >= 0: {v}")
+
+
+def pbo_bioassay(x, complex_: str = "gambiae", gain_scale: float = 1.0):
+    """Churcher 2016 Equation 4 (MathML in PMC5025277): logit(f) = b1 + b2 (x - tau) / (1 + b3 (x - tau)).
+    v0.17: gain_scale s scales PBO's gain in bioassay-mortality logit, logit f_s = logit x + s (logit f - logit x)
+    (s = 1: Equation 4 exactly, the same code path; s = 0: no PBO gain)."""
     C = CHURCHER
     b1, b2, b3 = C["pbo"][complex_]
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
-    return _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+    f = _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+    if gain_scale == 1.0:
+        return f
+    lx = _logit(x)
+    return _expit(lx + float(gain_scale) * (_logit(f) - lx))
 
 
-def hut_new_net(x, pbo: bool, complex_: str = "gambiae"):
-    """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day)."""
+def hut_mortality_ratio(gain_scale: float, x_lo: float, x_hi: float, complex_: str = "gambiae", n: int = 301) -> float:
+    """v0.17 prior rule for pbo_gain_scale: the PBO net's hut mortality over the pyrethroid net's (Churcher Equation 2
+    at Equation 4's f_s and at x), each averaged over bioassay mortality x uniform on [x_lo, x_hi] (a resistance
+    category of a pooled hut-trial estimate)."""
+    C = CHURCHER
+    x = np.linspace(x_lo, x_hi, n)
+    lm = lambda z: _expit(C["a1"] + C["a2"] * (z - C["tau"]))  # noqa: E731
+    return float(np.mean(lm(pbo_bioassay(x, complex_, gain_scale))) / np.mean(lm(x)))
+
+
+def pbo_gain_scale_for_hut_rr(rr: float, x_lo: float, x_hi: float, complex_: str = "gambiae",
+                              s_max: float = 20.0) -> float | None:
+    """The scale whose category-mean hut mortality ratio equals `rr` (bisection; the ratio rises with the scale over
+    the categories used), or None when no scale in [0, s_max] reaches it."""
+    f = lambda s: hut_mortality_ratio(s, x_lo, x_hi, complex_) - rr  # noqa: E731
+    lo, hi = 0.0, s_max
+    if f(lo) > 0 or f(hi) < 0:
+        return None
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if f(mid) < 0 else (lo, mid)
+    return 0.5 * (lo + hi)
+
+
+def engine_adv_decay(x: float, t0_d: float, t1_d: float, P: dict, complex_: str = "gambiae") -> float:
+    """The engine's own waning rate (per year) of a PBO net's advantage over a same-age pyrethroid net between net
+    ages t0_d and t1_d (days): ln(A(t0) / A(t1)) / years, A = the pyrethroid net's feeding share minus the PBO net's,
+    per attempt, holes off (holes add absolute changes, so the advantage is not scaled by them). Feeding, not
+    killing: the killing advantage changes sign with resistance (above x of about 0.2), the feeding advantage does
+    not. With P's pbo_adv_decay set, it is the total waning: Churcher's plus exp(-decay t)."""
+    a = np.array([t0_d, t1_d], float)
+    _, _, s_b = itn_effect(np.ones(2, int), x, a, P, complex_, holes=False)
+    _, _, s_p = itn_effect(np.zeros(2, int), x, a, P, complex_, holes=False)
+    adv = s_p - s_b
+    return float(np.log(adv[0] / adv[1]) / ((t1_d - t0_d) / 365.0))
+
+
+def pbo_adv_decay_extra(early, late, t0_d: float, t1_d: float, xs, complex_: str = "gambiae") -> dict:
+    """v0.17 prior rule for pbo_adv_decay (review round 2): the trial's total waning (adv_decay_from_prs, unclipped)
+    minus the engine's own waning (engine_adv_decay at the defaults) at each resistance level x in xs; the range is
+    the hull over xs of [lo - k(x), hi - k(x)], clipped at 0. Returns {by_x: {x: {k, extra: (pt, lo, hi)}}, range}."""
+    pt, lo, hi = adv_decay_from_prs(early, late, (t1_d - t0_d) / 365.0, clip=False)
+    P0 = dict(NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0)
+    by = {}
+    for x in xs:
+        k = engine_adv_decay(float(x), t0_d, t1_d, P0, complex_)
+        by[float(x)] = {"k": k, "extra": (max(0.0, pt - k), max(0.0, lo - k), max(0.0, hi - k))}
+    return {"trial": (pt, lo, hi), "by_x": by,
+            "range": [round(min(v["extra"][1] for v in by.values()), 3), round(max(v["extra"][2] for v in by.values()), 3)]}
+
+
+def adv_decay_from_prs(early, late, dt_years: float, clip: bool = True) -> tuple:
+    """v0.17 prior rule for pbo_adv_decay from two prevalence ratios (point, lo95, hi95) of one trial, dt_years apart:
+    log PR(t) fades as exp(-decay t), so decay = ln(log PR_early / log PR_late) / dt; its 95% range by the delta method
+    with each SE from its CI and the two estimates taken as independent (conservative: they share clusters), the lower
+    end clipped at 0 (no faster-than-Churcher fading below zero). Returns (point, lo, hi)."""
+    se = lambda t: (np.log(t[2]) - np.log(t[1])) / (2 * 1.959964)  # noqa: E731
+    a, b = -np.log(early[0]), -np.log(late[0])
+    pt = float(np.log(a / b) / dt_years)
+    s = float(np.sqrt((se(early) / a) ** 2 + (se(late) / b) ** 2) / dt_years)
+    return pt, (max(0.0, pt - 1.959964 * s) if clip else pt - 1.959964 * s), pt + 1.959964 * s
+
+
+def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0):
+    """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day). v0.17: kill_shift is added to
+    the hut-mortality intercept alpha1 (Equation 2), so killing, deterrence, feeding and the insecticide decay all
+    follow Churcher's own relationships from the shifted hut mortality; pbo_gain_scale as in pbo_bioassay."""
     C = CHURCHER
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
     if pbo:
-        x = pbo_bioassay(x, complex_)
-    l = _expit(C["a1"] + C["a2"] * (x - C["tau"]))
+        x = pbo_bioassay(x, complex_, pbo_gain_scale)
+    l = _expit(C["a1"] + kill_shift + C["a2"] * (x - C["tau"]))
     m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
     k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
     j = np.clip(1 - l - k, 0.0, 1.0)
@@ -252,14 +344,20 @@ def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae", holes: bool = T
     holes=False)."""
     net_type = np.asarray(net_type)
     age_d = np.maximum(np.asarray(age_d, float), 0.0)
+    shift, scale, lam = (float(P.get(k, d)) for k, d in NET_DEFAULTS.items())
     out = []
     for pbo in (False, True):
-        r0, d0, _, gam = hut_new_net(x, pbo, complex_)
+        r0, d0, _, gam = hut_new_net(x, pbo, complex_, shift, scale)
         dec = np.exp(-gam * age_d)
         r = (r0 - CHURCHER["rM"]) * dec + CHURCHER["rM"]
         d = d0 * dec
         out.append((r, d, dec))
     (r_p, d_p, dec_p), (r_b, d_b, dec_b) = out
+    if lam > 0:
+        # v0.17: the PBO net's advantage over a same-age pyrethroid net fades at pbo_adv_decay per year (PBO lost from
+        # the net); decay 0 is v0.16's code path
+        w = np.exp(-lam * age_d / 365.0)
+        r_b, d_b, dec_b = r_p + w * (r_b - r_p), d_p + w * (d_b - d_p), dec_p + w * (dec_b - dec_p)
     is_pbo = net_type == 1
     r = np.where(is_pbo, r_b, r_p)
     d = np.where(is_pbo, d_b, d_p)
@@ -328,6 +426,153 @@ def cycle(b, w0, y, w, z, tau1=0.69, tau2=2.31):
     p1 = W * p10 / (1 - Z * p10)
     mu = -f * np.log(p1 * p2)
     return f, mu, W
+
+
+def _itn_effect_v016(net_type, x, age_d, P, complex_="gambiae", holes=True):
+    """Frozen copy of the v0.16 net code (Churcher constants only), the reference for V31: at their defaults the
+    v0.17 net-effect parameters must give these outputs bit for bit."""
+    C = CHURCHER
+
+    def new_net(x, pbo):
+        x = np.clip(np.asarray(x, float), 0.0, 1.0)
+        if pbo:
+            b1, b2, b3 = C["pbo"][complex_]
+            x = _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+        l = _expit(C["a1"] + C["a2"] * (x - C["tau"]))
+        m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
+        k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
+        j = np.clip(1 - l - k, 0.0, 1.0)
+        jp, kp, lp = m * j + (1 - m), m * k, m * l
+        s0 = np.clip(kp / C["k0"], 0.0, 1.0)
+        g = _expit(C["mu"] + C["rho"] * (l - C["tau"]))
+        gs = _expit(C["mu"] + C["rho"] * (1 - C["tau"]))
+        return (1 - s0) * jp / (jp + lp), (1 - s0) * lp / (jp + lp), LN2 / ((LN2 / g) / (LN2 / gs) * C["Hys"] * 365.0)
+
+    net_type, age_d = np.asarray(net_type), np.maximum(np.asarray(age_d, float), 0.0)
+    out = []
+    for pbo in (False, True):
+        r0, d0, gam = new_net(x, pbo)
+        dec = np.exp(-gam * age_d)
+        out.append(((r0 - C["rM"]) * dec + C["rM"], d0 * dec, dec))
+    (r_p, d_p, dec_p), (r_b, d_b, dec_b) = out
+    is_pbo = net_type == 1
+    r, d, dec = np.where(is_pbo, r_b, r_p), np.where(is_pbo, d_b, d_p), np.where(is_pbo, dec_b, dec_p)
+    s = np.clip(1 - r - d, 0.0, 1.0)
+    r, d, s = apply_holes(r, d, s, x, age_d, dec, holes and P.get("net_holes", 1.0) > 0)
+    c = P["cfp_kill"] * np.exp(-LN2 * age_d / P["cfp_half"])
+    dual = net_type == 2
+    r, s = np.where(dual, r * (1 - c), r), np.where(dual, s * (1 - c), s)
+    return r, 1 - r - s, s
+
+
+def _self_test_v017(ok, P) -> None:
+    """v0.17 (F6 net-effect ranges): the three net-effect parameters, their defaults and their meaning."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    nt = np.repeat(np.array([0, 1, 2]), 9)
+    ages = np.tile(np.array([0.0, 1.0, 30.0, 180.0, 365.0, 548.0, 730.0, 1100.0, 1500.0]), 3)
+    xs = (0.0, 0.088, 0.25, 0.5, 0.95, 1.0)
+
+    def v31():
+        same = True
+        for cx in ("gambiae", "funestus"):
+            for x in xs:
+                for holes in (True, False):
+                    ref = _itn_effect_v016(nt, x, ages, P, cx, holes)
+                    for Pd in (P, dict(P, **NET_DEFAULTS)):
+                        got = itn_effect(nt, x, ages, Pd, cx, holes)
+                        same &= all(np.array_equal(a, b) for a, b in zip(got, ref))
+        ok(same and NET_DEFAULTS == {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0},
+           "V31 at their defaults (kill shift 0, PBO gain scale 1, PBO advantage decay 0) the net outcomes equal the "
+           "frozen v0.16 code bit for bit (pyrethroid, PBO, dual-AI; 6 resistance levels, 2 complexes, 9 ages, holes on/off)")
+    case("V31", v31)
+
+    def v32():
+        r0, d0, s0, g0 = hut_new_net(0.25, False)
+        r1, d1, s1, g1 = hut_new_net(0.25, False, kill_shift=0.5)
+        r_ref, d_ref, s_ref, g_ref = hut_new_net(0.25 + 0.5 / CHURCHER["a2"], False)
+        ok(d1 > d0 and s1 < s0 and g1 < g0
+           and np.allclose([r1, d1, s1, g1], [r_ref, d_ref, s_ref, g_ref], rtol=1e-12, atol=0),
+           f"V32 a kill shift of +0.5 on Churcher's hut-mortality logit (alpha1) kills more ({float(d0):.3f} -> "
+           f"{float(d1):.3f}), lets fewer feed and decays slower, exactly as a net at bioassay mortality x + 0.5/alpha2")
+    case("V32", v32)
+
+    def v33():
+        Pz = dict(P, pbo_gain_scale=0.0)
+        a = itn_effect(np.ones(9, int), 0.088, ages[:9], Pz)
+        b = itn_effect(np.zeros(9, int), 0.088, ages[:9], Pz)
+        f1 = float(pbo_bioassay(0.088))
+        f2 = float(pbo_bioassay(0.088, gain_scale=2.0))
+        lg = lambda p: np.log(p / (1 - p))  # noqa: E731
+        ok(all(np.allclose(u, v, rtol=0, atol=1e-12) for u, v in zip(a, b))
+           and abs((lg(f2) - lg(0.088)) - 2 * (lg(f1) - lg(0.088))) < 1e-9,
+           f"V33 PBO gain scale: 0 makes a PBO net a pyrethroid net; 2 doubles the PBO gain in bioassay-mortality logit "
+           f"(x 0.088: f {f1:.3f} at scale 1, {f2:.3f} at scale 2)")
+    case("V33", v33)
+
+    def v34():
+        lam = 1.0
+        age = np.array([0.0, 365.0, 730.0])
+        p0 = itn_effect(np.ones(3, int), 0.088, age, P, holes=False)
+        q0 = itn_effect(np.zeros(3, int), 0.088, age, P, holes=False)
+        p1 = itn_effect(np.ones(3, int), 0.088, age, dict(P, pbo_adv_decay=lam), holes=False)
+        w = np.exp(-lam * age / 365.0)
+        ok(all(np.allclose(p1[i], q0[i] + w * (p0[i] - q0[i]), rtol=0, atol=1e-12) for i in range(3))
+           and np.array_equal(p1[1][:1], p0[1][:1]),
+           "V34 PBO advantage decay (per year): a new PBO net is unchanged; at age t its outcomes are a same-age "
+           "pyrethroid net's plus exp(-decay t) times the PBO net's advantage")
+    case("V34", v34)
+
+    def v35():
+        bad = []
+        for k, v in (("pbo_gain_scale", -0.1), ("pbo_adv_decay", -1.0), ("net_kill_shift", float("nan"))):
+            try:
+                net_check(dict(P, **{k: v}))
+                bad.append(k)
+            except ValueError:
+                pass
+        net_check(dict(P, **NET_DEFAULTS))
+        ok(not bad, f"V35 a negative PBO gain scale or decay, or a non-finite kill shift, fails closed (accepted: {bad})")
+    case("V35", v35)
+
+    def v36():
+        # Gleave et al. 2021 Cochrane CD012776.pub3, abstract: unwashed PBO vs standard nets, mosquito mortality, high
+        # resistance (< 30% bioassay mortality) RR 1.84 (1.60-2.11). Rule: the scale whose category-mean hut-mortality
+        # ratio (Churcher Eq. 2 at Eq. 4's f_s vs at x, x uniform on 0-0.30) equals each CI bound
+        r1 = hut_mortality_ratio(1.0, 0.0, 0.30)
+        b = {cx: [pbo_gain_scale_for_hut_rr(t, 0.0, 0.30, cx) for t in (1.60, 2.11)] for cx in ("gambiae", "funestus")}
+        ok(abs(r1 - 2.211) < 0.002 and abs(b["gambiae"][0] - 0.511) < 0.002 and abs(b["gambiae"][1] - 0.912) < 0.002
+           and abs(b["funestus"][0] - 0.316) < 0.002 and abs(b["funestus"][1] - 0.513) < 0.002,
+           f"V36 the PBO gain scale range rule on Gleave 2021's high-resistance hut mortality RR 1.84 (1.60-2.11): "
+           f"Equation 4 (scale 1) gives {r1:.3f}; scales {b}")
+    case("V36", v36)
+
+    def v37():
+        # Staedke et al. 2020 Lancet 395:1292, Table 2 (p. 1299), as-treated PR 0.74 (0.62-0.87) at 6 months and 0.84
+        # (0.72-0.98) at 18 months. Rule: log PR(t) fades as exp(-decay t); delta method, the two estimates taken as
+        # independent (conservative), lower bound clipped at 0
+        pt, lo, hi = adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0, clip=False)
+        # review round 2: the parameter is decay ON TOP OF the engine's own waning of the PBO advantage, so the prior is
+        # the trial's total minus the engine's, at each resistance level of the high-resistance category (x 0-0.30)
+        xs = np.round(np.linspace(0.0, 0.30, 31), 3)
+        rr = pbo_adv_decay_extra((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 182.5, 547.5, xs)
+        applied = {}
+        for x in (0.10, 0.15, 0.25):                   # the application: the engine's total waning equals the trial's
+            lam = rr["by_x"][x]["extra"][0]
+            applied[x] = engine_adv_decay(x, 182.5, 547.5, dict(P, pbo_adv_decay=lam))
+        ok(abs(pt - 0.546) < 0.002 and abs(lo + 0.502) < 0.002 and abs(hi - 1.594) < 0.002
+           and abs(engine_adv_decay(0.15, 182.5, 547.5, P)) < 1e-3 and abs(engine_adv_decay(0.0, 182.5, 547.5, P) - 0.977) < 2e-3
+           and all(abs(v - pt) < 1e-9 for v in applied.values())
+           and rr["range"] == [0.0, round(float(rr["by_x"][0.3]["extra"][2]), 3)] and abs(rr["range"][1] - 1.895) < 2e-3,
+           f"V37 the PBO advantage decay prior is LLINEUP's total waning ({pt:.3f}/y, 95% {lo:.3f} to {hi:.3f}) minus the "
+           f"engine's own (feeding advantage, 6-18 months: 0.977/y at x 0, 0.000 at 0.15, -0.301 at 0.30); applied, the "
+           f"extra rate makes the engine's total equal the trial's ({ {k: round(v, 6) for k, v in applied.items()} }); "
+           f"range over x 0-0.30, clipped at 0: {rr['range']}")
+    case("V37", v37)
 
 
 def _self_test() -> int:
@@ -456,6 +701,7 @@ def _self_test() -> int:
        f"V28 insecticide gone (x = 0.088, 2 years): holes add {sh2[0] - sn2[0]:.3f} to feeding, as Briet's near-untreated net")
     ok(resistance_of({"gambiae": 0.1, "default": 0.5}, "funestus") == 0.5 and resistance_of(0.3, "gambiae") == 0.3,
        "V16 resistance per species, with a default")
+    _self_test_v017(ok, P)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

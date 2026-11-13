@@ -300,8 +300,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     from toolkit.analysis import burden as BV
     anc = BV.anchor_step(A, out0, A.last_events) if BV.section(spec.raw) is not None else None
     if anc is not None:     # F6 S2-5d: absolute burden at the external level; every later evaluation is anchored
-        arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
         out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
         log("burden anchor: " + ", ".join(f"{r['id']} x{r['factor']:.3g}" for r in anc["rows"]))
     events0 = list(A.last_events)
     from toolkit.alloc import costs as acosts
@@ -1964,11 +1964,26 @@ def _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol):
        f"BA19 (review r2 P2) each anchor's interval enters the tornado and an automatic range test: "
        f"{sorted(srow)[:6]}, {sorted(tests)[:8]}")
     dt = next(t for t in DT.prior_range_tests(A) if t["id"] == "anchor_range_N0")
-    rec = DT.run_one(A, dict(dt, values=[A.anchor["rows"]["N0"]["value"] * 0.06, A.anchor["rows"]["N0"]["value"] * 15]),
+    v0 = A.anchor["rows"]["N0"]["value"]          # the test's two ends, moved far apart (review r3: ends by group)
+    rec = DT.run_one(A, dict(dt, ends={0.025: {"anchor:N0": v0 * 0.06}, 0.975: {"anchor:N0": v0 * 15}}),
                      z0, ben0, cost0, plan, R["uncertainty"], out0)
     ok(rec.get("status") == "run" and rec.get("decision_changes") is True,
        f"BA19 (review r2 P2) an anchor that moves the recommendation is found by its range test "
        f"({rec.get('share_units_changed')}, {rec.get('triggered_by')})")
+    import tempfile
+    saved_dts = A.spec.raw["analysis"].get("decision_tests")
+    A.spec.raw["analysis"]["decision_tests"] = list(saved_dts or []) + [
+        {"id": "anchor_range_N0", "type": "envelope", "values": [9000.0], "text": "t"}]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            DT.run_all(A, z0, out0, ben0, cost0, plan, R["uncertainty"], td)
+            ran = os.listdir(os.path.join(td, DT.DIR)) if os.path.isdir(os.path.join(td, DT.DIR)) else []
+        ok(False, f"BA24 (review r3) a declared test id equal to an automatic one is refused before any test runs ({ran})")
+    except ValueError as e:
+        ok("anchor_range_N0" in str(e), f"BA24 (review r3) a declared test id equal to an automatic one is refused "
+           f"before any test runs: {e}")
+    finally:
+        A.spec.raw["analysis"]["decision_tests"] = saved_dts
 
 
 
