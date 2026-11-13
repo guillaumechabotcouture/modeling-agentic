@@ -297,6 +297,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "what the model reaches inside calibration.range (clamped at a bound)")
     # ---- point and optimum
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    from toolkit.analysis import burden as BV
+    anc = BV.anchor_step(A, out0, A.last_events) if BV.section(spec.raw) is not None else None
+    if anc is not None:     # F6 S2-5d: absolute burden at the external level; every later evaluation is anchored
+        arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        log("burden anchor: " + ", ".join(f"{r['id']} x{r['factor']:.3g}" for r in anc["rows"]))
     events0 = list(A.last_events)
     from toolkit.alloc import costs as acosts
     floors0 = acosts.floor_report(A.last_cost_floors, A.alloc)     # F6 S1-3: reported, never read as a real cost
@@ -334,7 +340,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         point["reserve"] = reserve
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
         point["headline_variant"] = A.headline_variant
-    arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]])
+    arts["point"] = S.write("point", point, "toolkit/analysis/core.py", [arts["calibration"]]
+                            + ([arts["burden_anchor"]] if anc else []))
     bnd = None
     if model.kind == "emulator":      # F6 S2-4b: the emulator's order near package switches, against engine runs
         from toolkit.analysis import boundary as BD
@@ -344,8 +351,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     log(f"point: {point['averted'][A.primary]:,.0f} {A.primary} averted, cost {point['cost_allocated']:,.0f}, "
         f"mix {point['mix']}")
     # ---- uncertainty
-    from toolkit.analysis import burden as BV
     bcol = BV.Collector(A) if BV.section(spec.raw) is not None else None      # F6 S2-5: references' values per draw
+    bcol = bcol if bcol is None or bcol.refs else None          # S2-5d: anchor rows alone validate nothing
     # F6 S2-6: each fixed plan's outcome and cost in every draw; each solved variant's too (its cost against the budget)
     fcol = V.Draws(A, V.solved_plans(A, ben0, cost0)) if V.config(spec.raw).get("variants") else None
     hooks = [h.add for h in (bcol, fcol) if h is not None]
@@ -443,17 +450,18 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
     c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
-                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd)
+                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
-                             + ([arts["burden_validation"]] if bvd else []))
+                             + ([arts["burden_validation"]] if bvd else [])
+                             + ([arts["burden_anchor"]] if anc else []))
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
-                              + (["burden_validation"] if bvd else []),
+                              + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
@@ -805,6 +813,7 @@ def _self_test() -> int:
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
         _self_test_burden_e2e(ok, d, q)
+        _self_test_anchor_e2e(ok, d, q)
     with tempfile.TemporaryDirectory() as d:
         # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
         _direct_toy(d)
@@ -1720,6 +1729,59 @@ def _self_test_burden_e2e(ok, d, q):
         M.pops = saved
     ok(err is None and all("burden" not in got[i] for i in A.ids),
        f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
+
+
+def _self_test_anchor_e2e(ok, d, q):
+    """F6 S2-5d: anchor rows on the emulator path: each region's cases and all units' DALYs scaled to the external
+    level over the model window; every package's outcome moves by its unit's factor, reductions are kept."""
+    import yaml
+    from toolkit.analysis import burden as BV, contract
+    open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval", "group_by")),
+        "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,,",
+        *[f"N{k},r{k},,cases,count,,1,{v},{v / 2},{2 * v},estimated,synthetic N,ratio,,,TOY-TARGETS,,anchor,,region"
+          for k, v in ((0, 2000.0), (1, 1500.0), (2, 1000.0))],
+        "ND,*,,dalys,count,,1,10000,5000,20000,estimated,synthetic ND,ratio,,,REF-ND,,anchor,,"]) + "\n")
+    try:
+        _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2],
+                                                               window_metrics={"cases": "prev", "dalys": "prev"}))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        ba = yaml.safe_load(open(os.path.join(d, "analysis", "burden_anchor.yaml")))["data"]
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA6 a run with anchor rows completes and writes analysis/burden_anchor.yaml: {type(e).__name__}: {e}")
+        return
+    A, rows = R["_A"], {x["id"]: x for x in ba["rows"]}
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    anchored = A.evaluate(A.theta0, z0)
+    saved, A.anchor = A.anchor, None
+    try:
+        raw_out, raw_ben, _c = A.evaluate(A.theta0, z0)
+    finally:
+        A.anchor = saved
+    reg = {i: A.by_id[i]["region"] for i in A.ids}
+    f = {i: (rows[f"N{reg[i][1]}"]["factor"], rows["ND"]["factor"]) for i in A.ids}
+    tol = lambda a, b: abs(a - b) <= 1e-9 * max(abs(b), 1.0)  # noqa: E731
+    ok(set(rows) == {"N0", "N1", "N2", "ND"} and rows["N0"]["independent"] is False
+       and rows["N0"]["overlapping_source_ids"] == ["TOY-TARGETS"] and rows["ND"]["independent"] is True
+       and all(tol(rows[k]["factor"], rows[k]["value"] / rows[k]["model"]) for k in rows),
+       f"BA6 the artifact records each anchor's model value, external value, factor and independence: "
+       f"{ {k: round(r['factor'], 4) for k, r in rows.items()} }")
+    ok(all(tol(anchored[0][i]["y"][k]["cases"], raw_out[i]["y"][k]["cases"] * f[i][0])
+           and tol(anchored[0][i]["y"][k]["dalys"], raw_out[i]["y"][k]["dalys"] * f[i][1])
+           and tol(anchored[1][i][k], raw_ben[i][k] * f[i][1]) for i in A.ids for k in A.pk)
+       and all(tol(anchored[0][i]["y"][k]["cases"] / anchored[0][i]["y"][A.comp]["cases"],
+                   raw_out[i]["y"][k]["cases"] / raw_out[i]["y"][A.comp]["cases"]) for i in A.ids for k in A.pk),
+       "BA3 with an anchor every package's outcome and benefit move by the unit's factor; package/comparator ratios "
+       "are unchanged; with the anchor removed the evaluation is the engine's")
+    tot = sum(raw_out[i]["y"][A.comp]["dalys"] * f[i][1] for i in A.ids)
+    ok(tol(R["point"]["comparator_total"]["dalys"], tot)
+       and tol(sum(raw_out[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == "r0") * rows["N0"]["factor"],
+               2000.0),
+       f"BA6 the point outcomes are the un-anchored ones times the factor ({R['point']['comparator_total']['dalys']:.6g}"
+       f" vs {tot:.6g}); the anchored arm's window burden is the external value")
+    fs = contract.gate_findings(d)
+    res = open(os.path.join(d, "results.md")).read()
+    ok(not [x for x in fs if x["kind"].startswith("burden_anchor")] and "anchored to external estimates" in res
+       and "[CLAIM:" not in res, f"BA6 the gate accepts the anchor artifact and results.md reports it: {fs}")
 
 
 def _self_test_floors_e2e(ok, d, q):

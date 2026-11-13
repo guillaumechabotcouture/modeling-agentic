@@ -98,6 +98,9 @@ class Analysis:
         # envelope that affordability is judged against.
         self.plan_budget = None
         self.reserve_fraction = None
+        # F6 S2-5d: the burden anchor (toolkit/analysis/burden.py anchor_step): every evaluation's anchored outcomes at
+        # the external level; None (the default) leaves the outcomes as the model predicts them
+        self.anchor = None
 
     def set_reserve(self, fraction):
         """F6 S1-1b: plan within `fraction` of every allocatable budget (None: no reserve)."""
@@ -152,6 +155,9 @@ class Analysis:
         ids = ids or self.ids
         out = self.model.predict(zs, theta, ids, noise=noise)
         self.last_events = list(getattr(self.model, "last_events", []) or [])
+        if self.anchor is not None:      # F6 S2-5d: in a draw (noise given) each anchor's factor is drawn too
+            from toolkit.analysis import burden as BU
+            BU.apply_anchor(self.anchor, out, ids, noise)
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]

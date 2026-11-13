@@ -29,7 +29,18 @@ never wider than its widest band | overlap: the model interval meets [lower, upp
 dataset) and derived_from (its upstream source ids, ; separated, may be empty). Optional columns (S2-5b): role (blank
 or checked | report_only: computed and reported beside the checked rows, never a finding) and interval (blank or
 published | none: no interval is published, lower and upper are left blank, and the row is judged on its ratio band
-alone; overlap needs a published interval).
+alone; overlap needs a published interval), and group_by (blank: `group`; else the units-table column this row's group
+names).
+
+Anchor rows (S2-5d, role anchor): an estimated, all-ages row (count or rate) that sets its group's absolute level
+instead of being judged. With `window` declared (required), factor = value / the arm's model-window value for the
+group; every package's outcome in the group's units is multiplied by it (Analysis.anchor, set before the plan is
+solved), so reductions relative to the comparator are the engine's and absolute burden, and so outcomes averted, are
+the external level. Each unit is covered by exactly one anchor row per anchored outcome; factors outside
+thresholds.yaml `burden_anchor` stop the analysis. In a draw with the emulator error each factor is drawn log-uniformly
+within lower/model to upper/model. A reported DALY outcome that is not anchored itself follows its anchored parts
+through daly_parts (deaths, cases, yll_per_death `all`), else the analysis stops. An anchor may derive from a
+calibration source (it sets a level, it validates nothing): analysis/burden_anchor.yaml records the overlap.
 
 Independence is declared, not inferred: every calibration input names its source ids (observation targets per row in
 their `source` column; `calibration.targets.source_id`, `calibration.target_source_id` for the inversion target column,
@@ -67,7 +78,8 @@ COLUMNS = ("id", "group", "age_band", "outcome", "measure", "per", "year", "valu
 KINDS = ("estimated", "reported")
 TOLERANCES = ("ratio", "overlap")
 STATUSES = ("within", "outside", "information", "unmatched")
-OPTIONAL = {"role": ("checked", "report_only"), "interval": ("published", "none")}    # S2-5b: blank = the first
+OPTIONAL = {"role": ("checked", "report_only", "anchor"), "interval": ("published", "none")}  # blank = the first
+ANCHOR = "anchor"                   # S2-5d: a row that sets its group's absolute level (anchor_factors)
 WINDOW = "burden_validation"        # the engine's named window for validation.burden.window
 
 
@@ -190,7 +202,8 @@ def provenance(s, data=None) -> dict:
     rel = lambda q: os.path.relpath(q, s.base) if os.path.isabs(q) else q  # noqa: E731
     refs = load_references(s, data)[0] if data is not None else []
     cids, cbad = calibration_source_ids(s)
-    shared = [x["id"] for x in refs if x["source_id"] in cids or set(x["derived_from"]) & set(cids)]
+    shared = [x["id"] for x in refs if x["role"] != ANCHOR and (x["source_id"] in cids
+                                                                 or set(x["derived_from"]) & set(cids))]
     return {"csv": config(s)["csv"], "realpath": me[0] if me else None, "sha256": me[2] if me else None,
             "calibration_inputs": [{"path": rel(q), "sha256": i[2] if i else None} for q, i in ins],
             "calibration_source_ids": cids,
@@ -220,8 +233,13 @@ def sheet_lines(raw, run_dir, data=None) -> list[str]:
             f"(calibration sources: {', '.join(pv['calibration_source_ids']) or 'none declared'}). Reference file "
             f"`{pv['csv']}` (sha256 `{(pv['sha256'] or 'unreadable')[:16]}`).", "",
             "| Reference | Kind | Source id | Derived from | Citation |", "|---|---|---|---|---|"]
-    out += [f"| {x['id']} | {x['kind']} | {x['source_id']} | {', '.join(x['derived_from']) or 'none'} | {x['source']} |"
-            for x in refs]
+    if anchor_rows(refs):
+        out += ["Rows marked anchor set the absolute level of their outcome in their group's units (every package "
+                "times external value / model value over the model window); they are not judged and may come from a "
+                "calibration source.", ""]
+    out += [f"| {x['id']} | {x['kind']}"
+            + (f", anchor ({x['group_by'] or config(sp)['group']})" if x["role"] == ANCHOR else "")
+            + f" | {x['source_id']} | {', '.join(x['derived_from']) or 'none'} | {x['source']} |" for x in refs]
     return out + [f"- problem: {b}" for b in bad] + [""]
 
 
@@ -283,10 +301,10 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
     if dp is not None:
         y = dp.get("yll_per_death") if isinstance(dp, dict) else None
         names = {p.name for p in s.engine().parameters()}
-        if not isinstance(dp, dict) or set(dp) - {"dalys", "deaths", "yll_per_death"} or (
+        if not isinstance(dp, dict) or set(dp) - {"dalys", "deaths", "cases", "yll_per_death"} or (
                 y is not None and not (isinstance(y, dict) and (set(y) == {"all"} or set(y) == set(pops))
                                        and all((_num(x) or 0) > 0 or x in names for x in y.values()))):
-            bad.append(f"{P}.daly_parts: {{dalys, deaths, yll_per_death: {{all or every population group: a positive "
+            bad.append(f"{P}.daly_parts: {{dalys, deaths, cases, yll_per_death: {{all or every population group: a positive "
                        "number or an engine parameter}}}}")
     if not isinstance(cfg["csv"], str) or not cfg["csv"]:
         return [], bad + [f"{P}.csv: the reference estimates file"]
@@ -307,7 +325,8 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
         return [], bad + [f"{P}.csv: {e}"]
     if not rows or set(COLUMNS) - set(rows[0]):
         return [], bad + [f"{P}.csv: needs a row and the columns {', '.join(COLUMNS)}"]
-    groups = {str(u.get(cfg["group"])) for u in units} if cfg["group"] and cfg["group"] in units[0] else set()
+    ucols = set(units[0]) if units else set()
+    gvals = lambda c: {str(u.get(c)) for u in units} if c and c in ucols else set()  # noqa: E731
     outs = s.outcomes()
     t0, t1 = (float(x) for x in s["objective"]["horizon"])
     mw, wm = None, cfg["window_metrics"]
@@ -340,9 +359,11 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
         if not re.fullmatch(r"[A-Za-z0-9_\-]+", rid) or rid in seen:
             e.append("id: unique, letters, digits, _ or -")
         seen.add(rid)
-        g, band = str(r["group"]), str(r["age_band"] or "").strip()
-        if g != "*" and g not in groups:
-            e.append(f"group {g!r} is not a value of {cfg['group']} (or *): no unit to compare")
+        g, band, gb = str(r["group"]), str(r["age_band"] or "").strip(), str(r.get("group_by") or "").strip()
+        if gb and gb not in ucols:
+            e.append(f"group_by {gb!r} is not a units-table column")
+        elif g != "*" and g not in gvals(gb or cfg["group"]):
+            e.append(f"group {g!r} is not a value of {gb or cfg['group']} (or *): no unit to compare")
         if band and band not in pops:
             e.append(f"age_band {band!r} is not a decision_units.populations group")
         if mw and wm and r["outcome"] not in wm:
@@ -363,6 +384,11 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
                      f"{'model' if mw else 'decision'} window {t0:g}-{t1:g}")
         opt = {k: str(r.get(k) or "").strip() or v[0] for k, v in OPTIONAL.items()}
         e += [f"{k} {opt[k]!r}: blank, or one of {', '.join(v)}" for k, v in OPTIONAL.items() if opt[k] not in v]
+        if opt["role"] == ANCHOR:       # S2-5d
+            e += [x for c, x in ((r["kind"] != "estimated", "an anchor row is kind estimated"),
+                                 (band, "an anchor row has no age band (all ages; age-banded anchors are not supported)"),
+                                 (cfg["window"] is None, "an anchor row needs validation.burden.window: the level is set "
+                                  "from the model window's burden outputs, never the decision horizon")) if c]
         val, lo, hi = _num(r["value"]), _num(r["lower"]), _num(r["upper"])
         if opt["interval"] == "none":           # S2-5b: no published interval; lower and upper stay blank
             if str(r["lower"] or "").strip() or str(r["upper"] or "").strip() or val is None or val < 0:
@@ -395,14 +421,17 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
         refs.append({"id": rid, "group": g, "age_band": band or None, "outcome": r["outcome"],
                      "measure": r["measure"], "per": per if r["measure"] == "rate" else None, "year": yr,
                      "year_gap": gap, "value": val, "lower": lo, "upper": hi, "kind": r["kind"], **opt, "window": mw,
+                     "group_by": gb or None,
                      "source": r["source"].strip(), "source_id": sid, "derived_from": der, "tolerance": {"type": r["tolerance"], "ratio_band": list(band_r)
                                                                   if r["tolerance"] == "ratio" else None}})
-    if refs and not any(x["kind"] == "estimated" and x["role"] == "checked" for x in refs):
+    if refs and not any(x["kind"] == "estimated" and x["role"] in ("checked", ANCHOR) for x in refs):
         bad.append(f"{P}.csv: no estimated reference among the checked rows (reported values and report-only rows "
-                   "are never judged)")
+                   "are never judged) and no anchor row")
     cids, cbad = calibration_source_ids(s)       # Codex r2: declared provenance, never numeric coincidence
     bad += [f"{P}: every calibration input declares its sources: {x}" for x in cbad]
     for x in refs:
+        if x["role"] == ANCHOR:         # S2-5d: an anchor sets a level, it validates nothing; the artifact records it
+            continue
         if x["source_id"] in cids:
             bad.append(f"{P}.csv reference {x['id']}: source_id {x['source_id']} is a calibration source; references "
                        "validate, they are never fitted")
@@ -418,8 +447,8 @@ def _years(A) -> float:
     return t1 - t0
 
 
-def _members(A, cfg, g) -> list:
-    return [i for i in A.ids if g == "*" or str(A.by_id[i].get(cfg["group"])) == g]
+def _members(A, col, g) -> list:
+    return [i for i in A.ids if g == "*" or str(A.by_id[i].get(col)) == g]
 
 
 def _pop(A, ids, band) -> float:
@@ -432,7 +461,7 @@ def _value(A, cfg, ref, out, arm):
     """The arm's annual mean over the window for the reference's group (a rate per `per` people of its band), or None
     when no unit (or no population, or no model-window output) matches. With a model window (S2-5b) the window is
     the reference's, and the totals are the model's `burden` outputs (window metric x population)."""
-    ids = _members(A, cfg, ref["group"])
+    ids = _members(A, ref.get("group_by") or cfg["group"], ref["group"])
     if not ids:
         return None
     if ref.get("window"):
@@ -466,6 +495,8 @@ def by_population(A, theta, zs, bands, arm) -> dict:
             m.pops = {b: A.spec["decision_units"]["populations"][b]}
             m.packages = list(dict.fromkeys([A.comp, arm]))
             res[b] = m.predict(zs, theta, A.ids)
+            if getattr(A, "anchor", None) is not None:      # S2-5d: the anchored level, as A.evaluate gives it
+                apply_anchor(A.anchor, res[b], A.ids)
             ev += list(getattr(m, "last_events", []) or [])        # read before the state is restored
     finally:
         m.pops, m.packages, m.last_events = saved
@@ -482,6 +513,7 @@ class Collector:
         self.refs, bad = load_references(A.spec, self.data)
         if bad:
             raise ValueError("validation.burden: " + "; ".join(bad))
+        self.refs = [r for r in self.refs if r["role"] != ANCHOR]      # S2-5d: anchors are never judged
         self.draws = {r["id"]: [] for r in self.refs if not r["age_band"] or r["window"]}   # S2-5c: windowed too
 
     def add(self, out, events=(), cost=None):
@@ -610,6 +642,218 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
             "statement": f"the {arm} arm's annual mean over {t0:g}-{t1:g} against each reference's year"}
 
 
+# --------------------------------------------------------------------------- anchor (F6 S2-5d)
+class AnchorError(ValueError):
+    """An anchor that cannot set the absolute level: the analysis stops (fail closed)."""
+
+
+def anchor_bounds() -> tuple[float, float]:
+    """thresholds.yaml burden_anchor: the factors (point and interval ends) an anchor may apply."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        b = yaml.safe_load(f)["burden_anchor"]
+    return float(b["factor_min"]), float(b["factor_max"])
+
+
+def anchor_rows(refs) -> list[dict]:
+    return [r for r in refs or [] if r.get("role") == ANCHOR]
+
+
+def _daly_composition(A, cfg, anchored) -> dict | None:
+    """How a reported DALY outcome that is not anchored itself follows its anchored parts: YLL = deaths x
+    yll_per_death, YLD = DALYs - YLL (floored at 0), anchored DALYs = f_deaths x YLL + f_cases x YLD. None when no
+    DALY outcome is reported, it is anchored itself, or no other outcome is anchored. Refused when daly_parts cannot
+    say how (DALYs are never left unanchored silently)."""
+    dp = cfg["daly_parts"] if isinstance(cfg["daly_parts"], dict) else {}
+    dn, de, dc = dp.get("dalys", "dalys"), dp.get("deaths", "deaths"), dp.get("cases", "cases")
+    parts = set(anchored) - {dn}
+    if dn not in A.outcomes or dn in anchored or not parts:
+        return None
+    y = dp.get("yll_per_death")
+    why = ("none is declared" if not dp else f"{de} is not reported" if de not in A.outcomes else
+           "yll_per_death must be {all: <number | parameter>} (by population group needs deaths by group, which the "
+           "evaluation does not carry)" if not (isinstance(y, dict) and set(y) == {"all"}) else
+           f"the anchored {sorted(parts - {de, dc})} are neither daly_parts.deaths nor daly_parts.cases"
+           if parts - {de, dc} else None)
+    if why:
+        raise AnchorError(f"{dn} is reported and built from the anchored {sorted(parts)}: validation.burden.daly_parts "
+                          f"must say how ({why}); DALYs are never left unanchored")
+    return {"outcome": dn, "deaths": de, "cases": dc, "yll_per_death": _param(A, y["all"]),
+            "statement": f"{dn} = f({de}) x {de} x years of life lost per death + f({dc}) x the rest (floored at 0); "
+                         "f = 1 for an outcome with no anchor"}
+
+
+def anchor_factors(A, cfg, refs, out, arm) -> dict:
+    """{units: {unit: {outcome: (factor, lo, hi, row id)}}, rows: {row id: (factor, lo, hi)}, dalys: the DALY
+    composition or None, record: the burden_anchor artifact's payload}. factor = the row's value / the arm's value over
+    the model window for its group (_value); its interval is lower/model to upper/model (the point with no published
+    interval). Every unit is covered by exactly one row of each anchored outcome."""
+    fmin, fmax = anchor_bounds()
+    cids = set(calibration_source_ids(A.spec)[0])
+    units, rows, rec = {i: {} for i in A.ids}, {}, []
+    for r in anchor_rows(refs):
+        m = _value(A, cfg, r, out, arm)
+        if m is None or not m > 0:
+            raise AnchorError(f"anchor {r['id']} ({r['outcome']} in {r['group']}): the {arm} arm's model value over "
+                              f"the window is {m}; a factor needs a positive model value")
+        f = r["value"] / m
+        lo, hi = (f, f) if r["lower"] is None else (r["lower"] / m, r["upper"] / m)
+        if not all(fmin <= x <= fmax for x in (lo, f, hi)):
+            raise AnchorError(f"anchor {r['id']} ({r['outcome']} in {r['group']}): factor {f:.4g} (interval "
+                              f"{lo:.4g}-{hi:.4g}) outside [{fmin:g}, {fmax:g}] (thresholds.yaml burden_anchor)")
+        col = r["group_by"] or cfg["group"]
+        ids = _members(A, col, r["group"])
+        for i in ids:
+            units[i].setdefault(r["outcome"], []).append((f, lo, hi, r["id"]))
+        rows[r["id"]] = (f, lo, hi)
+        hit = sorted(({r["source_id"]} | set(r["derived_from"])) & cids)
+        rec.append({**{k: r[k] for k in ("id", "outcome", "group", "measure", "per", "year", "value", "lower", "upper",
+                                         "source", "source_id", "derived_from")},
+                    "group_by": col, "model": m, "factor": f, "interval": [lo, hi], "n_units": len(ids),
+                    "independent": not hit, "overlapping_source_ids": hit})
+    for o in sorted({r["outcome"] for r in anchor_rows(refs)}):
+        for n, what in ((0, "no anchor row"), (2, "more than one anchor row")):
+            bad = [i for i in A.ids if (len(units[i].get(o, [])) >= 2 if n else not units[i].get(o))]
+            if bad:
+                raise AnchorError(f"{o}: units {bad[:5]} ({len(bad)}) are covered by {what}; each unit needs exactly "
+                                  "one per anchored outcome")
+    comp = _daly_composition(A, cfg, {r["outcome"] for r in anchor_rows(refs)})
+    w = [float(x) for x in cfg["window"]]
+    return {"units": {i: {o: v[0] for o, v in d.items()} for i, d in units.items()}, "rows": rows, "dalys": comp,
+            "record": {"arm": arm, "window": w, "rows": rec, "factor_bounds": [fmin, fmax], "dalys": comp,
+                       "units": {o: sum(o in d for d in units.values()) for o in sorted({x["outcome"] for x in rec})},
+                       "statement": f"each anchored outcome of every package, in each unit, times its group's factor: "
+                                    f"the external value over the {arm} arm's mean over {w[0]:g}-{w[1]:g}"}}
+
+
+def _scale(d, fu, comp):
+    orig = dict(d)
+    for o, x in fu.items():
+        if o in d:
+            d[o] = orig[o] * x
+    if comp and comp["outcome"] in d:
+        if comp["deaths"] not in orig:
+            raise AnchorError(f"{comp['outcome']} is built from anchored outcomes but {comp['deaths']} is not beside "
+                              "it in the outputs")
+        yll = orig[comp["deaths"]] * comp["yll_per_death"]
+        d[comp["outcome"]] = fu.get(comp["deaths"], 1.0) * yll + fu.get(comp["cases"], 1.0) * max(
+            orig[comp["outcome"]] - yll, 0.0)
+
+
+def apply_anchor(anchor, out, ids, rng=None) -> None:
+    """Replace each unit's entry in `out` by one whose every package's anchored outcomes (and the window burden, by
+    population group too) are multiplied by the unit's factor. The model's own dicts are never changed: a model may
+    return the same objects twice (a cache, the boundary check's stub), and anchoring them again would compound. With
+    `rng` (an uncertainty draw), each row's factor is drawn once, log-uniformly within its interval, from that
+    generator; without, the point factor."""
+    import copy
+    f = {}
+    for rid in sorted(anchor["rows"]):
+        p, lo, hi = anchor["rows"][rid]
+        f[rid] = p if rng is None or not hi > lo else float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
+    comp = anchor["dalys"]
+    for i in ids:
+        fu = {o: f[v[3]] for o, v in anchor["units"][i].items()}
+        out[i] = dict(out[i], **{k: copy.deepcopy(out[i][k]) for k in ("y", "burden", "burden_group") if k in out[i]})
+        for d in list(out[i]["y"].values()) + list((out[i].get("burden") or {}).values()):
+            _scale(d, fu, comp)
+        for bg in (out[i].get("burden_group") or {}).values():
+            for P in sorted({P for v in bg.values() for P in v}):
+                d = {o: v[P] for o, v in bg.items() if P in v}
+                _scale(d, fu, comp)
+                for o, x in d.items():
+                    bg[o][P] = x
+
+
+def anchor_step(A, out, events) -> dict | None:
+    """The anchor from the point evaluation `out` (its model corrections `events` guarded on the arm): sets
+    A.anchor and returns the burden_anchor artifact's payload; None when no row is an anchor."""
+    cfg = config(A.spec)
+    refs, bad = load_references(A.spec, read_reference(A.spec.base, cfg["csv"]))
+    if bad:
+        raise ValueError("validation.burden: " + "; ".join(bad))
+    if not anchor_rows(refs):
+        return None
+    guard_point(A, cfg["arm"], events, "burden anchor arm")
+    fac = anchor_factors(A, cfg, refs, out, cfg["arm"])
+    A.anchor = fac
+    return fac["record"]
+
+
+def anchor_findings(raw, data, expected) -> list[dict]:
+    """Gate findings, never declarable. `expected`: the declared references (None: unreadable, reported elsewhere).
+    With anchor rows declared, analysis/burden_anchor.yaml holds each exactly once with its declared metadata, a factor
+    equal to value / model inside the bounds and its interval; with none, there is no such artifact."""
+    if section(raw) is None or expected is None:
+        return []
+    F, exp = "analysis/burden_anchor.yaml", {r["id"]: r for r in anchor_rows(expected)}
+    if not exp:
+        return [] if data is None else [_f("burden_anchor_inconsistent", f"{F} exists but the spec declares no anchor "
+                                           "rows", "burden_anchor", False)]
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return [_f("burden_anchor_missing", f"the spec declares anchor rows {sorted(exp)} but {F} is missing or has no "
+                   "rows", "burden_anchor", False)]
+    ids = [str(r.get("id")) if isinstance(r, dict) else None for r in rows]
+    out = [_f("burden_anchor_missing", f"{F}: anchor {i} is not in the artifact", f"burden_anchor:{i}", False)
+           for i in sorted(set(exp) - set(ids))]
+    out += [_f("burden_anchor_inconsistent", f"{F}: row {i} is not a declared anchor, or appears twice",
+               f"burden_anchor:{i}", False) for i in sorted({str(i) for i in ids if i not in exp or ids.count(i) > 1})]
+    fmin, fmax = anchor_bounds()
+    dflt = (section(raw) or {}).get("group") or (raw.get("decision_units") or {}).get("region")
+    close = lambda a, b: _num(a) is not None and abs(_num(a) - b) <= 1e-9 * max(abs(b), 1e-300)  # noqa: E731
+    for r in rows:
+        i = str(r.get("id")) if isinstance(r, dict) else None
+        if i not in exp or ids.count(i) > 1:
+            continue
+        e = exp[i]
+        diff = [k for k in ("outcome", "group", "measure", "per", "value", "lower", "upper", "source_id")
+                if r.get(k) != e.get(k)] + (["group_by"] if r.get("group_by") != (e["group_by"] or dflt) else [])
+        m, f, iv = _num(r.get("model")), _num(r.get("factor")), r.get("interval")
+        want = None if not m or m <= 0 else [e["value"] / m] + ([e["lower"] / m, e["upper"] / m]
+                                                               if e["lower"] is not None else [e["value"] / m] * 2)
+        good = want is not None and close(f, want[0]) and fmin <= f <= fmax and isinstance(iv, list) and len(iv) == 2 \
+            and close(iv[0], want[1]) and close(iv[1], want[2])
+        if diff or not good:
+            out.append(_f("burden_anchor_inconsistent", f"{F}: anchor {i} " + (f"differs from the declared file in "
+                          f"{diff}" if diff else "has a factor or interval that is not value / model inside "
+                          f"[{fmin:g}, {fmax:g}]"), f"burden_anchor:{i}", False))
+    return out
+
+
+def anchor_claims(c, art, data) -> list[dict]:
+    cl = []
+    for j, r in enumerate(data["rows"]):
+        f, k = f"data.rows[{j}]", f"burden_anchor.{r['id']}"
+        cl += [c(f"{k}.model", "scalar", art, f"{f}.model", r["outcome"]),
+               c(f"{k}.value", "scalar", art, f"{f}.value", r["outcome"]),
+               c(f"{k}.factor", "scalar", art, f"{f}.factor", "ratio"),
+               c(f"{k}.low", "scalar", art, f"{f}.interval[0]", "ratio"),
+               c(f"{k}.high", "scalar", art, f"{f}.interval[1]", "ratio")]
+    return cl
+
+
+def anchor_results_lines(data) -> list[str]:
+    t0, t1 = data["window"]
+    L = ["## Absolute burden anchored to external estimates", "",
+         f"Every package's anchored outcomes are multiplied, in each unit, by its group's factor: the external value "
+         f"over the {data['arm']} arm's annual mean over {t0:g}-{t1:g} for that group (`validation.burden`, role "
+         "anchor). Reductions relative to the comparator are the engine's; absolute burden, and so outcomes averted, "
+         "are at the external level. In uncertainty draws that carry the emulator error, each factor is drawn "
+         "log-uniformly within its interval; elsewhere it is the point factor.", "",
+         "| Anchor | Outcome | Group | Units | Model | External | Factor (interval) | Independent of the calibration |",
+         "|---|---|---|---|---|---|---|---|"]
+    for r in data["rows"]:
+        k = f"burden_anchor.{r['id']}"
+        unit = f" per {r['per']:g}" if r["measure"] == "rate" else ""
+        L.append(f"| {r['id']} ({r['source']}; {r['source_id']}) | {r['outcome']}{unit} | "
+                 f"{'all units' if r['group'] == '*' else r['group_by'] + ' ' + r['group']} | {r['n_units']} | "
+                 f"[CLAIM:{k}.model] | [CLAIM:{k}.value] | [CLAIM:{k}.factor] ([CLAIM:{k}.low] to [CLAIM:{k}.high]) | "
+                 + ("yes" if r["independent"] else "no: shares " + ", ".join(r["overlapping_source_ids"])) + " |")
+    if data.get("dalys"):
+        L += ["", f"DALYs follow their anchored parts: {data['dalys']['statement']}."]
+    return L + [""]
+
+
 # --------------------------------------------------------------------------- gate, claims, results.md
 def _f(kind, claim, key, declarable):
     return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE", "claim": claim,
@@ -617,8 +861,8 @@ def _f(kind, claim, key, declarable):
 
 
 META = ("group", "age_band", "outcome", "measure", "per", "year", "year_gap", "value", "lower", "upper", "kind",
-        "source", "source_id", "derived_from", "tolerance", "role", "interval", "window")
-META_DEFAULT = {"role": "checked", "interval": "published", "window": None}     # S2-5b: artifacts written before it
+        "source", "source_id", "derived_from", "tolerance", "role", "interval", "window", "group_by")
+META_DEFAULT = {"role": "checked", "interval": "published", "window": None, "group_by": None}   # artifacts before
 
 
 def findings(raw, data, expected=None) -> list[dict]:
@@ -631,6 +875,10 @@ def findings(raw, data, expected=None) -> list[dict]:
         return []
     F = "analysis/burden_validation.yaml"
     rows = (data or {}).get("references") if isinstance(data, dict) else None
+    anchored = bool(anchor_rows(expected))          # S2-5d: anchor rows are anchor_findings', never judged here
+    expected = None if expected is None else [r for r in expected if r.get("role") != ANCHOR]
+    if anchored and not expected and not rows:
+        return []
     if expected is None or not isinstance(rows, list) or not rows:
         return [_f("burden_validation_missing", f"the spec declares validation.burden but {F} has no references"
                    if expected is not None else "the declared references could not be read to check " + F,
@@ -1131,6 +1379,10 @@ def _self_test() -> int:
            f"BV27 a file swapped during sheet generation: the sheet shows and binds the bytes it read, and signing "
            f"refuses the new file (footer {str(foot)[:12]}, refused {refused})")
     _self_test_s25b(ok, th)
+    try:
+        _self_test_anchor(ok)
+    except Exception as e:  # noqa: BLE001 -- a crash is a failed case, not a skipped one
+        ok(False, f"BA the anchor self-tests raised {type(e).__name__}: {e}")
     # DALY parts arithmetic on a stub analysis
     class _A:
         outcomes = ["dalys", "deaths"]
@@ -1341,6 +1593,157 @@ def _self_test_s25b(ok, th):
            f"BV33 results.md and the claims say which rows were report-only and which have no published interval")
         ok(verdict(dict(rows[1], tolerance={"type": "overlap", "ratio_band": None}), th) == "invalid",
            "BV33 an overlap tolerance with no published interval is invalid in an artifact")
+
+
+def _self_test_anchor(ok):
+    """F6 S2-5d: anchor rows set each group's absolute burden to an external estimate; relative reductions are kept."""
+    import copy
+    import tempfile
+    import types
+    from toolkit.spec import schema
+    head = ",".join(COLUMNS + ("role", "interval", "group_by"))
+
+    def row(rid="a", group="r0", band="", outcome="cases", value="2000", lo="1000", hi="4000", sid="GBD-X",
+            role="anchor", gb="", kind="estimated"):
+        return f"{rid},{group},{band},{outcome},count,,1,{value},{lo},{hi},{kind},synthetic,ratio,,,{sid},,{role},,{gb}"
+    chk = row("k", "*", sid="WMR-C", role="")
+    W = {"window": [1, 2], "window_metrics": {"cases": "prev", "dalys": "prev"}}
+    regions = [row("a", "r0"), row("b", "r1", value="3000", lo="3000", hi="3000"),
+               row("c", "r2", value="500", lo="250", hi="1000")]
+    dal = row("d", "*", outcome="dalys", value="12000", lo="6000", hi="24000")
+    with tempfile.TemporaryDirectory() as d:
+        raw0 = yaml.safe_load(open(schema.toy_spec(d)))
+        raw0["calibration"]["target_source_id"] = "SURVEY-T"
+
+        def spec(lines, blk=W, mut=None):
+            open(os.path.join(d, "a.csv"), "w").write("\n".join([head] + lines) + "\n")
+            r = copy.deepcopy(raw0)
+            r["validation"] = {"burden": dict({"csv": "a.csv"}, **blk)}
+            if mut:
+                mut(r)
+            return schema.Spec(r, d)
+        refs, bad = load_references(spec(regions + [dal, chk]))
+        by = {x["id"]: x for x in refs}
+        r_g, b_g = load_references(spec([row("g", "g0", gb="grp"), chk]))
+        r_c, b_c = load_references(spec([row(sid="SURVEY-T"), chk]))
+        b_k = load_references(spec([row(), row("k", "*", sid="SURVEY-T", role="")]))[1]
+        ok(bad == [] and by["a"]["role"] == "anchor" and by["a"]["group_by"] is None and b_g == []
+           and r_g[0]["group_by"] == "grp" and b_c == [] and r_c[0]["role"] == "anchor"
+           and any("calibration source" in x for x in b_k) and load_references(spec([row()]))[1] == [],
+           f"BA1 anchor rows and group_by validate; an anchor may come from a calibration source, a checked row may "
+           f"not; a section with only anchor rows is accepted: {bad} {b_g} {b_c}")
+        for name, lines, blk, needle in (
+                ("an anchor with an age band", [row(band="all"), chk], W, "age band"),
+                ("an anchor without a model window", [row(), chk], {}, "validation.burden.window"),
+                ("group_by not a units column", [row(gb="zz"), chk], W, "group_by"),
+                ("a group not a value of group_by", [row(group="r0", gb="grp"), chk], W, "is not a value"),
+                ("an anchor of kind reported", [row(kind="reported"), chk], W, "estimated"),
+                ("an unknown role", [row(role="maybe"), chk], W, "role"),
+                ("only reported rows, no anchor", [row("k", "*", kind="reported", role="")], W, "no estimated")):
+            got = load_references(spec(lines, blk))[1]
+            ok(any(needle in x for x in got), f"BA1 the contract refuses {name}: {got}")
+        # BA2 factors: value / the arm's model-window value, per group
+        sp = spec(regions + [dal, chk])
+        A = types.SimpleNamespace(spec=sp, ids=sp.unit_ids(), by_id={str(u[sp.uid]): u for u in sp.units()},
+                                  outcomes=sp.outcomes(), theta0={})
+
+        def fake(cases=100.0, dalys=200.0, zero=None):
+            return {i: {"y": {"none": {"cases": 10.0, "dalys": 40.0}, "a": {"cases": 6.0, "dalys": 30.0}},
+                        "burden": {"none": {"cases": 0.0 if zero and A.by_id[i]["region"] == zero else cases,
+                                            "dalys": dalys}}} for i in A.ids}
+        reg = {i: A.by_id[i]["region"] for i in A.ids}
+        fac = anchor_factors(A, config(sp), refs, fake(), "none")
+        fu, rows = fac["units"], {x["id"]: x for x in fac["record"]["rows"]}
+        want = {"r0": (5.0, 2.5, 10.0), "r1": (7.5, 7.5, 7.5), "r2": (1.25, 0.625, 2.5)}
+        ok(all(fu[i]["cases"][:3] == want[reg[i]] and fu[i]["dalys"][:3] == (5.0, 2.5, 10.0) for i in A.ids)
+           and rows["a"]["model"] == 400.0 and rows["a"]["n_units"] == 4 and rows["a"]["factor"] == 5.0
+           and rows["d"]["n_units"] == len(A.ids),
+           f"BA2 factor = external value / the arm's model-window value per group, interval from the bounds: "
+           f"{ {i: fu[i]['cases'][:3] for i in A.ids[:3]} }")
+
+        def refused(fn, needle, name, tag="BA2"):
+            try:
+                fn()
+            except AnchorError as e:
+                ok(needle in str(e), f"{tag} fails closed: {name} ({e})")
+                return
+            ok(False, f"{tag} fails closed: {name} (no error)")
+        cfg = config(sp)
+        refused(lambda: anchor_factors(A, cfg, [x for x in refs if x["id"] != "c"], fake(), "none"), "no anchor",
+                "a unit no anchor row covers")
+        two = load_references(spec(regions + [dal, row("e", "*"), chk]))[0]
+        refused(lambda: anchor_factors(A, cfg, two, fake(), "none"), "more than one", "a unit two rows cover")
+        refused(lambda: anchor_factors(A, cfg, refs, fake(zero="r0"), "none"), "model value", "a zero model value")
+        big = load_references(spec([row("a", "r0", value="9e9", lo="9e9", hi="9e9")] + regions[1:] + [dal, chk]))[0]
+        refused(lambda: anchor_factors(A, cfg, big, fake(), "none"), "outside", "a factor outside the thresholds")
+        # BA5 draws: log-uniform within [lo, hi], once per row and call, from the given generator
+        base = fake()
+
+        def applied(rng):
+            o = copy.deepcopy(base)
+            apply_anchor(fac, o, A.ids, rng)
+            return o
+        p0, g1, g1b, g2 = (applied(None), applied(np.random.default_rng(3)), applied(np.random.default_rng(3)),
+                           applied(np.random.default_rng(4)))
+        u0 = [i for i in A.ids if reg[i] == "r0"]
+        f1 = [g1[i]["y"]["none"]["cases"] / 10.0 for i in u0]
+        ok(all(p0[i]["y"]["none"]["cases"] == 10.0 * want[reg[i]][0] for i in A.ids) and g1 == g1b and g1 != g2
+           and len(set(f1)) == 1 and 2.5 <= f1[0] <= 10.0 and f1[0] != 5.0
+           and all(g1[i]["y"]["none"]["cases"] == 75.0 for i in A.ids if reg[i] == "r1"),
+           f"BA5 the point factor without a generator; one log-uniform draw per row within its interval, deterministic "
+           f"for a seeded generator (r0 draw {f1[0]:.4g} in [2.5, 10])")
+        shared = dict(base)
+        apply_anchor(fac, shared, A.ids)
+        ok(base == fake() and shared == p0, "BA3b the model's own outputs are never changed in place (a model that "
+           "returns the same objects twice is not anchored twice)")
+        ok(all(abs(p0[i]["y"]["a"]["cases"] / p0[i]["y"]["none"]["cases"] - 0.6) < 1e-12
+               and p0[i]["burden"]["none"]["cases"] == 100.0 * want[reg[i]][0] for i in A.ids),
+           "BA3 every package's outcome and the window burden move by the unit's factor; the package/comparator "
+           "ratio is unchanged")
+        # BA4 DALYs composed of anchored deaths or cases: YLL = deaths x yll_per_death, YLD = dalys - YLL (>= 0)
+        dp = {"dalys": "dalys", "deaths": "deaths", "yll_per_death": {"all": 30}}
+        three = lambda r: r.update(outcomes_reported=["dalys", "cases", "deaths"])  # noqa: E731
+        Wc = {"window": [1, 2], "window_metrics": {"cases": "prev"}}
+        sd = spec(regions + [chk], dict(Wc, daly_parts=dp), three)
+        Ad = types.SimpleNamespace(**dict(vars(A), spec=sd, outcomes=sd.outcomes()))
+        rd = load_references(sd)[0]
+        od = {i: {"y": {"none": {"cases": 10.0, "deaths": 2.0, "dalys": 100.0},
+                        "a": {"cases": 5.0, "deaths": 1.0, "dalys": 10.0}},
+                  "burden": {"none": {"cases": 100.0}}} for i in A.ids}
+        fd = anchor_factors(Ad, config(sd), rd, od, "none")
+        apply_anchor(fd, od, A.ids)
+        i0 = u0[0]
+        ok(od[i0]["y"]["none"] == {"cases": 50.0, "deaths": 2.0, "dalys": 60.0 + 5.0 * 40.0}
+           and od[i0]["y"]["a"]["dalys"] == 30.0 and fd["record"]["dalys"]["outcome"] == "dalys",
+           f"BA4 anchored DALYs = f_deaths x YLL + f_cases x YLD (YLD floored at 0): {od[i0]['y']}")
+        for name, blk in (("no daly_parts", Wc), ("no yll_per_death", dict(Wc, daly_parts={"deaths": "deaths"})),
+                          ("yll_per_death by population group",
+                           dict(Wc, daly_parts=dict(dp, yll_per_death={"all": 30, "kids": 2})))):
+            s4 = spec(regions + [chk], blk, three)
+            A4 = types.SimpleNamespace(**dict(vars(A), spec=s4, outcomes=s4.outcomes()))
+            refused(lambda: anchor_factors(A4, config(s4), load_references(s4)[0], od, "none"), "daly_parts",
+                    f"DALYs reported, cases anchored, {name}", "BA4")
+        # gate: the artifact against the declared anchor rows
+        sec = sp.raw            # the signed spec: its default group column is the region
+        rec = fac["record"]
+        anc = [x for x in refs if x["role"] == "anchor"]
+        bad_rec = copy.deepcopy(rec)
+        bad_rec["rows"][0]["factor"] *= 2
+        ok(anchor_findings(sec, rec, anc) == [] and anchor_findings({}, None, []) == []
+           and [x["kind"] for x in anchor_findings(sec, None, anc)] == ["burden_anchor_missing"]
+           and [x["kind"] for x in anchor_findings(sec, bad_rec, anc)] == ["burden_anchor_inconsistent"]
+           and [x["kind"] for x in anchor_findings(sec, dict(rec, rows=rec["rows"][1:]), anc)]
+           == ["burden_anchor_missing"] and not any(x["scope_declarable"] for x in anchor_findings(sec, None, anc))
+           and findings(sec, None, anc) == [],
+           "BA6 the gate: declared anchors need analysis/burden_anchor.yaml with each row's factor = value / model "
+           "(never declarable); a section with only anchor rows needs no burden_validation artifact")
+        txt = "\n".join(anchor_results_lines(rec))
+        cids = {c[0] for c in anchor_claims(lambda *a: a, "art", rec)}
+        sh = sheet_lines(spec(regions + [dal, chk]).raw, d)
+        ok("## Absolute burden anchored to external estimates" in txt and "[CLAIM:burden_anchor.a.factor]" in txt
+           and "burden_anchor.a.factor" in cids and any("| a | estimated, anchor (region) |" in x for x in sh),
+           f"BA6 results.md and the claims show each anchor's factor; the sign-off sheet marks anchor rows: "
+           f"{[x for x in sh if x.startswith('| a ')]}")
 
 
 if __name__ == "__main__":
