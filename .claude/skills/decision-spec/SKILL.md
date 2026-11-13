@@ -102,7 +102,11 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `prior_range` decision test; do not declare one. A prior targets an engine parameter only
    (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
    column is uncertain, declare that where it arises, as the observation of a latent quantity
-   through a source with a sampling frame and a bias model.
+   through a source with a sampling frame and a bias model. When field data dispute a
+   column's values for some units, declare a `unit_attribute` decision test over the disputed
+   values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
+   column must feed an engine attribute that has a declared valid range, and on the emulator
+   path an emulator feature.
 10. **Analysis.** `evaluation: emulator` for engines too slow to run per unit and draw (give
     the design: points, hold-out share, features), `direct` otherwise; the stability
     hold-out group; sensitivity; and **decision tests** for each simplification,

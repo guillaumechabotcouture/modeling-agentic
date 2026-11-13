@@ -104,7 +104,9 @@ docs/design/v2-spec-and-analysis.md §1):
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
-                                           # price case in which the listed unit costs change together
+                                           # price case in which the listed unit costs change together;
+                                           # type unit_attribute: unit_attribute {column, units: [ids] | all,
+                                           # values | scale | set_from} (a units-table column, F6)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     evidence:                              # F6: required when the options use a component whose engine card declares
@@ -172,7 +174,8 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 # F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
-DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items")
+DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
+                       "unit_attribute")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -440,8 +443,10 @@ class Spec:
                     if _isnum(m):
                         lo[it_id] = min(lo.get(it_id, 1.0), float(m))
         comp_cost = {}
-        for u in self.units():
-            uid = str(u[self.uid])
+        from toolkit.analysis import decision_tests as DT     # #228 r1 P2-3: and over every unit_attribute arm's table
+        tables = [self.units()] + DT.arm_tables(self)
+        for n_, u in ((n_, u) for n_, rows in enumerate(tables) for u in rows):
+            uid = f"{n_}:{u[self.uid]}"
             comp_cost[uid] = {}
             for it in items:
                 comp_cost[uid][it["component"]] = (comp_cost[uid].get(it["component"], 0.0)
@@ -1412,6 +1417,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         elif t == "envelope":
             if not dt.get("values") or not all(_isnum(v) for v in dt["values"]):
                 bad.append(f"decision test {i}: values (envelopes in USD)")
+        elif t == "unit_attribute":      # the runner's own planner (column, units, domain, identity), at sign-off
+            from toolkit.analysis import decision_tests as DT
+            emu = an.get("evaluation") == "emulator"      # #228 r1 P2-5: the design box the pre-run plan reads
+            pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"), DT.design_features_box(s) if emu else None)
+            if pl["status"] != "runs":
+                bad.append(f"decision test {i}: {pl['why']}")
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
@@ -1579,6 +1590,62 @@ def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)
     return p
 
 
+def direct_toy(r: dict) -> dict:
+    """The toy spec on direct evaluation with no calibration and the engine attribute x bound to column cov (a unit
+    attribute the units table sets; the unit-attribute decision-test self-tests)."""
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["calibration"] = {"method": "none"}
+    r["analysis"]["evaluation"] = "direct"
+    r["analysis"].pop("emulator", None)
+    r["analysis"]["decision_tests"] = []
+    r["uncertainty"]["sources"] = [{"kind": "engine_parameters"}]
+    r["uncertainty"]["excluded"] = [{"kind": k, "reason": "toy"} for k in ("costs", "calibration", "emulator")] + [
+        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
+    return r
+
+
+def _self_test_unit_attribute(ok, s, d, bad):
+    """F6: a unit_attribute decision test is checked at sign-off by the runner's own planner (decision_tests.py
+    plan_unit_attribute): column, units, values within the column's declared domain, and not an identity."""
+    def ua(**kw):
+        return lambda r: (direct_toy(r), r["analysis"]["decision_tests"].append(
+            dict({"id": "DTu", "type": "unit_attribute", "text": "t"}, **kw)))
+    bad(ua(), "give unit_attribute", "SP-UA1 a unit_attribute test without its unit_attribute mapping is refused")
+    bad(ua(unit_attribute={"column": "nocol", "values": [0.5]}), "not a column of the units table",
+        "SP-UA2 a unit_attribute test on an unknown column is refused")
+    bad(ua(unit_attribute={"column": "cov", "units": ["0", "zz"], "values": [0.5]}), "'zz'",
+        "SP-UA3 a unit_attribute test naming a unit id not in the table is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [9.0]}), "declared domain",
+        "SP-UA4 a unit_attribute value outside the column's declared domain (the engine card's valid range) is refused")
+    bad(ua(unit_attribute={"column": "cov", "scale": [1.0]}), "identity",
+        "SP-UA5 a unit_attribute test that leaves every unit unchanged is refused")
+    bad(ua(unit_attribute={"column": "pop", "values": [5.0]}), "feeds no engine unit attribute",
+        "SP-UA6 a unit_attribute test on a column bound to no engine attribute is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [0.5], "scale": [2.0]}), "exactly one of",
+        "SP-UA7 a unit_attribute test with two value modes is refused")
+    bad(ua(unit_attribute={"column": "cov", "set_from": "../elsewhere.csv"}), "inside the run directory",
+        "SP-UA8 a set_from table outside the run directory is refused")
+    r = copy.deepcopy(s.raw)
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["analysis"]["decision_tests"].append({"id": "DTu", "type": "unit_attribute", "text": "t",
+                                            "unit_attribute": {"column": "cov", "values": [0.5]}})
+    e9 = validate(Spec(r, d))
+    ok(any("calibration sets" in e for e in e9),
+       f"SP-UA9 a column bound to the calibrated attribute is refused (the calibration overrides it): {e9[:2]}")
+    r = copy.deepcopy(s.raw)
+    ua(unit_attribute={"column": "cov", "units": ["0", "1"], "values": [0.5, -0.5]})(r)
+    ok(validate(Spec(r, d)) == [], f"SP-UA10 a well-formed unit_attribute test validates: {validate(Spec(r, d))[:3]}")
+    r = direct_toy(copy.deepcopy(s.raw))         # #228 r1 P2-5: sign-off reads the emulator design box too
+    r["analysis"].update(evaluation="emulator", emulator=copy.deepcopy(s.raw["analysis"]["emulator"]))
+    r["analysis"]["emulator"]["features"] = ["cov"]
+    r["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "t",
+                                        "unit_attribute": {"column": "cov", "values": [1.9]}}]
+    e11 = validate(Spec(r, d))
+    ok(any("design box" in e for e in e11),
+       f"SP-UA11 at sign-off a value inside the declared domain but outside the emulator's design box is refused: "
+       f"{e11[:2]}")
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -1733,6 +1800,7 @@ def _self_test() -> int:
         dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_c)
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
+        _self_test_unit_attribute(ok, s, d, bad)
         bad(lambda r: r["analysis"].update(regret_threshold=2), "analysis.regret_threshold",
             "SP11c F6 S1-5: a regret threshold outside [0, 1] is refused")
         bad(lambda r: r["analysis"].update(dollars_threshold="x"), "analysis.dollars_threshold",
