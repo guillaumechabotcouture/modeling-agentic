@@ -1655,7 +1655,7 @@ def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS
     for q in qs:
         rd = os.path.join(out_root, "runs", q["id"])
         try:
-            prepare(dict(q, shadow_price=None), rd, root, max_engine_runs)
+            prepare(dict(q, shadow_price=None, carry_from=[]), rd, root, max_engine_runs)   # the design only
             e = engine_step(q, rd, max_engine_runs)
             out[q["id"]] = dict(e, ok=True)
         except Exception as ex:  # noqa: BLE001 -- recorded per question; the others run
