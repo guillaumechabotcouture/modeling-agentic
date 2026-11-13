@@ -1,0 +1,321 @@
+beliefs:
+- id: B1
+  mechanism: A single long-acting monoclonal antibody (nirsevimab-class) dose at birth reduces RSV hospitalisation
+    over the first ~5-6 months by roughly three quarters in randomised trials
+  about:
+    package: mab
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.9
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Drysdale SB et al. Nirsevimab for Prevention of Hospitalizations Due to RSV in Infants. N Engl J Med
+      2023;389:2425-2435 (HARMONIE)
+    location: Results, primary end point (RSV LRTI hospitalisation efficacy about 83%); table number not verified
+  - citation: Hammitt LL et al. Nirsevimab for Prevention of RSV in Healthy Late-Preterm and Term Infants. N Engl
+      J Med 2022;386:837-846 (MELODY)
+    location: Table 2 (medically attended RSV LRTI about 75%; hospitalisation about 62%, interval wide); table number
+      not verified
+  - citation: 'Simoes EAF et al. Efficacy of nirsevimab against respiratory syncytial virus lower respiratory tract
+      infections in preterm and term infants, and pharmacokinetic extrapolation to infants with congenital heart
+      disease and chronic lung disease: a pooled analysis of randomised controlled trials. Lancet Child Adolesc
+      Health 2023;7:180-189'
+    location: Results, pooled hospitalisation efficacy about 77%; table number not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Maternal RSV prefusion F vaccination in late pregnancy reduces infant RSV hospitalisation, with efficacy
+    waning from about two thirds at 90 days to about one half at 180 days
+  about:
+    package: maternal
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Kampmann B et al. Bivalent Prefusion F Vaccine in Pregnancy to Prevent RSV Illness in Infants. N Engl
+      J Med 2023;388:1451-1464 (MATISSE)
+    location: Table 2 and secondary end points (hospitalisation about 68% at 90 days, about 57% at 180 days, wide
+      intervals); location not verified
+  - citation: Madhi SA et al. Respiratory Syncytial Virus Vaccination during Pregnancy and Effects in Infants. N
+      Engl J Med 2020;383:426-439
+    location: Results, hospitalisation end point (different product, about 44%); location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Maternal vaccination is delivered through antenatal care, so its realised population effect rises with
+    ANC attendance; mab at birth does not depend on ANC (but on facility birth / postnatal contact, not in the data)
+  about:
+    package: maternal
+    feature: anc_attendance
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Kampmann B et al. Bivalent Prefusion F Vaccine in Pregnancy to Prevent RSV Illness in Infants. N Engl
+      J Med 2023;388:1451-1464
+    location: Methods (vaccination at 24-36 weeks gestation, i.e. an antenatal contact is required); reasoning,
+      not a measured coverage relation
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'Relative reductions are proportional: a product''s relative reduction does not depend on the district''s
+    baseline hospitalisation rate (the engine applies a multiplicative RR); absolute benefit scales with inc'
+  about:
+    package: mab
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Simoes EAF et al. Efficacy of nirsevimab against respiratory syncytial virus lower respiratory tract
+      infections in preterm and term infants, and pharmacokinetic extrapolation to infants with congenital heart
+      disease and chronic lung disease: a pooled analysis of randomised controlled trials. Lancet Child Adolesc
+      Health 2023;7:180-189'
+    location: Results (efficacy consistent across trials and settings of differing incidence); location not verified
+  confidence: medium
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'At the harness shadow price, maternal beats mab across the sweep''s inc range: the US$20 per-birth
+    price gap outweighs mab''s higher efficacy unless inc x (e_b - e_m) exceeds 0.0146'
+  about:
+    pair:
+    - maternal
+    - mab
+    feature: inc
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 0.0105
+    - 0.046
+  source_type: literature
+  evidence:
+  - citation: Kampmann B et al. Bivalent Prefusion F Vaccine in Pregnancy to Prevent RSV Illness in Infants. N Engl
+      J Med 2023;388:1451-1464
+    location: efficacy inputs as B2; arithmetic in file header
+  - citation: Drysdale SB et al. Nirsevimab for Prevention of Hospitalizations Due to RSV in Infants. N Engl J Med
+      2023;389:2425-2435
+    location: efficacy inputs as B1; arithmetic in file header
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: At low baseline risk, mab costs more than its averted hospitalisations are worth at the shadow price,
+    so none beats mab
+  about:
+    pair:
+    - none
+    - mab
+    feature: inc
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 0.0105
+    - 0.025
+  source_type: literature
+  evidence:
+  - citation: Drysdale SB et al. Nirsevimab for Prevention of Hospitalizations Due to RSV in Infants. N Engl J Med
+      2023;389:2425-2435
+    location: efficacy as B1; break-even inc = 0.0365 / e_b, about 0.04-0.06
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'Maternal vs none flips along baseline risk: maternal pays at the shadow price once inc x e_m exceeds
+    0.0219, i.e. inc roughly 0.03-0.046'
+  about:
+    pair:
+    - maternal
+    - none
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.028
+    - 0.046
+  source_type: literature
+  evidence:
+  - citation: Kampmann B et al. Bivalent Prefusion F Vaccine in Pregnancy to Prevent RSV Illness in Infants. N Engl
+      J Med 2023;388:1451-1464
+    location: efficacy as B2; break-even inc = 0.0219 / e_m
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: Baseline infant RSV hospitalisation risk in the first six months is of order 1-5% in LMIC settings
+    and varies severalfold between places; it is the quantity that ranks districts
+  about:
+    component: maternal
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: 'Li Y et al. Global, regional, and national disease burden estimates of acute lower respiratory infections
+      due to respiratory syncytial virus in children younger than 5 years in 2019: a systematic analysis. Lancet
+      2022;399:2047-2064'
+    location: Results, hospital admission rates for 0-6 months; location not verified
+  - citation: units.csv
+    location: column inc
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Does the engine/spec make maternal coverage depend on anc_attendance (and mab coverage on anything)?
+    If maternal realised effect is about 0.57 x ANC, the efficacy gap widens and mab can win in high-inc, low-ANC
+    districts.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Which hospitalisation efficacy over 0-6 months does the spec's maternal prior use (90-day vs 180-day,
+    product-specific), and how wide is it? The maternal/mab ranking turns on e_b/e_m against the 1.67 price ratio.
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: The harness shadow price (DALY threshold) is far below the budget's own dual under a binding US$3M budget;
+    paired tests at 0.00073 may favour none over products that the budget-constrained plan would fund. Which lambda
+    is the decision's?
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Seasonality and birth timing relative to the RSV season change realised protection of both products
+    (maternal protection wanes; mab given at birth outside season is partly wasted); not represented in the engine.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Across usable points, mab's relative reduction in rsv_hosp lies in 0.6-0.9 at >= 70% of points; refuted
+    if <= 30% lie in the band.
+  test:
+    kind: effect_band
+    package: mab
+    band:
+    - 0.6
+    - 0.9
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Maternal's relative reduction in rsv_hosp lies in 0.4-0.7 at >= 70% of points; refuted if <= 30% (e.g.
+    ANC-scaled coverage pushes it below 0.4).
+  test:
+    kind: effect_band
+    package: maternal
+    band:
+    - 0.4
+    - 0.7
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: Maternal's relative reduction increases with anc_attendance (Spearman interval excludes 0, positive); refuted
+    if it is negligible or decreasing.
+  test:
+    kind: effect_direction
+    package: maternal
+    feature: anc_attendance
+    direction: increases
+- id: H4
+  belief: B4
+  claim: 'Mab''s relative reduction does not vary with inc: Spearman rho interval inside +/-0.2.'
+  test:
+    kind: effect_direction
+    package: mab
+    feature: inc
+    direction: negligible
+    equivalence: 0.2
+- id: H5
+  belief: B5
+  claim: At the shadow price, maternal has higher net benefit than mab at >= 80% of usable points across inc 0.0105-0.046;
+    refuted if mab wins at >= 80%.
+  test:
+    kind: paired_sign
+    a: maternal
+    b: mab
+    feature: inc
+    range:
+    - 0.0105
+    - 0.046
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B6
+  claim: For inc 0.0105-0.025, none has higher net benefit than mab at >= 80% of usable points at the shadow price.
+  test:
+    kind: paired_sign
+    a: none
+    b: mab
+    feature: inc
+    range:
+    - 0.0105
+    - 0.025
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: The maternal/none transition along inc lies within inc 0.028-0.046; refuted if it is located wholly outside
+    that range.
+  test:
+    kind: flip_in
+    a: maternal
+    b: none
+    feature: inc
+    range:
+    - 0.028
+    - 0.046
