@@ -1,17 +1,17 @@
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (evaluation suite): the population, numbers and files below are synthetic, generated for
-  this test; they do not describe a real place. A health ministry will receive 770,000 influenza vaccine doses (11 blocks
-  of 70,000) before next season for a population of 4.6 million in five age groups (0-4, 5-17, 18-49, 50-64, 65+). Allocate
-  whole blocks to age groups, with at most 70% of any group vaccinated, to minimise expected influenza hospitalisations next
-  season. Assume next season''s transmissibility and pre-season susceptibility equal last season''s, vaccination before the
-  season with all-or-nothing protection against infection at the effectiveness given, and an age-structured SIR epidemic with
-  the contact matrix given (mean daily contacts of a person in the row group with people in the column group). Input files:
-  data/evals/flu_vaccine/population.csv, data/evals/flu_vaccine/contact_matrix.csv, data/evals/flu_vaccine/serosurvey_last_season.csv
-  (pre-season susceptible titres and paired seroconversion by age group, no vaccination last season), data/evals/flu_vaccine/hospitalisations_last_season.csv,
-  data/evals/flu_vaccine/vaccine_effectiveness.csv. Report hospitalisations averted against no vaccination, with a 95% uncertainty
-  interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run directory with columns age_group,
-  doses (a multiple of 70,000) and hospitalisations_averted; and the uncertainty analysis must report the total as an output
-  named hospitalisations_averted.'
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): the population, numbers and files below are synthetic, generated
+  for this test; they do not describe a real place. A health ministry will receive 770,000 influenza vaccine doses
+  (11 blocks of 70,000) before next season for a population of 4.6 million in five age groups (0-4, 5-17, 18-49,
+  50-64, 65+). Allocate whole blocks to age groups, with at most 70% of any group vaccinated, to minimise expected
+  influenza hospitalisations next season. Assume next season''s transmissibility and pre-season susceptibility equal
+  last season''s, vaccination before the season with all-or-nothing protection against infection at the effectiveness
+  given, and an age-structured SIR epidemic with the contact matrix given (mean daily contacts of a person in the
+  row group with people in the column group). Input files: data/evals/flu_vaccine/population.csv, data/evals/flu_vaccine/contact_matrix.csv,
+  data/evals/flu_vaccine/serosurvey_last_season.csv (pre-season susceptible titres and paired seroconversion by
+  age group, no vaccination last season), data/evals/flu_vaccine/hospitalisations_last_season.csv, data/evals/flu_vaccine/vaccine_effectiveness.csv.
+  Report hospitalisations averted against no vaccination, with a 95% uncertainty interval, and state the decision
+  rule. Deliverables: allocation_optimized.csv in the run directory with columns age_group, doses (a multiple of
+  70,000) and hospitalisations_averted; and the uncertainty analysis must report the total as an output named hospitalisations_averted.'
 decision_maker: health ministry immunisation programme (synthetic evaluation question)
 decision_date: 2026
 engine:
@@ -108,8 +108,9 @@ decision_units:
     intro:
       value: 5-17
       source: school-age introduction (assumption)
-  note: 'contact is the given matrix times transmission_scale (fitted outside the harness by the template generator to last
-    season''s seroconversion through the final-size relation, q = 0.2); its uncertainty is not swept: a declared limitation'
+  note: 'contact is the given matrix times transmission_scale (fitted outside the harness by the template generator
+    to last season''s seroconversion through the final-size relation, q = 0.2); its uncertainty is not swept: a
+    declared limitation'
   defaults_accepted:
     always_immune: none declared
     always_susceptible: none declared
@@ -147,31 +148,40 @@ options:
   cost_items:
   - id: vax_children_doses
     component: vax_children
-    value: 0.7
+    value: 2.8
     price_year: '2026'
     price_rule: as_published
     basis: per_eligible
     includes:
-    - doses
-    note: 'one unit of cost = one dose: reach x eligible people'
+    - vaccine
+    - delivery
+    note: 'US$ per eligible person: reach 0.7 doses per eligible person x US$4.00 per dose delivered (assumption:
+      an order-of-magnitude price for a seasonal influenza dose with delivery in a low- or middle-income setting;
+      not from the question or any sweep; verified: false)'
   - id: vax_older_doses
     component: vax_older
-    value: 0.5
+    value: 2.0
     price_year: '2026'
     price_rule: as_published
     basis: per_eligible
     includes:
-    - doses
-    note: 'one unit of cost = one dose: reach x eligible people'
+    - vaccine
+    - delivery
+    note: 'US$ per eligible person: reach 0.5 doses per eligible person x US$4.00 per dose delivered (assumption:
+      an order-of-magnitude price for a seasonal influenza dose with delivery in a low- or middle-income setting;
+      not from the question or any sweep; verified: false)'
   - id: vax_65plus_doses
     component: vax_65plus
-    value: 0.7
+    value: 2.8
     price_year: '2026'
     price_rule: as_published
     basis: per_eligible
     includes:
-    - doses
-    note: 'one unit of cost = one dose: reach x eligible people'
+    - vaccine
+    - delivery
+    note: 'US$ per eligible person: reach 0.7 doses per eligible person x US$4.00 per dose delivered (assumption:
+      an order-of-magnitude price for a seasonal influenza dose with delivery in a low- or middle-income setting;
+      not from the question or any sweep; verified: false)'
 objective:
   outcome: hosp
   sense: avert
@@ -180,7 +190,9 @@ objective:
   - 365
   discounting: none
 constraints:
-  envelope_usd: 800000
+  envelope_usd: 3080000.0
+  note: 'the question''s 770,000 doses (11 blocks of 70,000) at US$4.00 per dose delivered: costs are in USD so
+    the template''s willingness to pay (outcome per USD) applies'
 comparator:
   package: none
   text: no vaccination (as last season)
@@ -195,8 +207,8 @@ engine_parameters:
     - 0.697
     dist: triangular
     basis: setting_data
-    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range +/- 0.1
-      assumed
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
     reason: all-or-nothing protection against infection at the given effectiveness
   efficacy:vax_older:
     value: 0.444
@@ -205,8 +217,8 @@ engine_parameters:
     - 0.544
     dist: triangular
     basis: setting_data
-    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range +/- 0.1
-      assumed
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
     reason: all-or-nothing protection against infection at the given effectiveness
   efficacy:vax_65plus:
     value: 0.4
@@ -215,8 +227,8 @@ engine_parameters:
     - 0.5
     dist: triangular
     basis: setting_data
-    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range +/- 0.1
-      assumed
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
     reason: all-or-nothing protection against infection at the given effectiveness
 calibration:
   method: emulator_inversion
@@ -232,8 +244,8 @@ calibration:
   metric: attack_rate
   target_uncertainty:
     region_sd_logit: 0.05
-  note: the swept attribute is the share of children the school-age programme reaches (achieved coverage, at most 70%); it
-    is a scenario axis, not fitted to the target column
+  note: the swept attribute is the share of children the school-age programme reaches (achieved coverage, at most
+    70%); it is a scenario axis, not fitted to the target column
 uncertainty:
   level: 0.95
   draws: 8

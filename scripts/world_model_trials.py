@@ -432,9 +432,13 @@ def prepare(q, run_dir, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> d
             "primary_outcome": spec.outcomes()[0],
             "sweep": {"design_points": len(design["points"]), "engine_runs": len(jobs), "features": feats,
                       "independent_features": list(design.get("independent_features") or []),
-                      # the value is withheld: a template's shadow price may have been placed from a check sweep
-                      "shadow_price": "withheld: net benefit is compared at a declared shadow price (outcome per "
-                                      "USD) whose value is not shown" if q.get("shadow_price") is not None else None,
+                      # the pre-registered willingness to pay (a published threshold, question-independent) is shown
+                      # from batch 4 on (owner, 2026-11-13); batches 1-3 were seeded with it withheld and keep that
+                      "shadow_price": None if q.get("shadow_price") is None else
+                      "withheld: net benefit is compared at a declared shadow price (outcome per USD) whose value is "
+                      "not shown" if q.get("withhold_shadow_price") else
+                      {"value": q["shadow_price"], "units": "outcome per USD",
+                       "basis": q.get("shadow_price_basis") or "the template's pre-registered willingness to pay"},
                       "paired_tests": "testable" if q.get("shadow_price") is not None else
                       "untestable: no shadow price is declared",
                       "optimised_plan": False,
@@ -1055,7 +1059,7 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
         t = dict(t, id=q["id"], engine_ref=q["engine"], rerun_of=q.get("rerun_of"),
                  steps=dict(t.get("steps") or {}), status="running")
         t["shadow_price"] = shadow_price_of(q, root)
-        q = dict(q, shadow_price=t["shadow_price"]["value"])
+        q = dict(q, shadow_price=t["shadow_price"]["value"], shadow_price_basis=t["shadow_price"]["basis"])
         try:
             if "prepare" not in t["steps"]:
                 t["context"] = prepare(q, rd, root, max_engine_runs)
@@ -1222,7 +1226,7 @@ def _citations(run_dir):
     if not os.path.isfile(p):
         return None
     recs = json.load(open(p)).get("records") or []
-    return dict({k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "lookup_failed")},
+    return dict({k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "not_a_citation", "lookup_failed")},
                 beliefs_downgraded=sorted({r["belief"] for r in recs if r["status"] == "not_found"}))
 
 
@@ -1285,7 +1289,7 @@ def score(trials_root) -> dict:
     tot = dict({"written": 0, "testable": 0, "post_hoc": 0, "by_status": {}}, **{c: 0 for c in ASIDE})
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     fm, wtl = {}, {"decision_relevant": 0, "questions": 0}
-    cit = {"found": 0, "not_found": 0, "lookup_failed": 0, "questions_checked": 0}
+    cit = {"found": 0, "not_found": 0, "not_a_citation": 0, "lookup_failed": 0, "questions_checked": 0}
     sup = {q["rerun_of"]: i for i, q in Q.items() if q.get("rerun_of") and q["status"] == "complete"}
     for i, q in Q.items():
         if i in sup:                    # an earlier run of a question rerun under newer rules: listed, not scored
@@ -1308,7 +1312,7 @@ def score(trials_root) -> dict:
         wtl["questions"] += q["where_to_look"]["top"] is not None
         if q.get("citations"):
             cit["questions_checked"] += 1
-            for k in ("found", "not_found", "lookup_failed"):
+            for k in ("found", "not_found", "not_a_citation", "lookup_failed"):
                 cit[k] += q["citations"][k]
         wtl["decision_relevant"] += q["where_to_look"]["decision_relevant"]
     for c in conf.values():
@@ -1341,8 +1345,9 @@ def summary_md(S) -> str:
          "Circular means the verdict is fixed by a spec input (analysis/circular.json): reported, never a confirmation, never moving confidence. "
          f"Circular tests: {o['hypotheses']['circular']} of {o['hypotheses']['written']}. "
          f"Literature citations looked up (questions run with the check: {o['citations']['questions_checked']}): "
-         f"{o['citations']['found']} found, {o['citations']['not_found']} not found (their beliefs set to low "
-         f"confidence), {o['citations']['lookup_failed']} lookups failed.", "",
+         f"{o['citations']['found']} found, {o['citations']['not_found']} not found (a flag only: confidence kept until "
+         f"matching is validated), {o['citations'].get('not_a_citation', 0)} not a citation (lowered to low confidence), "
+         f"{o['citations']['lookup_failed']} lookups failed.", "",
          "## Per question", "",
          "| Question | Engine | Status | Written | Testable | Supported | Refuted | Inconclusive | Untestable | "
          "Circular | Post hoc | Repairs | Spend (USD) |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]

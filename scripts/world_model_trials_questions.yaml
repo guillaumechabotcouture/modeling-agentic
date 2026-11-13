@@ -33,6 +33,7 @@ questions:
     baseline = mean recorded cases per person in the district''s ''none'' years of programme_history.csv; unit costs
     from unit_costs.csv; packages restricted to 5 of the question''s 7 (none, itn, irs, itn+irs, itn+smc) to keep
     10 design points within 50 engine runs'
+  withhold_shadow_price: true
 - id: measles_campaign
   batch: 1
   eval_question: true
@@ -57,6 +58,7 @@ questions:
   inputs: 'derived from data/evals/measles_campaign public inputs: districts.csv populations; group sizes from the
     stated 3% birth cohort; s0 = 1 - 2025 serosurvey seropositive share by band (under 1 = 1, 15+ = 0); transmission
     swept through contact_rate (R0 = q x contact_rate, 12-18)'
+  withhold_shadow_price: true
 - id: tb_acf
   batch: 1
   eval_question: true
@@ -78,6 +80,7 @@ questions:
   inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
     = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
     from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
+  withhold_shadow_price: true
 - id: flu_vaccine
   batch: 1
   eval_question: true
@@ -102,6 +105,7 @@ questions:
     / (seroconverted share x population) as ratio:hosp, VE weighted by population over targeted groups; contact
     matrix x 0.815 fitted outside the harness to last season''s seroconversion (transmission uncertainty not swept);
     three targeting packages, not whole-block allocations'
+  withhold_shadow_price: true
 - id: dengue_outbreak
   batch: 1
   eval_question: true
@@ -124,6 +128,7 @@ questions:
   inputs: 'derived from data/evals/dengue_outbreak public inputs: city population, the generation interval; R0 fixed
     at the engine default 2.0 and the 2026 susceptible share swept 0.3-1.0, so the R0 the question asks to estimate
     is not swept'
+  withhold_shadow_price: true
 - id: measles_age_targeting
   batch: 1
   eval_question: false
@@ -140,6 +145,7 @@ questions:
   engine_mode: null
   template: data/world_model_trials/measles_age_targeting
   inputs: 'synthetic (seeded 20261113): 10 districts, MCV1 0.55-0.92, susceptible gaps derived from coverage'
+  withhold_shadow_price: true
 - id: cholera_ocv_siting
   batch: 1
   eval_question: false
@@ -155,6 +161,7 @@ questions:
   template: data/world_model_trials/cholera_ocv_siting
   inputs: 'synthetic (seed 11): 12 districts, log-uniform incidence 0.0005-0.008 per person-year scaled by (1.4
     - sanitation share); direct protection only, no herd effect'
+  withhold_shadow_price: true
 - id: outbreak_growth_peak
   batch: 1
   eval_question: false
@@ -171,6 +178,7 @@ questions:
   template: data/world_model_trials/outbreak_growth_peak
   inputs: 'synthetic (seeded 1113): 8 cities, population, seed share 10^-6.5 to 10^-4.5; the s0 sweep overrides
     each city''s prior immunity'
+  withhold_shadow_price: true
 - id: tb_case_finding
   batch: 1
   eval_question: false
@@ -187,6 +195,7 @@ questions:
   template: data/world_model_trials/tb_case_finding
   inputs: 'synthetic (seed 23): 12 districts, log-uniform prevalence 0.0015-0.009, adult HIV prevalence 1-25% (a
     feature the engine does not read)'
+  withhold_shadow_price: true
 - id: hiv_prep_targeting
   batch: 1
   eval_question: false
@@ -204,6 +213,7 @@ questions:
   template: data/world_model_trials/hiv_prep_targeting
   inputs: 'synthetic (seed 37): 4 districts x 3 groups; incidence log-uniform per group; adherence score 0.3-0.8
     (a feature the engine does not read)'
+  withhold_shadow_price: true
 - id: tb_acf_r2
   batch: 1
   eval_question: true
@@ -229,6 +239,7 @@ questions:
   rerun_reason: the tb_acf smoke (2026-11-13) let the seed read the spec's effect priors, so its band tests confirmed
     the engine's own inputs; rerun with the spec's values, the engine's effect values and priors and the input data
     values withheld from the seed task, and circular tests classified
+  withhold_shadow_price: true
 - id: malaria_alloc_r3
   batch: 1r3
   eval_question: true
@@ -258,6 +269,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: measles_campaign_r3
   batch: 1r3
   eval_question: true
@@ -286,6 +298,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: tb_acf_r3
   batch: 1r3
   eval_question: true
@@ -311,6 +324,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: flu_vaccine_r3
   batch: 1r3
   eval_question: true
@@ -339,6 +353,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: dengue_outbreak_r3
   batch: 1r3
   eval_question: true
@@ -365,6 +380,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: measles_age_targeting_r3
   batch: 1r3
   eval_question: false
@@ -385,6 +401,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: cholera_ocv_siting_r3
   batch: 1r3
   eval_question: false
@@ -404,6 +421,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: outbreak_growth_peak_r3
   batch: 1r3
   eval_question: false
@@ -424,6 +442,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: tb_case_finding_r3
   batch: 1r3
   eval_question: false
@@ -444,6 +463,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: hiv_prep_targeting_r3
   batch: 1r3
   eval_question: false
@@ -465,6 +485,7 @@ questions:
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
     units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
     tests classified'
+  withhold_shadow_price: true
 - id: rotavirus_intro_ranking
   batch: 2
   eval_question: false
@@ -482,6 +503,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (ranking)
   area: vaccines
+  withhold_shadow_price: true
 - id: hpv_dose_schedule
   batch: 2
   eval_question: false
@@ -499,6 +521,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (schedule choice)
   area: vaccines
+  withhold_shadow_price: true
 - id: dengue_wolbachia_vs_spraying
   batch: 2
   eval_question: false
@@ -515,6 +538,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (intervention choice)
   area: vector control
+  withhold_shadow_price: true
 - id: malaria_repellent_vs_itn_topup
   batch: 2
   eval_question: false
@@ -532,6 +556,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (package choice)
   area: vector control
+  withhold_shadow_price: true
 - id: lf_mda_ida_vs_da
   batch: 2
   eval_question: false
@@ -549,6 +574,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (regimen choice)
   area: MDA / NTDs
+  withhold_shadow_price: true
 - id: trachoma_mda_frequency
   batch: 2
   eval_question: false
@@ -565,6 +591,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (frequency choice)
   area: MDA / NTDs
+  withhold_shadow_price: true
 - id: hcv_test_treat_targeting
   batch: 2
   eval_question: false
@@ -582,6 +609,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: targeting
   area: screening
+  withhold_shadow_price: true
 - id: nutrition_sqlns_vs_mnp
   batch: 2
   eval_question: false
@@ -598,6 +626,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (product choice)
   area: nutrition
+  withhold_shadow_price: true
 - id: measles_reactive_campaign_timing
   batch: 2
   eval_question: false
@@ -616,6 +645,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: timing
   area: outbreak response
+  withhold_shadow_price: true
 - id: school_influenza_estimation
   batch: 2
   eval_question: false
@@ -633,6 +663,7 @@ questions:
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: estimation
   area: outbreak response
+  withhold_shadow_price: true
 - id: amr_crp_delayed_prescribing
   batch: 2
   eval_question: false
@@ -650,6 +681,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/amr_crp_delayed_prescribing/generate_units.py (seeded)'
   decision_type: allocation
   area: AMR stewardship
+  withhold_shadow_price: true
 - id: amr_hospital_stewardship
   batch: 2
   eval_question: false
@@ -666,6 +698,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/amr_hospital_stewardship/generate_units.py (seeded)'
   decision_type: allocation
   area: AMR stewardship
+  withhold_shadow_price: true
 - id: ntd_schisto_mda_strategy
   batch: 2
   eval_question: false
@@ -682,6 +715,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/ntd_schisto_mda_strategy/generate_units.py (seeded)'
   decision_type: allocation
   area: NTDs
+  withhold_shadow_price: true
 - id: ntd_vl_irs_vs_acd
   batch: 2
   eval_question: false
@@ -698,6 +732,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/ntd_vl_irs_vs_acd/generate_units.py (seeded)'
   decision_type: allocation
   area: NTDs
+  withhold_shadow_price: true
 - id: tb_tpt_3hp_vs_6h
   batch: 2
   eval_question: false
@@ -715,6 +750,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/tb_tpt_3hp_vs_6h/generate_units.py (seeded)'
   decision_type: allocation
   area: screening / TB prevention
+  withhold_shadow_price: true
 - id: cervical_hpv_vs_via
   batch: 2
   eval_question: false
@@ -731,6 +767,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/cervical_hpv_vs_via/generate_units.py (seeded)'
   decision_type: allocation
   area: screening / cancer
+  withhold_shadow_price: true
 - id: typhoid_tcv_age_targeting
   batch: 2
   eval_question: false
@@ -748,6 +785,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/typhoid_tcv_age_targeting/generate_units.py (seeded)'
   decision_type: targeting
   area: vaccines
+  withhold_shadow_price: true
 - id: flu_school_closure_timing
   batch: 2
   eval_question: false
@@ -764,6 +802,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/flu_school_closure_timing/generate_units.py (seeded)'
   decision_type: timing
   area: outbreak response
+  withhold_shadow_price: true
 - id: ebola_ring_vaccination
   batch: 2
   eval_question: false
@@ -781,6 +820,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/ebola_ring_vaccination/generate_units.py (seeded)'
   decision_type: estimation
   area: outbreak response
+  withhold_shadow_price: true
 - id: early_growth_doubling_time
   batch: 2
   eval_question: false
@@ -797,6 +837,7 @@ questions:
   inputs: 'synthetic: data/world_model_trials/early_growth_doubling_time/generate_units.py (seeded)'
   decision_type: estimation
   area: outbreak response
+  withhold_shadow_price: true
 - id: diphtheria_catchup_vs_routine
   batch: 3
   eval_question: false
@@ -818,6 +859,7 @@ questions:
   area: vaccines
   mechanism: 'herd-immunity threshold: an option that brings R0 x s0 below one prevents the outbreak; beyond it,
     more reach buys almost nothing (saturation)'
+  withhold_shadow_price: true
 - id: rubella_crs_campaign_age
   batch: 3
   eval_question: false
@@ -838,6 +880,7 @@ questions:
   area: vaccines
   mechanism: 'herd effect versus direct protection: vaccinating children can push R_eff below one and protect women
     indirectly; where adult susceptibility is high it cannot, and only WIDE averts CRS'
+  withhold_shadow_price: true
 - id: mumps_mmr3_outbreak_timing
   batch: 3
   eval_question: false
@@ -857,6 +900,7 @@ questions:
   area: outbreak response
   mechanism: 'R_eff = 2 s0 straddles one: below it outbreaks fade without the dose; above it an early dose cuts
     the epidemic before its peak while a late one arrives after most infections'
+  withhold_shadow_price: true
 - id: flu_vaccination_timing
   batch: 3
   eval_question: false
@@ -878,6 +922,7 @@ questions:
   area: vaccines
   mechanism: 'epidemic timing: a campaign completed after the peak protects few remaining susceptibles, and where
     R_eff is below one there is no season to prevent; cheaper late vaccine wins only in slow or late seasons'
+  withhold_shadow_price: true
 - id: pertussis_maternal_vs_cocooning
   batch: 3
   eval_question: false
@@ -896,6 +941,7 @@ questions:
   area: vaccines
   mechanism: 'package-rate: the trial effect of maternal vaccination against a cocooning effect indistinguishable
     from none'
+  withhold_shadow_price: true
 - id: yellow_fever_reactive_delay
   batch: 3
   eval_question: false
@@ -914,6 +960,7 @@ questions:
   area: outbreak response
   mechanism: 'reactive delay: the share of an outbreak averted falls with the weeks lost before transmission is
     cut, and depends on how far the town is from the threshold and how large the seed is'
+  withhold_shadow_price: true
 - id: norovirus_care_home_estimation
   batch: 3
   eval_question: false
@@ -932,6 +979,7 @@ questions:
   area: outbreak response
   mechanism: 'final-size nonlinearity: attack rate and peak time depend on R_eff = 2 s0 near one and on the seed;
     the control bundle matters most just above the threshold'
+  withhold_shadow_price: true
 - id: azithro_mda_child_mortality
   batch: 3
   eval_question: false
@@ -950,6 +998,7 @@ questions:
   decision_type: targeting (age)
   area: AMR stewardship
   mechanism: 'package-rate: trial mortality effects by age group; resistance is a declared concern, not modelled'
+  withhold_shadow_price: true
 - id: mening_reactive_vs_preventive
   batch: 3
   eval_question: false
@@ -972,6 +1021,7 @@ questions:
   area: vaccines / outbreak response
   mechanism: 'a reactive campaign acts on the susceptibles left 8 weeks in: it saves little where the epidemic grows
     fast (high R0, high susceptibility, large seed) and almost as much as prevention where it grows slowly'
+  withhold_shadow_price: true
 - id: booster_timing_before_wave
   batch: 3
   eval_question: false
@@ -994,6 +1044,7 @@ questions:
   area: vaccines
   mechanism: 'the late campaign reaches more people but acts only on the susceptibles left on day 42: it wins where
     the wave peaks after day 42 (small seed, low R_eff) and loses where the peak has passed'
+  withhold_shadow_price: true
 - id: measles_routine_vs_response
   batch: 3
   eval_question: false
@@ -1016,6 +1067,7 @@ questions:
   area: vaccines / outbreak response
   mechanism: whether the immunity gap pushes R_eff above 1 (a threshold) decides whether any outbreak occurs; where
     gaps sit in 5-9 year olds, routine work in the youngest cannot close them and the later response wins
+  withhold_shadow_price: true
 - id: ebola_tracing_threshold
   batch: 3
   eval_question: false
@@ -1037,6 +1089,7 @@ questions:
   area: outbreak response
   mechanism: 'control requires R_eff = 2 s0 (1 - effect) below 1: TRACE80 buys control where TRACE50 leaves R_eff
     just above 1 (high s0), and both are wasted where neither crosses the threshold or where TRACE50 already does'
+  withhold_shadow_price: true
 - id: hepa_catchup_age_saturation
   batch: 3
   eval_question: false
@@ -1059,6 +1112,7 @@ questions:
   mechanism: 'herd effects and saturation: vaccinating children averts adult (symptomatic) cases indirectly when
     it pushes R_eff below 1; once below, widening the age range adds little; where adults carry most susceptibles
     the indirect effect is small'
+  withhold_shadow_price: true
 - id: chikv_vector_control_timing
   batch: 3
   eval_question: false
@@ -1080,6 +1134,7 @@ questions:
   mechanism: an eight-week cut in transmission matters most when it covers the epidemic's growth before the peak;
     cities with a large seed peak early (early control wins), slow cities peak later (peak-timed control wins),
     low-s0 cities barely grow
+  withhold_shadow_price: true
 - id: anc_mms_vs_ifa_lbw
   batch: 3
   eval_question: false
@@ -1098,3 +1153,4 @@ questions:
   area: nutrition
   mechanism: 'no dynamics: relative effects are the trial priors and burden ranks districts; anaemia is drawn but
     not read by the engine (a test on it is engine-blind)'
+  withhold_shadow_price: true
