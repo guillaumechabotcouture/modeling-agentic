@@ -1,0 +1,119 @@
+# World model v0 (before any simulation) for outbreak_growth_peak.
+# Decision: for each of 8 cities, fund the transmission-reducing measure (weeks 4-16 of 2026, ~US$3 per resident)
+# or not (comparator `none`), under a US$15M budget (~5M residents covered). Outcome: infections over 2026.
+# Cost per resident is the same in every city, so cities rank on infections averted PER RESIDENT; population only
+# matters for packing the budget. At the sweep's shadow price (0.05 infections per US$), the measure pays its way
+# in a city when it averts more than about 0.15 infections per resident over 2026 (0.05 x 3).
+# Reading of the mechanism: one closed population, no waning, so a temporary 12-week cut in R_t mostly DELAYS
+# infections; it averts infections over the year only by (a) cutting the overshoot past herd immunity when the
+# window covers the peak, or (b) pushing part of the epidemic beyond the end of 2026 (a horizon effect, not a
+# permanent aversion). Which regime a city is in is set by its effective R (R0 x s0) and its seed share, which
+# together fix the unmitigated peak week.
+beliefs:
+  - id: B1
+    mechanism: "A larger multiplicative cut in R_t during weeks 4-16 averts a larger share of 2026 infections; monotone in the effect size in both the overshoot and the delay regime"
+    about: {package: measure, feature: "effect:measure"}
+    direction: increases
+    magnitude: {band: [0.05, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Di Lauro F, Kiss IZ, Miller JC. The timing of one-shot interventions for epidemic control. PLoS Comput Biol 2021", location: "Results, temporary-intervention analysis (exact figure not recalled)"}
+      - {citation: "Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious disease. Bull Math Biol 2006", location: "final size relation, main theorem"}
+    confidence: high
+    decision_relevant: true
+  - id: B2
+    mechanism: "Higher susceptible share (higher R0 x s0) makes the epidemic faster and more complete within 2026; the 12-week measure then mostly shifts infections within the year and only trims overshoot, so the relative reduction over 2026 falls as s0 rises"
+    about: {package: measure, feature: "s0 (calibration scale)"}
+    direction: decreases
+    magnitude: {band: [0.02, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive numbers. Proc R Soc B 2007", location: "R = 1/M(-r) relation (main result, equation in section 2)"}
+      - {citation: "Handel A, Longini IM, Antia R. What is the best control strategy for multiple infectious disease outbreaks? Proc R Soc B 2007", location: "overshoot argument; figure location not recalled"}
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: "A larger seed share brings the unmitigated peak earlier (time to peak ~ ln(1/seed)/r), so less of the epidemic can be pushed past week 52 and the relative reduction over 2026 falls as seed_share rises"
+    about: {package: measure, feature: seed_share}
+    direction: decreases
+    magnitude: {band: [0.02, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One 2007", location: "renewal-equation formulation (methods)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B4
+    mechanism: "In a closed renewal model with seeding expressed as a share, city size does not change per-capita dynamics; relative reduction is independent of pop (pop matters only for the budget)"
+    about: {package: measure, feature: pop}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying reproduction numbers during epidemics. Am J Epidemiol 2013", location: "renewal model definition (methods)"}
+    confidence: high
+    decision_relevant: false
+  - id: B5
+    mechanism: "Over the whole sweep, the measure's relative reduction of 2026 infections is moderate: overshoot regime ~5-25%, delay regime (peak pushed toward or past year end) up to ~60%"
+    about: {package: measure}
+    direction: reduces
+    magnitude: {band: [0.05, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Di Lauro F, Kiss IZ, Miller JC. The timing of one-shot interventions for epidemic control. PLoS Comput Biol 2021", location: "Results (values not recalled; band is my reasoning)"}
+    confidence: low
+    decision_relevant: true
+  - id: B6
+    mechanism: "At the upper end of the stated effect range (30-45%), the measure averts more than ~0.15 infections per resident, so it beats no action at the 0.05 infections/US$ shadow price in most cities and draws"
+    about: {pair: [measure, none]}
+    direction: increases
+    conditions: [{feature: "effect:measure", range: [0.3, 0.45]}]
+    source_type: literature
+    evidence:
+      - {citation: "Abaluck J, Kwong LH, Styczynski A, et al. Impact of community masking on COVID-19: a cluster-randomized trial in Bangladesh. Science 2022", location: "main results (about 11% relative reduction in symptomatic seroprevalence for surgical masks)"}
+    confidence: low
+    decision_relevant: true
+open_questions:
+  - id: Q1
+    question: "Is the 2026 horizon counting infections merely delayed into 2027 as averted? If the unmitigated peak is late in the year, the in-year benefit is mostly a horizon artefact; a multi-year or final-size outcome could reverse the ranking of cities."
+    beliefs: [B2, B3, B5]
+    decision_relevant: true
+  - id: Q2
+    question: "Where does each city's unmitigated peak fall relative to weeks 4-16 and week 52? That sets the regime (overshoot trimming vs delay) and so which cities get the measure."
+    beliefs: [B2, B3]
+    decision_relevant: true
+  - id: Q3
+    question: "What is the trial-anchored effect of combined masks/distancing/ventilation on transmission? Community mask RCTs (Abaluck 2022; Bundgaard et al., Ann Intern Med 2021, DANMASK-19) suggest effects at or below the low end of 15-45% for masks alone; the combined package lacks RCT evidence."
+    beliefs: [B1, B6]
+    decision_relevant: true
+  - id: Q4
+    question: "The stated generation interval (about 5 days) and the weekly grid (0.6/0.35/0.05, mean ~1.45 weeks, ~10 days) disagree; the grid's longer mean lowers r for a given R and shifts peaks later."
+    beliefs: [B2, B3]
+    decision_relevant: false
+  - id: Q5
+    question: "Does lifting the measure at week 16 with many susceptibles left cause a rebound that erases most of the benefit in cities whose peak would have fallen inside the window?"
+    beliefs: [B2, B5]
+    decision_relevant: true
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "Relative reduction of 2026 infections rises with the measure's effect, adjusted for s0 and seed share"
+    test: {kind: effect_direction, package: measure, feature: "effect:measure", direction: increases, adjust_for: ["s0 (calibration scale)", seed_share]}
+  - id: H2
+    belief: B2
+    claim: "Relative reduction falls as the susceptible share rises, adjusted for effect and seed share; refuted if the adjusted correlation is positive"
+    test: {kind: effect_direction, package: measure, feature: "s0 (calibration scale)", direction: decreases, adjust_for: ["effect:measure", seed_share]}
+  - id: H3
+    belief: B3
+    claim: "Relative reduction falls as the seed share rises (earlier peak), adjusted for effect and s0; refuted if positive"
+    test: {kind: effect_direction, package: measure, feature: seed_share, direction: decreases, adjust_for: ["effect:measure", "s0 (calibration scale)"]}
+  - id: H4
+    belief: B4
+    claim: "City population has no effect on relative reduction once effect, s0 and seed share are held fixed (|partial rho| < 0.3)"
+    test: {kind: effect_direction, package: measure, feature: pop, direction: negligible, equivalence: 0.3, adjust_for: ["effect:measure", "s0 (calibration scale)", seed_share]}
+  - id: H5
+    belief: B5
+    claim: "At least 60% of usable points show a relative reduction of 2026 infections between 5% and 60%; refuted if 40% or fewer do"
+    test: {kind: effect_band, package: measure, band: [0.05, 0.6], min_share: 0.6}
+  - id: H6
+    belief: B6
+    claim: "With effect 30-45%, the measure beats no action at the shadow price in at least 60% of points across the s0 range"
+    test: {kind: paired_sign, a: measure, b: none, feature: "s0 (calibration scale)", range: [0.55, 0.99], sign: positive, min_share: 0.6, where: {"effect:measure": [0.3, 0.45]}}
