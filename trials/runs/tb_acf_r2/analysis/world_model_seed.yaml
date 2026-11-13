@@ -1,0 +1,178 @@
+# World model v0 (before any simulation): one round of active case finding (ACF) in 10 districts,
+# one algorithm per district (none / SYM / CXR), US$1.1M budget, primary outcome = undetected
+# bacteriologically confirmed TB (prevalent undiagnosed cases left undetected after the round).
+#
+# How the decision works, from first principles:
+#   cases detected in a district = pop x 0.70 reach x prev_undiag x yield fraction of the algorithm,
+#   where yield fraction = P(screen positive | TB) x P(Xpert Ultra positive | TB, tested) x completion.
+#   cost in a district = pop x 0.70 x cost per person screened (CXR > SYM; SYM is cheap per person but
+#   its Xpert load scales with the share presumptive).
+# Burden (prev_undiag) varies ~5-fold across districts and is the main thing that ranks districts;
+# the relative effect (yield fraction) is roughly constant across districts and ranks algorithms;
+# price per person screened sets where CXR stops being worth its extra cost vs SYM, and where any
+# screening stops being worth it vs none. Because cost scales with people screened but benefit scales
+# with prevalence x people screened, the choice per district is a threshold rule on prev_undiag:
+# CXR at the highest prevalence, SYM in the middle, none (possibly) at the lowest, the thresholds set
+# by the budget's shadow price. Population size changes total cost and benefit proportionally and should
+# not change a district's per-person choice.
+beliefs:
+  - id: B1
+    mechanism: >-
+      CXR-first screening (any abnormality -> Xpert Ultra) detects most prevalent bacteriologically
+      confirmed TB among those reached: CXR any-abnormality sensitivity ~0.9-0.98, Xpert Ultra sensitivity
+      ~0.85-0.9 on screen-detected (often paucibacillary) cases, x 0.70 reach, minus sputum non-submission.
+      Expected reduction in undetected prevalent cases across the target population ~0.45-0.65.
+    about: {package: cxr}
+    direction: reduces
+    magnitude: {band: [0.40, 0.72], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "van't Hoog AH, Onozaki I, Lonnroth K. Choosing algorithms for TB screening: a modelling study to compare yield, predictive value and diagnostic burden. BMC Infect Dis 2014", location: "sensitivity inputs table (CXR any abnormality ~0.98, WHO symptom screen lower); exact table number not recalled"}
+      - {citation: "WHO. Consolidated guidelines on tuberculosis, Module 2: Screening - systematic screening for tuberculosis disease. Geneva 2021", location: "recommendations on CXR and symptom screening accuracy; page not recalled"}
+      - {citation: "Zifodya JS et al. Xpert Ultra versus Xpert MTB/RIF for pulmonary tuberculosis and rifampicin resistance in adults with presumptive pulmonary tuberculosis. Cochrane Database Syst Rev 2021", location: "Summary of findings (Ultra pooled sensitivity ~0.88); table number not recalled"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: >-
+      Symptom-first screening misses the large subclinical share of prevalent TB (about half of
+      survey-detected bacteriologically confirmed cases report no cough >=2 weeks), so its yield fraction
+      is roughly half of CXR's: sensitivity of symptom screen ~0.4-0.75 depending on the symptom rule,
+      x Xpert Ultra ~0.85-0.9, x 0.70 reach. Expected reduction in undetected prevalent cases ~0.2-0.4.
+    about: {package: sym}
+    direction: reduces
+    magnitude: {band: [0.15, 0.45], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Frascella B et al. Subclinical tuberculosis disease - a review and analysis of prevalence surveys to inform definitions, burden, associations and screening methodology. Clin Infect Dis 2021", location: "pooled proportion subclinical ~50%; table not recalled"}
+      - {citation: "WHO. Consolidated guidelines on tuberculosis, Module 2: Screening. Geneva 2021", location: "symptom screen accuracy in general population; page not recalled"}
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: >-
+      The engine applies each algorithm's effect as a multiplicative relative rate on the district's
+      baseline, so a package's relative reduction moves with its own log relative rate: a higher
+      (less negative) lrr means a smaller reduction.
+    about: {package: cxr, feature: "lrr:cxr:undetected"}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "engine card (package_rate): rate = baseline x M(package) / M(baseline coverage), m = product of component RR", location: "_task_input.json is a harness file; mechanism statement only, no value"}
+    confidence: high
+  - id: B4
+    mechanism: >-
+      Same structural relation for SYM: its relative reduction falls as lrr:sym:undetected rises.
+    about: {package: sym, feature: "lrr:sym:undetected"}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "engine card (package_rate) multiplicative combination rule", location: "mechanism statement only"}
+    confidence: high
+  - id: B5
+    mechanism: >-
+      The relative yield of an algorithm does not depend on the district's prevalence (screening test
+      sensitivity is not a function of prevalence to first order; the engine is multiplicative), so the
+      relative reduction is flat along prev_undiag; prevalence drives absolute cases, not the relative effect.
+      In reality higher-prevalence settings may have a slightly different symptomatic share, a second-order effect.
+    about: {package: cxr, feature: prev_undiag}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Frascella B et al. Clin Infect Dis 2021", location: "subclinical share broadly similar across prevalence levels; not certain of the figure"}
+    confidence: medium
+  - id: B6
+    mechanism: >-
+      Under the binding budget, CXR's extra yield over SYM (~0.15-0.3 of prevalent cases among the
+      target population) is worth its higher per-person cost only where prevalence is high; the
+      CXR-vs-SYM net benefit increases with prev_undiag and flips from SYM to CXR somewhere in the upper
+      part of the sampled prevalence range. Location depends on the per-person price gap and the shadow price.
+    about: {pair: [cxr, sym], feature: prev_undiag}
+    direction: flips
+    conditions: [{feature: prev_undiag, range: [0.005, 0.011928]}]
+    source_type: literature
+    evidence:
+      - {citation: "Burke RM et al. Community-based active case-finding interventions for tuberculosis: a systematic review. Lancet Public Health 2021", location: "yield and number needed to screen depend strongly on prevalence; table not recalled"}
+      - {citation: "WHO. Consolidated guidelines on tuberculosis, Module 2: Screening. Geneva 2021", location: "prioritisation of screening by risk group prevalence (NNS); page not recalled"}
+    confidence: low
+    decision_relevant: true
+  - id: B7
+    mechanism: >-
+      At the highest prevalences, CXR beats SYM in net benefit at the budget's shadow price: the
+      absolute extra cases per person reached (prev x ~0.2) outweigh the price gap valued at lambda.
+    about: {pair: [cxr, sym], feature: prev_undiag}
+    direction: increases
+    conditions: [{feature: prev_undiag, range: [0.009, 0.011928]}]
+    source_type: literature
+    evidence:
+      - {citation: "van't Hoog AH et al. BMC Infect Dis 2014", location: "CXR-based algorithms give highest yield; NNS comparison table not recalled"}
+    confidence: low
+    decision_relevant: true
+  - id: B8
+    mechanism: >-
+      The inert calibration axis is not read by the engine and must not move any outcome.
+    about: {package: cxr, feature: "inert_design_axis (calibration scale)"}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "sweep design: read_by_engine false", location: "harness design description"}
+    confidence: high
+open_questions:
+  - id: Q1
+    question: >-
+      What share of prevalent undiagnosed TB in these high-risk adults is subclinical (symptom-negative)?
+      This sets SYM's yield relative to CXR and so the CXR/SYM threshold. The 2022-2025 ACF records
+      (cases per person screened by algorithm) identify it only together with prevalence and Xpert
+      sensitivity.
+    beliefs: [B2, B6]
+    decision_relevant: true
+  - id: Q2
+    question: >-
+      Per-person cost of CXR vs SYM (including Xpert for presumptives and CXR-abnormals) and whether the
+      budget binds tightly: the price gap times the shadow price places the CXR/SYM flip on prevalence.
+    beliefs: [B6, B7]
+    decision_relevant: true
+  - id: Q3
+    question: >-
+      Is district prevalence identified well from ACF yields? Yields from a symptom algorithm understate
+      prevalence by the subclinical share; national reference yields may come from a different population.
+      Mis-estimating prevalence moves districts across the threshold.
+    beliefs: [B6]
+    decision_relevant: true
+  - id: Q4
+    question: >-
+      Is it ever worth leaving a low-prevalence district unscreened so that more high-prevalence districts
+      get CXR (none vs SYM at the bottom of the prevalence range)?
+    beliefs: [B6]
+    decision_relevant: true
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "CXR reduces undetected prevalent TB by 0.40-0.72 in at least 70% of usable points."
+    test: {kind: effect_band, package: cxr, band: [0.40, 0.72], min_share: 0.7}
+  - id: H2
+    belief: B2
+    claim: "SYM reduces undetected prevalent TB by 0.15-0.45 in at least 70% of usable points."
+    test: {kind: effect_band, package: sym, band: [0.15, 0.45], min_share: 0.7}
+  - id: H3
+    belief: B3
+    claim: "CXR's relative reduction decreases as lrr:cxr:undetected increases."
+    test: {kind: effect_direction, package: cxr, feature: "lrr:cxr:undetected", direction: decreases}
+  - id: H4
+    belief: B4
+    claim: "SYM's relative reduction decreases as lrr:sym:undetected increases."
+    test: {kind: effect_direction, package: sym, feature: "lrr:sym:undetected", direction: decreases}
+  - id: H5
+    belief: B5
+    claim: "CXR's relative reduction does not vary with district prevalence (|rho| < 0.2)."
+    test: {kind: effect_direction, package: cxr, feature: prev_undiag, direction: negligible, equivalence: 0.2}
+  - id: H6
+    belief: B6
+    claim: "The SYM-to-CXR switch along prevalence lies within prev_undiag 0.005-0.0119."
+    test: {kind: flip_in, a: cxr, b: sym, feature: prev_undiag, range: [0.005, 0.011928]}
+  - id: H7
+    belief: B7
+    claim: "At prev_undiag >= 0.009, CXR beats SYM in net benefit at the shadow price in at least 60% of usable points."
+    test: {kind: paired_sign, a: cxr, b: sym, feature: prev_undiag, range: [0.009, 0.011928], sign: positive, min_share: 0.6}
+  - id: H8
+    belief: B8
+    claim: "CXR's relative reduction is flat along the inert calibration axis (|rho| < 0.2)."
+    test: {kind: effect_direction, package: cxr, feature: "inert_design_axis (calibration scale)", direction: negligible, equivalence: 0.2}
