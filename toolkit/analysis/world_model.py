@@ -1499,6 +1499,169 @@ def _self_test() -> int:
                 except WorldModelError:
                     ok(True, f"WM43c a recorded identity {why} is refused")
     tryit("WM43 recorded engine identity", wm43)
+
+    def wm44():
+        units = {str(i): {"age": str(v)} for i, v in enumerate([20, 30] + [25] * 9)}
+        plan = {u: ("A" if units[u]["age"] in ("20", "30") else "B") for u in units}
+        t = {"kind": "plan_share", "component": "a", "where": {"age": [20, 30]}, "min_share": 0.8}
+        st, res = _one(sw, t, plan=plan, units=units)
+        ok(st == "refuted" and res["observed"].get("units") == 11, "WM44 a numeric filter over CSV text matches the "
+           f"whole range, not only its endpoints (2 of 11 units get A): {st} {res['observed']}")
+        units["0"]["age"] = "unknown"
+        try:
+            _one(sw, t, plan=plan, units=units)
+            ok(False, "WM44b a non-numeric value under a numeric filter fails closed")
+        except WorldModelError:
+            ok(True, "WM44b a non-numeric value under a numeric filter fails closed")
+    tryit("WM44 numeric filters", wm44)
+
+    def wm45():
+        point = {"per_unit": {"1": {"package": "B", "benefit": 0.3, "cost": 2.0}}, "solver": {"status": "optimal"}}
+        ok(shadow_price(point)[0] is None, "WM45 no shadow price is inferred from average benefit / cost: without a "
+                                           f"recorded dual it is none: {shadow_price(point)}")
+        point["solver"]["budget_dual"] = 0.07
+        ok(shadow_price(point)[0] == 0.07, f"WM45b a recorded dual is used: {shadow_price(point)}")
+        point["solver"] = {"budget_slack": True}
+        ok(shadow_price(point)[0] == 0.0, f"WM45c lambda is 0 only when the plan says its budget is slack: "
+                                          f"{shadow_price(point)}")
+    tryit("WM45 shadow price", wm45)
+
+    def wm46():
+        x = np.linspace(1000, 1001, 200)
+        cs = _sw({"x": x}, np.where(x < 1000.5, 0.5, 0.2), 0.35 + 0 * x)
+        st, res = _one(cs, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [1000.0, 1000.0],
+                            "scope": "marginal"})
+        ok(st != "supported", f"WM46 verdicts compare full-precision values (a flip at 1000.5 is not 'at 1000'): {st} "
+                              f"{res['observed']}")
+        x2 = np.linspace(0, 1, 20)
+        cs2 = _sw({"x": x2}, np.where(x2 < 0.5, 0.5, 0.2), 0.35 + 0 * x2)
+        st2, res2 = _one(cs2, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [0.467, 0.533],
+                               "scope": "marginal"})
+        ok(st2 != "supported", f"WM46b a claim equal to the rounded range is not inside the computed one: {st2} "
+                               f"{res2['observed']}")
+    tryit("WM46 precision", wm46)
+
+    def wm47():
+        rng = np.random.default_rng(21)
+        x = rng.uniform(0, 1, 4000)
+        cs = _sw({"x": x}, 0.3 + 0 * x, 0.3 + 0.01 * (x + 1.9 * rng.standard_normal(4000)))
+        t = {"kind": "effect_direction", "package": "B", "feature": "x", "direction": "negligible"}
+        s1, r1 = _one(cs, dict(t, equivalence=0.3))
+        s2, r2 = _one(cs, dict(t, equivalence=0.16))
+        ok(s1 == "supported" and s2 == "inconclusive", "WM47 an equivalence claim is judged on its bound, whatever the "
+           f"significance (interval inside 0.3: supported; crossing 0.16: inconclusive): {s1} {r1['observed'].get('ci')}"
+           f", {s2}")
+    tryit("WM47 equivalence", wm47)
+
+    def wm48():
+        rng = np.random.default_rng(3)
+        base = np.array([0.0] * 23 + [1.0, 2.0])
+        heavy = sum(direction(base, rng.permutation(base))["direction"] in ("increases", "decreases")
+                    for _ in range(600)) / 600
+        lv = np.repeat([0.0, 1.0, 2.0, 3.0], 10)
+        mod = sum(direction(lv, rng.permutation(lv))["direction"] in ("increases", "decreases")
+                  for _ in range(600)) / 600
+        ok(heavy <= 0.05 and mod <= 0.08, f"WM48 directions on tied data are calibrated under the null (heavily tied: "
+                                          f"{heavy:.3f}; four levels: {mod:.3f})")
+    tryit("WM48 ties", wm48)
+
+    def wm49():
+        import yaml
+        from toolkit.analysis.artifacts import sha256
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write("x: 1\n")
+            open(os.path.join(d, "analysis", "calibration.yaml"), "w").write("c: 1\n")
+            ident = {"name": "e", "version": "1"}
+            good = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")),
+                    "inputs": {"analysis/calibration.yaml": sha256(os.path.join(d, "analysis", "calibration.yaml"))},
+                    "data": {"engine_identity": ident, "plan": {}}}
+            pth = os.path.join(d, "analysis", "point.yaml")
+            yaml.safe_dump(good, open(pth, "w"))
+            ok(point_doc(d, ident)["data"]["plan"] == {}, "WM49 a point plan bound to this run is read")
+            for mut, why in ((lambda g: g.update(spec_sha256="0" * 64), "another spec"),
+                             (lambda g: g["data"].update(engine_identity={"name": "e", "version": "2"}),
+                              "another engine identity"),
+                             (lambda g: g["inputs"].update({"analysis/calibration.yaml": "0" * 64}), "a changed input"),
+                             (lambda g: g["inputs"].update({"analysis/gone.yaml": "0" * 64}), "a missing input")):
+                bad = json.loads(json.dumps(good))
+                mut(bad)
+                yaml.safe_dump(bad, open(pth, "w"))
+                try:
+                    point_doc(d, ident)
+                    ok(False, f"WM49b a stale point plan ({why}) is refused")
+                except WorldModelError:
+                    ok(True, f"WM49b a stale point plan ({why}) is refused")
+    tryit("WM49 stale plan", wm49)
+
+    def wm50():
+        x = np.linspace(0, 1, 200)
+        cs = _sw({"x": x}, np.where(x < 0.8, 0.3, 0.9), 0.3 + 0 * x)
+        lit = [{"citation": "T", "location": "p. 1"}]
+        sd = {"beliefs": [{"id": "C1", "mechanism": "A cuts the outcome by 20-40% at high x", "about": {"package": "A"},
+                           "direction": "reduces", "magnitude": {"band": [0.2, 0.4], "scale": "relative_reduction"},
+                           "conditions": [{"feature": "x", "range": [0.8, 1.0]}], "source_type": "literature",
+                           "evidence": lit, "confidence": "low"}],
+              "hypotheses": [{"id": "K1", "belief": "C1", "claim": "A's effect is 20-40%", "registered_at": REGISTERED,
+                              "test": {"kind": "effect_band", "package": "A", "band": [0.2, 0.4],
+                                       "min_share": 0.75}}]}
+        _, hy = build(sd, cs)
+        ok(hy["hypotheses"][0]["status"] == "refuted", "WM50 a belief's conditions constrain its hypothesis' check "
+                                                       f"(every point at x >= 0.8 fails the band): "
+                                                       f"{hy['hypotheses'][0]['status']}")
+        sd2 = {"beliefs": [{"id": "C2", "mechanism": "A beats B at low x", "about": {"pair": ["A", "B"]},
+                            "direction": "none", "conditions": [{"feature": "x", "range": [0.0, 0.4]}],
+                            "source_type": "literature", "evidence": lit, "confidence": "low"}],
+               "hypotheses": [{"id": "K2", "belief": "C2", "claim": "A beats B", "registered_at": REGISTERED,
+                               "test": {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0.0, 1.0],
+                                        "where": {"x": [0.8, 1.0]}, "sign": "positive", "min_share": 0.8}}]}
+        try:
+            validate_seed(sd2)
+            ok(False, "WM50b a test whose intersected region lies outside its belief's conditions is refused")
+        except WorldModelError:
+            ok(True, "WM50b a test whose intersected region lies outside its belief's conditions is refused")
+    tryit("WM50 belief conditions", wm50)
+
+    def wm51():
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d:
+            spec = schema.load(schema.toy_spec(d))
+            got = consumed_inputs(spec, d)
+            ok("units.csv" in got and all(isinstance(v, str) and len(v) == 64 for v in got.values()),
+               f"WM51 the units table and every data or settings file consumed are fingerprinted: {sorted(got)}")
+    tryit("WM51 inputs", wm51)
+
+    def wm52():
+        for wh, kind, why in (({"f1": [0, 1, float("nan")]}, "effect_band", "a three-element region with NaN"),
+                              ({"f1": [0.5, 0.2]}, "effect_band", "an unordered region"),
+                              ({"f1": "low"}, "effect_band", "a text region on a sweep test"),
+                              ({"f1": [True, 1]}, "effect_band", "a boolean bound"),
+                              ({"region": ["north", 3]}, "plan_share", "a categorical filter with a number in it")):
+            sd = _seed()
+            h = sd["hypotheses"][0] if kind == "effect_band" else sd["hypotheses"][4]
+            h["test"]["where"] = wh
+            try:
+                validate_seed(sd)
+                ok(False, f"WM52 validation refuses {why}")
+            except WorldModelError:
+                ok(True, f"WM52 validation refuses {why}")
+    tryit("WM52 regions", wm52)
+
+    def wm53():
+        one, x = np.ones(30), np.linspace(0, 1, 30)
+        col = Sweep({"x": x}, {"none": [], "A": ["a"], "a": ["b"]}, "none", one,
+                    {"none": one, "A": 0.7 * one, "a": 0.8 * one}, {"none": 0 * one, "A": one, "a": one},
+                    points=list(range(30)), lam=0.1, evidence_time=EVIDENCE_TIME)
+        units = {str(i): {"x": float(v)} for i, v in enumerate(x)}
+        plan = {u: "a" for u in units}
+        s1, r1 = _one(col, {"kind": "plan_share", "component": "a", "where": {"x": [0, 1]}, "min_share": 0.8},
+                      plan=plan, units=units)
+        s2, _ = _one(col, {"kind": "plan_share", "package": "a", "where": {"x": [0, 1]}, "min_share": 0.8},
+                     plan=plan, units=units)
+        ok(s1 == "refuted" and s2 == "supported", "WM53 a component test inspects package composition (no package "
+                                                  f"named 'a' contains component a), a package test the package: {s1} "
+                                                  f"{r1['observed']}, {s2}")
+    tryit("WM53 component and package", wm53)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
