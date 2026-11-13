@@ -1,0 +1,261 @@
+beliefs:
+- id: B1
+  mechanism: Two-dose oral rotavirus vaccine in high-burden settings reduces all-cause severe diarrhoea by roughly
+    a fifth to a third in vaccinated infants (efficacy against severe rotavirus disease about 40-60%, diluted by
+    the non-rotavirus share); at about 70% coverage the population-level relative reduction of severe diarrhoea
+    is therefore roughly 0.08-0.30.
+  about:
+    package: routine
+  direction: reduces
+  magnitude:
+    band:
+    - 0.08
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Madhi SA et al. Effect of human rotavirus vaccine on severe diarrhea in African infants. N Engl J
+      Med 2010
+    location: Table 2 (all-cause severe gastroenteritis efficacy ~30%)
+  - citation: 'Soares-Weiser K et al. Vaccines for preventing rotavirus diarrhoea: vaccines in use. Cochrane Database
+      Syst Rev 2019'
+    location: Summary of findings, high-mortality countries (all-cause severe diarrhoea); values recalled, unsure
+  - citation: 'Armah GE et al. Efficacy of pentavalent rotavirus vaccine against severe rotavirus gastroenteritis
+      in infants in developing countries in sub-Saharan Africa: a randomised, double-blind, placebo-controlled trial.
+      Lancet 2010'
+    location: Results / Table 2 (efficacy ~39% over follow-up)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Outreach raises coverage from about 70% to 85%, so its relative reduction is about 1.2x routine's (same
+    per-child efficacy); population-level relative reduction roughly 0.10-0.36.
+  about:
+    package: outreach
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.36
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Madhi SA et al. Effect of human rotavirus vaccine on severe diarrhea in African infants. N Engl J
+      Med 2010
+    location: Table 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Under a binding budget routine dominates outreach: the routine-to-outreach increment yields under
+    half the benefit per US$ of routine, so at the shadow price set by the marginal routine district outreach only
+    wins where incidence exceeds roughly 2.3x the marginal district''s, which the 5x incidence range makes rare.'
+  about:
+    pair:
+    - routine
+    - outreach
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: question arithmetic (coverage 0.70 vs 0.85, price 3.00 vs 4.50); no external source
+    location: n/a
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B4
+  mechanism: Absolute benefit of routine vs none scales with baseline severe-diarrhoea incidence; with the budget
+    covering only a minority of children, routine beats none only in the higher-incidence districts, so the routine/none
+    choice flips along inc in its upper part.
+  about:
+    pair:
+    - routine
+    - none
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.028
+    - 0.055
+  source_type: literature
+  evidence:
+  - citation: Troeger C et al. Rotavirus Vaccination and the Global Burden of Rotavirus Diarrhea Among Children
+      Younger Than 5 Years. JAMA Pediatr 2018
+    location: burden varies several-fold between locations; flip location here is reasoning, not cited
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: The vaccine acts only on rotavirus episodes, so the relative reduction of all-cause severe diarrhoea
+    should scale with the rotavirus share (sentinel rv_share). The engine card lists only baseline_rate as a unit
+    attribute, so the engine may omit this; if so the ranking ignores a two-fold variation in effect.
+  about:
+    package: routine
+    feature: rv_share
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Troeger C et al. Rotavirus Vaccination and the Global Burden of Rotavirus Diarrhea Among Children
+      Younger Than 5 Years. JAMA Pediatr 2018
+    location: rotavirus fraction of diarrhoea; location unsure
+  - citation: 'data: units.csv column rv_share'
+    location: units.csv:rv_share
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B6
+  mechanism: In reality outreach adds most where facility access is low (routine coverage below 70%), but the engine
+    fixes package coverage and does not read access, so in the sweep the relative reduction of outreach does not
+    vary with access.
+  about:
+    package: outreach
+    feature: access
+  direction: negligible
+  source_type: data
+  evidence:
+  - dossier_entry: units.csv:access
+    file: units.csv
+    column: access
+  confidence: medium
+  decision_relevant: false
+- id: B7
+  mechanism: Under a multiplicative rate engine the relative reduction is independent of baseline incidence; inc
+    changes absolute benefit, not relative effect.
+  about:
+    package: routine
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'engine card: rate = baseline x M(package) / M(baseline coverage)'
+    location: _task_input mechanisms (structural reasoning)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Does the engine scale the severe-diarrhoea reduction by rv_share? If not, effect should be rv_share
+    x VE x coverage applied outside the engine, and districts would re-rank by inc x rv_share.
+  beliefs:
+  - B5
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Is the trial effect (first-year efficacy in infants) applied to all under-fives? In 2026-27 most children
+    aged 2-4 are unvaccinated, so a cohort-based effect would be several times smaller in absolute terms (ranking
+    unchanged, total averted changed).
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q3
+  question: Does real coverage under routine depend on access (low-access districts below 70%), which would raise
+    the incremental value of outreach there?
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: What shadow price is declared, and does it match the budget dual? A lower value favours outreach.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Routine's relative reduction of severe diarrhoea lies in 0.08-0.30 at >=60% of usable points; refuted if
+    <=40% do.
+  test:
+    kind: effect_band
+    package: routine
+    band:
+    - 0.08
+    - 0.3
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: Outreach's relative reduction lies in 0.10-0.36 at >=60% of usable points; refuted if <=40% do.
+  test:
+    kind: effect_band
+    package: outreach
+    band:
+    - 0.1
+    - 0.36
+    min_share: 0.6
+- id: H3
+  belief: B3
+  claim: At the budget shadow price routine beats outreach at >=80% of usable points across the whole inc range;
+    refuted if outreach wins at >=80%.
+  test:
+    kind: paired_sign
+    a: routine
+    b: outreach
+    feature: inc
+    range:
+    - 0.01026
+    - 0.05537
+    sign: positive
+    min_share: 0.8
+- id: H4
+  belief: B4
+  claim: The routine/none transition along inc lies within inc 0.028-0.055 (routine only in higher-incidence districts);
+    refuted if the located flip is disjoint from that range.
+  test:
+    kind: flip_in
+    a: routine
+    b: none
+    feature: inc
+    range:
+    - 0.028
+    - 0.055
+- id: H5
+  belief: B5
+  claim: Routine's relative reduction increases with rv_share (Spearman interval above 0); a negligible or negative
+    relation means the engine omits the rotavirus fraction.
+  test:
+    kind: effect_direction
+    package: routine
+    feature: rv_share
+    direction: increases
+- id: H6
+  belief: B6
+  claim: Outreach's relative reduction does not vary with access (|rho| bound within 0.2).
+  test:
+    kind: effect_direction
+    package: outreach
+    feature: access
+    direction: negligible
+    equivalence: 0.2
+- id: H7
+  belief: B7
+  claim: Routine's relative reduction does not vary with baseline incidence (|rho| bound within 0.2).
+  test:
+    kind: effect_direction
+    package: routine
+    feature: inc
+    direction: negligible
+    equivalence: 0.2
