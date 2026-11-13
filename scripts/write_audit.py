@@ -333,7 +333,7 @@ REVIEWED: dict = {
     "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/equilibration.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/guess_sensitivity.py": {"open-write": (1, _REPO)},
-    "toolkit/engines/malaria/benchmarks/net_effect_fit.py": {"open-write": (1, _REPO + " (net_effect_fit.yaml, or a smoke's --out)")},
+    "toolkit/engines/malaria/benchmarks/net_effect_fit.py": {"open-write": (2, _REPO + " (net_effect_fit.yaml or a smoke's --out; a copy under the job's JOB_OUT)")},
     "toolkit/engines/malaria/benchmarks/render_notes.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {"open-write": (3, _REPO)},
     "toolkit/engines/malaria/benchmarks/runtime.py": {"open-write": (1, _REPO)},

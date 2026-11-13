@@ -102,7 +102,7 @@ pending}` until it reports.
 |---|---|---|---|---|
 | `net_kill_shift` | 0 | logit | added to the hut-mortality intercept: logit l = 0.63 + shift + 4.00 (x − 0.5), for every net type. Deterrence, feeding, killing and insecticide decay all follow from l through Churcher's own equations | −0.618 to 0.66 (triangular). Churcher 2016, Results: α1 = 0.634 (95% CrI 0.012–1.29), re-centred on Table 6's 0.63 |
 | `pbo_gain_scale` | 1 | multiplier | scales PBO's gain in bioassay-mortality logit: logit f_s = logit x + s (logit f − logit x), with f from Equation 4. 0 = no PBO gain | 0.316 to 1.0 (uniform). Gleave et al. 2021 Cochrane review, hut-trial mortality; rule below |
-| `pbo_adv_decay` | 0 | per year | a PBO net of age t gives a same-age pyrethroid net's outcomes plus exp(−decay × t) times the PBO net's advantage (repeat, kill and the insecticide content used by the holes model) | 0 to 1.594 (uniform). LLINEUP, Staedke et al. 2020, Table 2; rule below |
+| `pbo_adv_decay` | 0 | per year | a PBO net of age t gives a same-age pyrethroid net's outcomes plus exp(−decay × t) times the PBO net's advantage (repeat, kill and the insecticide content used by the holes model) | 0 to 1.895 (uniform). LLINEUP, Staedke et al. 2020, Table 2, less the engine's own waning; rule below |
 
 **Why these three, and not the 20 coefficients.** Each net type's effect runs through one quantity, the hut mortality l.
 - **Pyrethroid nets against no nets.** l comes from the bioassay mortality x through α1 and α2 (Equation 2). Entry (m), feeding (k), exit (j), the per-attempt outcomes (r0, d0, s0) and the wash decay γ are all functions of l (Equations 8, 11–19). A shift on α1 moves every outcome the way the hut-trial data tie them together, whereas drawing δ1–δ3, θ1–θ2, μ and ρ independently would ignore their correlation in Churcher's joint fit. The paper reports a credible interval only for α1 and α2 (Results). The slope α2, which sets how the effect changes with resistance, stays fixed.
@@ -137,13 +137,23 @@ The pack's PBO trials (B9, B9b, B9c) and their papers play no part in these rang
   - 0.74 (0.62–0.87) at 6 months;
   - 0.73 (0.63–0.85) at 12 months;
   - 0.84 (0.72–0.98) at 18 months.
-- *Rule* (`adv_decay_from_prs`):
-  1. Assume log PR fades as exp(−decay × t) between 6 and 18 months.
-  2. Then decay = ln(ln 0.74 / ln 0.84) / 1 y = 0.546 per year.
-  3. The 95% range comes from the delta method, with each SE taken from its CI and the two estimates treated as independent. That is conservative, since they come from the same clusters.
-  4. The lower end is clipped at 0.
-- *Result.* 0 to 1.594 per year.
-- *Cross-check.* The intention-to-treat ratios (0.78, 0.80, 0.94; Table 2) give 1.39 per year, inside the range.
+- *The trial's total waning* (`adv_decay_from_prs`):
+  1. Assume log PR fades as exp(−rate × t) between 6 and 18 months.
+  2. Then rate = ln(ln 0.74 / ln 0.84) / 1 y = 0.546 per year.
+  3. The 95% interval, −0.502 to 1.594, comes from the delta method, with each SE taken from its CI and the two estimates treated as independent. That is conservative, since they come from the same clusters.
+- *Why that total is not the parameter (review round 2).* `pbo_adv_decay` acts on top of the engine's own waning of the PBO advantage, because Churcher's PBO and pyrethroid nets already decay at different rates. The engine's own waning of the PBO feeding advantage between net ages 6 and 18 months (`engine_adv_decay`; defaults, holes off, A. gambiae complex) depends strongly on resistance:
+  - 0.977 per year at bioassay mortality x = 0;
+  - 0.000 at x = 0.15;
+  - −0.301 at x = 0.30, where the advantage grows with net age.
+
+  The feeding advantage is used, not the killing advantage, because the killing advantage changes sign above x of about 0.2.
+- *Rule* (`pbo_adv_decay_extra`):
+  1. Take extra(x) = trial total − engine waning(x), at x = 0, 0.01, …, 0.30.
+  2. The range is the hull of [lo − k(x), hi − k(x)], clipped at 0.
+- *Which resistance levels.* LLINEUP reports very high resistance (target-site Vgsc-L1014S and metabolic markers, p. 1294), but no discriminating-dose mortality in the article. So Gleave 2021's high-resistance category (below 30%) is used, and the hull covers it.
+- *Result.* 0 to 1.895 per year. At the trial's point estimate the extra rate is 0 for x below about 0.05, 0.546 at x = 0.15 and 0.847 at x = 0.30.
+- *Check.* Self-test V37 applies the rule: with the extra rate set, the engine's total waning equals the trial's 0.546 at x = 0.10, 0.15 and 0.25.
+- *Cross-check.* The intention-to-treat ratios (0.78, 0.80, 0.94; Table 2) give a total of 1.39 per year, inside the trial's interval.
 - *Mechanism.* At 12 months, PBO in withdrawn nets was below the manufacturers' minimum target in 80% of PermaNet 3.0 and 90% of Olyset Plus (p. 1298).
 - *Assumption.* Mapping the fading of a prevalence ratio onto the fading of the per-attempt advantage assumes that transmission responds linearly and that attrition is equal in the two arms.
 
@@ -215,7 +225,7 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 - The sites' calibration arms (pyrethroid nets, no IRS) depend on no other fitted parameter (F9). So the sites are calibrated on a grid of 5 values of `net_kill_shift`.
 - Each parameter point, whether design, chosen or sample, takes its m0 by log-linear interpolation at its own value.
 - Results are cached under the calibration they ran with (F10). The design points, the verification at the chosen value and the verified sample points therefore all share one calibration rule.
-- Each verified point also records its control arms' baseline against the target it is calibrated to.
+- Each verified point, and the chosen point, records its control arms' baseline against the target it is calibrated to. The acceptance gate below uses it.
 
 **Method.** The pack's joint fit, rule `joint-v1` (`benchmark.fit_joint`, unchanged), on that runner:
 1. Run a Latin hypercube of 45 points plus the centre on the pack's 8 seeds.
@@ -225,7 +235,15 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 
 **Joint sample.**
 - The output is up to 2,000 parameter sets from the region where the surrogate puts every target in band, with their correlation matrix. The hull and the box-edge flags are computed from every accepted candidate, before subsampling (F12).
-- 12 of them are re-run on the engine. If any one is out of band, the sample is marked invalid: it moves to `sample_unverified` with the failing points, and the run exits 2 (F11).
+- 12 of them are re-run on the engine, each at its own calibration.
+- **Acceptance gate (review rounds 1–2, F11).** The sample is `verified` only if all of these hold:
+  - every verified point and the chosen point keep every target in band;
+  - the chosen point is not disproved;
+  - every control arm is within 10% (relative) of its site's calibration target;
+  - no site's calibration grid clamps m0 at a grid bound (`at_grid_edge`).
+
+  Otherwise the sample moves to `sample_unverified`, the reasons are recorded under `acceptance`, and the run exits 2.
+- *Why 10%.* The interpolation in `net_kill_shift` and the seed noise move the control arm. 10% is a third or less of the training targets' band half-widths (for example B10 0.30–0.67 around 0.45). A baseline that close does not, on its own, move a ratio across its band, while a clamped or badly interpolated m0 (a reviewer found 0.30 against 0.458) is caught.
 - Why a joint sample: independent draws from the marginal ranges break a narrow trade-off. Self-test F5 shows one where 90% of independent draws fall outside it.
 
 **Run count.**
@@ -233,11 +251,21 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 - Calibration grid: 5 × 21 grid values × 2 seeds = 210 runs.
 - Total: 3,986 arm runs.
 
-**Cost.** Laptop basis, measured on v0.16 with 5000 agents: about 70 s per burn-in group and 7.4 s per extra arm.
-- Laptop: 49 CPU-hours.
-- VM: 98–147 vCPU-hours, assuming a VM vCPU is 2–3 times slower than a laptop core.
-- Price: **$10.7–22.3**, at $0.109 per vCPU-hour (the P6 billing) up to $0.152 (the `vm_prices.yaml` bound). That is under the owner's $25 cap.
-- `run` refuses a plan whose upper estimate exceeds the cap (F6), as well as a run without `--approved`.
+**Cost: allocated VM time, not CPU work (review round 2).** The price is the allocated vCPUs × wall time.
+- *Wall time.* Each `_map` wave, at 2–3 times the laptop task time, plus about 15 minutes of VM start-up and 20 s per process pool (both assumptions).
+- *Laptop task times.* Measured on v0.16 with 5000 agents: a burn-in group with one arm 77 s; each further arm 7.4 s.
+- *Waves on one 16-vCPU VM:*
+  - calibration: 5 calls × ⌈42/16⌉ = 15;
+  - design: 1,472 tasks in chunks of 300, 93 waves;
+  - chosen point: 4 calls of 8 tasks, 4 waves;
+  - sample: 384 tasks, 25 waves.
+- *Result.* 108–159 vCPU-hours, **$11.7–24.1**, under the $25 cap. Pricing aggregate CPU work instead would have said $22.3.
+- *Other VM sizes.* 64 vCPUs would cost up to $31.1, because more workers sit idle in the short waves. The script refuses that plan.
+
+**Launch.** `plan` prints the launch command. It goes through `cloud/vm_job.py run f6-netfit net-effect-fit --cap-usd 25 --budget-scope f6 --cpu 16 --memory "64 GiB" -- python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py run --approved … --workers 16`.
+- The job's USD meter stops the VM at the cap (F13).
+- `run_cluster.py` launches `main.py` pipeline runs. A single engine job goes through `vm_job.py`, which takes the same owner-signed budget and `--cap-usd`.
+- `run` refuses to start when the plan's upper estimate on its vCPUs exceeds the cap (F6), or without `--approved`.
 
 **Output.** `benchmarks/net_effect_fit.yaml`, never `fitted.yaml` or `results.yaml`. Adopting it is a later engine version:
 1. The fitted parameters take the joint sample as their uncertainty. Draws as joint rows are a harness change.

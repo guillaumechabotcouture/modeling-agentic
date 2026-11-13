@@ -277,7 +277,34 @@ def pbo_gain_scale_for_hut_rr(rr: float, x_lo: float, x_hi: float, complex_: str
     return 0.5 * (lo + hi)
 
 
-def adv_decay_from_prs(early, late, dt_years: float) -> tuple:
+def engine_adv_decay(x: float, t0_d: float, t1_d: float, P: dict, complex_: str = "gambiae") -> float:
+    """The engine's own waning rate (per year) of a PBO net's advantage over a same-age pyrethroid net between net
+    ages t0_d and t1_d (days): ln(A(t0) / A(t1)) / years, A = the pyrethroid net's feeding share minus the PBO net's,
+    per attempt, holes off (holes add absolute changes, so the advantage is not scaled by them). Feeding, not
+    killing: the killing advantage changes sign with resistance (above x of about 0.2), the feeding advantage does
+    not. With P's pbo_adv_decay set, it is the total waning: Churcher's plus exp(-decay t)."""
+    a = np.array([t0_d, t1_d], float)
+    _, _, s_b = itn_effect(np.ones(2, int), x, a, P, complex_, holes=False)
+    _, _, s_p = itn_effect(np.zeros(2, int), x, a, P, complex_, holes=False)
+    adv = s_p - s_b
+    return float(np.log(adv[0] / adv[1]) / ((t1_d - t0_d) / 365.0))
+
+
+def pbo_adv_decay_extra(early, late, t0_d: float, t1_d: float, xs, complex_: str = "gambiae") -> dict:
+    """v0.17 prior rule for pbo_adv_decay (review round 2): the trial's total waning (adv_decay_from_prs, unclipped)
+    minus the engine's own waning (engine_adv_decay at the defaults) at each resistance level x in xs; the range is
+    the hull over xs of [lo - k(x), hi - k(x)], clipped at 0. Returns {by_x: {x: {k, extra: (pt, lo, hi)}}, range}."""
+    pt, lo, hi = adv_decay_from_prs(early, late, (t1_d - t0_d) / 365.0, clip=False)
+    P0 = dict(NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0)
+    by = {}
+    for x in xs:
+        k = engine_adv_decay(float(x), t0_d, t1_d, P0, complex_)
+        by[float(x)] = {"k": k, "extra": (max(0.0, pt - k), max(0.0, lo - k), max(0.0, hi - k))}
+    return {"trial": (pt, lo, hi), "by_x": by,
+            "range": [round(min(v["extra"][1] for v in by.values()), 3), round(max(v["extra"][2] for v in by.values()), 3)]}
+
+
+def adv_decay_from_prs(early, late, dt_years: float, clip: bool = True) -> tuple:
     """v0.17 prior rule for pbo_adv_decay from two prevalence ratios (point, lo95, hi95) of one trial, dt_years apart:
     log PR(t) fades as exp(-decay t), so decay = ln(log PR_early / log PR_late) / dt; its 95% range by the delta method
     with each SE from its CI and the two estimates taken as independent (conservative: they share clusters), the lower
@@ -286,7 +313,7 @@ def adv_decay_from_prs(early, late, dt_years: float) -> tuple:
     a, b = -np.log(early[0]), -np.log(late[0])
     pt = float(np.log(a / b) / dt_years)
     s = float(np.sqrt((se(early) / a) ** 2 + (se(late) / b) ** 2) / dt_years)
-    return pt, max(0.0, pt - 1.959964 * s), pt + 1.959964 * s
+    return pt, (max(0.0, pt - 1.959964 * s) if clip else pt - 1.959964 * s), pt + 1.959964 * s
 
 
 def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0):

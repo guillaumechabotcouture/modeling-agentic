@@ -62,6 +62,14 @@ DESIGN = {"n": 45, "seed": 17}     # 15 quadratic coefficients in 4 dimensions; 
 VERIFY = 12                        # joint-sample points re-run on the engine, each at its own calibration
 SAMPLE = 2000                      # joint-sample points exported (surrogate all-in-band region)
 CAP_USD = 25.0                     # owner, 13 Nov: hard cap for the fit; `run` refuses a plan above it
+VCPUS = 16                         # one VM of 16 vCPUs, one worker each: the cheapest of 16/32/64 under the cap
+# Acceptance (review round 2): a verified point's control arms must reproduce the baseline each site is calibrated
+# to within 10% (relative). The interpolation in net_kill_shift and the seed noise move it; 10% is a third or less
+# of the training targets' band half-widths (B10 0.30-0.67, B12m 0.19-0.55 around 0.45 and 0.33), so a baseline
+# that close does not move a ratio across its band on its own, and a clamped or badly interpolated m0 is caught
+CAL_TOL = 0.10
+START_H = 0.25                     # VM start, image and tree upload (an assumption; vm_job starts one VM)
+POOL_S = 20.0                      # a fresh process pool per _map chunk (an assumption)
 # Cost basis (measured 2026-11-12 on the laptop, arm64, one process, OMP_NUM_THREADS=2, v0.16 tree, 5000 agents,
 # Muleba setting): a 50-year burn-in with the history to the fork and one arm 77 s CPU, with four arms 99.5 s, so
 # about 70 s per (parameter point, setting, seed) group and 7.4 s per extra arm. VM_FACTOR 2-3: a VM vCPU against one
@@ -195,25 +203,57 @@ class RecalRunner(BM.Runner):
         return {a: self.cache[(a, key)] for a in arms}
 
 
-def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N) -> dict:
+def _task_s(k: int) -> float:
+    """Laptop seconds of one engine task: a burn-in group of k arms of one setting at one point and seed."""
+    return GROUP_S + k * ARM_S
+
+
+def _waves(n_tasks: int, vcpus: int, chunk: int = 300) -> int:
+    """benchmark.Runner._map runs tasks in chunks of 300, each on a fresh pool of `vcpus` workers."""
+    return sum(-(-min(chunk, n_tasks - i) // vcpus) for i in range(0, n_tasks, chunk))
+
+
+def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPUS) -> dict:
+    """Run counts and the price of the allocated VM (review round 2): vcpus x the wall time of each _map wave
+    (calibration: cal_n calls of 42 single-arm tasks; design: one call; the chosen point: one call per training
+    setting; the sample: one call), at VM_FACTOR x the laptop task time, plus START_H and POOL_S per pool."""
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = _fit_settings(pack)
+    per_set = max(sum(1 for a in arms if pack["arms"][a]["setting"] == s) for s in settings)
     npts, ns = int(fj["design"]["n"]) + 1, len(pack["seeds"])
     grid = sum(len(pack["settings"][s]["calibrate"]["grid"]) for s in settings if pack["settings"][s].get("calibrate"))
-    cal = cal_n * grid * min(2, ns)                 # the calibration grid in CAL_PARAM; each run its own burn-in
+    cal_tasks = grid * min(2, ns)
+    cal = cal_n * cal_tasks                         # the calibration grid in CAL_PARAM; each run its own burn-in
     pts = npts + 1 + verify                         # design, the chosen value, the verified joint-sample points
     groups, sims = pts * len(settings) * ns, pts * len(arms) * ns
     cpu_h = (groups * GROUP_S + sims * ARM_S + cal * (GROUP_S + ARM_S)) / 3600
-    vcpu = [cpu_h * f for f in VM_FACTOR]
+    waves = {"calibration": cal_n * _waves(cal_tasks, vcpus), "design": _waves(npts * len(settings) * ns, vcpus),
+             "chosen": len(settings) * _waves(ns, vcpus), "sample": _waves(verify * len(settings) * ns, vcpus)}
+    pools = cal_n + len(settings) + sum(-(-n // 300) for n in (npts * len(settings) * ns, verify * len(settings) * ns))
+    lap = waves["calibration"] * _task_s(1) + (waves["design"] + waves["chosen"] + waves["sample"]) * _task_s(per_set)
+    wall = [lap * f / 3600 + START_H + pools * POOL_S / 3600 for f in VM_FACTOR]
+    vh = [vcpus * w for w in wall]
     _, held = split(pack)
     return {"params": fj["params"], "targets_train": fj["targets"], "held_out_untouched": held,
             "not_fitted": sorted(set(NET_PARAMS) - set(fj["params"])), "calibration_depends_on": sorted(
                 calibration_params(pack)), "arms": arms, "settings": settings,
             "design_points": npts, "verified_sample_points": verify, "seeds": ns, "calibration_runs": cal,
-            "arm_runs": sims + cal, "burn_in_groups": groups + cal, "laptop_cpu_hours": round(cpu_h, 1),
-            "vm_vcpu_hours": [round(v, 1) for v in vcpu],
-            "usd": [round(vcpu[0] * USD_PER_VCPU_H[0], 1), round(vcpu[1] * USD_PER_VCPU_H[1], 1)]}
+            "arm_runs": sims + cal, "burn_in_groups": groups + cal, "cpu_work_hours": round(cpu_h, 1),
+            "vcpus": vcpus, "waves": waves, "wall_hours": [round(w, 2) for w in wall],
+            "vm_vcpu_hours": [round(v, 1) for v in vh],
+            "usd": [round(vh[0] * USD_PER_VCPU_H[0], 1), round(vh[1] * USD_PER_VCPU_H[1], 1)],
+            "launch": " ".join(launch_command(vcpus))}
+
+
+def launch_command(vcpus: int = VCPUS) -> list:
+    """The launch (the lead session runs it after the owner's approval): one VM through cloud/vm_job.py, whose job
+    meter stops the VM at --cap-usd in USD (cloud/budget.py); the fit writes a copy of its output under $JOB_OUT."""
+    return ["python3", "cloud/vm_job.py", "run", "f6-netfit", "net-effect-fit", "--tree", ".",
+            "--store", "outputs/_engine/net_effect_fit", "--cap-usd", f"{CAP_USD:g}", "--budget-scope", "f6",
+            "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--",
+            "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
+            "--approved", "owner 2026-11-13: fit approved, hard cap 25 USD", "--workers", str(vcpus)]
 
 
 def target_bands(pack: dict) -> dict:
@@ -250,22 +290,54 @@ def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarr
             "correlation": {"names": names, "matrix": corr}, "sample": [to(cand[i]) for i in idx]}
 
 
-def finalize(reg: dict, checked: list) -> tuple[dict, int]:
-    """Attach the verification; a verified point out of band invalidates the sample (review P2): it is moved to
-    `sample_unverified`, `sample` is emptied, and the code is 2. Every verified point in band: `verified`, code 0."""
-    failed = [c["point"] for c in checked if not c["all_in_band"]]
+def calibration_ok(cal: dict) -> list:
+    """Sites whose control arm is off its calibration target by more than CAL_TOL (relative)."""
+    return sorted(s for s, c in (cal or {}).items()
+                  if not abs(float(c["achieved"]) / float(c["target"]) - 1.0) <= CAL_TOL)
+
+
+def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=()) -> tuple[dict, int]:
+    """The acceptance gate (review rounds 1-2). The sample is `verified` (code 0) only if every verified point and
+    the chosen point keep every target in band, their control arms are within CAL_TOL of the calibration targets,
+    the chosen point is not disproved, and no site's calibration grid clamps at its edge. Otherwise the sample moves
+    to `sample_unverified`, `sample` is emptied, the reasons are recorded, and the code is 2."""
+    failed = [c["point"] for c in checked if not c["all_in_band"] or calibration_ok(c.get("calibration_check"))]
+    why = [f"verified point out of band or off calibration: {p}" for p in failed]
+    for c in checked:
+        if calibration_ok(c.get("calibration_check")):
+            why.append(f"control arms off target by more than {CAL_TOL:.0%} at {c['point']}: "
+                       f"{calibration_ok(c.get('calibration_check'))}")
+    if chosen is None:
+        why.append("the chosen point's verification is missing")
+    else:
+        if not chosen.get("all_in_band") or chosen.get("disproved_by_verification"):
+            why.append(f"the chosen point fails its verification: {chosen.get('disproved_by_verification')}")
+        if calibration_ok(chosen.get("calibration_check")):
+            why.append(f"the chosen point's control arms are off target: {calibration_ok(chosen['calibration_check'])}")
+    if grid_edge:
+        why.append(f"the calibration grid clamps at its edge for {sorted(grid_edge)}")
+    if not checked:
+        why.append("no verified sample point")
     reg["verified"] = {"n": len(checked), "all_in_band": len(checked) - len(failed), "failed": failed,
-                       "points": checked}
-    if failed or not checked:
-        reg["sample_status"] = "invalid" if failed else "unverified"
+                       "points": checked, "chosen": chosen, "calibration_tolerance": CAL_TOL}
+    reg["acceptance"] = why
+    if why:
+        reg["sample_status"] = "unverified" if why == ["no verified sample point"] else "invalid"
         reg["sample_unverified"], reg["sample"] = reg.get("sample") or [], []
         return reg, 2
     reg["sample_status"] = "verified"
     return reg, 0
 
 
+def _control_check(runner, pack: dict, ctrl: dict, point: dict) -> dict:
+    """Each site's control arm at the point's own calibration, against the baseline it is calibrated to."""
+    res = runner.arm_results(sorted(ctrl.values()), point)
+    return {s: {"target": pack["settings"][s]["calibrate"]["target"], "achieved": round(float(np.mean(
+        [BM.get(r, pack["settings"][s]["calibrate"]["value_path"]) for r in res[a]])), 4)} for s, a in ctrl.items()}
+
+
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
-        verify: int = VERIFY, cap_usd: float = CAP_USD) -> int:
+        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None) -> int:
     if os.path.basename(out_path) in PROTECTED:
         raise ValueError(f"net_effect_fit writes its own file, never {PROTECTED}")
     bad = check(pack, base)
@@ -274,9 +346,9 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
     cal_n = 2 if smoke else CAL_N
-    q = plan(pack, verify, cal_n)
+    q = plan(pack, verify, cal_n, vcpus or max(int(workers), 1))
     if not smoke and q["usd"][1] > cap_usd:
-        raise ValueError(f"the plan's upper cost ${q['usd'][1]} is above the cap ${cap_usd}")
+        raise ValueError(f"the plan's upper cost ${q['usd'][1]} on {q['vcpus']} vCPUs is above the cap ${cap_usd}")
     if calibration_params(pack) != {CAL_PARAM}:
         raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
@@ -286,39 +358,45 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
     centre = {k: float(box[i].mean()) for i, k in enumerate(names)}
     runner.calibrate_grid(_fit_settings(pack), centre, cal_n)
+    grid_edge = sorted(s for s, rows in runner.cal_grid["rows"].items() if any(r.get("at_grid_edge") for r in rows))
     fit = BM.fit_joint(pack, eng, runner)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
     reg = joint_region(X, fit["design"]["computed"], target_bands(pack), names, box,
                        int(pack["fit_joint"]["design"]["seed"]))
-    # re-run `verify` joint-sample points, each at its own interpolated calibration, as the design points were
     byid = {b["id"]: b for b in pack["benchmarks"]}
+    ctrl = {s: next(a for a, c in pack["arms"].items() if c["setting"] == s and (c.get("package") or {}) ==
+                    (pack["settings"][s]["calibrate"].get("arm_package") or {})) for s in _fit_settings(pack)}
+    best = {k: v["value"] for k, v in fit["parameters"].items()}
+    chosen = {"point": best, "all_in_band": all(v["in_band"] for v in fit["verification"].values()),
+              "disproved_by_verification": fit["feasibility"]["disproved_by_verification"],
+              "calibration_check": _control_check(runner, pack, ctrl, best)}
+    # re-run `verify` joint-sample points, each at its own interpolated calibration, as the design points were
     rng = np.random.default_rng(int(pack["fit_joint"]["design"]["seed"]) + 1)
     pick = sorted(rng.choice(len(reg["sample"]), min(verify, len(reg["sample"])), replace=False).tolist()) \
         if reg["sample"] else []
     runner.prefetch(sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])}),
                     [reg["sample"][i] for i in pick])
-    # each site's control arm at the interpolated calibration, against the baseline it is calibrated to
-    ctrl = {s: next(a for a, c in pack["arms"].items() if c["setting"] == s and (c.get("package") or {}) ==
-                    (pack["settings"][s]["calibrate"].get("arm_package") or {})) for s in _fit_settings(pack)}
     checked = []
     for i in pick:
         rows = {t: runner.evaluate(byid[t], reg["sample"][i]) for t in pack["fit_joint"]["targets"]}
-        res = runner.arm_results(sorted(ctrl.values()), reg["sample"][i])
-        cal = {s: {"target": pack["settings"][s]["calibrate"]["target"], "achieved": round(float(np.mean(
-            [BM.get(r, pack["settings"][s]["calibrate"]["value_path"]) for r in res[a]])), 4)} for s, a in ctrl.items()}
         checked.append({"point": reg["sample"][i], "all_in_band": all(r["in_band"] for r in rows.values()),
-                        "computed": {t: round(r["computed"], 4) for t, r in rows.items()}, "calibration_check": cal})
-    reg, code = finalize(reg, checked)
+                        "computed": {t: round(r["computed"], 4) for t, r in rows.items()},
+                        "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
+    reg, code = finalize(reg, checked, chosen, grid_edge)
     doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters on the pack's training targets "
                                "(ENGINE_NOTES.md, v0.17); not adopted",
                     "smoke": smoke, "approved": approved, "cap_usd": cap_usd, "plan": q, "n_sims": runner.nsims,
                     "wall_s": round(time.time() - t0, 1), "fitted_at": time.strftime("%F %T"),
-                    "calibration_grid": {CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"]},
+                    "calibration_grid": {CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
+                                         "at_grid_edge": grid_edge},
                     "joint_region": reg, **fit}, eng)
     yaml.safe_dump(doc, open(out_path, "w"), sort_keys=False)
+    job_out = os.environ.get("JOB_OUT")
+    if job_out and not smoke:
+        yaml.safe_dump(doc, open(os.path.join(job_out, os.path.basename(out_path)), "w"), sort_keys=False)
     print(f"wrote {out_path} ({runner.nsims} sims); joint sample {reg['sample_status']}: verified "
-          f"{reg['verified']['all_in_band']}/{reg['verified']['n']} all in band")
+          f"{reg['verified']['all_in_band']}/{reg['verified']['n']} all in band; acceptance: {reg['acceptance'] or 'ok'}")
     return code
 
 
@@ -500,13 +578,14 @@ def main(argv=None) -> int:
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--approved", default=None)
     ap.add_argument("--verify", type=int, default=VERIFY)
+    ap.add_argument("--vcpus", type=int, default=VCPUS, help="the VM's vCPUs (plan; run: defaults to --workers)")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     base = yaml.safe_load(open(PACK))
     pack = build_pack(base, a.smoke)
     if a.action == "plan":
-        print(yaml.safe_dump(plan(pack, a.verify), sort_keys=False))
+        print(yaml.safe_dump(plan(pack, a.verify, vcpus=a.vcpus), sort_keys=False))
         return 0
     if a.smoke and not a.out:
         print("--smoke needs --out (a scratch file): a smoke is not evidence")

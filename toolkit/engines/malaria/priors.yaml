@@ -111,18 +111,26 @@ priors:
       Equation 2 describes new nets; the category-mean (x uniform within the category) is an assumption"
   pbo_adv_decay:
     dist: uniform
-    range: [0.0, 1.594]
+    range: [0.0, 1.895]
     source: "Staedke et al. 2020 Lancet 395:1292-1303 (LLINEUP, Uganda; 10.1016/S0140-6736(20)30214-2), Table 2 (p.
       1299), as-treated analysis, children 2-10 years, PBO vs non-PBO LLIN: prevalence ratio 0.74 (95% CI 0.62-0.87) at
-      6 months, 0.73 (0.63-0.85) at 12 months, 0.84 (0.72-0.98) at 18 months. Rule (vector.adv_decay_from_prs): log PR
-      fades as exp(-decay t) from 6 to 18 months, decay = ln(ln 0.74 / ln 0.84) = 0.546 per year; 95% range by the
-      delta method with the two estimates taken as independent, lower end clipped at 0: 0-1.594 per year"
+      6 months, 0.73 (0.63-0.85) at 12 months, 0.84 (0.72-0.98) at 18 months. The trial's TOTAL waning: log PR fades as
+      exp(-rate t) from 6 to 18 months, rate = ln(ln 0.74 / ln 0.84) = 0.546 per year, 95% -0.502 to 1.594 (delta
+      method, the two estimates taken as independent). The parameter is waning ON TOP OF the engine's own (review
+      round 2): rule vector.pbo_adv_decay_extra, extra = total - the engine's waning of the PBO feeding advantage between
+      net ages 6 and 18 months (vector.engine_adv_decay, defaults, holes off, A. gambiae complex), at each bioassay
+      mortality x = 0, 0.01, ..., 0.30; the range is the hull of [lo - k(x), hi - k(x)] clipped at 0: 0-1.895 per year"
     verified: unverified
-    note: "the mapping of the fading of a prevalence ratio onto the fading of the per-attempt PBO advantage is an
-      assumption (transmission is nonlinear, and the arms' attrition is taken as equal). Mechanism: LLINEUP p. 1298,
-      PBO in nets withdrawn at 12 months was below the manufacturers' minimum target in 80% of PermaNet 3.0 and 90%
-      of Olyset Plus. The intention-to-treat ratios (0.78, 0.80, 0.94; Table 2) give 1.39 per year, inside the range.
-      Uniform: 0 is the engine's point value and a triangular mode there would contradict the point estimate"
+    note: "resistance levels: LLINEUP reports very high pyrethroid resistance (target-site Vgsc-L1014S and metabolic
+      markers, p. 1294) but no discriminating-dose mortality in the article, so the high-resistance category of the
+      Gleave 2021 review (below 30%) is used, and the hull covers it. The engine's own waning falls from 0.977 per year
+      at x = 0 through 0.000 at 0.15 to -0.301 at 0.30 (its advantage grows with age there), so the extra rate at the
+      trial's point estimate is 0 (x below about 0.05) to 0.847 (x = 0.30). Vector self-test V37 applies the rule: with
+      the extra rate set, the engine's total waning equals the trial's. Assumptions: the fading of a prevalence ratio
+      maps onto the fading of the per-attempt feeding advantage (transmission is nonlinear; the arms' attrition is
+      taken as equal). Mechanism: LLINEUP p. 1298, PBO in nets withdrawn at 12 months was below the manufacturers'
+      minimum target in 80% of PermaNet 3.0 and 90% of Olyset Plus. Uniform: 0 is the engine's point value and a
+      triangular mode there would contradict the evidence"
   dw_moderate:
     dist: triangular
     range: [0.032, 0.074]
