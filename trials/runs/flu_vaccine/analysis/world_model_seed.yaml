@@ -1,0 +1,134 @@
+# World model v0 (seed), written before any simulation. Synthetic evaluation question.
+# Decision: allocate 11 blocks of 70,000 influenza doses (770,000; ~17% of 4.6 M) across five
+# age groups, <=70% coverage per group, to minimise next-season hospitalisations; comparator
+# "none" (no vaccination). All doses cost the same, so the choice is purely where a dose averts
+# the most hospitalisations: direct protection (hospitalisation ratio x attack rate x VE) versus
+# indirect protection (removing high-contact susceptibles lowers Reff and the attack rate of all).
+beliefs:
+  - id: B1
+    mechanism: >-
+      Vaccinating children (the high-contact, high-attack-rate groups in an age-structured contact
+      matrix) cuts transmission, so its hospitalisation reduction includes large indirect protection
+      of unvaccinated adults and 65+. With seasonal influenza Reff only modestly above 1 after prior
+      immunity, removing ~15-20% of the population's susceptibles concentrated in children can cut
+      the final size sharply (final size is very nonlinear near threshold).
+    about: {package: vax_children}
+    direction: reduces
+    magnitude: {band: [0.25, 0.85], scale: relative_reduction}
+    conditions: []
+    source_type: literature
+    evidence:
+      - {citation: "Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009;325:1705-1708", location: "Fig. 2 (optimal allocation by age; children and young adults prioritised for most outcomes); exact panel uncertain"}
+      - {citation: "Loeb M et al. Effect of influenza vaccination of children on infection rates in Hutterite communities: a randomized trial. JAMA 2010;303:943-950", location: "Results, primary outcome (about 61% protection of unvaccinated members); table number uncertain"}
+      - {citation: "Reichert TA et al. The Japanese experience with vaccinating schoolchildren against influenza. N Engl J Med 2001;344:889-896", location: "Fig. 1 (excess mortality fell during school vaccination era)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: >-
+      Vaccinating 65+ gives mostly direct protection to the group with the highest hospitalisation
+      ratio, but VE is lower in older adults (immunosenescence) and 65+ contribute little to
+      transmission, so the total relative reduction is bounded by their share of hospitalisations x
+      coverage x VE x (share still susceptible).
+    about: {package: vax_65plus}
+    direction: reduces
+    magnitude: {band: [0.05, 0.35], scale: relative_reduction}
+    conditions: []
+    source_type: literature
+    evidence:
+      - {citation: "Govaert TM et al. The efficacy of influenza vaccination in elderly individuals: a randomized double-blind placebo-controlled trial. JAMA 1994;272:1661-1665", location: "Results (efficacy about 50-58% against serologically/clinically defined influenza in 60+); table uncertain"}
+      - {citation: "Osterholm MT et al. Efficacy and effectiveness of influenza vaccines: a systematic review and meta-analysis. Lancet Infect Dis 2012;12:36-44", location: "Results/Fig. 2 (pooled TIV efficacy ~59% in adults 18-65; insufficient RCT evidence 65+)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: >-
+      Vaccinating the older adult group (vax_older; working-age/50-64 adults) gives intermediate
+      benefit: moderate contact rates (some indirect effect), moderate hospitalisation ratio, adult VE.
+    about: {package: vax_older}
+    direction: reduces
+    magnitude: {band: [0.10, 0.55], scale: relative_reduction}
+    conditions: []
+    source_type: literature
+    evidence:
+      - {citation: "Medlock J, Galvani AP. Science 2009;325:1705-1708", location: "Fig. 2 (adults 30-39, parents of children, also prioritised for transmission); panel uncertain"}
+    confidence: low
+    decision_relevant: true
+  - id: B4
+    mechanism: >-
+      Because doses cost the same, the children package dominates 65+ targeting for hospitalisations
+      when the epidemic is near threshold and child contact rates are high; the ranking could flip
+      to 65+ only if children's VE is low, their reachable susceptible pool small, or 65+
+      hospitalisation ratio extreme (e.g. >10x that of children).
+    about: {pair: [vax_children, vax_65plus]}
+    # Flip region roughly at children's VE below ~0.3 (location uncertain); not encoded as a
+    # condition because the efficacy range is withheld and the condition would filter H4's points.
+    direction: flips
+    source_type: literature
+    evidence:
+      - {citation: "Medlock J, Galvani AP. Science 2009;325:1705-1708", location: "Fig. 2 and text on hospitalisation/mortality objectives; uncertain"}
+      - {citation: "Bansal S, Pourbohloul B, Meyers LA. A comparative analysis of influenza vaccination programs. PLoS Med 2006;3:e387", location: "Figs 3-4 (transmission-based vs age-targeted ranking depends on transmissibility); uncertain"}
+    confidence: medium
+    decision_relevant: true
+  - id: B5
+    mechanism: >-
+      Higher reach (coverage) of children increases the reduction from the children package, more
+      than linearly near the herd-immunity threshold.
+    about: {package: vax_children, feature: "reach:vax_children (calibration scale)"}
+    direction: increases
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans. Oxford University Press 1991", location: "Ch. 5 (final size and critical vaccination fraction); page uncertain"}
+    confidence: high
+    decision_relevant: false
+  - id: B6
+    mechanism: >-
+      The 65+ package's reduction rises with 65+ VE (direct protection scales roughly linearly with VE).
+    about: {package: vax_65plus, feature: "efficacy:vax_65plus"}
+    direction: increases
+    source_type: literature
+    evidence:
+      - {citation: "Govaert TM et al. JAMA 1994;272:1661-1665", location: "Results; uncertain"}
+    confidence: high
+    decision_relevant: false
+  - id: B7
+    mechanism: >-
+      Doses given to already-immune people are wasted (no targets_susceptible), so groups with high
+      pre-season seropositivity (often adults/65+ after prior seasons, or children after a large
+      previous epidemic) yield less per dose; the serosurvey's susceptible fractions and last
+      season's age-specific attack rates shift the ranking.
+    about: {component: vax_children}
+    direction: none
+    source_type: data
+    evidence:
+      - {dossier_entry: "population.csv", column: s0_groups}
+    confidence: low
+    decision_relevant: true
+open_questions:
+  - {id: Q1, question: "Which age groups map to vax_children and vax_older, and how many of the 11 blocks each package can absorb under the 70% cap?", beliefs: [B1, B3, B4], decision_relevant: true}
+  - {id: Q2, question: "How close to 1 is next season's Reff given last season's transmissibility and the pre-season susceptibility? Near threshold indirect effects dominate; far above it direct protection of 65+ gains.", beliefs: [B1, B4], decision_relevant: true}
+  - {id: Q3, question: "How large is the 65+ hospitalisation ratio relative to children's, and how do 0-4 (high ratio, high contact) fit?", beliefs: [B2, B4], decision_relevant: true}
+  - {id: Q4, question: "Age-specific pre-season susceptibility: are many doses wasted on immune children or adults?", beliefs: [B7], decision_relevant: true}
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "The children package reduces hospitalisations by 25-85% vs no vaccination at most design points."
+    test: {kind: effect_band, package: vax_children, band: [0.25, 0.85], min_share: 0.7}
+  - id: H2
+    belief: B2
+    claim: "The 65+ package reduces hospitalisations by only 5-35% vs no vaccination at most design points."
+    test: {kind: effect_band, package: vax_65plus, band: [0.05, 0.35], min_share: 0.7}
+  - id: H3
+    belief: B3
+    claim: "The older-adult package reduces hospitalisations by 10-55% at most design points."
+    test: {kind: effect_band, package: vax_older, band: [0.10, 0.55], min_share: 0.7}
+  - id: H4
+    belief: B4
+    claim: "Across the sampled children's coverage, vaccinating children beats vaccinating 65+ on net benefit at >=75% of points."
+    test: {kind: paired_sign, a: vax_children, b: vax_65plus, feature: "reach:vax_children (calibration scale)", range: [0.4059101042337716, 0.6949376931414007], sign: positive, min_share: 0.75}
+  - id: H5
+    belief: B5
+    claim: "The children package's reduction increases with children's reach."
+    test: {kind: effect_direction, package: vax_children, feature: "reach:vax_children (calibration scale)", direction: increases}
+  - id: H6
+    belief: B6
+    claim: "The 65+ package's reduction increases with 65+ vaccine efficacy."
+    test: {kind: effect_direction, package: vax_65plus, feature: "efficacy:vax_65plus", direction: increases}
