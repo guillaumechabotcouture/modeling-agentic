@@ -220,6 +220,10 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
+    if not errs and not sp.engine_pending:      # a departure counts only with the owner's signature (#215 review)
+        from toolkit.engines import benchmark_coverage as BC
+        errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
+                for e in BC.spec_problems(sp, by=by)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs

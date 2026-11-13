@@ -208,18 +208,22 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
 ## Engine benchmarks that are not in band
 
 An engine is not eligible for a component the options use when a benchmark covering it (the engine's
-`benchmark_coverage.yaml`) is `out_of_band`, `not_assessable` or `band_mis_based` in its verified record.
-The pre-sign check names each such benchmark. Prefer options and an engine the evidence supports. When the
-decision still needs that engine, declare a departure for the owner to sign, never a silent one:
+`benchmark_coverage.yaml`) is `out_of_band`, `not_assessable` or `band_mis_based` in its verified record, or when
+no benchmark covers the component. A cost-per-outcome benchmark gates only when the spec charges the component
+through the engine cost output it prices; otherwise it is reported. The pre-sign check names each problem.
+Prefer options and an engine the evidence supports. When the decision still needs that engine, declare a
+departure for the owner to sign, never a silent one:
 
     engine_departures:
       - {engine: <card name>, benchmark: <id>, reason: "<why the decision may still use it>",
-         decision_test: <an analysis.decision_tests id that moves the effect over the trial's range>}
-      # or, instead of decision_test: no_decision_test_because: "<why no test can be computed>"
+         decision_test: <an analysis.decision_tests id that varies that effect>}
+      - {engine: <card name>, component: <engine component>, reason: "...", decision_test: <id>}
 
-The report declares each signed departure as a limitation. A held-out benchmark is validation: its result
-stands, and no parameter is ever tuned toward it. A fit target out of band means the engine's fit failed; it
-gates the same way.
+The decision test must vary the related effect: a parameter_value test on an effect parameter the coverage file
+names for it, or an interaction_rescale test naming the component. Only the owner's signature makes a departure
+count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
+limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
+fit target out of band means the engine's fit failed; it gates the same way.
 
 ## What not to do
 

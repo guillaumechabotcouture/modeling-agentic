@@ -1,23 +1,29 @@
 # Which package components each benchmark of the malaria-starsim pack covers (owner decision 2026-11-12;
 # toolkit/engines/benchmark_coverage.py). Read from each benchmark's metric, source and arms (benchmarks/pack.yaml).
 # A covering benchmark that is not in_band in the verified record makes the engine ineligible for a spec using the
-# component, unless the signed spec declares a departure for it.
+# component, unless the owner-signed spec declares a departure for it. A cost-per-outcome benchmark gates only when the
+# spec charges the component through the engine cost driver it prices; otherwise it is reported. A used component
+# with no covering benchmark (cm) blocks unless a departure names a decision test on its effect parameter.
 engine: malaria-starsim
 absent_values: {net: [none], smc: [0], irs: [0], cm: [0]}
 components_without_benchmark:
-  cm: >-
-    no benchmark in the pack compares case management with its absence or another level (no arm sets cm); its
-    effect is not judged against a trial
+  cm:
+    reason: >-
+      no benchmark in the pack compares case management with its absence or another level (no arm sets cm); its
+      effect is not judged against a trial
+    effect_parameters: [cm_add]
 benchmarks:
   B7:
     covers: {net: [pyr, pbo, dual]}
     estimand: effect_vs_none
+    effect_parameters: [net_kill_shift]
     note: >-
       Pyrethroid nets vs no nets, prevalence (Pryce 2018 Cochrane). PBO and dual-AI nets are benchmarked only
       against pyrethroid nets (B9-B11), so their effect against no nets carries this one.
   B8:
     covers: {net: [pyr, pbo, dual]}
     estimand: effect_vs_none
+    effect_parameters: [net_kill_shift]
     note: Nets vs no nets, clinical incidence under 5 (Pryce 2018); carried by PBO and dual-AI nets as for B7.
   B9: {covers: {net: [pbo]}, estimand: effect_vs_component, versus: {net: pyr},
        note: "PBO vs pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
@@ -44,8 +50,8 @@ benchmarks:
     covers_none_because: >-
       EIR-prevalence relation (Beier 1999): the engine's baseline transmission, not a component's effect; the
       decision's baseline burden comes from external estimates (decision design principle 3)
-  B17: {covers: {smc: [1]}, estimand: cost_per_outcome, note: "SMC cost per DALY averted (Gilmartin 2021)"}
-  B18: {covers: {net: [pyr]}, estimand: cost_per_outcome, note: "Pyrethroid nets cost per DALY averted (Conteh 2021)"}
-  B19: {covers: {irs: [1]}, estimand: cost_per_outcome, note: "IRS cost per DALY averted (Conteh 2021)"}
-  B20: {covers: {net: [dual]}, estimand: cost_per_outcome, versus: {net: pyr},
+  B17: {covers: {smc: [1]}, estimand: cost_per_outcome, cost_drivers: [smc_doses], note: "SMC cost per DALY averted (Gilmartin 2021)"}
+  B18: {covers: {net: [pyr]}, estimand: cost_per_outcome, cost_drivers: [nets_given], note: "Pyrethroid nets cost per DALY averted (Conteh 2021)"}
+  B19: {covers: {irs: [1]}, estimand: cost_per_outcome, cost_drivers: [irs_sprayed], note: "IRS cost per DALY averted (Conteh 2021)"}
+  B20: {covers: {net: [dual]}, estimand: cost_per_outcome, versus: {net: pyr}, cost_drivers: [nets_given],
         note: "Dual-AI vs pyrethroid nets, incremental cost per DALY averted (Mosha 2022)"}
