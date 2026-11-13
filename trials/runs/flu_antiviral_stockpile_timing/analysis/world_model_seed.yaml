@@ -1,0 +1,281 @@
+beliefs:
+- id: B1
+  mechanism: An 8-week release of antivirals (early treatment plus household prophylaxis) lowers R_t by a modest
+    fraction while it runs; household post-exposure prophylaxis trials show high individual protection of contacts
+    (protective efficacy roughly 70-90%), but population coverage, ascertainment of index cases and the share of
+    transmission outside households dilute this to a modest reduction in R. Inside a 26-week horizon, a temporary
+    cut in R both averts infections and delays the rest, so the relative reduction in horizon infections from LATE
+    is moderate.
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Welliver R et al. Effectiveness of oseltamivir in preventing influenza in household contacts: a randomized
+      controlled trial. JAMA 2001'
+    location: Results, protective efficacy against laboratory-confirmed clinical influenza (about 89%); page not
+      verified
+  - citation: 'Hayden FG et al. Management of influenza in households: a prospective, randomized comparison of oseltamivir
+      treatment with or without postexposure prophylaxis. J Infect Dis 2004'
+    location: Results, protective efficacy of post-exposure prophylaxis; table not verified
+  - citation: Ferguson NM et al. Strategies for mitigating an influenza pandemic. Nature 2006
+    location: Results on antiviral treatment and household prophylaxis; figure not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B2
+  mechanism: 'A fixed proportional cut in R averts a smaller share of infections the further the effective reproduction
+    number (R0 x s0) sits above 1: near threshold a modest cut stops growth (large relative reduction), well above
+    it the epidemic overshoots regardless (final-size curvature). Higher pre-season susceptibility therefore lowers
+    the relative reduction of either release, while raising the absolute burden.'
+  about:
+    package: late
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  - citation: 'Biggerstaff M et al. Estimates of the reproduction number for seasonal, pandemic, and zoonotic influenza:
+      a systematic review of the literature. BMC Infect Dis 2014'
+    location: 'Results: seasonal influenza median R about 1.3; table not verified'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'Same final-size curvature for EARLY: its relative reduction falls as susceptibility rises.'
+  about:
+    package: early
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: A larger initial infected share brings the peak forward. The LATE window (weeks 6-14) then falls increasingly
+    on or after the peak, and on the declining side a temporary cut averts little, so LATE's relative reduction
+    falls as seed_share rises. With a small seed, both windows fall in the growth phase and mostly delay the epidemic,
+    which inside a fixed horizon still counts as infections averted.
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC. The timing of one-shot interventions for epidemic control. PLoS Comput
+      Biol 2021
+    location: 'Results: optimal start of a one-shot intervention is shortly before the peak; figure not verified'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'Timing: with equal durations and similar effects, the two windows give nearly the same delay while
+    the epidemic is still growing exponentially through week 14, and EARLY additionally removes the few infections
+    of weeks 2-6, so EARLY averts at least as much as LATE there. Where the epidemic is fast (large seed), LATE
+    comes after or across the peak and EARLY clearly averts more. EARLY loses mainly where the peak falls around
+    weeks 9-13 so that the LATE window straddles it (Di Lauro et al.), or where its effect value is set below LATE''s.
+    At the declared, very small shadow price, net benefit tracks infections averted, so EARLY is favoured at large
+    seeds.'
+  about:
+    pair:
+    - early
+    - late
+  direction: flips
+  conditions:
+  - feature: seed_share
+    range:
+    - 0.0003
+    - 0.0009599
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC. The timing of one-shot interventions for epidemic control. PLoS Comput
+      Biol 2021
+    location: Results on intervention start time relative to the peak; figure not verified
+  - citation: Ferguson NM et al. Strategies for mitigating an influenza pandemic. Nature 2006
+    location: sensitivity of antiviral impact to delay in starting; figure not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Releasing (LATE) beats doing nothing in net benefit at the declared shadow price almost everywhere:
+    any R cut during a growing epidemic averts infections, and the cost term per person is tiny at 6e-6 outcome
+    per USD.'
+  about:
+    pair:
+    - late
+    - none
+  direction: reduces
+  source_type: literature
+  evidence:
+  - citation: Ferguson NM et al. Strategies for mitigating an influenza pandemic. Nature 2006
+    location: antiviral scenarios; figure not verified
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: In one closed population with per-capita seeding, the epidemic curve per person does not depend on
+    population size, so the relative reduction of a release does not vary with pop; pop only scales totals and cost,
+    i.e. which cities fit within the budget, not which option is best per person.
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation is per capita, Section 2
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+open_questions:
+- id: Q1
+  question: What is R0 relative to 1/s0 across the s0 range? If R0 x s0 is below 1 for low s0, those cities have
+    almost no burden and should get nothing; if well above 1 everywhere, relative reductions are small and timing
+    matters most.
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: Are the EARLY and LATE effect values (the reduction in R) set equal or different? EARLY's outreach could
+    reach more cases, or reach them before transmission; if EARLY's effect is clearly larger, it wins on infections
+    nearly everywhere.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Under the binding US$10M budget, EARLY is worth it only where it averts about 1.67 times LATE's infections
+    per person; the declared shadow price (6e-6) is far below any plausible budget dual, so the paired tests do
+    not test this rule, and no optimised plan is produced to check it.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: How much of the relative reduction within the 26-week horizon is delay (infections pushed beyond June
+    2026) rather than infections truly averted? A slow epidemic delayed past the horizon inflates both options'
+    apparent effect.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: LATE's relative reduction in horizon infections lies between 0.1 and 0.6 at most design points.
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.1
+    - 0.6
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: LATE's relative reduction falls as pre-season susceptibility rises.
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: EARLY's relative reduction falls as pre-season susceptibility rises.
+  test:
+    kind: effect_direction
+    package: early
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: LATE's relative reduction falls as the initial infected share rises (the late window lands nearer or after
+    the peak).
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: In cities with a large initial infected share (seed_share >= 3e-4), EARLY has the higher net benefit than
+    LATE at the declared shadow price at 60% or more of points.
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 0.0003
+    - 0.0009599
+    sign: positive
+    min_share: 0.6
+- id: H6
+  belief: B6
+  claim: LATE has a higher net benefit than no release at 90% or more of points across the whole susceptibility
+    range.
+  test:
+    kind: paired_sign
+    a: late
+    b: none
+    feature: s0 (calibration scale)
+    range:
+    - 0.5028220434673131
+    - 0.9474296059925109
+    sign: positive
+    min_share: 0.9
+- id: H7
+  belief: B7
+  claim: EARLY's relative reduction does not vary with city population (Spearman rho within +/-0.15).
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
