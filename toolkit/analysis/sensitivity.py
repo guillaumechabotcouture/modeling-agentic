@@ -78,6 +78,15 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
             ends.append(_end(A, m, ben, cost, plan))
         rows.append({"name": it, "kind": "cost_item", "basis": "multiplier", "point": 1.0, "low": ends[0],
                      "high": ends[1]})
+    for rid, a in sorted(((getattr(A, "anchor", None) or {}).get("rows") or {}).items()):   # F6 S2-5d review r2
+        if a["lower"] is None or not a["upper"] > a["lower"]:
+            continue
+        ends = []
+        for v in (a["lower"], a["upper"]):
+            _, ben, cost = A.evaluate(A.theta0, z0, sampled={f"anchor:{rid}": float(v)})
+            ends.append(_end(A, v, ben, cost, plan))
+        rows.append({"name": f"burden_anchor_{rid}", "kind": "burden_anchor", "basis": f"published interval of the "
+                     f"external {a['outcome']} estimate", "point": a["value"], "low": ends[0], "high": ends[1]})
     for r in rows:
         r["swing_point_plan"] = abs(r["high"]["point_plan_objective"] - r["low"]["point_plan_objective"])
         r["swing_pct_of_point"] = 100.0 * r["swing_point_plan"] / obj0 if obj0 else None

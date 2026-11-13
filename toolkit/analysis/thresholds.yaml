@@ -67,6 +67,12 @@ burden:
   default_ratio_band: [0.5, 2.0]
   widest_ratio_band: [0.2, 5.0]
   max_year_gap: 5
+burden_anchor:
+  # F6 S2-5d (proposals for the owner's review): an anchor row (validation.burden, role anchor) scales a group's
+  # outcomes by external value / model value over the model window. A factor, or an end of its interval, outside
+  # [factor_min, factor_max] stops the analysis: the model and the external level disagree too much to rescale.
+  factor_min: 0.05
+  factor_max: 20
 emulator:
   # F6 S2-4b (proposals for the owner's review): ranking accuracy near package switches (toolkit/analysis/boundary.py).
   # The `boundary_units` units whose plan package and runner-up are closest in benefit per cost are run on the engine
