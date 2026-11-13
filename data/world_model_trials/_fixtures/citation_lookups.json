@@ -1,0 +1,5610 @@
+{
+ "baeten": {
+  "citation": "Baeten JM et al. Antiretroviral prophylaxis for HIV prevention in heterosexual men and women. N Engl J Med 2012;367:399-410",
+  "responses": {
+   "Baeten JM et al. Antiretroviral prophylaxis for HIV prevention in heterosexual men and women. N Engl J Med 2012;367:399-410": [
+    {
+     "paperId": "https://openalex.org/W2153943638",
+     "title": "Prophylactic antiretroviral HIV therapy prevents infection in heterosexual men and women",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Sarah J. Fidler"
+      },
+      {
+       "name": "Peter Bock"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2162226934",
+     "title": "Antiretroviral Preexposure Prophylaxis for Heterosexual HIV Transmission in Botswana",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Michael C. Thigpen"
+      },
+      {
+       "name": "Poloko Moloko Kebaabetswe"
+      },
+      {
+       "name": "Lynn A. Paxton"
+      },
+      {
+       "name": "Dawn K. Smith"
+      },
+      {
+       "name": "Charles E. Rose"
+      },
+      {
+       "name": "Tebogo M. Segolodi"
+      },
+      {
+       "name": "Faith L. Henderson"
+      },
+      {
+       "name": "Sonal R. Pathak"
+      },
+      {
+       "name": "Fatma Soud"
+      },
+      {
+       "name": "Kata L. Chillag"
+      },
+      {
+       "name": "Rodreck Mutanhaurwa"
+      },
+      {
+       "name": "Lovemore Ian Chirwa"
+      },
+      {
+       "name": "Michael Kasonde"
+      },
+      {
+       "name": "Daniel Abebe"
+      },
+      {
+       "name": "Evans Buliva"
+      },
+      {
+       "name": "Roman J. Gvetadze"
+      },
+      {
+       "name": "Sandra Johnson"
+      },
+      {
+       "name": "Thom Sukalac"
+      },
+      {
+       "name": "Vasavi T. Thomas"
+      },
+      {
+       "name": "Clyde E. Hart"
+      },
+      {
+       "name": "Jeffrey Allan Johnson"
+      },
+      {
+       "name": "C. Kevin Malotte"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "John T. Brooks"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1969264050",
+     "title": "Antiretroviral Prophylaxis for Sexual and Injection Drug Use Acquisition of HIV",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "James D. Campbell"
+      },
+      {
+       "name": "Jeffrey H. Herbst"
+      },
+      {
+       "name": "Robert T. Koppenhaver"
+      },
+      {
+       "name": "Dawn K. Smith"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2055336397",
+     "title": "Pre-Exposure Prophylaxis for HIV",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "James W. Curran"
+      },
+      {
+       "name": "Richard A. Crosby"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2025664999",
+     "title": "A Proposed Framework to Monitor Daily Oral Antiretroviral Pre-Exposure Prophylaxis in the U.S",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Dawn K. Smith"
+      },
+      {
+       "name": "JOHN F. BELTRAMI"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2734089744",
+     "title": "Update to Interim Guidance for Preexposure Prophylaxis (PrEP) for the Prevention of HIV Infection: PrEP for injecting drug users.",
+     "year": 2013,
+     "authors": [],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2044737529",
+     "title": "Pre-exposure prophylaxis for HIV prevention: Ready for prime time in South Africa?",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Robyn Eakle"
+      },
+      {
+       "name": "Fran\u00e7ois Venter"
+      },
+      {
+       "name": "Helen Rees"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2094993889",
+     "title": "Assessing the Cost Effectiveness of Pre-Exposure Prophylaxis for HIV Prevention in the US",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Fred Joseph Hellinger"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Antiretroviral prophylaxis for HIV prevention in heterosexual men and women": [
+    {
+     "paperId": "https://openalex.org/W2117057469",
+     "title": "Antiretroviral Prophylaxis for HIV Prevention in Heterosexual Men and Women",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Jared M. Baeten"
+      },
+      {
+       "name": "Deborah J Donnell"
+      },
+      {
+       "name": "Patrick Ndase"
+      },
+      {
+       "name": "Nelly Mugo"
+      },
+      {
+       "name": "James D. Campbell"
+      },
+      {
+       "name": "Jonathan Wangisi"
+      },
+      {
+       "name": "Jordan W. Tappero"
+      },
+      {
+       "name": "Elizabeth Anne Bukusi"
+      },
+      {
+       "name": "Craig R. Cohen"
+      },
+      {
+       "name": "Elly Tebasoboke Katabira"
+      },
+      {
+       "name": "Allan Ronald"
+      },
+      {
+       "name": "Elioda Tumwesigye"
+      },
+      {
+       "name": "Edwin O. Were"
+      },
+      {
+       "name": "Kenneth H. Fife"
+      },
+      {
+       "name": "James Njogu Kiarie"
+      },
+      {
+       "name": "Carey Farquhar"
+      },
+      {
+       "name": "Grace  C. John-Stewart"
+      },
+      {
+       "name": "Aloysious Kakia"
+      },
+      {
+       "name": "Josephine B. Odoyo"
+      },
+      {
+       "name": "Akasiima Mucunguzi"
+      },
+      {
+       "name": "Moses Lutaakome Joloba"
+      },
+      {
+       "name": "Rogers Twesigye"
+      },
+      {
+       "name": "Kenneth Ngure"
+      },
+      {
+       "name": "Cosmas Apaka"
+      },
+      {
+       "name": "Harrison Tamooh"
+      },
+      {
+       "name": "Fridah Gabona"
+      },
+      {
+       "name": "Andrew Mujugira"
+      },
+      {
+       "name": "Dana Panteleeff"
+      },
+      {
+       "name": "Katherine K. Thomas"
+      },
+      {
+       "name": "Lara Kidoguchi"
+      },
+      {
+       "name": "Meighan L. Krows"
+      },
+      {
+       "name": "Jennifer Revall"
+      },
+      {
+       "name": "Susan A. Morrison"
+      },
+      {
+       "name": "Harald S. Haugen"
+      },
+      {
+       "name": "Mira Emmanuel-Ogier"
+      },
+      {
+       "name": "Lisa Ondrejcek"
+      },
+      {
+       "name": "Robert W. Coombs"
+      },
+      {
+       "name": "Lisa M. Frenkel"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Namandj\u00e9 N. Bumpus"
+      },
+      {
+       "name": "David R. Bangsberg"
+      },
+      {
+       "name": "Jessica Elizabeth Haberer"
+      },
+      {
+       "name": "Wendy Susan Stevens"
+      },
+      {
+       "name": "Jairam R. Lingappa"
+      },
+      {
+       "name": "Connie Celum"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4206490738",
+     "title": "Faculty Opinions recommendation of Antiretroviral prophylaxis for HIV prevention in heterosexual men and women.",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "J Michael Kilby"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4235164952",
+     "title": "Faculty Opinions recommendation of Antiretroviral prophylaxis for HIV prevention in heterosexual men and women.",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Joe Eron"
+      },
+      {
+       "name": "Christopher B. Hurt"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4232168020",
+     "title": "Faculty Opinions recommendation of Antiretroviral prophylaxis for HIV prevention in heterosexual men and women.",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Anthony David Harries"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4253048332",
+     "title": "Faculty Opinions recommendation of Antiretroviral prophylaxis for HIV prevention in heterosexual men and women.",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Eric S. Daar"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2110530964",
+     "title": "Sexual behaviour of heterosexual men and women receiving antiretroviral pre-exposure prophylaxis for HIV prevention: a longitudinal analysis",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Kenneth K. Mugwanya"
+      },
+      {
+       "name": "Deborah J Donnell"
+      },
+      {
+       "name": "Connie Celum"
+      },
+      {
+       "name": "Katherine K. Thomas"
+      },
+      {
+       "name": "Patrick Ndase"
+      },
+      {
+       "name": "Nelly Mugo"
+      },
+      {
+       "name": "Elly Tebasoboke Katabira"
+      },
+      {
+       "name": "Kenneth Ngure"
+      },
+      {
+       "name": "Jared M. Baeten"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2162226934",
+     "title": "Antiretroviral Preexposure Prophylaxis for Heterosexual HIV Transmission in Botswana",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Michael C. Thigpen"
+      },
+      {
+       "name": "Poloko Moloko Kebaabetswe"
+      },
+      {
+       "name": "Lynn A. Paxton"
+      },
+      {
+       "name": "Dawn K. Smith"
+      },
+      {
+       "name": "Charles E. Rose"
+      },
+      {
+       "name": "Tebogo M. Segolodi"
+      },
+      {
+       "name": "Faith L. Henderson"
+      },
+      {
+       "name": "Sonal R. Pathak"
+      },
+      {
+       "name": "Fatma Soud"
+      },
+      {
+       "name": "Kata L. Chillag"
+      },
+      {
+       "name": "Rodreck Mutanhaurwa"
+      },
+      {
+       "name": "Lovemore Ian Chirwa"
+      },
+      {
+       "name": "Michael Kasonde"
+      },
+      {
+       "name": "Daniel Abebe"
+      },
+      {
+       "name": "Evans Buliva"
+      },
+      {
+       "name": "Roman J. Gvetadze"
+      },
+      {
+       "name": "Sandra Johnson"
+      },
+      {
+       "name": "Thom Sukalac"
+      },
+      {
+       "name": "Vasavi T. Thomas"
+      },
+      {
+       "name": "Clyde E. Hart"
+      },
+      {
+       "name": "Jeffrey Allan Johnson"
+      },
+      {
+       "name": "C. Kevin Malotte"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "John T. Brooks"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4247370725",
+     "title": "Faculty Opinions recommendation of Sexual behaviour of heterosexual men and women receiving antiretroviral pre-exposure prophylaxis for HIV prevention: a longitudinal analysis.",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Anne Buv\u00e9"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "grant": {
+  "citation": "Grant RM et al. Preexposure chemoprophylaxis for HIV prevention in men who have sex with men. N Engl J Med 2010;363:2587-99",
+  "responses": {
+   "Grant RM et al. Preexposure chemoprophylaxis for HIV prevention in men who have sex with men. N Engl J Med 2010;363:2587-99": [
+    {
+     "paperId": "https://openalex.org/W2030703739",
+     "title": "Oral antiretroviral pre-exposure prophylaxis reduces the risk of HIV acquisition among men who have sex with men",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Marie\u2010Claude Boily"
+      },
+      {
+       "name": "Beno\u00eet R. M\u00e2sse"
+      },
+      {
+       "name": "Dobromir Dimitrov"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2157402310",
+     "title": "Oral Preexposure Prophylaxis for HIV \u2014 Another Arrow in the Quiver?",
+     "year": 2010,
+     "authors": [
+      {
+       "name": "Nelson L. Michael"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2100756872",
+     "title": "Reproductive Decision-Making and Periconception Practices Among HIV-Positive Men and Women Attending HIV Services in Durban, South Africa",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Lynn T. Matthews"
+      },
+      {
+       "name": "Tamaryn L. Crankshaw"
+      },
+      {
+       "name": "Janet Giddy"
+      },
+      {
+       "name": "Angela Kaida"
+      },
+      {
+       "name": "Jennifer A. Smit"
+      },
+      {
+       "name": "Norma C. Ware"
+      },
+      {
+       "name": "David R. Bangsberg"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2010050614",
+     "title": "Life Expectancy in Africa: Back to the Future?",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Deborah J. Cotton"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2169249122",
+     "title": "Acute HIV-1 Infection",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "George M. Shaw"
+      },
+      {
+       "name": "Andrew James McMichael"
+      },
+      {
+       "name": "Barton F. Haynes"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2398478594",
+     "title": "Treatment as prevention: will it work?",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Marita J. W. van de Laar"
+      },
+      {
+       "name": "Anastasia Pharris"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2054889360",
+     "title": "Advances in the prevention of heterosexual transmission of HIV/AIDS among women in the United States",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Nadine E. Chen"
+      },
+      {
+       "name": "Jaimie P. Meyer"
+      },
+      {
+       "name": "Sandra Ann Springer"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4251122387",
+     "title": "Advances in the Prevention of Heterosexual Transmission of HIV/AIDS Among Women in the United States",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Nadine E. Chen"
+      },
+      {
+       "name": "Jaimie P. Meyer"
+      },
+      {
+       "name": "Sandra Ann Springer"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Preexposure chemoprophylaxis for HIV prevention in men who have sex with men": [
+    {
+     "paperId": "https://openalex.org/W2103920597",
+     "title": "Preexposure Chemoprophylaxis for HIV Prevention in Men Who Have Sex with Men",
+     "year": 2010,
+     "authors": [
+      {
+       "name": "Robert M. Grant"
+      },
+      {
+       "name": "Javier R. Lama"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Vanessa McMahan"
+      },
+      {
+       "name": "Albert Liu"
+      },
+      {
+       "name": "Lorena Silva Vargas"
+      },
+      {
+       "name": "Pedro Goicochea"
+      },
+      {
+       "name": "Mart\u00edn Casap\u00eda"
+      },
+      {
+       "name": "Juan V. Guanira"
+      },
+      {
+       "name": "Maria Esther Ramirez-Cardich"
+      },
+      {
+       "name": "Orlando Montoya"
+      },
+      {
+       "name": "Telmo Fern\u00e1ndez"
+      },
+      {
+       "name": "Valdilea Gon\u00e7alves Veloso"
+      },
+      {
+       "name": "Susan Buchbinder"
+      },
+      {
+       "name": "Suwat Chariyalertsak"
+      },
+      {
+       "name": "Mauro Schechter"
+      },
+      {
+       "name": "Linda\u2010Gail Bekker"
+      },
+      {
+       "name": "Kenneth Hugh Mayer"
+      },
+      {
+       "name": "Esper Georges Kallas"
+      },
+      {
+       "name": "K. Rivet Amico"
+      },
+      {
+       "name": "Kathleen M. Mulligan"
+      },
+      {
+       "name": "Lane R. Bushman"
+      },
+      {
+       "name": "Robert J. Hance"
+      },
+      {
+       "name": "Carmela Ganoza"
+      },
+      {
+       "name": "Patricia A. Defechereux"
+      },
+      {
+       "name": "Brian S. Postle"
+      },
+      {
+       "name": "Furong Wang"
+      },
+      {
+       "name": "J. Jeff McConnell"
+      },
+      {
+       "name": "Jia\u2010Hua Zheng"
+      },
+      {
+       "name": "Jeanny Lee"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Howard S. Jaffe"
+      },
+      {
+       "name": "Ana I. Mart\u00ednez"
+      },
+      {
+       "name": "David Burns"
+      },
+      {
+       "name": "David V. Glidden"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2103694841",
+     "title": "Re: Preexposure Chemoprophylaxis for HIV Prevention in Men Who Have Sex With Men",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Richard E. Berger"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4206583564",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2010,
+     "authors": [
+      {
+       "name": "Eric S. Daar"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4252330643",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Anthony David Harries"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4242135428",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2010,
+     "authors": [
+      {
+       "name": "John S. Greenspan"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4230498711",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Paul A. Pham"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4231693719",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Kiat Ruxrungtham"
+      },
+      {
+       "name": "Wirach Maek-a-nantawat"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4256667345",
+     "title": "Faculty Opinions recommendation of Preexposure chemoprophylaxis for HIV prevention in men who have sex with men.",
+     "year": 2010,
+     "authors": [
+      {
+       "name": "ALAN L. LANDAY"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "landovitz": {
+  "citation": "Landovitz RJ et al. Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women. N Engl J Med 2021;385:595-608",
+  "responses": {
+   "Landovitz RJ et al. Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women. N Engl J Med 2021;385:595-608": [
+    {
+     "paperId": "https://openalex.org/W4223581695",
+     "title": "Transactional sex, HIV and health among young cisgender men and transgender women who have sex with men in Thailand",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Brian W. Weir"
+      },
+      {
+       "name": "Chen Dun"
+      },
+      {
+       "name": "Andrea L. Wirtz"
+      },
+      {
+       "name": "Sandra Hsu Hnin Mon"
+      },
+      {
+       "name": "Noor Qaragholi"
+      },
+      {
+       "name": "Tareerat Chemnasiri"
+      },
+      {
+       "name": "Sarika Pattanasin"
+      },
+      {
+       "name": "Wichuda Sukwicha"
+      },
+      {
+       "name": "Anchalee Varangrat"
+      },
+      {
+       "name": "Eileen Frances Dunne"
+      },
+      {
+       "name": "Timothy H. Holtz"
+      },
+      {
+       "name": "Surang Janyam"
+      },
+      {
+       "name": "Harry Jin"
+      },
+      {
+       "name": "Danai Linjongrat"
+      },
+      {
+       "name": "Philip A. Mock"
+      },
+      {
+       "name": "Michael C. Thigpen"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Patrick Sean Sullivan"
+      },
+      {
+       "name": "Andrew C. Hickey"
+      },
+      {
+       "name": "Pachara Sirivongrangson"
+      },
+      {
+       "name": "Chris Beyrer"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4296028039",
+     "title": "Long-Acting Injectable Cabotegravir for HIV Prevention: What Do We Know and Need to Know about the Risks and Consequences of Cabotegravir Resistance?",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Urvi M. Parikh"
+      },
+      {
+       "name": "Catherine A. Koss"
+      },
+      {
+       "name": "John W. Mellors"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4288494273",
+     "title": "Long\u2010acting injectable cabotegravir: implementation science needed to advance this additional HIV prevention choice",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Heather-Marie Ann Schmidt"
+      },
+      {
+       "name": "Michelle Rodolph"
+      },
+      {
+       "name": "Robin Schaefer"
+      },
+      {
+       "name": "Rachel Clare Baggaley"
+      },
+      {
+       "name": "Meg C. Doherty"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4291019872",
+     "title": "A population pharmacokinetic model based on HPTN 077 of long\u2010acting injectable cabotegravir for HIV PrEP",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Yifan Yu"
+      },
+      {
+       "name": "Kristin L. Bigos"
+      },
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Raphael J. Landovitz"
+      },
+      {
+       "name": "Marybeth McCauley"
+      },
+      {
+       "name": "Susan L. Ford"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Robert R. Bies"
+      },
+      {
+       "name": "Ethel  Derby Weld"
+      },
+      {
+       "name": "the HPTN 077 Study Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4307135513",
+     "title": "A clinical review of HIV integrase strand transfer inhibitors (INSTIs) for the prevention and treatment of HIV-1 infection",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Alexa Zhao"
+      },
+      {
+       "name": "Rustin D. Crutchley"
+      },
+      {
+       "name": "Rakesh Chowdary Guduru"
+      },
+      {
+       "name": "Kathy Ton"
+      },
+      {
+       "name": "Tammie Lam"
+      },
+      {
+       "name": "Amy Min"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4312872969",
+     "title": "HIV Prevention Utilizing Long-acting Injectables",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Eric F. Egelund"
+      },
+      {
+       "name": "Jessica Huston"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4312414931",
+     "title": "Dapivirine Vaginal Ring for HIV Prevention in Women in South Africa",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Katherine Gill"
+      },
+      {
+       "name": "Linda\u2010Gail Bekker"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4206773312",
+     "title": "HIV prevention: better choice for better coverage",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Linda\u2010Gail Bekker"
+      },
+      {
+       "name": "Carey Pike"
+      },
+      {
+       "name": "Sharon L. Hillier"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women": [
+    {
+     "paperId": "https://openalex.org/W3190424399",
+     "title": "Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Raphael J. Landovitz"
+      },
+      {
+       "name": "Deborah J Donnell"
+      },
+      {
+       "name": "Meredith E. Clement"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Leslie M. Cottle"
+      },
+      {
+       "name": "Lara Esteves Coelho"
+      },
+      {
+       "name": "Robinson L. Cabello"
+      },
+      {
+       "name": "Suwat Chariyalertsak"
+      },
+      {
+       "name": "Eileen Frances Dunne"
+      },
+      {
+       "name": "Ian Frank"
+      },
+      {
+       "name": "Jorge A. Gallardo-Cartagena"
+      },
+      {
+       "name": "Aditya H. Gaur"
+      },
+      {
+       "name": "Pedro Gonz\u00e1les"
+      },
+      {
+       "name": "Tr\u1ea7n Vi\u1ec7t H\u00e0"
+      },
+      {
+       "name": "Juan Hinojosa"
+      },
+      {
+       "name": "Esper Georges Kallas"
+      },
+      {
+       "name": "Colleen F. Kelley"
+      },
+      {
+       "name": "Marcelo Horacio Losso"
+      },
+      {
+       "name": "Jos\u00e9 Valdez Madruga"
+      },
+      {
+       "name": "Keren Middelkoop"
+      },
+      {
+       "name": "Nittaya Phanuphak"
+      },
+      {
+       "name": "Breno Santos"
+      },
+      {
+       "name": "Omar Gustavo Sued"
+      },
+      {
+       "name": "Javier Valencia Huaman\u00ed"
+      },
+      {
+       "name": "Edgar Turner Overton"
+      },
+      {
+       "name": "Shobha Swaminathan"
+      },
+      {
+       "name": "Carlos del R\u00edo"
+      },
+      {
+       "name": "Roy M. Gulick"
+      },
+      {
+       "name": "Paul Richardson"
+      },
+      {
+       "name": "Philip Sullivan"
+      },
+      {
+       "name": "Estelle Piwowar\u2010Manning"
+      },
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Maoji Li"
+      },
+      {
+       "name": "Zhe Wang"
+      },
+      {
+       "name": "Jeanne Marisa Marrazzo"
+      },
+      {
+       "name": "Eric S. Daar"
+      },
+      {
+       "name": "Aida Asmelash"
+      },
+      {
+       "name": "Todd Tarquin Brown"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      },
+      {
+       "name": "Marcus Bryan"
+      },
+      {
+       "name": "Cheryl Blanchette"
+      },
+      {
+       "name": "Jonathan Paul Lucas"
+      },
+      {
+       "name": "Christina Psaros"
+      },
+      {
+       "name": "Steven A. Safren"
+      },
+      {
+       "name": "Jeremy Sugarman"
+      },
+      {
+       "name": "Hyman M Scott"
+      },
+      {
+       "name": "Joseph J. Eron"
+      },
+      {
+       "name": "Sheldon D. Fields"
+      },
+      {
+       "name": "Nirupama Deshmane Sista"
+      },
+      {
+       "name": "Kailazarid Gomez"
+      },
+      {
+       "name": "Andrea Jennings"
+      },
+      {
+       "name": "Ryan Kofron"
+      },
+      {
+       "name": "Timothy H. Holtz"
+      },
+      {
+       "name": "Katherine Shin"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Kimberly Y. Smith"
+      },
+      {
+       "name": "William R. Spreen"
+      },
+      {
+       "name": "David M. Margolis"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Marybeth McCauley"
+      },
+      {
+       "name": "Beatriz Gilda Jegerhorn Grinsztejn"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3137354410",
+     "title": "Characterization of Human Immunodeficiency Virus (HIV) Infection in Cisgender Men and Transgender Women Who Have Sex With Men Receiving Injectable Cabotegravir for HIV Prevention: HPTN 083",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Beatriz Gilda Jegerhorn Grinsztejn"
+      },
+      {
+       "name": "Jessica M. Fogel"
+      },
+      {
+       "name": "Estelle Piwowar\u2010Manning"
+      },
+      {
+       "name": "Maoji Li"
+      },
+      {
+       "name": "Lei Weng"
+      },
+      {
+       "name": "Marybeth McCauley"
+      },
+      {
+       "name": "Vanessa Cummings"
+      },
+      {
+       "name": "Shahnaz Ahmed"
+      },
+      {
+       "name": "Casey D Haines"
+      },
+      {
+       "name": "Lane R. Bushman"
+      },
+      {
+       "name": "Christos J. Petropoulos"
+      },
+      {
+       "name": "Deborah Persaud"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "Ryan Kofron"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "Marty St. Clair"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Daniel Pryluka"
+      },
+      {
+       "name": "Lara Esteves Coelho"
+      },
+      {
+       "name": "Aditya H. Gaur"
+      },
+      {
+       "name": "Keren Middelkoop"
+      },
+      {
+       "name": "Nittaya Phanuphak"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Deborah J Donnell"
+      },
+      {
+       "name": "Raphael J. Landovitz"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4226116413",
+     "title": "Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084, a phase 3, randomised clinical trial",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Sin\u00e9ad Delany\u2010Moretlwe"
+      },
+      {
+       "name": "James P. Hughes"
+      },
+      {
+       "name": "Peter Bock"
+      },
+      {
+       "name": "Samuel Gurrion Ouma"
+      },
+      {
+       "name": "Portia Hunidzarira"
+      },
+      {
+       "name": "Dishiki Kalonji"
+      },
+      {
+       "name": "Noel Kayange"
+      },
+      {
+       "name": "Joseph M. Makhema"
+      },
+      {
+       "name": "Patricia Mandima"
+      },
+      {
+       "name": "Carrie Mathew"
+      },
+      {
+       "name": "Elizabeth Spooner"
+      },
+      {
+       "name": "Juliet Mpendo"
+      },
+      {
+       "name": "Pamela Grace Mukwekwerere"
+      },
+      {
+       "name": "Nyaradzo Mavis Mgodi"
+      },
+      {
+       "name": "Patricia Nahirya Ntege"
+      },
+      {
+       "name": "Gonasagrie Nair"
+      },
+      {
+       "name": "Clemensia Nakabiito"
+      },
+      {
+       "name": "Harriet Nuwagaba\u2010Biribonwoha"
+      },
+      {
+       "name": "Ravindre Panchia"
+      },
+      {
+       "name": "Nishanta Singh"
+      },
+      {
+       "name": "Bekezela Siziba"
+      },
+      {
+       "name": "Jennifer Farrior"
+      },
+      {
+       "name": "Scott Rose"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      },
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Stephanie Beigel-Orme"
+      },
+      {
+       "name": "Sybil Hosek"
+      },
+      {
+       "name": "Elizabeth E. Tolley"
+      },
+      {
+       "name": "Nirupama Deshmane Sista"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "William R. Spreen"
+      },
+      {
+       "name": "Kimberly Y. Smith"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Mina C. Hosseinipour"
+      },
+      {
+       "name": "Aida Asmelash"
+      },
+      {
+       "name": "Alice Sehurutshi"
+      },
+      {
+       "name": "Allan Baguma"
+      },
+      {
+       "name": "Anita Marais"
+      },
+      {
+       "name": "Barbarah Kawoozo"
+      },
+      {
+       "name": "Bongiwe Prudence Malinga"
+      },
+      {
+       "name": "Brenda Gati Mirembe"
+      },
+      {
+       "name": "Brenda Okech"
+      },
+      {
+       "name": "Bryan Esterhuizen"
+      },
+      {
+       "name": "Caroline Murombedzi"
+      },
+      {
+       "name": "Daphne Gadama"
+      },
+      {
+       "name": "Eldinah Hwengwere"
+      },
+      {
+       "name": "Elizabeth Roos"
+      },
+      {
+       "name": "Elizabeth S Magada"
+      },
+      {
+       "name": "Emily Shava"
+      },
+      {
+       "name": "Estelle Piwowar-Manning"
+      },
+      {
+       "name": "Eunice Tahuringana"
+      },
+      {
+       "name": "Felix GS Muhlanga"
+      },
+      {
+       "name": "Francesca Conradie"
+      },
+      {
+       "name": "Frank Angira"
+      },
+      {
+       "name": "Gertrude Nanyonjo"
+      },
+      {
+       "name": "Girisha Kistnasami"
+      },
+      {
+       "name": "Hazzie Mvula"
+      },
+      {
+       "name": "Ishana Naidoo"
+      },
+      {
+       "name": "Jaco Horak"
+      },
+      {
+       "name": "Jane Jere"
+      },
+      {
+       "name": "Jeeva Moodley"
+      },
+      {
+       "name": "Katie Shin"
+      },
+      {
+       "name": "Kerry Nel"
+      },
+      {
+       "name": "Kevin Bokoch"
+      },
+      {
+       "name": "Birungi Lilian"
+      },
+      {
+       "name": "Lynda Emel"
+      },
+      {
+       "name": "Maletsatsi Monametsi"
+      },
+      {
+       "name": "Marvelous Sibanda"
+      },
+      {
+       "name": "Mercy T. Mutambanengwe-Jacob"
+      },
+      {
+       "name": "Miria Chitukuta"
+      },
+      {
+       "name": "Moleen Matimbira"
+      },
+      {
+       "name": "Muchaneta Bhondai-Mhuri"
+      },
+      {
+       "name": "Ncamsile Sibisi"
+      },
+      {
+       "name": "Neetha Morar"
+      },
+      {
+       "name": "Netsai Mudzonga"
+      },
+      {
+       "name": "Paul Natureeba"
+      },
+      {
+       "name": "Paul Richardson"
+      },
+      {
+       "name": "Petina Musara"
+      },
+      {
+       "name": "Pippa Macdonald"
+      },
+      {
+       "name": "Rejoice Nkambule"
+      },
+      {
+       "name": "Repelang Mosime"
+      },
+      {
+       "name": "Rhonda White"
+      },
+      {
+       "name": "Ribka Berhanu"
+      },
+      {
+       "name": "Ritha Ncube-Sihlongonyane"
+      },
+      {
+       "name": "Rogers Sekabira"
+      },
+      {
+       "name": "Samantha Siva"
+      },
+      {
+       "name": "Saresha Pillay"
+      },
+      {
+       "name": "Shamelle Govender"
+      },
+      {
+       "name": "Sheiala Bamweyana"
+      },
+      {
+       "name": "Siyabonga Nzimande"
+      },
+      {
+       "name": "Steve Innes"
+      },
+      {
+       "name": "Sufia S. Dadabhai"
+      },
+      {
+       "name": "Taraz Samandari"
+      },
+      {
+       "name": "Tchangani Tembo"
+      },
+      {
+       "name": "Thandie Lungu Mabedi"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3194569230",
+     "title": "Injectable PrEP superior to oral PrEP",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Tim Thomas"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4288494273",
+     "title": "Long\u2010acting injectable cabotegravir: implementation science needed to advance this additional HIV prevention choice",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Heather-Marie Ann Schmidt"
+      },
+      {
+       "name": "Michelle Rodolph"
+      },
+      {
+       "name": "Robin Schaefer"
+      },
+      {
+       "name": "Rachel Clare Baggaley"
+      },
+      {
+       "name": "Meg C. Doherty"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4223581695",
+     "title": "Transactional sex, HIV and health among young cisgender men and transgender women who have sex with men in Thailand",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Brian W. Weir"
+      },
+      {
+       "name": "Chen Dun"
+      },
+      {
+       "name": "Andrea L. Wirtz"
+      },
+      {
+       "name": "Sandra Hsu Hnin Mon"
+      },
+      {
+       "name": "Noor Qaragholi"
+      },
+      {
+       "name": "Tareerat Chemnasiri"
+      },
+      {
+       "name": "Sarika Pattanasin"
+      },
+      {
+       "name": "Wichuda Sukwicha"
+      },
+      {
+       "name": "Anchalee Varangrat"
+      },
+      {
+       "name": "Eileen Frances Dunne"
+      },
+      {
+       "name": "Timothy H. Holtz"
+      },
+      {
+       "name": "Surang Janyam"
+      },
+      {
+       "name": "Harry Jin"
+      },
+      {
+       "name": "Danai Linjongrat"
+      },
+      {
+       "name": "Philip A. Mock"
+      },
+      {
+       "name": "Michael C. Thigpen"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Patrick Sean Sullivan"
+      },
+      {
+       "name": "Andrew C. Hickey"
+      },
+      {
+       "name": "Pachara Sirivongrangson"
+      },
+      {
+       "name": "Chris Beyrer"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3164718118",
+     "title": "Pre-Exposure Prophylaxis (PrEP) for HIV Infection in Cisgender and Transgender Women in the U.S.: A Narrative Review of the Literature",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Aleta Baldwin"
+      },
+      {
+       "name": "Brenda Light"
+      },
+      {
+       "name": "Waridibo E. Allison"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4306689888",
+     "title": "Cabotegravir Extended-Release Injectable Suspension: A Review in HIV-1 Pre-Exposure Prophylaxis",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Hannah A. Blair"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "delany": {
+  "citation": "Delany-Moretlwe S et al. Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084, a phase 3, randomised clinical trial. Lancet 2022;399:1779-1789",
+  "responses": {
+   "Delany-Moretlwe S et al. Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084, a phase 3, randomised clinical trial. Lancet 2022;399:1779-1789": [
+    {
+     "paperId": "https://openalex.org/W4309662590",
+     "title": "Pregnancy outcomes and pharmacokinetics in pregnant women living with HIV exposed to long\u2010acting cabotegravir and rilpivirine in clinical trials",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Parul Patel"
+      },
+      {
+       "name": "Susan L. Ford"
+      },
+      {
+       "name": "Mark Baker"
+      },
+      {
+       "name": "Claudia Meyer"
+      },
+      {
+       "name": "Louise Garside"
+      },
+      {
+       "name": "Ronald D. D'Amico"
+      },
+      {
+       "name": "Rodica M Van Solingen-Ristea"
+      },
+      {
+       "name": "Herta M. Crauwels"
+      },
+      {
+       "name": "Joseph W. Polli"
+      },
+      {
+       "name": "Ciara Seal"
+      },
+      {
+       "name": "Itziar Yague"
+      },
+      {
+       "name": "Shanker Thiagarajah"
+      },
+      {
+       "name": "Eileen Birmingham"
+      },
+      {
+       "name": "William R. Spreen"
+      },
+      {
+       "name": "Bryan Baugh"
+      },
+      {
+       "name": "Jean Andre Van Wyk"
+      },
+      {
+       "name": "Vani X. Vannappagari"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4386047107",
+     "title": "Preexposure Prophylaxis for the Prevention of HIV: Updated Evidence Report and Systematic Review for the US Preventive Services Task Force",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Roger Chou"
+      },
+      {
+       "name": "Hunter C. Spencer"
+      },
+      {
+       "name": "Christina Bougatsos"
+      },
+      {
+       "name": "Ian Blazina"
+      },
+      {
+       "name": "Azrah Y. Ahmed"
+      },
+      {
+       "name": "Shelley Selph"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4327892922",
+     "title": "Personalizing prevention: Advances in pharmacotherapy for HIV prevention",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Marisa B. Brizzi"
+      },
+      {
+       "name": "Elizabeth M Sherman"
+      },
+      {
+       "name": "Sarah B. Green"
+      },
+      {
+       "name": "Diana Nicole Nowicki"
+      },
+      {
+       "name": "Emily N. Drwiega"
+      },
+      {
+       "name": "Melanie R. Nicol"
+      },
+      {
+       "name": "Daniel B. Chastain"
+      },
+      {
+       "name": "Eric G. Sahloff"
+      },
+      {
+       "name": "William R Truong"
+      },
+      {
+       "name": "David B. Cluck"
+      },
+      {
+       "name": "Melissa E. Badowski"
+      },
+      {
+       "name": "Sarah M. Michienzi"
+      },
+      {
+       "name": "Spencer H. Durham"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4388206252",
+     "title": "Prevention strategies for sexually transmitted infections, HIV, and viral hepatitis in Europe",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Deniz G\u00f6kengin"
+      },
+      {
+       "name": "Teymur Noori"
+      },
+      {
+       "name": "Andrea Alemany"
+      },
+      {
+       "name": "Carlo Bie\u0144kowski"
+      },
+      {
+       "name": "Geoffroy Liegon"
+      },
+      {
+       "name": "Ahmet \u00c7a\u011fkan \u0130nkaya"
+      },
+      {
+       "name": "Jorge Carrillo"
+      },
+      {
+       "name": "Georg Stary"
+      },
+      {
+       "name": "Katja Knapp"
+      },
+      {
+       "name": "Jordi Mitj\u00e0"
+      },
+      {
+       "name": "Jean\u2010Michel Molina"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4285806139",
+     "title": "Disrupting the status quo to achieve early inclusion of pregnant women in studies of new agents for prevention and treatment of HIV infection",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Elaine J. Abrams"
+      },
+      {
+       "name": "Martina Penazzato"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4386045941",
+     "title": "Preexposure Prophylaxis to Prevent Acquisition of HIV: US Preventive Services Task Force Recommendation Statement",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "US Preventive Services Task Force"
+      },
+      {
+       "name": "Michael J. Barry"
+      },
+      {
+       "name": "Wanda Kay Nicholson"
+      },
+      {
+       "name": "Michael Silverstein"
+      },
+      {
+       "name": "David P. Chelmow"
+      },
+      {
+       "name": "Tumaini R. Coker"
+      },
+      {
+       "name": "Esa M. Davis"
+      },
+      {
+       "name": "Katrina E Donahue"
+      },
+      {
+       "name": "Carlos Roberto Ja\u00e9n"
+      },
+      {
+       "name": "Marti Kubik"
+      },
+      {
+       "name": "Li Li"
+      },
+      {
+       "name": "Gbenga G Ogedegbe"
+      },
+      {
+       "name": "Goutham Rao"
+      },
+      {
+       "name": "John Manuel Ruiz"
+      },
+      {
+       "name": "James Stevermer"
+      },
+      {
+       "name": "Joel Tsevat"
+      },
+      {
+       "name": "Sandra Millon Underwood"
+      },
+      {
+       "name": "John B. Wong"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4311157442",
+     "title": "Advancing considerations of context in the evaluation and implementation of evidence-based biomedical HIV prevention interventions: a review of recent research",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Jennifer Velloza"
+      },
+      {
+       "name": "Stephanie D. Roche"
+      },
+      {
+       "name": "Tessa L. Concepcion"
+      },
+      {
+       "name": "Katrina F. Ortblad"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4379980575",
+     "title": "Promises and potential pitfalls of long-acting injectable pre-exposure prophylaxis",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Carey Pike"
+      },
+      {
+       "name": "Elzette Rousseau"
+      },
+      {
+       "name": "Linda\u2010Gail Bekker"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084, a phase 3, randomised clinical trial": [
+    {
+     "paperId": "https://openalex.org/W4226116413",
+     "title": "Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084, a phase 3, randomised clinical trial",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Sin\u00e9ad Delany\u2010Moretlwe"
+      },
+      {
+       "name": "James P. Hughes"
+      },
+      {
+       "name": "Peter Bock"
+      },
+      {
+       "name": "Samuel Gurrion Ouma"
+      },
+      {
+       "name": "Portia Hunidzarira"
+      },
+      {
+       "name": "Dishiki Kalonji"
+      },
+      {
+       "name": "Noel Kayange"
+      },
+      {
+       "name": "Joseph M. Makhema"
+      },
+      {
+       "name": "Patricia Mandima"
+      },
+      {
+       "name": "Carrie Mathew"
+      },
+      {
+       "name": "Elizabeth Spooner"
+      },
+      {
+       "name": "Juliet Mpendo"
+      },
+      {
+       "name": "Pamela Grace Mukwekwerere"
+      },
+      {
+       "name": "Nyaradzo Mavis Mgodi"
+      },
+      {
+       "name": "Patricia Nahirya Ntege"
+      },
+      {
+       "name": "Gonasagrie Nair"
+      },
+      {
+       "name": "Clemensia Nakabiito"
+      },
+      {
+       "name": "Harriet Nuwagaba\u2010Biribonwoha"
+      },
+      {
+       "name": "Ravindre Panchia"
+      },
+      {
+       "name": "Nishanta Singh"
+      },
+      {
+       "name": "Bekezela Siziba"
+      },
+      {
+       "name": "Jennifer Farrior"
+      },
+      {
+       "name": "Scott Rose"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      },
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Stephanie Beigel-Orme"
+      },
+      {
+       "name": "Sybil Hosek"
+      },
+      {
+       "name": "Elizabeth E. Tolley"
+      },
+      {
+       "name": "Nirupama Deshmane Sista"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "William R. Spreen"
+      },
+      {
+       "name": "Kimberly Y. Smith"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Mina C. Hosseinipour"
+      },
+      {
+       "name": "Aida Asmelash"
+      },
+      {
+       "name": "Alice Sehurutshi"
+      },
+      {
+       "name": "Allan Baguma"
+      },
+      {
+       "name": "Anita Marais"
+      },
+      {
+       "name": "Barbarah Kawoozo"
+      },
+      {
+       "name": "Bongiwe Prudence Malinga"
+      },
+      {
+       "name": "Brenda Gati Mirembe"
+      },
+      {
+       "name": "Brenda Okech"
+      },
+      {
+       "name": "Bryan Esterhuizen"
+      },
+      {
+       "name": "Caroline Murombedzi"
+      },
+      {
+       "name": "Daphne Gadama"
+      },
+      {
+       "name": "Eldinah Hwengwere"
+      },
+      {
+       "name": "Elizabeth Roos"
+      },
+      {
+       "name": "Elizabeth S Magada"
+      },
+      {
+       "name": "Emily Shava"
+      },
+      {
+       "name": "Estelle Piwowar-Manning"
+      },
+      {
+       "name": "Eunice Tahuringana"
+      },
+      {
+       "name": "Felix GS Muhlanga"
+      },
+      {
+       "name": "Francesca Conradie"
+      },
+      {
+       "name": "Frank Angira"
+      },
+      {
+       "name": "Gertrude Nanyonjo"
+      },
+      {
+       "name": "Girisha Kistnasami"
+      },
+      {
+       "name": "Hazzie Mvula"
+      },
+      {
+       "name": "Ishana Naidoo"
+      },
+      {
+       "name": "Jaco Horak"
+      },
+      {
+       "name": "Jane Jere"
+      },
+      {
+       "name": "Jeeva Moodley"
+      },
+      {
+       "name": "Katie Shin"
+      },
+      {
+       "name": "Kerry Nel"
+      },
+      {
+       "name": "Kevin Bokoch"
+      },
+      {
+       "name": "Birungi Lilian"
+      },
+      {
+       "name": "Lynda Emel"
+      },
+      {
+       "name": "Maletsatsi Monametsi"
+      },
+      {
+       "name": "Marvelous Sibanda"
+      },
+      {
+       "name": "Mercy T. Mutambanengwe-Jacob"
+      },
+      {
+       "name": "Miria Chitukuta"
+      },
+      {
+       "name": "Moleen Matimbira"
+      },
+      {
+       "name": "Muchaneta Bhondai-Mhuri"
+      },
+      {
+       "name": "Ncamsile Sibisi"
+      },
+      {
+       "name": "Neetha Morar"
+      },
+      {
+       "name": "Netsai Mudzonga"
+      },
+      {
+       "name": "Paul Natureeba"
+      },
+      {
+       "name": "Paul Richardson"
+      },
+      {
+       "name": "Petina Musara"
+      },
+      {
+       "name": "Pippa Macdonald"
+      },
+      {
+       "name": "Rejoice Nkambule"
+      },
+      {
+       "name": "Repelang Mosime"
+      },
+      {
+       "name": "Rhonda White"
+      },
+      {
+       "name": "Ribka Berhanu"
+      },
+      {
+       "name": "Ritha Ncube-Sihlongonyane"
+      },
+      {
+       "name": "Rogers Sekabira"
+      },
+      {
+       "name": "Samantha Siva"
+      },
+      {
+       "name": "Saresha Pillay"
+      },
+      {
+       "name": "Shamelle Govender"
+      },
+      {
+       "name": "Sheiala Bamweyana"
+      },
+      {
+       "name": "Siyabonga Nzimande"
+      },
+      {
+       "name": "Steve Innes"
+      },
+      {
+       "name": "Sufia S. Dadabhai"
+      },
+      {
+       "name": "Taraz Samandari"
+      },
+      {
+       "name": "Tchangani Tembo"
+      },
+      {
+       "name": "Thandie Lungu Mabedi"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4229065105",
+     "title": "Department of Error",
+     "year": 2022,
+     "authors": [],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4388517747",
+     "title": "Long-acting cabotegravir PrEP: a time for cautious optimism",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "David W J Griffin"
+      },
+      {
+       "name": "Jennifer Hoy"
+      },
+      {
+       "name": "James H. McMahon"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4361270511",
+     "title": "Extended Analysis of HIV Infection in Cisgender Men and Transgender Women Who Have Sex with Men Receiving Injectable Cabotegravir for HIV Prevention: HPTN 083",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Jessica M. Fogel"
+      },
+      {
+       "name": "Zhe Wang"
+      },
+      {
+       "name": "Estelle Piwowar\u2010Manning"
+      },
+      {
+       "name": "Ryan Kofron"
+      },
+      {
+       "name": "Amber Moser"
+      },
+      {
+       "name": "Pradip Bhandari"
+      },
+      {
+       "name": "Ryann Gollings"
+      },
+      {
+       "name": "Lane R. Bushman"
+      },
+      {
+       "name": "Lei Weng"
+      },
+      {
+       "name": "Elias Konstantine Halvas"
+      },
+      {
+       "name": "John W. Mellors"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Deborah Persaud"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Marybeth McCauley"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "Marty St. Clair"
+      },
+      {
+       "name": "Susan L. Ford"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "Suwat Chariyalertsak"
+      },
+      {
+       "name": "Kenneth Hugh Mayer"
+      },
+      {
+       "name": "Roberto C. Arduino"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Beatriz Gilda Jegerhorn Grinsztejn"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Raphael J. Landovitz"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4308374271",
+     "title": "Relative cost-effectiveness of long-acting injectable cabotegravir versus oral pre-exposure prophylaxis in South Africa based on the HPTN 083 and HPTN 084 trials: a modelled economic evaluation and threshold analysis",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Lise Jamieson"
+      },
+      {
+       "name": "Leigh Francis Johnson"
+      },
+      {
+       "name": "Brooke E Nichols"
+      },
+      {
+       "name": "Sin\u00e9ad Delany\u2010Moretlwe"
+      },
+      {
+       "name": "Mina C. Hosseinipour"
+      },
+      {
+       "name": "Colin A. Russell"
+      },
+      {
+       "name": "Gesine Meyer\u2010Rath"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4309662590",
+     "title": "Pregnancy outcomes and pharmacokinetics in pregnant women living with HIV exposed to long\u2010acting cabotegravir and rilpivirine in clinical trials",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Parul Patel"
+      },
+      {
+       "name": "Susan L. Ford"
+      },
+      {
+       "name": "Mark Baker"
+      },
+      {
+       "name": "Claudia Meyer"
+      },
+      {
+       "name": "Louise Garside"
+      },
+      {
+       "name": "Ronald D. D'Amico"
+      },
+      {
+       "name": "Rodica M Van Solingen-Ristea"
+      },
+      {
+       "name": "Herta M. Crauwels"
+      },
+      {
+       "name": "Joseph W. Polli"
+      },
+      {
+       "name": "Ciara Seal"
+      },
+      {
+       "name": "Itziar Yague"
+      },
+      {
+       "name": "Shanker Thiagarajah"
+      },
+      {
+       "name": "Eileen Birmingham"
+      },
+      {
+       "name": "William R. Spreen"
+      },
+      {
+       "name": "Bryan Baugh"
+      },
+      {
+       "name": "Jean Andre Van Wyk"
+      },
+      {
+       "name": "Vani X. Vannappagari"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4388516659",
+     "title": "Efficacy and safety of long-acting cabotegravir compared with daily oral tenofovir disoproxil fumarate plus emtricitabine to prevent HIV infection in cisgender men and transgender women who have sex with men 1 year after study unblinding: a secondary analysis of the phase 2b and 3 HPTN 083 randomised controlled trial",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Raphael J. Landovitz"
+      },
+      {
+       "name": "Brett S. Hanscom"
+      },
+      {
+       "name": "Meredith E. Clement"
+      },
+      {
+       "name": "Tr\u1ea7n Vi\u1ec7t H\u00e0"
+      },
+      {
+       "name": "Esper Georges Kallas"
+      },
+      {
+       "name": "Manya Magnus"
+      },
+      {
+       "name": "Omar Gustavo Sued"
+      },
+      {
+       "name": "Jorge Sanchez"
+      },
+      {
+       "name": "Hyman M Scott"
+      },
+      {
+       "name": "Joe Eron"
+      },
+      {
+       "name": "Carlos del R\u00edo"
+      },
+      {
+       "name": "Sheldon D. Fields"
+      },
+      {
+       "name": "Mark A. Marzinke"
+      },
+      {
+       "name": "Susan H. Eshleman"
+      },
+      {
+       "name": "Deborah J Donnell"
+      },
+      {
+       "name": "Matthew A. Spinelli"
+      },
+      {
+       "name": "Ryan Kofron"
+      },
+      {
+       "name": "Richard Berman"
+      },
+      {
+       "name": "Estelle Piwowar\u2010Manning"
+      },
+      {
+       "name": "Paul A Richardson"
+      },
+      {
+       "name": "Philip A Sullivan"
+      },
+      {
+       "name": "Jonathan Paul Lucas"
+      },
+      {
+       "name": "Peter L. Anderson"
+      },
+      {
+       "name": "Craig W. Hendrix"
+      },
+      {
+       "name": "Adeola Adeyeye"
+      },
+      {
+       "name": "James F. Rooney"
+      },
+      {
+       "name": "Alex R. Rinehart"
+      },
+      {
+       "name": "Myron S. Cohen"
+      },
+      {
+       "name": "Marybeth McCauley"
+      },
+      {
+       "name": "Beatriz Gilda Jegerhorn Grinsztejn"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4296028039",
+     "title": "Long-Acting Injectable Cabotegravir for HIV Prevention: What Do We Know and Need to Know about the Risks and Consequences of Cabotegravir Resistance?",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Urvi M. Parikh"
+      },
+      {
+       "name": "Catherine A. Koss"
+      },
+      {
+       "name": "John W. Mellors"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "vanthoog": {
+  "citation": "van't Hoog AH et al. Screening strategies for tuberculosis prevalence surveys: the value of chest radiography and symptoms. PLoS One, 2012",
+  "responses": {
+   "van't Hoog AH et al. Screening strategies for tuberculosis prevalence surveys: the value of chest radiography and symptoms. PLoS One, 2012": [
+    {
+     "paperId": "https://openalex.org/W2068223658",
+     "title": "Screening Strategies for Tuberculosis Prevalence Surveys: The Value of Chest Radiography and Symptoms",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Anna H. van\u2019t Hoog"
+      },
+      {
+       "name": "Helen K. Meme"
+      },
+      {
+       "name": "Kayla F. Laserson"
+      },
+      {
+       "name": "Janet A. Agaya"
+      },
+      {
+       "name": "Benson G. Muchiri"
+      },
+      {
+       "name": "Willie Githui"
+      },
+      {
+       "name": "Lazarus Odeny"
+      },
+      {
+       "name": "Barbara J. Marston"
+      },
+      {
+       "name": "Martien W. Borgdorff"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1520802443",
+     "title": "Tuberculosis: Current state of knowledge",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Chi Chiu Leung"
+      },
+      {
+       "name": "Christoph G. Lange"
+      },
+      {
+       "name": "Ying Zhang"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1972096399",
+     "title": "Rapid Diagnostic Algorithms as a Screening Tool for Tuberculosis: An Assessor Blinded Cross-Sectional Study",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Franz Ratzinger"
+      },
+      {
+       "name": "Harald Bruckschwaiger"
+      },
+      {
+       "name": "Martin Wischenbart"
+      },
+      {
+       "name": "Bernhard Parschalk"
+      },
+      {
+       "name": "Delmiro Fern\u00e1ndez-Reyes"
+      },
+      {
+       "name": "Heimo Lagler"
+      },
+      {
+       "name": "Alexandra Indra"
+      },
+      {
+       "name": "Wolfgang Graninger"
+      },
+      {
+       "name": "Stefan Winkler"
+      },
+      {
+       "name": "Sanjeev Krishna"
+      },
+      {
+       "name": "Michael Ramharter"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2161131246",
+     "title": "Prevalence of TB/HIV Co-Infection in Countries Except China: A Systematic Review and Meta-Analysis",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Junling Gao"
+      },
+      {
+       "name": "Pinpin Zheng"
+      },
+      {
+       "name": "Hua Fu"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2145151789",
+     "title": "Feasibility, Yield, and Cost of Active Tuberculosis Case Finding Linked to a Mobile HIV Service in Cape Town, South Africa: A Cross-sectional Study",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Katharina Kranzer"
+      },
+      {
+       "name": "Stephen D Lawn"
+      },
+      {
+       "name": "Gesine Meyer\u2010Rath"
+      },
+      {
+       "name": "Anna Vassall"
+      },
+      {
+       "name": "Eudoxia Raditlhalo"
+      },
+      {
+       "name": "Darshini Govindasamy"
+      },
+      {
+       "name": "Nienke van Schaik"
+      },
+      {
+       "name": "Robin Wood"
+      },
+      {
+       "name": "Linda\u2010Gail Bekker"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W652369789",
+     "title": "Optimal tuberculosis case-finding methodologies for field trials of new tuberculosis vaccines in young children",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Sizulu Moyo"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2145756005",
+     "title": "Optimal Triage Test Characteristics to Improve the Cost-Effectiveness of the Xpert MTB/RIF Assay for TB Diagnosis: A Decision Analysis",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Anna H. van\u2019t Hoog"
+      },
+      {
+       "name": "Frank G. J. Cobelens"
+      },
+      {
+       "name": "Anna Vassall"
+      },
+      {
+       "name": "Sanne Christine van Kampen"
+      },
+      {
+       "name": "Susan E. Dorman"
+      },
+      {
+       "name": "David Alland"
+      },
+      {
+       "name": "Jerrold J. Ellner"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W36584194",
+     "title": "Mercado de Sopocachi. La Paz (Bolivia)",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Yanet Acosta"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Screening strategies for tuberculosis prevalence surveys: the value of chest radiography and symptoms": [
+    {
+     "paperId": "https://openalex.org/W2068223658",
+     "title": "Screening Strategies for Tuberculosis Prevalence Surveys: The Value of Chest Radiography and Symptoms",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Anna H. van\u2019t Hoog"
+      },
+      {
+       "name": "Helen K. Meme"
+      },
+      {
+       "name": "Kayla F. Laserson"
+      },
+      {
+       "name": "Janet A. Agaya"
+      },
+      {
+       "name": "Benson G. Muchiri"
+      },
+      {
+       "name": "Willie Githui"
+      },
+      {
+       "name": "Lazarus Odeny"
+      },
+      {
+       "name": "Barbara J. Marston"
+      },
+      {
+       "name": "Martien W. Borgdorff"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2124081195",
+     "title": "Scoring systems using chest radiographic features for the diagnosis of pulmonary tuberculosis in adults: a systematic review",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Lancelot Pinto"
+      },
+      {
+       "name": "Madhukar Pai"
+      },
+      {
+       "name": "Keertan U.J. Dheda"
+      },
+      {
+       "name": "Kevin Schwartzman"
+      },
+      {
+       "name": "Dick Menzies"
+      },
+      {
+       "name": "Karen R Steingart"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2006435715",
+     "title": "Development of a Simple Reliable Radiographic Scoring System to Aid the Diagnosis of Pulmonary Tuberculosis",
+     "year": 2013,
+     "authors": [
+      {
+       "name": "Lancelot Pinto"
+      },
+      {
+       "name": "Keertan U.J. Dheda"
+      },
+      {
+       "name": "Grant Theron"
+      },
+      {
+       "name": "Brian Allwood"
+      },
+      {
+       "name": "Greg Calligaro"
+      },
+      {
+       "name": "Richard Nellis van Zyl-Smit"
+      },
+      {
+       "name": "Jonny Peter"
+      },
+      {
+       "name": "Kevin Schwartzman"
+      },
+      {
+       "name": "Dick Menzies"
+      },
+      {
+       "name": "Eric Donn Bateman"
+      },
+      {
+       "name": "Madhukar Pai"
+      },
+      {
+       "name": "Rodney Dawson"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2102063452",
+     "title": "Development of a Standardized Screening Rule for Tuberculosis in People Living with HIV in Resource-Constrained Settings: Individual Participant Data Meta-analysis of Observational Studies",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Haileyesus Getahun"
+      },
+      {
+       "name": "Wanitchaya Kittikraisak"
+      },
+      {
+       "name": "Charles M. Heilig"
+      },
+      {
+       "name": "Elizabeth Lucy Corbett"
+      },
+      {
+       "name": "Helen Ayles"
+      },
+      {
+       "name": "Kevin P. Cain"
+      },
+      {
+       "name": "Alison D. Grant"
+      },
+      {
+       "name": "Gavin Churchyard"
+      },
+      {
+       "name": "Michael Kimerling"
+      },
+      {
+       "name": "Sarita Shah"
+      },
+      {
+       "name": "Stephen D Lawn"
+      },
+      {
+       "name": "Robin Wood"
+      },
+      {
+       "name": "Gary Maartens"
+      },
+      {
+       "name": "Reuben Granich"
+      },
+      {
+       "name": "Anand A. Date"
+      },
+      {
+       "name": "Jay K. Varma"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2171167861",
+     "title": "Screening and Rapid Molecular Diagnosis of Tuberculosis in Prisons in Russia and Eastern Europe: A Cost-Effectiveness Analysis",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Daniel E. Winetsky"
+      },
+      {
+       "name": "Diana M. Negoescu"
+      },
+      {
+       "name": "Emilia H. DeMarchis"
+      },
+      {
+       "name": "Olga Almukhamedova"
+      },
+      {
+       "name": "Aizhan Dooronbekova"
+      },
+      {
+       "name": "Dilshod Pulatov"
+      },
+      {
+       "name": "Natalia Vezhnina"
+      },
+      {
+       "name": "Douglas K Owens"
+      },
+      {
+       "name": "Jeremy D. Goldhaber\u2010Fiebert"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2069406852",
+     "title": "Prevalence of Pulmonary Tuberculosis among Adults in a Rural Sub-District of South India",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Vineet Kumar Chadha"
+      },
+      {
+       "name": "Prahlad Kumar"
+      },
+      {
+       "name": "Sharada M. Anjinappa"
+      },
+      {
+       "name": "Sanjay Pratap Singh"
+      },
+      {
+       "name": "Somashekar Narasimhaiah"
+      },
+      {
+       "name": "Malathi V. Joshi"
+      },
+      {
+       "name": "Joydev Gupta"
+      },
+      {
+       "name": "Lakshminarayana"
+      },
+      {
+       "name": "Jitendra Ramchandra"
+      },
+      {
+       "name": "Magesh Velu"
+      },
+      {
+       "name": "Suganthi Papkianathan"
+      },
+      {
+       "name": "S Santhosh Babu"
+      },
+      {
+       "name": "Krishna Hemalatha"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2153700132",
+     "title": "A comparative examination of tuberculosis immigration medical screening programs from selected countries with high immigration and low tuberculosis incidence rates",
+     "year": 2011,
+     "authors": [
+      {
+       "name": "Gonzalo G. Alvarez"
+      },
+      {
+       "name": "Brian D. Gushulak"
+      },
+      {
+       "name": "Khaled Abu Rumman"
+      },
+      {
+       "name": "Ekkehardt Altpeter"
+      },
+      {
+       "name": "Daniel Chemtob"
+      },
+      {
+       "name": "Paul J Douglas"
+      },
+      {
+       "name": "Connie G.M. Erkens"
+      },
+      {
+       "name": "Peter Helbling"
+      },
+      {
+       "name": "Ingrid Hamilton"
+      },
+      {
+       "name": "Jane A. Jones"
+      },
+      {
+       "name": "Alberto Matteelli"
+      },
+      {
+       "name": "Marie-Claire Paty"
+      },
+      {
+       "name": "Drew L. Posey"
+      },
+      {
+       "name": "Daniel Sagebiel"
+      },
+      {
+       "name": "Erika Slump"
+      },
+      {
+       "name": "Anders Tegnell"
+      },
+      {
+       "name": "Elena Rodr\u00edguez Val\u00edn"
+      },
+      {
+       "name": "Brita Askeland Winje"
+      },
+      {
+       "name": "Edward Ellis"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2112147097",
+     "title": "Contact investigation for tuberculosis: a systematic review and meta-analysis",
+     "year": 2012,
+     "authors": [
+      {
+       "name": "Gregory James Fox"
+      },
+      {
+       "name": "Simone E. Barry"
+      },
+      {
+       "name": "Warwick J. Britton"
+      },
+      {
+       "name": "Guy Barrington Marks"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "boarding": {
+  "citation": "Influenza in a boarding school. Br Med J 1978",
+  "responses": {
+   "Influenza in a boarding school. Br Med J 1978": [
+    {
+     "paperId": "https://openalex.org/W4232859708",
+     "title": "Supplying the NHS.",
+     "year": 1978,
+     "authors": [],
+     "source": "openalex"
+    }
+   ],
+   "Influenza in a boarding school": [
+    {
+     "paperId": "https://openalex.org/W252529933",
+     "title": "The protective effect of influenza vaccine in a mixed influenza A and B epidemic in a boys' boarding school.",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "J. H. D. Briscoe"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1676230314",
+     "title": "'Red'flu': a study of an epidemic in a girls' boarding school in February 1978.",
+     "year": 1979,
+     "authors": [
+      {
+       "name": "D. J. Belbin"
+      },
+      {
+       "name": "William Henry Smithson"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1794955263",
+     "title": "Hilo Boarding School - Hawaii's Experiment in Vocational Education",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "Ralph C. Canevali"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2903094373",
+     "title": "Natural infection and vaccination with influenza A (H3N2).",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "Alyson J Smith"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2093158072",
+     "title": "Guillain-Barr\u00e9 syndrome and influenza vaccine.",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "WOLFGANG EHRENGUT"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2061088954",
+     "title": "The laboratory surveillance of influenza epidemics in the United Kingdom 1968\u20131976",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "Marguerite S. Pereira"
+      },
+      {
+       "name": "Pratima Chakraverty"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2145526117",
+     "title": "The response to inactivated influenza A (H3N2) vaccines: the development and effect of antibodies to the surface antigens",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "Alyson J Smith"
+      },
+      {
+       "name": "Joan R. Davies"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2335752073",
+     "title": "Respiratory viral infections 1976",
+     "year": 1977,
+     "authors": [
+      {
+       "name": "E.R. Smith"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "who_ebola": {
+  "citation": "WHO Ebola Response Team. Ebola Virus Disease in West Africa - The First 9 Months of the Epidemic and Forward Projections. New England Journal of Medicine 2014",
+  "responses": {
+   "WHO Ebola Response Team. Ebola Virus Disease in West Africa - The First 9 Months of the Epidemic and Forward Projections. New England Journal of Medicine 2014": [
+    {
+     "paperId": "https://openalex.org/W4210710163",
+     "title": "Ebola Virus Disease in West Africa \u2014 The First 9 Months of the Epidemic and Forward Projections",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "WHO Ebola Response Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2190947059",
+     "title": "Mathematical modeling of the West Africa Ebola epidemic",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Jean-Paul Chr\u00e9tien"
+      },
+      {
+       "name": "Steven Riley"
+      },
+      {
+       "name": "Dylan B George"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W229950415",
+     "title": "Ebola Virus Disease among Children in West Africa",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "WHO Ebola Response Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2105084778",
+     "title": "Ebola Virus Disease in the Democratic Republic of Congo",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "Ga\u00ebl Darren Maganga"
+      },
+      {
+       "name": "Jimmy Kapetshi"
+      },
+      {
+       "name": "Nicol\u00e1s Berthet"
+      },
+      {
+       "name": "Beno\u00eet Kebela Ilunga"
+      },
+      {
+       "name": "Felix Kabange"
+      },
+      {
+       "name": "Placide Mbala Kingebeni"
+      },
+      {
+       "name": "Vital Mondonge"
+      },
+      {
+       "name": "Jean\u2010Jacques Muyembe"
+      },
+      {
+       "name": "Eric Bertherat"
+      },
+      {
+       "name": "Sylvie C. Briand"
+      },
+      {
+       "name": "Joseph Waogodo Cabore"
+      },
+      {
+       "name": "Alain Epelbo\u00efn"
+      },
+      {
+       "name": "Pierre Formenty"
+      },
+      {
+       "name": "Gary Kobinger"
+      },
+      {
+       "name": "Lic\u00e9 Gonz\u00e1lez-Angulo"
+      },
+      {
+       "name": "Ingrid Labouba"
+      },
+      {
+       "name": "Jean\u2010Claude Manuguerra"
+      },
+      {
+       "name": "Jean\u2010Marie Okwo\u2010Bele"
+      },
+      {
+       "name": "Christopher Dye"
+      },
+      {
+       "name": "Eric Maurice Leroy"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2113054317",
+     "title": "Clinical Presentation of Patients with Ebola Virus Disease in Conakry, Guinea",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "Elhadj Ibrahima Bah"
+      },
+      {
+       "name": "Marie-Claire Lamah"
+      },
+      {
+       "name": "Tom E. Fletcher"
+      },
+      {
+       "name": "Shevin T. Jacob"
+      },
+      {
+       "name": "David M. Brett\u2010Major"
+      },
+      {
+       "name": "Amadou Alpha Sall"
+      },
+      {
+       "name": "Nahoko Shindo"
+      },
+      {
+       "name": "William A. Fischer"
+      },
+      {
+       "name": "Fran\u00e7ois Lamontagne"
+      },
+      {
+       "name": "Sow Mamadou Saliou"
+      },
+      {
+       "name": "Daniel G. Bausch"
+      },
+      {
+       "name": "Moumi\u00e9 Barry"
+      },
+      {
+       "name": "Tim Jagatic"
+      },
+      {
+       "name": "Armand Sprecher"
+      },
+      {
+       "name": "James V. Lawler"
+      },
+      {
+       "name": "Thierry Mayet"
+      },
+      {
+       "name": "Fr\u00e9d\u00e9rique Jacqu\u00e9rioz"
+      },
+      {
+       "name": "Mar\u00eda F.M\u00e9ndez Baggi"
+      },
+      {
+       "name": "Constanza Vallenas"
+      },
+      {
+       "name": "Christophe Cl\u00e9ment"
+      },
+      {
+       "name": "S Mardel"
+      },
+      {
+       "name": "Ousmane Faye"
+      },
+      {
+       "name": "Oumar Faye"
+      },
+      {
+       "name": "Bar\u00e9 Soropogui"
+      },
+      {
+       "name": "N\u2019Faly Magassouba"
+      },
+      {
+       "name": "Lamine Koivogui"
+      },
+      {
+       "name": "Ruxandra L Pinto"
+      },
+      {
+       "name": "Robert Fowler"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1070000046",
+     "title": "West African Ebola Epidemic after One Year \u2014 Slowing but Not Yet under Control",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "WHO Ebola Response Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W1850664963",
+     "title": "What Factors Might Have Led to the Emergence of Ebola in West Africa?",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Kathleen A. Alexander"
+      },
+      {
+       "name": "Claire E. Sanderson"
+      },
+      {
+       "name": "Madav Marathe"
+      },
+      {
+       "name": "Bryan Leroy Lewis"
+      },
+      {
+       "name": "Caitlin Rivers"
+      },
+      {
+       "name": "Jeffrey L. Shaman"
+      },
+      {
+       "name": "John M. Drake"
+      },
+      {
+       "name": "Eric Lofgren"
+      },
+      {
+       "name": "Virginia Dato"
+      },
+      {
+       "name": "Marisa C. Eisenberg"
+      },
+      {
+       "name": "Stephen Eubank"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2034362332",
+     "title": "Chains of transmission and control of Ebola virus disease in Conakry, Guinea, in 2014: an observational study",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Ousmane Faye"
+      },
+      {
+       "name": "Pierre\u2010Yves Bo\u00eblle"
+      },
+      {
+       "name": "Emmanuel Heleze"
+      },
+      {
+       "name": "Oumar Faye"
+      },
+      {
+       "name": "Cheikh Loucoubar"
+      },
+      {
+       "name": "N\u2019Faly Magassouba"
+      },
+      {
+       "name": "Barr\u00e9 Soropogui"
+      },
+      {
+       "name": "Sakoba Keita"
+      },
+      {
+       "name": "Tata Gakou"
+      },
+      {
+       "name": "Elhadj Ibrahima Bah"
+      },
+      {
+       "name": "Lamine Koivogui"
+      },
+      {
+       "name": "Amadou Alpha Sall"
+      },
+      {
+       "name": "Simon Cauchemez"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Ebola Virus Disease in West Africa - The First 9 Months of the Epidemic and Forward Projections": [
+    {
+     "paperId": "https://openalex.org/W4210710163",
+     "title": "Ebola Virus Disease in West Africa \u2014 The First 9 Months of the Epidemic and Forward Projections",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "WHO Ebola Response Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2099006677",
+     "title": "The unprecedented scale of the West African Ebola virus disease outbreak is due to environmental and sociological factors, not special attributes of the currently circulating strain of the virus",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "Derek Gatherer"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2140717270",
+     "title": "Cases of Ebola virus disease predicted to rise from hundreds to thousands per week unless control measures improve",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Kristian G. Andersen"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W229950415",
+     "title": "Ebola Virus Disease among Children in West Africa",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "WHO Ebola Response Team"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2190947059",
+     "title": "Mathematical modeling of the West Africa Ebola epidemic",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Jean-Paul Chr\u00e9tien"
+      },
+      {
+       "name": "Steven Riley"
+      },
+      {
+       "name": "Dylan B George"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2123064552",
+     "title": "Ebola virus disease epidemic in West Africa: lessons learned and issues arising from West African countries",
+     "year": 2015,
+     "authors": [
+      {
+       "name": "Obinna Ositadimma Oleribe"
+      },
+      {
+       "name": "Babatunde Lawal Salako"
+      },
+      {
+       "name": "Mourtalla Ka"
+      },
+      {
+       "name": "Albert Kwaku Akpalu"
+      },
+      {
+       "name": "Mairi McConnochie"
+      },
+      {
+       "name": "Matthew Foster"
+      },
+      {
+       "name": "Simon David Taylor-Robinson"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W2105084778",
+     "title": "Ebola Virus Disease in the Democratic Republic of Congo",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "Ga\u00ebl Darren Maganga"
+      },
+      {
+       "name": "Jimmy Kapetshi"
+      },
+      {
+       "name": "Nicol\u00e1s Berthet"
+      },
+      {
+       "name": "Beno\u00eet Kebela Ilunga"
+      },
+      {
+       "name": "Felix Kabange"
+      },
+      {
+       "name": "Placide Mbala Kingebeni"
+      },
+      {
+       "name": "Vital Mondonge"
+      },
+      {
+       "name": "Jean\u2010Jacques Muyembe"
+      },
+      {
+       "name": "Eric Bertherat"
+      },
+      {
+       "name": "Sylvie C. Briand"
+      },
+      {
+       "name": "Joseph Waogodo Cabore"
+      },
+      {
+       "name": "Alain Epelbo\u00efn"
+      },
+      {
+       "name": "Pierre Formenty"
+      },
+      {
+       "name": "Gary Kobinger"
+      },
+      {
+       "name": "Lic\u00e9 Gonz\u00e1lez-Angulo"
+      },
+      {
+       "name": "Ingrid Labouba"
+      },
+      {
+       "name": "Jean\u2010Claude Manuguerra"
+      },
+      {
+       "name": "Jean\u2010Marie Okwo\u2010Bele"
+      },
+      {
+       "name": "Christopher Dye"
+      },
+      {
+       "name": "Eric Maurice Leroy"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4240740667",
+     "title": "Ebola virus disease",
+     "year": 2014,
+     "authors": [
+      {
+       "name": "Nicholas J. Beeching"
+      },
+      {
+       "name": "M. Fenech"
+      },
+      {
+       "name": "Catherine F. Houlihan"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "who_schisto": {
+  "citation": "WHO guideline on control and elimination of human schistosomiasis. World Health Organization 2022",
+  "responses": {
+   "WHO guideline on control and elimination of human schistosomiasis. World Health Organization 2022": [
+    {
+     "paperId": "https://openalex.org/W4307156367",
+     "title": "The new WHO guideline for control and elimination of human schistosomiasis: implications for the Schistosomiasis Elimination Programme in Nigeria",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Akinola Stephen Oluwole"
+      },
+      {
+       "name": "Uwem Friday Ekpo"
+      },
+      {
+       "name": "Obiageli J. Nebe"
+      },
+      {
+       "name": "Nse Michael Akpan"
+      },
+      {
+       "name": "Jacob Solomon"
+      },
+      {
+       "name": "Uche Veronica Amazigo"
+      },
+      {
+       "name": "J. Russell Stothard"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4280592334",
+     "title": "Review of 2022 WHO guidelines on the control and elimination of schistosomiasis",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Nathan C. Lo"
+      },
+      {
+       "name": "Fernando Schemelzer de Moraes Bezerra"
+      },
+      {
+       "name": "Daniel G. Colley"
+      },
+      {
+       "name": "Fiona M. Fleming"
+      },
+      {
+       "name": "Mamoun M. A. Homeida"
+      },
+      {
+       "name": "Narcis B. Kabatereine"
+      },
+      {
+       "name": "Fatma Mohammed Kabole"
+      },
+      {
+       "name": "Charles H. King"
+      },
+      {
+       "name": "Margaret A. Mafe"
+      },
+      {
+       "name": "Nicholas Midzi"
+      },
+      {
+       "name": "Francisca Mutapi"
+      },
+      {
+       "name": "Joseph Rogathe Mwanga"
+      },
+      {
+       "name": "Reda M. R. Ramzy"
+      },
+      {
+       "name": "Fadjar Satrija"
+      },
+      {
+       "name": "J. Russell Stothard"
+      },
+      {
+       "name": "Mamadou Souncalo Traor\u00e9"
+      },
+      {
+       "name": "Joanne P. Webster"
+      },
+      {
+       "name": "J\u00fcrg Utzinger"
+      },
+      {
+       "name": "Xiao\u2010Nong Zhou"
+      },
+      {
+       "name": "Anthony Danso\u2010Appiah"
+      },
+      {
+       "name": "Paolo Eusebi"
+      },
+      {
+       "name": "Eric S. Loker"
+      },
+      {
+       "name": "Charles Obonyo"
+      },
+      {
+       "name": "Reginald Quansah"
+      },
+      {
+       "name": "Song Liang"
+      },
+      {
+       "name": "Michel Vaillant"
+      },
+      {
+       "name": "Mohammad Hassan Murad"
+      },
+      {
+       "name": "Paul Hagan"
+      },
+      {
+       "name": "Amadou Garba"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4386012356",
+     "title": "Reaching the World Health Organization elimination targets for schistosomiasis: the importance of a One Health perspective",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Adriana V. D\u00edaz"
+      },
+      {
+       "name": "Martin Walker"
+      },
+      {
+       "name": "Joanne P. Webster"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4283767265",
+     "title": "The WHO new guideline to control and eliminate human schistosomiasis: implications for the verification of transmission interruption and surveillance of Schistosoma japonicum in China",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Jing Xu"
+      },
+      {
+       "name": "Shi\u2010Zhu Li"
+      },
+      {
+       "name": "Jiagang Guo"
+      },
+      {
+       "name": "Xiao\u2010Nong Zhou"
+      },
+      {
+       "name": "Amadou Garba Djirmay"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4291674835",
+     "title": "Defining elimination as a public health problem for schistosomiasis control programmes: beyond prevalence of heavy-intensity infections",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Ryan E. Wiegand"
+      },
+      {
+       "name": "Fiona M. Fleming"
+      },
+      {
+       "name": "Sake J. de Vlas"
+      },
+      {
+       "name": "Maurice R. Odiere"
+      },
+      {
+       "name": "Safari Kinung\u2019hi"
+      },
+      {
+       "name": "Charles H. King"
+      },
+      {
+       "name": "Darin S. Evans"
+      },
+      {
+       "name": "Michael D. French"
+      },
+      {
+       "name": "Susan P. Montgomery"
+      },
+      {
+       "name": "Anne Straily"
+      },
+      {
+       "name": "J\u00fcrg Utzinger"
+      },
+      {
+       "name": "Penelope Vounatsou"
+      },
+      {
+       "name": "William Evan Secor"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4389338454",
+     "title": "FioSchisto\u2019s expert perspective on implementing WHO guidelines for schistosomiasis control and transmission elimination in Brazil",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Camilla Almeida Menezes"
+      },
+      {
+       "name": "L\u00e2ngia Colli Montresor"
+      },
+      {
+       "name": "Soraya Torres Gaze"
+      },
+      {
+       "name": "Aline Carvalho de Mattos"
+      },
+      {
+       "name": "Ana L\u00facia Coutinho Domingues"
+      },
+      {
+       "name": "Arnaldo Maldonado"
+      },
+      {
+       "name": "Cl\u00e9lia Christina Mello-Silva"
+      },
+      {
+       "name": "Constan\u00e7a Sim\u00f5es Barbosa"
+      },
+      {
+       "name": "Cristiane Lafet\u00e1 Furtado de Mendon\u00e7a"
+      },
+      {
+       "name": "Cr\u00edstiano Lara Massara"
+      },
+      {
+       "name": "Cristina Toscano Fonseca"
+      },
+      {
+       "name": "Edward Oliveira"
+      },
+      {
+       "name": "Elainne Christine de Souza Gomes"
+      },
+      {
+       "name": "Eliz\u00e2ngela Feitosa da Silva"
+      },
+      {
+       "name": "Fernando Schemelzer de Moraes Bezerra"
+      },
+      {
+       "name": "Floriano Paes Silva"
+      },
+      {
+       "name": "Isadora Cristina de Siqueira"
+      },
+      {
+       "name": "Jos\u00e9 Roberto Machado e Silva"
+      },
+      {
+       "name": "L\u00e9o Heller"
+      },
+      {
+       "name": "Leonardo Paiva Farias"
+      },
+      {
+       "name": "L\u00edlian Christina N\u00f3brega Holsbach Beck"
+      },
+      {
+       "name": "Mariana Cristina Silva Santos"
+      },
+      {
+       "name": "Mariana Gomes Lima"
+      },
+      {
+       "name": "Marina de Moraes Mour\u00e3o"
+      },
+      {
+       "name": "Martin Johannes Enk"
+      },
+      {
+       "name": "M\u00f4nica Ammon Fernandez"
+      },
+      {
+       "name": "Naftale Katz"
+      },
+      {
+       "name": "Omar dos Santos Carvalho"
+      },
+      {
+       "name": "Patr\u00edcia Martins Parreiras"
+      },
+      {
+       "name": "Renata Heisler Neves"
+      },
+      {
+       "name": "Sandra Grossi Gava"
+      },
+      {
+       "name": "Sheilla Andrade de Oliveira"
+      },
+      {
+       "name": "Silvana Carvalho Thiengo"
+      },
+      {
+       "name": "Tereza Cristina Favre"
+      },
+      {
+       "name": "Carlos Graeff-Teixeira"
+      },
+      {
+       "name": "Ot\u00e1vio Sarmento Pieri"
+      },
+      {
+       "name": "Roberta Lima Caldeira"
+      },
+      {
+       "name": "Rosiane Aparecida da Silva-Pereira"
+      },
+      {
+       "name": "Roberto Sena Rocha"
+      },
+      {
+       "name": "Ricardo Riccio Oliveira"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4385796205",
+     "title": "Schistosomiasis elimination in Madagascar: challenges and opportunities for implementing the new WHO guidelines",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Clara Fabienne Rasoamanamihaja"
+      },
+      {
+       "name": "Rivo Andry Rakotoarivelo"
+      },
+      {
+       "name": "Glenn Torrencelli Edosoa"
+      },
+      {
+       "name": "Tahinamandranto Rasamoelina"
+      },
+      {
+       "name": "Antonio Montresor"
+      },
+      {
+       "name": "Valentina Marchese"
+      },
+      {
+       "name": "Daniela Fusco"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4321230852",
+     "title": "Livestock Reservoir Hosts: An Obscured Threat to Control of Human Schistosomiasis in Nigeria",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Hammed Oladeji Mogaji"
+      },
+      {
+       "name": "Olaitan Olamide Omitola"
+      },
+      {
+       "name": "Adedotun Ayodeji Bayegun"
+      },
+      {
+       "name": "Uwem Friday Ekpo"
+      },
+      {
+       "name": "Andrew William Taylor-Robinson"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "WHO guideline on control and elimination of human schistosomiasis": [
+    {
+     "paperId": "https://openalex.org/W4288733459",
+     "title": "[Sharing the WHO guideline on control and elimination of human schistosomiasis to achieve the goal of schistosomiasis elimination in China].",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "T P Wang"
+      },
+      {
+       "name": "Shuliang Lu"
+      },
+      {
+       "name": "Z Q Qin"
+      },
+      {
+       "name": "Y B Zhou"
+      },
+      {
+       "name": "Y Liu"
+      },
+      {
+       "name": "Li-yong Wen"
+      },
+      {
+       "name": "J G Guo"
+      },
+      {
+       "name": "Jie Xu"
+      },
+      {
+       "name": "S Z Li"
+      },
+      {
+       "name": "G M Zhang"
+      },
+      {
+       "name": "S Q Zhang"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4307156367",
+     "title": "The new WHO guideline for control and elimination of human schistosomiasis: implications for the Schistosomiasis Elimination Programme in Nigeria",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Akinola Stephen Oluwole"
+      },
+      {
+       "name": "Uwem Friday Ekpo"
+      },
+      {
+       "name": "Obiageli J. Nebe"
+      },
+      {
+       "name": "Nse Michael Akpan"
+      },
+      {
+       "name": "Jacob Solomon"
+      },
+      {
+       "name": "Uche Veronica Amazigo"
+      },
+      {
+       "name": "J. Russell Stothard"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4288753031",
+     "title": "[Decoding the evolution of preventive chemotherapy schemes for schistosomiasis in China to improve the precise implementation of the WHO guideline on control and elimination of human schistosomiasis].",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Jing Xu"
+      },
+      {
+       "name": "Y F Li"
+      },
+      {
+       "name": "Y Dong"
+      },
+      {
+       "name": "Z Y Zhao"
+      },
+      {
+       "name": "Li-yong Wen"
+      },
+      {
+       "name": "S Q Zhang"
+      },
+      {
+       "name": "D D Lin"
+      },
+      {
+       "name": "J Zhou"
+      },
+      {
+       "name": "Shuang Liang"
+      },
+      {
+       "name": "J G Guo"
+      },
+      {
+       "name": "S Z Li"
+      },
+      {
+       "name": "X N Zhou"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4288754097",
+     "title": "[Contribution to global implementation of WHO guideline on control and elimination of human schistosomiasis by learning successful experiences from the national schistosomiasis control program in China].",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "X Y Wang"
+      },
+      {
+       "name": "J F Zhang"
+      },
+      {
+       "name": "J G Guo"
+      },
+      {
+       "name": "Shuliang Lu"
+      },
+      {
+       "name": "M J Ji"
+      },
+      {
+       "name": "Z D Wu"
+      },
+      {
+       "name": "Yibiao Zhou"
+      },
+      {
+       "name": "Qingwu Jiang"
+      },
+      {
+       "name": "J Zhou"
+      },
+      {
+       "name": "Jia Liu"
+      },
+      {
+       "name": "D D Lin"
+      },
+      {
+       "name": "Ting Wang"
+      },
+      {
+       "name": "Y Dong"
+      },
+      {
+       "name": "Y Liu"
+      },
+      {
+       "name": "S Z Li"
+      },
+      {
+       "name": "Kun Yang"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4283767265",
+     "title": "The WHO new guideline to control and eliminate human schistosomiasis: implications for the verification of transmission interruption and surveillance of Schistosoma japonicum in China",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Jing Xu"
+      },
+      {
+       "name": "Shi\u2010Zhu Li"
+      },
+      {
+       "name": "Jiagang Guo"
+      },
+      {
+       "name": "Xiao\u2010Nong Zhou"
+      },
+      {
+       "name": "Amadou Garba Djirmay"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4280592334",
+     "title": "Review of 2022 WHO guidelines on the control and elimination of schistosomiasis",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Nathan C. Lo"
+      },
+      {
+       "name": "Fernando Schemelzer de Moraes Bezerra"
+      },
+      {
+       "name": "Daniel G. Colley"
+      },
+      {
+       "name": "Fiona M. Fleming"
+      },
+      {
+       "name": "Mamoun M. A. Homeida"
+      },
+      {
+       "name": "Narcis B. Kabatereine"
+      },
+      {
+       "name": "Fatma Mohammed Kabole"
+      },
+      {
+       "name": "Charles H. King"
+      },
+      {
+       "name": "Margaret A. Mafe"
+      },
+      {
+       "name": "Nicholas Midzi"
+      },
+      {
+       "name": "Francisca Mutapi"
+      },
+      {
+       "name": "Joseph Rogathe Mwanga"
+      },
+      {
+       "name": "Reda M. R. Ramzy"
+      },
+      {
+       "name": "Fadjar Satrija"
+      },
+      {
+       "name": "J. Russell Stothard"
+      },
+      {
+       "name": "Mamadou Souncalo Traor\u00e9"
+      },
+      {
+       "name": "Joanne P. Webster"
+      },
+      {
+       "name": "J\u00fcrg Utzinger"
+      },
+      {
+       "name": "Xiao\u2010Nong Zhou"
+      },
+      {
+       "name": "Anthony Danso\u2010Appiah"
+      },
+      {
+       "name": "Paolo Eusebi"
+      },
+      {
+       "name": "Eric S. Loker"
+      },
+      {
+       "name": "Charles Obonyo"
+      },
+      {
+       "name": "Reginald Quansah"
+      },
+      {
+       "name": "Song Liang"
+      },
+      {
+       "name": "Michel Vaillant"
+      },
+      {
+       "name": "Mohammad Hassan Murad"
+      },
+      {
+       "name": "Paul Hagan"
+      },
+      {
+       "name": "Amadou Garba"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4288752998",
+     "title": "[Analysis of the new WHO guideline to accelerate the progress towards elimination of schistosomiasis in China].",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Zhao-Yu Guo"
+      },
+      {
+       "name": "Jiaxin Feng"
+      },
+      {
+       "name": "L J Zhang"
+      },
+      {
+       "name": "Y B Zhou"
+      },
+      {
+       "name": "J Zhou"
+      },
+      {
+       "name": "Kun Yang"
+      },
+      {
+       "name": "Y Liu"
+      },
+      {
+       "name": "D D Lin"
+      },
+      {
+       "name": "J Liu"
+      },
+      {
+       "name": "Y Dong"
+      },
+      {
+       "name": "Ting Wang"
+      },
+      {
+       "name": "Li-yong Wen"
+      },
+      {
+       "name": "M J Ji"
+      },
+      {
+       "name": "Z D Wu"
+      },
+      {
+       "name": "Q W Jiang"
+      },
+      {
+       "name": "Shuang Liang"
+      },
+      {
+       "name": "J G Guo"
+      },
+      {
+       "name": "C L Cao"
+      },
+      {
+       "name": "Jing Xu"
+      },
+      {
+       "name": "Shuliang Lu"
+      },
+      {
+       "name": "S Z Li"
+      },
+      {
+       "name": "X N Zhou"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4385796205",
+     "title": "Schistosomiasis elimination in Madagascar: challenges and opportunities for implementing the new WHO guidelines",
+     "year": 2023,
+     "authors": [
+      {
+       "name": "Clara Fabienne Rasoamanamihaja"
+      },
+      {
+       "name": "Rivo Andry Rakotoarivelo"
+      },
+      {
+       "name": "Glenn Torrencelli Edosoa"
+      },
+      {
+       "name": "Tahinamandranto Rasamoelina"
+      },
+      {
+       "name": "Antonio Montresor"
+      },
+      {
+       "name": "Valentina Marchese"
+      },
+      {
+       "name": "Daniela Fusco"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ },
+ "who_tb": {
+  "citation": "WHO consolidated guidelines on tuberculosis. Module 2: screening - systematic screening for tuberculosis disease. World Health Organization, 2021",
+  "responses": {
+   "WHO consolidated guidelines on tuberculosis. Module 2: screening - systematic screening for tuberculosis disease. World Health Organization, 2021": [
+    {
+     "paperId": "https://openalex.org/W3045976532",
+     "title": "Screening tests for active pulmonary tuberculosis in children",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Bryan J. Vonasek"
+      },
+      {
+       "name": "Tara E. Ness"
+      },
+      {
+       "name": "Yemisi Takwoingi"
+      },
+      {
+       "name": "Alexander W. Kay"
+      },
+      {
+       "name": "Susanna S van Wyk"
+      },
+      {
+       "name": "Lara Ouellette"
+      },
+      {
+       "name": "Ben J. Marais"
+      },
+      {
+       "name": "Karen R Steingart"
+      },
+      {
+       "name": "Anna Maria Mandalakas"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3214090172",
+     "title": "Screening for Tuberculosis in Migrants: A Survey by the Global Tuberculosis Network",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Lia D\u2019Ambrosio"
+      },
+      {
+       "name": "Rosella Centis"
+      },
+      {
+       "name": "Claudia Caroline Dobler"
+      },
+      {
+       "name": "Simon Tiberi"
+      },
+      {
+       "name": "Alberto Matteelli"
+      },
+      {
+       "name": "Justin Timothy Denholm"
+      },
+      {
+       "name": "Dominik Zenner"
+      },
+      {
+       "name": "Seif Al-Abri"
+      },
+      {
+       "name": "Fatma Alyaquobi"
+      },
+      {
+       "name": "Marcos Abdo Arbex"
+      },
+      {
+       "name": "Evgeny Belilovskiy"
+      },
+      {
+       "name": "F.\u2013X. Blanc"
+      },
+      {
+       "name": "Sergey E. Borisov"
+      },
+      {
+       "name": "Anna Cristina Cal\u00e7ada Carvalho"
+      },
+      {
+       "name": "Jeremiah Muhwa Chakaya"
+      },
+      {
+       "name": "Nicola Cocco"
+      },
+      {
+       "name": "Luigi Ruffo Codecasa"
+      },
+      {
+       "name": "Margareth Pretti Dalcolmo"
+      },
+      {
+       "name": "Keertan U.J. Dheda"
+      },
+      {
+       "name": "Anh Tuan Dinh\u2010Xuan"
+      },
+      {
+       "name": "Susanna Esposito"
+      },
+      {
+       "name": "Jos\u00e9-Mar\u00eda Garc\u00eda-Garc\u00eda"
+      },
+      {
+       "name": "Yang Li"
+      },
+      {
+       "name": "Selene Manga"
+      },
+      {
+       "name": "Valentina Marchese"
+      },
+      {
+       "name": "Marcela Ver\u00f3nica Mu\u00f1oz-Torrico"
+      },
+      {
+       "name": "Emanuele Pontali"
+      },
+      {
+       "name": "Adri\u00e1n Rend\u00f3n"
+      },
+      {
+       "name": "Denise Rossato Silva"
+      },
+      {
+       "name": "Rupak Singla"
+      },
+      {
+       "name": "Ivan Solovi\u010d"
+      },
+      {
+       "name": "Giovanni Sotgiu"
+      },
+      {
+       "name": "Martin van den Boom"
+      },
+      {
+       "name": "Nguyen Viet Nhung"
+      },
+      {
+       "name": "Jean-Pierre Zellweger"
+      },
+      {
+       "name": "Giovanni Battista Migliori"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3196428738",
+     "title": "The definition of tuberculosis infection based on the spectrum of tuberculosis disease",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Giovanni Battista Migliori"
+      },
+      {
+       "name": "Catherine W.M. Ong"
+      },
+      {
+       "name": "Linda Petrone"
+      },
+      {
+       "name": "Lia D\u2019Ambrosio"
+      },
+      {
+       "name": "Rosella Centis"
+      },
+      {
+       "name": "Delia Goletti"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3198656422",
+     "title": "Tuberculosis screening costs and cost-effectiveness in high-risk groups: a systematic review",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Hannah Alsdurf"
+      },
+      {
+       "name": "Brianna Empringham"
+      },
+      {
+       "name": "Cecily R. Miller"
+      },
+      {
+       "name": "Alice Anne Zwerling"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3047108013",
+     "title": "Advances in Molecular Diagnosis of Tuberculosis",
+     "year": 2020,
+     "authors": [
+      {
+       "name": "Emily Lai-Ho MacLean"
+      },
+      {
+       "name": "Mikashmi Kohli"
+      },
+      {
+       "name": "Stefan Fabian Weber"
+      },
+      {
+       "name": "Anita Suresh"
+      },
+      {
+       "name": "Samuel G. Schumacher"
+      },
+      {
+       "name": "Claudia Maria Denkinger"
+      },
+      {
+       "name": "Madhukar Pai"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3213157722",
+     "title": "Tuberculosis screening among ambulatory people living with HIV: a systematic review and individual participant data meta-analysis",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Ashar Dhana"
+      },
+      {
+       "name": "Yohhei Hamada"
+      },
+      {
+       "name": "Andre P Kengne"
+      },
+      {
+       "name": "Andrew D. Kerkhoff"
+      },
+      {
+       "name": "Molebogeng X. Rangaka"
+      },
+      {
+       "name": "Tamara Kredo"
+      },
+      {
+       "name": "Annabel Baddeley"
+      },
+      {
+       "name": "Cecily Miller"
+      },
+      {
+       "name": "Satvinder Singh"
+      },
+      {
+       "name": "Yasmeen Hanifa"
+      },
+      {
+       "name": "Alison D. Grant"
+      },
+      {
+       "name": "Katherine Fielding"
+      },
+      {
+       "name": "Dissou Affolabi"
+      },
+      {
+       "name": "Corinne S Merle"
+      },
+      {
+       "name": "Ablo Prudence Wachinou"
+      },
+      {
+       "name": "Christina Yoon"
+      },
+      {
+       "name": "Adithya Cattamanchi"
+      },
+      {
+       "name": "Christopher J Hoffmann"
+      },
+      {
+       "name": "Neil Alexander Martinson"
+      },
+      {
+       "name": "Eyongetah Tabenyang Mbu"
+      },
+      {
+       "name": "Melissa S Sander"
+      },
+      {
+       "name": "Taye T Balcha"
+      },
+      {
+       "name": "Sten Skogmar"
+      },
+      {
+       "name": "Byron W P Reeve"
+      },
+      {
+       "name": "Grant Theron"
+      },
+      {
+       "name": "Gcobisa Ndlangalavu"
+      },
+      {
+       "name": "Surbhi Modi"
+      },
+      {
+       "name": "Joseph Cavanaugh"
+      },
+      {
+       "name": "Susan Swindells"
+      },
+      {
+       "name": "Richard E Chaisson"
+      },
+      {
+       "name": "Faiz Ahmad Khan"
+      },
+      {
+       "name": "Andrea A Howard"
+      },
+      {
+       "name": "Robin Wood"
+      },
+      {
+       "name": "Swe Swe Thit"
+      },
+      {
+       "name": "Mar Mar Kyi"
+      },
+      {
+       "name": "Josh Hanson"
+      },
+      {
+       "name": "Paul K Drain"
+      },
+      {
+       "name": "Adrienne E Shapiro"
+      },
+      {
+       "name": "Tendesayi Kufa"
+      },
+      {
+       "name": "Gavin Churchyard"
+      },
+      {
+       "name": "Duc T. Nguyen"
+      },
+      {
+       "name": "Edward A. Graviss"
+      },
+      {
+       "name": "Stephanie Bjerrum"
+      },
+      {
+       "name": "Isik S Johansen"
+      },
+      {
+       "name": "Jill K Gersh"
+      },
+      {
+       "name": "David J. de L. Horne"
+      },
+      {
+       "name": "Sylvia M. LaCourse"
+      },
+      {
+       "name": "Haider Abdulrazzaq Abed Al-Darraji"
+      },
+      {
+       "name": "Adeeba Kamarulzaman"
+      },
+      {
+       "name": "Russell Ryan Kempker"
+      },
+      {
+       "name": "Nestani Tukvadze"
+      },
+      {
+       "name": "David A Barr"
+      },
+      {
+       "name": "Graeme Meintjes"
+      },
+      {
+       "name": "Gary Maartens"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3141362962",
+     "title": "Guidelines on controlling latent tuberculosis infection to support tuberculosis elimination",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Pere Godoy"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3210721663",
+     "title": "Pooling Sputum Samples for Efficient Mass Tuberculosis Screening in Prisons",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Paulo C\u00e9sar Pereira dos Santos"
+      },
+      {
+       "name": "Andr\u00e9a da Silva Santos"
+      },
+      {
+       "name": "Roberto Dias de Oliveira"
+      },
+      {
+       "name": "Bruna Oliveira da Silva"
+      },
+      {
+       "name": "Thiego Ramon Soares"
+      },
+      {
+       "name": "Leonardo Mart\u00ednez"
+      },
+      {
+       "name": "Renu Verma"
+      },
+      {
+       "name": "Jason Randolph Andrews"
+      },
+      {
+       "name": "J\u00falio Croda"
+      }
+     ],
+     "source": "openalex"
+    }
+   ],
+   "Module 2: screening - systematic screening for tuberculosis disease": [
+    {
+     "paperId": "https://openalex.org/W3167725648",
+     "title": "WHO consolidated guidelines on tuberculosis Module 2: Screening \u2013 Systematic screening for tuberculosis disease",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Peter MacPherson"
+      },
+      {
+       "name": "Karen R Steingart"
+      },
+      {
+       "name": "Paul Garner"
+      },
+      {
+       "name": "Nancy Medley"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3214090172",
+     "title": "Screening for Tuberculosis in Migrants: A Survey by the Global Tuberculosis Network",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Lia D\u2019Ambrosio"
+      },
+      {
+       "name": "Rosella Centis"
+      },
+      {
+       "name": "Claudia Caroline Dobler"
+      },
+      {
+       "name": "Simon Tiberi"
+      },
+      {
+       "name": "Alberto Matteelli"
+      },
+      {
+       "name": "Justin Timothy Denholm"
+      },
+      {
+       "name": "Dominik Zenner"
+      },
+      {
+       "name": "Seif Al-Abri"
+      },
+      {
+       "name": "Fatma Alyaquobi"
+      },
+      {
+       "name": "Marcos Abdo Arbex"
+      },
+      {
+       "name": "Evgeny Belilovskiy"
+      },
+      {
+       "name": "F.\u2013X. Blanc"
+      },
+      {
+       "name": "Sergey E. Borisov"
+      },
+      {
+       "name": "Anna Cristina Cal\u00e7ada Carvalho"
+      },
+      {
+       "name": "Jeremiah Muhwa Chakaya"
+      },
+      {
+       "name": "Nicola Cocco"
+      },
+      {
+       "name": "Luigi Ruffo Codecasa"
+      },
+      {
+       "name": "Margareth Pretti Dalcolmo"
+      },
+      {
+       "name": "Keertan U.J. Dheda"
+      },
+      {
+       "name": "Anh Tuan Dinh\u2010Xuan"
+      },
+      {
+       "name": "Susanna Esposito"
+      },
+      {
+       "name": "Jos\u00e9-Mar\u00eda Garc\u00eda-Garc\u00eda"
+      },
+      {
+       "name": "Yang Li"
+      },
+      {
+       "name": "Selene Manga"
+      },
+      {
+       "name": "Valentina Marchese"
+      },
+      {
+       "name": "Marcela Ver\u00f3nica Mu\u00f1oz-Torrico"
+      },
+      {
+       "name": "Emanuele Pontali"
+      },
+      {
+       "name": "Adri\u00e1n Rend\u00f3n"
+      },
+      {
+       "name": "Denise Rossato Silva"
+      },
+      {
+       "name": "Rupak Singla"
+      },
+      {
+       "name": "Ivan Solovi\u010d"
+      },
+      {
+       "name": "Giovanni Sotgiu"
+      },
+      {
+       "name": "Martin van den Boom"
+      },
+      {
+       "name": "Nguyen Viet Nhung"
+      },
+      {
+       "name": "Jean-Pierre Zellweger"
+      },
+      {
+       "name": "Giovanni Battista Migliori"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3198656422",
+     "title": "Tuberculosis screening costs and cost-effectiveness in high-risk groups: a systematic review",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Hannah Alsdurf"
+      },
+      {
+       "name": "Brianna Empringham"
+      },
+      {
+       "name": "Cecily R. Miller"
+      },
+      {
+       "name": "Alice Anne Zwerling"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3045976532",
+     "title": "Screening tests for active pulmonary tuberculosis in children",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Bryan J. Vonasek"
+      },
+      {
+       "name": "Tara E. Ness"
+      },
+      {
+       "name": "Yemisi Takwoingi"
+      },
+      {
+       "name": "Alexander W. Kay"
+      },
+      {
+       "name": "Susanna S van Wyk"
+      },
+      {
+       "name": "Lara Ouellette"
+      },
+      {
+       "name": "Ben J. Marais"
+      },
+      {
+       "name": "Karen R Steingart"
+      },
+      {
+       "name": "Anna Maria Mandalakas"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3213157722",
+     "title": "Tuberculosis screening among ambulatory people living with HIV: a systematic review and individual participant data meta-analysis",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Ashar Dhana"
+      },
+      {
+       "name": "Yohhei Hamada"
+      },
+      {
+       "name": "Andre P Kengne"
+      },
+      {
+       "name": "Andrew D. Kerkhoff"
+      },
+      {
+       "name": "Molebogeng X. Rangaka"
+      },
+      {
+       "name": "Tamara Kredo"
+      },
+      {
+       "name": "Annabel Baddeley"
+      },
+      {
+       "name": "Cecily Miller"
+      },
+      {
+       "name": "Satvinder Singh"
+      },
+      {
+       "name": "Yasmeen Hanifa"
+      },
+      {
+       "name": "Alison D. Grant"
+      },
+      {
+       "name": "Katherine Fielding"
+      },
+      {
+       "name": "Dissou Affolabi"
+      },
+      {
+       "name": "Corinne S Merle"
+      },
+      {
+       "name": "Ablo Prudence Wachinou"
+      },
+      {
+       "name": "Christina Yoon"
+      },
+      {
+       "name": "Adithya Cattamanchi"
+      },
+      {
+       "name": "Christopher J Hoffmann"
+      },
+      {
+       "name": "Neil Alexander Martinson"
+      },
+      {
+       "name": "Eyongetah Tabenyang Mbu"
+      },
+      {
+       "name": "Melissa S Sander"
+      },
+      {
+       "name": "Taye T Balcha"
+      },
+      {
+       "name": "Sten Skogmar"
+      },
+      {
+       "name": "Byron W P Reeve"
+      },
+      {
+       "name": "Grant Theron"
+      },
+      {
+       "name": "Gcobisa Ndlangalavu"
+      },
+      {
+       "name": "Surbhi Modi"
+      },
+      {
+       "name": "Joseph Cavanaugh"
+      },
+      {
+       "name": "Susan Swindells"
+      },
+      {
+       "name": "Richard E Chaisson"
+      },
+      {
+       "name": "Faiz Ahmad Khan"
+      },
+      {
+       "name": "Andrea A Howard"
+      },
+      {
+       "name": "Robin Wood"
+      },
+      {
+       "name": "Swe Swe Thit"
+      },
+      {
+       "name": "Mar Mar Kyi"
+      },
+      {
+       "name": "Josh Hanson"
+      },
+      {
+       "name": "Paul K Drain"
+      },
+      {
+       "name": "Adrienne E Shapiro"
+      },
+      {
+       "name": "Tendesayi Kufa"
+      },
+      {
+       "name": "Gavin Churchyard"
+      },
+      {
+       "name": "Duc T. Nguyen"
+      },
+      {
+       "name": "Edward A. Graviss"
+      },
+      {
+       "name": "Stephanie Bjerrum"
+      },
+      {
+       "name": "Isik S Johansen"
+      },
+      {
+       "name": "Jill K Gersh"
+      },
+      {
+       "name": "David J. de L. Horne"
+      },
+      {
+       "name": "Sylvia M. LaCourse"
+      },
+      {
+       "name": "Haider Abdulrazzaq Abed Al-Darraji"
+      },
+      {
+       "name": "Adeeba Kamarulzaman"
+      },
+      {
+       "name": "Russell Ryan Kempker"
+      },
+      {
+       "name": "Nestani Tukvadze"
+      },
+      {
+       "name": "David A Barr"
+      },
+      {
+       "name": "Graeme Meintjes"
+      },
+      {
+       "name": "Gary Maartens"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4221114263",
+     "title": "Tuberculosis screening among HIV-positive inpatients: a systematic review and individual participant data meta-analysis",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Ashar Dhana"
+      },
+      {
+       "name": "Yohhei Hamada"
+      },
+      {
+       "name": "Andre P Kengne"
+      },
+      {
+       "name": "Andrew D. Kerkhoff"
+      },
+      {
+       "name": "Molebogeng X. Rangaka"
+      },
+      {
+       "name": "Tamara Kredo"
+      },
+      {
+       "name": "Annabel Baddeley"
+      },
+      {
+       "name": "Cecily Miller"
+      },
+      {
+       "name": "Ankur Gupta\u2010Wright"
+      },
+      {
+       "name": "Katherine Fielding"
+      },
+      {
+       "name": "Robin Wood"
+      },
+      {
+       "name": "Helena Huerga"
+      },
+      {
+       "name": "Sekai Chenai Mathabire R\u00fccker"
+      },
+      {
+       "name": "Christine Heidebrecht"
+      },
+      {
+       "name": "Douglas Wilson"
+      },
+      {
+       "name": "Stephanie Bjerrum"
+      },
+      {
+       "name": "Isik S Johansen"
+      },
+      {
+       "name": "Swe Swe Thit"
+      },
+      {
+       "name": "Mar Mar Kyi"
+      },
+      {
+       "name": "Josh Hanson"
+      },
+      {
+       "name": "David A Barr"
+      },
+      {
+       "name": "Graeme Meintjes"
+      },
+      {
+       "name": "Gary Maartens"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W3210721663",
+     "title": "Pooling Sputum Samples for Efficient Mass Tuberculosis Screening in Prisons",
+     "year": 2021,
+     "authors": [
+      {
+       "name": "Paulo C\u00e9sar Pereira dos Santos"
+      },
+      {
+       "name": "Andr\u00e9a da Silva Santos"
+      },
+      {
+       "name": "Roberto Dias de Oliveira"
+      },
+      {
+       "name": "Bruna Oliveira da Silva"
+      },
+      {
+       "name": "Thiego Ramon Soares"
+      },
+      {
+       "name": "Leonardo Mart\u00ednez"
+      },
+      {
+       "name": "Renu Verma"
+      },
+      {
+       "name": "Jason Randolph Andrews"
+      },
+      {
+       "name": "J\u00falio Croda"
+      }
+     ],
+     "source": "openalex"
+    },
+    {
+     "paperId": "https://openalex.org/W4213448116",
+     "title": "The identification of prevalent tuberculosis disease through infection screening among high-risk migrants in the Netherlands",
+     "year": 2022,
+     "authors": [
+      {
+       "name": "Ineke T. Spruijt"
+      },
+      {
+       "name": "Chantal Joren"
+      },
+      {
+       "name": "Henrieke Schimmel"
+      },
+      {
+       "name": "Frouke A Procee"
+      },
+      {
+       "name": "Yalda Alam"
+      },
+      {
+       "name": "Susan van den Hof"
+      },
+      {
+       "name": "Connie G.M. Erkens"
+      }
+     ],
+     "source": "openalex"
+    }
+   ]
+  }
+ }
+}

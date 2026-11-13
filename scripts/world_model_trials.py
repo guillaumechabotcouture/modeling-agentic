@@ -1237,7 +1237,7 @@ def main(argv=None) -> int:
 
 
 # ---------------------------------------------------------------- self-test
-def _toy_template(d, points=12):
+def _toy_template(d, points=12, wtp=True):
     """A trial template on the toy engine (the stub engine of these tests): the analysis self-tests' toy spec."""
     import yaml
     from toolkit.spec import schema
@@ -1247,7 +1247,19 @@ def _toy_template(d, points=12):
     raw["analysis"]["emulator"]["points"] = points
     with open(p, "w") as f:
         yaml.safe_dump(raw, f, sort_keys=False)
+    if wtp:
+        with open(os.path.join(d, "wtp.yaml"), "w") as f:
+            yaml.safe_dump({"outcome_type": "toy_daly"}, f)
     return d
+
+
+def _toy_wtp_table(root):
+    """The willingness-to-pay table of a toy repository: 10 USD per DALY, one DALY per toy outcome (lambda 0.1)."""
+    import yaml
+    os.makedirs(os.path.join(root, os.path.dirname(WTP_TABLE)), exist_ok=True)
+    with open(os.path.join(root, WTP_TABLE), "w") as f:
+        yaml.safe_dump({"threshold": {"usd_per_daly": 10.0, "source": "toy threshold"},
+                        "outcome_types": {"toy_daly": {"dalys": 1.0, "source": "toy: one DALY per outcome"}}}, f)
 
 
 def _toy_seed(bad=None):
@@ -1311,6 +1323,7 @@ def _toy_repo(d):
     _git("commit", "-q", "-m", "init", cwd=repo)
     _git("remote", "add", "origin", origin, cwd=repo)
     _git("push", "-q", "origin", "main", cwd=repo)
+    _toy_wtp_table(repo)
     return repo
 
 
@@ -1370,9 +1383,10 @@ def _self_test() -> int:
     def wt2():
         with tempfile.TemporaryDirectory() as d:
             _toy_template(os.path.join(d, "tpl", "toy"))
+            _toy_wtp_table(d)
             qp = os.path.join(d, "q.yaml")
             doc = {"questions": [{"id": "toy1", "question": "Which package per unit?", "engine": toy_ref,
-                                  "template": "tpl/toy", "shadow_price": 0.1, "inputs": "synthetic"}]}
+                                  "template": "tpl/toy", "inputs": "synthetic"}]}
             yaml.safe_dump(doc, open(qp, "w"))
             got = load_questions(qp, root=d, engines={toy_ref})
             ok([q["id"] for q in got] == ["toy1"], f"WT2 a questions file loads: {[q['id'] for q in got]}")
@@ -1380,7 +1394,9 @@ def _self_test() -> int:
                               "an engine that is not one of the cheap engines"),
                              (lambda q: q.update(template="tpl/none"), "a missing template"),
                              (lambda q: q.pop("question"), "no question text"),
-                             (lambda q: q.update(id="a b/c"), "an id that is not a plain name")):
+                             (lambda q: q.update(id="a b/c"), "an id that is not a plain name"),
+                             (lambda q: q.update(shadow_price=0.1), "a shadow price set in the questions file (the "
+                              "template pre-registers its willingness to pay)")):
                 bad = json.loads(json.dumps(doc))
                 mut(bad["questions"][0])
                 yaml.safe_dump(bad, open(qp, "w"))
@@ -1409,7 +1425,7 @@ def _self_test() -> int:
         for i in range(n):
             _toy_template(os.path.join(repo, "data", "tpl", f"toy{i}"))
         qs = [{"id": f"toy{i}", "question": "Which package per unit?", "engine": toy_ref,
-               "template": f"data/tpl/toy{i}", "shadow_price": 0.1, "inputs": "synthetic"} for i in range(n)]
+               "template": f"data/tpl/toy{i}", "inputs": "synthetic"} for i in range(n)]
         calls, live = [], {"llm": 0, "llm_max": 0, "eng": 0, "eng_max": 0}
         lock = threading.Lock()
 
@@ -1527,7 +1543,7 @@ def _self_test() -> int:
             n0 = len(calls)
             L2 = SpendLedger(os.path.join(troot, "spend.jsonl"), 20.0)
             qs = [{"id": f"toy{i}", "question": "Which package per unit?", "engine": toy_ref,
-                   "template": f"data/tpl/toy{i}", "shadow_price": 0.1, "inputs": "synthetic"} for i in range(3)]
+                   "template": f"data/tpl/toy{i}", "inputs": "synthetic"} for i in range(3)]
             res2 = run_trials(qs, troot, repo=repo, seed_fn=lambda *a: (_ for _ in ()).throw(AssertionError("called")),
                               ledger=L2, anchor=GitAnchor(repo, os.path.join(troot, ".wm-trials")),
                               engines={toy_ref})
@@ -1710,7 +1726,7 @@ def _self_test() -> int:
                                      "test": {"kind": "effect_direction", "package": "a",
                                               "feature": "x (calibration scale)", "direction": "negligible",
                                               "equivalence": 0.2, "adjust_for": ["eff_a"]}})
-            got = circular_tests(rd, sd, {"shadow_price": 0.1})
+            got = circular_tests(rd, sd, 0.1)
             ok(set(got) == {"A1"}, f"WT13 only a test against its own effect parameter is circular, not one that "
                                    f"adjusts for it or restricts its region to it (or a band its range is not inside): "
                                    f"{sorted(got)}")
@@ -1730,7 +1746,7 @@ def _self_test() -> int:
                f"WT13c a paper section (Results, Abstract) is a verifiable location; 'somewhere' is not: {fm}")
             before = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
             n0 = len(calls)
-            out = rebuild(troot, [{"id": "toy0", "shadow_price": 0.1}, {"id": "missing", "shadow_price": 0.1}],
+            out = rebuild(troot, [{"id": "toy0"}, {"id": "missing"}],
                           anchor_ref="refs/remotes/origin/wm-trials")
             after = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
             ok(len(calls) == n0 and out["toy0"]["status"] == "rebuilt" and out["missing"]["status"] == "skipped"
@@ -1870,6 +1886,152 @@ def _self_test() -> int:
         ok(DEFAULT_MAX_ENGINE_RUNS >= 400, f"WT16b designs of 60-100 points fit the run limit "
                                            f"({DEFAULT_MAX_ENGINE_RUNS} engine runs)")
     tryit("WT16 prompt and design size", wt16)
+
+    # Owner, 2026-11-13 (batch 3): citation matching fixed on round 2's false negatives; not found is a flag only;
+    # "not a citation" lowers confidence; willingness to pay pre-registered; prior echo and engine-blind tests apart.
+    def wt17():
+        fx = json.load(open(os.path.join(REPO, "data", "world_model_trials", "_fixtures", "citation_lookups.json")))
+        found = {k for k, v in fx.items()
+                 if any(citation_match(v["citation"], p) for rows in v["responses"].values() for p in rows)}
+        ok(found == {"baeten", "grant", "landovitz", "delany", "vanthoog", "who_ebola", "who_tb"},
+           f"WT17 round 2's false negatives match their papers in the recorded OpenAlex responses (punctuation, "
+           f"apostrophes, hyphens, subtitles, organisation authors); the anonymous 1978 note and the WHO "
+           f"schistosomiasis guideline (only papers about it are indexed) stay not found: {sorted(found)}")
+        bad = {"Celum C. Faculty Opinions recommendation", "Gatherer D. The unprecedented scale"}
+        ok(not any(citation_match(fx["who_schisto"]["citation"], p) for rows in fx["who_schisto"]["responses"].values()
+                   for p in rows), f"WT17b a paper about a guideline is not the guideline: {bad}")
+        nac = ["engine card: rate = baseline x M(package) / M(baseline coverage)",
+               "question arithmetic (coverage 0.70 vs 0.85, price 3.00 vs 4.50); no external source",
+               "data: units.csv column rv_share", "Engine card in the run's task description"]
+        real = [v["citation"] for v in fx.values()]
+        ok(all(citation_class(c) == "not_a_citation" for c in nac) and not any(citation_class(c) for c in real),
+           f"WT17c an engine card, question arithmetic or a data column is not a citation; real references are: "
+           f"{[citation_class(c) for c in nac]}")
+        seed = {"beliefs": [
+            {"id": "B1", "source_type": "literature", "confidence": "high",
+             "evidence": [{"citation": "Nobody N. An unindexed paper title here. J X 2020", "location": "Table 1"}]},
+            {"id": "B2", "source_type": "literature", "confidence": "high",
+             "evidence": [{"citation": nac[1], "location": "p. 1"}]}]}
+        out, rec = verify_citations(seed, lookup=lambda q: [], pause_s=0)
+        conf = {b["id"]: b["confidence"] for b in out["beliefs"]}
+        st = {r["belief"]: r["status"] for r in rec}
+        ok(conf == {"B1": "high", "B2": "low"} and st == {"B1": "not_found", "B2": "not_a_citation"}
+           and out["beliefs"][0]["citation_check"]["not_found"] == 1,
+           f"WT17d not found is a flag (confidence kept); not a citation lowers it to low: {conf} {st}")
+        sleeps, srcs = [], []
+
+        def s2_429(q, author=None):
+            raise RateLimited("429")
+        look = Lookup([("semantic_scholar", s2_429), ("openalex", lambda q, a=None: srcs.append("oa") or []),
+                       ("crossref", lambda q, a=None: srcs.append("cr") or
+                        [{"paperId": "doi:1", "title": "An unindexed paper title here", "year": 2020,
+                          "authors": [{"name": "N Nobody"}]}])], breaker=2)
+        p, tried = look.find("Nobody N. An unindexed paper title here. J X 2020")
+        ok(p and p["source"] == "crossref" and tried == ["semantic_scholar", "openalex", "crossref"],
+           f"WT17e sources in order: Semantic Scholar, then OpenAlex, then Crossref, until one matches: {tried}")
+
+        class Opener:
+            def __call__(self, req, timeout=None):
+                import urllib.error
+                raise urllib.error.HTTPError(req.full_url, 429, "rate", {}, None)
+        try:
+            s2_lookup("x", pause_s=0, opener=Opener(), sleep=sleeps.append)
+            ok(False, "WT17f a rate-limited Semantic Scholar backs off exponentially, then gives way")
+        except RateLimited:
+            ok(sleeps == [2, 4, 8, 16], f"WT17f a rate-limited Semantic Scholar backs off exponentially, then gives "
+                                         f"way: {sleeps}")
+    tryit("WT17 citations, round 3", wt17)
+
+    def wt18():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            t = json.load(open(os.path.join(troot, "runs", "toy0", TRIAL)))
+            ok(t["shadow_price"]["value"] == 0.1 and "toy threshold" in t["shadow_price"]["basis"],
+               f"WT18 the shadow price is the template's pre-registered willingness to pay (DALYs per outcome over the "
+               f"published threshold), recorded with its basis: {t['shadow_price']}")
+            _toy_template(os.path.join(d, "nowtp"), wtp=False)
+            lam = shadow_price_of({"template": "nowtp"}, d)
+            ok(lam["value"] is None, f"WT18b a template without a willingness to pay has no shadow price: {lam}")
+            with open(os.path.join(d, "nowtp", "wtp.yaml"), "w") as f:
+                yaml.safe_dump({"outcome_type": "unknown_outcome"}, f)
+            try:
+                shadow_price_of({"template": "nowtp"}, repo)
+                ok(False, "WT18c an outcome type missing from the willingness-to-pay table is refused")
+            except TrialError:
+                ok(True, "WT18c an outcome type missing from the willingness-to-pay table is refused")
+    tryit("WT18 willingness to pay", wt18)
+
+    def wt19():
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            tpl = os.path.join(repo, "data", "tpl", "toy0")
+            _indep_template(tpl, None)
+            qs = [{"id": "toy0", "question": "Which package per unit?", "engine": toy_ref, "template": "data/tpl/toy0",
+                   "inputs": "synthetic"}]
+            sd = _toy_seed()
+            sd["beliefs"].append({"id": "B7", "mechanism": "a's effect does not depend on cov",
+                                  "about": {"package": "a", "feature": "cov"}, "direction": "negligible",
+                                  "source_type": "literature", "confidence": "low",
+                                  "evidence": [{"citation": "Toy (2020) J Toy 1:1", "location": "Table 1"}]})
+            sd["hypotheses"] = [h for h in sd["hypotheses"] if h["id"] in ("H1", "H4")] + [
+                {"id": "E1", "belief": "B1", "claim": "a reduces by 70-90%",
+                 "test": {"kind": "effect_band", "package": "a", "band": [0.7, 0.9], "min_share": 0.7}},
+                {"id": "E2", "belief": "B7", "claim": "cov does not change a's effect",
+                 "test": {"kind": "effect_direction", "package": "a", "feature": "cov", "direction": "negligible",
+                          "equivalence": 0.2}},
+                {"id": "E3", "belief": "B3", "claim": "a's effect rises with x",
+                 "test": {"kind": "effect_direction", "package": "a", "feature": "x (calibration scale)",
+                          "direction": "increases", "scope": "marginal"}}]
+
+            def seed_fn(run_dir, ctx, feedback, cap_usd):
+                from agents.v2_tasks import TaskResult
+                with open(os.path.join(run_dir, "world_model_seed.yaml"), "w") as f:
+                    yaml.safe_dump(sd, f, sort_keys=False)
+                return TaskResult(True, {"ok": True}, 0.25, "stub")
+            troot = os.path.join(repo, "trials")
+            res = run_trials(qs, troot, repo=repo, seed_fn=seed_fn, ledger=SpendLedger(os.path.join(troot, "s.jsonl"),
+                                                                                       20.0),
+                             anchor=GitAnchor(repo, os.path.join(troot, ".wm-trials")), engines={toy_ref},
+                             citation_lookup=lambda q: [])
+            rd = os.path.join(troot, "runs", "toy0")
+            hy = {h["id"]: h for h in yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))["hypotheses"]}
+            cls = {k: (h["confrontation"].get("set_aside") or {}).get("class") for k, h in hy.items()}
+            ok(res["toy0"]["status"] == "complete" and cls == {"H1": "circular", "H4": None, "E1": "prior_echo",
+                                                               "E2": "engine_blind", "E3": None},
+               f"WT19 a band on a reduction its declared effect prior fixes is prior echo (circular when its range lies "
+               f"inside the band); a direction test on a feature the engine never reads is engine-blind: {cls}")
+            ok(hy["E2"]["status"] == "untestable" and "never reads" in str(hy["E2"]["result"]["observed"]),
+               f"WT19b an engine-blind test is untestable by this engine, not inconclusive: {hy['E2']['status']}")
+            wm = yaml.safe_load(open(os.path.join(rd, "analysis", "world_model.yaml")))
+            tr = wm["track_record"]
+            b1 = [b for b in wm["beliefs"] if b["id"] == "B1"][0]
+            ok("prior_echo" in tr and "engine_blind" in tr and "E1" not in (b1.get("confirmed_by") or []) +
+               (b1.get("contradicted_by") or []),
+               f"WT19c prior echo and engine-blind tests are counted apart and never move confidence: "
+               f"{ {k: tr.get(k) for k in ('circular', 'prior_echo', 'engine_blind')} }")
+            S = score(troot)
+            q = S["questions"]["toy0"]["hypotheses"]
+            ok(q.get("prior_echo") == 1 and q.get("engine_blind") == 1 and q.get("circular") == 1,
+               f"WT19d the summary counts circular, prior-echo and engine-blind tests: {q}")
+    tryit("WT19 prior echo and engine-blind", wt19)
+
+    def wt20():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            sp = os.path.join(rd, SEED)
+            s = yaml.safe_load(open(sp))                         # as round 2 left it: not found lowered confidence
+            s["beliefs"][0].update(confidence="low", citation_check={"confidence_claimed": "high", "found": 0,
+                                                                     "not_found": 1, "lookup_failed": 0})
+            with open(sp, "w") as f:
+                yaml.safe_dump(s, f, sort_keys=False)
+            rebuild(troot, [{"id": "toy0"}], anchor_ref="refs/remotes/origin/wm-trials", recheck_citations=True,
+                    lookup=lambda q: [])
+            b = yaml.safe_load(open(sp))["beliefs"][0]
+            ok(b["confidence"] == "high" and b["citation_check"]["not_found"] == 1,
+               f"WT20 a rebuild under the new rule restores the claimed confidence of a belief whose citation was not "
+               f"found, keeping the flag: {b['confidence']}, {b['citation_check']}")
+    tryit("WT20 recheck citations", wt20)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
