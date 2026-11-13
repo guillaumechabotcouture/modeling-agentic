@@ -1,0 +1,299 @@
+beliefs:
+- id: B1
+  mechanism: Lab-based screening (antibody, then a separate visit for laboratory RNA confirmation, then DAAs) loses
+    people at each step of the cascade (RNA confirmation, return for results, treatment start). Of the viraemic
+    people in a screened group, perhaps 35-55% start treatment, about 90% of those are cured (SVR with pangenotypic
+    DAAs is 95% or more per protocol, lower by intention to treat), and the cure arrives 3-6 months into a 24-month
+    window. The relative VPY reduction over the window is therefore roughly 0.15-0.45.
+  about:
+    package: lab
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.45
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Trickey A, Fajardo E, Alemu D, Artenie AA, Easterbrook P. Impact of hepatitis C virus point-of-care
+      RNA viral load testing compared with laboratory-based testing on uptake of RNA testing and treatment, and
+      turnaround times: a systematic review and meta-analysis. Lancet Gastroenterol Hepatol 2023'
+    location: pooled treatment-uptake proportions for the laboratory-based arm (exact table not recalled)
+  - citation: Feld JJ, et al. Sofosbuvir and Velpatasvir for HCV Genotype 1, 2, 4, 5, and 6 Infection. N Engl J
+      Med 2015
+    location: SVR12 results (ASTRAL-1), main results table
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Point-of-care RNA testing with same-day treatment start removes the separate confirmation visit and
+    the wait for results, raising treatment initiation among viraemic people (perhaps 60-80%) and cutting time to
+    treatment by weeks to months. The relative VPY reduction over the window is roughly 0.30-0.60, larger than for
+    lab.
+  about:
+    package: poc
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Trickey A, Fajardo E, Alemu D, Artenie AA, Easterbrook P. Impact of hepatitis C virus point-of-care
+      RNA viral load testing compared with laboratory-based testing on uptake of RNA testing and treatment, and
+      turnaround times: a systematic review and meta-analysis. Lancet Gastroenterol Hepatol 2023'
+    location: pooled treatment uptake and time to treatment, POC versus laboratory (exact table not recalled)
+  - citation: World Health Organization. Updated recommendations on simplified service delivery and diagnostics
+      for hepatitis C infection. 2022
+    location: recommendation on point-of-care HCV RNA viral load testing (section not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Over a two-year window the relative reduction is a property of the cascade, not of how common infection
+    is: treatment-as-prevention feedback on new infections is small within 2 years, and the engine applies one relative
+    effect per package to each unit''s baseline. The relative reduction therefore does not change materially with
+    prevalence (the absolute benefit does).'
+  about:
+    package: poc
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Martin NK, Vickerman P, Grebely J, et al. Hepatitis C virus treatment for prevention among people
+      who inject drugs: Modeling treatment scale-up in the age of direct-acting antivirals. Hepatology 2013'
+    location: projected prevalence reductions emerge over 10-15 years, not 2 (figures; exact values not recalled)
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Where viraemic prevalence is high (PWID and prison groups, roughly above 10%), the extra VPY that poc
+    averts per person screened (p x 2 x (r_poc - r_lab), about 0.02-0.06) is worth more than the extra US$15 at
+    the budget's shadow price, so poc beats lab there.
+  about:
+    pair:
+    - poc
+    - lab
+    feature: inc
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.1
+    - 0.1916
+  source_type: literature
+  evidence:
+  - citation: 'Trickey A, Fajardo E, Alemu D, Artenie AA, Easterbrook P. Impact of hepatitis C virus point-of-care
+      RNA viral load testing compared with laboratory-based testing on uptake of RNA testing and treatment, and
+      turnaround times: a systematic review and meta-analysis. Lancet Gastroenterol Hepatol 2023'
+    location: difference in treatment uptake, POC versus laboratory (approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'The lab/poc choice flips along prevalence: below some prevalence the incremental gain of poc no longer
+    pays for the incremental US$15 and lab wins. I put the flip roughly at a viraemic prevalence of 3-12%. Its location
+    scales with lambda / (r_poc - r_lab), and both are unknown, so this location is a guess.'
+  about:
+    pair:
+    - poc
+    - lab
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.03
+    - 0.12
+  source_type: literature
+  evidence:
+  - citation: 'Trickey A, Fajardo E, Alemu D, Artenie AA, Easterbrook P. Impact of hepatitis C virus point-of-care
+      RNA viral load testing compared with laboratory-based testing on uptake of RNA testing and treatment, and
+      turnaround times: a systematic review and meta-analysis. Lancet Gastroenterol Hepatol 2023'
+    location: uptake difference (approximate); the flip location is reasoning, not a reported value
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: In low-prevalence general-population groups (viraemic prevalence around 2% or less), screening everyone
+    yields about p x 2 x r_lab, below 0.01 VPY per person for US$30. At a binding budget whose marginal use is lab
+    in moderate-prevalence groups, that is worth less than its cost, so none beats lab there.
+  about:
+    pair:
+    - lab
+    - none
+    feature: inc
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.0051
+    - 0.02
+  source_type: literature
+  evidence:
+  - citation: World Health Organization. Updated recommendations on simplified service delivery and diagnostics
+      for hepatitis C infection. 2022
+    location: focused testing in high-prevalence populations versus general-population testing (section not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B7
+  mechanism: Expected linkage to care multiplies the cascade, and it matters more for lab (two contact points to
+    lose people) than for poc. In reality the relative reduction of lab should rise with linkage. The engine card
+    lists only baseline_rate as a unit attribute, so the engine may not carry this mechanism at all. If it does
+    not, the plan will ignore a mechanism that moves the lab/poc choice in poorly linked groups.
+  about:
+    package: lab
+    feature: linkage
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Trickey A, Fajardo E, Alemu D, Artenie AA, Easterbrook P. Impact of hepatitis C virus point-of-care
+      RNA viral load testing compared with laboratory-based testing on uptake of RNA testing and treatment, and
+      turnaround times: a systematic review and meta-analysis. Lancet Gastroenterol Hepatol 2023'
+    location: loss to follow-up between antibody and RNA testing in laboratory pathways (approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The relative VPY reduction of lab falls in 0.15-0.45 at 80% or more of usable points.
+  test:
+    kind: effect_band
+    package: lab
+    band:
+    - 0.15
+    - 0.45
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: The relative VPY reduction of poc falls in 0.30-0.60 at 80% or more of usable points.
+  test:
+    kind: effect_band
+    package: poc
+    band:
+    - 0.3
+    - 0.6
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: 'The relative reduction of poc does not change with prevalence: |rho| stays below 0.2.'
+  test:
+    kind: effect_direction
+    package: poc
+    feature: inc
+    direction: negligible
+    equivalence: 0.2
+- id: H4
+  belief: B4
+  claim: At viraemic prevalence 0.10-0.19, poc has higher net benefit than lab at the shadow price at 70% or more
+    of usable points.
+  test:
+    kind: paired_sign
+    a: poc
+    b: lab
+    feature: inc
+    range:
+    - 0.1
+    - 0.1916
+    sign: positive
+    min_share: 0.7
+- id: H5
+  belief: B5
+  claim: The poc/lab transition along prevalence lies within 0.03-0.12.
+  test:
+    kind: flip_in
+    a: poc
+    b: lab
+    feature: inc
+    range:
+    - 0.03
+    - 0.12
+- id: H6
+  belief: B6
+  claim: At viraemic prevalence 0.005-0.02, none has higher net benefit than lab (lab minus none is negative) at
+    70% or more of usable points.
+  test:
+    kind: paired_sign
+    a: lab
+    b: none
+    feature: inc
+    range:
+    - 0.0051
+    - 0.02
+    sign: negative
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: The relative reduction of lab rises with expected linkage to care (rho interval excludes 0, positive).
+    A refutation would mean the engine does not carry linkage.
+  test:
+    kind: effect_direction
+    package: lab
+    feature: linkage
+    direction: increases
+open_questions:
+- id: Q1
+  question: How large is the gap r_poc - r_lab in these groups? It sets the prevalence at which poc pays for its
+    extra US$15, and a gap under about 0.1 would leave lab (or none) nearly everywhere.
+  beliefs:
+  - B2
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Does the engine modulate effects by linkage (or group_code)? If not, a poorly linked group gets the
+    same lab effect as a well linked one, which overstates lab exactly where poc's advantage is largest.
+  beliefs:
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Reinfection among people who inject drugs after cure erodes VPY averted within 2 years. Is it represented,
+    and does it differ by group_code?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q4
+  question: Is the cost per person screened charged on the whole group (pop) or on the people actually reached?
+    Partial reach would cut both cost and benefit, and the per-person ranking by prevalence would hold only if reach
+    is similar across groups.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q5
+  question: Is unit prevalence ('inc') measured comparably across groups (sero-surveys in prisons and PWID versus
+    modelled district estimates)? Its error ranks the groups.
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: true
