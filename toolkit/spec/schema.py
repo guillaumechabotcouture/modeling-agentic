@@ -440,8 +440,10 @@ class Spec:
                     if _isnum(m):
                         lo[it_id] = min(lo.get(it_id, 1.0), float(m))
         comp_cost = {}
-        for u in self.units():
-            uid = str(u[self.uid])
+        from toolkit.analysis import decision_tests as DT     # #228 r1 P2-3: and over every unit_attribute arm's table
+        tables = [self.units()] + DT.arm_tables(self)
+        for n_, u in ((n_, u) for n_, rows in enumerate(tables) for u in rows):
+            uid = f"{n_}:{u[self.uid]}"
             comp_cost[uid] = {}
             for it in items:
                 comp_cost[uid][it["component"]] = (comp_cost[uid].get(it["component"], 0.0)
@@ -1414,7 +1416,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                 bad.append(f"decision test {i}: values (envelopes in USD)")
         elif t == "unit_attribute":      # the runner's own planner (column, units, domain, identity), at sign-off
             from toolkit.analysis import decision_tests as DT
-            pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"))
+            emu = an.get("evaluation") == "emulator"      # #228 r1 P2-5: the design box the pre-run plan reads
+            pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"), DT.design_features_box(s) if emu else None)
             if pl["status"] != "runs":
                 bad.append(f"decision test {i}: {pl['why']}")
         elif t == "cost_items":

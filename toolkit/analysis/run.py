@@ -417,7 +417,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         [arts["point"], arts["uncertainty"]] + eng_files
         + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
         # F6: a unit_attribute test's set_from table is an input (each modified table's sha256 is in its record)
-        + sorted({os.path.join(run_dir, f) for x in dts for f in ((x.get("unit_attribute") or {}).get("inputs") or {})}))
+        + DT.artifact_inputs(dts, run_dir))
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
