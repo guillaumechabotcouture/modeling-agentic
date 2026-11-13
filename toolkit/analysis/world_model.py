@@ -508,7 +508,8 @@ def flip_along(sw, a, b, f, mask=None):
 def flip(sw, a, b):
     """The a/b comparison along every feature; `along` displays at most flips_max located flips."""
     if sw.lam is None:
-        return {"a": a, "b": b, "status": "no_shadow_price", "along": []}
+        return {"a": a, "b": b, "status": "no_shadow_price", "along": [],     # attempted: in the family at p = 1
+                "_all": [{"feature": f, "status": "no_shadow_price"} for f in sorted(sw.features)]}
     d, tol = sw.diff(a, b)
     fl = [{k: v for k, v in flip_along(sw, a, b, f).items() if k != "points"} for f in sorted(sw.features)]
     return {"a": a, "b": b, "measure": "net_benefit", "lambda": sw.lam, "n": len(d), "share_a": _r(np.mean(d > tol)),
@@ -708,13 +709,15 @@ def _scope(sw, t, st, obs, m):
 
 
 def _constrained(t, b):
-    """The test as checked: its belief's conditions intersected into its `where` (a flip belief's condition on the
-    test's own feature locates the flip, so it is not applied)."""
+    """The test as checked: its belief's conditions intersected into its `where`. A flip belief's condition on the
+    test's own feature locates the flip: it is not a sampling region, and for a flip_in test it narrows the claimed
+    flip range (so the belief's location constrains the verdict and the test's identity)."""
     conds = {}
     for c in (b or {}).get("conditions") or []:          # repeated conditions on one feature intersect
         conds = _intersect(conds, c["feature"], c["range"])
-    if (b or {}).get("direction") == "flips":
-        conds.pop(t.get("feature"), None)
+    loc = conds.pop(t.get("feature"), None) if (b or {}).get("direction") == "flips" else None
+    if loc and t["kind"] == "flip_in":
+        t = dict(t, range=[max(t["range"][0], loc[0]), min(t["range"][1], loc[1])])
     if not conds:
         return t
     w = dict(t.get("where") or {})
@@ -734,11 +737,19 @@ def _canon(v):
 
 
 def canonical_test(t, belief=None):
-    """The test exactly as checked: its belief's conditions applied, defaults resolved (scope), an empty `where`
-    dropped and numbers as floats. Its sha256 is the test's identity in the ledger and the track record."""
+    """The test exactly as checked: its belief's conditions applied, defaults resolved (scope), a pair in name
+    order (a paired test's sign mirrored with it), category lists as sorted sets, an empty `where` dropped and
+    numbers as floats. Its sha256 is the test's identity in the ledger and the track record."""
     c = dict(_constrained(t, belief))
     if c["kind"] in ("effect_direction", "flip_in"):
         c.setdefault("scope", "conditional")
+    if c["kind"] in ("paired_sign", "flip_in") and str(c["a"]) > str(c["b"]):    # a test and its mirror: one id
+        c["a"], c["b"] = c["b"], c["a"]
+        if c["kind"] == "paired_sign":
+            c["sign"] = "negative" if c["sign"] == "positive" else "positive"
+    if isinstance(c.get("where"), dict):                 # category lists are sets
+        c["where"] = {k: sorted(set(v)) if isinstance(v, list) and v and all(isinstance(e, str) for e in v) else v
+                      for k, v in c["where"].items()}
     if not c.get("where"):
         c.pop("where", None)
     return {k: _canon(v) for k, v in sorted(c.items()) if v is not None}
@@ -1196,6 +1207,8 @@ def _manifest_problems(run_dir):
     bad += [f"analysis/batch.yaml does not record the current {rel}" for rel in
             ("analysis/batch/design.json", "analysis/batch/results.jsonl")
             if inp.get(rel) is None or inp.get(rel) != sha256(os.path.join(run_dir, rel))]
+    if m.get("settings_sha256") != sha256(os.path.join(run_dir, "analysis_settings.yaml")):
+        bad.append("analysis_settings.yaml was added, changed or removed since the analysis (settings_sha256)")
     return bad
 
 
@@ -1213,15 +1226,17 @@ def point_doc(run_dir, ident):
     bad = _manifest_problems(run_dir)
     bad += [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
     bad += [] if doc["data"].get("engine_identity") == ident else ["the engine identity"]
-    bad += _input_problems(run_dir, rel, doc, set())
+    bad += _input_problems(run_dir, rel, doc, set(), {"spec_sha256": doc.get("spec_sha256"),
+                                                      "engine": doc.get("engine")})
     if bad:
         raise WorldModelError(f"{rel} is not bound to this run: {bad} differ from what it was computed with")
     return doc
 
 
-def _input_problems(run_dir, rel, doc, seen):
+def _input_problems(run_dir, rel, doc, seen, root=None):
     """What does not verify in an artifact's recorded inputs, recursively through the harness artifacts among them:
-    each must exist with its recorded sha256, and the artifact must record at least one."""
+    each must exist with its recorded sha256, the artifact must record at least one, and every descendant harness
+    artifact must carry the root's spec sha256 and (when both record one) its engine."""
     import yaml
     from toolkit.analysis.artifacts import sha256
     inp = doc.get("inputs") if isinstance(doc, dict) else None
@@ -1241,7 +1256,13 @@ def _input_problems(run_dir, rel, doc, seen):
             except (OSError, yaml.YAMLError):
                 sub = None
             if isinstance(sub, dict) and ("inputs" in sub or str(sub.get("schema") or "").startswith("analysis.")):
-                bad += _input_problems(run_dir, q_rel, sub, seen)      # a harness artifact must record its inputs
+                if str(sub.get("schema") or "").startswith("analysis.") and root:
+                    if sub.get("spec_sha256") != root.get("spec_sha256"):
+                        bad.append(f"{q_rel}: computed under another spec")
+                    if sub.get("engine") is not None and root.get("engine") is not None and \
+                            sub["engine"] != root["engine"]:
+                        bad.append(f"{q_rel}: computed by another engine")
+                bad += _input_problems(run_dir, q_rel, sub, seen, root)   # a harness artifact must record its inputs
     return bad
 
 
@@ -1463,7 +1484,8 @@ def _bind(d):
     yaml.safe_dump({"written_at": EVIDENCE_TIME, "inputs": {
         f"analysis/batch/{n}": sha256(os.path.join(b, n)) for n in ("design.json", "results.jsonl")}},
         open(os.path.join(d, "analysis", "batch.yaml"), "w"))
-    json.dump({"complete": True, "status": "complete", "settings_sha256": sha256(os.path.join(d, "analysis_settings.yaml")),
+    json.dump({"complete": True, "status": "complete",
+               "settings_sha256": sha256(os.path.join(d, "analysis_settings.yaml")),
                "artifacts": {rel: {"sha256": sha256(os.path.join(d, rel))}
                              for rel in ("analysis/point.yaml", "analysis/batch.yaml")}},
               open(os.path.join(d, "analysis", "manifest.json"), "w"))
