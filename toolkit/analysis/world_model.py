@@ -25,8 +25,9 @@ Track record. Each confrontation is identified by the sha256 of its canonical te
 floats, the belief's conditions applied; unknown test fields are refused) and the sha256 of exactly the evidence it
 read: its points, the features of its region, the outcomes of its packages and the comparator, and for a paired test
 their costs, the shadow price and the discount (for a plan test, the matching units' plan and filter values). Its
-evidence time is the evidence's own first record: the batch artifact (analysis/batch.yaml written_at) bound to the
-results' sha256, or point.yaml's written_at for a plan test; without one, it is post hoc. Only confrontations
+evidence time is the earliest first-seen record of the results' sha256 (analysis/batch/first_seen.jsonl, appended
+when a batch first appears and never refreshed on reuse; written by record_first_seen()), or point.yaml's
+written_at for a plan test; without one, it is post hoc. Only confrontations
 re-derived from this run's artifacts are scored; an imported history entry that this build does not re-derive with
 the same identity is listed as unverified and never scored. A replay or an alias counts once and moves no
 confidence; counters are recomputed from the history, never taken from the seed (`reconciled` records a
@@ -143,7 +144,8 @@ LEDGER = "analysis/hypotheses_registry.jsonl"
 SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
             "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3,
             "fdr_q": 0.05, "correlated": 0.5, "tie_share_max": 0.5,
-            "alpha": 0.05, "perm_n_max": 50, "perm_resamples": 20000, "perm_seed": 0, "perm_minority_min": 10}
+            "alpha": 0.05, "perm_n_max": 50, "perm_resamples": 20000, "perm_seed": 0, "perm_minority_min": 10,
+            "exhausted_rtol": 1e-10}
 
 
 class WorldModelError(ValueError):
@@ -737,9 +739,15 @@ def partial_direction(x, y, covs):
     if n < max(SETTINGS["perm_n_max"], k + 10):
         return {"direction": "inconclusive", "n": n, "why": f"{n} points: too few for an adjusted estimate"}
     Z = np.column_stack([np.ones(n)] + [rankdata(c) for c in covs.T])
-    res = [v - Z @ np.linalg.lstsq(Z, v, rcond=None)[0] for v in (rankdata(x), rankdata(y))]
-    if min(float(np.std(v)) for v in res) == 0:
-        return {"direction": "inconclusive", "n": n, "why": "no variation left after adjustment"}
+    rx, ry = rankdata(x), rankdata(y)
+    if np.ptp(rx) == 0 or np.ptp(ry) == 0:
+        return {"direction": "inconclusive", "n": n, "why": "a constant feature or response"}
+    if np.linalg.matrix_rank(Z) < Z.shape[1]:
+        return {"direction": "inconclusive", "n": n, "why": "rank-deficient covariates"}
+    res = [v - Z @ np.linalg.lstsq(Z, v, rcond=None)[0] for v in (rx, ry)]
+    if any(float(np.var(r)) <= SETTINGS["exhausted_rtol"] * float(np.var(v)) for r, v in zip(res, (rx, ry))):
+        return {"direction": "inconclusive", "n": n, "why": "no variation left after adjustment (the covariates "
+                                                            "explain the feature or the response)"}
     rho = float(np.corrcoef(*res)[0, 1])
     zr, se = math.atanh(max(min(rho, 1 - 1e-12), -1 + 1e-12)), 1 / math.sqrt(n - 3 - k)
     lo, hi = math.tanh(zr - SETTINGS["z"] * se), math.tanh(zr + SETTINGS["z"] * se)
@@ -816,7 +824,7 @@ def evidence_of(t, ctx):
             "comparator": sw.burden[m].tolist(), "outcomes": {q: sw.y[q][m].tolist() for q in pk}}
     if k in ("paired_sign", "flip_in"):
         part.update(costs={q: (sw.cost[q][m] - sw.cost[sw.comparator][m]).tolist() for q in pk}, lam=sw.lam,
-                    dfac=sw.dfac)
+                    dfac=sw.dfac, tie_tolerance=sw.diff(pk[0], pk[1])[1] if sw.lam is not None else None)
     return _sha(part)
 
 
@@ -1341,19 +1349,57 @@ def _input_problems(run_dir, rel, doc, seen, root=None):
     return bad
 
 
+FIRST_SEEN = "analysis/batch/first_seen.jsonl"
+
+
+def _first_seen(run_dir):
+    """{results sha256: earliest first-seen time} from the append-only first-seen record; a malformed line fails."""
+    out = {}
+    path = os.path.join(run_dir, FIRST_SEEN)
+    if not os.path.isfile(path):
+        return out
+    for k, line in enumerate(open(path)):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+            h, at = e["results_sha256"], e["first_seen"]
+        except (ValueError, KeyError, TypeError):
+            raise WorldModelError(f"{FIRST_SEEN} line {k + 1}: malformed")
+        if _when(at) is None:
+            raise WorldModelError(f"{FIRST_SEEN} line {k + 1}: first_seen is not an ISO 8601 time with a zone")
+        if h not in out or _when(at) < _when(out[h]):
+            out[h] = at
+    return out
+
+
+def record_first_seen(run_dir, rel="analysis/batch/results.jsonl", at=None):
+    """The first time these results (by sha256) appeared: appended once when a batch first appears and never
+    refreshed when a later analysis reuses the same results. For the batch producer to call when it publishes a
+    batch (wiring it into toolkit/analysis/batch.py is a separate change); `at` is for tests."""
+    import datetime as dt
+    from toolkit.analysis.artifacts import _safe_io, sha256
+    h = sha256(os.path.join(run_dir, rel))
+    if h is None:
+        raise WorldModelError(f"record_first_seen: {rel} is missing")
+    seen = _first_seen(run_dir)
+    if h in seen:
+        return seen[h]
+    at = at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    _safe_io().write_nofollow(run_dir, FIRST_SEEN, (json.dumps({"results_sha256": h, "first_seen": at, "path": rel},
+                                                               sort_keys=True) + "\n").encode(), append=True)
+    return at
+
+
 def evidence_time(run_dir, rel="analysis/batch/results.jsonl"):
-    """(time, source) when the batch results first existed: analysis/batch.yaml's written_at when that artifact
-    records the results' current sha256 among its inputs; else (None, why), and every test on them is post hoc."""
-    import yaml
+    """(time, source) when these batch results first existed: the earliest first-seen record of their sha256
+    (analysis/batch/first_seen.jsonl), which a rerun on cached results does not refresh. Without one (None, why):
+    every test on them is post hoc. batch.yaml's written_at is not used (an analysis rewrites it on every run)."""
     from toolkit.analysis.artifacts import sha256
-    try:
-        doc = yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml")))
-    except (OSError, yaml.YAMLError):
-        return None, "no analysis/batch.yaml record of the results"
-    if not isinstance(doc, dict) or (doc.get("inputs") or {}).get(rel) != sha256(os.path.join(run_dir, rel)) or \
-            _when(doc.get("written_at")) is None:
-        return None, "analysis/batch.yaml does not record these results (sha256) with a time"
-    return doc["written_at"], "analysis/batch.yaml written_at, bound to the results' sha256"
+    at = _first_seen(run_dir).get(sha256(os.path.join(run_dir, rel)))
+    if at is None:
+        return None, f"no first-seen record of these results ({FIRST_SEEN}): post hoc"
+    return at, f"{FIRST_SEEN}: the first record of the results' sha256"
 
 
 def consumed_inputs(spec, run_dir):
@@ -2424,10 +2470,13 @@ def _self_test() -> int:
             ok(evidence_time(d)[0] is None, "WM65 an analysis finish time is not when the evidence first existed")
             yaml.safe_dump({"written_at": "2026-01-01T00:00:00+00:00", "inputs": {
                 "analysis/batch/results.jsonl": sha256(res)}}, open(os.path.join(d, "analysis", "batch.yaml"), "w"))
-            ok(evidence_time(d)[0] == "2026-01-01T00:00:00+00:00", f"WM65b the batch record bound to the results "
-                                                                     f"dates them: {evidence_time(d)}")
+            ok(evidence_time(d)[0] is None, "WM65b batch.yaml's written_at alone does not date the results (an "
+                                            "analysis rewrites it on every run)")
+            record_first_seen(d, at="2026-01-01T00:00:00+00:00")
+            ok(evidence_time(d)[0] == "2026-01-01T00:00:00+00:00", f"WM65b' the first-seen record dates them: "
+                                                                     f"{evidence_time(d)}")
             open(res, "w").write("{}\n{}\n")
-            ok(evidence_time(d)[0] is None, "WM65c a batch record bound to other results does not date these")
+            ok(evidence_time(d)[0] is None, "WM65c a first-seen record of other results does not date these")
     tryit("WM65 evidence time", wm65)
 
     def wm66():
