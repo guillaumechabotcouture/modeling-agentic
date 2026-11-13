@@ -217,7 +217,9 @@ decision still needs that engine, declare a departure for the owner to sign, nev
          decision_test: <an analysis.decision_tests id that moves the effect over the trial's range>}
       # or, instead of decision_test: no_decision_test_because: "<why no test can be computed>"
 
-The report declares each signed departure as a limitation.
+The report declares each signed departure as a limitation. A held-out benchmark is validation: its result
+stands, and no parameter is ever tuned toward it. A fit target out of band means the engine's fit failed; it
+gates the same way.
 
 ## What not to do
 

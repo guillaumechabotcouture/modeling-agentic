@@ -41,6 +41,11 @@ if ROOT not in sys.path:
 
 FILE = "benchmark_coverage.yaml"
 ESTIMANDS = ("effect_vs_none", "effect_vs_component", "durability", "interaction", "cost_per_outcome")
+# Both roles gate. A held-out benchmark is validation: its result stands and no parameter is tuned toward it
+# (toolkit/spec/engine_parameters.py refuses such values). A fit target out of band means the engine's fit failed.
+ROLE_MEANING = {"held_out": "held-out validation; the result stands, no parameter is tuned toward it",
+                "fit": "a fit target the fitted engine misses (the fit failed)",
+                "unknown": "role not recorded"}
 DEPARTURE_FIELDS = ("engine", "benchmark", "reason", "decision_test", "no_decision_test_because")
 
 
@@ -148,17 +153,19 @@ def gate(cov: dict | None, cov_problems: list, card, needs_components: dict, rec
         if st == "in_band":
             continue
         comps = [f"{c}={v}" for c, v in hits]
+        role = r.get("role", "unknown")
         dep = deps.get(i)
         if dep is not None and departures_status in ("signed", "proposed"):
-            out["departures"].append(dict(dep, status=departures_status, benchmark_status=st, components=comps))
+            out["departures"].append(dict(dep, status=departures_status, benchmark_status=st, role=role,
+                                          components=comps))
             continue
-        out["blocking"].append(i)
+        out["blocking"].append({"id": i, "role": role, "status": st})
         note = {"unsigned": "; the spec's departure for it is not signed (or the spec changed since sign-off)"}.get(
             departures_status, "") if dep is not None else ""
         out["why_not"].append(
-            f"benchmark {i} ({r.get('metric', '')}) covers {', '.join(comps)} and is {st} (computed "
-            f"{r.get('computed')}, band {r.get('band')}): the engine is not eligible for it without an owner-signed "
-            f"engine_departures entry{note}")
+            f"benchmark {i} ({r.get('metric', '')}; role {role}: {ROLE_MEANING.get(role, ROLE_MEANING['unknown'])}) "
+            f"covers {', '.join(comps)} and is {st} (computed {r.get('computed')}, band {r.get('band')}): the engine is "
+            f"not eligible for it without an owner-signed engine_departures entry{note}")
     return out
 
 
@@ -210,6 +217,8 @@ def sheet_lines(raw: dict, candidates: list | None) -> list[str]:
         seen = rows.get((d.get("engine"), d.get("benchmark")))
         what = (f" Covers {', '.join(seen['components'])}; the record shows {seen['benchmark_status']}." if seen
                 else " No candidate engine's record needs it.")
+        if seen:
+            what += f" Role: {ROLE_MEANING.get(seen.get('role'), ROLE_MEANING['unknown'])}."
         out.append(f"- **{d.get('benchmark')}** (engine {d.get('engine')}): {d.get('reason')} ({_test_of(d)}).{what}")
     return out + [""]
 
@@ -221,7 +230,8 @@ def results_lines(raw: dict) -> list[str]:
         return []
     return (["## Declared engine departures (signed in the spec)", "",
              "The engine was used for components whose benchmark against the trial is not in band; the owner "
-             "signed each departure:", ""]
+             "signed each departure. A held-out benchmark's result stands as validation of the engine (no parameter "
+             "was tuned toward it); a fit target out of band means the engine's fit missed it:", ""]
             + [f"- {d.get('benchmark')} (engine {d.get('engine')}): {d.get('reason')} ({_test_of(d)})." for d in deps]
             + [""])
 
@@ -268,7 +278,7 @@ def _self_test() -> int:
     rec = lambda: ([{"id": "I", "status": "out_of_band"}], None)  # noqa: E731
     ok(gate(cov, [], Card, {"p": [1]}, rec, [], "unsigned")["why_not"] == [],
        "BC5 an interaction benchmark (match all) does not apply when only one of its components is used")
-    ok(gate(cov, [], Card, {"p": [1], "q": [1]}, rec, [], "unsigned")["blocking"] == ["I"],
+    ok([b["id"] for b in gate(cov, [], Card, {"p": [1], "q": [1]}, rec, [], "unsigned")["blocking"]] == ["I"],
        "BC6 it applies when both are used")
     ok(gate(None, [], Card, {"p": [1]}, rec, [], "unsigned")["why_not"] == [],
        "BC7 an engine with no benchmarks needs no coverage file")

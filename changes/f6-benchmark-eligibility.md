@@ -16,4 +16,6 @@ card's); a record from another engine identity counts for nothing. A spec-level 
 benchmark, reason, and a decision test or the reason none is possible) makes the engine eligible only once the
 owner has signed the spec (the pre-sign check counts it as proposed, including for a spec that names its engine);
 it is validated by the schema, shown on the sign-off sheet, recorded in `engine_choice.json` and declared in
-`results.md`. Self-tests G1-G12 (analysis_backend), BC1-BC8 (`toolkit/engines/benchmark_coverage.py`).
+`results.md`. Both benchmark roles gate: a held-out benchmark stands as validation (never a fitting target) and a
+fit target out of band means the fit failed; each failing benchmark's role is recorded in `why_not`,
+`benchmarks_not_in_band` and the departure. Self-tests G1-G12 (analysis_backend), BC1-BC8 (`toolkit/engines/benchmark_coverage.py`).

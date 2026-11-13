@@ -223,6 +223,7 @@ def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> li
         rows.append({"ref": ref, "config": config, "name": card.name, "version": card.version, "eligible": not why,
                      "why_not": why, "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or []),
                      "departures": bg.get("departures") or [], "benchmark_record": bg.get("record"),
+                     "benchmarks_not_in_band": bg.get("blocking") or [],
                      "components_without_benchmark": bg.get("uncovered") or {}})
     return rows
 
@@ -762,7 +763,7 @@ def _self_test_benchmark_gate(ok) -> None:
            "benchmarks": {"T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none"},
                           "T2": {"covers": {"b": [1]}, "estimand": "effect_vs_none"},
                           "T3": {"covers": {}, "covers_none_because": "the baseline burden, not a component"}}}
-    rows_in = [{"id": "T1", "metric": "a vs none", "status": "out_of_band", "computed": 0.3, "band": [0.5, 0.7]},
+    rows_in = [{"id": "T1", "metric": "a vs none", "role": "held_out", "status": "out_of_band", "computed": 0.3, "band": [0.5, 0.7]},
                {"id": "T2", "metric": "b vs none", "status": "in_band", "computed": 0.6, "band": [0.5, 0.7]},
                {"id": "T3", "metric": "baseline", "status": "out_of_band", "computed": 9, "band": [1, 2]}]
     with tempfile.TemporaryDirectory() as d:
@@ -778,7 +779,9 @@ def _self_test_benchmark_gate(ok) -> None:
         spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}}}
         spec_b = {"options": {"engine_map": {"b": {"b": 1}}}}
         r = eligible_engines(spec_ab, entry)[0]
-        ok(not r["eligible"] and any("T1" in w and "out_of_band" in w for w in r["why_not"])
+        ok(not r["eligible"] and any("T1" in w and "out_of_band" in w and "held-out validation" in w
+                                     for w in r["why_not"])
+           and r["benchmarks_not_in_band"] == [{"id": "T1", "role": "held_out", "status": "out_of_band"}]
            and not any("T3" in w for w in r["why_not"]),
            f"G1 an out-of-band benchmark covering a used component makes the engine ineligible, naming it ({r['why_not']})")
         r = eligible_engines(spec_b, entry)[0]
@@ -801,12 +804,19 @@ def _self_test_benchmark_gate(ok) -> None:
         signoff.sign(run, "owner")
         r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
         ok(r["eligible"] and r["departures"] == [dict(dep, status="signed", benchmark_status="out_of_band",
-                                                       components=["a=1"])],
+                                                       role="held_out", components=["a=1"])],
            f"G5 an owner-signed departure makes the engine eligible and is recorded on the row ({r.get('departures')})")
         rec = engine_choice_record(r["ref"], "test", [r])
-        ok(rec.get("engine_departures") == r["departures"], "G5b the departure is recorded in engine_choice.json")
+        ok(rec.get("engine_departures") == r["departures"] and rec["engine_departures"][0]["role"] == "held_out",
+           "G5b the departure is recorded in engine_choice.json with the benchmark's role")
+        write_results([dict(rows_in[0], role="fit"), rows_in[1], rows_in[2]])
+        r2 = eligible_engines(spec_ab, entry)[0]
+        ok(not r2["eligible"] and any("the fit failed" in w for w in r2["why_not"]),
+           "G5d a fit-target benchmark out of band also makes the engine ineligible (its fit failed)")
+        write_results(rows_in)
         sh = signoff.sheet(run, candidates=[r])
         ok("## Engine departures from benchmark evidence" in sh and "T1" in sh and "DT1" in sh
+           and "the result stands" in sh
            and "the trial measured a different net type" in sh,
            "G5c the sign-off sheet lists the departure with its reason and decision test")
         with open(p, "a") as f:
