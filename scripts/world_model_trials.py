@@ -2184,6 +2184,26 @@ def _self_test() -> int:
                "WT14d without a declaration the design is unchanged (no independent_features key)")
     tryit("WT14 independent features", wt14)
 
+    def wt14e():
+        # batch 3, ebola_tracing_threshold H8: pop and seed_share were drawn from separate streams, yet their realized
+        # rank correlation over the 24 units was 0.82, so the "independent" pop stood in for seed_share
+        from toolkit.analysis import batch as B
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d:
+            _indep_template(d, {"features": ["cov", "tgt"], "generator": "generate_units.py", "basis": "b"})
+            p = os.path.join(d, "decision_spec.yaml")
+            raw = yaml.safe_load(open(p))
+            raw["analysis"]["emulator"]["features"] = ["cov", "tgt"]      # tgt is a function of x, as cov nearly is
+            with open(p, "w") as f:
+                yaml.safe_dump(raw, f, sort_keys=False)
+            try:
+                B.design(schema.load(p))
+                ok(False, "WT14e declared features that are correlated in the realized units table are refused")
+            except ValueError as e:
+                ok("correlat" in str(e), f"WT14e declared features that are correlated in the realized units table are "
+                                         f"refused: {str(e)[:160]}")
+    tryit("WT14e realized independence", wt14e)
+
     def wt15():
         seen = []
 
