@@ -15,6 +15,8 @@ harness wrote, for the spec that was signed:
   analysis_contract_claims     a ledger claim is not harness-produced or cites a file the manifest does not list
   analysis_contract_figure     a figure's sources changed after it was drawn, or are recorded outside the run dir
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
+  analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
+                               when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -229,7 +231,7 @@ def gate_findings(run_dir: str) -> list[dict]:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
     cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc, ba_doc = None, None, None, None, None, None, None
-    bd_doc = None
+    bd_doc = voi_doc = None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -323,6 +325,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             ba_doc = doc.get("data") or {}
         if kind == "plan_variants":
             pv_doc = doc.get("data") or {}
+        if kind == "value_of_information":
+            voi_doc = doc.get("data")
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -346,6 +350,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
+        out += _value_of_information(run_dir, unc_doc, voi_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -484,6 +489,18 @@ def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
     return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
+def _value_of_information(run_dir: str, unc, voi) -> list[dict]:
+    """F6: the artifact the signed spec asks for (on by default from the minimum draws), whatever the manifest
+    expects, and its shape and arithmetic (toolkit/analysis/value_of_information.py contract_findings)."""
+    from toolkit.analysis import value_of_information as VOI
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_value_of_information", f"{SPEC} unreadable: {e}")]
+    return [_f("analysis_contract_value_of_information", m, "value_of_information")
+            for m in VOI.contract_findings(raw, unc, voi)]
+
+
 def _decision_tests(run_dir, man) -> list[dict]:
     out = []
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -590,6 +607,9 @@ def _self_test() -> int:
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
                "claims": {"n_claims": 0, "unresolved": []}}
+        # F6: on by default; below the minimum draws it records too_few_draws
+        pay["value_of_information"] = {"status": "too_few_draws", "draws": pay["uncertainty"].get("draws"),
+                                       "evpi": None, "inputs": [], "not_drawn": []}
         for k, v in pay.items():
             if k != drop_kind:
                 S.write(k, v, f"toolkit/analysis/{k}.py", ["units.csv"] if k == "calibration" else [])

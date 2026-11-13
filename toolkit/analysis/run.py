@@ -356,11 +356,22 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # F6 S2-6: each fixed plan's outcome and cost in every draw; each solved variant's too (its cost against the budget)
     fcol = V.Draws(A, V.solved_plans(A, ben0, cost0)) if V.config(spec.raw).get("variants") else None
     hooks = [h.add for h in (bcol, fcol) if h is not None]
+    from toolkit.analysis import value_of_information as VOI
+    nd_ = UQ._n_seed(A, draws)[0]
+    vcol = VOI.Collector(A) if VOI.expected(spec.raw) and nd_ >= VOI.thresholds()["min_draws"] else None
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
-               on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None)
+               on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None,
+               on_solve=vcol.add if vcol is not None else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
+    voi = None
+    if VOI.expected(spec.raw):        # F6: which drawn input is worth better data, from the same draws
+        voi = VOI.run(A, vcol, plan, dict(fcol.plans) if fcol is not None else None, u["report"],
+                      level=u["data"]["interval"].get("level", 0.95), seed=u["data"]["seed"]) if vcol is not None \
+            else VOI.too_few(nd_, u["report"], A)
+        arts["value_of_information"] = S.write("value_of_information", voi, VOI.PRODUCER, [arts["uncertainty"]])
+        log(f"value of information: {voi['status']}, EVPI {(voi['evpi'] or {}).get('value')}")
     bvd = None
     if bcol is not None:        # F6 S2-5: the continuation arm's burden against external estimates
         bvd = BV.run(A, out0, z0, point, bcol, level=u["data"]["interval"].get("level", 0.95), events0=events0)
@@ -450,10 +461,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         S.deliverable(os.path.join(run_dir, fgd["path"]), FG.PRODUCER, "figure")
     # ---- claims and results.md
     c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
-                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc)
+                 dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc,
+                 voi=voi)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
+                             + ([arts["value_of_information"]] if voi is not None else [])
                              + ([arts["burden_validation"]] if bvd else [])
                              + ([arts["burden_anchor"]] if anc else []))
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
@@ -461,7 +474,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S.manifest["wall_s"] = round(time.time() - t0, 1)
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
-                              + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else []),
+                              + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
+                              + (["value_of_information"] if voi is not None else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
@@ -844,6 +858,7 @@ def _self_test() -> int:
     _self_test_joint(ok, q)
     _self_test_stability_flagged(ok)
     _self_test_variants(ok, q)
+    _self_test_voi(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -1058,6 +1073,82 @@ def _self_test_variants(ok, q):
         ok("analysis_contract_plan_variants" in kinds and "headline" in why,
            f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)}; "
            f"rebuild: {why[:120]})")
+
+
+def _self_test_voi(ok, q):
+    """F6 value of information on the toy: the artifact, its claims and results line, the contract checks, and the
+    switch (off: no artifact, the uncertainty step's data unchanged)."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        r = yaml.safe_load(open(p))
+        r["analysis"]["decision_tests"] = []
+        r["analysis"]["plan_variants"] = {"variants": [{"id": "given", "type": "fixed_plan", "column": "given",
+                                                        "text": "the plan as funded"}]}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        _given_column(d, lambda i: "b" if i % 2 == 0 else "a")      # b is not eligible in even units
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"VR1 a run with 32 draws completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        art = os.path.join(d, "analysis", "value_of_information.yaml")
+        doc = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
+        ids = {c["id"] for c in (doc.get("candidates") or {}).get("list") or []}
+        gv = {c["id"]: c for c in (doc.get("candidates") or {}).get("list") or []}.get("variant:given") or {}
+        ok(doc.get("status") == "indicative" and doc.get("draws") == 32 and {"point", "variant:given", "robust"} <= ids
+           and (doc.get("evpi") or {}).get("value", -1) >= 0 and doc.get("decide_now") != "variant:given"
+           and gv.get("eligible") is False and "not feasible" in str(gv.get("excluded")) and gv.get("regret") is not None,
+           f"VR1 the run writes value_of_information.yaml: indicative at 32 draws; the point plan, the plan decided "
+           f"under the affordability rule and the declared variant among the candidates; the variant breaks the "
+           f"signed eligibility, so it is reported with its regret, never chosen ({doc.get('status')}, "
+           f"{doc.get('decide_now')}, {gv})")
+        names = {x["input"] for x in doc.get("inputs") or []}
+        nd = {x.get("input") for x in doc.get("not_drawn") or []}
+        ok({"shift:r0", "shift:r1", "shift:r2", "calibration shifts"} <= names and {"synergy", "costs"} <= nd,
+           f"VR2 every drawn input and the calibration-shift group are valued; inputs not drawn are listed "
+           f"({sorted(names)}, {sorted(nd)})")
+        cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        txt = open(os.path.join(d, "results.md")).read()
+        sup = sum(bool(x.get("supported")) for x in doc.get("inputs") or [])
+        ok({"voi.evpi", "voi.status"} <= cs and "## Value of information" in txt
+           and len([x for x in cs if x.startswith("voi.top") and x.endswith(".evppi")]) == min(sup, 5)
+           and "[CLAIM:" not in txt, f"VR3 claims and a results.md section ({sorted(x for x in cs if 'voi' in x)})")
+        ok(contract.gate_findings(d) == [], f"VR4 the contract checks pass: {contract.gate_findings(d)}")
+        mp = os.path.join(d, "analysis", "manifest.json")
+        man = json.load(open(mp))
+        man2 = dict(man, artifacts={k: v for k, v in man["artifacts"].items() if v.get("kind") != "value_of_information"},
+                    expected=dict(man["expected"], kinds=[k for k in man["expected"]["kinds"]
+                                                         if k != "value_of_information"]))
+        json.dump(man2, open(mp, "w"))
+        ok(any(f["kind"] == "analysis_contract_value_of_information" for f in contract.gate_findings(d)),
+           "VR5 a run without the artifact the spec asks for is a finding, whatever its manifest expects")
+        json.dump(man, open(mp, "w"))
+        unc_on = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+        rep_on = open(os.path.join(d, "uncertainty_report.yaml")).read()
+        _resign(d, lambda x: x["analysis"].update(value_of_information={"enabled": False}))
+        R2 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        unc_off = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+        kinds = {v.get("kind") for v in json.load(open(mp))["artifacts"].values()}
+        txt2 = open(os.path.join(d, "results.md")).read()
+        checks = {"no artifact recorded": "value_of_information" not in R2["artifacts"]
+                  and "value_of_information" not in kinds,
+                  "no results section": "## Value of information" not in txt2,
+                  "uncertainty data identical": unc_off == unc_on,
+                  "uncertainty report identical": open(os.path.join(d, "uncertainty_report.yaml")).read() == rep_on,
+                  "checks pass": contract.gate_findings(d) == []}
+        ok(all(checks.values()), f"VR6 switched off: no artifact, the uncertainty data and report identical, checks "
+                                 f"pass ({[k for k, v in checks.items() if not v]})")
+        _resign(d, lambda x: x["analysis"].pop("value_of_information"))
+        run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+        few = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
+        ok(few.get("status") == "too_few_draws" and few.get("draws") == 8 and few.get("evpi") is None
+           and contract.gate_findings(d) == [],
+           f"VR7 below the minimum draws the artifact records too_few_draws and the count, not silence "
+           f"({few.get('status')}, {few.get('draws')}, {contract.gate_findings(d)})")
 
 
 def _given_column(d, pkg):

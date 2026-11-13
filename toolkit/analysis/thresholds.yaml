@@ -83,3 +83,19 @@ emulator:
   boundary_units: 20
   boundary_rank_agreement_min: 0.8
   boundary_tie_rel_gap: 0.01
+value_of_information:
+  # F6 (proposals for the owner's review; toolkit/analysis/value_of_information.py). Regression EVPPI (Strong, Oakley &
+  # Brennan 2014) fits each candidate plan's net benefit on an input; with few draws the max over noisy fitted values
+  # biases it upward. Below min_draws the step does not run: a spline chosen by GCV needs several draws per degree of
+  # freedom, and the bootstrap enough distinct draws. Below informative_draws every value is labelled indicative (the
+  # paper's examples use thousands of draws); at every count each value is reported beside its permutation noise floor.
+  min_draws: 30
+  informative_draws: 500
+  max_df_share: 0.2         # the smoother's degrees of freedom at most this share of the draws
+  max_knots: 6              # natural cubic spline knots per input (2: linear)
+  bins: 4                   # quantile bins of an input: feasibility after learning, and conditional candidate plans
+  min_bin_draws: 8          # fewer bins when the draws would leave fewer than this many per bin
+  max_conditional_solves: 120   # solves for the plans decided within each bin (the rest recorded as truncated)
+  permutations: 100         # shuffles of an input against the net benefits (GCV repeated) for its noise floor
+  noise_quantile: 0.95      # the noise floor: this quantile of the shuffled EVPPI
+  exceeds_evpi_tol: 0.02    # an EVPPI above EVPI by more than this share of EVPI is flagged (exceeds_evpi)
