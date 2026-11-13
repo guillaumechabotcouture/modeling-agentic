@@ -1,0 +1,324 @@
+beliefs:
+- id: B1
+  mechanism: Transfluthrin spatial repellent emanators reduce clinical malaria on top of existing ITN use; trials
+    in ITN-using, pyrethroid-resistant settings report roughly 25-35% protective efficacy against infection
+  about:
+    package: sr
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.4
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Syafruddin D, et al. Efficacy of a Spatial Repellent for Control of Malaria in Indonesia: A Cluster-Randomized
+      Controlled Trial. Am J Trop Med Hyg 2020'
+    location: Abstract (protective efficacy against first-time infection, about 28%; value from memory)
+  - citation: 'Ochomo EO, et al. Effect of a spatial repellent on malaria incidence in an area of western Kenya
+      characterised by high malaria transmission, insecticide resistance, and universal coverage of insecticide
+      treated nets (AEGIS): a cluster-randomised, controlled trial. Lancet 2025'
+    location: Abstract (about 33% reduction in infection incidence; year and value uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: A top-up raising net use by about 25 pp extends ITN protection (rate ratio about 0.5-0.55 for uncomplicated
+    episodes versus no nets) to a quarter of the population; relative to a baseline that already includes current
+    nets this is r = 0.25(1-RR)/(1-u(1-RR)), roughly 0.12-0.19, wider for trial uncertainty and loss of net use
+    over two years
+  about:
+    package: topup
+  direction: reduces
+  magnitude:
+    band:
+    - 0.08
+    - 0.22
+    scale: relative_reduction
+  conditions:
+  - feature: net_use
+    range:
+    - 0.327
+    - 0.697
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018
+    location: Summary of findings table 1 (uncomplicated episodes, ITN vs no nets, rate ratio about 0.55)
+  - citation: Lengeler C. Insecticide-treated bed nets and curtains for preventing malaria. Cochrane Database Syst
+      Rev 2004
+    location: Main results (about 50% reduction in uncomplicated episodes)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: SR and TOPUP combine by roughly independent (multiplicative) action, 1-(1-r_sr)(1-r_topup); no factorial
+    trial exists, and the Kenya SR trial was run on top of universal ITN coverage, which supports additivity on
+    the log scale
+  about:
+    package: sr+topup
+  direction: reduces
+  magnitude:
+    band:
+    - 0.22
+    - 0.52
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Ochomo EO, et al. Effect of a spatial repellent on malaria incidence in an area of western Kenya
+      characterised by high malaria transmission, insecticide resistance, and universal coverage of insecticide
+      treated nets (AEGIS): a cluster-randomised, controlled trial. Lancet 2025'
+    location: Methods (trial run on top of universal ITN coverage); combination band derived from B1 and B2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Under a multiplicative coverage model, a fixed +25 pp top-up gives a larger relative reduction where
+    current net use is higher, because the baseline being reduced already carries more net protection (denominator
+    1-u(1-RR) shrinks); the effect is small, about +0.03 across the net_use range, and holds only if the engine
+    reads net use
+  about:
+    package: topup
+    feature: net_use
+  direction: increases
+  conditions:
+  - feature: net_use
+    range:
+    - 0.327
+    - 0.697
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018
+    location: Summary of findings table 1 (rate ratio used in the derivation; the dependence on net use is arithmetic,
+      not a trial result)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'The SR effect does not depend on the pyrethroid resistance index: the Kenya and Indonesia trials found
+    protection in resistant vector populations, and the engine''s only unit attribute is the baseline rate'
+  about:
+    package: sr
+    feature: resistance
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Ochomo EO, et al. Effect of a spatial repellent on malaria incidence in an area of western Kenya
+      characterised by high malaria transmission, insecticide resistance, and universal coverage of insecticide
+      treated nets (AEGIS): a cluster-randomised, controlled trial. Lancet 2025'
+    location: Abstract (setting with high pyrethroid resistance)
+  - citation: 'Kleinschmidt I, et al. Implications of insecticide resistance for malaria vector control with long-lasting
+      insecticidal nets: a WHO-coordinated, prospective, international, observational cohort study. Lancet Infect
+      Dis 2018'
+    location: Findings (no association between resistance and net effect; bears on TOPUP)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'Baseline burden ranks districts: with uniform per-person costs and relative effects that do not scale
+    with incidence, cases averted per dollar rise in proportion to incidence, so in the highest-incidence districts
+    any funded package beats none at the budget''s shadow price'
+  about:
+    pair:
+    - topup
+    - none
+    feature: inc
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.4
+    - 0.6929
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018
+    location: Summary of findings table 1 (relative effect, applied to the district baseline)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Adding SR to TOPUP costs US$4.00 per person for about r_sr(1-r_topup), about 0.25, of the remaining
+    cases, so it pays at the shadow price only above an incidence threshold of about 4 lambda / 0.25; with a shadow
+    price set by the marginal TOPUP district, that threshold is roughly 0.3-0.55 cases per person-year. Below it
+    TOPUP alone is preferred
+  about:
+    pair:
+    - sr+topup
+    - topup
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.25
+    - 0.6
+  source_type: literature
+  evidence:
+  - citation: 'Syafruddin D, et al. Efficacy of a Spatial Repellent for Control of Malaria in Indonesia: A Cluster-Randomized
+      Controlled Trial. Am J Trop Med Hyg 2020'
+    location: Abstract (SR effect size; threshold location is derived arithmetic and depends on the withheld shadow
+      price)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: 'Per dollar, SR alone and TOPUP alone are close (about inc x 0.3/4.00 vs inc x 0.15/1.80); which wins
+    turns on the SR effect draw and the price ratio, so SR alone is rarely the best choice: below the threshold
+    TOPUP wins on price, above it SR+TOPUP wins'
+  about:
+    pair:
+    - sr
+    - topup
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018
+    location: Summary of findings table 1
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What clinical-case effect does the spec assign to SR? The trials measured infection incidence, not clinical
+    cases, and the Mali arm of AEGIS may have been null; the SR effect size sets the SR+TOPUP threshold
+  beliefs:
+  - B1
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q2
+  question: Does the engine read net_use for the top-up (M at baseline coverage), and does the +25 pp gain hold
+    over two years given net attrition?
+  beliefs:
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Where is the shadow price of the US$12M budget? It locates the incidence at which funding stops and
+    at which SR is added
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Do SR and ITN act independently, or does SR divert mosquitoes or reduce net use (substitution)? No factorial
+    trial exists
+  beliefs:
+  - B3
+  decision_relevant: true
+- id: Q5
+  question: Does pyrethroid resistance reduce the protection a top-up adds (the engine appears not to read resistance)?
+  beliefs:
+  - B5
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: SR alone reduces clinical cases by 15-40% relative to current nets in at least 80% of usable points; refuted
+    if 20% or fewer fall in the band
+  test:
+    kind: effect_band
+    package: sr
+    band:
+    - 0.15
+    - 0.4
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: TOPUP reduces clinical cases by 8-22% relative to current nets in at least 80% of usable points
+  test:
+    kind: effect_band
+    package: topup
+    band:
+    - 0.08
+    - 0.22
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: SR+TOPUP reduces clinical cases by 22-52% in at least 80% of usable points, consistent with multiplicative
+    combination
+  test:
+    kind: effect_band
+    package: sr+topup
+    band:
+    - 0.22
+    - 0.52
+    min_share: 0.8
+- id: H4
+  belief: B4
+  claim: TOPUP's relative reduction increases with current net use (Spearman interval above 0); refuted if it decreases
+  test:
+    kind: effect_direction
+    package: topup
+    feature: net_use
+    direction: increases
+- id: H5
+  belief: B5
+  claim: SR's relative reduction does not vary with the resistance index (rho interval within +/-0.1)
+  test:
+    kind: effect_direction
+    package: sr
+    feature: resistance
+    direction: negligible
+    equivalence: 0.1
+- id: H6
+  belief: B6
+  claim: In districts with incidence 0.4 or more, TOPUP beats none at the shadow price in at least 80% of usable
+    points
+  test:
+    kind: paired_sign
+    a: topup
+    b: none
+    feature: inc
+    range:
+    - 0.4
+    - 0.6929
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: The choice between SR+TOPUP and TOPUP flips along incidence, with the transition inside 0.25-0.6 cases
+    per person-year
+  test:
+    kind: flip_in
+    a: sr+topup
+    b: topup
+    feature: inc
+    range:
+    - 0.25
+    - 0.6
