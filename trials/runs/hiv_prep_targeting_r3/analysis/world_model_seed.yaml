@@ -1,0 +1,289 @@
+beliefs:
+- id: B1
+  mechanism: Daily oral TDF/FTC PrEP reduces HIV acquisition by roughly half on intention to treat across populations,
+    more with high adherence and little with poor adherence
+  about:
+    package: oral
+  direction: reduces
+  magnitude:
+    band:
+    - 0.35
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Fonner VA et al. Effectiveness and safety of oral HIV preexposure prophylaxis for all populations.
+      AIDS 2016
+    location: Results, pooled RR overall (~0.49) and by adherence subgroup; figure numbering not verified
+  - citation: Baeten JM et al. Antiretroviral prophylaxis for HIV prevention in heterosexual men and women. N Engl
+      J Med 2012
+    location: Results, TDF/FTC efficacy ~75% in serodiscordant couples (Partners PrEP); table number not verified
+  - citation: Grant RM et al. Preexposure chemoprophylaxis for HIV prevention in men who have sex with men. N Engl
+      J Med 2010
+    location: Results, 44% efficacy (iPrEx)
+  - citation: 'McCormack S et al. Pre-exposure prophylaxis to prevent the acquisition of HIV-1 infection (PROUD):
+      effectiveness results from the pilot phase of a pragmatic open-label randomised trial. Lancet 2016'
+    location: Results, 86% relative reduction
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 2
+    lookup_failed: 0
+- id: B2
+  mechanism: Long-acting cabotegravir every two months is superior to oral TDF/FTC (HR ~0.34 in MSM/TGW, ~0.11 in
+    women), implying ~80-95% reduction against no PrEP
+  about:
+    package: cab
+  direction: reduces
+  magnitude:
+    band:
+    - 0.75
+    - 0.97
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Landovitz RJ et al. Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women. N Engl
+      J Med 2021
+    location: Results, HR 0.34 vs TDF/FTC (HPTN 083)
+  - citation: 'Delany-Moretlwe S et al. Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084,
+      a phase 3, randomised clinical trial. Lancet 2022'
+    location: Results, HR 0.11 vs TDF/FTC
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 2
+    lookup_failed: 0
+- id: B3
+  mechanism: Oral PrEP protection rises steeply with adherence (null trials FEM-PrEP and VOICE had low drug detection);
+    the engine card lists only baseline_rate as a unit attribute, so the engine may omit this modification
+  about:
+    package: oral
+    feature: adherence
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Fonner VA et al. Effectiveness and safety of oral HIV preexposure prophylaxis for all populations.
+      AIDS 2016
+    location: Results, adherence subgroup analysis (RR lower where adherence >70%)
+  - citation: Van Damme L et al. Preexposure prophylaxis for HIV infection among African women. N Engl J Med 2012
+    location: Results, no significant effect with low drug detection (FEM-PrEP)
+  - citation: Marrazzo JM et al. Tenofovir-based preexposure prophylaxis for HIV infection among African women.
+      N Engl J Med 2015
+    location: Results, no significant effect, low adherence (VOICE)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Injectable cabotegravir is largely insensitive to daily pill-taking adherence (protection depends on
+    injection on-time, not daily behaviour), so its relative reduction should not vary materially with the oral
+    adherence score
+  about:
+    package: cab
+    feature: adherence
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Delany-Moretlwe S et al. Cabotegravir for the prevention of HIV-1 in women: results from HPTN 084,
+      a phase 3, randomised clinical trial. Lancet 2022'
+    location: Discussion, superiority attributed to adherence-independent delivery; infections mostly with delayed
+      or missed injections
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Under a binding budget the oral/cab choice flips along incidence: oral wins at low incidence (cheaper
+    per infection averted), cab wins in the highest-incidence groups where its extra 0.3-0.45 absolute reduction
+    times incidence repays US$180 per person-year more'
+  about:
+    pair:
+    - cab
+    - oral
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.022
+    - 0.06116
+  source_type: literature
+  evidence:
+  - citation: Landovitz RJ et al. Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women. N Engl
+      J Med 2021
+    location: Results, HR 0.34 vs TDF/FTC (relative advantage used in the arithmetic above)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B6
+  mechanism: In a rate-multiplicative model the relative reduction of each option is the same at every baseline
+    incidence (no transmission feedback over a two-year horizon)
+  about:
+    package: oral
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Fonner VA et al. Effectiveness and safety of oral HIV preexposure prophylaxis for all populations.
+      AIDS 2016
+    location: Results, no clear effect modification by population/incidence once adherence is accounted for (from
+      memory; not verified)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'Below the flip, in the lowest-incidence groups, oral dominates cab on net benefit at the budget''s
+    shadow price: cab''s extra absolute reduction (~0.3-0.45 x incidence) does not repay its extra US$180 per person-year,
+    so there is no switch to cab there'
+  about:
+    pair:
+    - oral
+    - cab
+    feature: inc
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 0.01154
+    - 0.02
+  source_type: literature
+  evidence:
+  - citation: Landovitz RJ et al. Cabotegravir for HIV Prevention in Cisgender Men and Transgender Women. N Engl
+      J Med 2021
+    location: Results, HR 0.34 vs TDF/FTC (relative advantage used in the arithmetic in the header)
+  - citation: Fonner VA et al. Effectiveness and safety of oral HIV preexposure prophylaxis for all populations.
+      AIDS 2016
+    location: Results, pooled RR overall (~0.49); figure numbering not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Does the budget bind (people expected to start x US$120-300 x 2 years vs US$8M), and how high is its
+    shadow price? It locates the oral/cab and none/oral thresholds on incidence.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Does the engine scale oral PrEP's effect with the group's adherence score? If not, the plan ignores
+    the main reason to prefer cab in low-adherence groups (e.g. adolescent girls and young women).
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Is lrr:cab a reduction against no PrEP or against oral PrEP (the card mentions both)? Applied to the
+    wrong comparator it double counts or under counts cab's effect.
+  beliefs:
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: Do serodiscordant-partner incidences already reflect the index partner's ART (U=U)? If not, PrEP benefit
+    there is overstated.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q5
+  question: Is 'people expected to start' equal to person-years on PrEP, or does discontinuation (high for oral
+    in young women) reduce both cost and protection?
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Oral PrEP's relative reduction in infections against none lies in 0.35-0.80 at >=80% of design points
+  test:
+    kind: effect_band
+    package: oral
+    band:
+    - 0.35
+    - 0.8
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Cabotegravir's relative reduction against none lies in 0.75-0.97 at >=80% of design points
+  test:
+    kind: effect_band
+    package: cab
+    band:
+    - 0.75
+    - 0.97
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: Oral PrEP's relative reduction increases with the adherence score; refuted (no association) would show
+    the engine omits adherence
+  test:
+    kind: effect_direction
+    package: oral
+    feature: adherence
+    direction: increases
+- id: H4
+  belief: B4
+  claim: Cabotegravir's relative reduction does not vary with the adherence score (rank correlation within +/-0.15)
+  test:
+    kind: effect_direction
+    package: cab
+    feature: adherence
+    direction: negligible
+    equivalence: 0.15
+- id: H5
+  belief: B7
+  claim: In the lowest-incidence groups (inc 0.0115-0.020) oral beats cab on net benefit at the shadow price at
+    >=70% of points
+  test:
+    kind: paired_sign
+    a: oral
+    b: cab
+    feature: inc
+    range:
+    - 0.01154
+    - 0.02
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: The oral-to-cab transition along incidence lies in 0.022-0.06116 (upper part of the range)
+  test:
+    kind: flip_in
+    a: cab
+    b: oral
+    feature: inc
+    range:
+    - 0.022
+    - 0.06116
+- id: H7
+  belief: B6
+  claim: Oral PrEP's relative reduction is unrelated to baseline incidence (rank correlation within +/-0.1), marginal
+    association only
+  test:
+    kind: effect_direction
+    package: oral
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+    scope: marginal
