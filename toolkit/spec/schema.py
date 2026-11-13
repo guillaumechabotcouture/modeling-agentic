@@ -104,7 +104,9 @@ docs/design/v2-spec-and-analysis.md §1):
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
-                                           # price case in which the listed unit costs change together
+                                           # price case in which the listed unit costs change together;
+                                           # type unit_attribute: unit_attribute {column, units: [ids] | all,
+                                           # values | scale | set_from} (a units-table column, F6)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     deliverable:
@@ -169,7 +171,8 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 # F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
-DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items")
+DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
+                       "unit_attribute")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1409,6 +1412,11 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         elif t == "envelope":
             if not dt.get("values") or not all(_isnum(v) for v in dt["values"]):
                 bad.append(f"decision test {i}: values (envelopes in USD)")
+        elif t == "unit_attribute":      # the runner's own planner (column, units, domain, identity), at sign-off
+            from toolkit.analysis import decision_tests as DT
+            pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"))
+            if pl["status"] != "runs":
+                bad.append(f"decision test {i}: {pl['why']}")
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:

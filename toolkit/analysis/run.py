@@ -412,9 +412,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "dollars_reallocated", "population_changed", "triggered_by",
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
-                                                    "rejected_values", "reachable_interaction") if k in x}} for x in dts]}, DT.PRODUCER,
+                                                    "rejected_values", "reachable_interaction", "unit_attribute")
+                                    if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
-        + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})}))
+        + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
+        # F6: a unit_attribute test's set_from table is an input (each modified table's sha256 is in its record)
+        + sorted({os.path.join(run_dir, f) for x in dts for f in ((x.get("unit_attribute") or {}).get("inputs") or {})}))
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
@@ -2423,6 +2426,27 @@ def _self_test_unit_attr(ok, q):
             on_disk = {"error": f"{type(e).__name__}: {e}"}
         ok((on_disk.get("unit_attribute") or {}).get("cases", [{}])[0].get("table_sha256") == want,
            f"UA15 the result file names the column, units and modified-table sha256 ({str(on_disk)[:160]})")
+    with tempfile.TemporaryDirectory() as d:     # end to end: the manifest binds the record and the set_from table
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n2,1.2\n3,-1.2\n")
+        r["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "Does the attribute move it?",
+                                            "unit_attribute": {"column": "cov", "set_from": "override.csv"}}]
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        from toolkit.analysis import contract
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+            art = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+            man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            art, man = {"error": f"{type(e).__name__}: {e}"}, {}
+        fsha = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        det = ((art.get("data") or {}).get("tests") or [{}])[0].get("detail") or {}
+        ok((art.get("inputs") or {}).get("override.csv") == fsha and det.get("unit_attribute", {}).get("column") == "cov"
+           and "models/decision_tests/DTu.yaml" in (man.get("deliverables") or {}) and contract.gate_findings(d) == [],
+           f"UA16 a run records the test in analysis/decision_tests.yaml with the set_from table among its hashed "
+           f"inputs, its record file is a manifest deliverable, and the contract checks pass ({str(art)[:200]})")
 
 
 def _direct_toy(d):
