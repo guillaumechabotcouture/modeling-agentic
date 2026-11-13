@@ -1,0 +1,257 @@
+beliefs:
+- id: B1
+  mechanism: wMel Wolbachia deployment reduces symptomatic dengue by about three quarters relative to no deployment
+    (cluster-randomised AWED trial, Yogyakarta)
+  about:
+    package: wolbachia
+  direction: reduces
+  magnitude:
+    band:
+    - 0.65
+    - 0.85
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Utarini A, et al. Efficacy of Wolbachia-Infected Mosquito Deployments for the Control of Dengue. N
+      Engl J Med. 2021
+    location: 'Abstract and Table 2: protective efficacy 77.1% (95% CI 65.3-84.9) against virologically confirmed
+      symptomatic dengue'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: ULV space spraying has at most a small and uncertain effect on dengue cases; no randomised trial shows
+    a significant case reduction
+  about:
+    package: spray
+  direction: reduces
+  magnitude:
+    band:
+    - 0.0
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Bowman LR, Donegan S, McCall PJ. Is Dengue Vector Control Deficient in Effectiveness or Evaluation?
+      A Systematic Review and Meta-analysis. PLoS Negl Trop Dis. 2016
+    location: 'Results, space spraying: no significant effect on dengue incidence (exact table not recalled)'
+  - citation: Esu E, Lenhart A, Smith L, Horstick O. Effectiveness of peridomestic space spraying with insecticide
+      on dengue transmission; systematic review. Trop Med Int Health. 2010
+    location: Results and conclusions (page not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'The relative effect of Wolbachia is roughly constant across cities with different vector abundance:
+    the engine applies a fixed relative rate, and the trial gives no evidence of modification by house index'
+  about:
+    package: wolbachia
+    feature: aedes_index
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Utarini A, et al. Efficacy of Wolbachia-Infected Mosquito Deployments for the Control of Dengue. N
+      Engl J Med. 2021
+    location: 'Results: efficacy consistent across serotypes; no subgroup by vector density reported (low confidence
+      on location)'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'At the budget''s shadow price, Wolbachia beats spraying in high-incidence cities: its much larger
+    relative effect outweighs its ~2.4x higher price over the two-year window'
+  about:
+    pair:
+    - wolbachia
+    - spray
+    feature: inc
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.009
+    - 0.01562
+  source_type: literature
+  evidence:
+  - citation: Utarini A, et al. Efficacy of Wolbachia-Infected Mosquito Deployments for the Control of Dengue. N
+      Engl J Med. 2021
+    location: Table 2
+  - citation: Bowman LR, Donegan S, McCall PJ. Is Dengue Vector Control Deficient in Effectiveness or Evaluation?
+      A Systematic Review and Meta-analysis. PLoS Negl Trop Dis. 2016
+    location: Results, space spraying
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Spraying does not pay its cost at a binding budget''s shadow price anywhere in the incidence range:
+    with a relative reduction of <=0.3 it buys less than half of what Wolbachia buys per dollar'
+  about:
+    pair:
+    - spray
+    - none
+    feature: inc
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 0.00221
+    - 0.01562
+  source_type: literature
+  evidence:
+  - citation: Bowman LR, Donegan S, McCall PJ. Is Dengue Vector Control Deficient in Effectiveness or Evaluation?
+      A Systematic Review and Meta-analysis. PLoS Negl Trop Dis. 2016
+    location: Results, space spraying
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: The budget binds (Wolbachia for all residents would cost several times US$40M), so the choice between
+    Wolbachia and none flips at an incidence threshold in the upper part of the city range; reported incidence ranks
+    the cities
+  about:
+    pair:
+    - wolbachia
+    - none
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.007
+    - 0.01562
+  source_type: literature
+  evidence:
+  - citation: Utarini A, et al. Efficacy of Wolbachia-Infected Mosquito Deployments for the Control of Dengue. N
+      Engl J Med. 2021
+    location: Table 2 (effect size feeding the threshold arithmetic); threshold location is reasoning, not literature
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Wolbachia's relative reduction in dengue cases lies in [0.65, 0.85] at >=80% of usable points
+  test:
+    kind: effect_band
+    package: wolbachia
+    band:
+    - 0.65
+    - 0.85
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Spraying's relative reduction in dengue cases lies in [0.0, 0.30] at >=80% of usable points
+  test:
+    kind: effect_band
+    package: spray
+    band:
+    - 0.0
+    - 0.3
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: Wolbachia's relative reduction does not vary with aedes_index (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: wolbachia
+    feature: aedes_index
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: In cities with inc >= 0.009, Wolbachia has the higher net benefit than spray at >=80% of usable points
+  test:
+    kind: paired_sign
+    a: wolbachia
+    b: spray
+    feature: inc
+    range:
+    - 0.009
+    - 0.01562
+    sign: positive
+    min_share: 0.8
+- id: H5
+  belief: B5
+  claim: Across the full incidence range, spray has lower net benefit than none at the shadow price at >=70% of
+    usable points
+  test:
+    kind: paired_sign
+    a: spray
+    b: none
+    feature: inc
+    range:
+    - 0.00221
+    - 0.01562
+    sign: negative
+    min_share: 0.7
+- id: H6
+  belief: B6
+  claim: The none-to-Wolbachia transition along inc lies within inc [0.007, 0.01562]
+  test:
+    kind: flip_in
+    a: wolbachia
+    b: none
+    feature: inc
+    range:
+    - 0.007
+    - 0.01562
+open_questions:
+- id: Q1
+  question: What spray relative effect does the engine's prior hold, and on what evidence? If its upper tail exceeds
+    ~0.3, spray could compete on price with Wolbachia in low-incidence cities.
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Is 'effective from deployment' realistic? wMel establishment takes months, and AWED measured efficacy
+    after release. A ramp-up would cut Wolbachia's benefit over 2026-2027 and lower the spray-vs-Wolbachia price
+    threshold.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: How complete is reporting of the 2021-2025 incidence (inc) in each city? Differences in under-reporting
+    between cities would change the incidence ranking that sets which cities receive Wolbachia.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: What shadow price is declared, and does it match the budget dual? It locates the Wolbachia threshold
+    and the paired signs.
+  beliefs:
+  - B4
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q5
+  question: Is the incidence over the 2021-2025 window a fair forecast for 2026-2027, given multi-year dengue cycles
+    and serotype shifts?
+  beliefs:
+  - B6
+  decision_relevant: true
