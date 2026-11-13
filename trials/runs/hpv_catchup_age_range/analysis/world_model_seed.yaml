@@ -1,0 +1,331 @@
+beliefs:
+- id: B1
+  mechanism: Vaccinating 80% of 9-14 year-olds removes roughly a third of the susceptible pool (most 9-14s are still
+    uninfected); with indirect (herd) effects the final size of the epidemic falls by more than the direct share,
+    by less at high transmission
+  about:
+    package: to14
+  direction: reduces
+  magnitude:
+    band:
+    - 0.35
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Brisson M, et al. Population-level impact, herd immunity, and elimination after human papillomavirus
+      vaccination: a systematic review and meta-analysis of predictions from transmission-dynamic models. Lancet
+      Public Health 2016'
+    location: Results, girls-only vaccination scenarios (figure on predicted reductions by coverage); exact figure
+      number not recalled
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: final-size relation z = 1 - exp(-R z); chapter on simple epidemics (page not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B2
+  mechanism: TO26 removes roughly half or more of the susceptible pool; Reff falls near or below 1 in most settings,
+    so the reduction is large and close to complete except at the highest transmission
+  about:
+    package: to26
+  direction: reduces
+  magnitude:
+    band:
+    - 0.65
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: final-size relation and critical vaccination fraction 1 - 1/R0 (page not recalled)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: 'Higher contact rate (higher R0) raises baseline burden but lowers the relative reduction of a fixed
+    campaign: the remaining susceptibles are still infected at high Reff, and the herd effect that amplifies the
+    direct protection weakens'
+  about:
+    package: to14
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Brisson M, et al. Population-level impact, herd immunity, and elimination after human papillomavirus
+      vaccination: a systematic review and meta-analysis of predictions from transmission-dynamic models. Lancet
+      Public Health 2016'
+    location: herd effects and elimination predicted at high coverage; the dependence on transmission is from model
+      structure, page not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'Extending to 15-19 pays only where to14 alone leaves the epidemic above threshold: at low contact
+    rate to14 already drives Reff below 1 and the extra US$0.70 per resident averts little, so to14 beats to19;
+    above a threshold contact rate to19 wins. The flip is located in the lower part of the contact-rate range (rough,
+    low confidence)'
+  about:
+    pair:
+    - to19
+    - to14
+    feature: contact_rate (calibration scale)
+  direction: flips
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 6.129090587608516
+    - 9.5
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: threshold behaviour of the final size near R = 1 (page not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'At high transmission the full catch-up (to26) beats to14 at the shadow price: per US$ the incremental
+    15-26 doses still avert far more than 0.00046 persistent infections, because the epidemic is not stopped by
+    to14 and each susceptible removed averts most of an infection'
+  about:
+    pair:
+    - to26
+    - to14
+    feature: contact_rate (calibration scale)
+  direction: increases
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 10.5
+    - 14.895772559568286
+  source_type: literature
+  evidence:
+  - citation: 'Drolet M, et al. Population-level impact and herd effects following the introduction of human papillomavirus
+      vaccination programmes: updated systematic review and meta-analysis. Lancet 2019'
+    location: results by catch-up age (multi-cohort vs single cohort) for HPV16/18 prevalence; table number not
+      recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'The value of the 20-26 increment scales with the share of 20-26 year-olds still uninfected (s0_20_26):
+    doses to those already infected are wasted, so where s0_20_26 is high to26 beats to19 at the shadow price'
+  about:
+    pair:
+    - to26
+    - to19
+    feature: s0_20_26
+  direction: increases
+  conditions:
+  - feature: s0_20_26
+    range:
+    - 0.55
+    - 0.7432
+  source_type: literature
+  evidence:
+  - citation: 'Paavonen J, et al. Efficacy of human papillomavirus (HPV)-16/18 AS04-adjuvanted vaccine against cervical
+      infection and precancer caused by oncogenic HPV types (PATRICIA): final analysis of a double-blind, randomised
+      study in young women. Lancet 2009'
+    location: efficacy high in HPV-naive women and much lower in the total vaccinated cohort including prior exposure
+      (results; table not recalled)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'The 15-19 increment pays where 15-19 year-olds are still mostly uninfected (s0_15_19 high): to19 beats
+    to14 at the shadow price there'
+  about:
+    pair:
+    - to19
+    - to14
+    feature: s0_15_19
+  direction: increases
+  conditions:
+  - feature: s0_15_19
+    range:
+    - 0.65
+    - 0.8993
+  source_type: literature
+  evidence:
+  - citation: FUTURE II Study Group. Quadrivalent vaccine against human papillomavirus to prevent high-grade cervical
+      lesions. N Engl J Med 2007
+    location: per-protocol (HPV-naive) vs intention-to-treat efficacy (results; table not recalled)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: 'Relative reduction rises with vaccine efficacy against infection among the susceptible reached (trials:
+    near-complete protection against HPV16/18 persistent infection in naive women)'
+  about:
+    package: to14
+    feature: efficacy:to14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: FUTURE II Study Group. Quadrivalent vaccine against human papillomavirus to prevent high-grade cervical
+      lesions. N Engl J Med 2007
+    location: per-protocol efficacy (results)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+open_questions:
+- id: Q1
+  question: What share of residents are aged 9-14, 15-19 and 20-26, and does the engine model only these cohorts
+    or the whole population? This sets the direct share removed and so every band.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q2
+  question: Is the R0 range 1.2-3.0 defined in a fully susceptible population or already net of prior infection?
+    If net, many provinces sit near threshold and to14 suffices.
+  beliefs:
+  - B3
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Does the budget bind hard enough that the true dual is far above the declared shadow price (0.00046
+    per US$)? At the declared price nearly every campaign pays; a binding US$20M budget favours to14 spread across
+    provinces over to26 in a few.
+  beliefs:
+  - B5
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Are doses targeted to susceptibles (targets_susceptible) or wasted on the already infected? This decides
+    how strongly s0_15_19 and s0_20_26 drive the extension.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: TO14 reduces persistent infections by 35-95% relative to none in most usable points
+  test:
+    kind: effect_band
+    package: to14
+    band:
+    - 0.35
+    - 0.95
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: TO26 reduces persistent infections by 65-100% relative to none in most usable points
+  test:
+    kind: effect_band
+    package: to26
+    band:
+    - 0.65
+    - 1.0
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: TO14's relative reduction decreases as the contact rate rises
+  test:
+    kind: effect_direction
+    package: to14
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: The to19-vs-to14 choice flips in the lower part of the contact-rate range (to14 wins below, to19 above)
+  test:
+    kind: flip_in
+    a: to19
+    b: to14
+    feature: contact_rate (calibration scale)
+    range:
+    - 6.129090587608516
+    - 9.5
+- id: H5
+  belief: B5
+  claim: At high contact rates to26 beats to14 in net benefit at the shadow price in at least 80% of usable points
+  test:
+    kind: paired_sign
+    a: to26
+    b: to14
+    feature: contact_rate (calibration scale)
+    range:
+    - 10.5
+    - 14.895772559568286
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B6
+  claim: Where s0_20_26 is high, to26 beats to19 in net benefit in at least 70% of usable points
+  test:
+    kind: paired_sign
+    a: to26
+    b: to19
+    feature: s0_20_26
+    range:
+    - 0.55
+    - 0.7432
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: Where s0_15_19 is high, to19 beats to14 in net benefit in at least 70% of usable points
+  test:
+    kind: paired_sign
+    a: to19
+    b: to14
+    feature: s0_15_19
+    range:
+    - 0.65
+    - 0.8993
+    sign: positive
+    min_share: 0.7
+- id: H8
+  belief: B8
+  claim: TO14's relative reduction increases with its efficacy
+  test:
+    kind: effect_direction
+    package: to14
+    feature: efficacy:to14
+    direction: increases
