@@ -521,7 +521,8 @@ def flip_along(sw, a, b, f, mask=None):
 def flip(sw, a, b):
     """The a/b comparison along every feature; `along` displays at most flips_max located flips."""
     if sw.lam is None:
-        return {"a": a, "b": b, "status": "no_shadow_price", "along": []}
+        return {"a": a, "b": b, "status": "no_shadow_price", "along": [],     # attempted: in the family at p = 1
+                "_all": [{"feature": f, "status": "no_shadow_price"} for f in sorted(sw.features)]}
     d, tol = sw.diff(a, b)
     fl = [{k: v for k, v in flip_along(sw, a, b, f).items() if k != "points"} for f in sorted(sw.features)]
     return {"a": a, "b": b, "measure": "net_benefit", "lambda": sw.lam, "n": len(d), "share_a": _r(np.mean(d > tol)),
@@ -749,13 +750,15 @@ def partial_direction(x, y, covs):
 
 
 def _constrained(t, b):
-    """The test as checked: its belief's conditions intersected into its `where` (a flip belief's condition on the
-    test's own feature locates the flip, so it is not applied)."""
+    """The test as checked: its belief's conditions intersected into its `where`. A flip belief's condition on the
+    test's own feature locates the flip: it is not a sampling region, and for a flip_in test it narrows the claimed
+    flip range (so the belief's location constrains the verdict and the test's identity)."""
     conds = {}
     for c in (b or {}).get("conditions") or []:          # repeated conditions on one feature intersect
         conds = _intersect(conds, c["feature"], c["range"])
-    if (b or {}).get("direction") == "flips":
-        conds.pop(t.get("feature"), None)
+    loc = conds.pop(t.get("feature"), None) if (b or {}).get("direction") == "flips" else None
+    if loc and t["kind"] == "flip_in":
+        t = dict(t, range=[max(t["range"][0], loc[0]), min(t["range"][1], loc[1])])
     if not conds:
         return t
     w = dict(t.get("where") or {})
@@ -775,11 +778,19 @@ def _canon(v):
 
 
 def canonical_test(t, belief=None):
-    """The test exactly as checked: its belief's conditions applied, defaults resolved (scope), an empty `where`
-    dropped and numbers as floats. Its sha256 is the test's identity in the ledger and the track record."""
+    """The test exactly as checked: its belief's conditions applied, defaults resolved (scope), a pair in name
+    order (a paired test's sign mirrored with it), category lists as sorted sets, an empty `where` dropped and
+    numbers as floats. Its sha256 is the test's identity in the ledger and the track record."""
     c = dict(_constrained(t, belief))
     if c["kind"] in ("effect_direction", "flip_in"):
         c.setdefault("scope", "conditional")
+    if c["kind"] in ("paired_sign", "flip_in") and str(c["a"]) > str(c["b"]):    # a test and its mirror: one id
+        c["a"], c["b"] = c["b"], c["a"]
+        if c["kind"] == "paired_sign":
+            c["sign"] = "negative" if c["sign"] == "positive" else "positive"
+    if isinstance(c.get("where"), dict):                 # category lists are sets
+        c["where"] = {k: sorted(set(v)) if isinstance(v, list) and v and all(isinstance(e, str) for e in v) else v
+                      for k, v in c["where"].items()}
     if not c.get("where"):
         c.pop("where", None)
     return {k: _canon(v) for k, v in sorted(c.items()) if v is not None}
@@ -1271,6 +1282,8 @@ def _manifest_problems(run_dir):
     bad += [f"analysis/batch.yaml does not record the current {rel}" for rel in
             ("analysis/batch/design.json", "analysis/batch/results.jsonl")
             if inp.get(rel) is None or inp.get(rel) != sha256(os.path.join(run_dir, rel))]
+    if m.get("settings_sha256") != sha256(os.path.join(run_dir, "analysis_settings.yaml")):
+        bad.append("analysis_settings.yaml was added, changed or removed since the analysis (settings_sha256)")
     return bad
 
 
@@ -1288,15 +1301,17 @@ def point_doc(run_dir, ident):
     bad = _manifest_problems(run_dir)
     bad += [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
     bad += [] if doc["data"].get("engine_identity") == ident else ["the engine identity"]
-    bad += _input_problems(run_dir, rel, doc, set())
+    bad += _input_problems(run_dir, rel, doc, set(), {"spec_sha256": doc.get("spec_sha256"),
+                                                      "engine": doc.get("engine")})
     if bad:
         raise WorldModelError(f"{rel} is not bound to this run: {bad} differ from what it was computed with")
     return doc
 
 
-def _input_problems(run_dir, rel, doc, seen):
+def _input_problems(run_dir, rel, doc, seen, root=None):
     """What does not verify in an artifact's recorded inputs, recursively through the harness artifacts among them:
-    each must exist with its recorded sha256, and the artifact must record at least one."""
+    each must exist with its recorded sha256, the artifact must record at least one, and every descendant harness
+    artifact must carry the root's spec sha256 and (when both record one) its engine."""
     import yaml
     from toolkit.analysis.artifacts import sha256
     inp = doc.get("inputs") if isinstance(doc, dict) else None
@@ -1316,7 +1331,13 @@ def _input_problems(run_dir, rel, doc, seen):
             except (OSError, yaml.YAMLError):
                 sub = None
             if isinstance(sub, dict) and ("inputs" in sub or str(sub.get("schema") or "").startswith("analysis.")):
-                bad += _input_problems(run_dir, q_rel, sub, seen)      # a harness artifact must record its inputs
+                if str(sub.get("schema") or "").startswith("analysis.") and root:
+                    if sub.get("spec_sha256") != root.get("spec_sha256"):
+                        bad.append(f"{q_rel}: computed under another spec")
+                    if sub.get("engine") is not None and root.get("engine") is not None and \
+                            sub["engine"] != root["engine"]:
+                        bad.append(f"{q_rel}: computed by another engine")
+                bad += _input_problems(run_dir, q_rel, sub, seen, root)   # a harness artifact must record its inputs
     return bad
 
 
@@ -1566,9 +1587,11 @@ def _bind(d):
     yaml.safe_dump({"written_at": EVIDENCE_TIME, "inputs": {
         f"analysis/batch/{n}": sha256(os.path.join(b, n)) for n in ("design.json", "results.jsonl")}},
         open(os.path.join(d, "analysis", "batch.yaml"), "w"))
-    json.dump({"complete": True, "status": "complete", "artifacts": {
-        rel: {"sha256": sha256(os.path.join(d, rel))} for rel in ("analysis/point.yaml", "analysis/batch.yaml")}},
-        open(os.path.join(d, "analysis", "manifest.json"), "w"))
+    json.dump({"complete": True, "status": "complete",
+               "settings_sha256": sha256(os.path.join(d, "analysis_settings.yaml")),
+               "artifacts": {rel: {"sha256": sha256(os.path.join(d, rel))}
+                             for rel in ("analysis/point.yaml", "analysis/batch.yaml")}},
+              open(os.path.join(d, "analysis", "manifest.json"), "w"))
 
 
 def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1, independent=True):
@@ -2684,6 +2707,88 @@ def _self_test() -> int:
             except WorldModelError:
                 ok(True, "WM82d a plan from an incomplete analysis is refused")
     tryit("WM82 plan bound to the completed analysis", wm82)
+
+    def wm83():
+        import yaml
+        from toolkit.analysis.artifacts import sha256
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write("x: 1\n")
+            open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
+            ident = {"name": "e"}
+            pt = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident},
+                  "inputs": {"units.csv": sha256(os.path.join(d, "units.csv"))}}
+            yaml.safe_dump(pt, open(os.path.join(d, "analysis", "point.yaml"), "w"))
+            _bind(d)
+            st = os.path.join(d, "analysis_settings.yaml")
+            ok(point_doc(d, ident) is not None, "WM83 no settings recorded and none present: the plan is used")
+            for step, why in ((lambda: open(st, "w").write("uncertainty: {draws: 8}\n"), "added"),
+                              (lambda: (_bind(d), open(st, "w").write("uncertainty: {draws: 9}\n")),
+                               "changed"),
+                              (lambda: (open(st, "w").write("uncertainty: {draws: 8}\n"), _bind(d),
+                                        os.remove(st)), "removed")):
+                step()
+                try:
+                    point_doc(d, ident)
+                    ok(False, f"WM83b analysis settings {why} after the analysis make its plan stale (refused)")
+                except WorldModelError:
+                    ok(True, f"WM83b analysis settings {why} after the analysis make its plan stale (refused)")
+
+            cal = {"schema": "analysis.calibration/1", "spec_sha256": "0" * 64, "engine": {"name": "e"},
+                   "inputs": {"units.csv": sha256(os.path.join(d, "units.csv"))}}
+            yaml.safe_dump(cal, open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
+            pt2 = dict(pt, engine={"name": "e"}, inputs={"analysis/calibration.yaml": sha256(os.path.join(
+                d, "analysis", "calibration.yaml"))})
+            yaml.safe_dump(pt2, open(os.path.join(d, "analysis", "point.yaml"), "w"))
+            _bind(d)
+            for c, why in ((cal, "another spec"), (dict(cal, spec_sha256=pt["spec_sha256"], engine={"name": "f"}),
+                                                   "another engine")):
+                yaml.safe_dump(c, open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
+                yaml.safe_dump(dict(pt2, inputs={"analysis/calibration.yaml": sha256(os.path.join(
+                    d, "analysis", "calibration.yaml"))}), open(os.path.join(d, "analysis", "point.yaml"), "w"))
+                _bind(d)
+                try:
+                    point_doc(d, ident)
+                    ok(False, f"WM87 a descendant artifact computed under {why} is refused in the provenance walk")
+                except WorldModelError:
+                    ok(True, f"WM87 a descendant artifact computed under {why} is refused in the provenance walk")
+    tryit("WM83, 87 settings and descendant identity", wm83)
+
+    def wm84():
+        t = {"kind": "plan_share", "package": "A", "min_share": 0.8}
+        ok(canonical_test(dict(t, where={"region": ["north", "south"]})) ==
+           canonical_test(dict(t, where={"region": ["south", "north", "south"]})),
+           "WM84 category lists canonicalise as sets (sorted, deduplicated)")
+        ps = {"kind": "paired_sign", "feature": "f1", "range": [0, 1], "min_share": 0.8}
+        ok(canonical_test(dict(ps, a="A", b="B", sign="positive")) ==
+           canonical_test(dict(ps, a="B", b="A", sign="negative")),
+           "WM84b a paired test and its mirror (b over a, opposite sign) are one test")
+        fl = {"kind": "flip_in", "feature": "f1", "range": [0.3, 0.7]}
+        ok(canonical_test(dict(fl, a="A", b="B")) == canonical_test(dict(fl, a="B", b="A")),
+           "WM84c a flip test is symmetric in its pair")
+    tryit("WM84 symmetric and set-valued fields", wm84)
+
+    def wm85():
+        x = np.linspace(0, 1, 60)
+        mu = summarise(_sw({"x": x}, 0.3 + 0.1 * x, 0.2 + 0 * x, lam=None))["multiplicity"]
+        ok(mu["tested"] == 3, f"WM85 a flip not computed for want of a shadow price enters the family at p = 1: {mu}")
+    tryit("WM85 missing shadow price", wm85)
+
+    def wm86():
+        x = np.linspace(0, 1, 400)
+        cs = _sw({"x": x}, np.where(x < 0.5, 0.5, 0.2), 0.35 + 0 * x)
+        lit = [{"citation": "T", "location": "p. 1"}]
+        sd = {"beliefs": [{"id": "F1", "mechanism": "A beats B at low x", "about": {"pair": ["A", "B"]},
+                           "direction": "flips", "conditions": [{"feature": "x", "range": [0.0, 0.1]}],
+                           "source_type": "literature", "evidence": lit, "confidence": "low"}],
+              "hypotheses": [{"id": "K", "belief": "F1", "claim": "the choice flips",
+                              "test": {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [0.0, 1.0],
+                                       "scope": "marginal"}}]}
+        _, hy = build(sd, cs)
+        ok(hy["hypotheses"][0]["status"] == "refuted", "WM86 a flip belief's location condition constrains its flip "
+                                                       f"test's verdict (the flip is at 0.5, the belief says 0-0.1): "
+                                                       f"{hy['hypotheses'][0]['status']}")
+    tryit("WM86 flip location", wm86)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
