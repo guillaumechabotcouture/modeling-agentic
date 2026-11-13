@@ -19,6 +19,10 @@ decision_inputs:
       - {kind: unit_attribute, name: itn_use_at, why: "when itn_use was measured: maps the survey's use to use at the
           campaign"}
       - {kind: unit_attribute, name: campaign_year, why: "when the package's nets arrive, against the decision window"}
+      - {kind: unit_attribute, name: season, why: "the transmission season: when biting happens against the
+          campaign and the decay of the nets' protection"}
+      - {kind: parameter, name: net_holes, why: "the physical-hole correction of net efficacy (vector.itn_effect):
+          it changes the repelled, killed and fed probabilities"}
       - {kind: parameter, name: net_retention_half, why: "median net retention: how long the protection lasts"}
       - {kind: parameter, name: net_survival_k, why: "the shape of net attrition around its median"}
       - {kind: parameter, name: use_rate, why: "use among those with access"}
@@ -42,6 +46,8 @@ decision_inputs:
       - {kind: unit_attribute, name: irs_product, why: "the product sets the decay of the spray's effect"}
       - {kind: unit_attribute, name: irs_month, why: "the month of spraying, against the transmission season"}
       - {kind: unit_attribute, name: irs_years, why: "the years sprayed"}
+      - {kind: unit_attribute, name: season, why: "the transmission season: the spray's timing against it (the
+          default spray month is derived from its peak) and its decay"}
       - {kind: parameter, name: irs_kill, why: "the fitted kill of indoor-resting fed mosquitoes"}
       - {kind: parameter, name: irs_rep, why: "deterrence on entry"}
       - {kind: parameter, name: irs_divert, why: "the share of deterred mosquitoes that bite outdoors instead"}
@@ -122,7 +128,6 @@ not_decision_inputs:
   "unit_attribute:smc_hist_rounds": "rounds per past SMC year: baseline (as smc_hist_years)"
   "unit_attribute:smc_hist_cov": "reach of past SMC: baseline (as smc_hist_years)"
   "parameter:import_eir": "imported infections in every arm: part of the baseline transmission the calibration fits"
-  "parameter:net_holes": "a numerical setting (priors.yaml settings), not an effect"
   "parameter:n_agents": "a numerical setting"
   "parameter:burnin_years": "a numerical setting (its convergence evidence is benchmarks/equilibration.yaml)"
   "parameter:init_eir_per_m0": "a numerical setting of the start (its sensitivity is benchmarks/guess_sensitivity.yaml)"

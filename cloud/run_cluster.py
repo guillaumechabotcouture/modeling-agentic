@@ -464,35 +464,31 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
                        f"({str(src.get('spec_sha256'))[:12]}, shipped {hashlib.sha256(spec).hexdigest()[:12]}); {regen}")
         elif src.get("derivations_sha256") != (hashlib.sha256(rec).hexdigest() if rec is not None else "none"):
             out.append(f"{rel}: the sign-off sheet was generated from another data/derivations_record.json; {regen}")
-        else:
-            drel, dos, why = _shipped_dossier(code, rel, spec)
-            if why:
-                out.append(why)
-            elif drel and dos is None:
-                out.append(f"{rel}: the evidence dossier {drel} the spec names is missing in the code to launch")
-            elif drel and src.get("evidence_dossier_sha256") != hashlib.sha256(dos).hexdigest():
-                out.append(f"{rel}: the sign-off sheet was generated from another evidence dossier ({drel}); {regen}")
+        else:       # F6 (#218): what signing will check (coverage too), so an unsignable run never starts a cluster
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "sign")]
     return out
 
 
-SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
-
-
-def _shipped_dossier(code: bytes, rel: str, spec: bytes | None) -> tuple:
-    """(dossier path the shipped spec names or None, its shipped bytes or None, problem or None). F6 evidence
-    dossier: toolkit/spec/evidence_dossier.py dossier_reference, read from the archive."""
-    import yaml
+def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
+    """The run's registered preconditions (toolkit/spec/preconditions.py) on the archive's own bytes: "sign" for a
+    run at SIGN (what the signer will check), "launch" for one past it (the sign-off record compared)."""
+    root = os.path.dirname(HERE)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     try:
-        doc = yaml.safe_load((spec or b"").decode("utf-8")) or {}
-    except (yaml.YAMLError, UnicodeDecodeError):
-        return None, None, f"{rel}: decision_spec.yaml does not parse in the code to launch"
-    ev = doc.get("evidence") if isinstance(doc, dict) else None
-    drel = ev.get("dossier") if isinstance(ev, dict) else None
-    if not isinstance(drel, str) or not drel.strip():
-        return None, None, None
-    if os.path.isabs(drel) or ".." in drel.replace("\\", "/").split("/"):
-        return drel, None, f"{rel}: the evidence dossier {drel} is not a path inside the run"
-    return drel, _archive_member(code, os.path.normpath(f"{rel}/{drel}").replace(os.sep, "/")), None
+        from toolkit.spec import preconditions as PC
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return [f"the preconditions cannot be checked ({type(e).__name__}: {e})"]
+
+    def read(name):
+        parts = str(name).replace("\\", "/").split("/")
+        if os.path.isabs(name) or ".." in parts:
+            raise ValueError(f"{name} is not a path inside the run")
+        return _archive_member(code, f"{rel}/{name}")
+    return PC.problems(None, None, signer, read=read)
+
+
+SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
 
 
 PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
@@ -517,10 +513,9 @@ def _signoff_record(code: bytes, rel: str) -> tuple:
 
 
 def _signed_run_problems(code: bytes, rel: str) -> list[str]:
-    """A run past SIGN (#218 review round 1): it ships the spec its sign-off hashed, and that sign-off's evidence
-    binding holds. A dossier edited after signing, a spec edited after signing (removing `evidence` with it), or a
-    sign-off made before the evidence-dossier requirement of a spec whose options need decision inputs
-    (unsigned_evidence) would compute on evidence nobody attested."""
+    """A run past SIGN: it ships a sign-off record of the spec it ships, and every registered precondition holds on
+    the archive's bytes (toolkit/spec/preconditions.py: for the evidence dossier, the record's spec and dossier sha256,
+    the sheet's, coverage on the engine chosen, recomputed; an empty or partial evidence binding is refused)."""
     import hashlib
     spec = _archive_member(code, f"{rel}/decision_spec.yaml")
     rec, signed = _signoff_record(code, rel)
@@ -529,33 +524,7 @@ def _signed_run_problems(code: bytes, rel: str) -> list[str]:
     if hashlib.sha256(spec).hexdigest() != signed:
         return [f"{rel}: decision_spec.yaml is not the one signed (edited after its sign-off): the owner amends and "
                 "re-signs the spec before launch"]
-    ev = rec.get("evidence")
-    if isinstance(ev, dict):
-        drel = ev.get("dossier")
-        if not drel:
-            return []
-        _, dos, why = _shipped_dossier(code, rel, spec)
-        if why:
-            return [why]
-        want = (rec.get("sha256") or {}).get(drel) or (rec.get("evidence_sha256") or {}).get(drel) or ev.get("sha256")
-        if dos is not None and want == hashlib.sha256(dos).hexdigest():
-            return []
-        return [f"{rel}: the evidence dossier {drel} is not the one the sign-off recorded (edited after signing, or "
-                "missing): the signature is stale; the owner amends and re-signs the spec before launch"]
-    try:                                # a sign-off made before the requirement: does the spec need a dossier?
-        import yaml
-        root = os.path.dirname(HERE)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from toolkit.spec import evidence_dossier as ED
-        doc = yaml.safe_load(spec.decode("utf-8")) or {}
-        req, probs = ED.required_inputs(doc if isinstance(doc, dict) else {})
-    except Exception as e:  # noqa: BLE001 -- fail closed
-        return [f"{rel}: whether the signed spec needs an evidence dossier cannot be decided ({type(e).__name__}: {e})"]
-    if req or probs:
-        return [f"{rel}: unsigned_evidence: signed before the evidence-dossier requirement, and its options need "
-                f"{len(req)} decision input(s): the owner re-signs the spec with a dossier before launch"]
-    return []
+    return [f"{rel}: {p}" for p in _preconditions(code, rel, "launch")]
 
 
 def archive_commit(code: bytes) -> str | None:
@@ -1997,6 +1966,9 @@ def relaunch(cfg, label) -> int:
                                  "not relaunching")
         code, commit = code_tarball(cfg)
         pipeline = pipeline_preflight(cfg, code)
+        stale = stale_sheet_problems(code, cfg.flags, pipeline)   # F6 (#218): the launch's checks, on these bytes
+        if stale:
+            raise SystemExit(f"{label}: refusing: " + "; ".join(stale))
         client.upload_file(os.path.join(HERE, "worker_side.py"))
         question, keys = open(cfg.question_file).read().strip(), read_keys()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
@@ -4731,7 +4703,7 @@ def _self_test_sheet(ok) -> None:
     # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
     def rec_for(sp, ev=None):
         return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
-                           "evidence": ev or {"required": [], "dossier": None}}).encode()
+                           "evidence": ev or {"required": [], "dossier": None, "sha256": None}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
                                           f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
@@ -4773,12 +4745,13 @@ def _self_test_sheet(ok) -> None:
     d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
     signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
                                         "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
-                             "evidence": {"required": ["x"], "dossier": "evidence_dossier.yaml"}}).encode()
+                             "evidence": {"required": [], "dossier": "evidence_dossier.yaml",
+                                          "sha256": hashlib.sha256(dos).hexdigest()}}).encode()
     past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
     p_ok = stale_sheet_problems(tar_of(past), flags)
     p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
-    ok(d_fresh == [] and p_ok == [] and len(d_edit) == 1 and "evidence dossier" in d_edit[0] and len(d_gone) == 1
-       and len(p_edit) == 1 and "evidence dossier" in p_edit[0] and "sign" in p_edit[0],
+    ok(d_fresh == [] and p_ok == [] and any("another evidence dossier" in x for x in d_edit)
+       and any("does not exist" in x for x in d_gone) and any("not the one the sign-off recorded" in x for x in p_edit),
        f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
        f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
     # RC82 (#218 review round 1)
@@ -4791,8 +4764,8 @@ def _self_test_sheet(ok) -> None:
                                               "decision_spec.yaml": hashlib.sha256(nspec).hexdigest()}}).encode()}),
                                   flags)
     unsigned = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE")}), flags)
-    ok(spec_state == [] and len(edited) == 1 and "signed" in edited[0] and len(legacy) == 1
-       and "unsigned_evidence" in legacy[0] and len(unsigned) == 1,
+    ok(spec_state == [] and any("not the one signed" in x for x in edited)
+       and any("unsigned_evidence" in x for x in legacy) and any("no sign-off record" in x for x in unsigned),
        f"RC82 a draft at SPEC is not refused; past SIGN, a spec edited after its sign-off (removing `evidence` too), a "
        f"sign-off made before the dossier requirement of a spec that needs one, and no sign-off at all are refused: "
        f"{spec_state} {edited} {legacy} {unsigned}")

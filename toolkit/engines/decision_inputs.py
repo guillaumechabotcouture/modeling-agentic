@@ -27,6 +27,7 @@ Nothing here names a disease; the names come from each engine's card.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -225,6 +226,68 @@ def component_inputs(decl, component: str, value) -> list | None:
             for i in list(d.get("inputs") or []) + list(bv.get(str(value)) or []) if isinstance(i, dict)]
 
 
+def dependency_problems(engine, unit, horizon, outcome: str, decl, oi=None, components=None, base_params=None,
+                        step: float = 0.2, rel_tol: float = 1e-6, seed: int = 1) -> list[str]:
+    """Per-component completeness, by perturbation, not by presence anywhere (#218 review round 3). For each active
+    component value: its incremental effect on `outcome` (per capita, without it minus with it) is recomputed after
+    moving each engine parameter and each numeric unit attribute by `step` (relative; absolute from 0; inside its
+    range). An input that moves the effect must be declared for that component, or as an outcome input; one that is
+    excluded (not_decision_inputs) or declared only for another component is a problem.
+    `components`: {component: value} (default: each card component at its first active value)."""
+    import fnmatch
+    from toolkit.engines.contract import Package, UnitSpec
+    card = engine.describe()
+    comps = components or {c: next(v for v in vals if is_active(decl, c, v)) for c, vals in card.components.items()
+                           if any(is_active(decl, c, v) for v in vals)}
+    base = dict(base_params or {})
+
+    def eff(params, attrs, c, v):
+        u = UnitSpec(unit.id, attrs)
+        a = engine.run(params, u, Package("none", {}), horizon, seed).per_capita[outcome]
+        b = engine.run(params, u, Package(c, {c: v}), horizon, seed).per_capita[outcome]
+        return sum(a.values()) - sum(b.values())
+
+    def moved(x, lo=None, hi=None):
+        y = x * (1 + step) if x else step
+        if hi is not None and y > hi:
+            y = x * (1 - step) if x else -step
+        if lo is not None and y < lo:
+            y = lo if lo != x else (hi if hi is not None else x)
+        return y
+    out = []
+    for c, v in comps.items():
+        allowed = [(i["kind"], i["name"].replace("{component}", c)) for i in component_inputs(decl, c, v) or []]
+        allowed += [(i["kind"], i["name"]) for i in outcome_inputs(oi, [outcome])]
+        e0 = eff(base, unit.attributes, c, v)
+
+        def ok(kind, name):
+            return any(k == kind and fnmatch.fnmatchcase(name, n) for k, n in allowed)
+        for p in engine.parameters():
+            x = float(base.get(p.name, p.value))
+            y = moved(x, p.lo, p.hi)
+            if y == x:
+                continue
+            e1 = eff(dict(base, **{p.name: y}), unit.attributes, c, v)
+            if not math.isclose(e0, e1, rel_tol=rel_tol, abs_tol=1e-15) and not ok("parameter", p.name):
+                out.append(f"{c}={v}: parameter {p.name} moves its effect ({e0:.6g} -> {e1:.6g}) but is not one of "
+                           "its declared inputs")
+        for a, x in unit.attributes.items():
+            if isinstance(x, bool) or not (isinstance(x, (int, float)) or (
+                    isinstance(x, list) and x and all(isinstance(z, (int, float)) and not isinstance(z, bool) for z in x))):
+                continue
+            lo, hi = ((card.valid_ranges or {}).get(a) or [None, None])[:2]
+            y = [moved(float(z), lo, hi) for z in x] if isinstance(x, list) else moved(float(x), lo, hi)
+            try:
+                e1 = eff(base, dict(unit.attributes, **{a: y}), c, v)
+            except ValueError:          # outside what the engine accepts: move the other way
+                y = [float(z) * (1 - step) for z in x] if isinstance(x, list) else float(x) * (1 - step)
+                e1 = eff(base, dict(unit.attributes, **{a: y}), c, v)
+            if not math.isclose(e0, e1, rel_tol=rel_tol, abs_tol=1e-15) and not ok("unit_attribute", a):
+                out.append(f"{c}={v}: unit attribute {a} moves its effect ({e0:.6g} -> {e1:.6g}) but is not one of "
+                           "its declared inputs")
+    return out
+
+
 def is_active(decl, component: str, value) -> bool:
     """Whether component=value has an effect: declared, and not one of its inactive values."""
     d = decl.get(component, decl.get("*")) if isinstance(decl, dict) else None
@@ -244,6 +307,9 @@ def card_vocabulary(engine_dir: str) -> dict:
 
 def _self_test() -> int:
     import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:            # run as a script: the repo root, for the toy engine (DI11)
+        sys.path.insert(0, root)
     fails = []
 
     def ok(cond, msg):
@@ -335,6 +401,27 @@ def _self_test() -> int:
            f"problems; they count for completeness: {got}")
     except NameError as e:
         ok(False, f"DI10: {e}")
+    # DI11 (#218 review round 3): completeness per component, by perturbation, not by presence anywhere
+    try:
+        from toolkit.engines.contract import Horizon, ToyEngine, UnitSpec
+        toy, h = ToyEngine(), Horizon(0, 3, (0, 3), {})
+        part = {"a": {"inputs": [{"kind": "parameter", "name": "eff_a", "why": "w"}]},
+                "b": {"inputs": [{"kind": "parameter", "name": "eff_b", "why": "w"}]}}
+        got = dependency_problems(toy, UnitSpec("u", {"x": 0.5}), h, "cases", part, components={"a": 1, "b": 1})
+        full = {c: {"inputs": [{"kind": "parameter", "name": f"eff_{c}", "why": "w"},
+                               {"kind": "parameter", "name": "base", "why": "w"},
+                               {"kind": "parameter", "name": "k", "why": "w"},
+                               {"kind": "parameter", "name": "noise", "why": "w"},
+                               {"kind": "unit_attribute", "name": "x", "why": "w"}]} for c in ("a", "b")}
+        swapped = {"a": full["b"], "b": full["a"]}
+        ok(any("a=1: parameter base" in g for g in got) and any("unit attribute x" in g for g in got)
+           and dependency_problems(toy, UnitSpec("u", {"x": 0.5}), h, "cases", full, components={"a": 1, "b": 1}) == []
+           and any("a=1: parameter eff_a" in g for g in dependency_problems(toy, UnitSpec("u", {"x": 0.5}), h,
+                                                                            "cases", swapped, components={"a": 1, "b": 1})),
+           f"DI11 an input that moves a component's effect must be declared for that component (declared for another "
+           f"one, or not at all, is a problem): {got[:3]}")
+    except NameError as e:
+        ok(False, f"DI11: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -847,8 +847,8 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     held = PV.signoff_refusals(spec_doc if isinstance(spec_doc, dict) else {}, run_dir=run_dir)
     if held:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
-    from toolkit.spec import evidence_dossier as ED    # F6: the shared evidence check-and-bind, whoever signs
-    ev = ED.bind(run_dir, data)
+    from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
+    ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
@@ -857,15 +857,19 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     return rec
 
 
-def _dossier_for_choice(run_dir: str, spec: dict, ref: str, cfg: dict) -> list[str]:
-    """ENGINE_CHOICE's re-check (F6 evidence dossier): why the signed dossier does not cover the chosen engine's
-    decision inputs (empty: it does). Fail closed on an error."""
+POST_CHOICE_STATES = ("CONFIGURE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE",
+                      "PRESENTATION")
+
+
+def evidence_gate(run_dir: str, engine: tuple | None = None) -> list[str]:
+    """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
+    compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
+    on every resume past it, before any compute. Empty: they hold. Fail closed on an error."""
     try:
-        from toolkit.spec import evidence_dossier as ED
-        raw = {k: v for k, v in (spec or {}).items() if k != "_run_dir"}
-        return ED.choice_refusals(run_dir, raw, ref, cfg)
+        from toolkit.spec import preconditions as PC
+        return PC.problems(run_dir, None, "resume", engine=engine)
     except Exception as e:  # noqa: BLE001
-        return [f"the dossier could not be checked against {ref}: {type(e).__name__}: {e}"]
+        return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
 
 # ------------------------------------------------------------------ the machine
@@ -1092,6 +1096,12 @@ class Machine:
         return getattr(self, "h_" + s)()
 
     def run(self, max_steps: int = 200) -> str:
+        if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
+            miss = evidence_gate(self.run_dir)
+            if miss:
+                self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
+                save_state(self.run_dir, self.st)
+                return self.st.status or self.st.state
         for _ in range(max_steps):
             before = (self.st.state, len(self.st.history))
             self.step()
@@ -1214,7 +1224,7 @@ class Machine:
         else:
             why = (res.output or {}).get("why", "")
         cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
-        miss = _dossier_for_choice(self.run_dir, spec, pick, cfg)
+        miss = evidence_gate(self.run_dir, engine=(pick, cfg))
         if miss:            # F6: the signed dossier must cover the engine actually chosen, before any compute
             _write_json(self.run_dir, AB.ENGINE_CHOICE, dict(rec, evidence_refused={"engine": pick, "why": miss}))
             return self._go("FINAL", f"the signed evidence dossier does not cover {pick}'s decision inputs: "

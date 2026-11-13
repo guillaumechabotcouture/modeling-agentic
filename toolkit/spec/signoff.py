@@ -94,34 +94,28 @@ def burden_changed(run_dir: str, rec: dict) -> list[str]:
     return [] if signed is not None and signed == now else [rel]
 
 
-def _evidence_state(run_dir: str, rec: dict) -> str:
-    """toolkit/spec/evidence_dossier.py evidence_state on the spec as it is now (unreadable: changed)."""
-    import yaml
-    from toolkit.spec import evidence_dossier as ED
-    try:
-        doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
-    except Exception:  # noqa: BLE001 -- unreadable: changed
-        return "changed"
-    return ED.evidence_state(run_dir, doc if isinstance(doc, dict) else {}, rec)
+def preconditions_state(run_dir: str, rec: dict | None = None) -> tuple:
+    """(status, problems) of the run's registered preconditions (toolkit/spec/preconditions.py), recomputed from the
+    files: "ok", or the evidence check's own status (unsigned_evidence | changed | evidence_incomplete), else
+    "preconditions_failed"."""
+    from toolkit.spec import preconditions as PC
+    cap: dict = {}
+    bad = PC.problems(run_dir, None, "status", record=rec, capture=cap)
+    if not bad:
+        return "ok", []
+    ev = cap.get("evidence_status")
+    return (ev if ev and ev != "ok" else "preconditions_failed"), bad
 
 
 def dossier_changed(run_dir: str, rec: dict) -> list[str]:
-    """F6 evidence dossier: the dossier, when the sign-off's evidence binding no longer holds (its bytes changed, or
-    the sign-off predates the requirement and the options need decision inputs); fail closed."""
-    from toolkit.spec import evidence_dossier as ED
-    if _evidence_state(run_dir, rec) == "ok":
-        return []
-    try:
-        import yaml
-        doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
-    except Exception:  # noqa: BLE001
-        doc = {}
-    return [ED.dossier_reference(doc) or ED.DOSSIER_FILE]
+    """F6 evidence dossier: the problems that make the sign-off's evidence binding not hold (empty: it holds)."""
+    return preconditions_state(run_dir, rec)[1]
 
 
 def status(run_dir: str) -> str:
-    """absent | invalid | awaiting | changed | signed | unsigned_evidence (signed before the evidence-dossier
-    requirement, of a spec whose options need decision inputs: it must be re-signed with a dossier)."""
+    """absent | invalid | awaiting | changed | signed, or a precondition's status for a signed run whose
+    preconditions do not hold now: unsigned_evidence (signed without a complete evidence binding where the options
+    need decision inputs), evidence_incomplete (the inputs required now are not covered), preconditions_failed."""
     path = os.path.join(run_dir, SPEC)
     rec = _spec_record(run_dir)
     if not os.path.exists(path):
@@ -130,8 +124,8 @@ def status(run_dir: str) -> str:
         if DB._sha(path) != (rec.get("sha256") or {}).get(SPEC) or derived_changed(run_dir, rec) \
                 or burden_changed(run_dir, rec):
             return "changed"
-        ev = _evidence_state(run_dir, rec)
-        return "signed" if ev == "ok" else ev
+        st = preconditions_state(run_dir, rec)[0]
+        return "signed" if st == "ok" else st
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
@@ -184,6 +178,22 @@ def _sha_nofollow(run_dir: str, rel: str) -> str | None:
         raise ValueError(f"{rel}: {e}") from None
 
 
+def sign_preconditions(run_dir: str, spec_bytes: bytes) -> dict:
+    """What every signer calls (this module, scripts/decision_brief.py, agents/stage_machine.py): every registered
+    precondition on the spec bytes being signed, refused (ValueError) on any problem; returns the evidence binding
+    ({files, record}) to record."""
+    from toolkit.spec import preconditions as PC
+    cap: dict = {}
+    bad = PC.problems(run_dir, spec_bytes, "sign", capture=cap)
+    if bad:
+        raise ValueError("spec not signable (preconditions): " + "; ".join(bad[:12])
+                         + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
+    b = cap.get("evidence_binding")
+    if not isinstance(b, dict):
+        raise ValueError("spec not signable (preconditions): the evidence check returned no binding")
+    return b
+
+
 def signed_sha(run_dir: str) -> str | None:
     rec = _spec_record(run_dir)
     return (rec.get("sha256") or {}).get(SPEC) if rec else None
@@ -213,10 +223,6 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if brel and bdata is None:
         raise ValueError(f"{brel} (the validation.burden reference file) does not exist")
     bsha = hashlib.sha256(bdata).hexdigest() if bdata is not None else None
-    from toolkit.spec import evidence_dossier as ED
-    # F6 evidence dossier: read once here (the sheet check uses its hash); checked and bound below from these bytes
-    erel, edata = captured_ev = ED.capture(run_dir, data)
-    esha = ED.sha(edata)
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
@@ -241,10 +247,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
     if sheet_bytes is not None and (
             src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
-            or (brel is not None and src.get("burden_references_sha256") != bsha)
-            or (erel is not None and src.get("evidence_dossier_sha256") != esha)):
-        raise ValueError(f"{SHEET} was generated from another spec, derivation record, reference file or evidence "
-                         "dossier (it is stale): the sheet is regenerated before the owner signs; read the new one")
+            or (brel is not None and src.get("burden_references_sha256") != bsha)):
+        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
+                         "stale): the sheet is regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -258,9 +263,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
-    # the one check-and-bind of every signing path: refused, whoever signs, when the inputs the options need are not
-    # covered; the same dossier bytes the sheet check hashed
-    evidence = ED.bind(run_dir, data, captured=captured_ev)
+    # every registered precondition (toolkit/spec/preconditions.py), recomputed from the files, whoever signs; the
+    # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
+    evidence = sign_preconditions(run_dir, data)
     extra.update(evidence["files"])
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
@@ -931,7 +936,7 @@ def _self_test() -> int:
             write_sheet(d)
             md = open(os.path.join(d, SHEET)).read()
             sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
-            ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.6" in sec
+            ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.7" in sec
                and "DT_eff_a" in sec and "no data" in sec and "0.5" in sec,
                f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
                f"test): {sec[:600]!r}")
@@ -946,7 +951,7 @@ def _self_test() -> int:
                f"ED4 a complete dossier (with a 'no data' entry and its borrowing rule) signs and its hash is recorded: "
                f"{sorted(rec['sha256'])}")
             open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after sign-off\n")
-            ok(status(d) == "changed" and dossier_changed(d, _spec_record(d)) == ["evidence_dossier.yaml"],
+            ok(status(d) == "changed" and bool(dossier_changed(d, _spec_record(d))),
                f"ED6 a dossier edit after sign-off makes the signature stale: {status(d)}")
         with tempfile.TemporaryDirectory() as d:
             ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
@@ -990,6 +995,7 @@ def _self_test() -> int:
                f"ED11a the stage machine's sign-off refuses it too: {why}")
         with tempfile.TemporaryDirectory() as d:
             ED.toy_dossier_spec(d)
+            write_sheet(d)                  # the stage machine signer, too, binds what the sheet showed
             rec = SM.sign(d, "owner", "n")
             ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
                and (rec.get("evidence_sha256") or {}).get("evidence_dossier.yaml"),
@@ -1027,7 +1033,8 @@ def _self_test() -> int:
             empty = {"files": {}, "record": {"required": [], "dossier": None, "sha256": None}}
             w1 = brief_refusal(d, evidence=empty)
             ED.toy_dossier_spec(other)
-            foreign = ED.bind(other, open(os.path.join(other, SPEC), "rb").read())
+            write_sheet(other)
+            foreign = sign_preconditions(other, open(os.path.join(other, SPEC), "rb").read())
             w2 = brief_refusal(d, evidence=foreign)
             ok("evidence dossier" in w1 and w2 and status(d) != "signed",
                f"ED14 a caller's binding is never trusted: an empty one and one made for another spec are refused "
@@ -1037,7 +1044,8 @@ def _self_test() -> int:
             brief(d)
             ED.toy_dossier_spec(other)
             open(os.path.join(other, "evidence_dossier.yaml"), "a").write("# another dossier\n")
-            foreign = ED.bind(other, open(os.path.join(other, SPEC), "rb").read())
+            write_sheet(other)
+            foreign = sign_preconditions(other, open(os.path.join(other, SPEC), "rb").read())
             w3 = brief_refusal(d, evidence=foreign)
             w4 = brief_refusal(d, evidence={"files": {}, "record": {"required": [], "dossier": None, "sha256": None}})
             ok("binding supplied" in w3 and "binding supplied" in w4 and status(d) != "signed",
