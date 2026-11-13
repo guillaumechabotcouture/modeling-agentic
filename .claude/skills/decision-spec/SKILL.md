@@ -125,16 +125,15 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     missing, unparseable or incomplete dossier and a blank field, and lists what is missing,
     whether or not the spec names a dossier. The sheet shows the table and the signature
     binds the file, so an edit after sign-off needs a new sign-off.
-    Each entry is checked against what execution uses:
-    - A parameter the run calibrates attests its declared prior range and names its
-      `calibration_targets`.
-    - A drawn or fitted parameter gives that range and cites the automatic test the runner
-      generates for it (`prior_range_<p>` or `fitted_range_<p>`).
-    - Any other parameter gives the value the engine runs (its default, or the spec's value).
-    - A unit attribute gives the literal or default the run uses; when it varies by unit,
-      it gives the units' min, median and max (numbers) or the sha256 of the per-unit
-      values.
-    - A card table gives its content sha256.
+    The gate checks coverage and validity only. A range must cite a decision test the run
+    executes that varies the input: the automatic test the runner generates for it
+    (`prior_range_<p>` or `fitted_range_<p>`), or a `parameter_value` test that runs on this
+    run's path and covers the range. An input the run calibrates is varied by the
+    calibration itself. The sheet shows, next to each choice, the value or range execution
+    will use, and lists at its top every input where they differ, for the owner to decide;
+    a difference never blocks signing. Signing binds every file the run reads (the spec, the
+    files it names, the dossier and the engine's files), so any later change makes the run
+    stale. Give observations as a list.
 
 ## Closed-population epidemic questions (the compartmental engine)
 

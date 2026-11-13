@@ -367,11 +367,15 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         esha = ED.sha(ebytes)
     except ValueError:
         ebytes, esha = None, "unreadable"
+    # #218 round 5: the input closure the signature will bind, recorded on the sheet (the files listed, its digest)
+    st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
+    closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes, dossier_bytes=ebytes)
+                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "evidence_dossier_sha256": esha,
+                      "input_closure_sha256": ED.closure_digest(closure),
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
@@ -381,7 +385,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
-          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None) -> str:
+          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -451,7 +455,7 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
             dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
         except ValueError:
             dossier_bytes = None
-    out += ED.sheet_lines(raw, run_dir, dossier_bytes)  # F6: each decision input, model vs field, the chosen range
+    out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

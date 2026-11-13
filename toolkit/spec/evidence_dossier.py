@@ -29,11 +29,14 @@ shows it as a table and the signature binds its sha256, so an edit after sign-of
 No field may be blank at any depth, and text fields must be text. The inputs the options need decide whether a
 dossier is required, not whether the spec names one.
 
-One function decides (#218 review round 3): state() recomputes everything from the run's files every time (the
-required inputs on the chosen or every eligible engine; coverage and validity; each entry against the value the run
-uses, card defaults and structured literals included; a chosen range containing the draw support and covered by a
-decision test that executes on this run's path; and the sheet's and the sign-off record's sha256 against the current
-bytes). A stored record is only compared, never trusted. It is registered in toolkit/spec/preconditions.py, which
+One function decides (#218 reviews rounds 3-5): state() recomputes everything from the run's files every time. It
+gates on coverage and validity only: every decision input of the components and outcomes in use has a complete,
+sourced entry, and a range has a decision test the run executes. It binds the run's input closure (every file the
+run reads for this spec: the spec, the files it names, the dossier, the derivation record and its outputs, and the
+engine's priors, fitted values, benchmarks, binding, card and declarations from the shipped tree), so any change
+after signing is stale on every path. It never refuses a value: the sheet shows what execution will use (computed
+with execution's own functions) next to each choice and lists where they differ, for the owner to decide. A stored
+record is only compared, never trusted. It is registered in toolkit/spec/preconditions.py, which
 every path calls: the three signers, signoff.status, the launch and relaunch checks (cloud/run_cluster.py), and the
 stage machine at ENGINE_CHOICE and on resume. toolkit/spec/evidence_regressions.py drives every bypass the reviews
 found through every path. Nothing here names a disease; the inputs come from the engine's card.
@@ -348,23 +351,22 @@ def card_table_sha256(ref: str, name: str) -> str | None:
     return hashlib.sha256(_canon(c[name]).encode()).hexdigest() if isinstance(c, dict) and name in c else None
 
 
-def _calibrated(r: dict, run: dict) -> tuple | None:
-    """(declared range, where) when the run calibrates this input (its value comes out of the run, not the spec): a
-    parameter the calibration fits (calibration.parameters or calibration.priors), or the calibration attribute."""
+def _calibrated_by_run(r: dict, run: dict) -> str | None:
+    """The calibration method when the run itself calibrates this input (its value comes out of the run): a parameter
+    in calibration.parameters, or the calibration attribute; else None. Only what execution calibrates counts (a
+    name merely listed under calibration.priors does not)."""
     cal = run.get("calibration") if isinstance(run.get("calibration"), dict) else {}
-    if cal.get("method") in (None, "none"):
+    m = cal.get("method")
+    if m in (None, "none"):
         return None
-    if r["kind"] == "parameter":
-        pri = cal.get("priors") if isinstance(cal.get("priors"), dict) else {}
-        names = set(cal.get("parameters") or []) | set(pri)
-        if r["name"] in names:
-            q = pri.get(r["name"]) if isinstance(pri.get(r["name"]), dict) else {}
-            return q.get("range"), f"calibration.priors.{r['name']}.range"
+    if r["kind"] == "parameter" and r["name"] in (cal.get("parameters") or []):
+        return m
     if r["kind"] == "unit_attribute" and cal.get("attribute") == r["name"]:
-        return cal.get("range"), "calibration.range"
+        return m
     return None
 
 
+# ----------------------------------------------------------------------------------- advice (shown, never refused)
 def _unit_values(r: dict, run: dict, run_dir: str | None, ref: str, cfg: dict, memo: dict):
     """(values per unit, how they are bound) as execution builds them: the spec's binding (schema unit_attributes), or
     the card's attribute_binding default for one accepted by name; (None, why) when they cannot be read."""
@@ -380,113 +382,115 @@ def _unit_values(r: dict, run: dict, run_dir: str | None, ref: str, cfg: dict, m
             res = ([s.unit_attributes(row).get(r["name"]) for row in s.units()],
                    "column" if "value" not in (ea[r["name"]] or {}) else "value")
         except Exception as e:  # noqa: BLE001
-            res = (None, f"the units table cannot be read ({type(e).__name__}: {e})")
+            res = (None, f"the units table cannot be read ({type(e).__name__})")
     else:
         try:
             b, _ = schema.load_binding(schema.engine_class(ref)(**(cfg or {})))
             rule = schema.binding_rule(b, r["name"])
             res = ([rule["default"]], "default") if isinstance(rule, dict) and "default" in rule else (None, "unbound")
         except Exception as e:  # noqa: BLE001
-            res = (None, f"the engine's attribute binding cannot be read ({type(e).__name__}: {e})")
+            res = (None, f"the engine's attribute binding cannot be read ({type(e).__name__})")
     memo[key] = res
     return res
 
 
-def _value_problems(key: str, e: dict, r: dict, ch: dict, run: dict, run_dir: str | None, memo: dict) -> list[str]:
-    """The dossier reconciles with what execution uses, from execution's own functions (#218 review round 4). An input
-    the run calibrates attests its declared prior or search range and its calibration targets (no point value exists
-    before the run). A drawn or fitted parameter attests its declared range and cites the automatic test the runner
-    generates for it (its endpoints are a run-time product). Any other parameter: the model value is the value
-    execution uses (resolve_params; fitted.yaml), and a chosen value equals it or a chosen range contains it. A unit
-    attribute: the literal or default execution uses, or, when it varies by unit, the units' summary (min, median, max)
-    or the sha256 of the per-unit values. A card table: its content sha256."""
-    bad: list = []
-    cal = _calibrated(r, run)
-    if cal is not None:
-        rng, where = cal
-        if not _range_eq(ch.get("range"), rng):
-            bad.append(f"entry {key}: the run calibrates it: chosen.range must be the declared range {rng} ({where}), "
-                       f"not {ch.get('range', ch.get('value'))!r}")
-        if not _text(e.get("calibration_targets")):
-            bad.append(f"entry {key}: name its calibration targets (calibration_targets)")
-        return bad
+def _execution_view(r: dict, run: dict, run_dir: str | None, memo: dict):
+    """(what execution will use: a value, a [lo, hi] range or a {min, median, max} summary, or None, and a short
+    description), computed with execution's own functions: resolve_params and fitted ranges, the draw plan, the
+    calibration's prior (calibration.Prior.from_decl) or the likelihood's search bounds (the engine's range), the
+    units' values (schema unit_attributes, binding defaults), a card table's content sha256."""
+    m = _calibrated_by_run(r, run)
+    cal = run.get("calibration") if isinstance(run.get("calibration"), dict) else {}
     for ref, cfg in r.get("engines") or []:
-        if r["kind"] == "card_table":
-            want = card_table_sha256(ref, r["name"])
-            got = e.get("model_value")
-            if want is None:
-                bad.append(f"entry {key}: {ref} has no card table {r['name']} to compare")
-            elif not (isinstance(got, dict) and got.get("sha256") == want):
-                bad.append(f"entry {key}: model_value must name the card table's content sha256 ({want}), not {got!r}")
-            continue
-        if r["kind"] == "unit_attribute":
-            vals, how = _unit_values(r, run, run_dir, ref, cfg, memo)
-            if vals is None:
-                if how != "unbound":
-                    bad.append(f"entry {key}: {how}")
-                continue
-            if all(_same(v, vals[0]) for v in vals):
-                x = vals[0]
-                if not _same(e.get("model_value"), x):
-                    bad.append(f"entry {key}: model_value {e.get('model_value')!r} is not the value the run uses "
-                               f"({how}: {x!r})")
-                if ch.get("value") is not None and not _same(ch["value"], x):
-                    bad.append(f"entry {key}: chosen.value {ch['value']!r} is not the value the run uses ({how}: {x!r})")
-            elif all(_num(v) for v in vals):
-                import statistics
-                summ = {"min": min(vals), "median": statistics.median(vals), "max": max(vals)}
-                got = e.get("model_value")
-                if not (isinstance(got, dict) and all(_num(got.get(k)) and _same(float(got[k]), float(summ[k]))
-                                                      for k in summ)):
-                    bad.append(f"entry {key}: model_value must give the per-unit values' summary {summ} (min, median, "
-                               f"max of the {how}), not {got!r}")
-            else:
-                want = hashlib.sha256(_canon(vals).encode()).hexdigest()
-                got = e.get("model_value")
-                if not (isinstance(got, dict) and got.get("sha256") == want):
-                    bad.append(f"entry {key}: model_value must name the sha256 of the per-unit values ({want}, in "
-                               f"unit order), not {got!r}")
-            continue
         try:
+            if r["kind"] == "card_table":
+                h = card_table_sha256(ref, r["name"])
+                return ({"sha256": h} if h else None), "the card table's content"
+            if m is not None:
+                pri = (cal.get("priors") or {}).get(r["name"]) if isinstance(cal.get("priors"), dict) else None
+                if m == "posterior" and isinstance(pri, dict):
+                    from toolkit.analysis.calibration import Prior
+                    p = Prior.from_decl(r["name"], pri)
+                    return [float(p.lo), float(p.hi)], f"the posterior's {p.dist} prior"
+                if r["kind"] == "unit_attribute":
+                    return (list(cal.get("range")) if isinstance(cal.get("range"), list) else None,
+                            "the calibration's search range")
+                ex = _exec_context(ref, cfg, memo, run, run_dir)
+                rg = ex["ranges"].get(r["name"])
+                return (list(rg) if rg else None), "the bounds the likelihood searches (the engine's range)"
+            if r["kind"] == "unit_attribute":
+                vals, how = _unit_values(r, run, run_dir, ref, cfg, memo)
+                if vals is None:
+                    return None, how
+                if all(_same(v, vals[0]) for v in vals):
+                    return vals[0], f"the {how} every unit runs"
+                if all(_num(v) for v in vals):
+                    import statistics
+                    return ({"min": min(vals), "median": statistics.median(vals), "max": max(vals)},
+                            f"the per-unit {how} values")
+                return {"sha256": hashlib.sha256(_canon(vals).encode()).hexdigest()}, f"the per-unit {how} values"
             ex = _exec_context(ref, cfg, memo, run, run_dir)
-        except Exception as e_:  # noqa: BLE001
-            bad.append(f"entry {key}: {ref} cannot be resolved ({type(e_).__name__}: {e_})")
-            continue
-        bad += ex["problems"]
-        name = r["name"]
-        varied = ex["drawn"].get(name) or ex["fitted"].get(name)
-        if varied is not None:
-            gen = ex["generated"].get(name)
-            if not _range_eq(ch.get("range"), varied):
-                bad.append(f"entry {key}: the uncertainty draws vary it over {list(varied)} on {ref}: chosen.range "
-                           f"must be that declared range, not {ch.get('range', ch.get('value'))!r}")
-            if gen and e.get("decision_test") != gen:
-                bad.append(f"entry {key}: decision_test must be {gen}, the automatic test the runner generates for it "
-                           f"(not {e.get('decision_test')!r})")
-        x = ex["values"].get(name)
-        if x is None:
-            bad.append(f"entry {key}: {name} is not a parameter of {ref}")
-            continue
-        where = f"engine_parameters.{name}.value" if name in ((run.get("engine_parameters") or {}) if isinstance(
-            run.get("engine_parameters"), dict) else {}) else f"the value {ref} runs"
-        if not _same(e.get("model_value"), x):
-            bad.append(f"entry {key}: model_value {e.get('model_value')!r} is not the value the run uses ({where} = {x!r})")
-        if varied is None:
-            rg = ch.get("range")
-            if rg is not None:
-                if isinstance(rg, list) and len(rg) == 2 and all(_num(y) for y in rg) and not rg[0] <= x <= rg[1]:
-                    bad.append(f"entry {key}: the value the run uses ({where} = {x!r}) is outside the chosen range {rg}")
-            elif ch.get("value") is not None and not _same(ch["value"], x):
-                bad.append(f"entry {key}: chosen.value {ch['value']!r} is not the value the run uses ({where} = {x!r})")
-    return sorted(set(bad), key=bad.index)
+            varied = ex["drawn"].get(r["name"]) or ex["fitted"].get(r["name"])
+            if varied is not None:
+                return list(varied), "the range the uncertainty draws vary it over"
+            if r["name"] in ex["values"]:
+                return ex["values"][r["name"]], "the value execution uses (resolve_params)"
+        except Exception as e:  # noqa: BLE001 -- shown as not computed, never a silent pass
+            return None, f"not computed ({type(e).__name__}: {str(e)[:80]})"
+    return None, "not computed"
 
 
+def _differs(x, ch: dict):
+    """True / False / None (cannot be compared numerically or structurally)."""
+    if x is None:
+        return None
+    v, rg = ch.get("value"), ch.get("range")
+    isrange = lambda z: isinstance(z, list) and len(z) == 2 and all(_num(y) for y in z)  # noqa: E731
+    if isinstance(x, dict) and set(x) == {"min", "median", "max"}:
+        if _num(v):
+            return not x["min"] <= v <= x["max"]
+        if isrange(rg):
+            return not (rg[0] <= x["min"] and rg[1] >= x["max"])
+        return None
+    if isrange(x) and isrange(rg):
+        return not _range_eq(x, rg)
+    if isrange(x) and _num(v):
+        return not x[0] <= v <= x[1]
+    if _num(x) and isrange(rg):
+        return not rg[0] <= x <= rg[1]
+    if v is not None:
+        return not _same(v, x)
+    return None
+
+
+def _advise_one(r: dict, e, run: dict, run_dir: str | None, memo: dict) -> dict:
+    x, how = _execution_view(r, run, run_dir, memo)
+    ch = e.get("chosen") if isinstance(e, dict) and isinstance(e.get("chosen"), dict) else {}
+    return {"execution": x, "how": how, "chosen": ch.get("range", ch.get("value")), "differs": _differs(x, ch)}
+
+
+def advise(raw: dict, run_dir: str | None, data: bytes | None) -> dict:
+    """{input: {execution, how, chosen, differs}} for the sheet: what execution will use next to the dossier's choice.
+    Advisory: shown to the owner, never a refusal and never a silent pass."""
+    import yaml
+    memo: dict = {}
+    try:
+        req, _ = required_inputs(raw, run_dir)
+        doc = yaml.safe_load(data.decode("utf-8")) if data is not None else None
+    except Exception:  # noqa: BLE001
+        return {}
+    ins = doc.get("inputs") if isinstance(doc, dict) and isinstance(doc.get("inputs"), dict) else {}
+    return {k: _advise_one(req[k], ins.get(k), raw, run_dir, memo) for k in sorted(req)}
+
+
+# ----------------------------------------------------------------------------------- the gate (coverage, validity)
 def _test_problems(key: str, r: dict, rng: list, tid: str, run: dict, run_dir: str | None, memo: dict) -> list[str]:
-    """A range on a parameter the run holds fixed: its decision test executes on this run's path, varies it, and
-    covers the range (toolkit/spec/preconditions.py decision_test_runs). Calibrated, drawn and fitted parameters are
-    checked against their declared range and generated test instead (_value_problems)."""
+    """A range needs a decision test the run will execute that varies this input: the automatic test the runner's own
+    generator names for it (decision_tests.prior_range_tests), or a declared test the runner's planner runs on this
+    path (preconditions.decision_test_runs) whose values cover the range. An input the run calibrates is varied by
+    the calibration itself."""
     from toolkit.spec import preconditions as PC
-    if _calibrated(r, run) is not None:
+    if _calibrated_by_run(r, run) is not None:
         return []
     if r["kind"] != "parameter":
         return [f"entry {key}: no decision test type varies a {r['kind']} (parameter_value varies engine parameters): "
@@ -498,7 +502,12 @@ def _test_problems(key: str, r: dict, rng: list, tid: str, run: dict, run_dir: s
         except Exception as e:  # noqa: BLE001
             bad.append(f"entry {key}: {ref} cannot be resolved ({type(e).__name__}: {e})")
             continue
-        if (ex["drawn"].get(r["name"]) or ex["fitted"].get(r["name"])) is not None:
+        gen = ex["generated"].get(r["name"])
+        if tid == gen:
+            continue
+        if tid.startswith(("prior_range_", "fitted_range_")):
+            bad.append(f"entry {key}: {tid} is not a test the runner generates for {r['name']} on {ref} (it is not "
+                       f"drawn; the runner generates {gen or 'none'} for it)")
             continue
         draws = dict(ex["fitted"], **ex["drawn"])
         try:
@@ -517,24 +526,39 @@ def _test_problems(key: str, r: dict, rng: list, tid: str, run: dict, run_dir: s
     return sorted(set(bad), key=bad.index)
 
 
+def _blank_value(v) -> bool:
+    """A value field is blank when it is None or blank text, or holds one; an empty list or mapping is a value."""
+    if isinstance(v, (list, tuple)):
+        return any(_blank_value(x) for x in v)
+    if isinstance(v, dict):
+        return any(_blank_value(x) for x in v.values())
+    return _blank(v)
+
+
 def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: dict) -> list[str]:
+    """Coverage and validity only (#218 review round 5): a complete, sourced, non-blank entry, and for a range a
+    decision test the run executes. What the entry says against what execution uses is advice on the sheet."""
     if not isinstance(e, dict) or not e:
         return [f"entry {key} is blank: give model_value, model_source, observations or no_data, and chosen"]
-    bad = [f"entry {key}: model_value is blank" for _ in [0] if _blank(e.get("model_value"))]
+    bad = [f"entry {key}: model_value is blank" for _ in [0] if "model_value" not in e or _blank_value(e["model_value"])]
     bad += [f"entry {key}: model_source is blank or not text" for _ in [0] if not _text(e.get("model_source"))]
     obs, nd = e.get("observations"), e.get("no_data")
-    has_obs, has_nd = obs not in (None, [], {}), nd not in (None, {})
+    if obs is not None and not isinstance(obs, list):
+        bad.append(f"entry {key}: observations must be a list of {{source, where, year, sites, n, sampling_frame, "
+                   "value}} (one observation is a list of one)")
+        obs = None
+    has_obs, has_nd = bool(obs), nd not in (None, {})
     if has_obs == has_nd:
         bad.append(f"entry {key}: give exactly one of observations and no_data")
     if has_obs:
-        for j, o in enumerate(obs if isinstance(obs, list) else [obs]):
+        for j, o in enumerate(obs):
             if not isinstance(o, dict):
                 bad.append(f"entry {key}: observations[{j}] is not a mapping")
                 continue
             bad += [f"entry {key}: observations[{j}].{f} is blank or not text"
                     for f in ("source", "where", "sampling_frame") if not _text(o.get(f))]
             bad += [f"entry {key}: observations[{j}].{f} is blank" for f in ("year", "sites", "n", "value")
-                    if _blank(o.get(f))]
+                    if f not in o or _blank_value(o[f])]
         if not _text(e.get("comparison")):
             bad.append(f"entry {key}: comparison is blank (how the observations compare with the model value)")
     if has_nd:
@@ -546,32 +570,108 @@ def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: 
     has_v, has_r = "value" in ch and ch["value"] is not None, "range" in ch and ch["range"] is not None
     if has_v == has_r:
         bad.append(f"entry {key}: chosen needs exactly one of value and range")
-    elif has_v and _blank(ch["value"]):
+    elif has_v and _blank_value(ch["value"]):
         bad.append(f"entry {key}: chosen.value is blank")
     elif has_r:
         rg = ch["range"]
         if not (isinstance(rg, list) and len(rg) == 2 and all(_num(x) for x in rg) and rg[0] <= rg[1]):
             bad.append(f"entry {key}: chosen.range must be [lo, hi] with lo <= hi")
-        elif _calibrated(r, run) is None and not _varied(r, run, run_dir, memo):
+        elif _calibrated_by_run(r, run) is None:
             if not _text(e.get("decision_test")):
-                bad.append(f"entry {key}: a range needs its decision_test (one that varies this input over the range)")
+                bad.append(f"entry {key}: a range needs its decision_test (one the run executes that varies it)")
             else:
                 bad += _test_problems(key, r, rg, e["decision_test"].strip(), run, run_dir, memo)
-    return bad + _value_problems(key, e, r, ch, run, run_dir, memo)
+    return bad
 
 
-def _varied(r: dict, run: dict, run_dir: str | None, memo: dict) -> bool:
-    """Whether the uncertainty draws vary this parameter on some engine (a drawn prior or a fitted parameter)."""
-    if r["kind"] != "parameter":
-        return False
-    for ref, cfg in r.get("engines") or []:
+# ----------------------------------------------------------------------------------- the input closure
+def _string_leaves(x):
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from _string_leaves(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _string_leaves(v)
+
+
+def _engine_files(ref: str, cfg: dict) -> set:
+    """The files execution reads for this engine, from its own resolution: priors (priors.priors_path), fitted values
+    (fitted_path), benchmark results (results_path), its benchmark pack (engine_parameters.benchmark_pack), and, in
+    each class's directory, the attribute binding, the card and the decision-input declarations."""
+    import inspect
+    from toolkit.spec import schema, priors as PRI
+    from toolkit.spec import engine_parameters as EP
+    eng = schema.engine_class(ref)(**(cfg or {}))
+    out = {PRI.priors_path(eng), getattr(eng, "fitted_path", None), getattr(eng, "results_path", None)}
+    try:
+        pk = EP.benchmark_pack(eng)
+        if isinstance(pk, tuple) and isinstance(pk[1], str) and os.path.isfile(pk[1]):
+            out.add(pk[1])
+    except Exception:  # noqa: BLE001 -- an unreadable pack: execution refuses it on its own
+        pass
+    for k in type(eng).__mro__:
         try:
-            ex = _exec_context(ref, cfg, memo, run, run_dir)
-        except Exception:  # noqa: BLE001
+            d = os.path.dirname(os.path.abspath(inspect.getfile(k)))
+        except (TypeError, OSError):
             continue
-        if (ex["drawn"].get(r["name"]) or ex["fitted"].get(r["name"])) is not None:
-            return True
-    return False
+        out |= {os.path.join(d, f) for f in (schema.BINDING_FILE, "card.yaml", DI.FILE)}
+    return {p for p in out if isinstance(p, str) and os.path.isfile(p)}
+
+
+def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: list) -> dict:
+    """{"run:<path>" | "tree:<path>": sha256} of every file the run reads for this spec: the spec; every path the spec
+    names that resolves to a file in the run (its units table, calibration targets and data, reference files); the
+    evidence dossier; the derivation record and the outputs it lists; and each engine's files from the code tree (its
+    priors, fitted values, benchmark results and pack, attribute binding, card and declarations). Bound at signing
+    and recorded on the sheet: any change after signing makes the run stale."""
+    out = {"run:decision_spec.yaml": sha(spec)}
+    for leaf in _string_leaves(run):
+        s_ = leaf.strip()
+        if not s_ or len(s_) > 300 or os.path.isabs(s_) or ".." in s_.replace("\\", "/").split("/") \
+                or "\n" in s_ or "." not in os.path.basename(s_):
+            continue
+        try:
+            b = read(s_)
+        except ValueError:
+            b = None
+        if b is not None:
+            out[f"run:{s_}"] = sha(b)
+    try:
+        rec = read("data/derivations_record.json")
+    except ValueError:
+        rec = None
+    if rec is not None:
+        out["run:data/derivations_record.json"] = sha(rec)
+        try:
+            derivs = (json.loads(rec.decode()) or {}).get("derivations") or {}
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            derivs = {}
+        for e in derivs.values() if isinstance(derivs, dict) else []:
+            for o in ((e or {}).get("outputs") or {}) if isinstance(e, dict) else {}:
+                try:
+                    b = read(str(o))
+                except ValueError:
+                    b = None
+                out[f"run:{o}"] = sha(b)
+    root = os.path.realpath(ROOT)
+    for ref, cfg in engines:
+        try:
+            files = _engine_files(ref, cfg)
+        except Exception as e:  # noqa: BLE001
+            out[f"tree:<{ref}>"] = f"unreadable: {type(e).__name__}"
+            continue
+        for p in sorted(files):
+            rp = os.path.realpath(p)
+            key = "tree:" + (os.path.relpath(rp, root) if rp.startswith(root + os.sep) else rp)
+            with open(rp, "rb") as f:
+                out[key] = hashlib.sha256(f.read()).hexdigest()
+    return dict(sorted(out.items()))
+
+
+def closure_digest(closure: dict) -> str:
+    return hashlib.sha256(_canon(closure).encode()).hexdigest()
 
 
 def check(raw: dict, data: bytes | None, req: dict, rel: str = DOSSIER_FILE, run_dir: str | None = None,
@@ -631,7 +731,7 @@ SHEET = "decision_spec.signoff_sheet.md"
 SHEET_SOURCES = "<!-- signoff-sheet-sources: "       # toolkit/spec/signoff.py SHEET_SOURCES
 RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")
 ENGINE_CHOICE = "engine_choice.json"
-EVIDENCE_KEYS = ("required", "dossier", "sha256", "declarations")
+EVIDENCE_KEYS = ("required", "dossier", "sha256", "declarations", "closure")
 
 
 def _sheet_sources(text) -> dict | None:
@@ -718,11 +818,17 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
         bad, req = [f"the evidence check failed: {type(e).__name__}: {e}"], {}
     coverage = probs + bad
     needed = bool(req) or rel is not None
-    refs = sorted({ref for r in req.values() for ref, _ in r.get("engines") or []})
-    decls = {ref: declaration_sha256(ref) for ref in refs}
+    opts = run.get("options") if isinstance(run.get("options"), dict) else {}
+    try:                                # every engine that may run (not only those requiring inputs now); none when
+        engines = _engines(run, run_dir)[0] if opts.get("components") else []   # no component can require any
+    except Exception as e:  # noqa: BLE001
+        engines, coverage = [], coverage + [f"the engines that may run cannot be resolved ({type(e).__name__}: {e})"]
+    decls = {ref: declaration_sha256(ref) for ref, _ in engines}
+    closure = input_closure(run, spec, read, run_dir, engines) if needed else {}
     binding = {"files": {rel: sha(data) if data is not None else None} if rel else {},
                "record": {"required": sorted(req), "dossier": rel,
-                          "sha256": sha(data) if rel and data is not None else None, "declarations": decls}}
+                          "sha256": sha(data) if rel and data is not None else None, "declarations": decls,
+                          "closure": closure}}
     bind_probs, unsigned, changed = [], [], []
     if needed and require_sheet:
         src = _sheet_sources((get(SHEET) or b"").decode("utf-8", "replace"))
@@ -736,6 +842,9 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
             if src.get("evidence_dossier_sha256") != sha(data):
                 bind_probs.append("the sign-off sheet was generated from another evidence dossier (it is stale): "
                                   "regenerate it and read it again")
+            if src.get("input_closure_sha256") != closure_digest(closure):
+                bind_probs.append("the sign-off sheet was generated from other inputs (its input closure differs from "
+                                  "the files the run reads now): regenerate it and read it again")
     if not signing:
         rec = record
         if rec is None:
@@ -777,10 +886,15 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
                 extra = sorted(set(req) - set(ev.get("required") or []))
                 if extra:           # the engine chosen may need fewer than the signed superset; never more
                     coverage.append(f"the decision inputs required now include some not signed: {extra}")
-                for ref, h in decls.items():
-                    if ev["declarations"].get(ref) != h:
+                for ref in sorted(set(decls) | set(ev["declarations"])):
+                    if ev["declarations"].get(ref) != decls.get(ref) and ref in decls:
                         coverage.append(f"the decision-input declaration of {ref} changed since signing (its content "
                                         "sha256 differs): re-sign the spec with the dossier checked against it")
+                signed_cl = ev.get("closure") if isinstance(ev.get("closure"), dict) else {}
+                diff = sorted(k for k in set(signed_cl) | set(closure) if signed_cl.get(k) != closure.get(k))
+                if diff:
+                    changed.append("the run's inputs changed since signing (input closure): " + ", ".join(diff[:8])
+                                   + (f" and {len(diff) - 8} more" if len(diff) > 8 else ""))
     problems = unsigned + changed + bind_probs + coverage
     if not problems:
         status = "ok"
@@ -816,9 +930,15 @@ def _cell(v, n=160) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
-def sheet_lines(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]:
-    """The sheet's dossier section: one row per decision input (model value and source, field or trial value and
-    source, chosen value or range, rule and test), then what signing would refuse."""
+DIFFERS_HEADING = "Inputs whose chosen value or range differs from what execution will use"
+
+
+def sheet_lines(raw: dict, run_dir: str | None, data: bytes | None, closure: dict | None = None) -> list[str]:
+    """The sheet's dossier section. First the inputs whose chosen value or range differs from what execution will use
+    (advisory: the owner decides; never a silent pass). Then one row per decision input: what execution will use
+    (computed with execution's own functions), the dossier's model value and source, the field or trial evidence,
+    the chosen value or range, the rule and test, and whether they differ. Then what signing would refuse, and the
+    input closure the signature binds."""
     import yaml
     out = [SECTION]
     try:
@@ -834,26 +954,41 @@ def sheet_lines(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]
         doc = None
     ins = (doc.get("inputs") if isinstance(doc, dict) else None) or {}
     ins = ins if isinstance(ins, dict) else {}
+    adv = advise(raw, run_dir, data)
+    diff = [k for k in sorted(req) if (adv.get(k) or {}).get("differs") is True]
     out += [f"Signing attests `{rel or 'no dossier named'}` (sha256 `{sha(data)[:16]}`).", "",
-            "| Input | Used by | Model value (source) | Field / trial value (source) | Chosen | Rule; test |",
-            "|---|---|---|---|---|---|"]
+            f"**{DIFFERS_HEADING}** ({len(diff)}; advisory: the owner decides):"]
+    out += [f"- {k}: execution will use {_cell((adv[k] or {}).get('execution'), 80)} "
+            f"({_cell((adv[k] or {}).get('how'), 60)}); the dossier chooses {_cell((adv[k] or {}).get('chosen'), 60)}"
+            for k in diff] or ["- none"]
+    out += ["", "| Input | Used by | Execution will use | Model value (source) | Field / trial value (source) | Chosen | "
+                "Rule; test | Differs |", "|---|---|---|---|---|---|---|---|"]
     for key in sorted(req):
         e = ins.get(key) if isinstance(ins.get(key), dict) else {}
         obs = e.get("observations") if isinstance(e.get("observations"), list) else []
         nd = e.get("no_data") if isinstance(e.get("no_data"), dict) else None
         field = "; ".join(f"{o.get('value')} ({o.get('source')}, {o.get('where')}, {o.get('year')}, n {o.get('n')}, "
                           f"{o.get('sampling_frame')})" for o in obs if isinstance(o, dict))
+        if isinstance(e.get("observations"), dict):
+            field = "**observations must be a list** (refused at sign-off)"
         if nd:
             field = f"no data: {nd.get('reason')}; borrowing rule: {nd.get('borrowing_rule')}"
         ch = e.get("chosen") if isinstance(e.get("chosen"), dict) else {}
         chosen = ch.get("range") if ch.get("range") is not None else ch.get("value")
         rule = f"{ch.get('rule', '')}" + (f"; {e['decision_test']}" if e.get("decision_test") else "")
-        out.append(f"| {key} | {_cell(', '.join(req[key]['used_by']), 60)} | "
+        a = adv.get(key) or {}
+        ex = f"{_cell(a.get('execution'), 50)} ({_cell(a.get('how'), 50)})"
+        flag = {True: "**differs**", False: "same", None: "not compared"}[a.get("differs")]
+        out.append(f"| {key} | {_cell(', '.join(req[key]['used_by']), 60)} | {ex} | "
                    + (f"{_cell(e.get('model_value'), 60)} ({_cell(e.get('model_source'), 80)}) | {_cell(field, 240)} | "
-                      f"{_cell(chosen, 40)} | {_cell(rule)} |" if e else "**MISSING** | | | |"))
+                      f"{_cell(chosen, 40)} | {_cell(rule)} | {flag} |" if e else f"**MISSING** | | | | {flag} |"))
     bad = refusals(raw, run_dir, data)
     out += [""] + ([f"- **REFUSED at sign-off**: {_cell(b, 400)}" for b in bad] or
                    ["Every decision input has a sourced entry."]) + [""]
+    if closure:
+        out += [f"Signing binds these {len(closure)} input files (sha256; any change after signing makes the run "
+                f"stale; digest `{closure_digest(closure)[:16]}`):"]
+        out += [f"- `{k}` `{str(v)[:16]}`" for k, v in closure.items()] + [""]
     return out
 
 
@@ -1011,12 +1146,12 @@ def _self_test_round4(ok, T) -> None:
                         "priors": {"r0": {"dist": "uniform", "range": [1.0, 4.0], "source": "toy"}}},
         "analysis": {"evaluation": "direct"}}
     req, _ = required_inputs(comp)
-    point = {"model_value": 2.5, "model_source": "s", "no_data": {"reason": "r", "borrowing_rule": "b"},
-             "chosen": {"value": 2.5, "rule": "r"}}
-    a = _advise_one(req["parameter:r0"], point, comp, None, {})
+    prior = {"model_value": 2.5, "model_source": "s", "no_data": {"reason": "r", "borrowing_rule": "b"},
+             "chosen": {"range": [1.0, 4.0], "rule": "the declared prior"}}
+    a = _advise_one(req["parameter:r0"], prior, comp, None, {})
     ok(a["differs"] is True and "0.05" in str(a["execution"]) and "40" in str(a["execution"]),
        f"ED-X5 a likelihood-calibrated parameter is shown with the bounds the likelihood searches (the engine's "
-       f"range), and a chosen point is flagged: {a}")
+       f"range), and a dossier giving the spec's prior [1, 4] instead is flagged: {a}")
 
 
 def _self_test_round2(ok, T) -> None:

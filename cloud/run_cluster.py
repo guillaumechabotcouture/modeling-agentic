@@ -4738,7 +4738,7 @@ def _self_test_sheet(ok) -> None:
     def rec_for(sp, ev=None):
         return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
                            "evidence": ev or {"required": [], "dossier": None, "sha256": None,
-                                                 "declarations": {}}}).encode()
+                                                 "declarations": {}, "closure": {}}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
                                           f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
@@ -4769,10 +4769,20 @@ def _self_test_sheet(ok) -> None:
     # run whose shipped dossier is not the one its sheet (at SIGN) or its sign-off (past SIGN) recorded
     dspec, dos = b"spec: 1\nevidence: {dossier: evidence_dossier.yaml}\n", b"inputs: {}\n"
 
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import evidence_dossier as ED
+
+    def closure_of(sp, rc, ds):         # the input closure state() computes for these run files (no engine)
+        return dict(sorted({"run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                            "run:evidence_dossier.yaml": hashlib.sha256(ds).hexdigest(),
+                            "run:data/derivations_record.json": hashlib.sha256(rc).hexdigest()}.items()))
+
     def sheet_d(sp, rc, ds):
         return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
             {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest(),
-             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest()}) + " -->\n").encode()
+             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest(),
+             "input_closure_sha256": ED.closure_digest(closure_of(sp, rc, ds))}) + " -->\n").encode()
     dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos,
              f"{R}/decision_spec.signoff_sheet.md": sheet_d(dspec, rec, dos)}
     d_fresh = stale_sheet_problems(tar_of(dbase), flags)
@@ -4781,7 +4791,8 @@ def _self_test_sheet(ok) -> None:
     signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
                                         "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
                              "evidence": {"required": [], "dossier": "evidence_dossier.yaml",
-                                          "sha256": hashlib.sha256(dos).hexdigest(), "declarations": {}}}).encode()
+                                          "sha256": hashlib.sha256(dos).hexdigest(), "declarations": {},
+                                          "closure": closure_of(dspec, rec, dos)}}).encode()
     past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
     p_ok = stale_sheet_problems(tar_of(past), flags)
     p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
