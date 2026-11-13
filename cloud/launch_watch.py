@@ -284,7 +284,7 @@ def shell_runner(cfg_path, prefix=None):
         import signal
         import tempfile
         limit = timeout or TIMEOUTS.get(tail[0], 1800)
-        with tempfile.TemporaryFile(mode="w+") as f:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as f:   # a cut character is replaced
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
             try:
                 code = p.wait(timeout=limit)
@@ -1073,6 +1073,17 @@ def _self_test() -> int:
         return code is None and "started" in out and "TimeoutError" in out and _t.time() - t0 < 20
     case("LW13c", "shell_runner: a call past its deadline whose child left a grandchild holding its output returns "
                   "within the deadline (the process group is killed)", grandchild_case)
+
+    def partial_utf8_case():      # gpt-6-astra review of #208: a cut multibyte sequence must not crash the watch
+        prog = "import sys, time; sys.stdout.buffer.write(b'ok \\xe2\\x82'); sys.stdout.flush(); time.sleep(60)"
+        run = shell_runner("cfg.py", prefix=[sys.executable, "-c", prog])
+        try:
+            code, out = run(["status"], None, timeout=2.0)
+        except UnicodeDecodeError:
+            return False
+        return code is None and out.startswith("ok ")
+    case("LW13e", "shell_runner: output cut inside a UTF-8 character is read with a replacement, not a crash",
+         partial_utf8_case)
 
     # 2026-11-12: a status call that times out was retried up to `retries` times (each its own deadline) before the
     # next spend reading, so a hung status could skip the cap for an hour. In the watch loop status is tried once per
