@@ -1445,6 +1445,58 @@ def _self_test() -> int:
                    f"{fb}")
     tryit("WT12 data evidence", wt12)
 
+    # From the first 10 (2026-11-13): an own effect parameter in adjust_for or a region is not a test against it; a
+    # literature belief citing a harness file is refused; a section name (Results, Abstract) is a location; rebuild.
+    def wt13():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            sd = _toy_seed()
+            sd["hypotheses"] = [
+                {"id": "A1", "belief": "B3", "claim": "x adjusted for eff_a",
+                 "test": {"kind": "effect_direction", "package": "a", "feature": "eff_a", "direction": "increases",
+                          "adjust_for": ["x (calibration scale)"]}},
+                {"id": "A2", "belief": "B2", "claim": "b's band where eff_b is high",
+                 "test": {"kind": "effect_band", "package": "b", "band": [0.0, 0.05], "min_share": 0.7,
+                          "where": {"eff_b": [0.0, 1.0]}}}]
+            sd["beliefs"].append({"id": "B6", "mechanism": "x does not change a's effect, given eff_a",
+                                  "about": {"package": "a", "feature": "x (calibration scale)"},
+                                  "direction": "negligible", "source_type": "literature", "confidence": "low",
+                                  "evidence": [{"citation": "Toy (2020) J Toy 1:1", "location": "Table 1"}]})
+            sd["hypotheses"].append({"id": "A3", "belief": "B6", "claim": "x is negligible for a, adjusting eff_a",
+                                     "test": {"kind": "effect_direction", "package": "a",
+                                              "feature": "x (calibration scale)", "direction": "negligible",
+                                              "equivalence": 0.2, "adjust_for": ["eff_a"]}})
+            got = circular_tests(rd, sd, {"shadow_price": 0.1})
+            ok(set(got) == {"A1"}, f"WT13 only a test against its own effect parameter is circular, not one that "
+                                   f"adjusts for it or restricts its region to it (or a band its range is not inside): "
+                                   f"{sorted(got)}")
+            ctx = calls[0]["ctx"]
+            bad = _toy_seed()
+            bad["beliefs"][0]["evidence"] = [{"citation": "_task_input.json engine card (2026)", "location": "p. 1"}]
+            ok(any("B1" in x and "_task_input.json" in x for x in seed_problems(bad, ctx)),
+               "WT13b a literature belief citing a file the harness writes is refused")
+            fm = failure_modes([], {"beliefs": [
+                {"id": "L1", "source_type": "literature", "evidence": [{"citation": "Doe J. NEJM 2019", "location":
+                                                                         "Results, primary outcome"}]},
+                {"id": "L2", "source_type": "literature", "evidence": [{"citation": "Doe J. NEJM 2019", "location":
+                                                                         "Abstract"}]},
+                {"id": "L3", "source_type": "literature", "evidence": [{"citation": "Doe J. NEJM 2019", "location":
+                                                                         "somewhere"}]}]}, {})
+            ok(fm.get("citation_not_verifiable") == ["L3"],
+               f"WT13c a paper section (Results, Abstract) is a verifiable location; 'somewhere' is not: {fm}")
+            before = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
+            n0 = len(calls)
+            out = rebuild(troot, [{"id": "toy0", "shadow_price": 0.1}, {"id": "missing", "shadow_price": 0.1}],
+                          anchor_ref="refs/remotes/origin/wm-trials")
+            after = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
+            ok(len(calls) == n0 and out["toy0"]["status"] == "rebuilt" and out["missing"]["status"] == "skipped"
+               and [h["status"] for h in after["hypotheses"]] == [h["status"] for h in before["hypotheses"]]
+               and all(h["confrontation"]["registration_status"] == "remote-anchored" for h in after["hypotheses"]),
+               f"WT13d rebuild re-runs only the circular classification and the build (no LLM, no engine), keeping "
+               f"verdicts and anchoring: {out}")
+    tryit("WT13 circular scope, harness citations, rebuild", wt13)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
