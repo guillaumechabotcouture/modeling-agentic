@@ -21,13 +21,21 @@ shows it as a table and the signature binds its sha256, so an edit after sign-of
         comparison: "..."               ... and how they compare with the model value on the same estimand
         no_data: {reason, borrowing_rule}    ... or, instead, "no data" said explicitly with the rule borrowed by
         chosen: {value: ... | range: [lo, hi], rule: "..."}           the value or range used, and why
-        decision_test: <id>             required with a range: an analysis.decision_tests id
+        decision_test: <id>             required with a range: a test that varies this input over the range (a
+                                        parameter_value test of the parameter whose values cover it, or the
+                                        generated prior_range_<parameter> of a drawn prior); no test type varies a
+                                        unit attribute or a card table, so those take a value
 
-No field may be blank. Nothing here names a disease; the inputs come from the engine's card.
+No field may be blank at any depth, and text fields must be text. The inputs the options need decide whether a
+dossier is required, not whether the spec names one: signing refuses either way, and a sign-off made before this
+requirement of a spec that needs one is `unsigned_evidence` (signoff.status), refused at launch. Every signing path
+(signoff.py, decision_brief.py, stage_machine.py) calls bind(); ENGINE_CHOICE re-checks the engine it picks
+(choice_refusals). Nothing here names a disease; the inputs come from the engine's card.
 """
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import sys
 
@@ -44,7 +52,28 @@ SECTION = "## Evidence dossier (inputs that drive an option's effect)"
 
 
 def _blank(v) -> bool:
-    return v is None or (isinstance(v, str) and not v.strip()) or (isinstance(v, (list, dict)) and not v)
+    """Blank at any depth: None, empty or whitespace text, an empty collection, a collection holding a blank, a
+    non-finite number, or a value of another type (only text, numbers, dates, lists and mappings carry evidence)."""
+    import datetime
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return not v.strip()
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return not math.isfinite(v)
+    if isinstance(v, (datetime.date, datetime.datetime)):
+        return False
+    if isinstance(v, dict):
+        return not v or any(_blank(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return not v or any(_blank(x) for x in v)
+    return True
+
+
+def _text(v) -> bool:
+    return isinstance(v, str) and bool(v.strip())
 
 
 def dossier_reference(raw) -> str | None:
@@ -72,14 +101,18 @@ def sha(data: bytes | None) -> str:
     return hashlib.sha256(data).hexdigest() if data is not None else "none"
 
 
+def _engine_dir(ref: str) -> str | None:
+    p = os.path.join(ROOT, *str(ref).partition(":")[0].split(".")) + ".py"
+    return os.path.dirname(p) if os.path.isfile(p) else None
+
+
 def engine_declaration(ref: str, config: dict | None = None) -> dict | None:
     """An engine's decision-input declaration: the card files in its module's directory (read without importing the
     engine), else, walking its classes, a `DECISION_INPUTS` attribute or the card files of a base class's directory
     (a subclass inherits its base's declaration); None when nothing declares one."""
-    mod = str(ref).partition(":")[0]
-    p = os.path.join(ROOT, *mod.split(".")) + ".py"
-    if os.path.isfile(p):
-        d = DI.load(os.path.dirname(p))
+    d0 = _engine_dir(ref)
+    if d0:
+        d = DI.load(d0)
         if d is not None:
             return d
     from toolkit.spec import schema
@@ -93,82 +126,167 @@ def engine_declaration(ref: str, config: dict | None = None) -> dict | None:
     return None
 
 
+def _vocab(ref: str, config: dict) -> dict:
+    """The configured engine's parameter and unit-attribute names (its card as this configuration builds it)."""
+    from toolkit.spec import schema
+    e = schema.engine_class(ref)(**(config or {}))
+    return {"parameter": [p.name for p in e.parameters()], "unit_attribute": list(e.describe().unit_attributes)}
+
+
+def _priors(ref: str) -> dict:
+    """{parameter: [lo, hi]} of the engine's card priors (priors.yaml beside its card), for prior_range tests."""
+    import yaml
+    d = _engine_dir(ref)
+    p = os.path.join(d, "priors.yaml") if d else None
+    if not p or not os.path.isfile(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    return {n: q.get("range") for n, q in ((doc.get("priors") or {}) if isinstance(doc, dict) else {}).items()
+            if isinstance(q, dict)}
+
+
 def _engines(raw: dict, run_dir: str | None) -> tuple[list, list]:
     eng = raw.get("engine")
     if isinstance(eng, str) and eng != "auto":
         return [(eng, {})], []
     if isinstance(eng, dict) and eng.get("ref") and eng.get("auto") is not True:
         return [(eng["ref"], eng.get("config") or {})], []
-    from agents import analysis_backend as AB          # the eligibility ENGINE_CHOICE uses (read only)
-    rows = AB.eligible_engines(dict(raw, **({"_run_dir": run_dir} if run_dir else {})))
+    # engine: auto: every engine the run could choose, by the eligibility ENGINE_CHOICE itself uses (the backend's,
+    # with its engine needs and, given the run dir, the full validation per candidate); read only
+    from agents import analysis_backend as AB
+    b = AB.backend()
+    try:
+        rows = b.eligible_engines(dict(raw, **({"_run_dir": run_dir} if run_dir else {})))
+    except Exception:  # noqa: BLE001 -- the full per-candidate check cannot run here (e.g. a run dir in another
+        # layout): the card-level filter alone, a superset of the eligible engines, so more inputs are required
+        try:
+            rows = b.eligible_engines(dict(raw))
+        except Exception as e:  # noqa: BLE001
+            return [], [f"engine: auto: the eligible engines cannot be determined ({type(e).__name__}: {e})"]
     el = [(r["ref"], r.get("config") or {}) for r in rows if r.get("eligible")]
-    return el, [] if el else ["engine: auto: no engine is eligible, so the decision inputs cannot be resolved"]
+    why = "; ".join(f"{r.get('ref')}: {'; '.join(str(w) for w in (r.get('why_not') or [])[:2])}" for r in rows)[:600]
+    return el, [] if el else [f"engine: auto: no engine is eligible, so the decision inputs cannot be resolved ({why})"]
 
 
 def required_inputs(raw: dict, run_dir: str | None = None) -> tuple[dict, list]:
-    """({"<kind>:<name>": {kind, name, why, used_by}}, problems): the decision inputs the spec's options need. A problem
-    is a component an engine cannot map (fail closed)."""
+    """({"<kind>:<name>": {kind, name, why, used_by, prior_range}}, problems): the decision inputs the spec's options
+    need on every engine that may run them. Problems (each a refusal): a used component with no engine mapping, an
+    engine whose declaration is missing or malformed for a mapped component, an input its configured card lacks."""
     opts = raw.get("options") if isinstance(raw, dict) else None
-    comps = (opts or {}).get("components") if isinstance(opts, dict) else None
-    emap = (opts or {}).get("engine_map") or {} if isinstance(opts, dict) else {}
+    comps = opts.get("components") if isinstance(opts, dict) else None
+    emap = opts.get("engine_map") if isinstance(opts, dict) else None
     if not isinstance(comps, dict) or not comps:
         return {}, []
-    engines, probs = _engines(raw, run_dir)
+    emap = emap if isinstance(emap, dict) else {}
+    probs = [f"options component {c} has no engine mapping (options.engine_map.{c} is missing, empty or not a "
+             "mapping): its decision inputs cannot be resolved" for c in comps
+             if not isinstance(emap.get(c), dict) or not emap.get(c)]
+    engines, more = _engines(raw, run_dir)
+    probs += more
     req: dict = {}
     for ref, cfg in engines:
         try:
             decl = engine_declaration(ref, cfg)
+            bad = DI.problems(decl) if decl is not None else []
         except Exception as e:  # noqa: BLE001 -- recorded: an unreadable declaration is a refusal
             probs.append(f"engine {ref}: its decision inputs cannot be read ({type(e).__name__}: {e})")
             continue
+        if bad:
+            probs.append(f"engine {ref}: its decision inputs are malformed: " + "; ".join(bad[:5]))
+            continue
+        vocab, priors = None, _priors(ref)
         for c in comps:
-            m = emap.get(c) if isinstance(emap, dict) else None
+            m = emap.get(c)
             for k, v in (m.items() if isinstance(m, dict) else []):
                 ins = DI.component_inputs(decl, k, v)
                 if ins is None:
                     probs.append(f"engine {ref} declares no decision inputs for component {k} (options component "
                                  f"{c}): its effect cannot be checked (fail closed)")
                     continue
+                try:
+                    if vocab is None and any(i.get("if_on_card") or "*" in i["name"] for i in ins):
+                        vocab = _vocab(ref, cfg)
+                    ins = DI.resolve(ins, vocab)
+                except Exception as e:  # noqa: BLE001 -- an input the configured card cannot resolve is a refusal
+                    probs.append(f"engine {ref}, component {k}: {type(e).__name__}: {e}")
+                    continue
                 for i in ins:
-                    e = req.setdefault(f"{i['kind']}:{i['name']}", {"kind": i["kind"], "name": i["name"],
-                                                                    "why": i.get("why", ""), "used_by": []})
+                    e = req.setdefault(f"{i['kind']}:{i['name']}", {
+                        "kind": i["kind"], "name": i["name"], "why": i.get("why", ""), "used_by": [],
+                        "prior_range": priors.get(i["name"]) if i["kind"] == "parameter" else None})
                     tag = f"{c} ({k}={v})"
                     if tag not in e["used_by"]:
                         e["used_by"].append(tag)
     return req, probs
 
 
-def _entry_problems(key: str, e, tests: set) -> list[str]:
-    if _blank(e) or not isinstance(e, dict):
+def _test_problems(key: str, r: dict, rng: list, tid: str, tests: dict, raw: dict) -> list[str]:
+    """Why decision test `tid` does not vary input `key` over the chosen range `rng` (empty: it does)."""
+    if r["kind"] != "parameter":
+        return [f"entry {key}: no decision test type varies a {r['kind']} (parameter_value varies engine parameters): "
+                "choose a value with its rule, and declare the range in the spec as a limitation"]
+    name = r["name"]
+    if tid == f"prior_range_{name}":
+        pri = (((raw.get("uncertainty") or {}).get("priors") or {}).get(name) or {}).get("range") or r.get("prior_range")
+        if not (isinstance(pri, list) and len(pri) == 2):
+            return [f"entry {key}: {tid} is generated only for a parameter with a prior, and {name} has none"]
+        vals = pri
+    else:
+        t = tests.get(tid)
+        if t is None:
+            return [f"entry {key}: decision_test {tid} is not an analysis.decision_tests id"]
+        if t.get("type") != "parameter_value" or t.get("parameter") != name:
+            return [f"entry {key}: decision_test {tid} does not vary parameter {name} (a parameter_value test of "
+                    f"{name}, or prior_range_{name} for a drawn prior, does)"]
+        vals = t.get("values") or []
+    nums = [x for x in vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    if not nums or min(nums) > rng[0] or max(nums) < rng[1]:
+        return [f"entry {key}: decision_test {tid}'s values {vals} do not cover the chosen range {rng}"]
+    return []
+
+
+def _entry_problems(key: str, e, r: dict, tests: dict, raw: dict) -> list[str]:
+    if not isinstance(e, dict) or not e:
         return [f"entry {key} is blank: give model_value, model_source, observations or no_data, and chosen"]
-    bad = [f"entry {key}: {f} is blank" for f in ("model_value", "model_source") if _blank(e.get(f))]
+    bad = [f"entry {key}: model_value is blank" for _ in [0] if _blank(e.get("model_value"))]
+    bad += [f"entry {key}: model_source is blank or not text" for _ in [0] if not _text(e.get("model_source"))]
     obs, nd = e.get("observations"), e.get("no_data")
-    if _blank(obs) == _blank(nd):
+    has_obs, has_nd = obs not in (None, [], {}), nd not in (None, {})
+    if has_obs == has_nd:
         bad.append(f"entry {key}: give exactly one of observations and no_data")
-    if not _blank(obs):
+    if has_obs:
         for j, o in enumerate(obs if isinstance(obs, list) else [obs]):
-            bad += [f"entry {key}: observations[{j}].{f} is blank" for f in OBS_FIELDS
-                    if not isinstance(o, dict) or _blank(o.get(f))]
-        if _blank(e.get("comparison")):
+            if not isinstance(o, dict):
+                bad.append(f"entry {key}: observations[{j}] is not a mapping")
+                continue
+            bad += [f"entry {key}: observations[{j}].{f} is blank or not text" for f in ("source", "where",
+                                                                                         "sampling_frame")
+                    if not _text(o.get(f))]
+            bad += [f"entry {key}: observations[{j}].{f} is blank" for f in ("year", "sites", "n", "value")
+                    if _blank(o.get(f))]
+        if not _text(e.get("comparison")):
             bad.append(f"entry {key}: comparison is blank (how the observations compare with the model value)")
-    if not _blank(nd):
-        bad += [f"entry {key}: no_data.{f} is blank" for f in ("reason", "borrowing_rule")
-                if not isinstance(nd, dict) or _blank(nd.get(f))]
-    ch = e.get("chosen")
-    if not isinstance(ch, dict) or _blank(ch.get("rule")):
-        bad.append(f"entry {key}: chosen.rule is blank")
-        ch = ch if isinstance(ch, dict) else {}
-    if _blank(ch.get("value")) == _blank(ch.get("range")):
+    if has_nd:
+        bad += [f"entry {key}: no_data.{f} is blank or not text" for f in ("reason", "borrowing_rule")
+                if not isinstance(nd, dict) or not _text(nd.get(f))]
+    ch = e.get("chosen") if isinstance(e.get("chosen"), dict) else {}
+    if not _text(ch.get("rule")):
+        bad.append(f"entry {key}: chosen.rule is blank or not text")
+    has_v, has_r = "value" in ch and ch["value"] is not None, "range" in ch and ch["range"] is not None
+    if has_v == has_r:
         bad.append(f"entry {key}: chosen needs exactly one of value and range")
-    elif not _blank(ch.get("range")):
-        r = ch["range"]
-        if not (isinstance(r, list) and len(r) == 2 and all(isinstance(x, (int, float)) for x in r) and r[0] <= r[1]):
+    elif has_v and _blank(ch["value"]):
+        bad.append(f"entry {key}: chosen.value is blank")
+    elif has_r:
+        rg = ch["range"]
+        if not (isinstance(rg, list) and len(rg) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                              and math.isfinite(x) for x in rg) and rg[0] <= rg[1]):
             bad.append(f"entry {key}: chosen.range must be [lo, hi] with lo <= hi")
-        t = e.get("decision_test")
-        if _blank(t):
-            bad.append(f"entry {key}: a range needs its decision_test (an analysis.decision_tests id)")
-        elif str(t) not in tests:
-            bad.append(f"entry {key}: decision_test {t} is not an analysis.decision_tests id")
+        elif not _text(e.get("decision_test")):
+            bad.append(f"entry {key}: a range needs its decision_test (one that varies this input over the range)")
+        else:
+            bad += _test_problems(key, r, rg, e["decision_test"].strip(), tests, raw)
     return bad
 
 
@@ -184,28 +302,97 @@ def check(raw: dict, data: bytes | None, req: dict, rel: str = DOSSIER_FILE) -> 
     ins = doc.get("inputs") if isinstance(doc, dict) else None
     if not isinstance(ins, dict):
         return [f"{rel} (the evidence dossier): a mapping with `inputs: {{<kind>:<name>: entry}}`"]
-    tests = {str(t.get("id")) for t in ((raw.get("analysis") or {}).get("decision_tests") or []) if isinstance(t, dict)}
+    tests = {str(t.get("id")): t for t in ((raw.get("analysis") or {}).get("decision_tests") or [])
+             if isinstance(t, dict)}
     bad = []
     for key in sorted(req):
         if key not in ins:
             bad.append(f"no entry for {key} (used by {', '.join(req[key]['used_by'])})")
         else:
-            bad += _entry_problems(key, ins[key], tests)
+            bad += _entry_problems(key, ins[key], req[key], tests, raw)
     return bad
 
 
-def refusals(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]:
-    """Why the spec cannot be signed for want of evidence (empty: it can). `data`: the dossier bytes signing hashes."""
+def _refusals(raw: dict, run_dir: str | None, data: bytes | None) -> tuple[list, dict]:
     if isinstance(raw, dict) and "evidence" in raw and dossier_reference(raw) is None:
-        return ["evidence: name the dossier file ({dossier: evidence_dossier.yaml})"]
+        return ["evidence: name the dossier file ({dossier: evidence_dossier.yaml})"], {}
     req, probs = required_inputs(raw, run_dir)
     rel = dossier_reference(raw)
     if rel is None:
         if not req:
-            return probs
+            return probs, req
         return probs + [f"the options need {len(req)} decision input(s) and the spec names no evidence dossier "
-                        f"(evidence: {{dossier: {DOSSIER_FILE}}}): " + ", ".join(sorted(req))]
-    return probs + check(raw, data, req, rel)
+                        f"(evidence: {{dossier: {DOSSIER_FILE}}}): " + ", ".join(sorted(req))], req
+    return probs + check(raw, data, req, rel), req
+
+
+def refusals(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]:
+    """Why the spec cannot be signed for want of evidence (empty: it can). The inputs the options need decide, whether
+    or not the spec names a dossier. `data`: the dossier bytes signing hashes."""
+    return _refusals(raw, run_dir, data)[0]
+
+
+def capture(run_dir: str, spec_bytes: bytes) -> tuple:
+    """(dossier path the spec bytes name or None, its bytes or None), read once through a no-follow fd."""
+    import yaml
+    try:
+        raw = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"decision_spec.yaml does not parse: {e}") from None
+    rel = dossier_reference(raw if isinstance(raw, dict) else {})
+    return rel, (read_dossier(run_dir, rel) if rel else None)
+
+
+def bind(run_dir: str, spec_bytes: bytes, captured: tuple | None = None) -> dict:
+    """The one check-and-bind every signing path calls (toolkit/spec/signoff.py, scripts/decision_brief.py,
+    agents/stage_machine.py). Reads the dossier once (or takes `captured` from capture() on the same spec bytes);
+    ValueError when the spec cannot be signed for want of evidence; else {"files": {dossier: sha256} (empty when none
+    is named), "record": {required, dossier, sha256}} to record."""
+    import yaml
+    try:
+        raw = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise ValueError(f"decision_spec.yaml does not parse: {e}") from None
+    raw = raw if isinstance(raw, dict) else {}
+    rel, data = captured if captured is not None else capture(run_dir, spec_bytes)
+    bad, req = _refusals(raw, run_dir, data)
+    if bad:
+        raise ValueError("spec not signable (evidence dossier): " + "; ".join(bad[:12])
+                         + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
+    h = sha(data) if rel else None
+    return {"files": {rel: h} if rel else {}, "record": {"required": sorted(req), "dossier": rel, "sha256": h}}
+
+
+def evidence_state(run_dir: str, raw: dict, rec: dict) -> str:
+    """ok | changed | unsigned_evidence for a sign-off record. A record that bound the evidence: changed when the
+    dossier's bytes differ. A record made before the dossier requirement: unsigned_evidence when the spec's options
+    need decision inputs (it must be re-signed), ok when they need none; fail closed on an error."""
+    ev = rec.get("evidence") if isinstance(rec, dict) else None
+    if isinstance(ev, dict):
+        rel = ev.get("dossier")
+        if not rel:
+            return "ok" if dossier_reference(raw) is None else "changed"
+        try:
+            now = read_dossier(run_dir, rel)
+        except ValueError:
+            return "changed"
+        signed = (rec.get("sha256") or {}).get(rel) or (rec.get("evidence_sha256") or {}).get(rel) or ev.get("sha256")
+        return "ok" if now is not None and signed == sha(now) else "changed"
+    try:
+        req, probs = required_inputs(raw, run_dir)
+    except Exception:  # noqa: BLE001
+        return "unsigned_evidence"
+    return "unsigned_evidence" if req or probs else "ok"
+
+
+def choice_refusals(run_dir: str, raw: dict, ref: str, config: dict | None) -> list[str]:
+    """ENGINE_CHOICE's re-check: why the signed dossier does not cover the engine actually chosen (empty: it does)."""
+    rel = dossier_reference(raw)
+    try:
+        data = read_dossier(run_dir, rel) if rel else None
+    except ValueError as e:
+        return [str(e)]
+    return refusals(dict(raw, engine={"ref": ref, "config": dict(config or {})}), run_dir, data)
 
 
 def _cell(v, n=160) -> str:
@@ -334,7 +521,7 @@ def _self_test_round1(ok, T) -> None:
                 ("a range whose test varies another quantity", lambda e: e["parameter:eff_a"].__setitem__(
                     "decision_test", "DT1"), "does not vary"),
                 ("a range wider than its test's values", lambda e: e["parameter:eff_a"]["chosen"].__setitem__(
-                    "range", [0.2, 0.6]), "does not cover"),
+                    "range", [0.2, 0.6]), "do not cover"),
                 ("a range on a unit attribute", lambda e: e["unit_attribute:x"].__setitem__("chosen", {
                     "range": [0, 1], "rule": "r"}) or e["unit_attribute:x"].__setitem__("decision_test", "DT1"),
                  "unit_attribute:x")):
@@ -477,7 +664,8 @@ def _self_test() -> int:
             ok(required_inputs(raw, d) == ({}, []),
                "ED-R2 a spec whose options use no component with decision inputs needs none (and no dossier)")
             raw["engine"] = {"auto": True, "candidates": [TOY]}
-            req, probs = required_inputs(raw, d)
+            yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)  # the backend's
+            req, probs = required_inputs(raw, d)        # full check reads the spec from the run dir
             ok(sorted(req) == ["parameter:eff_a", "unit_attribute:x"],
                f"ED-R3 engine: auto takes the inputs of every eligible candidate engine ({sorted(req)}, {probs})")
             raw["engine"] = {"ref": TOY}

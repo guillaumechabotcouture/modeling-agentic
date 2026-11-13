@@ -847,11 +847,25 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     held = PV.signoff_refusals(spec_doc if isinstance(spec_doc, dict) else {}, run_dir=run_dir)
     if held:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
+    from toolkit.spec import evidence_dossier as ED    # F6: the shared evidence check-and-bind, whoever signs
+    ev = ED.bind(run_dir, data)
+    rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
     _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
+
+
+def _dossier_for_choice(run_dir: str, spec: dict, ref: str, cfg: dict) -> list[str]:
+    """ENGINE_CHOICE's re-check (F6 evidence dossier): why the signed dossier does not cover the chosen engine's
+    decision inputs (empty: it does). Fail closed on an error."""
+    try:
+        from toolkit.spec import evidence_dossier as ED
+        raw = {k: v for k, v in (spec or {}).items() if k != "_run_dir"}
+        return ED.choice_refusals(run_dir, raw, ref, cfg)
+    except Exception as e:  # noqa: BLE001
+        return [f"the dossier could not be checked against {ref}: {type(e).__name__}: {e}"]
 
 
 # ------------------------------------------------------------------ the machine
@@ -1200,6 +1214,11 @@ class Machine:
         else:
             why = (res.output or {}).get("why", "")
         cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
+        miss = _dossier_for_choice(self.run_dir, spec, pick, cfg)
+        if miss:            # F6: the signed dossier must cover the engine actually chosen, before any compute
+            _write_json(self.run_dir, AB.ENGINE_CHOICE, dict(rec, evidence_refused={"engine": pick, "why": miss}))
+            return self._go("FINAL", f"the signed evidence dossier does not cover {pick}'s decision inputs: "
+                                     + "; ".join(miss[:5]), "run_failed")
         rec.update(AB.engine_choice_record(pick, why, rows, config=cfg))
         if self.cross and len(eligible) > 1:
             try:

@@ -119,9 +119,12 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     and its source; field or trial observations (source, URL or table, year, sites, n,
     sampling frame, value) and how they compare with the model value on the same estimand,
     or `no_data` with the borrowing rule; the chosen value or range with its rule; and, for a
-    range, its decision test. Sign-off refuses a missing, unparseable or incomplete dossier
-    and a blank field, and lists what is missing. The sheet shows the table and the
-    signature binds the file, so an edit after sign-off needs a new sign-off.
+    range, the decision test that varies that input over the range (a `parameter_value` test
+    of the parameter whose values cover the range, or the generated `prior_range_<parameter>`
+    of a drawn prior; a unit attribute or card table takes a value). Sign-off refuses a
+    missing, unparseable or incomplete dossier and a blank field, and lists what is missing,
+    whether or not the spec names a dossier. The sheet shows the table and the signature
+    binds the file, so an edit after sign-off needs a new sign-off.
 
 ## Closed-population epidemic questions (the compartmental engine)
 

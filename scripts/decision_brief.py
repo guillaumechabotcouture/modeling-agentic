@@ -442,10 +442,12 @@ def _capture(run_dir: str, names) -> dict:
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
          accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
-         expect_geometry: str | None = None) -> dict:
+         expect_geometry: str | None = None, evidence: dict | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
-    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
+    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record;
+    `evidence`: the spec's evidence-dossier binding (toolkit/spec/evidence_dossier.py bind) when the caller already
+    made it from the same spec bytes; otherwise this entry point makes it (every signing path checks and binds)."""
     import hashlib
     from lib.safe_io import write_nofollow, LinkRefused
     captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
@@ -476,6 +478,8 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         # sign does, and refuses the same)
         from toolkit.spec import signoff as SO
         SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
+        from toolkit.spec import evidence_dossier as ED       # F6: refused here too, whoever signs
+        evidence = evidence or ED.bind(run_dir, captured[DECISION_SPEC])
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
@@ -491,7 +495,8 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {**shas, **(extra_sha or {})},
+        "sha256": {**shas, **(extra_sha or {}), **((evidence or {}).get("files") or {})},
+        **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }

@@ -438,8 +438,10 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
             continue
         if st.get("signoff") == "none":                    # signoff none: h_SIGN does not sign
             continue
+        if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+            continue
         if state != "SIGN":
-            out += _dossier_signature_problems(code, rel)
+            out += _signed_run_problems(code, rel)
             continue
         spec = _archive_member(code, f"{rel}/decision_spec.yaml")
         sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
@@ -493,24 +495,67 @@ def _shipped_dossier(code: bytes, rel: str, spec: bytes | None) -> tuple:
     return drel, _archive_member(code, os.path.normpath(f"{rel}/{drel}").replace(os.sep, "/")), None
 
 
-def _dossier_signature_problems(code: bytes, rel: str) -> list[str]:
-    """A run past SIGN whose spec names an evidence dossier: the shipped dossier must be the one its sign-off record
-    hashed. An edit after signing makes the signature stale, and the run would compute on evidence nobody attested."""
-    import hashlib
-    drel, dos, why = _shipped_dossier(code, rel, _archive_member(code, f"{rel}/decision_spec.yaml"))
-    if why or not drel:
-        return [why] if why else []
-    signed = None
+PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
+
+
+def _signoff_record(code: bytes, rel: str) -> tuple:
+    """(record, sha256 it holds for decision_spec.yaml) from the shipped sign-off records: the spec-only record
+    (toolkit/spec/signoff.py `sha256`, or the stage machine's `spec_sha256`), else the brief's when it hashed the spec;
+    (None, None) when there is none."""
     for f in SIGNOFF_RECORDS:
         try:
-            got = ((json.loads((_archive_member(code, f"{rel}/{f}") or b"{}").decode()) or {}).get("sha256") or {})
-        except (ValueError, UnicodeDecodeError, AttributeError):
-            got = {}
-        signed = signed or (got.get(drel) if isinstance(got, dict) else None)
-    if dos is not None and signed == hashlib.sha256(dos).hexdigest():
-        return []
-    return [f"{rel}: the evidence dossier {drel} is not the one the sign-off recorded (edited after signing, or "
-            "missing): the signature is stale; the owner amends and re-signs the spec before launch"]
+            doc = json.loads((_archive_member(code, f"{rel}/{f}") or b"null").decode())
+        except (ValueError, UnicodeDecodeError):
+            doc = None
+        if not isinstance(doc, dict):
+            continue
+        s = (doc.get("sha256") or {}).get("decision_spec.yaml") if isinstance(doc.get("sha256"), dict) else None
+        s = s or doc.get("spec_sha256")
+        if s:
+            return doc, s
+    return None, None
+
+
+def _signed_run_problems(code: bytes, rel: str) -> list[str]:
+    """A run past SIGN (#218 review round 1): it ships the spec its sign-off hashed, and that sign-off's evidence
+    binding holds. A dossier edited after signing, a spec edited after signing (removing `evidence` with it), or a
+    sign-off made before the evidence-dossier requirement of a spec whose options need decision inputs
+    (unsigned_evidence) would compute on evidence nobody attested."""
+    import hashlib
+    spec = _archive_member(code, f"{rel}/decision_spec.yaml")
+    rec, signed = _signoff_record(code, rel)
+    if spec is None or rec is None:
+        return [f"{rel}: past SIGN with no decision_spec.yaml or no sign-off record of it in the code to launch"]
+    if hashlib.sha256(spec).hexdigest() != signed:
+        return [f"{rel}: decision_spec.yaml is not the one signed (edited after its sign-off): the owner amends and "
+                "re-signs the spec before launch"]
+    ev = rec.get("evidence")
+    if isinstance(ev, dict):
+        drel = ev.get("dossier")
+        if not drel:
+            return []
+        _, dos, why = _shipped_dossier(code, rel, spec)
+        if why:
+            return [why]
+        want = (rec.get("sha256") or {}).get(drel) or (rec.get("evidence_sha256") or {}).get(drel) or ev.get("sha256")
+        if dos is not None and want == hashlib.sha256(dos).hexdigest():
+            return []
+        return [f"{rel}: the evidence dossier {drel} is not the one the sign-off recorded (edited after signing, or "
+                "missing): the signature is stale; the owner amends and re-signs the spec before launch"]
+    try:                                # a sign-off made before the requirement: does the spec need a dossier?
+        import yaml
+        root = os.path.dirname(HERE)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from toolkit.spec import evidence_dossier as ED
+        doc = yaml.safe_load(spec.decode("utf-8")) or {}
+        req, probs = ED.required_inputs(doc if isinstance(doc, dict) else {})
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return [f"{rel}: whether the signed spec needs an evidence dossier cannot be decided ({type(e).__name__}: {e})"]
+    if req or probs:
+        return [f"{rel}: unsigned_evidence: signed before the evidence-dossier requirement, and its options need "
+                f"{len(req)} decision input(s): the owner re-signs the spec with a dossier before launch"]
+    return []
 
 
 def archive_commit(code: bytes) -> str | None:

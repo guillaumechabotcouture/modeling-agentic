@@ -94,34 +94,44 @@ def burden_changed(run_dir: str, rec: dict) -> list[str]:
     return [] if signed is not None and signed == now else [rel]
 
 
-def dossier_changed(run_dir: str, rec: dict) -> list[str]:
-    """F6 evidence dossier: the dossier the spec names, when its bytes are not the ones the sign-off recorded (none
-    recorded, absent or unreadable: changed, fail closed)."""
+def _evidence_state(run_dir: str, rec: dict) -> str:
+    """toolkit/spec/evidence_dossier.py evidence_state on the spec as it is now (unreadable: changed)."""
     import yaml
     from toolkit.spec import evidence_dossier as ED
     try:
         doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
     except Exception:  # noqa: BLE001 -- unreadable: changed
-        return [SPEC]
-    rel = ED.dossier_reference(doc)
-    if rel is None:
+        return "changed"
+    return ED.evidence_state(run_dir, doc if isinstance(doc, dict) else {}, rec)
+
+
+def dossier_changed(run_dir: str, rec: dict) -> list[str]:
+    """F6 evidence dossier: the dossier, when the sign-off's evidence binding no longer holds (its bytes changed, or
+    the sign-off predates the requirement and the options need decision inputs); fail closed."""
+    from toolkit.spec import evidence_dossier as ED
+    if _evidence_state(run_dir, rec) == "ok":
         return []
     try:
-        now = ED.read_dossier(run_dir, rel)
-    except ValueError:
-        return [rel]
-    signed = (rec.get("sha256") or {}).get(rel)
-    return [] if now is not None and signed == ED.sha(now) else [rel]
+        import yaml
+        doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        doc = {}
+    return [ED.dossier_reference(doc) or ED.DOSSIER_FILE]
 
 
 def status(run_dir: str) -> str:
+    """absent | invalid | awaiting | changed | signed | unsigned_evidence (signed before the evidence-dossier
+    requirement, of a spec whose options need decision inputs: it must be re-signed with a dossier)."""
     path = os.path.join(run_dir, SPEC)
     rec = _spec_record(run_dir)
     if not os.path.exists(path):
         return "changed" if rec is not None else "absent"
     if rec is not None:
-        return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) and not derived_changed(run_dir, rec) \
-            and not burden_changed(run_dir, rec) and not dossier_changed(run_dir, rec) else "changed"
+        if DB._sha(path) != (rec.get("sha256") or {}).get(SPEC) or derived_changed(run_dir, rec) \
+                or burden_changed(run_dir, rec):
+            return "changed"
+        ev = _evidence_state(run_dir, rec)
+        return "signed" if ev == "ok" else ev
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
@@ -204,8 +214,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{brel} (the validation.burden reference file) does not exist")
     bsha = hashlib.sha256(bdata).hexdigest() if bdata is not None else None
     from toolkit.spec import evidence_dossier as ED
-    erel = ED.dossier_reference(doc0)  # F6 evidence dossier: read once, then checked, shown and bound from these bytes
-    edata = ED.read_dossier(run_dir, erel) if erel else None
+    # F6 evidence dossier: read once here (the sheet check uses its hash); checked and bound below from these bytes
+    erel, edata = captured_ev = ED.capture(run_dir, data)
+    esha = ED.sha(edata)
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
@@ -227,12 +238,11 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         # it was generated from; it is refused, never skipped
         raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
                          "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
-    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {}),
-             **({erel: ED.sha(edata) if edata is not None else None} if erel else {})}
+    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
     if sheet_bytes is not None and (
             src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
             or (brel is not None and src.get("burden_references_sha256") != bsha)
-            or (erel is not None and src.get("evidence_dossier_sha256") != ED.sha(edata))):
+            or (erel is not None and src.get("evidence_dossier_sha256") != esha)):
         raise ValueError(f"{SHEET} was generated from another spec, derivation record, reference file or evidence "
                          "dossier (it is stale): the sheet is regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
@@ -248,16 +258,16 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
-    bad = ED.refusals(doc0 if isinstance(doc0, dict) else {}, run_dir, edata)
-    if bad:                             # F6: a precondition, whoever signs; no flag or note overrides it
-        raise ValueError("spec not signable (evidence dossier): " + "; ".join(bad[:12])
-                         + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
+    # the one check-and-bind of every signing path: refused, whoever signs, when the inputs the options need are not
+    # covered; the same dossier bytes the sheet check hashed
+    evidence = ED.bind(run_dir, data, captured=captured_ev)
+    extra.update(evidence["files"])
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
-        # decision_brief.sign freezes the spec's geometry too (#131)
+        # decision_brief.sign freezes the spec's geometry too (#131), and binds this evidence
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect)
+                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect, evidence=evidence)
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
@@ -269,7 +279,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{SPEC} does not parse: {e}") from None
     geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: sha, **extra},
+              "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"],
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     try:
