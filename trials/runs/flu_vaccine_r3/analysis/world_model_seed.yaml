@@ -1,0 +1,269 @@
+beliefs:
+- id: B1
+  mechanism: Vaccinating children (high-contact, high-susceptibility groups) cuts Reff through the contact matrix,
+    so the hospitalisations averted in the whole population rise with the children's reach, and more than linearly
+    while Reff stays above 1 (final-size nonlinearity of the SIR epidemic).
+  about:
+    package: vax_children
+    feature: reach:vax_children (calibration scale)
+  direction: increases
+  magnitude:
+    band:
+    - 0.2
+    - 0.8
+    scale: relative_reduction
+  conditions:
+  - feature: reach:vax_children (calibration scale)
+    range:
+    - 0.4043030195869506
+    - 0.6965257519856095
+  source_type: literature
+  evidence:
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: main results figure on optimal age allocation (exact figure number unsure)
+  - citation: Mossong J et al. Social contacts and mixing patterns relevant to the spread of infectious diseases.
+      PLoS Medicine 2008
+    location: contact matrices by age (figure; exact number unsure)
+  - citation: 'Loeb M et al. Effect of influenza vaccination of children on infection rates in Hutterite communities:
+      a randomized trial. JAMA 2010'
+    location: primary outcome, protection of unvaccinated community members (table location unsure)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: 'Protection given by the children''s package scales with the vaccine''s efficacy in children (all-or-nothing:
+    effective coverage = reach x efficacy x susceptible share); its relative reduction in hospitalisations rises
+    with efficacy:vax_children.'
+  about:
+    package: vax_children
+    feature: efficacy:vax_children
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Osterholm MT et al. Efficacy and effectiveness of influenza vaccines: a systematic review and meta-analysis.
+      Lancet Infectious Diseases 2012'
+    location: pooled efficacy estimates (table location unsure)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Vaccinating 65+ protects mostly directly: few contacts, so a small indirect effect, but the highest
+    hospitalisation ratio. Its relative reduction in total hospitalisations is roughly the 65+ share of hospitalisations
+    times their effective coverage (reach x VE in the elderly, lower than in children), i.e. modest; it rises with
+    efficacy:vax_65plus.'
+  about:
+    package: vax_65plus
+    feature: efficacy:vax_65plus
+  direction: increases
+  magnitude:
+    band:
+    - 0.05
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Govaert TM et al. The efficacy of influenza vaccination in elderly individuals. A randomized double-blind
+      placebo-controlled trial. JAMA 1994
+    location: efficacy against serological and clinical influenza (results table, location unsure)
+  - citation: 'Osterholm MT et al. Efficacy and effectiveness of influenza vaccines: a systematic review and meta-analysis.
+      Lancet Infectious Diseases 2012'
+    location: notes the scarcity of RCT evidence in 65+ (discussion)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'The adult (older, non-65+) package acts through both routes: adults have many contacts (workplace,
+    contacts with children) and intermediate hospitalisation ratios; its effect rises with efficacy:vax_older.'
+  about:
+    package: vax_older
+    feature: efficacy:vax_older
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: optimal allocation includes adults 30-39 alongside schoolchildren (figure; number unsure)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Component specificity: the 65+ package''s effect does not depend on the efficacy in children (it contains
+    no children''s component and the engine reads only its own component''s efficacy), so its relative reduction
+    is flat along efficacy:vax_children.'
+  about:
+    package: vax_65plus
+    feature: efficacy:vax_children
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, van Boven M, Lipsitch M. Optimizing infectious disease interventions during an emerging
+      epidemic. PNAS 2010
+    location: next-generation-matrix framework (methods)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Per dose, vaccinating children averts more hospitalisations than vaccinating 65+ when Reff is moderate
+    (indirect protection reaches the high-risk old through the contact matrix), as in the Japanese school programme
+    and model-based optimal allocations; this can flip toward 65+ if Reff is high or the age gradient in hospitalisation
+    ratio is steep. At the declared shadow price children's vaccination should win across most of the reach range.
+  about:
+    pair:
+    - vax_children
+    - vax_65plus
+  direction: raises
+  conditions:
+  - feature: reach:vax_children (calibration scale)
+    range:
+    - 0.4043030195869506
+    - 0.6965257519856095
+  source_type: literature
+  evidence:
+  - citation: Reichert TA et al. The Japanese experience with vaccinating schoolchildren against influenza. New
+      England Journal of Medicine 2001
+    location: excess mortality in elderly vs schoolchild vaccination period (figure; number unsure)
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: main results (location unsure)
+  - citation: Bansal S, Pourbohloul B, Meyers LA. A comparative analysis of influenza vaccination programs. PLoS
+      Medicine 2006
+    location: results comparing children-first vs elderly-first (location unsure)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What is last season's Reff (pre-season susceptibility x transmissibility)? Near 1 favours children (indirect
+    effect); well above 1 favours direct protection of 65+.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: How steep is the age gradient of the hospitalisation ratio (ratio_hosp), and how large is the 65+ share
+    of last season's hospitalisations?
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: What share of each group is already immune before the season (s0)? Doses to immune people are wasted,
+    which lowers the yield in groups with high prior immunity.
+  beliefs:
+  - B1
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: How does efficacy differ between children and 65+ (immunosenescence), and is the 65+ efficacy anchored
+    to an RCT or to observational test-negative estimates?
+  beliefs:
+  - B2
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q5
+  question: Which age groups does vax_older cover (18-49, 50-64 or both), and how are 70,000-dose blocks mapped
+    onto reach under the 70% cap?
+  beliefs:
+  - B4
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The children's package's relative reduction in hospitalisations rises with the children's reach.
+  test:
+    kind: effect_direction
+    package: vax_children
+    feature: reach:vax_children (calibration scale)
+    direction: increases
+- id: H2
+  belief: B1
+  claim: Vaccinating children at 40-70% reach averts 20-80% of hospitalisations (indirect effect included) in at
+    least 70% of points; refuted if 30% or fewer points fall in the band.
+  test:
+    kind: effect_band
+    package: vax_children
+    band:
+    - 0.2
+    - 0.8
+    min_share: 0.7
+- id: H3
+  belief: B2
+  claim: The children's package's relative reduction rises with efficacy:vax_children.
+  test:
+    kind: effect_direction
+    package: vax_children
+    feature: efficacy:vax_children
+    direction: increases
+- id: H4
+  belief: B3
+  claim: Vaccinating 65+ averts 5-30% of total hospitalisations in at least 70% of points (direct protection of
+    a minority group with lower VE).
+  test:
+    kind: effect_band
+    package: vax_65plus
+    band:
+    - 0.05
+    - 0.3
+    min_share: 0.7
+- id: H5
+  belief: B3
+  claim: The 65+ package's relative reduction rises with efficacy:vax_65plus.
+  test:
+    kind: effect_direction
+    package: vax_65plus
+    feature: efficacy:vax_65plus
+    direction: increases
+- id: H6
+  belief: B5
+  claim: The 65+ package's relative reduction is flat along efficacy:vax_children (|rho| interval within 0.2).
+  test:
+    kind: effect_direction
+    package: vax_65plus
+    feature: efficacy:vax_children
+    direction: negligible
+    equivalence: 0.2
+- id: H7
+  belief: B6
+  claim: At the declared shadow price, the children's package beats the 65+ package in net benefit in at least 70%
+    of points across the children's reach range; refuted if 65+ wins in at least 70%.
+  test:
+    kind: paired_sign
+    a: vax_children
+    b: vax_65plus
+    feature: reach:vax_children (calibration scale)
+    range:
+    - 0.4043030195869506
+    - 0.6965257519856095
+    sign: positive
+    min_share: 0.7
+- id: H8
+  belief: B4
+  claim: The adult package's relative reduction rises with efficacy:vax_older.
+  test:
+    kind: effect_direction
+    package: vax_older
+    feature: efficacy:vax_older
+    direction: increases
