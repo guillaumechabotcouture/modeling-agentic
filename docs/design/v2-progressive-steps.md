@@ -60,19 +60,39 @@ What each step passes forward:
 - Step 3 gives the plan and its comparison with step 0. When the two agree, the report says the
   simulation added little for this decision.
 
-## 4. The world model: what the steps build
+## 4. The world model: the modeller's working understanding
 
-The steps do not only hand a plan forward. They build a **world model**: a compact,
-human-readable account of how the decision works, much simpler than the engine's mathematics,
-whose numbers and branching points come from the simulation work. It is an emulator for
-thinking, not for computing. It says which terms drive the choice, how they depend on the setting,
-and where the preferred option changes.
+A good modeller carries a model of the world in their head: simpler than any simulation,
+built up from reading papers, analysing data and running simulations. It holds what they
+believe drives the answer, how sure they are, and where they are unsure. It guides their intuition
+about what result to expect, and it tells them where a simulation would teach them something.
+The harness makes that model explicit as the **world model**: a compact, human-readable account
+of how the decision works, kept as a file that every step reads and updates.
+
+It is an emulator for thinking, not for computing. It says which terms drive the choice, how they
+depend on the setting, where the preferred option changes, what the evidence for each belief is,
+and what is still unknown.
+
+**Where its beliefs come from.** Three sources, each recorded with each belief:
+
+- **Literature.** Trial effect sizes, reviews and mechanism papers: "PBO nets roughly halve
+  prevalence against pyrethroid nets at 9 months under high resistance (Protopopoff 2018, Table 2);
+  the advantage was not seen at 24 months in a second trial (Mosha 2022)". Each needs its citation
+  and the table or page it was read from, checked the same way as a dossier entry.
+- **Data analysis.** The evidence dossier and analyses of the run's own data: "field species
+  surveys in this state find 3% *An. arabiensis*; the modelled map says 83%".
+- **Simulation.** Results of the engine steps: forms, thresholds and intervals fitted by harness
+  code, with links to the points that produced them.
+
+It exists before any simulation. Version 0 is written from literature and data, together with
+step 0's arithmetic, and states what the modeller would expect the simulation to show.
+Disagreements between sources are kept side by side, never averaged away.
 
 **What it holds** (`analysis/world_model.yaml`, versioned per step):
 
 - **Structure.** The decision decomposed into its terms: baseline burden per unit, the relative effect
-  of each component in a setting, how components combine, and cost. Version 0 is step 0's
-  arithmetic: benefit = burden × effect, against cost.
+  of each component in a setting, how components combine, and cost: benefit = burden × effect,
+  against cost.
 - **Each term's current form**, the simplest one the evidence supports: a constant, a range, a
   function of one or two setting features, or a piecewise form. Each form carries its source (trial,
   dossier entry, sweep), its uncertainty and the domain it is valid in. Example: "the gain of
@@ -81,21 +101,38 @@ and where the preferred option changes.
 - **Branching points.** The thresholds where the preferred option flips, with an interval. Example:
   "PBO is preferred over dual-AI above a bioassay mortality of T (interval T1–T2) at the 2026 price
   ratio; the threshold moves by D per 10% change in that ratio".
+- **Beliefs and their confidence.** Each element states its source type (literature, data,
+  simulation), its evidence and a confidence, and keeps conflicting evidence side by side.
+- **Expectations.** What the next step is expected to show, written before it runs.
+- **Open questions.** What is unknown and would change the choice if known, ranked by value of
+  information.
 - **Rules.** Short statements of the form "in settings with ..., option ... is preferred", each with
   the share of units it covers and how often the full analysis agrees with it.
 - **Fidelity.** How well the world model reproduces the full analysis: agreement with the plan and the
   value lost by following the world model's rules instead of the optimised plan.
 
-**How it is built.** From step 2's sweep, the harness fits an interpretable surrogate to the
-paired difference between competing options: a shallow tree or a monotone piecewise fit on a
-small number of features, with a simplicity budget (for example at most three features per rule)
-and bootstrap intervals on each threshold. Step 3 measures its fidelity on the real units. Each
-number in it links to the sweep points or analysis artifact that produced it.
+**How it is built.** Literature and data beliefs are added by bounded tasks that read sources,
+each with a citation the harness checks against the dossier format. Simulation-derived
+elements are computed by harness code: from step 2's sweep, an interpretable surrogate of the
+paired difference between competing options (a shallow tree or a monotone piecewise fit on a few
+features, with a simplicity budget such as at most three features per rule, and bootstrap
+intervals on each threshold). Step 3 measures its fidelity on the real units. Every number links
+to its source: a citation, a dossier entry, or the sweep points or artifact that produced it.
+
+**Expectation, then surprise.** Before a step runs, the world model states what it expects the
+step to show, for example "the dual-AI net is preferred wherever bioassay mortality is below
+about 0.3". After the step, the harness compares. Where the result differs, that is the most
+informative event in the run: either the world model is missing something or the simulation is
+wrong. Both get a hypothesis and a test; neither is resolved by adjusting the simulation's inputs.
 
 **What it is for.**
 
-- **Guiding the next step.** Branching points say where to add sweep points. Terms with wide
-  intervals that sit near a branching point say which data to look for (§5).
+- **Focusing simulation.** The next engine runs go where the world model is both uncertain and
+  decision-relevant: near a branching point whose interval is wide, or where literature and
+  data disagree about a term that could flip the choice. Settings where the world model already
+  predicts the choice with confidence get few runs.
+- **Focusing the search for evidence.** Terms with wide intervals that sit near a branching point
+  say which papers or data to look for (§5).
 - **Explaining the result.** The report explains the plan through the world model's rules, and states
   their fidelity. Decision numbers in the report still come from the full analysis' claims.
 - **Carrying knowledge forward.** A world model from one run is the starting point (version 0) for
@@ -151,8 +188,10 @@ inputs toward an answer (principle 4).
    and the units and packages that differ, with the driver of each difference. It is cited in the
    report.
 6. **World model and hypotheses.** Two new run artifacts, `analysis/world_model.yaml` and
-   `analysis/hypotheses.yaml`, written by harness code (surrogate fit, thresholds, fidelity); an LLM
-   task may propose hypotheses and wording, never the numbers. A stage `LEARN` after each step runs
+   `analysis/hypotheses.yaml`. Simulation-derived numbers come only from harness code (surrogate
+   fit, thresholds, fidelity). Literature and data beliefs may be added by a bounded reading task,
+   each with a citation and table or page that the harness checks in the dossier's format; a task
+   never writes a simulation-derived number. A stage `LEARN` after each step runs
    the loop of §5 and routes to the owner when it proposes dossier changes.
 
 ## 7. What this means for F6
