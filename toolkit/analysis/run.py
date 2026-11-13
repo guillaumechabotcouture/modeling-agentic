@@ -859,6 +859,7 @@ def _self_test() -> int:
     _self_test_stability_flagged(ok)
     _self_test_variants(ok, q)
     _self_test_voi(ok, q)
+    _self_test_unit_attr(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -2329,6 +2330,99 @@ def _self_test_round2(ok, d, q):
     ok(clean and st, f"R32 engine: auto runs on the harness's engine choice, and a changed choice makes the analysis "
                      f"stale ({len(st)} findings)")
     del math
+
+
+def _self_test_unit_attr(ok, q):
+    """F6: a decision test varies a units-table column that feeds an engine unit attribute (toy table, direct path)."""
+    import copy
+    import hashlib
+    import io
+    import tempfile
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n2,1.2\n3,-1.2\n")
+        spec = schema.Spec(r, d)
+        A = Analysis(spec, DirectModel(spec, log=q))
+        base_rows = [dict(u) for u in spec.units()]
+        z0 = {i: None for i in A.ids}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = A.solve(ben0, cost0)["choice"]
+
+        def one(**ua):
+            dt = {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua}
+            try:
+                return DT.run_one(A, dt, z0, ben0, cost0, plan, {}, out0)
+            except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                return {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+        rec = one(column="cov", values=[1.8, -1.8])
+        ua = rec.get("unit_attribute") or {}
+        ok(rec.get("status") == "run" and ua.get("column") == "cov" and ua.get("attributes") == ["x"]
+           and all(len(c["units_changed"]) == len(A.ids) for c in ua.get("cases") or [{}])
+           and max((rec.get("benefit_change_by_package") or {"": 0}).values()) > 0,
+           f"UA1 a unit_attribute test runs: it names the column, its engine attribute and the units changed, and the "
+           f"benefits move ({rec.get('status')}, {rec.get('reason')}, {ua.get('cases')})")
+
+        def ser(rows):
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=list(rows[0]), lineterminator="\n")
+            w.writeheader()
+            w.writerows(rows)
+            return hashlib.sha256(buf.getvalue().encode()).hexdigest()
+        want = ser([dict(u, cov=repr(1.8)) for u in base_rows])
+        hs = [c.get("table_sha256") for c in ua.get("cases") or []]
+        ok(len(hs) == 2 and hs[0] == want and hs[0] != hs[1] and ua.get("base_table_sha256") == ser(base_rows),
+           f"UA2 each case records the sha256 of the modified units table (and the base table's): {hs}")
+        _, ben1, _ = A.evaluate(A.theta0, z0)
+        ok(spec.units() == base_rows and ben1 == ben0 and all(A.model.attrs[i] == spec.unit_attributes(A.by_id[i])
+                                                             for i in A.ids),
+           "UA3 after the test the units table, the engine attributes and the benefits are the headline's again")
+        rs = one(column="cov", units=["0", "1"], scale=[0.5])
+        ok(rs.get("status") == "run" and (rs.get("unit_attribute") or {}).get("cases", [{}])[0].get("units_changed")
+           == ["0", "1"], f"UA4 a scale case changes only the listed units ({rs.get('reason')}, "
+                          f"{(rs.get('unit_attribute') or {}).get('cases')})")
+        rf = one(column="cov", set_from="override.csv")
+        uf = rf.get("unit_attribute") or {}
+        fsha = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        ok(rf.get("status") == "run" and uf.get("cases", [{}])[0].get("units_changed") == ["2", "3"]
+           and uf.get("inputs") == {"override.csv": fsha},
+           f"UA5 a set_from case takes per-unit values from a table in the run directory and records its sha256 "
+           f"({rf.get('reason')}, {uf})")
+        refusals = {
+            "UA6 an unknown column": (dict(column="nocol", values=[0.5]), "not a column of the units table"),
+            "UA7 a unit id not in the table": (dict(column="cov", units=["zz"], values=[0.5]), "'zz'"),
+            "UA8 a value outside the declared domain": (dict(column="cov", values=[9.0]), "declared domain"),
+            "UA9 a scale that leaves every unit unchanged": (dict(column="cov", scale=[1.0]), "identity"),
+            "UA10 values equal to every unit's own": (dict(column="cov", units=["0"], values=[float(base_rows[0]["cov"])]),
+                                                     "identity"),
+            "UA11 a column feeding no engine attribute": (dict(column="pop", values=[5.0]), "feeds no engine unit"),
+            "UA12 a set_from table outside the run directory": (dict(column="cov", set_from="/etc/hosts"),
+                                                               "inside the run directory"),
+            "UA13 a scale case that leaves the domain": (dict(column="cov", scale=[10.0]), "declared domain")}
+        for label, (u_, needle) in refusals.items():
+            x = one(**u_)
+            ok(x.get("status") == "not_run" and needle in str(x.get("reason")),
+               f"{label} is refused: the test is not run and says why ({x.get('status')}, {x.get('reason')})")
+        # the emulator path: a column that is no emulator input cannot move the emulator's answer
+        ev = {"kind": "emulator", "box": {}, "features_box": {}, "point": dict(A.theta0), "packages": A.pk,
+              "engine": A.eng}
+        pe = DT.plan_test(spec, {"id": "DTu", "type": "unit_attribute",
+                                 "unit_attribute": {"column": "cov", "values": [0.5]}}, ev)
+        ok(pe.get("status") == "not_run" and "emulator input" in pe.get("why", ""),
+           f"UA14 on the emulator path a column that feeds no emulator feature is refused ({pe.get('why')})")
+        r2 = copy.deepcopy(r)
+        r2["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "t",
+                                             "unit_attribute": {"column": "cov", "values": [1.8]}}]
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        A2 = Analysis(schema.Spec(r2, d), DirectModel(schema.Spec(r2, d), log=q))
+        try:
+            recs = DT.run_all(A2, z0, out0, ben0, cost0, plan, {}, d)
+            on_disk = yaml.safe_load(open(os.path.join(d, recs[0]["path"])))
+        except Exception as e:  # noqa: BLE001
+            on_disk = {"error": f"{type(e).__name__}: {e}"}
+        ok((on_disk.get("unit_attribute") or {}).get("cases", [{}])[0].get("table_sha256") == want,
+           f"UA15 the result file names the column, units and modified-table sha256 ({str(on_disk)[:160]})")
 
 
 def _direct_toy(d):

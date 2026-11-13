@@ -1576,6 +1576,53 @@ def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)
     return p
 
 
+def direct_toy(r: dict) -> dict:
+    """The toy spec on direct evaluation with no calibration and the engine attribute x bound to column cov (a unit
+    attribute the units table sets; the unit-attribute decision-test self-tests)."""
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["calibration"] = {"method": "none"}
+    r["analysis"]["evaluation"] = "direct"
+    r["analysis"].pop("emulator", None)
+    r["analysis"]["decision_tests"] = []
+    r["uncertainty"]["sources"] = [{"kind": "engine_parameters"}]
+    r["uncertainty"]["excluded"] = [{"kind": k, "reason": "toy"} for k in ("costs", "calibration", "emulator")] + [
+        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
+    return r
+
+
+def _self_test_unit_attribute(ok, s, d, bad):
+    """F6: a unit_attribute decision test is checked at sign-off by the runner's own planner (decision_tests.py
+    plan_unit_attribute): column, units, values within the column's declared domain, and not an identity."""
+    def ua(**kw):
+        return lambda r: (direct_toy(r), r["analysis"]["decision_tests"].append(
+            dict({"id": "DTu", "type": "unit_attribute", "text": "t"}, **kw)))
+    bad(ua(), "give unit_attribute", "SP-UA1 a unit_attribute test without its unit_attribute mapping is refused")
+    bad(ua(unit_attribute={"column": "nocol", "values": [0.5]}), "not a column of the units table",
+        "SP-UA2 a unit_attribute test on an unknown column is refused")
+    bad(ua(unit_attribute={"column": "cov", "units": ["0", "zz"], "values": [0.5]}), "'zz'",
+        "SP-UA3 a unit_attribute test naming a unit id not in the table is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [9.0]}), "declared domain",
+        "SP-UA4 a unit_attribute value outside the column's declared domain (the engine card's valid range) is refused")
+    bad(ua(unit_attribute={"column": "cov", "scale": [1.0]}), "identity",
+        "SP-UA5 a unit_attribute test that leaves every unit unchanged is refused")
+    bad(ua(unit_attribute={"column": "pop", "values": [5.0]}), "feeds no engine unit attribute",
+        "SP-UA6 a unit_attribute test on a column bound to no engine attribute is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [0.5], "scale": [2.0]}), "exactly one of",
+        "SP-UA7 a unit_attribute test with two value modes is refused")
+    bad(ua(unit_attribute={"column": "cov", "set_from": "../elsewhere.csv"}), "inside the run directory",
+        "SP-UA8 a set_from table outside the run directory is refused")
+    r = copy.deepcopy(s.raw)
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["analysis"]["decision_tests"].append({"id": "DTu", "type": "unit_attribute", "text": "t",
+                                            "unit_attribute": {"column": "cov", "values": [0.5]}})
+    e9 = validate(Spec(r, d))
+    ok(any("calibration sets" in e for e in e9),
+       f"SP-UA9 a column bound to the calibrated attribute is refused (the calibration overrides it): {e9[:2]}")
+    r = copy.deepcopy(s.raw)
+    ua(unit_attribute={"column": "cov", "units": ["0", "1"], "values": [0.5, -0.5]})(r)
+    ok(validate(Spec(r, d)) == [], f"SP-UA10 a well-formed unit_attribute test validates: {validate(Spec(r, d))[:3]}")
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -1730,6 +1777,7 @@ def _self_test() -> int:
         dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_c)
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
+        _self_test_unit_attribute(ok, s, d, bad)
         bad(lambda r: r["analysis"].update(regret_threshold=2), "analysis.regret_threshold",
             "SP11c F6 S1-5: a regret threshold outside [0, 1] is refused")
         bad(lambda r: r["analysis"].update(dollars_threshold="x"), "analysis.dollars_threshold",
