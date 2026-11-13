@@ -1,0 +1,173 @@
+# Malaria engine benchmark pack (architecture-v2 §3.3). Fitted ONCE per engine version:
+#   python3 -m toolkit.engines.benchmark toolkit/engines/malaria/benchmarks/pack.yaml fit
+#   python3 -m toolkit.engines.benchmark toolkit/engines/malaria/benchmarks/pack.yaml run
+# Targets and bands are E7 attempt 8's locked benchmark targets (models/benchmark_targets.yaml,
+# sources C15-C35 in its citations.md), plus two held-out PBO durability checks from the same
+# trials (B9b, B9c). Trial-site settings (species mix, resistance, seasonality, net use) are
+# ASSUMPTIONS written from the trial descriptions, not data the evidence service has checked.
+# Each site's transmission is set by `calibrate` to the site's control-arm or baseline level,
+# which is setting description, not engine tuning; settings may not override fitted parameters.
+engine: toolkit.engines.malaria.engine:MalariaEngine
+seeds: [11, 12, 13, 14, 15, 16, 17, 18]
+horizon:
+  start: 2014.0
+  stop: 2022.2
+  window: [2020.0, 2022.0]          # trial follow-up; nets distributed at 2020.0
+  windows:
+    pre: [2019.0, 2020.0]
+    m9: [2020.70, 2020.85]
+    m12: [2020.92, 2021.08]
+    m21: [2021.70, 2021.85]
+    m24: [2021.92, 2022.08]
+    m0_24: [2020.0, 2022.0]
+
+settings:
+  cochrane_itn:        # Pryce 2018 Cochrane ITN vs none: pre-resistance-era trials
+    unit: {season: [0.7, 0.6, 0.7, 0.9, 1.1, 1.3, 1.4, 1.4, 1.3, 1.1, 0.8, 0.7], resistance: 0.95,
+           species: {gambiae: 0.7, funestus: 0.3}, cm_ft: 0.3, itn_use: 0.7, campaign_year: 2020.0}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {}, value_path: windows.pre.pfpr_6m14y, target: 0.50,
+                grid: [4, 8, 16, 32, 64]}
+  muleba:              # Protopopoff 2018 (Muleba, Tanzania): high pyrethroid resistance, 2x2 PBO x IRS
+    unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1], resistance: 0.25,
+           species: {gambiae: 0.85, arabiensis: 0.05, funestus: 0.10}, cm_ft: 0.3, itn_use: 0.7,
+           itn_hist_years: [2017.0], campaign_year: 2020.0, irs_month: 1}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m9.pfpr_6m14y, target: 0.55,
+                grid: [8, 16, 32, 64, 128]}
+  misungwi:            # Mosha 2022 (Misungwi, Tanzania): An. funestus dominant, resistant; pyrethroid arm 45.8% at 24 m
+    unit: {season: [1.3, 1.2, 1.4, 1.5, 1.3, 0.7, 0.5, 0.5, 0.6, 0.8, 1.1, 1.1], resistance: 0.25,
+           species: {funestus: 0.85, arabiensis: 0.15}, cm_ft: 0.3, itn_use: 0.7,
+           itn_hist_years: [2017.0], campaign_year: 2020.0}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m24.pfpr_6m14y, target: 0.458,
+                grid: [8, 16, 32, 64, 128]}
+  benin:               # Accrombessi 2023 (Zou, Benin): pyrethroid arm 1.03 cases per child-year
+    unit: {season: [0.4, 0.5, 0.9, 1.3, 1.5, 1.6, 1.2, 0.9, 1.3, 1.4, 0.6, 0.4], resistance: 0.30,
+           species: {gambiae: 1.0}, cm_ft: 0.3, itn_use: 0.7, itn_hist_years: [2017.0], campaign_year: 2020.0}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m0_24.inc_u5, target: 2.06,
+                grid: [4, 8, 16, 32, 64]}
+  irs_added:           # Pryce 2022 Cochrane: non-pyrethroid-like IRS added to ITNs (4 cRCTs)
+    unit: {season: [0.7, 0.6, 0.7, 0.9, 1.1, 1.3, 1.4, 1.4, 1.3, 1.1, 0.8, 0.7], resistance: 0.6,
+           species: {gambiae: 0.6, arabiensis: 0.2, funestus: 0.2}, cm_ft: 0.3, itn_use: 0.6,
+           itn_hist_years: [2017.0], campaign_year: 2020.0}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m12.pfpr_6m14y, target: 0.40,
+                grid: [8, 16, 32, 64, 128]}
+  sahel_smc:           # Thwing 2024 SMC meta-analysis: Sahel, strongly seasonal
+    unit: {season: [0.098, 0.098, 0.098, 0.117, 0.543, 1.021, 1.450, 2.477, 3.315, 2.094, 0.592, 0.098],
+           resistance: 0.5, species: {gambiae: 0.6, arabiensis: 0.3, funestus: 0.1}, cm_ft: 0.3, itn_use: 0.5,
+           itn_hist_years: [2017.0], campaign_year: 2020.0}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {}, value_path: windows.pre.pfpr_u5, target: 0.40,
+                grid: [4, 8, 16, 32, 64]}
+  ce_ref:              # reference setting for cost per DALY (B17-B19): West African seasonal, PfPR 6m-14y 0.45
+    unit: {season: [0.098, 0.098, 0.098, 0.117, 0.543, 1.021, 1.450, 2.477, 3.315, 2.094, 0.592, 0.098],
+           resistance: 0.5, species: {gambiae: 0.6, arabiensis: 0.3, funestus: 0.1}, cm_ft: 0.3, itn_use: 0.55,
+           campaign_year: 2020.0}
+    horizon: {start: 2014.0, stop: 2023.0, window: [2020.0, 2023.0], windows: {pre: [2019.0, 2020.0]}}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {}, value_path: windows.pre.pfpr_6m14y, target: 0.45,
+                grid: [4, 8, 16, 32, 64]}
+  ce_res:              # as ce_ref with high resistance, for the dual-AI incremental cost per DALY (B20)
+    unit: {season: [0.098, 0.098, 0.098, 0.117, 0.543, 1.021, 1.450, 2.477, 3.315, 2.094, 0.592, 0.098],
+           resistance: 0.25, species: {gambiae: 0.6, arabiensis: 0.3, funestus: 0.1}, cm_ft: 0.3, itn_use: 0.55,
+           campaign_year: 2020.0}
+    horizon: {start: 2014.0, stop: 2023.0, window: [2020.0, 2023.0], windows: {pre: [2019.0, 2020.0]}}
+    params: {n_agents: 5000}
+    calibrate: {attribute: m0, arm_package: {}, value_path: windows.pre.pfpr_6m14y, target: 0.45,
+                grid: [4, 8, 16, 32, 64]}
+  eir_1: &eir {unit: {m0: 1.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3},
+               horizon: {start: 2012.0, stop: 2020.0, window: [2019.0, 2020.0], windows: {pre: [2019.0, 2020.0]}}}
+  eir_3: {<<: *eir, unit: {m0: 3.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3}}
+  eir_10: {<<: *eir, unit: {m0: 10.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3}}
+  eir_30: {<<: *eir, unit: {m0: 30.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3}}
+  eir_100: {<<: *eir, unit: {m0: 100.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3}}
+  eir_300: {<<: *eir, unit: {m0: 300.0, season: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], resistance: 0.9, species: {gambiae: 1.0}, cm_ft: 0.3}}
+
+arms:
+  coch_none: {setting: cochrane_itn, package: {}}
+  coch_pyr: {setting: cochrane_itn, package: {net: pyr}}
+  mul_pyr: {setting: muleba, package: {net: pyr}}
+  mul_pbo: {setting: muleba, package: {net: pbo}}
+  mul_pyr_irs: {setting: muleba, package: {net: pyr, irs: 1}}
+  mul_pbo_irs: {setting: muleba, package: {net: pbo, irs: 1}}
+  mis_pyr: {setting: misungwi, package: {net: pyr}}
+  mis_pbo: {setting: misungwi, package: {net: pbo}}
+  mis_dual: {setting: misungwi, package: {net: dual}}
+  ben_pyr: {setting: benin, package: {net: pyr}}
+  ben_dual: {setting: benin, package: {net: dual}}
+  irs_itn: {setting: irs_added, package: {net: pyr}}
+  irs_itn_irs: {setting: irs_added, package: {net: pyr, irs: 1}}
+  smc_off: {setting: sahel_smc, package: {}}
+  smc_on: {setting: sahel_smc, package: {smc: 1}}
+  ce_none: {setting: ce_ref, package: {}}
+  ce_pyr: {setting: ce_ref, package: {net: pyr}}
+  ce_irs: {setting: ce_ref, package: {irs: 1}}
+  ce_smc: {setting: ce_ref, package: {smc: 1}}
+  cer_pyr: {setting: ce_res, package: {net: pyr}}
+  cer_dual: {setting: ce_res, package: {net: dual}}
+  eir_1: {setting: eir_1, package: {}}
+  eir_3: {setting: eir_3, package: {}}
+  eir_10: {setting: eir_10, package: {}}
+  eir_30: {setting: eir_30, package: {}}
+  eir_100: {setting: eir_100, package: {}}
+  eir_300: {setting: eir_300, package: {}}
+
+benchmarks:
+  - {id: B7, metric: "ITN (pyrethroid) vs none, prevalence RR at 12 m", target: 0.83, band: [0.68, 0.98],
+     source: "C21 Pryce 2018 Cochrane CD000363.pub3",
+     estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m12.pfpr_6m14y}}
+  - {id: B8, metric: "ITN vs none, clinical incidence RR 0-24 m (under 5)", target: 0.55, band: [0.46, 0.64],
+     source: "C22 Pryce 2018", estimand: {type: ratio, num: coch_pyr, den: coch_none, value: windows.m0_24.inc_u5}}
+  - {id: B9, metric: "PBO vs pyrethroid nets, prevalence OR at 9 m (pooled over IRS arms)", target: 0.37, band: [0.09, 0.65],
+     source: "C15 Protopopoff 2018 Lancet",
+     estimand: {type: odds_ratio, num: [mul_pbo, mul_pbo_irs], den: [mul_pyr, mul_pyr_irs], value: windows.m9.pfpr_6m14y}}
+  - {id: B9b, metric: "PBO vs pyrethroid nets, prevalence OR at 21 m (pooled over IRS arms)", target: 0.40, band: [0.20, 0.81],
+     source: "C15 Protopopoff 2018 (added held-out durability check)",
+     estimand: {type: odds_ratio, num: [mul_pbo, mul_pbo_irs], den: [mul_pyr, mul_pyr_irs], value: windows.m21.pfpr_6m14y}}
+  - {id: B9c, metric: "PBO vs pyrethroid nets, prevalence aOR at 24 m (Misungwi)", target: 0.99, band: [0.67, 1.45],
+     source: "C17 Mosha 2022 Lancet (added held-out durability check)",
+     estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
+  - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.23, 0.67],
+     source: "C17 Mosha 2022", estimand: {type: odds_ratio, num: mis_dual, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
+  - {id: B11, metric: "Dual-AI vs pyrethroid nets, incidence RR 0-24 m", target: 0.54, band: [0.38, 0.70],
+     source: "C20 Accrombessi 2023 Lancet", estimand: {type: ratio, num: ben_dual, den: ben_pyr, value: windows.m0_24.inc_u5}}
+  - {id: B12, metric: "Non-pyrethroid IRS added to ITN, prevalence RR at 12 m", target: 0.61, band: [0.34, 0.88],
+     source: "C23 Pryce 2022 Cochrane CD012688.pub3",
+     estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m12.pfpr_6m14y}}
+  - {id: B12b, metric: "Non-pyrethroid IRS added to ITN, incidence RR 0-24 m", target: 0.86, band: [0.49, 1.23],
+     source: "C23 Pryce 2022", estimand: {type: ratio, num: irs_itn_irs, den: irs_itn, value: windows.m0_24.inc_u5}}
+  - {id: B13, metric: "SMC, in-season clinical incidence RR (3-59 m)", target: 0.27, band: [0.14, 0.40],
+     source: "C27 Thwing 2024 AJTMH", estimand: {type: ratio, num: smc_on, den: smc_off, value: windows.m0_24.inc_u5_smc}}
+  - {id: B15, metric: "ITN x IRS interaction OR (PBO x IRS, prevalence at 9 m, 2x2 factorial)", target: 2.43, band: [0.972, 6.075],
+     source: "C16 Protopopoff 2018: interaction OR 2.43 (1.19-4.97)",
+     estimand: {type: interaction_or, a11: mul_pbo_irs, a10: mul_pbo, a01: mul_pyr_irs, a00: mul_pyr,
+                value: windows.m9.pfpr_6m14y}}
+  - {id: B16c, metric: "EIR-prevalence curve (Beier 1999 rules: EIR > 15 -> PfPR >= 50%; EIR >= 200 -> PfPR > 80%)",
+     source: "C35 Beier 1999 AJTMH",
+     estimand: {type: curve_rules, arms: [eir_1, eir_3, eir_10, eir_30, eir_100, eir_300], x: windows.pre.eir_annual,
+                y: windows.pre.pfpr_2_10, rules: [{x_min: 15, y_min: 0.50}, {x_min: 200, y_min: 0.80}]}}
+  # Cost per DALY (2024 USD, the decision's cost spec: attempt 8 models/costs.py; DALYs from the engine's chain).
+  # nets_given is persons receiving a net: net delivered $2.913 (pyrethroid) / $3.596 (dual-AI) at 1.8 persons per net.
+  # irs_sprayed is person-rounds: $8.26 (2018 USD, C32) x 313.7/251.1 = $10.32. smc_doses: $3.97 per eligible
+  # child-season / 4 cycles / 0.88 mean cycle coverage = $1.128 per delivered dose.
+  - {id: B17, metric: "SMC $ per DALY averted (reference setting)", target: 38.37, band: [7.67, 191.9],
+     source: "C28 Gilmartin 2021", estimand: {type: cost_per_outcome, num: ce_smc, den: ce_none,
+     value: per_capita_all.dalys, costs: {smc_doses: 1.128}}}
+  - {id: B18, metric: "ITN vs none $ per DALY averted (reference setting)", target: 44.51, band: [8.90, 222.6],
+     source: "C29 Conteh 2021", estimand: {type: cost_per_outcome, num: ce_pyr, den: ce_none,
+     value: per_capita_all.dalys, costs: {nets_given: 1.618}}}
+  - {id: B19, metric: "IRS vs none $ per DALY averted (reference setting)", target: 25.16, band: [5.03, 125.8],
+     source: "C29 Conteh 2021", estimand: {type: cost_per_outcome, num: ce_irs, den: ce_none,
+     value: per_capita_all.dalys, costs: {irs_sprayed: 10.32}}}
+  - {id: B20, metric: "Dual-AI vs pyrethroid nets, incremental $ per DALY averted (high resistance)", target: 19.0,
+     band: [3.8, 95.0], source: "C19 Mosha 2022", estimand: {type: cost_per_outcome, num: cer_dual, den: cer_pyr,
+     value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
+
+fit:   # in order; every benchmark not named here is held out
+  - {param: itn_kill_max, grid: [0.15, 0.25, 0.35, 0.45, 0.6, 0.75], targets: [B7, B8]}
+  - {param: pbo_restore, grid: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], targets: [B9]}
+  - {param: cfp_kill, grid: [0.05, 0.15, 0.3, 0.45, 0.6, 0.8], targets: [B10, B11]}
+  - {param: irs_kill, grid: [0.1, 0.25, 0.4, 0.55, 0.7, 0.9], targets: [B12, B12b]}

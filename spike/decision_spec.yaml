@@ -1,0 +1,114 @@
+# Decision spec (architecture-v2 §3.1), hand-written from E7 attempt 8's decision_brief.yaml
+# for the spike. Status: draft for owner review (not signed).
+question: >-
+  Which intervention package (net type x SMC x IRS x case-management intensity) should each LGA
+  in Nigeria's 13 Global Fund-supported states receive under the GC7 malaria grant (2024-2026),
+  to maximise DALYs averted within the envelope? Subset of attempt 8's 774-LGA question.
+decision_maker: "NMEP programme manager with the CCM / Global Fund country team (attempt 8 brief)"
+decision_date: 2024
+engine: toolkit.engines.malaria.engine:MalariaEngine
+
+decision_units:
+  csv: spike/data/units.csv          # built by spike/units.py from attempt 8's processed data
+  id: lga_id
+  label: lga
+  region: state
+  holdout_group: archetype_id         # leave-one-archetype-out allocation stability (as attempt 8)
+  subset: "13 GF states (funder_2020_hbhi == Global Fund): 309 LGAs, 90.8M people"
+  engine_attributes:                  # engine unit attribute <- column(s)
+    season: {columns: [season_m01, season_m02, season_m03, season_m04, season_m05, season_m06,
+                       season_m07, season_m08, season_m09, season_m10, season_m11, season_m12]}
+    resistance: {column: resistance}
+    species: {columns: {gambiae: gambiae, arabiensis: arabiensis, funestus: funestus}}
+    cm_ft: {column: cm_ft}
+    campaign_year: {column: campaign_year}
+    itn_hist_years: {column: itn_hist_years, split: " "}
+    itn_use: {value: 0.55, source: "attempt 8 registry itn_postcampaign_use"}
+  populations:                        # unit population columns <- engine age groups
+    u5: {column: pop_u5, age_groups: [u5]}
+    older: {column: pop_5p, age_groups: ["5_14", "15p"]}
+
+calibration:
+  attribute: m0                        # engine transmission scaler, set per unit
+  log_range: [-1.2, 4.6]               # ln m0 searched (emulator design range)
+  target_column: target_pfpr_u5_2021   # attempt 8 pfpr_disagg_2021 (MAP rescaled to NMIS 2021 by state)
+  window: [2021.67, 2022.0]            # NMIS 2021 survey season
+  metric: pfpr_u5                      # microscopy, 6-59 months
+  target_uncertainty: {column_se_logit: null, common_state_sd_logit: 0.15,
+                       note: "state-level common-mode error on the logit target; NMIS 2021 state CIs are about +/-0.3 on the logit scale (95%)"}
+  loo_covariates: [map_pfpr_2021, sgroup, lat, resistance, cm_ft, arabiensis]
+
+horizon: {start: 2016.0, stop: 2027.0, window: [2024.0, 2027.0]}
+
+emulator:                              # analysis engine design (spike/analysis/batch.py)
+  points: 256
+  holdout_share: 0.1
+  seed: 7
+  features: [resistance, cm_ft, arabiensis, funestus, sgroup, campaign_year]
+
+options:                               # toolkit/alloc spec sections (costs.py, packages.py)
+  units:
+    csv: spike/data/units.csv
+    id: lga_id
+    populations: {total: pop, u5: pop_u5, smc_eligible: smc_pop}
+  components:
+    net_pyr: {group: net}
+    net_pbo: {group: net}
+    net_dual: {group: net}
+    smc: {eligible: smc_eligible}
+    irs: {}
+    cm: {}
+  packages: {generate: true}
+  eligibility:
+    smc: {column: smc_eligible}
+    irs: {column: irs_eligible}
+  engine_map:                          # alloc component -> engine package component
+    net_pyr: {net: pyr}
+    net_pbo: {net: pbo}
+    net_dual: {net: dual}
+    smc: {smc: 1}
+    irs: {irs: 1}
+    cm: {cm: 1}
+  prices:
+    base_year: "2024"
+    index_name: US CPI-U annual average
+    index: {"2018": 251.1, "2021.5": 281.85, "2023": 304.7, "2024": 313.7}
+  cost_items:                          # attempt 8 models/costs.py values (GF financial cost, 2024 USD)
+    # nets: Q2-2025 PPM list (attempt 8 primary basis for 2025-26 campaigns; 251 of 309 LGAs campaign then) x PSM 1.12
+    - {id: net_pyr_commodity, component: net_pyr, value: 2.072, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_pbo_commodity, component: net_pbo, value: 2.397, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_dual_commodity, component: net_dual, value: 2.867, price_year: "2024", price_rule: as_published,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [net, psm]}
+    - {id: net_pyr_delivery, component: net_pyr, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: net_pbo_delivery, component: net_pbo, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: net_dual_delivery, component: net_dual, value: 0.655, price_year: "2021.5", price_rule: index,
+       basis: per_commodity, people_per_commodity: 1.8, includes: [delivery]}
+    - {id: smc, component: smc, value: 3.97, price_year: "2024", price_rule: as_published, basis: per_eligible,
+       years: 3, includes: [drug, delivery]}
+    - {id: irs, component: irs, value: 8.26, price_year: "2018", price_rule: index, basis: per_person,
+       share: 0.8, years: 3, includes: [insecticide, spraying]}
+    - {id: cm_case, component: cm, value: 10.26, price_year: "2024", price_rule: as_published, basis: per_outcome,
+       outcome: treated, incremental: true, includes: [treatment, chw_programme]}
+
+objective: {outcome: dalys, horizon: [2024.0, 2027.0], discounting: none,
+            note: "attempt 8 primary: undiscounted in-window DALYs (AM-1)"}
+constraints:
+  envelope_usd: 315_600_000            # $320M x 98.6% (attempt 8's share of planned cost in these 13 states)
+  fixed_costs_usd: {cm_floor: 59_348_019.55}   # GC7 CM lines kept as is (attempt 8 C5 / D-003)
+comparator: {package: none, text: "CF1 in GF states: no GF campaign in the window, no SMC, no IRS, CM at current level"}
+outcomes_reported: [dalys, cases, deaths]
+uncertainty: {draws: 64, seed: 42, engine_parameters: fitted, calibration: target_uncertainty}
+decision_tests:
+  - {id: DT1, type: interaction_rescale, components: [irs], with_any: [net_pyr, net_pbo, net_dual],
+     benchmark: B15, values: [2.43, 1.19, 4.97],
+     text: "Does the plan change when the ITN x IRS interaction equals the trial value (and its CI ends)?"}
+deliverable: package per unit; national (subset) mix; DALYs averted with 95% UI
+attempt8_reference:
+  dalys_averted_gf_states_point: 10_849_958     # models/allocation_320m.csv, gf == 1
+  dalys_averted_national_median_ui: [10_660_000, 6_770_000, 15_450_000]   # report.md, all 774 LGAs incl. top-ups
+  package_mix_gf_states: {net_pbo: 174, net_dual: 135, smc: 119, irs: 0, cm: 12, no_net: 0}
+  loo_worst_fold_rank_r: 0.346

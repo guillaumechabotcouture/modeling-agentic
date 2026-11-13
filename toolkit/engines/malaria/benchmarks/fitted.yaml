@@ -1,0 +1,143 @@
+engine: toolkit.engines.malaria.engine:MalariaEngine
+fitted_at: '2026-10-30 22:59:03'
+seeds:
+- 11
+- 12
+- 13
+- 14
+n_sims: 338
+wall_s: 480.7
+parameters:
+  itn_kill_max:
+    value: 0.2228
+    lo: 0.1762
+    hi: 0.2835
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B7
+    - B8
+    grid:
+    - 0.15
+    - 0.25
+    - 0.35
+    - 0.45
+    - 0.6
+    - 0.75
+    loss:
+    - 1.546
+    - 0.687
+    - 3.899
+    - 12.252
+    - 33.464
+    - 66.942
+    computed_on_grid:
+    - B7: 0.8025
+      B8: 0.6738
+    - B7: 0.7134
+      B8: 0.551
+    - B7: 0.6188
+      B8: 0.4551
+    - B7: 0.5274
+      B8: 0.3659
+    - B7: 0.4067
+      B8: 0.2718
+    - B7: 0.3235
+      B8: 0.1927
+  pbo_restore:
+    value: 1.0
+    lo: 0.2863
+    hi: 1.0
+    all_targets_in_band_at_value: false
+    benchmarks:
+    - B9
+    grid:
+    - 0.0
+    - 0.2
+    - 0.4
+    - 0.6
+    - 0.8
+    - 1.0
+    loss:
+    - 1.012
+    - 1.055
+    - 0.929
+    - 0.881
+    - 0.76
+    - 0.595
+    computed_on_grid:
+    - B9: 1.0
+    - B9: 1.0214
+    - B9: 0.9592
+    - B9: 0.9357
+    - B9: 0.876
+    - B9: 0.7932
+  cfp_kill:
+    value: 0.29
+    lo: 0.29
+    hi: 0.3162
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B10
+    - B11
+    grid:
+    - 0.05
+    - 0.15
+    - 0.3
+    - 0.45
+    - 0.6
+    - 0.8
+    loss:
+    - 4.209
+    - 1.633
+    - 1.421
+    - 7.21
+    - 17.145
+    - 39.176
+    computed_on_grid:
+    - B10: 0.9344
+      B11: 0.8617
+    - B10: 0.8284
+      B11: 0.6436
+    - B10: 0.6596
+      B11: 0.4036
+    - B10: 0.5157
+      B11: 0.2387
+    - B10: 0.3962
+      B11: 0.1528
+    - B10: 0.2552
+      B11: 0.0821
+  irs_kill:
+    value: 0.14
+    lo: 0.127
+    hi: 0.404
+    all_targets_in_band_at_value: true
+    benchmarks:
+    - B12
+    - B12b
+    grid:
+    - 0.1
+    - 0.25
+    - 0.4
+    - 0.55
+    - 0.7
+    - 0.9
+    loss:
+    - 0.689
+    - 0.856
+    - 1.553
+    - 2.97
+    - 4.912
+    - 7.794
+    computed_on_grid:
+    - B12: 0.8973
+      B12b: 0.7938
+    - B12: 0.8023
+      B12b: 0.6163
+    - B12: 0.7091
+      B12b: 0.4939
+    - B12: 0.6256
+      B12b: 0.3893
+    - B12: 0.5575
+      B12b: 0.3113
+    - B12: 0.4812
+      B12b: 0.243
