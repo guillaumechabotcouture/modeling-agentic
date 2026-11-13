@@ -832,7 +832,22 @@ def _self_test() -> int:
             res.checkpoint(out_dir=dirs["res"], resume_from=dirs["cut"])
             res.task_fn = lambda t: (ran.append(1), BM._job_list(t))[1]
             r_res = res._map(jobs)
-            dump = lambda x: yaml.safe_dump(json.loads(json.dumps(x)), sort_keys=False)  # noqa: E731
+            # Codex r1 P2 probe: resuming into the same directory, after a stop that cut the last row mid-write
+            same_dir, frag = os.path.join(d, "same"), json.dumps({"key": "cut by the stop"})[:12]
+            os.makedirs(same_dir)
+            open(os.path.join(same_dir, CACHE_NAME), "w").write(
+                open(os.path.join(dirs["cut"], CACHE_NAME)).read() + frag)
+            again = mk()
+            again.checkpoint(out_dir=same_dir, resume_from=same_dir)
+            r_again = again._map(jobs)
+            try:
+                n_again = len(load_cache(same_dir, again.code_sha256()))
+            except ValueError as ex:
+                n_again = str(ex)
+            ok(n_again == len(jobs) and r_again == r_full,
+               f"F18 (Codex r1 P2) resuming into the directory it resumes from rewrites the accepted rows first "
+               f"(atomically), so new rows never follow a cut row: the next resume reads {n_again} rows")
+            dump =lambda x: yaml.safe_dump(json.loads(json.dumps(x)), sort_keys=False)  # noqa: E731
             same = r_res == r_full == plain and dump(r_res) == dump(plain) and json.dumps(r_res) == json.dumps(plain)
             ok(kept == 5 and len(ran) == len(jobs) - 5 and same,
                f"F16 (checkpoint) each finished engine task is appended to {CACHE_NAME} as it lands ({kept} rows after "
