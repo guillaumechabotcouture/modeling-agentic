@@ -1,0 +1,104 @@
+# World model v0 (before any simulation) -- cholera OCV siting, synthetic 12-district question.
+# Decision: per district choose none / ocv1 / ocv2 under a US$2.5M budget, 2026 campaigns,
+# outcome suspected cases averted over 2026-2027. Comparator: none (no campaign).
+# Reasoning arithmetic (from the question text only, not from spec values):
+#   cost per resident of a district: ocv1 = 0.7 x 1 dose x $3 = $2.10; ocv2 = 0.7 x 2 x $3 = $4.20.
+#   With 12 districts of 75k-560k people, covering all with ocv1 costs far more than $2.5M,
+#   so the budget binds and the choice is a ranking of districts by baseline incidence.
+#   Population-level relative reduction ~ coverage x direct efficacy (engine: direct protection only).
+#   ocv1 ~ 0.7 x (0.3-0.5) ~ 0.2-0.35; ocv2 ~ 0.7 x (0.5-0.7) ~ 0.35-0.5.
+#   Per dollar ocv1 averts more than ocv2 (second dose roughly doubles cost for well under double
+#   the effect), so breadth (ocv1 in more high-incidence districts) beats depth (ocv2) except
+#   where incidence is highest. Relative effect is the same in every district under the engine's
+#   multiplicative rule, so baseline incidence (inc) ranks districts; price and the effect ratio
+#   ocv2/ocv1 rank the options.
+beliefs:
+  - id: B1
+    mechanism: "A single OCV dose at 70% campaign coverage gives a direct-protection population reduction in suspected cases over two years of roughly coverage x single-dose efficacy (~40% in the Dhaka trial, waning, little in under-5s)"
+    about: {package: ocv1}
+    direction: reduces
+    magnitude: {band: [0.15, 0.40], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Qadri F et al., Efficacy of a single-dose, inactivated oral cholera vaccine in Bangladesh. N Engl J Med 2016;374:1723-32", location: "Results, protective efficacy against all cholera ~40% at 6 months (location within paper unsure)"}
+      - {citation: "Qadri F et al., Efficacy of a single-dose regimen of inactivated whole-cell oral cholera vaccine: results from 2 years of follow-up of a randomised trial. Lancet Infect Dis 2018;18:666-674", location: "Results, ~39% overall over 2 years, ~50% age >=5, no protection under 5 (table number unsure)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: "A two-dose OCV campaign at 70% coverage gives a larger but less-than-double reduction than one dose: two-dose efficacy ~55-70% over the first two years"
+    about: {package: ocv2}
+    direction: reduces
+    magnitude: {band: [0.30, 0.55], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Sur D et al., Efficacy and safety of a modified killed-whole-cell oral cholera vaccine in India: an interim analysis of a cluster-randomised, double-blind, placebo-controlled trial. Lancet 2009;374:1694-702", location: "Results, ~67% protective efficacy at 2 years (table unsure)"}
+      - {citation: "Bi Q et al., Protection against cholera from killed whole-cell oral cholera vaccines: a systematic review and meta-analysis. Lancet Infect Dis 2017;17:1080-8", location: "Pooled two-dose efficacy ~58%, effectiveness ~76% (figure numbers unsure)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: "Under the engine's multiplicative, direct-only rule the relative reduction of a package does not depend on district baseline incidence; incidence changes cases averted, not the relative effect"
+    about: {package: ocv2, feature: inc}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Engine card mechanism in this run: rate = baseline x M(package)/M(baseline coverage), direct protection only (no herd effect); herd effects would make it non-proportional (Ali M et al., Lancet 2005;366:44-49, Matlab herd protection)", location: "Ali 2005 Results, protection of non-vaccinees rose with neighbourhood coverage (table unsure)"}
+    confidence: high
+  - id: B4
+    mechanism: "Sanitation (wash) is not read by the engine (unit attribute is baseline_rate only), so it should not modify the relative reduction; in reality poor WASH raises baseline incidence and may raise herd benefit, which this engine omits"
+    about: {package: ocv1, feature: wash}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Engine card in this run lists unit_attributes: [baseline_rate]; WASH-OCV interaction not established in trials (no specific citation known to me)", location: "n/a"}
+    confidence: medium
+  - id: B5
+    mechanism: "Budget binds: at the shadow price ocv1 beats no campaign only in districts with high enough incidence; low-incidence districts get nothing. Cases averted per person over 2 years ~ 2 x inc x 0.2-0.35 vs price ~ lambda x $2.10, giving a break-even incidence roughly 0.0008-0.0025 per person-year (location uncertain: depends on outcome window, discounting and the engine's effect prior)"
+    about: {pair: [ocv1, none]}
+    direction: flips
+    conditions: [{feature: inc, range: [0.0008, 0.0025]}]
+    source_type: literature
+    evidence:
+      - {citation: "Arithmetic from B1 (Qadri 2018 Lancet Infect Dis) and the question's stated price of US$3.00 per dose delivered at 70% coverage; no external costing source cited", location: "question text"}
+    confidence: low
+    decision_relevant: true
+  - id: B6
+    mechanism: "The second dose costs as much as the first but adds only ~0.10-0.20 of population reduction, so ocv1 beats ocv2 at the shadow price except possibly in the highest-incidence districts (incremental break-even roughly inc > 0.003, may lie above the observed range)"
+    about: {pair: [ocv1, ocv2]}
+    direction: flips
+    conditions: [{feature: inc, range: [0.0028, 0.0060]}]
+    source_type: literature
+    evidence:
+      - {citation: "Incremental arithmetic from B1/B2: Qadri 2018 Lancet Infect Dis single-dose vs Bi 2017 Lancet Infect Dis two-dose pooled efficacy", location: "as in B1, B2"}
+    confidence: low
+    decision_relevant: true
+open_questions:
+  - {id: Q1, question: "What single-dose effect over a full two-year window does the engine prior encode, and does it include waning and the absent protection in under-5s? The ocv1-vs-ocv2 choice turns on the ratio of the two effects.", beliefs: [B1, B2, B6], decision_relevant: true}
+  - {id: Q2, question: "Is suspected-case incidence comparable across districts (suspected vs culture-confirmed, reporting completeness)? Suspected cases overstate cholera where diarrhoea from other causes is common, which would misrank districts.", beliefs: [B5], decision_relevant: true}
+  - {id: Q3, question: "Will the past five years' incidence persist into 2026-2027? Cholera is epidemic and focal; regression to the mean could make the top-ranked districts less burdened than their history suggests.", beliefs: [B5], decision_relevant: true}
+  - {id: Q4, question: "Would herd protection (excluded by the engine) favour concentrating coverage, e.g. ocv2 or full coverage in fewer districts, over spreading ocv1?", beliefs: [B3, B6], decision_relevant: true}
+  - {id: Q5, question: "Are outcomes over 2026-2027 discounted, and over what window exactly; this moves the break-even incidence.", beliefs: [B5, B6], decision_relevant: false}
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "ocv1 reduces suspected cases by 15-40% at the population level across the sweep; refuted if 20% or fewer points fall in that band"
+    test: {kind: effect_band, package: ocv1, band: [0.15, 0.40], min_share: 0.8}
+  - id: H2
+    belief: B2
+    claim: "ocv2 reduces suspected cases by 30-55% at the population level; refuted if 20% or fewer points fall in that band"
+    test: {kind: effect_band, package: ocv2, band: [0.30, 0.55], min_share: 0.8}
+  - id: H3
+    belief: B3
+    claim: "ocv2 relative reduction does not vary with district incidence (|rho| interval inside +/-0.2)"
+    test: {kind: effect_direction, package: ocv2, feature: inc, direction: negligible, equivalence: 0.2}
+  - id: H4
+    belief: B4
+    claim: "ocv1 relative reduction does not vary with sanitation share (|rho| interval inside +/-0.2)"
+    test: {kind: effect_direction, package: ocv1, feature: wash, direction: negligible, equivalence: 0.2}
+  - id: H5
+    belief: B5
+    claim: "the ocv1-vs-none transition along district incidence lies between 0.0008 and 0.0025 cases per person-year"
+    test: {kind: flip_in, a: ocv1, b: none, feature: inc, range: [0.0008, 0.0025]}
+  - id: H6
+    belief: B6
+    claim: "the ocv1-vs-ocv2 transition along district incidence (ocv1 preferred below, ocv2 above) lies between 0.0028 and 0.006 cases per person-year; refuted if the located transition lies wholly below 0.0028 (ocv2 preferred in mid-incidence districts); a transition above the observed range is one-sided and inconclusive"
+    test: {kind: flip_in, a: ocv1, b: ocv2, feature: inc, range: [0.0028, 0.0060]}
