@@ -1,0 +1,275 @@
+beliefs:
+- id: B1
+  mechanism: Two rounds of IRS of houses and cattle sheds reduce sand fly (P. argentipes) indoor density and hence
+    VL incidence in the following year; trial evidence is on vector density, not on cases, so the case effect is
+    modest and uncertain
+  about:
+    package: irs
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.5
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Joshi AB, Das ML, Akhter S, et al. Chemical and environmental vector control as a contribution to
+      the elimination of visceral leishmaniasis on the Indian subcontinent: cluster randomized controlled trials
+      in Bangladesh, India and Nepal. BMC Medicine 2009'
+    location: Results (sand fly density outcomes); exact table not recalled
+  - citation: 'Picado A, Singh SP, Rijal S, et al. Longlasting insecticidal nets for prevention of Leishmania donovani
+      infection in India and Nepal: paired cluster randomised trial. BMJ 2010'
+    location: Results / abstract (no significant effect of nets on infection or VL); indicates vector-density reductions
+      need not translate into large case reductions
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Six-monthly house-to-house ACD with rK39 RDTs shortens time from onset to treatment, shrinking the
+    infectious period of the human reservoir and so next-year incidence; the transmission effect within one year
+    is smaller than the IRS vector effect
+  about:
+    package: acd
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Hirve S, Singh SP, Kumar N, et al. Effectiveness and feasibility of active and passive case detection
+      in the visceral leishmaniasis elimination initiative in India, Bangladesh, and Nepal. American Journal of
+      Tropical Medicine and Hygiene 2010
+    location: Results (ACD finds additional cases earlier); not an incidence trial
+  - citation: 'Le Rutte EA, Coffeng LE, Bontje DM, et al. Feasibility of eliminating visceral leishmaniasis from
+      the Indian subcontinent: explorations with a set of deterministic age-structured transmission models. Parasites
+      & Vectors 2016'
+    location: Results on reduced onset-to-treatment delay; location not recalled
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: IRS and ACD act on different links (vector density vs infectious period); combined independently (multiplicative)
+    the joint reduction is 1-(1-a)(1-i), larger than either alone but less than the sum
+  about:
+    package: acd+irs
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Le Rutte EA, Coffeng LE, Bontje DM, et al. Feasibility of eliminating visceral leishmaniasis from
+      the Indian subcontinent: explorations with a set of deterministic age-structured transmission models. Parasites
+      & Vectors 2016'
+    location: combined-strategy scenarios; location not recalled
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Mud-walled houses raise sand fly density and VL risk (a baseline-burden risk factor, already reflected
+    in vl_rate); no trial shows that the relative effect of IRS differs by wall type, so the relative reduction
+    is not expected to vary with mud_share
+  about:
+    package: irs
+    feature: mud_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Bern C, Courtenay O, Alvar J. Of cattle, sand flies and men: a systematic review of risk factor analyses
+      for South Asian visceral leishmaniasis and implications for elimination. PLoS Neglected Tropical Diseases
+      2010'
+    location: risk-factor tables (house construction, mud walls); table number not recalled
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: The relative effect of ACD is a property of the intervention, not of the block's baseline incidence,
+    within one year and at these endemic levels; burden scales the absolute benefit, not the relative reduction
+  about:
+    package: acd
+    feature: vl_rate
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Le Rutte EA, Coffeng LE, Bontje DM, et al. Feasibility of eliminating visceral leishmaniasis from
+      the Indian subcontinent: explorations with a set of deterministic age-structured transmission models. Parasites
+      & Vectors 2016'
+    location: location not recalled
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: ACD is cheaper (0.60 vs 1.50 per resident) and its effect per dollar exceeds IRS unless IRS's relative
+    effect is more than 2.5x ACD's; at low and middle burden, where absolute benefit is small, the cheaper ACD beats
+    IRS on net benefit at the budget's shadow price
+  about:
+    pair:
+    - acd
+    - irs
+  direction: flips
+  conditions:
+  - feature: vl_rate
+    range:
+    - 6.0e-05
+    - 0.0006
+  source_type: literature
+  evidence:
+  - citation: Hirve S, Singh SP, Kumar N, et al. Effectiveness and feasibility of active and passive case detection
+      in the visceral leishmaniasis elimination initiative in India, Bangladesh, and Nepal. American Journal of
+      Tropical Medicine and Hygiene 2010
+    location: cost and feasibility discussion
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Under a binding budget that cannot cover all blocks, the highest-burden blocks are funded first; ACD
+    beats none in high-burden blocks and the none/acd switch sits at a vl_rate around the middle of the observed
+    range
+  about:
+    pair:
+    - acd
+    - none
+  direction: flips
+  conditions:
+  - feature: vl_rate
+    range:
+    - 0.00015
+    - 0.0007
+  source_type: literature
+  evidence:
+  - citation: 'Le Rutte EA, Coffeng LE, Bontje DM, et al. Feasibility of eliminating visceral leishmaniasis from
+      the Indian subcontinent: explorations with a set of deterministic age-structured transmission models. Parasites
+      & Vectors 2016'
+    location: 'general: intervention benefit scales with endemicity; threshold location is my reasoning, not from
+      the paper'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What is the trial-measured relative reduction in VL cases (not sand fly density) from synthetic-pyrethroid
+    IRS? No case-outcome RCT is known to me; if IRS's effect exceeds ~2.5x ACD's, IRS overtakes ACD per dollar.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Does ACD reduce next-year incidence at all within a one-year horizon, or does it mainly raise ascertainment
+    of cases (which could even raise counted cases in 2026)?
+  beliefs:
+  - B2
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: In the highest-burden blocks, is adding IRS to ACD (marginal 1.50 per resident for i x (1-a) of the
+    remaining burden) worth it at the shadow price, i.e. where does acd+irs replace acd?
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does wall type (mud_share) modify IRS's relative effect (mud absorbs insecticide, shortening residual
+    efficacy; cracks harbour sand flies)? The engine reads only baseline_rate, so any such modification is outside
+    the model.
+  beliefs:
+  - B4
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: IRS's relative reduction in 2026 cases lies in 0.10-0.50 at most design points; refuted if at least 30%
+    of points fall outside it
+  test:
+    kind: effect_band
+    package: irs
+    band:
+    - 0.1
+    - 0.5
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: ACD's relative reduction in 2026 cases lies in 0.05-0.30 at most design points; refuted if at least 30%
+    of points fall outside it
+  test:
+    kind: effect_band
+    package: acd
+    band:
+    - 0.05
+    - 0.3
+    min_share: 0.7
+- id: H3
+  belief: B4
+  claim: IRS's relative reduction does not vary with mud_share (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: irs
+    feature: mud_share
+    direction: negligible
+    equivalence: 0.2
+- id: H4
+  belief: B5
+  claim: ACD's relative reduction does not vary with baseline vl_rate (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: acd
+    feature: vl_rate
+    direction: negligible
+    equivalence: 0.2
+- id: H5
+  belief: B6
+  claim: At low and middle burden (vl_rate 0.00006-0.0006) ACD has higher net benefit than IRS at the shadow price
+    in at least 80% of usable points; refuted if IRS wins there in at least 80%
+  test:
+    kind: paired_sign
+    a: acd
+    b: irs
+    feature: vl_rate
+    range:
+    - 6.0e-05
+    - 0.0006
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B7
+  claim: The none-to-ACD transition along vl_rate lies within 0.00015-0.0007; refuted if the located transition
+    is disjoint from that range
+  test:
+    kind: flip_in
+    a: acd
+    b: none
+    feature: vl_rate
+    range:
+    - 0.00015
+    - 0.0007
