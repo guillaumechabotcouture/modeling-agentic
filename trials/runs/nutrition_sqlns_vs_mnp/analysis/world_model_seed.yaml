@@ -1,0 +1,251 @@
+beliefs:
+- id: B1
+  mechanism: SQ-LNS given to children 6-23 months modestly lowers wasting prevalence (trial prevalence ratio ~0.82-0.88
+    ITT); at ~70% receipt the population-level relative reduction is around 0.07-0.15
+  about:
+    package: sqlns
+  direction: reduces
+  magnitude:
+    band:
+    - 0.06
+    - 0.16
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Dewey KG et al. (2022) Preventive small-quantity lipid-based nutrient supplements reduce severe wasting
+      and severe stunting among young children: an individual participant data meta-analysis of randomized controlled
+      trials. Am J Clin Nutr'
+    location: main results, wasting prevalence ratio ~0.86 (exact table not recalled)
+  - citation: Das JK et al. (2019) Preventive lipid-based nutrient supplements given with complementary foods to
+      infants and young children 6 to 23 months of age for health, nutrition, and developmental outcomes. Cochrane
+      Database Syst Rev
+    location: Summary of findings table 1, wasting RR ~0.82 (value from memory)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: MNP home fortification has little or no effect on wasting (anaemia and iron deficiency are its benefits);
+    population relative reduction near zero
+  about:
+    package: mnp
+  direction: negligible
+  magnitude:
+    band:
+    - 0.0
+    - 0.05
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Suchdev PS et al. (2020) Home fortification of foods with multiple micronutrient powders for health
+      and nutrition in children under two years of age. Cochrane Database Syst Rev
+    location: 'Summary of findings, wasting: no clear effect (exact RR not recalled)'
+  - citation: De-Regil LM et al. (2011) Home fortification of foods with multiple micronutrient powders for health
+      and nutrition in children under two years of age. Cochrane Database Syst Rev
+    location: Summary of findings, anthropometry outcomes not improved
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: Under the multiplicative package_rate engine the relative reduction does not vary with baseline wasting;
+    absolute benefit scales with inc, so inc ranks districts
+  about:
+    package: sqlns
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Dewey KG et al. (2022) Characteristics that modify the effect of small-quantity lipid-based nutrient
+      supplementation on child anthropometric outcomes: an individual participant data meta-analysis of randomized
+      controlled trials. Am J Clin Nutr'
+    location: effect-modifier results; site-level burden modifiers reported, details not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Household food insecurity and stunting are not read by the engine (only baseline_rate), so they do
+    not modify the SQ-LNS relative reduction in the simulation; in the trials, modification by these factors was
+    weak or inconsistent
+  about:
+    package: sqlns
+    feature: food_insecurity
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Dewey KG et al. (2022) Characteristics that modify the effect of small-quantity lipid-based nutrient
+      supplementation on child anthropometric outcomes: an individual participant data meta-analysis of randomized
+      controlled trials. Am J Clin Nutr'
+    location: individual-level modifiers; food insecurity result not recalled precisely
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'The SQ-LNS relative reduction follows its trial-prior log relative risk directly: a larger lrr (weaker
+    effect) gives a smaller reduction'
+  about:
+    package: sqlns
+    feature: lrr:sqlns:wasted_child_years
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Dewey KG et al. (2022) Preventive small-quantity lipid-based nutrient supplements reduce severe wasting
+      and severe stunting among young children: an individual participant data meta-analysis of randomized controlled
+      trials. Am J Clin Nutr'
+    location: uncertainty interval of wasting prevalence ratio
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'SQ-LNS beats MNP at the shadow price only where baseline wasting is high: the incremental US$34 per
+    child buys roughly 0.05-0.14 more relative reduction, worth it only when inc x that gain clears the budget''s
+    marginal value; choice flips along inc, roughly in the 0.08-0.16 range (location uncertain because the shadow
+    price is withheld)'
+  about:
+    pair:
+    - sqlns
+    - mnp
+    feature: inc
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.08
+    - 0.16
+  source_type: literature
+  evidence:
+  - citation: 'Dewey KG et al. (2022) Preventive small-quantity lipid-based nutrient supplements reduce severe wasting
+      and severe stunting among young children: an individual participant data meta-analysis of randomized controlled
+      trials. Am J Clin Nutr'
+    location: wasting effect; combined with question prices US$40 vs US$6
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Does the engine apply the 70% coverage on top of trial ITT effects (which already reflect imperfect
+    adherence), double-discounting the effect?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q2
+  question: Is the MNP effect on wasting truly null, or small positive? With a 6.7x price ratio, an MNP relative
+    reduction of even ~0.02 makes MNP competitive per dollar with SQ-LNS in low-burden districts.
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Where does the budget shadow price sit, i.e. at what baseline wasting does SQ-LNS's incremental cost
+    over MNP stop paying? The price bracket for a flip is not computed by any harness test listed.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Is the SQ-LNS effect larger in high-wasting or food-insecure settings (effect modification the engine
+    cannot represent)?
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q5
+  question: Does a wasting-prevalence reduction translate one-for-one into wasted child-years (prevalence x time),
+    given wasting is short-episode and seasonal?
+  beliefs:
+  - B1
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: SQ-LNS relative reduction in wasted child-years vs none lies in 0.06-0.16 at most design points
+  test:
+    kind: effect_band
+    package: sqlns
+    band:
+    - 0.06
+    - 0.16
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: MNP relative reduction in wasted child-years vs none lies in 0.00-0.05 at most design points
+  test:
+    kind: effect_band
+    package: mnp
+    band:
+    - 0.0
+    - 0.05
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: SQ-LNS relative reduction does not change with baseline wasting (inc)
+  test:
+    kind: effect_direction
+    package: sqlns
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: SQ-LNS relative reduction does not change with household food insecurity
+  test:
+    kind: effect_direction
+    package: sqlns
+    feature: food_insecurity
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: SQ-LNS relative reduction decreases as its log relative risk prior increases
+  test:
+    kind: effect_direction
+    package: sqlns
+    feature: lrr:sqlns:wasted_child_years
+    direction: decreases
+- id: H6
+  belief: B6
+  claim: The SQ-LNS vs MNP choice flips along baseline wasting within inc 0.08-0.16
+  test:
+    kind: flip_in
+    a: sqlns
+    b: mnp
+    feature: inc
+    range:
+    - 0.08
+    - 0.16
+- id: H7
+  belief: B6
+  claim: In the highest-wasting districts (inc 0.16-0.1944) SQ-LNS has higher net benefit than MNP at the shadow
+    price
+  test:
+    kind: paired_sign
+    a: sqlns
+    b: mnp
+    feature: inc
+    range:
+    - 0.16
+    - 0.1944
+    sign: positive
+    min_share: 0.6
