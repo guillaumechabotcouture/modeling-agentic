@@ -1,0 +1,319 @@
+beliefs:
+- id: B1
+  mechanism: Vaccinating ~50% of pupils at random (doses not targeted at susceptibles) with all-or-nothing efficacy
+    e removes about 0.5 x e of susceptibles, lowering Reff by the factor (1 - 0.5 e). Through the final-size relation
+    the relative reduction in infections exceeds the direct share protected (indirect protection), ranging from
+    roughly a quarter when Reff stays well above 1 to near-complete when post-vaccination Reff falls below 1. With
+    trial efficacy of inactivated influenza vaccine around 0.4-0.7 against confirmed infection, and plausible school
+    R0 of ~2-4, I expect the relative reduction mostly in 0.25-0.9.
+  about:
+    package: vaccinate
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.9
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Osterholm MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines:
+      a systematic review and meta-analysis. Lancet Infect Dis 2012'
+    location: Results and Figure 2 (pooled TIV efficacy about 59% in adults 18-65; I am not certain of the figure
+      number)
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (Section on the threshold theorem)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: 'main result: final size independent of generation-interval shape'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: 'Higher pre-term susceptibility s0 raises Reff = R0 x s0, so the outbreak overshoots further above
+    the threshold and vaccination of half the pupils removes a smaller fraction of infections: the relative reduction
+    from vaccination decreases as s0 increases (while the absolute baseline attack share rises steeply). This is
+    the main reason schools differ.'
+  about:
+    package: vaccinate
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 5 (herd immunity threshold 1 - 1/R0); page not recalled
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: In the most immune schools (lowest s0) Reff is close to threshold, so vaccination of half the pupils
+    often pushes post-vaccination Reff to or below 1 and the relative reduction is large (mostly 0.45-1.0; wide
+    because school R0 is uncertain).
+  about:
+    package: vaccinate
+    feature: s0
+  direction: reduces
+  magnitude:
+    band:
+    - 0.45
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: s0
+    range:
+    - 0.628
+    - 0.75
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 5 (critical vaccination coverage); page not recalled
+  - citation: 'Osterholm MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines:
+      a systematic review and meta-analysis. Lancet Infect Dis 2012'
+    location: Results (pooled efficacy)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: In the least immune schools (highest s0) Reff stays well above 1 even after vaccination, so the relative
+    reduction is modest (mostly 0.15-0.65) although the absolute number averted per pupil is largest or near-largest.
+  about:
+    package: vaccinate
+    feature: s0
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.65
+    scale: relative_reduction
+  conditions:
+  - feature: s0
+    range:
+    - 0.85
+    - 0.939
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation
+  - citation: Influenza in a boarding school. Br Med J 1978
+    location: the single report (763 boys, 512 ill; a high-attack, high-R0 school outbreak)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B5
+  mechanism: The share infected on day 0 (0.04-0.26%) barely changes the final size of a well-mixed epidemic seeded
+    in a mostly susceptible population (final size depends on Reff, not on the seed, as the seed goes to zero),
+    so the relative reduction from vaccination is essentially unaffected by seed share. Only where post-vaccination
+    Reff < 1 do seed infections form a visible floor, which is small at these seed sizes.
+  about:
+    package: vaccinate
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size formula with a vanishing initial infected fraction
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: School size (600-2,400 pupils) does not change per-capita outcomes in a homogeneous-mixing, density-independent
+    (frequency-dependent) model; it scales cost and infections averted proportionally, so it matters for how many
+    schools fit the budget but not for the relative reduction.
+  about:
+    package: vaccinate
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: frequency-dependent transmission in homogeneous populations; page not recalled
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Higher vaccine efficacy protects more of the vaccinated susceptibles and so raises the relative reduction
+    monotonically, with amplification near the threshold.
+  about:
+    package: vaccinate
+    feature: efficacy:vaccinate
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Osterholm MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines:
+      a systematic review and meta-analysis. Lancet Infect Dis 2012'
+    location: Results (efficacy range across trials and seasons)
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: School R0 for influenza-like illness is plausibly 2-4, well above population-level seasonal estimates
+    (median about 1.3) because of dense boarding contacts; R0 inferred from an attack share via the final-size relation
+    R0 = -ln(1 - z/s0)/z is highly sensitive to s0, so serosurvey error in s0 propagates directly into the R0 interval.
+    This drives the estimation answer and the size of all vaccination effects.
+  about:
+    feature: s0
+  direction: none
+  magnitude:
+    band:
+    - 2.0
+    - 4.0
+    scale: R0
+  source_type: literature
+  evidence:
+  - citation: 'Biggerstaff M, Cauchemez S, Reed C, Gambhir M, Finelli L. Estimates of the reproduction number for
+      seasonal, pandemic, and zoonotic influenza: a systematic review of the literature. BMC Infect Dis 2014'
+    location: Results (median R for seasonal influenza about 1.28); table number not recalled
+  - citation: Influenza in a boarding school. Br Med J 1978
+    location: the single report (attack about 67% of 763 boys)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What is the strain's R0 in a school (the r0_target the engine is calibrated to, and its uncertainty)?
+    It sets whether vaccination pushes Reff below 1 in the more immune schools, which moves the relative reduction
+    from ~0.4 to ~0.95.
+  beliefs:
+  - B1
+  - B3
+  - B8
+  decision_relevant: true
+- id: Q2
+  question: What vaccine efficacy against infection applies (strain match, age group, all-or-nothing vs leaky),
+    and does the serosurvey's s0 measure protection or only antibody presence? A leaky vaccine or a biased serosurvey
+    changes both the R0 estimate and the averted infections.
+  beliefs:
+  - B1
+  - B2
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q3
+  question: Is the price US$12 per vaccinated pupil or per enrolled pupil, and does the budget bind? It decides
+    whether all 20 schools can be covered (~27,000 pupils at mid-size) or only those with the most infections averted
+    per dollar, which I expect to be the higher-s0 schools; no shadow price or optimised plan exists in this sweep,
+    so that ranking is untested here.
+  beliefs:
+  - B2
+  - B4
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Is the outcome window term-long or to extinction? The engine counts the final size to extinction, which
+    can overstate term infections for slow, near-threshold outbreaks (where vaccination looks best).
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Across the sweep, vaccinate reduces infections by 25-90% relative to none at most points.
+  test:
+    kind: effect_band
+    package: vaccinate
+    band:
+    - 0.25
+    - 0.9
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: The relative reduction from vaccinate decreases as pre-term susceptibility s0 increases.
+  test:
+    kind: effect_direction
+    package: vaccinate
+    feature: s0
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: In the most immune schools (s0 0.628-0.75) vaccinate reduces infections by 45-100% at most points.
+  test:
+    kind: effect_band
+    package: vaccinate
+    band:
+    - 0.45
+    - 1.0
+    min_share: 0.7
+    where:
+      s0:
+      - 0.628
+      - 0.75
+- id: H4
+  belief: B4
+  claim: In the least immune schools (s0 0.85-0.939) vaccinate reduces infections by only 15-65% at most points.
+  test:
+    kind: effect_band
+    package: vaccinate
+    band:
+    - 0.15
+    - 0.65
+    min_share: 0.7
+    where:
+      s0:
+      - 0.85
+      - 0.939
+- id: H5
+  belief: B5
+  claim: Seed share has a negligible rank association with vaccinate's relative reduction (|rho| bound within 0.3).
+  test:
+    kind: effect_direction
+    package: vaccinate
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.3
+- id: H6
+  belief: B6
+  claim: School size has a negligible rank association with vaccinate's relative reduction (|rho| bound within 0.3).
+  test:
+    kind: effect_direction
+    package: vaccinate
+    feature: pop
+    direction: negligible
+    equivalence: 0.3
+- id: H7
+  belief: B7
+  claim: Holding s0 fixed, vaccinate's relative reduction increases with vaccine efficacy.
+  test:
+    kind: effect_direction
+    package: vaccinate
+    feature: efficacy:vaccinate
+    direction: increases
+    adjust_for:
+    - s0
