@@ -249,6 +249,20 @@ class EmulatorModel:
         self._accuracy()
         return self
 
+    def _pred(self, key, X):
+        """A GP's prediction for an emulated quantity; DALYs (#220 r4) are the predicted YLL + YLD, never the DALY GP
+        (fitted only because the other outcomes' GPs start from its kernel): the log comparator burden, or the
+        reduction 1 - (YLL_k + YLD_k) / (YLL + YLD) with the parts' reductions clipped as predict() clips them."""
+        o = key[2]
+        if not (self.yll and o == self.yll["dalys"] and BV.YLD_OUT in self.outcomes):
+            return self.gps[key].predict(X)
+        P = key[1]
+        by, bd = (np.exp(self.gps[("base", P, q)].predict(X)) for q in (BV.YLL_OUT, BV.YLD_OUT))
+        if key[0] == "base":
+            return np.log(by + bd)
+        ry, rd = (np.clip(self.gps[("red", P, q, key[3])].predict(X), -0.5, 1.0) for q in (BV.YLL_OUT, BV.YLD_OUT))
+        return 1 - (by * (1 - ry) + bd * (1 - rd)) / (by + bd)
+
     def _accuracy(self):
         ho = self.hold
         if ho.sum() < 2:
@@ -265,11 +279,11 @@ class EmulatorModel:
                 continue
             for P in self.pops:
                 key = ("red", P, self.primary, k)
-                t, p = self.T[key][ho], self.gps[key].predict(Xh)
+                t, p = self.T[key][ho], self._pred(key, Xh)
                 for o in self.outcomes:          # Codex r2 P1: one residual column per outcome
                     ko = ("red", P, o, k)
                     cols.append((P, o, k))
-                    res.append(self.T[ko][ho] - self.gps[ko].predict(Xh))
+                    res.append(self.T[ko][ho] - self._pred(ko, Xh))
                 ss = np.sum((t - t.mean()) ** 2)
                 r2.append(1 - np.sum((t - p) ** 2) / ss if ss > 0 else float("nan"))
                 errs.append(np.mean(np.abs(t - p)))
@@ -278,7 +292,7 @@ class EmulatorModel:
         acc["reduction_r2_p10"] = float(np.nanpercentile(r2, 10))
         acc["reduction_mae_median"] = float(np.median(errs))
         P0 = next(iter(self.pops))
-        tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
+        tb, pb = self.T[("base", P0, self.primary)][ho], self._pred(("base", P0, self.primary), Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
         for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
             cols.append(("emu", "bw", o, P))
@@ -286,7 +300,7 @@ class EmulatorModel:
         for P in self.pops:    # F6 S2-4: the comparator burden and every cost output too, from the same points
             for o in self.outcomes:
                 cols.append(("emu", "base", P, o))    # four parts: never a reduction's or a window's key
-                res.append(self.T[("base", P, o)][ho] - self.gps[("base", P, o)].predict(Xh))
+                res.append(self.T[("base", P, o)][ho] - self._pred(("base", P, o), Xh))
         for name in self.cost_outputs:
             for k in self.packages:
                 cols.append(("emu", "cost", name, k))
@@ -294,6 +308,9 @@ class EmulatorModel:
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
+        if self.yll and self.yll["dalys"] in self.outcomes and BV.YLD_OUT in self.outcomes:
+            acc["dalys_from"] = ("the predicted YLL + YLD; the DALY GP is fitted only for the kernel the other outcomes' "
+                                 "GPs start from, and its prediction is never used")
         self.accuracy = acc
 
     # ---------------------------------------------------------------- prediction
@@ -776,7 +793,8 @@ def _self_test() -> int:
                 for k in pk:
                     cs = sp.packages()[k]
                     m = math.exp(z) * (1 - 0.3 * ("a" in cs) - 0.2 * ("b" in cs))
-                    dth, cas = 0.01 * m, 0.1 * m
+                    dth = 0.01 * m * (1 + 0.3 * math.sin(4 * z) * ("a" in cs)) * float(rng.uniform(0.8, 1.2))
+                    cas = 0.1 * m * (1 + 0.3 * math.cos(3 * z) * ("b" in cs)) * float(rng.uniform(0.8, 1.2))
                     res[f"p{n}|{k}"] = {"per_capita": {"deaths": {"all": dth}, "cases": {"all": cas},
                                                        "dalys": {"all": 0.5 * cas + dth * th["eff_a"]}},
                                         "meta": {"age_shares": {"all": 1.0}}, "cost_drivers": {"a_doses": 1.0, "b_doses": 1.0},
@@ -801,6 +819,24 @@ def _self_test() -> int:
                 BVm.apply_anchor(anc, o, ids, unit_factors={i: {"deaths": 2.0, "cases": 0.5} for i in ids})
                 good &= all(o[i]["y"][k]["dalys"] >= o[i]["y"][k][Y] - 1e-12 for i in ids for k in pk)
                 n_ok += 1
+            ho, Xh = em.hold, em.X[em.hold]
+            errs = []
+            for k in pk:
+                if k == em.comp:
+                    continue
+                by, bd = (np.exp(em.gps[("base", "all", q)].predict(Xh)) for q in (Y, D))
+                ry, rd = (np.clip(em.gps[("red", "all", q, k)].predict(Xh), -0.5, 1) for q in (Y, D))
+                pr = 1 - (by * (1 - ry) + bd * (1 - rd)) / (by + bd)
+                errs.append(np.mean(np.abs(em.T[("red", "all", "dalys", k)][ho] - pr)))
+            tb = em.T[("base", "all", "dalys")][ho]
+            pb = np.log(np.exp(em.gps[("base", "all", Y)].predict(Xh)) + np.exp(em.gps[("base", "all", D)].predict(Xh)))
+            gp_mae = np.median([np.mean(np.abs(em.T[("red", "all", "dalys", k)][ho]
+                                               - em.gps[("red", "all", "dalys", k)].predict(Xh))) for k in pk if k != em.comp])
+            ok(abs(em.accuracy["reduction_mae_median"] - float(np.median(errs))) < 1e-12
+               and abs(em.accuracy["base_log_rmse"] - float(np.sqrt(np.mean((tb - pb) ** 2)))) < 1e-12
+               and "YLL + YLD" in em.accuracy.get("dalys_from", "") and em.accuracy["reduction_mae_median"] != gp_mae,
+               f"MD6 (#220 r4) the reported DALY accuracy is the held-out error of DALYs = predicted YLL + YLD "
+               f"({em.accuracy['reduction_mae_median']:.3g}), not the DALY GP's ({gp_mae:.3g})")
             ok(np.allclose(tw, want) and good and n_ok == 4 and em.error is not None,
                "MD5 the emulator learns YLL from each design point's own weight parameter, predicts DALYs = YLL + YLD "
                "with both parts non-negative in every emulator-error draw, and anchored DALYs stay above anchored YLL")
