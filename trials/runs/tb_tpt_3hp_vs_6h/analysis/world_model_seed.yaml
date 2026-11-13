@@ -1,0 +1,290 @@
+beliefs:
+- id: B1
+  mechanism: 6H (six months daily isoniazid) reduces incident TB among contacts offered it, relative to no TPT;
+    trial efficacy of 6 months isoniazid ~ 55-65% reduction, diluted toward the lower half by incomplete adherence
+    when offered programmatically
+  about:
+    package: h6
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Smieja MJ, Marchetti CA, Cook DJ, Smaill FM. Isoniazid for preventing tuberculosis in non-HIV infected
+      persons. Cochrane Database of Systematic Reviews 1999
+    location: Main results (overall RR ~0.40; 6-month subgroup; exact table number not recalled)
+  - citation: 'International Union Against Tuberculosis Committee on Prophylaxis. Efficacy of various durations
+      of isoniazid preventive therapy for tuberculosis: five years of follow-up in the IUAT trial. Bulletin of the
+      World Health Organization 1982'
+    location: 'Results: 24-week arm ~65% reduction overall, higher among compliers (table number not recalled)'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B2
+  mechanism: 3HP (12 weekly doses of rifapentine plus isoniazid) is at least as efficacious as isoniazid regimens
+    and has markedly higher completion, so its reduction relative to no TPT among those offered is similar to or
+    somewhat larger than 6H's
+  about:
+    package: hp3
+  direction: reduces
+  magnitude:
+    band:
+    - 0.35
+    - 0.85
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Sterling TR, Villarino ME, Borisov AS, et al. Three months of rifapentine and isoniazid for latent
+      tuberculosis infection. New England Journal of Medicine 2011
+    location: 'Results / Table 2: TB 0.19% (3HP) vs 0.43% (9H), noninferior; completion 82% vs 69%'
+  - citation: 'Zenner D, Beer N, Harris RJ, Lipman MC, Stagg HR, van der Werf MJ. Treatment of latent tuberculosis
+      infection: an updated network meta-analysis. Annals of Internal Medicine 2017'
+    location: Results, network estimates vs placebo (table number not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: The engine's relative reduction of a regimen is the same at every baseline incidence (multiplicative
+    RR); trials give no strong evidence that relative efficacy varies with contacts' incidence. Absolute benefit,
+    not relative effect, scales with tb_rate
+  about:
+    package: hp3
+    feature: tb_rate
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Fox GJ, Barry SE, Britton WJ, Marks GB. Contact investigation for tuberculosis: a systematic review
+      and meta-analysis. European Respiratory Journal 2013'
+    location: 'Results: yield and incidence among household contacts by setting (baseline varies widely; table number
+      not recalled)'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: HIV prevalence among contacts does not modify the engine's relative reduction (HIV is not an engine
+    input); in trials, isoniazid's benefit in people with HIV is concentrated in TST-positive persons, an effect
+    modification the engine cannot represent
+  about:
+    package: h6
+    feature: hiv
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Akolo C, Adetifa I, Shepperd S, Volmink J. Treatment of latent tuberculosis infection in HIV infected
+      persons. Cochrane Database of Systematic Reviews 2010
+    location: 'Main results: overall RR ~0.68; TST-positive RR ~0.38; TST-negative no clear benefit'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'At the budget''s shadow price, treating with 6H beats no TPT in the high-incidence districts: benefit
+    per $ scales with tb_rate and the budget''s marginal district sits below the top of the range'
+  about:
+    pair:
+    - h6
+    - none
+    feature: tb_rate
+  direction: increases
+  conditions:
+  - feature: tb_rate
+    range:
+    - 0.015
+    - 0.02667
+  source_type: literature
+  evidence:
+  - citation: Smieja MJ, Marchetti CA, Cook DJ, Smaill FM. Isoniazid for preventing tuberculosis in non-HIV infected
+      persons. Cochrane Database of Systematic Reviews 1999
+    location: Main results (relative effect carried to absolute benefit by baseline rate; reasoning, not a reported
+      table)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: In low-incidence districts the extra $20 per contact for 3HP buys too few extra cases averted (a small
+    difference in relative effect times a low baseline), so 6H beats 3HP at the shadow price
+  about:
+    pair:
+    - hp3
+    - h6
+    feature: tb_rate
+  direction: decreases
+  conditions:
+  - feature: tb_rate
+    range:
+    - 0.00424
+    - 0.01
+  source_type: literature
+  evidence:
+  - citation: Sterling TR, Villarino ME, Borisov AS, et al. Three months of rifapentine and isoniazid for latent
+      tuberculosis infection. New England Journal of Medicine 2011
+    location: Results / Table 2 (efficacy noninferior, difference in TB rates small in absolute terms)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: The choice between 6H and no TPT flips along tb_rate at the budget's marginal district, which I expect
+    in the lower-middle of the incidence range because the budget covers well under all contacts
+  about:
+    pair:
+    - h6
+    - none
+    feature: tb_rate
+  direction: flips
+  conditions:
+  - feature: tb_rate
+    range:
+    - 0.006
+    - 0.02
+  source_type: literature
+  evidence:
+  - citation: Smieja MJ, Marchetti CA, Cook DJ, Smaill FM. Isoniazid for preventing tuberculosis in non-HIV infected
+      persons. Cochrane Database of Systematic Reviews 1999
+    location: Main results (reasoning on budget arithmetic; flip location is my estimate, not reported)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Is the engine's 3HP relative risk expressed against no TPT or against 6H (the card says 3HP's effect
+    is relative to H)? If it is a trial ratio vs isoniazid applied as if vs none, 3HP's effect is understated; if
+    composed, it must not double count.
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: How large is the 3HP minus 6H difference in effect among contacts offered treatment (completion ~80%
+    vs ~50-65% programmatically)? This difference against the $20 price gap decides whether 3HP enters any district.
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Does the 2026-2027 window capture the full protection (cases averted after 2027 are excluded), and does
+    the tb_rate baseline include contacts who are uninfected or already have prevalent TB at screening?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: Where is the budget's marginal district (shadow price)? It locates the none/6H flip and the region where
+    3HP could pay off.
+  beliefs:
+  - B5
+  - B7
+  decision_relevant: true
+- id: Q5
+  question: Should HIV prevalence modify regimen effect (benefit concentrated in TST-positive PLHIV; 3HP drug interactions
+    with ART such as dolutegravir/efavirenz)? The engine has no such mechanism.
+  beliefs:
+  - B4
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: 6H's relative reduction in incident TB vs no TPT lies within 0.25-0.70 at most design points
+  test:
+    kind: effect_band
+    package: h6
+    band:
+    - 0.25
+    - 0.7
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: 3HP's relative reduction in incident TB vs no TPT lies within 0.35-0.85 at most design points
+  test:
+    kind: effect_band
+    package: hp3
+    band:
+    - 0.35
+    - 0.85
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: 3HP's relative reduction does not vary with tb_rate (|Spearman rho| bound within 0.3)
+  test:
+    kind: effect_direction
+    package: hp3
+    feature: tb_rate
+    direction: negligible
+    equivalence: 0.3
+- id: H4
+  belief: B4
+  claim: 6H's relative reduction does not vary with HIV prevalence (|Spearman rho| bound within 0.3)
+  test:
+    kind: effect_direction
+    package: h6
+    feature: hiv
+    direction: negligible
+    equivalence: 0.3
+- id: H5
+  belief: B5
+  claim: In districts with tb_rate 0.015-0.02667, 6H has higher net benefit than no TPT at the shadow price at >=
+    80% of points
+  test:
+    kind: paired_sign
+    a: h6
+    b: none
+    feature: tb_rate
+    range:
+    - 0.015
+    - 0.02667
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B6
+  claim: In districts with tb_rate 0.00424-0.01, 3HP has lower net benefit than 6H at the shadow price at >= 70%
+    of points
+  test:
+    kind: paired_sign
+    a: hp3
+    b: h6
+    feature: tb_rate
+    range:
+    - 0.00424
+    - 0.01
+    sign: negative
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: The 6H vs no-TPT choice flips along tb_rate within 0.006-0.02
+  test:
+    kind: flip_in
+    a: h6
+    b: none
+    feature: tb_rate
+    range:
+    - 0.006
+    - 0.02
