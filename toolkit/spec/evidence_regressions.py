@@ -26,7 +26,7 @@ R = "runs/r1"
 SPEC, DOSSIER, SHEET = "decision_spec.yaml", "evidence_dossier.yaml", "decision_spec.signoff_sheet.md"
 
 
-def _yaml(d, rel, fn):
+def _fixture_yaml(d, rel, fn):
     import yaml
     p = os.path.join(d, rel)
     doc = yaml.safe_load(open(p)) if os.path.exists(p) else {}
@@ -34,19 +34,29 @@ def _yaml(d, rel, fn):
     yaml.safe_dump(doc, open(p, "w"), sort_keys=False)
 
 
-def _json(d, rel, fn):
+def _fixture_json(d, rel, fn):
     p = os.path.join(d, rel)
     doc = json.load(open(p))
     fn(doc)
     json.dump(doc, open(p, "w"), indent=1)
 
 
+def _fixture_write(d, rel, text, mode="w"):
+    """A self-test fixture write in the temporary run dir the table creates."""
+    with open(os.path.join(d, rel), mode) as f:
+        f.write(text)
+
+
+def _fixture_remove(d, rel):
+    os.remove(os.path.join(d, rel))
+
+
 def _entries(d, fn):
-    _yaml(d, DOSSIER, lambda doc: fn(doc["inputs"]))
+    _fixture_yaml(d, DOSSIER, lambda doc: fn(doc["inputs"]))
 
 
 def _spec(d, fn):
-    _yaml(d, SPEC, fn)
+    _fixture_yaml(d, SPEC, fn)
 
 
 PATCH: dict = {}                    # the toy declaration a row patched, written into the archive's code too
@@ -115,7 +125,7 @@ def p_signoff(d):
     return _refusal(lambda: SO.sign(d, "owner", note="n"))
 
 
-def p_brief(d):
+def p_brief_fixture(d):
     import decision_brief as DB
     import yaml
     yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
@@ -178,7 +188,7 @@ def p_resume(d, signoff="owner"):
     return why or f"ended {status} without reaching compute"
 
 
-def p_relaunch(d):
+def p_relaunch_fixture(d):
     """The real entry point: run_cluster.relaunch with its cloud calls stubbed. Refused: SystemExit before the first
     upload; accepted: it reaches the upload (the submission)."""
     import types
@@ -226,9 +236,9 @@ def p_relaunch(d):
             sys.modules["results_store"] = saved_rs
 
 
-PRE_PATHS = {"signoff.sign": p_signoff, "decision_brief.sign": p_brief, "stage_machine.sign": p_stage,
+PRE_PATHS = {"signoff.sign": p_signoff, "decision_brief.sign": p_brief_fixture, "stage_machine.sign": p_stage,
              "launch at SIGN": p_launch_sign}
-POST_PATHS = {"signoff.status": p_status, "launch past SIGN": p_launch_past, "relaunch": p_relaunch,
+POST_PATHS = {"signoff.status": p_status, "launch past SIGN": p_launch_past, "relaunch": p_relaunch_fixture,
               "Machine.run (resume past ENGINE_CHOICE)": p_resume}
 
 
@@ -271,14 +281,14 @@ PRE_ROWS = [
     ("R1-no-dossier", "the options need inputs and the spec names no dossier",
      lambda d: _spec(d, lambda s: s.pop("evidence")), True),
     ("R1-missing-file", "the spec names a dossier that does not exist",
-     lambda d: os.remove(os.path.join(d, DOSSIER)), True),
+     lambda d: _fixture_remove(d, DOSSIER), True),
     ("R1-uncovered", "an input has no entry", lambda d: _entries(d, lambda e: e.pop("unit_attribute:x")), True),
     ("R1-blank", "a blank entry", lambda d: _entries(d, lambda e: _set(e, "unit_attribute:x", None)), True),
     ("R1-unparseable", "the dossier does not parse",
-     lambda d: open(os.path.join(d, DOSSIER), "w").write("inputs: [unclosed\n"), True),
+     lambda d: _fixture_write(d, DOSSIER, "inputs: [unclosed\n"), True),
     ("R1-stale-sheet", "the dossier changed after the sheet",
-     lambda d: open(os.path.join(d, DOSSIER), "a").write("# edited\n"), False),
-    ("R3-no-sheet", "no sheet showed the dossier", lambda d: os.remove(os.path.join(d, SHEET)), False),
+     lambda d: _fixture_write(d, DOSSIER, "# edited\n", "a"), False),
+    ("R3-no-sheet", "no sheet showed the dossier", lambda d: _fixture_remove(d, SHEET), False),
     ("R4-sheet-other-spec", "the sheet was generated for another spec (the dossier unchanged)",
      lambda d: _spec(d, lambda s: _set(s, "question", "Another question?")), False),
     ("R1-malformed-decl", "a component declared {} (no inputs, no reason)",
@@ -327,15 +337,15 @@ PRE_ROWS = [
 POST_ROWS = [
     ("control", "nothing changed: every path accepts", lambda d: None),
     ("R1-dossier-edited", "the dossier edited after signing",
-     lambda d: open(os.path.join(d, DOSSIER), "a").write("# edited after signing\n")),
+     lambda d: _fixture_write(d, DOSSIER, "# edited after signing\n", "a")),
     ("R1-spec-edited", "the spec edited after signing (evidence removed with it)",
      lambda d: _spec(d, lambda s: s.pop("evidence"))),
     ("R1-legacy-record", "a sign-off made before the requirement (no evidence binding)",
-     lambda d: _json(d, "decision_spec.signoff.json", lambda r: r.pop("evidence"))),
+     lambda d: _fixture_json(d, "decision_spec.signoff.json", lambda r: r.pop("evidence"))),
     ("R3-empty-evidence", "a sign-off whose evidence binding is {}",
-     lambda d: _json(d, "decision_spec.signoff.json", lambda r: _set(r, "evidence", {}))),
+     lambda d: _fixture_json(d, "decision_spec.signoff.json", lambda r: _set(r, "evidence", {}))),
     ("R3-partial-evidence", "a sign-off whose evidence binding lacks its sha256",
-     lambda d: _json(d, "decision_spec.signoff.json", lambda r: r["evidence"].pop("sha256"))),
+     lambda d: _fixture_json(d, "decision_spec.signoff.json", lambda r: r["evidence"].pop("sha256"))),
     ("R3-declaration-grew", "a declaration that now requires an input the signed dossier lacks",
      lambda d: _patch_decl({"a": {"inactive": [0], "inputs": [
          {"kind": "parameter", "name": "eff_a", "why": "w"}, {"kind": "unit_attribute", "name": "x", "why": "w"},
@@ -366,7 +376,7 @@ WANT = {
     "R1-dossier-edited": ["changed", "evidence dossier"], "R1-spec-edited": ["changed", "not the one signed"],
     "R1-legacy-record": ["unsigned_evidence"], "R3-empty-evidence": ["unsigned_evidence"],
     "R3-partial-evidence": ["unsigned_evidence"], "R3-declaration-grew": ["evidence_incomplete", "parameter:base"],
-    "R4-declaration-changed": ["declaration"],
+    "R4-declaration-changed": ["declaration", "evidence_incomplete"],
 }
 
 
@@ -376,7 +386,7 @@ def _right(rid: str, why: str) -> bool:
     return bool(why) and any(w.lower() in why.lower() for w in WANT[rid])
 
 
-def run_table(ok) -> None:
+def _self_test_table(ok) -> None:
     import tempfile
     from toolkit.spec import evidence_dossier as ED, signoff as SO
     from toolkit.spec import toy_engines as T
@@ -438,7 +448,7 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
     try:
-        run_table(ok)
+        _self_test_table(ok)
     except Exception as e:  # noqa: BLE001 -- before the paths exist (the tests-first commit) this is the failure
         import traceback
         traceback.print_exc()

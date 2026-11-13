@@ -31,7 +31,7 @@ for _p in (ROOT, os.path.join(ROOT, "scripts")):
         sys.path.insert(0, _p)
 
 CHECKS: dict = {}               # name -> fn(run_dir, spec_bytes, signer, **ctx) -> [str]
-SIGNERS = ("sign", "status", "launch", "resume")
+SIGNERS = ("sign", "status", "launch", "resume", "unsigned")     # unsigned: a run nobody signs (signoff none)
 
 
 def register(name: str, fn) -> None:

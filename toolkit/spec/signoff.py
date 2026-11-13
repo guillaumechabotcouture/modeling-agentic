@@ -937,7 +937,7 @@ def _self_test() -> int:
             md = open(os.path.join(d, SHEET)).read()
             sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
             ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.7" in sec
-               and "DT_eff_a" in sec and "no data" in sec and "0.5" in sec,
+               and "fitted_range_eff_a" in sec and "no data" in sec and "0.5" in sec,
                f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
                f"test): {sec[:600]!r}")
             src = sheet_sources(md) or {}

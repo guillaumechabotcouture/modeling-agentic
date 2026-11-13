@@ -436,9 +436,10 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if st.get("signoff") == "none":                    # signoff none: h_SIGN does not sign
-            continue
         if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+            continue
+        if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "unsigned")]
             continue
         if state != "SIGN":
             out += _signed_run_problems(code, rel)
@@ -469,23 +470,51 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
     return out
 
 
-def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
-    """The run's registered preconditions (toolkit/spec/preconditions.py) on the archive's own bytes: "sign" for a
-    run at SIGN (what the signer will check), "launch" for one past it (the sign-off record compared)."""
-    root = os.path.dirname(HERE)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    try:
-        from toolkit.spec import preconditions as PC
-    except Exception as e:  # noqa: BLE001 -- fail closed
-        return [f"the preconditions cannot be checked ({type(e).__name__}: {e})"]
+TEST_ENGINE_REFS: tuple = ()      # self-tests only (set in-process, never from the environment): toy engines to enable
+_CHECKER = r"""
+import json, os, sys
+tree, rel, signer, refs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+sys.path[:0] = [tree, os.path.join(tree, "scripts")]
+if refs:
+    from toolkit import import_guard as G
+    G.allow_test_refs("engine", refs)
+from toolkit.spec import preconditions as PC
+print("PRECONDITIONS " + json.dumps(PC.problems(os.path.join(tree, rel), None, signer)))
+"""
 
-    def read(name):
-        parts = str(name).replace("\\", "/").split("/")
-        if os.path.isabs(name) or ".." in parts:
-            raise ValueError(f"{name} is not a path inside the run")
-        return _archive_member(code, f"{rel}/{name}")
-    return PC.problems(None, None, signer, read=read)
+
+def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
+    """The run's registered preconditions (toolkit/spec/preconditions.py) checked with the code the launch ships, not
+    the launcher's checkout (#218 review round 4): the archive is extracted and its own toolkit checks its own run
+    dir, engine declarations, cards, priors and fitted values, in a child process. signer "sign" for a run at SIGN
+    (what the signer will check), "launch" past it (the sign-off record compared), "unsigned" for signoff none.
+    Fail closed: an archive without the checks, or a checker that does not answer, is a problem."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
+                t.extractall(tmp, filter="data")
+        except (tarfile.TarError, OSError, ValueError) as e:
+            return [f"the code to launch cannot be unpacked to check its preconditions ({type(e).__name__}: {e})"]
+        if not os.path.isfile(os.path.join(tmp, "toolkit", "spec", "preconditions.py")):
+            return ["the code to launch has no toolkit/spec/preconditions.py: its preconditions cannot be checked"]
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", _CHECKER, tmp, rel, signer,
+                                json.dumps(list(TEST_ENGINE_REFS))], capture_output=True, text=True, timeout=900,
+                               cwd=tmp, env={k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG",
+                                                                                         "OMP_NUM_THREADS",
+                                                                                         "OPENBLAS_NUM_THREADS")})
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return [f"the preconditions check of the code to launch did not finish ({type(e).__name__})"]
+        line = next((x for x in reversed(r.stdout.splitlines()) if x.startswith("PRECONDITIONS ")), None)
+        if line is None:
+            return [f"the preconditions check of the code to launch failed: {(r.stderr or r.stdout)[-400:]}"]
+        try:
+            got = json.loads(line[len("PRECONDITIONS "):])
+        except ValueError:
+            return ["the preconditions check of the code to launch gave an unreadable answer"]
+        return [str(x) for x in got] if isinstance(got, list) else ["the preconditions check gave no list"]
 
 
 SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
@@ -4676,10 +4705,15 @@ def _self_test_sheet(ok) -> None:
     sheet does not record the shipped spec's and derivation record's sha256."""
     import hashlib
 
+    root = os.path.dirname(HERE)        # the launch check runs the archive's own code (#218 r4): ship this tree's
+    names = subprocess.run(["git", "-C", root, "ls-files", "toolkit", "agents", "scripts", "cloud"],
+                           capture_output=True, text=True).stdout.split()
+    code_files = {n: open(os.path.join(root, n), "rb").read() for n in names if os.path.isfile(os.path.join(root, n))}
+
     def tar_of(files: dict) -> bytes:
         bio = io.BytesIO()
         with tarfile.open(fileobj=bio, mode="w:gz") as t:
-            for n, data in files.items():
+            for n, data in {**code_files, **files}.items():
                 ti = tarfile.TarInfo(n)
                 ti.size = len(data)
                 t.addfile(ti, io.BytesIO(data))
@@ -4703,7 +4737,8 @@ def _self_test_sheet(ok) -> None:
     # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
     def rec_for(sp, ev=None):
         return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
-                           "evidence": ev or {"required": [], "dossier": None, "sha256": None}}).encode()
+                           "evidence": ev or {"required": [], "dossier": None, "sha256": None,
+                                                 "declarations": {}}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
                                           f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
@@ -4746,7 +4781,7 @@ def _self_test_sheet(ok) -> None:
     signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
                                         "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
                              "evidence": {"required": [], "dossier": "evidence_dossier.yaml",
-                                          "sha256": hashlib.sha256(dos).hexdigest()}}).encode()
+                                          "sha256": hashlib.sha256(dos).hexdigest(), "declarations": {}}}).encode()
     past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
     p_ok = stale_sheet_problems(tar_of(past), flags)
     p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)

@@ -861,13 +861,14 @@ POST_CHOICE_STATES = ("CONFIGURE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP", "O
                       "PRESENTATION")
 
 
-def evidence_gate(run_dir: str, engine: tuple | None = None) -> list[str]:
+def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
     """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
     compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
     on every resume past it, before any compute. Empty: they hold. Fail closed on an error."""
     try:
         from toolkit.spec import preconditions as PC
-        return PC.problems(run_dir, None, "resume", engine=engine)
+        # signoff none (nobody signs): coverage without a record, the rule the launch preflight applies too
+        return PC.problems(run_dir, None, "unsigned" if signoff == "none" else "resume", engine=engine)
     except Exception as e:  # noqa: BLE001
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
@@ -1097,7 +1098,7 @@ class Machine:
 
     def run(self, max_steps: int = 200) -> str:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
-            miss = evidence_gate(self.run_dir)
+            miss = evidence_gate(self.run_dir, signoff=self.st.signoff)
             if miss:
                 self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
                 save_state(self.run_dir, self.st)
@@ -1224,7 +1225,7 @@ class Machine:
         else:
             why = (res.output or {}).get("why", "")
         cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
-        miss = evidence_gate(self.run_dir, engine=(pick, cfg))
+        miss = evidence_gate(self.run_dir, engine=(pick, cfg), signoff=self.st.signoff)
         if miss:            # F6: the signed dossier must cover the engine actually chosen, before any compute
             _write_json(self.run_dir, AB.ENGINE_CHOICE, dict(rec, evidence_refused={"engine": pick, "why": miss}))
             return self._go("FINAL", f"the signed evidence dossier does not cover {pick}'s decision inputs: "
