@@ -62,6 +62,8 @@ MEASURES = ("rate_ratio", "hazard_ratio", "risk_ratio", "odds_ratio")
 # by under 4% (e.g. p0 0.10, RR 0.5: rate ratio 0.487). Above it, convert by constant hazard.
 RARE_MAX = 0.10
 RISK_TO_RATE = ("constant_hazard", "rare_outcome")
+TOL = 1e-12             # relative tolerance on the inclusive rare-outcome bound (log-scale round trips: exp(log 10))
+MIN_P0 = 1e-300         # a smaller control risk underflows p0 x RR; refused (and the limit RR used at evaluation)
 
 
 def _odds_to_risk(p0):
@@ -69,14 +71,22 @@ def _odds_to_risk(p0):
 
 
 def _risk_to_rate(method, p0):
-    if method == "rare_outcome":
-        return lambda x: x
+    """Risk ratio -> rate ratio. The treated risk p0 x RR is checked at every value (the point, the bounds, overrides
+    and draws; construction and evaluation call this same function): below 1 for constant hazard, at most RARE_MAX
+    (within TOL) for the rare-outcome approximation."""
+    def rare(x):
+        if not p0 * x <= RARE_MAX * (1 + TOL):
+            raise ValueError(f"rare-outcome approximation: treated risk p0 x risk ratio = {p0 * x:.4g} is above "
+                             f"{RARE_MAX}")
+        return x
 
-    def f(x):
+    def hazard(x):
         if not p0 * x < 1:
-            raise ValueError(f"constant-hazard conversion: p0 x risk ratio = {p0 * x:.4g} must be below 1")
-        return math.log(1.0 - p0 * x) / math.log(1.0 - p0)
-    return f
+            raise ValueError(f"constant-hazard conversion: treated risk p0 x risk ratio = {p0 * x:.4g} must be below 1")
+        if p0 * x < MIN_P0:             # the small-risk limit: the rate ratio equals the risk ratio
+            return x
+        return math.log1p(-p0 * x) / math.log1p(-p0)
+    return rare if method == "rare_outcome" else hazard
 
 
 def _measure(d, where, hi):
@@ -96,9 +106,9 @@ def _measure(d, where, hi):
     if not isinstance(cv, dict):
         return None, "", [f"{where}: a {m} applied to a rate needs `conversion` (see the engine docstring)"]
     p0, src = cv.get("p0"), str(cv.get("source") or "").strip()
-    bad = [] if src else [f"{where}.conversion.source: the basis of p0"]
-    if not (_num(p0) and 0 < p0 < 1):
-        return None, "", bad + [f"{where}.conversion.p0: the control risk, in (0, 1)"]
+    bad = _unknown(cv, "conversion", f"{where}.conversion") + ([] if src else [f"{where}.conversion.source: the basis of p0"])
+    if not (_num(p0) and MIN_P0 <= p0 < 1):
+        return None, "", bad + [f"{where}.conversion.p0: the control risk, in [{MIN_P0}, 1)"]
     first = None
     method = cv.get("method")
     if m == "odds_ratio":
@@ -116,13 +126,31 @@ def _measure(d, where, hi):
     if method == "rare_outcome" and p0 > RARE_MAX:
         bad.append(f"{where}.conversion: the rare-outcome approximation needs p0 <= {RARE_MAX} (p0 {p0:g}); "
                    "convert by constant_hazard")
-    if method == "constant_hazard" and not p0 * (first(hi) if first else hi) < 1:
-        bad.append(f"{where}.conversion: p0 x the upper ratio must be below 1 for a constant-hazard conversion")
     second = _risk_to_rate(method, p0)
     f = (lambda x: second(first(x))) if first else second
+    try:            # the top of the range, through the same function evaluation uses (the maps are increasing)
+        f(hi)
+    except ValueError as ex:
+        bad.append(f"{where}.conversion: at the upper ratio {hi:g}: {ex}"
+                   + ("; convert by constant_hazard" if method == "rare_outcome" else ""))
     what = (("odds ratio to risk ratio, then " if first else "") + ("risk ratio used as the rate ratio (rare outcome)"
             if method == "rare_outcome" else "risk ratio to rate ratio by constant hazard") + f" at p0 {p0:g} ({src})")
     return (None if bad else f), what, bad
+
+
+VALUE_KEYS = {"range", "dist", "source", "verified", "note"}
+KEYS = {"outcome": {"baseline_source", "note"}, "baseline": {"measured_under", "source", "overlap", "note"},
+        "effect": VALUE_KEYS | {"rr", "measure", "conversion"},
+        "conversion": {"method", "p0", "then", "reason", "source"},
+        "combination": {"rule", "source", "interactions"},
+        "interaction": VALUE_KEYS | {"components", "outcome", "ratio"}, "weight": VALUE_KEYS | {"value"}}
+
+
+def _unknown(d, kind, where) -> list:
+    """A misspelt optional key would silently fall back to its default: every key must be one the mode reads."""
+    if not isinstance(d, dict):         # a malformed scalar is reported by the section's own check
+        return []
+    return [f"{where}.{k}: not a {kind} setting (one of {sorted(KEYS[kind])})" for k in d if k not in KEYS[kind]]
 
 
 def combo_key(components) -> str:
@@ -206,13 +234,16 @@ class PackageRateEngine:
         self.outcomes = [str(o) for o in outcomes]
         names = self.components + self.outcomes + [str(t) for t in (compose or {})]
         bad += [f"name {n!r}: ':' and '+' are separators in parameter names" for n in names if set(n) & set(":+")]
+        bad += [f"name {n!r}: empty or blank" for n in names if not n.strip()]
         self.baseline_sources = {}
         for o, d in outcomes.items():
+            bad += _unknown(d, "outcome", f"outcomes.{o}")
             src = str(d.get("baseline_source") or "").strip() if isinstance(d, dict) else ""
             if not src:
                 bad.append(f"outcomes.{o}.baseline_source: the external burden estimate's source is missing")
             self.baseline_sources[o] = src
         b = baseline if isinstance(baseline, dict) else {}
+        bad += _unknown(b, "baseline", "baseline")
         self.measured_under, self.baseline_note = b.get("measured_under"), str(b.get("source") or "").strip()
         if self.measured_under not in MEASURED_UNDER:
             bad.append(f"baseline.measured_under: one of {MEASURED_UNDER} (what the baseline already includes)")
@@ -240,6 +271,7 @@ class PackageRateEngine:
             bad += [f"effects.{c}.{k}: not a declared outcome" for k in e if k not in self.outcomes + ["relative_to"]]
             for o in self.outcomes:
                 v, why = _value(e.get(o), f"effects.{c}.{o}", "rr", RATIO_DISTS, True)
+                why = _unknown(e.get(o), "effect", f"effects.{c}.{o}") + why
                 bad += why
                 if not v:
                     continue
@@ -259,6 +291,7 @@ class PackageRateEngine:
                            v[4], f"log {e[o]['measure']} {vs}" + (" (converted to a rate ratio at evaluation)"
                                                                   if what and e[o]["measure"] != "hazard_ratio" else ""))
         cb = combination if isinstance(combination, dict) else {}
+        bad += _unknown(cb, "combination", "combination")
         self.rule, self.rule_source = cb.get("rule"), str(cb.get("source") or "").strip()
         if self.rule not in RULES:
             bad.append(f"combination.rule: one of {RULES} (declared, never implied)")
@@ -268,6 +301,7 @@ class PackageRateEngine:
         for n, it in enumerate(cb.get("interactions") or []):
             w = f"combination.interactions[{n}]"
             cs, o = (it or {}).get("components"), (it or {}).get("outcome")
+            bad += _unknown(it, "interaction", w)
             if self.rule != "multiplicative":
                 bad.append(f"{w}: interaction terms apply under the multiplicative rule only")
             if not (isinstance(cs, list) and len(set(cs)) == len(cs) == 2 and set(cs) <= set(self.components)):
@@ -297,6 +331,7 @@ class PackageRateEngine:
                     bad.append(f"compose.{t}.{o}: not a declared outcome")
                     continue
                 v, why = _value(d, f"compose.{t}.{o}", "value", WEIGHT_DISTS, False)
+                why = _unknown(d, "weight", f"compose.{t}.{o}") + why
                 bad += why
                 if v:
                     rng = v[1] or [None, None]
@@ -344,7 +379,7 @@ class PackageRateEngine:
             for combo in itertools.product(*[s + [(1.0 - sum(q for q, _ in s), None)] for s in per]):
                 pr = math.prod(q for q, _ in combo)
                 if pr > 0:
-                    out.append((pr, frozenset(c for _, c in combo if c)))
+                    out.append((pr, frozenset(c for _, c in combo if c is not None)))
             return out
         cuts = sorted({0.0, 1.0} | {min(1.0, sum(q for q, _ in s[:k + 1])) for s in per for k in range(len(s))})
         out = []
@@ -367,6 +402,11 @@ class PackageRateEngine:
         badp = [k for k, v in p.items() if not _num(v) or (k.startswith("w:") and v < 0)]
         if badp:
             raise ValueError(f"parameters {badp}: not finite, or a negative composition weight")
+        for n, conv in self.conv.items():   # every resolved effect, whatever the package and the coverage
+            try:
+                conv(math.exp(p[n]))
+            except ValueError as ex:
+                raise ValueError(f"parameter {n} = {p[n]:.6g}: {ex}") from None
         br = unit.attributes.get("baseline_rate")
         if not isinstance(br, dict) or any(not _num(br.get(o)) or br[o] < 0 for o in self.outcomes):
             raise ValueError(f"unit {unit.id}: baseline_rate must give a rate >= 0 for each of {self.outcomes}")
@@ -561,6 +601,8 @@ def _self_test_trial(ok):
         ok(True, "T10 a unit without its external baseline fails closed")
     _self_test_review1(ok, cfg, h)
     _self_test_review2(ok, cfg, h)
+    _self_test_review3(ok, h)
+    _self_test_review4(ok, h)
     with tempfile.TemporaryDirectory() as d:
         try:
             R = _toy_trial_run(d)
@@ -738,6 +780,126 @@ def _self_test_review2(ok, cfg, h):
     cal = PackageRateEngine(["x", "y"])
     ok(not callable(getattr(cal, "config", None)) and config_digest(cal) is None,
        "V6 calibrated mode reports no configuration (config() not callable), as before")
+
+
+def _self_test_review3(ok, h):
+    """PR #217 review round 3: each reproduction is a case."""
+    import copy
+    from toolkit.engines.contract import Package, UnitSpec
+
+    def one(eff, comps=("a",), combination=None):
+        return {"components": list(comps), "outcome": "cases", "mode": "trial_priors",
+                "outcomes": {"cases": {"baseline_source": "toy"}},
+                "baseline": {"measured_under": "no_components", "source": "toy"},
+                "effects": {c: {"cases": copy.deepcopy(eff)} for c in comps},
+                "combination": combination or {"rule": "multiplicative", "source": "toy"}}
+
+    def refused(c):
+        try:
+            PackageRateEngine(**c)
+            return False
+        except ValueError:
+            return True
+
+    def rate(c, comps, params=None):
+        return PackageRateEngine(**c).run(params or {}, UnitSpec("u", {"baseline_rate": {"cases": 0.4}}),
+                                          Package("p", comps), h, 1).per_capita["cases"]["all"] / 2
+
+    def risk(rr, lo, hi, method, p0, measure="risk_ratio", **kw):
+        return {"rr": rr, "range": [lo, hi], "dist": "triangular", "measure": measure, "source": "toy",
+                "conversion": dict({"method": method, "p0": p0, "source": "toy"}, **kw)}
+    ok(refused(one(risk(8.0, 6.0, 9.0, "rare_outcome", 0.1))) and refused(one(risk(8.0, 7.0, 12.0, "rare_outcome", 0.1))),
+       "W1 rare outcome: a treated risk above the bound (p0 0.1 x RR 6-9, or up to 1.2) is refused across the range")
+    ok(refused(one(risk(8.0, 6.0, 12.0, "constant_hazard", 0.1))),
+       "W1 constant hazard: a treated risk p0 x RR at or above 1 anywhere in the range is refused")
+    odd = risk(3.0, 2.0, 4.0, "odds_to_risk", 0.08, measure="odds_ratio", then="rare_outcome")
+    ok(refused(one(odd)), "W1 an odds-derived risk ratio whose treated risk exceeds the rare-outcome bound is refused "
+                          "(p0 0.08, OR 2-4: treated risk 0.15-0.26)")
+    ok_c = one(risk(1.2, 1.0, 1.5, "rare_outcome", 0.05))
+    try:
+        rate(ok_c, {"a": 1}, {"lrr:a:cases": math.log(3.0)})
+        ok(False, "W1 a draw or override whose treated risk exceeds the rare-outcome bound fails at evaluation")
+    except ValueError:
+        ok(True, "W1 a draw or override whose treated risk exceeds the rare-outcome bound fails at evaluation")
+    try:
+        r = rate(one(risk(0.5, 0.4, 0.6, "constant_hazard", 1e-16)), {"a": 1})
+        r2 = rate(one(risk(0.5, 0.4, 0.6, "constant_hazard", 1e-20)), {"a": 1})
+        ok(abs(r / 0.4 - 0.5) < 1e-9 and abs(r2 / 0.4 - 0.5) < 1e-9,
+           f"W2 constant hazard keeps precision at tiny risks (p0 1e-16 and 1e-20: rate ratio 0.5) "
+           f"({r / 0.4:.6g}, {r2 / 0.4:.6g})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"W2 constant hazard keeps precision at tiny risks: {type(ex).__name__}: {ex}")
+    eff = {"rr": 0.5, "range": [0.4, 0.6], "dist": "triangular", "measure": "rate_ratio", "source": "toy"}
+    typo = one(eff, comps=("a", "b"), combination={"rule": "multiplicative", "source": "toy", "interaction": [
+        {"components": ["a", "b"], "outcome": "cases", "ratio": 4.0, "range": [3.0, 5.0], "dist": "triangular",
+         "source": "toy"}]})
+    c2 = one(eff)
+    c2["baseline"]["overlapp"] = "comonotone"
+    c3 = one(eff)
+    c3["effects"]["a"]["cases"]["rnage"] = [0.3, 0.7]
+    c4 = one(eff)
+    c4["outcomes"]["cases"]["baseline_sorce"] = "x"
+    ok(refused(typo) and refused(c2) and refused(c3) and refused(c4),
+       "W3 unknown keys are refused (combination.interaction, baseline.overlapp, an effect's rnage, an outcome's "
+       "baseline_sorce)")
+    ok(refused(one(eff, comps=("",))) and refused(one(eff, comps=("a", " "))),
+       "W4 an empty or blank component name is refused")
+
+
+def _self_test_review4(ok, h):
+    """PR #221 review round 1: each reproduction is a case."""
+    import copy
+    from toolkit.engines.contract import Package, UnitSpec
+
+    def one(eff, comps=("a",), measured="no_components"):
+        return {"components": list(comps), "outcome": "cases", "mode": "trial_priors",
+                "outcomes": {"cases": {"baseline_source": "toy"}},
+                "baseline": {"measured_under": measured, "source": "toy"},
+                "effects": {c: {"cases": copy.deepcopy(eff)} for c in comps},
+                "combination": {"rule": "multiplicative", "source": "toy"}}
+
+    def risk(rr, lo, hi, method, p0):
+        return {"rr": rr, "range": [lo, hi], "dist": "triangular", "measure": "risk_ratio", "source": "toy",
+                "conversion": {"method": method, "p0": p0, "source": "toy"}}
+
+    def run(c, comps, params=None, attrs=None):
+        return PackageRateEngine(**c).run(params or {}, UnitSpec("u", dict({"baseline_rate": {"cases": 0.4}},
+                                                                            **(attrs or {}))),
+                                          Package("p", comps), h, 1).per_capita["cases"]["all"] / 2
+    try:
+        r = run(one(risk(10.0, 9.0, 10.0, "rare_outcome", 0.01)), {"a": 1})
+        ok(abs(r - 4.0) < 1e-9, f"X1 the inclusive endpoint (p0 0.01, RR 10: treated risk 0.10) constructs and "
+                                f"evaluates ({r:.6g})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"X1 the inclusive endpoint (p0 0.01, RR 10) constructs and evaluates: {type(ex).__name__}: {ex}")
+    c = one(risk(1.2, 1.0, 1.5, "rare_outcome", 0.05), measured="coverage_attribute")
+    try:
+        run(c, {}, {"lrr:a:cases": math.log(3.0)}, {"baseline_coverage": {"a": 0.0}})
+        ok(False, "X2 an invalid override is refused even with the component absent and zero baseline coverage")
+    except ValueError:
+        ok(True, "X2 an invalid override is refused even with the component absent and zero baseline coverage")
+    try:
+        PackageRateEngine(**one(risk(0.5, 0.4, 0.6, "constant_hazard", 5e-324)))
+        ok(False, "X3 a control risk so small that p0 x RR underflows (p0 5e-324) is refused")
+    except ValueError:
+        ok(True, "X3 a control risk so small that p0 x RR underflows (p0 5e-324) is refused")
+    bad = []
+    for what, mut in (("effects.a.cases: 0.5", lambda x: x["effects"]["a"].update(cases=0.5)),
+                      ("outcomes.cases: 'x'", lambda x: x["outcomes"].update(cases="x")),
+                      ("baseline: 3", lambda x: x.update(baseline=3)),
+                      ("combination: 'multiplicative'", lambda x: x.update(combination="multiplicative")),
+                      ("compose.dalys.cases: 1.0", lambda x: x.update(compose={"dalys": {"cases": 1.0}})),
+                      ("conversion: 'rare'", lambda x: x["effects"]["a"]["cases"].update(conversion="rare"))):
+        x = one(risk(0.5, 0.4, 0.6, "rare_outcome", 0.05))
+        mut(x)
+        try:
+            PackageRateEngine(**x)
+            bad.append(f"{what}: accepted")
+        except ValueError:
+            pass
+        except Exception as ex:  # noqa: BLE001
+            bad.append(f"{what}: {type(ex).__name__}")
+    ok(not bad, f"X4 malformed scalar sections give the contextual ValueError, never a crash ({bad})")
 
 
 def toy_trial_config() -> dict:
