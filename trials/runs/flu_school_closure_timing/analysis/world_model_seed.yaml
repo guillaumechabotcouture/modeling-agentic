@@ -1,0 +1,303 @@
+beliefs:
+- id: B1
+  mechanism: A temporary cut in R_t only averts infections in the final size if it overlaps the epidemic peak, where
+    it reduces the overshoot beyond herd immunity; a cut lifted well before the peak mostly delays the epidemic,
+    which rebounds once schools reopen. Early closure (weeks 3-10) therefore averts more where the epidemic starts
+    large, i.e. its relative reduction rises with seed_share.
+  about:
+    package: early
+    feature: seed_share
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Bootsma MCJ, Ferguson NM. The effect of public health measures on the 1918 influenza pandemic in U.S.
+      cities. Proc Natl Acad Sci USA 2007
+    location: Results; resurgence after interventions were lifted (location within paper uncertain)
+  - citation: Handel A, Longini IM, Antia R. What is the best control strategy for multiple infectious disease outbreaks?
+      Proc R Soc B 2007
+    location: Results, optimal timing of a limited-duration intervention (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: 'Mirror of B1 for late closure (weeks 7-14): where the epidemic starts large it has peaked or is past
+    its peak by week 7, so late closure acts on the declining tail and averts little; its relative reduction falls
+    as seed_share rises.'
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Handel A, Longini IM, Antia R. What is the best control strategy for multiple infectious disease outbreaks?
+      Proc R Soc B 2007
+    location: Results (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'The early/late choice flips along seed_share: late wins in towns with small seeds (later peak inside
+    weeks 7-14), early wins in towns with large seeds (peak inside weeks 3-10). From doubling-time arithmetic (generation
+    interval ~0.5 week, R_eff 1.3-1.8) the flip should sit roughly at seed_share 2e-5 to 2e-4, and move toward lower
+    seed_share as s0 rises (faster growth). Location is rough; it depends on the withheld R0 and generation interval.'
+  about:
+    pair:
+    - early
+    - late
+    feature: seed_share
+  direction: flips
+  conditions:
+  - feature: seed_share
+    range:
+    - 2.0e-05
+    - 0.0002
+  source_type: literature
+  evidence:
+  - citation: Cowling BJ, Fang VJ, Riley S, Malik Peiris JS, Leung GM. Estimation of the serial interval of influenza.
+      Epidemiology 2009
+    location: Abstract (serial interval ~3.6 days)
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One
+      2007
+    location: Methods, renewal equation
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Well-timed closure (covering the peak) reduces the 2026 attack rate modestly: school closure or holidays
+    cut influenza transmission by roughly 15-30%, which over eight weeks around the peak reduces cumulative infections
+    by a few percent to about a third. Taken here as the relative reduction of early closure in the high-seed towns
+    where it is well timed.'
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.03
+    - 0.35
+    scale: relative_reduction
+  conditions:
+  - feature: seed_share
+    range:
+    - 0.0001
+    - 0.0002702
+  source_type: literature
+  evidence:
+  - citation: Cauchemez S, Valleron AJ, Boelle PY, Flahault A, Ferguson NM. Estimating the impact of school closure
+      on influenza transmission from Sentinel data. Nature 2008
+    location: Abstract (holidays reduce transmission; ~16-18% of seasonal cases prevented)
+  - citation: Cauchemez S, Ferguson NM, Wachtel C, Tegnell A, Saour G, Duncan B, Nicoll A. Closure of schools during
+      an influenza pandemic. Lancet Infect Dis 2009
+    location: Text on peak versus cumulative attack-rate reduction (location uncertain)
+  - citation: 'Jackson C, Vynnycky E, Hawker J, Olowokure B, Mangtani P. School closures and influenza: systematic
+      review of epidemiological studies. BMJ Open 2013'
+    location: Results/Discussion (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: In a homogeneous renewal model with seeds given as a population share, the relative reduction does
+    not depend on town population; population only scales infections averted and cost equally, so it does not change
+    the timing or the per-resident value of closing.
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One
+      2007
+    location: Methods, renewal equation (scale-free in N)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: The larger the multiplicative cut in R_t during closure, the more infections early closure averts (a
+    monotone dose-response, as long as the closure overlaps any growth phase).
+  about:
+    package: early
+    feature: effect:early
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Cauchemez S, Ferguson NM, Wachtel C, Tegnell A, Saour G, Duncan B, Nicoll A. Closure of schools during
+      an influenza pandemic. Lancet Infect Dis 2009
+    location: Text (location uncertain)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: A higher susceptible share (s0) raises R_eff, so epidemics grow faster and peak earlier; this moves
+    the peak into the early window and makes early closure avert more (and late closure less).
+  about:
+    package: early
+    feature: s0 (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Handel A, Longini IM, Antia R. What is the best control strategy for multiple infectious disease outbreaks?
+      Proc R Soc B 2007
+    location: Results (location uncertain)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: Total cost of closing every town is probably below US$40M, so the budget may not bind; the decision
+    is then mainly timing per town, and closure versus none hinges on the declared shadow price, not on the budget.
+  about:
+    pair:
+    - early
+    - none
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS One
+      2007
+    location: 'not applicable: arithmetic from the question''s population range and unit cost'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What R0 and generation interval does the spec declare? They set the epidemic's timing and so where the
+    early/late flip falls along seed_share.
+  beliefs:
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: What multiplicative effect on R_t does closure have, and does it differ between early and late (e.g.
+    by holiday overlap)? A larger effect sharpens the timing penalty because a rebound follows.
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Does the budget bind (total residents x US$4 vs US$40M)? If not, the plan is timing-only and closure
+    vs none depends on the shadow price.
+  beliefs:
+  - B8
+  decision_relevant: true
+- id: Q4
+  question: Does the 2026 horizon cut off late epidemics in low-seed, low-s0 towns, so that delay itself counts
+    as infections averted in 2026?
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q5
+  question: Is s0 shared across towns (a calibration scale) or town-specific? If shared, the uncertainty about timing
+    is correlated across all towns and a robust rule holds at the seed_share level.
+  beliefs:
+  - B7
+  - B3
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Early closure's relative reduction rises with seed_share (earlier epidemics put the peak inside weeks 3-10).
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: increases
+- id: H2
+  belief: B2
+  claim: Late closure's relative reduction falls as seed_share rises (large-seed towns peak before week 7).
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: 'The early/late choice flips along seed_share between 2e-5 and 2e-4: late below, early above.'
+  test:
+    kind: flip_in
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 2.0e-05
+    - 0.0002
+- id: H4
+  belief: B3
+  claim: In the highest-seed towns (seed_share >= 2e-4) early beats late in at least 75% of points; equal cost,
+    so the shadow price cancels.
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 0.0002
+    - 0.0002702
+    sign: positive
+    min_share: 0.75
+- id: H5
+  belief: B4
+  claim: Where early closure is well timed (seed_share 1e-4 to 2.7e-4), its relative reduction in 2026 infections
+    lies in 3-35% in at least 70% of points.
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.03
+    - 0.35
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: Town population has no effect on early closure's relative reduction (|rho| bound within 0.15).
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+- id: H7
+  belief: B6
+  claim: Early closure's relative reduction rises with its effect on R_t.
+  test:
+    kind: effect_direction
+    package: early
+    feature: effect:early
+    direction: increases
+- id: H8
+  belief: B7
+  claim: Early closure's relative reduction rises with the susceptible share s0 (faster, earlier epidemics).
+  test:
+    kind: effect_direction
+    package: early
+    feature: s0 (calibration scale)
+    direction: increases
