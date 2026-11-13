@@ -1419,6 +1419,8 @@ def main(argv=None) -> int:
             p.add_argument("--batch", help="only questions with this batch value")
             p.add_argument("--limit", type=int)
             p.add_argument("--max-engine-runs", type=int, default=DEFAULT_MAX_ENGINE_RUNS)
+    sub.choices["rebuild"].add_argument("--recheck-citations", action="store_true",
+                                        help="look the citations up again under the current rule before the build")
     r = sub.choices["run"]
     r.add_argument("--total-cap-usd", type=float, required=True, help="the cap on cumulative spend in the ledger")
     r.add_argument("--task-cap-usd", type=float, default=2.0)
@@ -1432,7 +1434,7 @@ def main(argv=None) -> int:
         return 0
     qs = select(load_questions(a.questions), set(a.only.split(",")) if a.only else None, a.batch, a.limit)
     if a.cmd == "rebuild":
-        res = rebuild(a.trials_dir, qs, f"refs/remotes/{REMOTE}/{BRANCH}")
+        res = rebuild(a.trials_dir, qs, f"refs/remotes/{REMOTE}/{BRANCH}", recheck_citations=a.recheck_citations)
         for i, r in res.items():
             print(json.dumps({i: r}, default=str))
         score(a.trials_dir)
