@@ -45,6 +45,11 @@ PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
 
 
+def _yld_summary(per_draw):
+    from toolkit.analysis import burden as BU      # F6 S2-5d: the anchor's YLD floors over the draws
+    return BU.yld_floor_summary(per_draw)
+
+
 def _pu():
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import propagate_uncertainty
@@ -279,7 +284,8 @@ def _draw_rows(A, D, nd):
         clamped = list(D.last_clamped)
         out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=sampled)
         yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
-               "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
+               "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or []),
+               "yld_floors": list(getattr(A, "last_yld_floors", None) or [])}
 
 
 def evaluate_draws(A, draws=None, seed=None) -> dict:
@@ -314,6 +320,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     corr_any = corr_plan = 0
     clamped_draws = []
     floors = []          # F6 S1-3: each draw's floored per-outcome increments (also from precomputed draws)
+    yfl = []             # F6 S2-5d: each draw's YLD floors (the model's DALYs below its YLL)
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
     for d, r in enumerate(rows):
         sampled, out, ben, cost = r["sampled"], r["out"], r["ben"], r["cost"]
@@ -323,6 +330,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         if on_draw is not None:
             on_draw(out, r["events"], cost)
         floors.append(r["floors"])
+        yfl.append(r.get("yld_floors") or [])
         row = {}
         for o in A.outcomes:
             v = sum(out[i]["y"][A.comp][o] - out[i]["y"][plan[i]][o] for i in A.ids)
@@ -396,6 +404,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             "headline": {"name": headline_name, "outcome": hl_outcome}, "draw_plan": plan_,
             "affordability": affordability(fixed_cost, A.budget, sp.get("affordability"), lvl) if nd else None,
             "cost_floors": _acosts().draw_floor_summary(floors),
+            **({"anchor_yld_floors": _yld_summary(yfl)} if getattr(A, "anchor", None) is not None else {}),
             "prior_dominated": sorted(set(plan_["prior_dominated"]) | set((A.lik or {}).get("prior_dominated") or []))}
     if "emulator" in D.src and getattr(A.model, "error_floors", None) is not None:   # F6 S2-4
         data["emulator_error_floors"] = {"note": "{cost output: {package: n}}, unit values floored at zero after the "

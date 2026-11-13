@@ -168,10 +168,12 @@ class Analysis:
             ids = [i for i in self.ids if i in need]
         out = self.model.predict(zs, theta, ids, noise=noise)
         self.last_events = list(getattr(self.model, "last_events", []) or [])
+        self.last_yld_floors = []
         if self.anchor is not None:      # F6 S2-5d: external level / this evaluation's own model value
             from toolkit.analysis import burden as BU
             BU.apply_anchor(self.anchor, out, ids, param=lambda x: BU.param_at(self, theta, x), sampled=sampled,
-                            factors=anchor_factors, unit_factors=anchor_unit_factors, skip=anchor_skip)
+                            factors=anchor_factors, unit_factors=anchor_unit_factors, skip=anchor_skip,
+                            floors=self.last_yld_floors)
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]

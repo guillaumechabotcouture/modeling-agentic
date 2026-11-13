@@ -868,7 +868,7 @@ def anchor_object(A, cfg, record) -> dict:
             "cost_scaling": dict(record.get("cost_scaling") or {}), "record": record}
 
 
-def _scale(d, fu, comp, where):
+def _scale(d, fu, comp, where, floors=None):
     """Scale one outcome dict by its unit's factors (the model's YLL with the deaths factor). A DALY outcome built
     from anchored parts is DALYs + (f_deaths - 1) x YLL + (f_cases - 1) x YLD with the dict's own YLL and YLD =
     DALYs - YLL (exactly the model's DALYs at factors 1). A YLD below zero (an emulator's DALYs below its YLL) counts
@@ -882,6 +882,8 @@ def _scale(d, fu, comp, where):
             raise AnchorError(f"{where}: {comp['outcome']} is built from anchored outcomes but the model's YLL is not "
                               "beside it (daly_parts.yll_per_death_by_age)")
         dal, yll = orig[comp["outcome"]], orig[comp["yll"]]
+        if dal < yll and floors is not None:        # recorded: the model's DALYs below its YLL (emulator error)
+            floors.append(yll - dal)
         d[comp["outcome"]] = (dal + (fu.get(comp["deaths"], 1.0) - 1.0) * yll
                               + (fu.get(comp["cases"], 1.0) - 1.0) * max(dal - yll, 0.0))
 
@@ -891,13 +893,15 @@ def _groups(bg):
     return {P: {o: v[P] for o, v in bg.items() if P in v} for P in sorted({P for v in bg.values() for P in v})}
 
 
-def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_factors=None, skip=None) -> dict:
+def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_factors=None, skip=None,
+                 floors=None) -> dict:
     """Replace each unit's entry in `out` by one whose anchored outcomes, for every package (totals, grouped outcomes,
     window burden, by population group too) and the cost outputs in cost_scaling, are multiplied by the unit's factor:
     the row's external value (the draw's, in `sampled` as anchor:<id>, else the point) over THIS evaluation's model
     value for its group (every member must be evaluated: Analysis.evaluate widens a partial evaluation to whole
     groups), so the anchored level is the external one in every evaluation. `factors`: fixed factors by row;
-    `unit_factors`: {unit: {outcome: factor}} (the boundary check); `skip`: {unit: packages left as they are}. DALYs
+    `unit_factors`: {unit: {outcome: factor}} (the boundary check); `skip`: {unit: packages left as they are};
+    `floors`: a list that receives {unit, package, where, shortfall} wherever a YLD below zero counted as zero. DALYs
     follow the model's own YLL and YLD (#220 r3). The model's own dicts are never changed. Returns the factors."""
     import copy
     idset, arm, f = set(ids), anchor["arm"], {}
@@ -926,27 +930,29 @@ def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_
             fu[YLL_OUT] = fu[de]            # the model's YLL moves with its deaths
         out[i] = dict(src, **{k: copy.deepcopy(src[k]) for k in ("y", "y_group", "cost", "burden", "burden_group")
                               if k in src})
-        ds = [(f"{k}", d) for k, d in out[i]["y"].items() if k not in sk]
-        ds += [(f"{k} window", d) for k, d in (out[i].get("burden") or {}).items()]
+        ds = [(f"{k}", d, k) for k, d in out[i]["y"].items() if k not in sk]
+        ds += [(f"{k} window", d, k) for k, d in (out[i].get("burden") or {}).items()]
         for grp in ("y_group", "burden_group"):
             for k, bg in (out[i].get(grp) or {}).items():
                 if k in sk:
                     continue
                 for P, d in _groups(bg).items():
-                    ds.append((f"{k}, {grp} {P}", d, bg, P))
+                    ds.append((f"{k}, {grp} {P}", d, k, bg, P))
         for item in ds:
             where, d = item[0], item[1]
-            raw = dict(d)
-            _scale(d, fu, comp, f"unit {i}, {where}")
+            raw, short = dict(d), []
+            _scale(d, fu, comp, f"unit {i}, {where}", short)
+            if floors is not None:
+                floors += [{"unit": i, "package": item[2], "where": where, "shortfall": float(x)} for x in short]
             if chk and chk["outcome"] in d and chk["yll"] in d and raw[chk["outcome"]] >= raw[chk["yll"]]:
                 yld = d[chk["outcome"]] - d[chk["yll"]]
                 if yld < -1e-9 * max(abs(d[chk["outcome"]]), 1.0):
                     raise AnchorError(f"unit {i}, {where}: anchored {chk['outcome']} {d[chk['outcome']]:.4g} is below "
                                       f"the anchored YLL {d[chk['yll']]:.4g} (the model's {raw[chk['yll']]:.4g} x "
                                       f"f({chk['deaths']})): the DALY and death anchors are inconsistent")
-            if len(item) == 4:
+            if len(item) == 5:
                 for o, x in d.items():
-                    item[2][o][item[3]] = x
+                    item[3][o][item[4]] = x
         for k, c in (out[i].get("cost") or {}).items():
             if k in sk:
                 continue
@@ -954,6 +960,19 @@ def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_
                 if name in c:
                     c[name] = c[name] * fu.get(o, 1.0)
     return f
+
+
+def yld_floor_summary(per_eval: list) -> dict:
+    """The YLD floors of a set of evaluations (each a list of apply_anchor floor records): where the model's DALYs fall
+    below its YLL (emulator error), YLD counts as zero; reported beside the cost floors."""
+    cases = [len({(f["unit"], f["package"]) for f in fl}) for fl in per_eval]
+    mx = max((f["shortfall"] for fl in per_eval for f in fl), default=0.0)
+    k = sum(c > 0 for c in cases)
+    return {"evaluations": len(cases), "evaluations_with_floors": k, "cases": sum(cases), "max_shortfall": float(mx),
+            "statement": (f"In {k} of {len(cases)} evaluations the model's DALYs fell below its YLL for some unit and "
+                          f"package ({sum(cases)} unit x package cases, largest shortfall {mx:.4g}); YLD was counted "
+                          "as zero there." if k else "The model's DALYs were never below its YLL; no YLD was counted "
+                          "as zero.")}
 
 
 def anchor_groups(anchor) -> list[dict]:
@@ -2374,6 +2393,21 @@ def _self_test_anchor_r4(ok, spec, row, chk, three, refused):
              dict(W2, window_metrics={"cases": "prev", "deaths": "prev", "dalys": "prev"}), "carries no YLL")):
         got = load_references(spec(both + [chk], blk, three))[1]
         ok(any(needle in x for x in got), f"BA38 (#220 r3) the contract refuses {name}: {got}")
+    # emulator DALYs below emulator YLL: YLD counted as zero, and recorded (unit x package, largest shortfall)
+    try:
+        fx2 = anchor_factors(A, config(sp), load_references(sp)[0], out(pk), "none")
+        low = dict(pk, b=dict(pk["b"], dalys=65.0))          # YLL 70: 5 short
+        fl = []
+        apply_anchor(fx2, out(low), A.ids, floors=fl)
+        sm = yld_floor_summary([fl, []])
+        ok(len(fl) == len(A.ids) and all(x["package"] == "b" and abs(x["shortfall"] - 5.0) < 1e-9 for x in fl)
+           and sm["evaluations"] == 2 and sm["evaluations_with_floors"] == 1 and sm["cases"] == len(A.ids)
+           and abs(sm["max_shortfall"] - 5.0) < 1e-9 and "zero" in sm["statement"]
+           and yld_floor_summary([[]])["cases"] == 0,
+           f"BA39 (#220 r3) a model's DALYs below its YLL count YLD as zero and are recorded per unit and package, "
+           f"with the largest shortfall: {sm}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA39 (#220 r3) YLD floors are recorded: {type(e).__name__}: {e}")
 
 
 def types_ns(sp_):

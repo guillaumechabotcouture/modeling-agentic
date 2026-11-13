@@ -300,8 +300,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     from toolkit.analysis import burden as BV
     anc = BV.anchor_step(A, out0, A.last_events) if BV.section(spec.raw) is not None else None
     if anc is not None:     # F6 S2-5d: absolute burden at the external level; every later evaluation is anchored
-        arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
         out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        anc["yld_floors"] = BV.yld_floor_summary([A.last_yld_floors])      # the point's (#220 r3)
+        arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
         log("burden anchor: " + ", ".join(f"{r['id']} x{r['factor']:.3g}" for r in anc["rows"]))
     events0 = list(A.last_events)
     from toolkit.alloc import costs as acosts
@@ -1810,6 +1811,10 @@ def _self_test_anchor_e2e(ok, d, q):
            {k: x.get(k) for k in ("kind", "status")} for x in ud["draw_plan"]["sources"]],
        f"BA9 (review r1 P2-3) a draw samples each anchor's external value from its own seeded stream; the draw's "
        f"window burden is that value ({lvl:.6g} vs {smp.get('anchor:N0')}); the interval covers burden_anchor")
+    yf, uf_ = ba.get("yld_floors") or {}, ud.get("anchor_yld_floors") or {}
+    ok(yf.get("evaluations") == 1 and yf.get("cases") == 0 and uf_.get("evaluations") == ud["draws"]
+       and "statement" in uf_, f"BA39 (#220 r3) burden_anchor.yaml and the uncertainty record report the YLD floors "
+       f"(point {yf}, draws {uf_.get('evaluations')})")
     # review r1 P2-9: a rebuild restores the anchor, so its benefits are the published ones
     from toolkit.analysis import figure_data as FD
     try:
