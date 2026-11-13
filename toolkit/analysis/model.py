@@ -86,7 +86,7 @@ def _yll_value(spec, theta):
     engine card's)."""
     from toolkit.spec import engine_parameters as PV
     base = dict({p.name: p.value for p in spec.engine().parameters()}, **PV.values(spec))
-    return lambda x: float(x) if not isinstance(x, str) else float((theta or {}).get(x, base[x]))
+    return lambda x: float(x) if BV._num(x) is not None else float((theta or {}).get(x, base[x]))
 
 
 def group_sizes(res, pops: dict, unit: dict) -> dict:
@@ -145,8 +145,9 @@ class EmulatorModel:
         self.fv = {i: FT.vector(spec, u) for i, u in self.by_id.items()}
         pts = design["points"]
         yw = BV.yll_weights(spec)        # F6 S2-5d #220 r3: YLL emulated beside the outcomes, from per-age deaths
+        self.yll = yw
         if yw:
-            self.outcomes = self.outcomes + [BV.YLL_OUT]
+            self.outcomes = self.outcomes + [BV.YLL_OUT] + ([BV.YLD_OUT] if yw["dalys"] in self.outcomes else [])
             th = {str(p["point"]): p["theta"] for p in pts}
             results = {key: BV.with_yll(r, yw, _yll_value(spec, th.get(key.rsplit("|", 1)[0])))
                        if isinstance(r, dict) and "per_capita" in r else r for key, r in results.items()}
@@ -383,6 +384,10 @@ class EmulatorModel:
                     b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
                     b[o] = b.get(o, 0.0) + v
         self.last_events = ev
+        if self.yll:        # #220 r4: DALYs = YLL + YLD (both emulated non-negative), the window's YLL
+            wts = BV.window_weights(self.spec, self.yll, _yll_value(self.spec, theta))
+            for row in y:
+                BV.finish_parts(row, self.yll, wts)
         return dict(zip(ids, y))
 
 
@@ -474,7 +479,8 @@ class DirectModel:
         self.comp = spec.comparator
         self.pops = spec["decision_units"]["populations"]
         self.yll = BV.yll_weights(spec)      # F6 S2-5d #220 r3: YLL from the engine's per-age deaths
-        self.outcomes = spec.outcomes() + ([BV.YLL_OUT] if self.yll else [])
+        self.outcomes = spec.outcomes() + ([BV.YLL_OUT] + ([BV.YLD_OUT] if self.yll["dalys"] in spec.outcomes() else [])
+                                           if self.yll else [])
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.attrs = {i: spec.unit_attributes(u) for i, u in self.by_id.items()}
         self.cal_attr = spec["calibration"].get("attribute")
@@ -548,6 +554,8 @@ class DirectModel:
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
+            if self.yll:
+                BV.finish_parts(row, self.yll, BV.window_weights(self.spec, self.yll, _yll_value(self.spec, theta)))
             out[i] = row
         return out
 
@@ -732,7 +740,8 @@ def _self_test() -> int:
     try:
         from toolkit.analysis import burden as BVm
         r4 = {"meta": {"age_shares": {"c": 0.4, "a": 0.6}}, "per_capita": {"deaths": {"c": 0.01, "a": 0.002}}}
-        d4 = BVm.with_yll(r4, ("deaths", {"c": 70, "a": "le_a"}), lambda x: {"le_a": 30.0}.get(x, x))
+        d4 = BVm.with_yll(r4, {"deaths": "deaths", "dalys": "dalys", "w": {"c": 70, "a": "le_a"}},
+                          lambda x: {"le_a": 30.0}.get(x, x))
         b1 = {"one": {"column": "p1", "age_groups": ["c", "a"]}}
         b2 = {"kids": {"column": "p2", "age_groups": ["c"]}, "ad1": {"column": "p3", "age_groups": ["a"]},
               "ad2": {"column": "p4", "age_groups": ["a"]}}
@@ -745,6 +754,58 @@ def _self_test() -> int:
            f"MD4 YLL per engine age group from its own deaths: mixed-age and repeated-age bands add up ({t1}, {t2})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"MD4 YLL per engine age group from its own deaths: {type(e).__name__}: {e}")
+    # MD5 (#220 r4): the emulator trains and predicts YLL and YLD (each design point's own weight parameter), its
+    # DALYs are YLL + YLD in every emulator-error draw, and anchored DALYs never fall below the anchored YLL
+    try:
+        import tempfile
+        import yaml as _y
+        from toolkit.spec import schema, priors as PRI, engine_parameters as PV
+        with tempfile.TemporaryDirectory() as d:
+            raw = _y.safe_load(open(schema.toy_spec(d)))
+            raw["outcomes_reported"] = ["dalys", "cases", "deaths"]
+            raw["validation"] = {"burden": {"daly_parts": {"dalys": "dalys", "deaths": "deaths",
+                                                           "yll_per_death_by_age": {"all": "eff_a"}}}}
+            sp = schema.Spec(raw, d)
+            rng = np.random.default_rng(3)
+            ids, pk = sp.unit_ids(), list(sp.packages())
+            pts, res = [], {}
+            for n in range(40):
+                z, th = float(rng.uniform(-2, 2)), {"eff_a": float(rng.uniform(0.3, 0.7)),
+                                                    "eff_b": float(rng.uniform(0.1, 0.5))}
+                pts.append({"point": f"p{n}", "unit_id": ids[n % len(ids)], "z": z, "theta": th, "holdout": n % 5 == 0})
+                for k in pk:
+                    cs = sp.packages()[k]
+                    m = math.exp(z) * (1 - 0.3 * ("a" in cs) - 0.2 * ("b" in cs))
+                    dth, cas = 0.01 * m, 0.1 * m
+                    res[f"p{n}|{k}"] = {"per_capita": {"deaths": {"all": dth}, "cases": {"all": cas},
+                                                       "dalys": {"all": 0.5 * cas + dth * th["eff_a"]}},
+                                        "meta": {"age_shares": {"all": 1.0}}, "cost_drivers": {"a_doses": 1.0, "b_doses": 1.0},
+                                        "windows": {"cal": {"prev": 1 / (1 + math.exp(-z))}}}
+            design = {"fitted_names": ["eff_a", "eff_b"], "prior_names": list(PRI.drawn(sp)),
+                      "spec_value_names": list(PV.tested_boxes(sp)), "packages": pk, "points": pts}
+            em = EmulatorModel(sp, design, res, log=lambda *a: None).fit()
+            BVm = BV
+            Y, D = BVm.YLL_OUT, BVm.YLD_OUT
+            tw = em.T[("base", "all", Y)] - em.T[("base", "all", "deaths")]
+            want = np.log([p["theta"]["eff_a"] for p in pts])
+            anc = {"rows": {}, "units": {i: {} for i in ids}, "arm": sp.comparator, "cost_scaling": {}, "daly_check": None,
+                   "dalys": {"outcome": "dalys", "deaths": "deaths", "cases": "cases", "yll": Y}}
+            good, n_ok = True, 0
+            for sd in range(4):
+                o = em.predict({i: 0.3 for i in ids}, {"eff_a": 0.5, "eff_b": 0.3}, ids,
+                               noise=np.random.default_rng(sd) if em.error is not None else None)
+                for i in ids:
+                    for k in pk:
+                        v = o[i]["y"][k]
+                        good &= v[Y] >= 0 and v[D] >= 0 and abs(v["dalys"] - v[Y] - v[D]) <= 1e-9 * max(v["dalys"], 1)
+                BVm.apply_anchor(anc, o, ids, unit_factors={i: {"deaths": 2.0, "cases": 0.5} for i in ids})
+                good &= all(o[i]["y"][k]["dalys"] >= o[i]["y"][k][Y] - 1e-12 for i in ids for k in pk)
+                n_ok += 1
+            ok(np.allclose(tw, want) and good and n_ok == 4 and em.error is not None,
+               "MD5 the emulator learns YLL from each design point's own weight parameter, predicts DALYs = YLL + YLD "
+               "with both parts non-negative in every emulator-error draw, and anchored DALYs stay above anchored YLL")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"MD5 the emulator's YLL and YLD: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

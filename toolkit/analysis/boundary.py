@@ -180,9 +180,9 @@ def engine_tables(A, cands, z0, out0, res):
                 except (KeyError, TypeError, ValueError):
                     raise AnchorError(f"boundary ranking: unit {u}: no engine window burden for {o} on the "
                                       f"{anc['arm']} arm (the arm must be among the packages run)") from None
-                if not e_b > 0:
-                    raise AnchorError(f"boundary ranking: unit {u}: engine window burden {e_b} for {o}")
-                uf[u][o] = a_b / e_b
+                # #220 r4: a unit with no engine burden (a low-incidence unit can have none in its run while its
+                # group's total is positive) takes its group's point factor, the one the decision applies there
+                uf[u][o] = a_b / e_b if e_b > 0 else float(anc["rows"][anc["units"][u][o]]["factor"])
         skip = {u: [k for k in A.pk if k not in pks] for u, (pks, _row) in eng.items()}
 
     def hybrid(scale):
