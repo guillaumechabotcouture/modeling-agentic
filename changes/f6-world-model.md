@@ -1,0 +1,13 @@
+---
+phase: "F6"
+commit: "WM"
+status_group: "F6 progressive steps"
+---
+
+## Changelog
+
+**The world model, v0: beliefs, hypotheses, a coarse sweep summary, check and where to look (F6 WM, design v2-progressive-steps.md §4).** A standalone module, `toolkit/analysis/world_model.py`, not yet wired into `run.py` or the stage machine. A seed file (YAML, written by a person now and by a bounded reasoning task later) holds beliefs: a mechanism and its direction, a rough magnitude band, conditions or rough branching points, the source type (literature, data, simulation) with its evidence (citation and table or page; dossier entry; artifact and point ids), a confidence, and conflicting evidence. It also holds hypotheses, each a testable expectation with a machine-checkable refutation test (`effect_band`, `effect_direction`, `paired_sign`, `flip_in`, `plan_share`). Validation fails closed on a belief without evidence (or literature without its location), a hypothesis without a test, an unknown test kind or a reference to an unknown belief. `build <run_dir> --seed` reads a run's batch offline (`design.json`, `results.jsonl`, the signed spec's populations and cost items, `point.yaml` when present) and works per person. It summarises each package's relative effect against the comparator as a 10th-90th percentile band with its direction along each feature (Spearman), and roughly where each competing pair's choice on benefit per cost flips (a one-feature logistic fit of the sign, with the range of its 25-75% transition, never narrower than the sweep's resolution). It adds these as simulation beliefs and records conflicts with seed beliefs side by side. `check()` evaluates every hypothesis against the artifacts and updates its status, the track record and the belief's confidence. A contradiction becomes an open question about its cause, never an input change. `where_to_look()` ranks decision-relevant beliefs that are weakly held, conflicting or contradicted, and gives the simulation region or the evidence that would most change each one. It writes `analysis/world_model.yaml` and `analysis/hypotheses.yaml` with input sha256s. Planted-truth self-test WM1-16: true direction, constant effect, a flip range that contains the true threshold, no flip along an irrelevant feature, deterministic output, refusals, a refuted hypothesis flagged, an untestable plan check without a plan, and a fail-closed load.
+
+## Status
+
+- **WM:** world model v0 (schema, seed validation, coarse sweep summary, mechanical hypothesis checks, where to look), standalone; wiring into a LEARN stage and the bounded task that writes seeds are later PRs.
