@@ -922,6 +922,34 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     return p
 
 
+def _self_test_round5(ok, T) -> None:
+    """#218 review round 5: trial-prior inputs by mode; the input closure bound at signing."""
+    import tempfile
+    from toolkit.engines.empirical.engine import toy_trial_config
+    rate = "toolkit.engines.empirical.engine:PackageRateEngine"
+    cfg = toy_trial_config()
+    tp = {"engine": {"ref": rate, "config": cfg},
+          "options": {"components": {c: {} for c in cfg["components"]},
+                      "engine_map": {c: {c: 1} for c in cfg["components"]}}}
+    req, probs = required_inputs(tp)
+    cal = {"engine": {"ref": rate, "config": {"components": ["a", "b"]}},
+           "options": {"components": {"a": {}, "b": {}}, "engine_map": {"a": {"a": 1}, "b": {"b": 1}}}}
+    ok({"parameter:lrr:a:cases", "parameter:lint:a+b:cases", "parameter:w:dalys:cases", "unit_attribute:baseline_rate",
+        "unit_attribute:baseline_coverage"} <= set(req) and probs == [] and required_inputs(cal) == ({}, []),
+       f"ED-Y1 the package-rate engine's trial_priors mode needs its trial effects, interactions, weights and "
+       f"baselines; calibrated mode needs none: {sorted(req)[:6]} {probs}")
+    with tempfile.TemporaryDirectory() as d:
+        from toolkit.spec import signoff as SO
+        toy_dossier_spec(d)
+        SO.write_sheet(d)
+        rec = SO.sign(d, "owner", note="n")
+        cl = (rec.get("evidence") or {}).get("closure") or {}
+        ok("run:decision_spec.yaml" in cl and "run:units.csv" in cl and "run:evidence_dossier.yaml" in cl
+           and any(k.startswith("tree:") for k in cl),
+           f"ED-Y2 the sign-off binds the input closure: the spec, the files it references, the dossier, and the "
+           f"engine files from the tree: {sorted(cl)[:8]}")
+
+
 def _self_test_round4(ok, T) -> None:
     """#218 review round 4: execution's own values, card tables by content, calibrated parameters, the signed
     superset, no caches across calls."""
@@ -942,11 +970,10 @@ def _self_test_round4(ok, T) -> None:
         good = {"model_value": {"sha256": sha_t}, "model_source": "card", "chosen": {"value": {"sha256": sha_t},
                                                                                      "rule": "the card's"},
                 "no_data": {"reason": "r", "borrowing_rule": "b"}}
-        bad = dict(good, model_value=0.123)
-        ok(not _value_problems("card_table:hut_trial_coefficients", good, r, good["chosen"], {}, None, {})
-           and any("sha256" in p for p in _value_problems("card_table:hut_trial_coefficients", bad, r,
-                                                          bad["chosen"], {}, None, {})),
-           "ED-X2 a card table entry names the table's content sha256, checked against the card; a scalar is refused")
+        bad = dict(good, chosen={"value": 0.123, "rule": "r"})
+        a1, a2 = _advise_one(r, good, {}, None, {}), _advise_one(r, bad, {}, None, {})
+        ok(a1["differs"] is False and a2["differs"] is True and sha_t in str(a1["execution"]),
+           f"ED-X2 a card table is shown by its content sha256; a chosen value that is not it is flagged: {a1} {a2}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"ED-X1/X2 execution values and card tables: {type(e).__name__}: {e}")
     with tempfile.TemporaryDirectory() as d:
@@ -959,7 +986,9 @@ def _self_test_round4(ok, T) -> None:
         ok(state(d, record=sup)["status"] == "ok",
            f"ED-X3 the chosen engine needs a subset of the inputs signed (a superset was signed): ok "
            f"{state(d, record=sup)['problems'][:2]}")
-        before = state(d)["status"]
+        raw_ = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        rk = required_inputs(raw_, d)[0]["parameter:k"]
+        before = _advise_one(rk, toy_entries()["parameter:k"], raw_, d, {})
         orig = T.ToyDossierEngine.parameters
 
         def moved(self):
@@ -967,12 +996,12 @@ def _self_test_round4(ok, T) -> None:
             return [ParamSpec("k", 0.9, "fixed", source="toy") if p.name == "k" else p for p in orig(self)]
         T.ToyDossierEngine.parameters = moved
         try:
-            after = state(d)
+            after = _advise_one(rk, toy_entries()["parameter:k"], raw_, d, {})
         finally:
             T.ToyDossierEngine.parameters = orig
-        ok(before == "ok" and after["status"] != "ok" and any("= 0.9" in p for p in after["problems"]),
-           f"ED-X4 nothing is cached across calls: an engine default changed after a check is seen by the next "
-           f"({before}, {after['problems'][:1]})")
+        ok(before["differs"] is False and after["differs"] is True and "0.9" in str(after["execution"]),
+           f"ED-X4 nothing is cached across calls: an engine default changed after a look is seen by the next "
+           f"({before}, {after})")
     comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": {
         "groups": ["all"], "structure": "single_group", "mode": "to_extinction", "initialiser": "given", "dt": "day",
         "generation_interval": [0.2, 0.3, 0.3, 0.2], "components": {"vax": {"kind": "campaign", "targets": ["all"],
@@ -984,15 +1013,10 @@ def _self_test_round4(ok, T) -> None:
     req, _ = required_inputs(comp)
     point = {"model_value": 2.5, "model_source": "s", "no_data": {"reason": "r", "borrowing_rule": "b"},
              "chosen": {"value": 2.5, "rule": "r"}}
-    prior = dict(point, chosen={"range": [1.0, 4.0], "rule": "the calibration prior"},
-                 calibration_targets="the attack-rate panel")
-    p1 = [p for p in check(comp, yaml.safe_dump({"inputs": {"parameter:r0": point}}).encode(), req)
-          if "parameter:r0" in p]
-    p2 = [p for p in check(comp, yaml.safe_dump({"inputs": {"parameter:r0": prior}}).encode(), req)
-          if "parameter:r0" in p]
-    ok(any("declared range" in p for p in p1) and not p2,
-       f"ED-X5 a calibrated parameter attests its declared prior range and its calibration targets, not a point value "
-       f"(which does not exist before the run): {p1[:2]} {p2[:2]}")
+    a = _advise_one(req["parameter:r0"], point, comp, None, {})
+    ok(a["differs"] is True and "0.05" in str(a["execution"]) and "40" in str(a["execution"]),
+       f"ED-X5 a likelihood-calibrated parameter is shown with the bounds the likelihood searches (the engine's "
+       f"range), and a chosen point is flagged: {a}")
 
 
 def _self_test_round2(ok, T) -> None:
@@ -1034,19 +1058,23 @@ def _self_test_round2(ok, T) -> None:
         e1 = dict(kentry, model_value=0.1, chosen={"value": 0.1, "rule": "r"})
         e1.pop("decision_test")
         e2 = dict(e1, model_value=0.9, chosen={"value": 0.9, "rule": "r"})
-        ok(any("0.9" in p for p in verdict(fixed, e1, d)) and verdict(fixed, e2, d) == [],
-           f"ED-V1 the chosen and model values reconcile with the value the spec runs (engine_parameters 0.9 vs 0.1 "
-           f"refused; 0.9 passes): {verdict(fixed, e1, d)} {verdict(fixed, e2, d)}")
+        rk = {"kind": "parameter", "name": "k", "engines": [(TOY, {})], "used_by": ["b"]}
+        ok(_advise_one(rk, e1, fixed, d, {})["differs"] is True and _advise_one(rk, e2, fixed, d, {})["differs"] is False
+           and verdict(fixed, e1, d) == [],
+           "ED-V1 a chosen value that is not the spec's engine_parameters value signs (coverage only) and is flagged "
+           "on the sheet; the matching one is not flagged")
         ua = copy.deepcopy(raw)
         ua["decision_units"]["engine_attributes"] = {"x": {"value": 0.5, "source": "toy"}}
         ua["calibration"] = {"method": "none"}      # x bound to a value, not calibrated
-        e3 = copy.deepcopy(toy_entries())
-        e3["unit_attribute:x"]["model_value"] = 0.2
-        e3["unit_attribute:x"]["chosen"] = {"value": 0.2, "rule": "r"}
-        req, _ = required_inputs(ua, d)
-        got = check(ua, yaml.safe_dump({"inputs": e3}).encode(), req, DOSSIER_FILE, d)
-        ok(any("0.5" in p and "unit_attribute:x" in p for p in got),
+        e3 = copy.deepcopy(toy_entries())["unit_attribute:x"]
+        e3["chosen"] = {"value": 0.2, "rule": "r"}
+        rx = {"kind": "unit_attribute", "name": "x", "engines": [(TOY, {})], "used_by": ["a"]}
+        got = _advise_one(rx, e3, ua, d, {})
+        ok(got["differs"] is True and "0.5" in str(got["execution"]),
            f"ED-V2 ... and a unit attribute bound to a value: {got}")
+        e4 = dict(e3, model_value=[], chosen={"value": [], "rule": "an explicitly empty list"})
+        ok(not [p for p in _entry_problems("unit_attribute:x", e4, rx, ua, d, {}) if "blank" in p],
+           "ED-V3 an empty collection is a legitimate value (not blank)")
     # ED-R11: compartmental outcome ratios when the configured outcome uses them
     base_cfg = {"groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "outcomes": ["deaths"],
                 "components": {"camp": {"kind": "campaign", "targets": ["g1"], "reach": 0.8}}}
@@ -1093,12 +1121,7 @@ def _self_test_round1(ok, T) -> None:
                 ("an observation value that is a list of blanks", lambda e: e["parameter:eff_a"]["observations"][0]
                  .__setitem__("value", [None]), "value"),
                 ("a range whose test varies another quantity", lambda e: e["parameter:eff_a"].__setitem__(
-                    "decision_test", "DT1"), "the runner generates"),
-                ("a range wider than its test's values", lambda e: e["parameter:eff_a"]["chosen"].__setitem__(
-                    "range", [0.2, 0.6]), "declared range"),
-                ("a range on a unit attribute", lambda e: e["unit_attribute:x"].__setitem__("chosen", {
-                    "range": [0, 1], "rule": "r"}) or e["unit_attribute:x"].__setitem__("decision_test", "DT1"),
-                 "unit_attribute:x")):
+                    "decision_test", "DT1"), "does not vary")):
             e = copy.deepcopy(toy_entries())
             mut(e)
             got = check(raw, yaml.safe_dump({"inputs": e}).encode(), req)
@@ -1299,6 +1322,10 @@ def _self_test() -> int:
                                                      "engines declare decision inputs")
     except NameError as e:
         ok(False, f"evidence dossier: {e}")
+    try:
+        _self_test_round5(ok, T)
+    except NameError as e:
+        ok(False, f"ED-Y round 5: {e}")
     try:                            # last: it imports the malaria engine (ED-R6 checks it is not imported before)
         _self_test_round4(ok, T)
     except NameError as e:          # before the round-4 functions exist (the tests-first commit)

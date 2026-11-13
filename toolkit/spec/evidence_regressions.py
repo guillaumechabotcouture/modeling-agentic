@@ -24,6 +24,7 @@ for _p in (ROOT, os.path.join(ROOT, "scripts"), os.path.join(ROOT, "cloud")):
 
 R = "runs/r1"
 SPEC, DOSSIER, SHEET = "decision_spec.yaml", "evidence_dossier.yaml", "decision_spec.signoff_sheet.md"
+DIFFERS_HEADING = "Inputs whose chosen value or range differs from what execution will use"
 
 
 def _fixture_yaml(d, rel, fn):
@@ -280,17 +281,17 @@ PRE_ROWS = [
     ("control", "nothing changed: every path accepts", lambda d: None, True),
     ("R1-no-dossier", "the options need inputs and the spec names no dossier",
      lambda d: _spec(d, lambda s: s.pop("evidence")), True),
-    ("R1-missing-file", "the spec names a dossier that does not exist",
-     lambda d: _fixture_remove(d, DOSSIER), True),
+    ("R1-missing-file", "the spec names a dossier that does not exist", lambda d: _fixture_remove(d, DOSSIER), True),
     ("R1-uncovered", "an input has no entry", lambda d: _entries(d, lambda e: e.pop("unit_attribute:x")), True),
     ("R1-blank", "a blank entry", lambda d: _entries(d, lambda e: _set(e, "unit_attribute:x", None)), True),
-    ("R1-unparseable", "the dossier does not parse",
-     lambda d: _fixture_write(d, DOSSIER, "inputs: [unclosed\n"), True),
+    ("R1-unparseable", "the dossier does not parse", lambda d: _fixture_write(d, DOSSIER, "inputs: [unclosed\n"), True),
     ("R1-stale-sheet", "the dossier changed after the sheet",
      lambda d: _fixture_write(d, DOSSIER, "# edited\n", "a"), False),
     ("R3-no-sheet", "no sheet showed the dossier", lambda d: _fixture_remove(d, SHEET), False),
     ("R4-sheet-other-spec", "the sheet was generated for another spec (the dossier unchanged)",
      lambda d: _spec(d, lambda s: _set(s, "question", "Another question?")), False),
+    ("R5-sheet-other-inputs", "an input file the run reads changed after the sheet (the units table)",
+     lambda d: _fixture_write(d, "units.csv", "\n", "a"), False),
     ("R1-malformed-decl", "a component declared {} (no inputs, no reason)",
      lambda d: _patch_decl({"a": {}, "b": {"inputs": [], "none_reason": "r"}}), True),
     ("R1-non-dict-input", "an input entry that is not a mapping",
@@ -299,38 +300,48 @@ PRE_ROWS = [
      lambda d: _spec(d, lambda s: s["options"]["engine_map"].pop("a")), True),
     ("R1-nested-blank", "a nested blank chosen value",
      lambda d: _entries(d, lambda e: _set(e["parameter:k"]["chosen"], "value", [None, " "])), True),
-    ("R1-test-other-quantity", "a fitted parameter's range citing a test of another quantity",
+    ("R5-observation-mapping", "a single observation given as a mapping, not a list",
+     lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"], "observations", e["parameter:eff_a"]["observations"][0])),
+     True),
+    ("R1-test-other-quantity", "a range citing a test of another quantity",
      lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"], "decision_test", "DT1")), True),
-    ("R1-test-narrow", "a fitted parameter's range that is not its declared (fitted) range",
-     lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"]["chosen"], "range", [0.2, 0.6])), True),
     ("R4-generated-name", "prior_range_<p> cited where the runner generates fitted_range_<p>",
      lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"], "decision_test", "prior_range_eff_a")), True),
     ("R2-excluded-prior", "prior_range_<p> cited for a prior the draw plan excludes",
      lambda d: (_spec(d, lambda s: (s["uncertainty"].__setitem__("priors", {"k": {
          "dist": "uniform", "range": [0.7, 0.9], "source": "toy"}}), s["uncertainty"]["excluded"].append(
          {"parameter": "k", "reason": "held"}))), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
-    ("R2-explicit-value", "the chosen value is not the spec's engine_parameters value (0.8 vs 0.9)",
-     lambda d: _spec(d, lambda s: _set(s, "engine_parameters", {"k": {
-         "value": 0.9, "source": "toy", "reason": "toy", "basis": "setting_data"}})), True),
-    ("R3-default-value", "the chosen value is not the default the engine runs (k 0.1 vs 0.8)",
-     lambda d: _entries(d, lambda e: (_set(e["parameter:k"], "model_value", 0.1),
-                                      _set(e["parameter:k"], "chosen", {"value": 0.1, "rule": "r"}))), True),
-    ("R4-default-attribute", "an attribute left at its card default (\"\") and a dossier saying \"g1\"",
-     _with_group(_group_entry("g1", "g1")), True),
-    ("R4-column-attribute", "an attribute bound to a column and a dossier that does not describe the column",
-     _with_group(_group_entry({"min": 0, "median": 0, "max": 0}, "g1"), {"column": "grp"}), True),
-    ("R3-structured-literal", "an attribute bound to a literal and a dossier giving another literal",
-     _with_group(_group_entry(["g1", "g2"], ["g1", "g2"]), {"value": ["g3", "g4"], "source": "toy"}), True),
-    ("R3-range-inside-draws", "a drawn parameter whose chosen range is not its declared range ([0.7, 0.9] vs "
-                              "[0.6, 1.0])",
-     lambda d: (_spec(d, lambda s: _set(s, "engine_parameters", {"k": {
-         "value": 0.8, "range": [0.6, 1.0], "dist": "uniform", "source": "toy", "reason": "toy",
-         "basis": "setting_data"}})), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
     ("R3-test-not-executable", "a parameter_value test the emulator path cannot run (k neither drawn nor set)",
      lambda d: (_spec(d, lambda s: s["analysis"]["decision_tests"].append({
          "id": "DT_k", "type": "parameter_value", "parameter": "k", "values": [0.7, 0.9],
          "text": "Does the plan change across the toy slope?"})),
                 _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K, decision_test="DT_k")))), True),
+]
+
+# advisory rows (#218 round 5): a dossier value or range that differs from what execution will use signs (the owner
+# decides) and the sheet flags the row as differing, at its top; (id, what, mutate, the input flagged)
+ADVISORY_ROWS = [
+    ("R2-explicit-value", "the chosen value 0.8 against the spec's engine_parameters value 0.9",
+     lambda d: _spec(d, lambda s: _set(s, "engine_parameters", {"k": {
+         "value": 0.9, "source": "toy", "reason": "toy", "basis": "setting_data"}})), "parameter:k"),
+    ("R3-default-value", "the chosen value 0.1 against the engine default 0.8",
+     lambda d: _entries(d, lambda e: (_set(e["parameter:k"], "model_value", 0.1),
+                                      _set(e["parameter:k"], "chosen", {"value": 0.1, "rule": "r"}))), "parameter:k"),
+    ("R4-default-attribute", "an attribute left at its card default (\"\") and a dossier choosing \"g1\"",
+     _with_group(_group_entry("g1", "g1")), "unit_attribute:group"),
+    ("R4-column-attribute", "an attribute bound to a numeric column and a dossier choosing a value outside it",
+     _with_group(_group_entry({"min": 0, "median": 0, "max": 0}, 999.0), {"column": "cov"}), "unit_attribute:group"),
+    ("R3-structured-literal", "an attribute bound to a literal and a dossier choosing another literal",
+     _with_group(_group_entry(["g1", "g2"], ["g1", "g2"]), {"value": ["g3", "g4"], "source": "toy"}),
+     "unit_attribute:group"),
+    ("R3-range-inside-draws", "a drawn parameter's chosen range [0.7, 0.9] against its draw range [0.6, 1.0]",
+     lambda d: (_spec(d, lambda s: _set(s, "engine_parameters", {"k": {
+         "value": 0.8, "range": [0.6, 1.0], "dist": "uniform", "source": "toy", "reason": "toy",
+         "basis": "setting_data"}})), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), "parameter:k"),
+    ("R1-test-narrow", "a fitted parameter's chosen range [0.2, 0.6] against its fitted range [0.3, 0.7]",
+     lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"]["chosen"], "range", [0.2, 0.6])), "parameter:eff_a"),
+    ("R5-calibration-range", "the calibration attribute's chosen range [0, 1] against its search range [-2, 2]",
+     lambda d: _entries(d, lambda e: _set(e["unit_attribute:x"]["chosen"], "range", [0, 1])), "unit_attribute:x"),
 ]
 
 # post-sign rows: signed from the control first; mutate(d) -> undo or None
@@ -340,6 +351,8 @@ POST_ROWS = [
      lambda d: _fixture_write(d, DOSSIER, "# edited after signing\n", "a")),
     ("R1-spec-edited", "the spec edited after signing (evidence removed with it)",
      lambda d: _spec(d, lambda s: s.pop("evidence"))),
+    ("R5-units-edited", "the units table (and its calibration targets) edited after signing",
+     lambda d: _fixture_write(d, "units.csv", open(os.path.join(d, "units.csv")).read().replace("0.", "0.9", 1))),
     ("R1-legacy-record", "a sign-off made before the requirement (no evidence binding)",
      lambda d: _fixture_json(d, "decision_spec.signoff.json", lambda r: r.pop("evidence"))),
     ("R3-empty-evidence", "a sign-off whose evidence binding is {}",
@@ -356,6 +369,9 @@ POST_ROWS = [
          {"kind": "parameter", "name": "eff_a", "why": "another reason"},
          {"kind": "unit_attribute", "name": "x", "why": "w"}]},
          "b": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "k", "why": "w"}]}})),
+    ("R5-declaration-shrank", "every declared input removed since signing (none_reason everywhere)",
+     lambda d: _patch_decl({"a": {"inputs": [], "none_reason": "none now"},
+                            "b": {"inputs": [], "none_reason": "none now"}})),
 ]
 
 
@@ -365,18 +381,19 @@ WANT = {
     "R1-uncovered": ["no entry for unit_attribute:x"], "R1-blank": ["entry unit_attribute:x is blank"],
     "R1-unparseable": ["does not parse"], "R1-stale-sheet": ["another evidence dossier"],
     "R3-no-sheet": ["no sign-off sheet"], "R4-sheet-other-spec": ["another spec", "another decision_spec"],
+    "R5-sheet-other-inputs": ["other inputs", "input closure"],
     "R1-malformed-decl": ["malformed"], "R1-non-dict-input": ["malformed"],
     "R1-engine-map": ["no engine mapping"], "R1-nested-blank": ["chosen.value is blank"],
-    "R1-test-other-quantity": ["the runner generates"], "R1-test-narrow": ["declared range"],
-    "R4-generated-name": ["fitted_range_eff_a"],
-    "R2-excluded-prior": ["not drawn"], "R2-explicit-value": ["= 0.9"], "R3-default-value": ["= 0.8"],
-    "R4-default-attribute": ["the value the run uses"], "R4-column-attribute": ["per-unit values"],
-    "R3-structured-literal": ["['g3', 'g4']"], "R3-range-inside-draws": ["declared range"],
+    "R5-observation-mapping": ["observations must be a list"],
+    "R1-test-other-quantity": ["does not vary"], "R4-generated-name": ["fitted_range_eff_a"],
+    "R2-excluded-prior": ["not drawn", "not a test the runner generates"],
     "R3-test-not-executable": ["does not execute"],
     "R1-dossier-edited": ["changed", "evidence dossier"], "R1-spec-edited": ["changed", "not the one signed"],
+    "R5-units-edited": ["changed", "units.csv"],
     "R1-legacy-record": ["unsigned_evidence"], "R3-empty-evidence": ["unsigned_evidence"],
     "R3-partial-evidence": ["unsigned_evidence"], "R3-declaration-grew": ["evidence_incomplete", "parameter:base"],
-    "R4-declaration-changed": ["declaration", "evidence_incomplete"],
+    "R4-declaration-changed": ["declaration", "evidence_incomplete", "changed"],
+    "R5-declaration-shrank": ["declaration", "evidence_incomplete", "changed"],
 }
 
 
@@ -410,6 +427,22 @@ def _self_test_table(ok) -> None:
             want_refused = rid != "control"
             ok(_right(rid, why),
                f"ET {rid} via {pname}: {'refused' if want_refused else 'accepted'} ({what}): {why[:160]!r}")
+    for rid, what, mutate, key in ADVISORY_ROWS:
+        for pname, path in PRE_PATHS.items():
+            with tempfile.TemporaryDirectory() as d:
+                ED.toy_dossier_spec(d)
+                undo = mutate(d)
+                try:
+                    SO.write_sheet(d)
+                    md = open(os.path.join(d, SHEET)).read()
+                    top = md.split(DIFFERS_HEADING)[1].split("\n\n")[0] if DIFFERS_HEADING in md else ""
+                    why = path(d)
+                finally:
+                    if callable(undo):
+                        undo()
+            ok(not why and key in top,
+               f"ET {rid} via {pname}: signs, and the sheet lists {key} as differing ({what}): "
+               f"{why[:120]!r} | {top[:160]!r}")
     for rid, what, mutate in POST_ROWS:
         for pname, path in POST_PATHS.items():
             with tempfile.TemporaryDirectory() as d:
