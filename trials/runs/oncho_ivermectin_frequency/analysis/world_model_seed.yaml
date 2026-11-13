@@ -1,0 +1,260 @@
+beliefs:
+- id: B1
+  mechanism: Annual ivermectin at about 75% therapeutic coverage cuts microfilaridermic person-time over 2026-2027.
+    Ivermectin clears skin microfilariae within weeks, but they come back over 6-12 months because it only temporarily
+    stops adult-worm production (with a modest cumulative effect on fecundity). So one round a year removes only
+    part of each treated person's mf-positive time, and coverage below 100% dilutes that further at population level.
+    The effect is on prevalence-time, not density, and is much smaller than the >90% density reductions seen at
+    1-3 months.
+  about:
+    package: annual
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.5
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: "Bas\xE1\xF1ez MG et al. Effect of single-dose ivermectin on Onchocerca volvulus: a systematic review\
+      \ and meta-analysis. Lancet Infect Dis 2008"
+    location: Results, skin microfilarial repopulation after a single dose (exact table not recalled)
+  - citation: 'Opoku NO et al. Single dose moxidectin versus ivermectin for Onchocerca volvulus infection in Ghana,
+      Liberia, and the Democratic Republic of the Congo: a randomised, controlled, double-blind phase 3 trial. Lancet
+      2018'
+    location: Results, skin microfilarial density and proportion with undetectable mf at 12 months, ivermectin arm
+      (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Biannual ivermectin works better than annual. A second round each year cuts short the rebound of skin
+    microfilariae, and repeated doses add to the permanent loss of adult-worm fecundity. But the gain is less than
+    double, because coverage stays below 100% and the same people are missed in every round, and because the 2-year
+    window is too short for much transmission effect: new infections take about a year to become patent.'
+  about:
+    package: biannual
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Gardon J et al. Effects of standard and high doses of ivermectin on adult worms of Onchocerca volvulus:
+      a randomised controlled trial. Lancet 2002'
+    location: Results, annual vs 3-monthly treatment arms (table not recalled)
+  - citation: Walker M et al. Macrofilaricidal efficacy of repeated doses of ivermectin for the treatment of river
+      blindness. Clin Infect Dis 2017
+    location: Results, cumulative effect of repeated doses (location uncertain)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: Biannual beats annual on the outcome in every unit. At the exogenous shadow price (6.5e-5 outcome per
+    USD), the extra US$1.00 per resident is worth almost nothing set against an extra reduction of inc x 2 x (r_b
+    - r_a), at least 0.15 x 2 x 0.05 mf person-years per resident. So biannual wins the paired comparison across
+    the whole prevalence range whenever r_b > r_a. This does not mean biannual is chosen under the US$3M budget
+    (see B4).
+  about:
+    pair:
+    - biannual
+    - annual
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.1472
+    - 0.5999
+  source_type: literature
+  evidence:
+  - citation: 'Turner HC et al. Reaching the London Declaration on Neglected Tropical Diseases goals for onchocerciasis:
+      an economic evaluation of increasing the frequency of ivermectin treatment in Africa. Clin Infect Dis 2014'
+    location: Results, incremental effect of biannual over annual treatment (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'Baseline prevalence (inc) ranks the units; population and vector density do not. Benefit and cost
+    both scale with population, so population cancels. The engine applies a relative reduction that does not depend
+    on the unit, so the relative effect does not vary with inc. Under the binding budget the rule is: treat by descending
+    inc, annual first, then upgrade to biannual only in the highest-prevalence units if r_b / r_a exceeds about
+    1.83. In reality, relative effects may vary somewhat with endemicity, but there is little such variation over
+    a 2-year horizon.'
+  about:
+    package: annual
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Turner HC et al. Reaching the London Declaration on Neglected Tropical Diseases goals for onchocerciasis:
+      an economic evaluation of increasing the frequency of ivermectin treatment in Africa. Clin Infect Dis 2014'
+    location: Results by pre-control endemicity (location uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Vector density (biting rate) changes how fast people are reinfected and so, over the long run, how
+    much higher treatment frequency adds. Over 2026-2027 its effect on mf person-years is small, because the prepatent
+    period is about a year. The engine reads only baseline_rate, so in the sweep the relative effect should not
+    depend on vector_density.
+  about:
+    package: biannual
+    feature: vector_density
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: "Bas\xE1\xF1ez MG et al. Effect of single-dose ivermectin on Onchocerca volvulus: a systematic review\
+      \ and meta-analysis. Lancet Infect Dis 2008"
+    location: Discussion, transmission and repopulation dynamics (location uncertain)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: Any ivermectin beats none. At the shadow price the cost of annual treatment is negligible beside the
+    mf person-years it averts, so annual dominates none in every unit.
+  about:
+    pair:
+    - annual
+    - none
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.1472
+    - 0.5999
+  source_type: literature
+  evidence:
+  - citation: "Bas\xE1\xF1ez MG et al. Effect of single-dose ivermectin on Onchocerca volvulus: a systematic review\
+      \ and meta-analysis. Lancet Infect Dis 2008"
+    location: Results, microfilaricidal effect (location uncertain)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+open_questions:
+- id: Q1
+  question: What is the ratio r_b / r_a of biannual to annual relative reduction in mf person-years over a 2-year
+    window at about 75% coverage? Above about 1.83, upgrading high-prevalence units beats spreading annual treatment
+    to more units; below it, spreading wins. No factorial or head-to-head trial reports this outcome directly.
+  beliefs:
+  - B1
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Does the US$3M budget bind? That depends on the total population of the 24 units. If annual treatment
+    for everyone fits with money left over, the leftover goes to biannual by descending inc.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Does the exogenous shadow price (6.5e-5 outcome per USD, derived from DALYs per mf person-year and a
+    1x GDP threshold) match the budget's real opportunity cost? If not, the paired tests that favour biannual say
+    nothing about the constrained allocation.
+  beliefs:
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: Does the 'inc' column measure skin-snip mf prevalence on the same estimand as the outcome (all-age mf-positive
+    person-time)? Is there any baseline (pre-2026) treatment coverage that the engine's M(baseline coverage) divides
+    out?
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Annual CDTI's relative reduction in mf person-years lies in 0.15-0.50 at most usable points.
+  test:
+    kind: effect_band
+    package: annual
+    band:
+    - 0.15
+    - 0.5
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Biannual CDTI's relative reduction in mf person-years lies in 0.30-0.70 at most usable points.
+  test:
+    kind: effect_band
+    package: biannual
+    band:
+    - 0.3
+    - 0.7
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: At the shadow price, biannual's net benefit exceeds annual's across the whole inc range.
+  test:
+    kind: paired_sign
+    a: biannual
+    b: annual
+    feature: inc
+    range:
+    - 0.1472
+    - 0.5999
+    sign: positive
+    min_share: 0.9
+- id: H4
+  belief: B4
+  claim: Annual's relative reduction does not vary with baseline prevalence (|rho| < 0.1).
+  test:
+    kind: effect_direction
+    package: annual
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: Biannual's relative reduction does not vary with vector density (|rho| < 0.1).
+  test:
+    kind: effect_direction
+    package: biannual
+    feature: vector_density
+    direction: negligible
+    equivalence: 0.1
+- id: H6
+  belief: B6
+  claim: At the shadow price, annual's net benefit exceeds no treatment's at essentially every point.
+  test:
+    kind: paired_sign
+    a: annual
+    b: none
+    feature: inc
+    range:
+    - 0.1472
+    - 0.5999
+    sign: positive
+    min_share: 0.95
