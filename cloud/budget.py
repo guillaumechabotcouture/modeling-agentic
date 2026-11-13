@@ -77,7 +77,7 @@ MAX_DAYS = 60
 CLOCK_SKEW_S = 30            # tolerated difference between this clock and Coiled's
 # VM types seen on our clusters' instance records (read-only check, 2026-11-11): every scheduler and keeper, the
 # P6 compute workers, and vm_job --cpu 32 / --cpu 64. vm_job sizes by --cpu, and Coiled picked Standard_D<cpu>_v5.
-OBSERVED_VM_TYPES = ("Standard_D2_v5", "Standard_E8s_v5", "Standard_D32_v5", "Standard_D64_v5")
+OBSERVED_VM_TYPES = ("Standard_D2_v5", "Standard_E8s_v5", "Standard_D32_v5", "Standard_D64_v5", "Standard_F8s_v2")
 ENDED = ("stopped", "error")
 FIELDS = ("scope", "usd", "start_utc", "note", "issued_utc", "expires_utc", "nonce", "prefixes",
           "floor_usd_per_instance_hour")
