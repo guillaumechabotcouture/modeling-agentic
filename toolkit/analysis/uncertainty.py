@@ -78,6 +78,10 @@ class Drawer:
         # joint calibration: its shared parameters are no longer free priors; with the calibration source they are
         # drawn from the region sample, without it they stay at the region's best point
         self.jc_names = set((A.joint or {}).get("shared") or [])
+        from toolkit.analysis import burden as BU      # F6 S2-5d review r1 P2-3: the anchors' external estimates
+        self.arng = np.random.default_rng([int(seed), BU.ANCHOR_STREAM]) if BU.ANCHOR_SOURCE in self.src else None
+        if self.arng is not None and getattr(A, "anchor", None) is None:
+            raise ValueError(f"uncertainty: source {BU.ANCHOR_SOURCE} is declared but the analysis has no anchor")
 
     def prepare(self, nd):
         from toolkit.analysis import calibration as C
@@ -149,6 +153,9 @@ class Drawer:
             cz = A.calibrate(theta, shifts)
             zs = {i: v[0] for i, v in cz.items()}
             self.last_clamped = sorted(i for i, v in cz.items() if v[1])   # Codex r2 P1-4: kept per draw
+        if self.arng is not None:
+            from toolkit.analysis import burden as BU
+            sampled.update(BU.draw_external(A.anchor, self.arng))
         return theta, zs, noise, mult, sampled
 
 
@@ -270,7 +277,7 @@ def _draw_rows(A, D, nd):
         D.last_clamped = []
         theta, zs, noise, mult, sampled = D.draw()
         clamped = list(D.last_clamped)
-        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
+        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=sampled)
         yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
                "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
 

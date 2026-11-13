@@ -305,7 +305,9 @@ def plan(spec) -> dict:
     cal = spec.raw["calibration"]
     moves = ([cal.get("attribute")] if cal.get("method") not in (None, "none") else []) + list(cal.get("parameters") or [])
     sources = []
-    for k, what in list(UNCERTAINTY_KINDS.items()) + [("priors", PRIORS_WHAT)]:
+    from toolkit.spec.schema import CONDITIONAL_KINDS
+    for k, what in list(UNCERTAINTY_KINDS.items()) + [("priors", PRIORS_WHAT)] + [
+            (c, w) for c, w in CONDITIONAL_KINDS.items() if c in inc or c in kex]:
         if k == "priors":
             declared = set(card["priors"]) | set(sp)
             st = "drawn" if dr else "excluded" if (k in kex or declared) else "none_declared"

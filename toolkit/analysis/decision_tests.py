@@ -92,6 +92,7 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
 PRIOR_RANGE_PREFIX = "prior_range_"
 FITTED_RANGE_PREFIX = "fitted_range_"
 SCENARIO_EXCLUDED_PREFIX = "scenario_excluded_"
+ANCHOR_RANGE_PREFIX = "anchor_range_"         # F6 S2-5d review r2: an anchor's external estimate at each interval end
 
 
 def prior_range_tests(A) -> list[dict]:
@@ -128,6 +129,13 @@ def prior_range_tests(A) -> list[dict]:
                         "values": [], "automatic": True, "reason": exc[q_.name],
                         "finding": f"decision_test:{SCENARIO_EXCLUDED_PREFIX}{q_.name}",
                         "text": f"Does the plan change with the scenario value {q_.name}?"})
+    for rid, a in sorted(((getattr(A, "anchor", None) or {}).get("rows") or {}).items()):
+        if a["lower"] is not None and a["upper"] > a["lower"]:
+            out.append({"id": f"{ANCHOR_RANGE_PREFIX}{rid}", "type": "anchor_range", "anchor": rid,
+                        "values": [float(a["lower"]), float(a["upper"])], "automatic": True,
+                        "finding": f"decision_test:{ANCHOR_RANGE_PREFIX}{rid}",
+                        "text": f"Does the plan change when the external {a['outcome']} estimate {rid} is at either end "
+                                "of its published interval?"})
     if A.method == "posterior":
         # v2d §3.2: a calibration parameter the data do not determine (prior-dominated or partly identified) gets the
         # same automatic test; the calibration is redone with the parameter held at each end of its declared range
@@ -211,6 +219,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             same_cost = all(abs(cost[i][k] - cost0[i][k]) <= 1e-9 * max(1.0, abs(cost0[i][k])) for i in A.ids for k in A.pk)
             lowers.append(same_cost and _lowers_only_unchosen(ben0, ben, plan))
             cases.append((v, ben, cost, None, None))
+    elif t == "anchor_range":
+        rid = dt["anchor"]
+        varied = f"the external estimate of anchor {rid} set to each end of its published interval"
+        cases, lowers = [], []
+        for v in dt["values"]:
+            _, ben, cost = A.evaluate(A.theta0, z0, sampled={f"anchor:{rid}": float(v)})
+            evs[v] = list(A.last_events)
+            cases.append((v, ben, cost, None, None))
+            lowers.append(False)
     elif t == "group_rule":
         from toolkit.analysis import variants as V
         a = copy.deepcopy(V.base_alloc(A))        # the signed rules; a headline variant's rule is joined below
