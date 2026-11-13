@@ -426,7 +426,7 @@ _UNDO: list = []
 def _toy_priors_file(d):
     """The chosen engine gets a priors file (an engine-side input the closure binds) for the row."""
     p = os.path.join(d, "toy_priors.yaml")
-    _fixture_write(d, "toy_priors.yaml", "priors: {}\n")
+    _fixture_write(d, "toy_priors.yaml", "priors: {}\nfixed: {base: toy, k: toy, noise: toy}\n")
     _UNDO.append(_patch_attr("priors_path", p))
 
 

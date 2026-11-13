@@ -620,72 +620,86 @@ def _engine_files(ref: str, cfg: dict) -> set:
     return {p for p in out if isinstance(p, str) and os.path.isfile(p)}
 
 
-def _execution_input_paths(run: dict, run_dir: str | None) -> list:
-    """The data files execution reads for this spec, from its own resolvers (Spec.resolve semantics: extensionless,
-    absolute and parent-relative paths included; outputs are never named here): the units table and every
-    calibration target table (toolkit/analysis/burden.py calibration_inputs), the joint calibration's tables
-    (joint_calibration.inputs), the burden reference file (burden.csv_path) and an estimates spec's generation
-    interval table. A resolver that cannot read its section is skipped only when the section is absent."""
+def _execution_input_paths(run: dict, run_dir: str | None) -> tuple:
+    """(paths, problems): the data files execution reads for this spec, each resolved independently with Spec.resolve
+    semantics (extensionless, absolute and parent-relative paths included; outputs are never named): the units table
+    (decision_units.csv, always), every calibration target table (toolkit/analysis/burden.py calibration_inputs,
+    when the calibration declares targets), the joint calibration's tables (joint_calibration.inputs, when declared),
+    the burden reference file (burden.csv_path, when declared) and an estimates spec's generation interval table. A
+    resolver that raises is a problem naming it (fail closed), never swallowed."""
     from toolkit.spec import schema
-    s = schema.Spec(run, run_dir or os.getcwd(), os.path.join(run_dir, "decision_spec.yaml") if run_dir else None)
-    out = []
-    try:
+    s_ = schema.Spec(run, run_dir or os.getcwd(), os.path.join(run_dir, "decision_spec.yaml") if run_dir else None)
+    paths, probs = [], []
+
+    def resolver(name, fn):
+        try:
+            paths.extend(p for p in fn() if isinstance(p, str) and p)
+        except Exception as e:  # noqa: BLE001 -- fail closed: an input that cannot be resolved is a refusal
+            probs.append(f"the input resolver {name} failed ({type(e).__name__}: {str(e)[:120]}): the run's input "
+                         "closure cannot be established")
+    if "decision_units" in run:
+        resolver("decision_units.csv", lambda: [s_.resolve(run["decision_units"]["csv"])])
+    cal = run.get("calibration") if isinstance(run.get("calibration"), dict) else {}
+    if "targets" in cal or "joint" in cal:
         from toolkit.analysis import burden as BV
-        out += [x["path"] for x in BV.calibration_inputs(s)]
-        if BV.section(s.raw) and BV.config(s).get("csv"):
-            out.append(BV.csv_path(s))
-    except (KeyError, TypeError, AttributeError):
-        pass
-    try:
+        resolver("burden.calibration_inputs", lambda: [x["path"] for x in BV.calibration_inputs(s_)])
+    if "joint" in cal:
         from toolkit.analysis import joint_calibration as JC
-        out += list(JC.inputs(s))
-    except (KeyError, TypeError, AttributeError):
-        pass
-    gi = ((run.get("dynamics") or {}).get("generation_interval") or {}) if isinstance(run.get("dynamics"), dict) else {}
-    if isinstance(gi, dict) and isinstance(gi.get("csv"), str):
-        out.append(s.resolve(gi["csv"]))
-    return sorted({p for p in out if isinstance(p, str) and p})
+        resolver("joint_calibration.inputs", lambda: list(JC.inputs(s_)))
+    if isinstance(run.get("validation"), dict) and "burden" in run["validation"]:
+        from toolkit.analysis import burden as BV
+        resolver("burden.csv_path", lambda: [BV.csv_path(s_)] if BV.config(s_).get("csv") else [])
+    if isinstance(run.get("dynamics"), dict) and "generation_interval" in run["dynamics"]:
+        gi = run["dynamics"]["generation_interval"]
+        resolver("dynamics.generation_interval.csv",
+                 lambda: [s_.resolve(gi["csv"])] if isinstance(gi, dict) and "csv" in gi else [])
+    return sorted(set(paths)), probs
 
 
-def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: list) -> dict:
-    """{"run:<path>" | "abs:<path>" | "tree:<path>": sha256} of every file the run reads for this spec: the spec; the
-    data files execution resolves as inputs (_execution_input_paths); the evidence dossier; the derivation record and
-    the outputs it lists; and each engine's files from the code tree (priors, fitted values, benchmark results and
-    pack, attribute binding, card, declarations). Recorded and checked for every signed run, whether or not it needs a
-    dossier; any change after signing makes it stale. An absent file is recorded as "absent"."""
+def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: list,
+                  owners: dict | None = None) -> tuple:
+    """(closure, problems). closure: {"run:<path relative to the run dir>" | "tree:<path>": sha256}
+    of every file the run reads for this spec: the spec; the data files execution resolves as inputs
+    (_execution_input_paths); the evidence dossier; the derivation record and the outputs it lists; and each
+    engine's files from the code tree (priors, fitted values, benchmark results and pack, attribute binding, card,
+    declarations). Run-side keys are relative to the run dir (a parent-relative input keeps a key such as
+    run:../shared/units.csv), so the same tree unpacked elsewhere matches. A
+    file absent is recorded as "absent". `owners`, when given, receives {tree key: [engine refs that read it]}."""
     out = {"run:decision_spec.yaml": sha(spec)}
+    paths, probs = _execution_input_paths(run, run_dir)
 
     def put(path):
-        rd = os.path.realpath(run_dir) if run_dir else None
-        rp = os.path.realpath(path) if os.path.isabs(path) or run_dir is None else os.path.realpath(path)
-        if rd and (rp == rd or rp.startswith(rd + os.sep)):
-            rel = os.path.relpath(rp, rd)
+        if run_dir is None and not os.path.isabs(path):
             try:
-                b = read(rel)
+                b_ = read(path)
             except ValueError:
-                b = None
-            out[f"run:{rel}"] = sha(b) if b is not None else "absent"
-        elif rd is None and not os.path.isabs(path):
+                b_ = None
+            out[f"run:{os.path.normpath(path)}"] = sha(b_) if b_ is not None else "absent"
+            return
+        ap = os.path.normpath(path if os.path.isabs(path) else os.path.join(run_dir, path))
+        rel = os.path.relpath(ap, os.path.normpath(run_dir))
+        if not rel.startswith(".."):
             try:
-                b = read(path)
+                b_ = read(rel)
             except ValueError:
-                b = None
-            out[f"run:{os.path.normpath(path)}"] = sha(b) if b is not None else "absent"
-        else:
-            try:
-                with open(rp, "rb") as f:
-                    out[f"abs:{rp}"] = hashlib.sha256(f.read()).hexdigest()
-            except OSError:
-                out[f"abs:{rp}"] = "absent"
-    for pth in _execution_input_paths(run, run_dir):
-        put(pth)
-    rel = dossier_reference(run)
-    if rel:
+                b_ = None
+            out[f"run:{rel}"] = sha(b_) if b_ is not None else "absent"
+            return
+        key = f"run:{rel}"           # relative to the run dir, wherever the tree is unpacked
         try:
-            b = read(rel)
+            with open(ap, "rb") as f:
+                out[key] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            out[key] = "absent"
+    for pth in paths:
+        put(pth)
+    rel_ = dossier_reference(run)
+    if rel_:
+        try:
+            b_ = read(rel_)
         except ValueError:
-            b = None
-        out[f"run:{rel}"] = sha(b) if b is not None else "absent"
+            b_ = None
+        out[f"run:{rel_}"] = sha(b_) if b_ is not None else "absent"
     try:
         rec = read("data/derivations_record.json")
     except ValueError:
@@ -699,34 +713,43 @@ def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: li
         for e in derivs.values() if isinstance(derivs, dict) else []:
             for o in ((e or {}).get("outputs") or {}) if isinstance(e, dict) else {}:
                 try:
-                    b = read(str(o))
+                    b_ = read(str(o))
                 except ValueError:
-                    b = None
-                out[f"run:{o}"] = sha(b) if b is not None else "absent"
+                    b_ = None
+                out[f"run:{o}"] = sha(b_) if b_ is not None else "absent"
     root = os.path.realpath(ROOT)
     for ref, cfg in engines:
         try:
             files = _engine_files(ref, cfg)
         except Exception as e:  # noqa: BLE001
-            out[f"tree:<{ref}>"] = f"unreadable: {type(e).__name__}"
+            probs.append(f"the engine files of {ref} cannot be resolved ({type(e).__name__}: {e})")
             continue
         for p_ in sorted(files):
             rp = os.path.realpath(p_)
             key = "tree:" + (os.path.relpath(rp, root) if rp.startswith(root + os.sep) else rp)
             with open(rp, "rb") as f:
                 out[key] = hashlib.sha256(f.read()).hexdigest()
-    return dict(sorted(out.items()))
+            if owners is not None:
+                owners.setdefault(key, [])
+                if ref not in owners[key]:
+                    owners[key].append(ref)
+    return dict(sorted(out.items())), probs
 
 
-def _closure_changes(signed: dict, current: dict) -> list:
-    """The closure members that changed since signing. Run data must match exactly (a member added, removed or
-    changed). Engine files follow the subset rule of the required inputs: after ENGINE_CHOICE the files of an engine
-    not chosen are not 'deleted'; a current engine file must be one signed, unchanged."""
+def _closure_changes(signed: dict, current: dict, owners: dict | None = None, engines_now=None) -> list:
+    """The closure members that changed since `signed` (a sign-off record's or the sheet's closure). Run data must
+    match exactly: a member added, removed or changed. Engine files follow the subset rule of the required inputs,
+    narrowly: a file signed and now missing is exempt only when every engine that read it (`owners`) is one not
+    chosen now (`engines_now`); a missing file of a chosen engine, a changed file, or a file not signed is a change."""
+    owners = owners if isinstance(owners, dict) else {}
+    now = set(engines_now or [])
     out = []
     for k in sorted(set(signed) | set(current)):
-        if k.startswith("tree:"):
-            if k in current and signed.get(k) != current[k]:
-                out.append(k)
+        if k.startswith("tree:") and k not in current:
+            own = owners.get(k) or []
+            if own and not (set(own) & now):
+                continue                    # exclusively an engine not chosen: not deleted
+            out.append(k)
         elif signed.get(k) != current.get(k):
             out.append(k)
     return out
@@ -890,11 +913,14 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
     # fitted values, benchmarks, card, declarations) are bound when the evidence is attested against them (needed); a
     # run that attests none keeps the analysis's own provenance check of those files (benchmark_sources: refit
     # required) as their guard.
-    closure = input_closure(run, spec, read, run_dir, engines if needed else [])
+    owners: dict = {}
+    closure, cprobs = input_closure(run, spec, read, run_dir, engines if needed else [], owners)
+    coverage += cprobs
+    engines_now = {ref for ref, _ in engines}
     binding = {"files": {rel: sha(data) if data is not None else None} if rel else {},
                "record": {"required": sorted(req), "dossier": rel,
                           "sha256": sha(data) if rel and data is not None else None, "declarations": decls,
-                          "closure": closure}}
+                          "closure": closure, "closure_owners": owners}}
     bind_probs, unsigned, changed = [], [], []
     if needed and require_sheet:
         src = _sheet_sources((get(SHEET) or b"").decode("utf-8", "replace"))
@@ -908,9 +934,15 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
             if src.get("evidence_dossier_sha256") != sha(data):
                 bind_probs.append("the sign-off sheet was generated from another evidence dossier (it is stale): "
                                   "regenerate it and read it again")
-            if src.get("input_closure_sha256") != closure_digest(closure):
+            sheet_cl = src.get("input_closure")
+            if isinstance(sheet_cl, dict):      # the sheet's closure is the signed superset: the same subset rule
+                stale = _closure_changes(sheet_cl, closure, src.get("input_closure_owners"), engines_now)
+            else:
+                stale = [] if src.get("input_closure_sha256") == closure_digest(closure) else ["(digest)"]
+            if stale:
                 bind_probs.append("the sign-off sheet was generated from other inputs (its input closure differs from "
-                                  "the files the run reads now): regenerate it and read it again")
+                                  "the files the run reads now: " + ", ".join(stale[:6]) + "): regenerate it and read "
+                                  "it again")
     if not signing:
         rec = record
         if rec is None:
@@ -957,7 +989,7 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
                         coverage.append(f"the decision-input declaration of {ref} changed since signing (its content "
                                         "sha256 differs): re-sign the spec with the dossier checked against it")
                 signed_cl = ev.get("closure") if isinstance(ev.get("closure"), dict) else {}
-                diff = _closure_changes(signed_cl, closure)
+                diff = _closure_changes(signed_cl, closure, ev.get("closure_owners"), engines_now)
                 if diff:
                     changed.append("the run's inputs changed since signing (input closure): " + ", ".join(diff[:8])
                                    + (f" and {len(diff) - 8} more" if len(diff) > 8 else ""))

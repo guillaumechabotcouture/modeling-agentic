@@ -370,12 +370,14 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     # #218 round 5: the input closure the signature will bind, recorded on the sheet (the files listed, its digest)
     st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
     closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
+    owners = ((st_.get("binding") or {}).get("record") or {}).get("closure_owners") or {}
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
                  burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "evidence_dossier_sha256": esha,
                       "input_closure_sha256": ED.closure_digest(closure),
+                      "input_closure": closure, "input_closure_owners": owners,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
