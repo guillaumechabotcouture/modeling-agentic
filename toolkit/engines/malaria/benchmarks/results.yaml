@@ -1,9 +1,9 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: malaria-starsim
-  version: '0.16'
-  code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
-  params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
+  version: '0.17'
+  code_sha256: 712a8ad1f7ecc9ca97eb47f31fcbb4f87a4698e5555c370811e278b09dc2e304
+  params_sha256: 74405a6e6598728cdeb90ff7e0fd5698accc9aa02cf8f30c30c9b3b62559fc15
   config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
 benchmarks:
 - id: B7
@@ -686,6 +686,91 @@ summary:
     band_mis_based: 1
   held_out_in_band: 9
   held_out_total: 12
-engine_version: '0.16'
+engine_version: '0.17'
 fit_rule: joint-v1
 wall_s: 1072.1
+restamped:
+  by: toolkit/engines/malaria/benchmarks/restamp_proof.py (byte-identity proof, not recomputed)
+  proof: toolkit/engines/malaria/benchmarks/restamp_proof.yaml
+  proof_identical: true
+  scope:
+    pack_settings:
+    - benin
+    - ce_ref
+    - ce_res
+    - cochrane_itn
+    - eir_1
+    - eir_10
+    - eir_100
+    - eir_3
+    - eir_30
+    - eir_300
+    - irs_added
+    - misungwi
+    - muleba
+    - sahel_smc
+    pack_arms: every arm of each setting, in one run_batch per setting and seed
+    seeds:
+    - 11
+    n_agents: each setting's own (pack.yaml params; 5000 where set, else the card's 4000); equilibration 4000; guess
+      sensitivity the card's 4000
+    burnin_years: the card's (50), the pack's own
+    evidence_cases:
+    - - equilibration
+      - - 3.5
+        - base
+        - burnin_years: 50
+        - 1
+    - - equilibration
+      - - 28.0
+        - doubled
+        - burnin_years: 100
+        - 1
+    - - equilibration
+      - - 9.0
+        - guess_hi
+        - burnin_years: 50
+          init_eir_per_m0: 2.4
+        - 2
+    - - guess_sensitivity
+      - - 3.5
+        - x1
+        - 1
+        - 50
+    - - guess_sensitivity
+      - - 28.0
+        - x0.25
+        - 2
+        - 50
+    scenarios:
+      gc7_delivery_routine: 4 members, seed 21, delivery [2024.0, 2027.0]
+      boundaries: 3 members, seed 22, delivery [2024.0, 2025.0]
+      heterogeneous: 5 members, seed 23, delivery None
+      empty_history_v010: 4 members, seed 24, delivery [2024.0, 2026.0]
+      past_smc_v013: 5 members, seed 25, delivery [2024.0, 2026.0]
+    not_repeated: calibration-grid runs (same code path at other attribute values)
+    compared: per_capita, windows, cost_drivers and meta (minus wall-clock seconds) exactly as JSON; initial-state
+      dicts exactly
+    added_window_metrics:
+    - severe_u5
+    - severe_5_14
+    - severe_15p
+    - severe_all
+    - deaths_u5
+    - deaths_5_14
+    - deaths_15p
+    - deaths_all
+  old_engine_version: '0.16'
+  proof_script_commit: b2bc503240a5d186690b4b35f80193ea38559352
+  note: the numbers in this file were computed by the old code; the proof shows the new code gives identical outputs
+    on these inputs. A Coiled pack run (validate_once.sh) is to confirm it; until it has run, the confirmation below
+    is pending.
+  confirmation:
+    validate_once: pending
+    evidence: null
+  old_identity:
+    name: malaria-starsim
+    version: '0.16'
+    code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
+    params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
+    config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
