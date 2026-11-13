@@ -1,8 +1,10 @@
 Decision design principles (the owner's default for every run, 2026-11-12). Apply them when drafting a
 spec, choosing an engine, critiquing, planning or making fixes, and writing. A departure from any of them is
 declared in the spec with its reason, and the report repeats it; it is never silent. Where the harness cannot
-yet compute what a principle asks for, that is such a departure: the spec declares it, and a critic reports
-it as a declared limitation, never as a blocker a fix task is asked to resolve.
+yet compute what a principle asks for, that is such a departure. When the signed spec already declares it, a
+critic reports it as that declared limitation, not as a blocker a fix task is asked to resolve. When it is
+found only after sign-off and it bears on the decision, a critic raises it as a finding for the owner, since
+only the owner can amend the signed spec.
 
 0. Think from first principles, and keep thinking from first principles. Before choosing a method, a
    structure, an input or a fix, ask what the decision needs and what the evidence can support, and reason
@@ -18,8 +20,11 @@ it as a declared limitation, never as a blocker a fix task is asked to resolve.
 
 2. Reprogramming from the decision date. The comparator is the plan as currently funded. When the funded
    plan differs between units and the spec's comparator is a single package, declare the funded plan as a
-   fixed plan (a plan variant) and report the headline as the regret or the gain against it, saying which
-   claim is the headline. A no-action counterfactual is context only, never the headline. An action already
+   fixed plan (a plan variant). The headline compares the recommended plan with the funded plan, and names
+   both plans, the spending each is held to and whether outcomes are discounted. Use a computed claim for
+   that comparison; a harness figure that compares the funded plan with a different plan (for example the
+   unconstrained optimum, or the optimum at the funded plan's own cost) is reported as that comparison,
+   never as the headline. When no computed claim compares the two, the spec declares it as a limitation. A no-action counterfactual is context only, never the headline. An action already
    delivered before the decision date is a fixed input, not a decision: optimise only what remains.
 
 3. Anchor each part to its strongest evidence.
@@ -54,6 +59,6 @@ it as a declared limitation, never as a blocker a fix task is asked to resolve.
    options' separate intervals overlap: shared uncertainty can leave two options' intervals overlapping
    while one wins in every draw. Where the paired difference does not favour one option reliably, report a
    robust rule at the level that holds (a region, or an intervention component) and mark finer lists as
-   indicative. Give the regret against the funded plan. When the choice between options turns on price,
+   indicative. Give the regret against the funded plan, on the comparison principle 2 names. When the choice between options turns on price,
    report the price bracket the harness's price tests computed within which it flips, or that it was not
    computed; never interpolate a price that no computation produced.

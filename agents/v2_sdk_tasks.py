@@ -444,7 +444,8 @@ def _self_test() -> int:
     # Owner, 2026-11-12: the decision design principles are the default of every task (one file, the source of truth).
     try:
         ptxt = open(PRINCIPLES_FILE).read().strip()
-        every = {k: (ptxt in v) for k, v in PROMPTS.items()}
+        # As delivered: the templates hold the file with its braces doubled for .format().
+        every = {k: (ptxt in v.replace("{{", "{").replace("}}", "}")) for k, v in PROMPTS.items()}
         banned = [w for w in ("malaria", "nigeria", "lga", "pbo", "smc", "itn", "net ", "anopheles")
                   if w in ptxt.lower()]
         ok(len(ptxt) > 500 and all(every.values()),
