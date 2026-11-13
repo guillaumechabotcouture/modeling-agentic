@@ -1,0 +1,315 @@
+beliefs:
+- id: B1
+  mechanism: Point-of-care CRP testing in primary-care ARI consultations reduces antibiotic prescribing at the index
+    consultation by roughly a fifth (trial pooled RR ~0.78-0.79), without harm to recovery. Trials measured all
+    antibiotic prescribing for ARI, not 'inappropriate' prescribing; applying the RR to an inappropriate-prescribing
+    baseline assumes a proportional reduction (it may understate the effect on inappropriate prescriptions, since
+    CRP mainly removes prescriptions for low-CRP, likely viral, illness).
+  about:
+    package: crp
+  direction: reduces
+  magnitude:
+    band:
+    - 0.08
+    - 0.34
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Aabenhus R, Jensen JU, Jorgensen KJ, Hrobjartsson A, Bjerrum L. Biomarkers as point-of-care tests
+      to guide prescription of antibiotics in patients with acute respiratory infections in primary care. Cochrane
+      Database Syst Rev 2014
+    location: Summary of findings table 1 (CRP vs usual care, antibiotic prescribing at index consultation, RR 0.78,
+      95% CI 0.66-0.92)
+  - citation: Smedemark SA, Aabenhus R, Llor C, Fournaise A, Olsen O, Jorgensen KJ. Biomarkers as point-of-care
+      tests to guide prescription of antibiotics in people with acute respiratory infections in primary care. Cochrane
+      Database Syst Rev 2022
+    location: Summary of findings table 1 (RR ~0.79; exact CI not verified from memory)
+  - citation: 'Cals JWL, Butler CC, Hopstaken RM, Hood K, Dinant GJ. Effect of point of care testing for C reactive
+      protein and training in communication skills on antibiotic use in lower respiratory tract infections: cluster
+      randomised trial. BMJ 2009'
+    location: Results, antibiotic prescribing at index consultation by arm (table number not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: 'A delayed-prescribing strategy with patient information reduces antibiotic use: patients given a delayed
+    script fill it far less often than those given an immediate one (~30% vs ~90%). At clinic level the effect on
+    the prescribing outcome is diluted: it applies only to consultations where an immediate prescription would have
+    been written, it depends on clinician uptake, and whether a delayed script counts as a ''prescription'' depends
+    on the outcome definition (issued vs collected). The clinic-level relative reduction is therefore much smaller
+    than the per-patient effect and more uncertain than CRP''s.'
+  about:
+    package: delayed
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.55
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Spurling GKP, Del Mar CB, Dooley L, Foxlee R, Farley R. Delayed antibiotic prescriptions for respiratory
+      infections. Cochrane Database Syst Rev 2017
+    location: Abstract, main results (antibiotic use 31% delayed vs 93% immediate); Summary of findings table 1
+  - citation: 'Little P, Moore M, Kelly J, et al. Delayed antibiotic prescribing strategies for respiratory tract
+      infections in primary care: pragmatic, factorial, randomised controlled trial. BMJ 2014'
+    location: Results, antibiotic use by strategy (immediate ~97%, delayed strategies ~37%; table number not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: CRP and delayed prescribing act on partly overlapping consultations (the uncertain cases); the engine
+    combines them multiplicatively (independent action). Factorial trials of CRP with communication-skills training
+    found the combination reduced prescribing most, roughly consistent with multiplicative or mildly sub-multiplicative
+    action. No trial tested CRP with delayed prescribing, so the combined relative reduction is about 1-(1-rc)(1-rd).
+  about:
+    package: crp+delayed
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.65
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Little P, Stuart B, Francis N, et al. Effects of internet-based training on antibiotic prescribing
+      rates for acute respiratory-tract infections: a multinational, cluster, randomised, factorial, controlled
+      trial. Lancet 2013'
+    location: Results, prescribing by factorial arm (CRP, communication, both); table number not verified
+  - citation: 'Cals JWL, Butler CC, Hopstaken RM, Hood K, Dinant GJ. Effect of point of care testing for C reactive
+      protein and training in communication skills on antibiotic use in lower respiratory tract infections: cluster
+      randomised trial. BMJ 2009'
+    location: Results, factorial arms (table number not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'The relative reduction of a package does not depend on the clinic''s baseline inappropriate-prescribing
+    rate: the engine applies a fixed RR to the baseline, and the trials give no strong evidence of effect modification
+    by baseline prescribing (heterogeneity exists but is not clearly explained by it). So clinics are ranked by
+    absolute burden (rx_rate), not by a varying relative effect.'
+  about:
+    package: crp
+    feature: rx_rate
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Aabenhus R, Jensen JU, Jorgensen KJ, Hrobjartsson A, Bjerrum L. Biomarkers as point-of-care tests
+      to guide prescription of antibiotics in patients with acute respiratory infections in primary care. Cochrane
+      Database Syst Rev 2014
+    location: Results, heterogeneity and subgroup analyses (location not verified)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: DELAYED is cheap (0.40 USD per patient-year) against a baseline of ~0.2-0.6 inappropriate prescriptions
+    per patient-year, so it averts roughly 0.03-0.3 prescriptions per patient for 0.40 USD; at any plausible shadow
+    price it beats doing nothing in every clinic.
+  about:
+    pair:
+    - delayed
+    - none
+  direction: reduces
+  source_type: literature
+  evidence:
+  - citation: Spurling GKP, Del Mar CB, Dooley L, Foxlee R, Farley R. Delayed antibiotic prescriptions for respiratory
+      infections. Cochrane Database Syst Rev 2017
+    location: Abstract, main results
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'DELAYED dominates CRP alone: it costs ~4.5x less per patient and its clinic-level relative effect
+    is probably at least comparable to CRP''s (B1, B2). CRP alone wins only if its relative effect clearly exceeds
+    DELAYED''s and the shadow price is low enough to ignore the 1.40 USD price gap.'
+  about:
+    pair:
+    - crp
+    - delayed
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Spurling GKP, Del Mar CB, Dooley L, Foxlee R, Farley R. Delayed antibiotic prescriptions for respiratory
+      infections. Cochrane Database Syst Rev 2017
+    location: Summary of findings table 1
+  - citation: Aabenhus R, Jensen JU, Jorgensen KJ, Hrobjartsson A, Bjerrum L. Biomarkers as point-of-care tests
+      to guide prescription of antibiotics in patients with acute respiratory infections in primary care. Cochrane
+      Database Syst Rev 2014
+    location: Summary of findings table 1
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'Adding CRP on top of DELAYED averts rx_rate x (1-rd) x rc per patient for 1.80 USD: a smaller increment
+    than CRP alone because DELAYED has already removed part of the burden. Whether it pays at the shadow price depends
+    on the clinic''s baseline rate: it is most likely to pay in the highest-burden clinics, and if the budget binds
+    the CRP add-on is the margin, allocated in descending order of rx_rate. If the budget does not bind (plausible:
+    full CRP+DELAYED coverage ~2.20 USD per patient) CRP+DELAYED goes everywhere.'
+  about:
+    pair:
+    - crp+delayed
+    - delayed
+    feature: rx_rate
+  direction: flips
+  conditions:
+  - feature: rx_rate
+    range:
+    - 0.1908
+    - 0.5882
+  source_type: literature
+  evidence:
+  - citation: 'Little P, Stuart B, Francis N, et al. Effects of internet-based training on antibiotic prescribing
+      rates for acute respiratory-tract infections: a multinational, cluster, randomised, factorial, controlled
+      trial. Lancet 2013'
+    location: Results, prescribing by factorial arm (table number not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Does the outcome count delayed scripts as prescriptions (issued) or only collected/consumed antibiotics?
+    The trial effect of delayed prescribing is on consumption; on issued prescriptions it could be near zero. This
+    can reverse the DELAYED-first rule.
+  beliefs:
+  - B2
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Does the budget bind? Total registered population x 2.20 USD vs 1.5M USD. If it does not, the plan is
+    CRP+DELAYED everywhere and the ranking of clinics is irrelevant; the shadow price used in paired tests is then
+    a declared value, not a budget dual.
+  beliefs:
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Is the trial RR on all ARI prescribing transferable to 'inappropriate' prescribing (proportional), or
+    is the relative reduction on inappropriate prescriptions larger (CRP and delayed scripts target the low-yield
+    cases)?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q4
+  question: Is resp_share used by the engine at all (only baseline_rate is a declared unit attribute)? If the baseline
+    is rx_rate x resp_share rather than rx_rate, clinics are ranked differently.
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: true
+- id: Q5
+  question: Are CRP and delayed prescribing sub-multiplicative in practice (both act on the same uncertain consultations)?
+    No trial tested them together; strong overlap would shrink the CRP add-on and favour DELAYED alone.
+  beliefs:
+  - B3
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CRP alone reduces inappropriate prescriptions by 8-34% relative to none at >= 80% of design points (the
+    Cochrane 95% CI).
+  test:
+    kind: effect_band
+    package: crp
+    band:
+    - 0.08
+    - 0.34
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: DELAYED alone reduces inappropriate prescriptions by 15-55% relative to none at >= 70% of design points.
+  test:
+    kind: effect_band
+    package: delayed
+    band:
+    - 0.15
+    - 0.55
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: CRP+DELAYED reduces inappropriate prescriptions by 25-65% relative to none at >= 70% of design points.
+  test:
+    kind: effect_band
+    package: crp+delayed
+    band:
+    - 0.25
+    - 0.65
+    min_share: 0.7
+- id: H4
+  belief: B4
+  claim: CRP's relative reduction does not vary with the clinic's baseline rate (|rho| < 0.15).
+  test:
+    kind: effect_direction
+    package: crp
+    feature: rx_rate
+    direction: negligible
+    equivalence: 0.15
+- id: H5
+  belief: B5
+  claim: DELAYED beats none on net benefit at the shadow price at >= 90% of points across the whole rx_rate range.
+  test:
+    kind: paired_sign
+    a: delayed
+    b: none
+    feature: rx_rate
+    range:
+    - 0.1908
+    - 0.5882
+    sign: positive
+    min_share: 0.9
+- id: H6
+  belief: B6
+  claim: DELAYED beats CRP alone on net benefit at the shadow price at >= 75% of points across the rx_rate range.
+  test:
+    kind: paired_sign
+    a: delayed
+    b: crp
+    feature: rx_rate
+    range:
+    - 0.1908
+    - 0.5882
+    sign: positive
+    min_share: 0.75
+- id: H7
+  belief: B7
+  claim: In the highest-burden clinics (rx_rate >= 0.45) adding CRP to DELAYED pays at the shadow price at >= 60%
+    of points.
+  test:
+    kind: paired_sign
+    a: crp+delayed
+    b: delayed
+    feature: rx_rate
+    range:
+    - 0.45
+    - 0.5882
+    sign: positive
+    min_share: 0.6
