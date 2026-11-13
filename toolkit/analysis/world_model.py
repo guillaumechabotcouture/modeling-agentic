@@ -2446,6 +2446,60 @@ def _self_test() -> int:
            f"{tr['confirmed']} confirmed, {len(tr.get('unverified') or [])} unverified")
     tryit("WM66 imported history", wm66)
 
+    def wm88():
+        import yaml
+        from toolkit.analysis.artifacts import sha256
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis", "batch"))
+            res = os.path.join(d, "analysis", "batch", "results.jsonl")
+            open(res, "w").write("{}\n")
+            put = lambda at: yaml.safe_dump({"written_at": at, "inputs": {  # noqa: E731
+                "analysis/batch/results.jsonl": sha256(res)}}, open(os.path.join(d, "analysis", "batch.yaml"), "w"))
+            put("2026-01-01T00:00:00+00:00")
+            ok(evidence_time(d)[0] is None, "WM88 without a first-seen record of the results, the evidence is undated "
+                                            "(post hoc), whatever batch.yaml says")
+            record_first_seen(d, at="2026-01-01T00:00:00+00:00")       # the batch first appears in January
+            put("2026-03-01T00:00:00+00:00")                            # a March rerun reuses the cached results
+            record_first_seen(d, at="2026-03-01T00:00:00+00:00")       # ... and does not refresh the record
+            got = evidence_time(d)[0]
+            ok(got == "2026-01-01T00:00:00+00:00", "WM88b the evidence time is the first record of these results, "
+                                                   f"surviving a rerun on cached results: {got}")
+            rng = np.random.default_rng(1)
+            units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+            plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+            feb = "2026-02-01T00:00:00+00:00"            # registered (and pushed) between the two analyses
+            late = Sweep(sw.features, sw.packages, sw.comparator, sw.burden, sw.y, sw.cost, groups=sw.groups,
+                         points=sw.points, artifacts=sw.artifacts, lam=sw.lam, evidence_time=got, design=sw.design)
+            _, hy = build(_seed(), late, plan=plan, units=units, plan_time=got,
+                          registry=_anch(register(_seed(), [], at=feb), feb))
+            ok(all(h["confrontation"]["post_hoc"] for h in hy["hypotheses"]),
+               "WM88c a registration between two analyses that share cached results stays post hoc")
+    tryit("WM88 first availability", wm88)
+
+    def wm89():
+        x = np.arange(100.0)
+        cases = ((x, x, np.column_stack([2 * x]), "a covariate collinear with the feature"),
+                 (x, x, np.column_stack([x]), "self-adjustment"),
+                 (x, np.full(100, 0.3), np.column_stack([np.sin(x)]), "a constant response"),
+                 (x, x + np.sin(x), np.column_stack([np.sin(x), 2 * np.sin(x)]), "a rank-deficient covariate matrix"))
+        for xx, yy, cv, why in cases:
+            r = partial_direction(xx, yy, cv)
+            ok(r["direction"] == "inconclusive", f"WM89 an adjusted direction with {why} is inconclusive: {r}")
+    tryit("WM89 exhausted adjustments", wm89)
+
+    def wm90():
+        x = np.linspace(0, 1, 100)
+        base = _sw({"x": x}, 0.5 + 0 * x, 0.2 + 0 * x)
+        far = Sweep(base.features, base.packages, base.comparator, base.burden, base.y,
+                    dict(base.cost, B=np.where(x > 0.5, 1e9, 1.0)), groups=base.groups, points=base.points,
+                    artifacts=base.artifacts, lam=base.lam, evidence_time=EVIDENCE_TIME, design=base.design)
+        t = {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0.0, 0.5], "sign": "positive",
+             "min_share": 0.8}
+        e1, e2 = evidence_of(t, {"sweep": base}), evidence_of(t, {"sweep": far})
+        ok(e1 != e2, "WM90 a paired test's evidence identity includes the tie tolerance (an out-of-region outlier that "
+                     "changes it is new evidence)")
+    tryit("WM90 tie tolerance in evidence", wm90)
+
     def wm67():
         rng = np.random.default_rng(1)
         units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
