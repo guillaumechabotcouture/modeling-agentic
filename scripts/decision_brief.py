@@ -476,6 +476,10 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         # sign does, and refuses the same)
         from toolkit.spec import signoff as SO
         SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
+        from toolkit.spec import preconditions as PC      # every signing path checks the spec's preconditions (#215)
+        pre = PC.problems(run_dir, captured[DECISION_SPEC], by)
+        if pre:
+            raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence

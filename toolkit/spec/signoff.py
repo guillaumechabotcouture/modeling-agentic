@@ -220,6 +220,10 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
+    if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
+        from toolkit.spec import preconditions as PC
+        errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
+                for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -393,6 +397,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
+    from toolkit.engines import benchmark_coverage as BC
+    out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
