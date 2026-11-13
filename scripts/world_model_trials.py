@@ -1091,7 +1091,10 @@ def summary_md(S) -> str:
          "Verdicts are the world model build's own (toolkit/analysis/world_model.py). Post hoc means not anchored "
          "in remote git before the evidence existed; post-hoc results are not in the confirmation shares. "
          "Circular means the verdict is fixed by a spec input (analysis/circular.json): reported, never a confirmation, never moving confidence. "
-         f"Circular tests: {o['hypotheses']['circular']} of {o['hypotheses']['written']}.", "",
+         f"Circular tests: {o['hypotheses']['circular']} of {o['hypotheses']['written']}. "
+         f"Literature citations looked up (questions run with the check: {o['citations']['questions_checked']}): "
+         f"{o['citations']['found']} found, {o['citations']['not_found']} not found (their beliefs set to low "
+         f"confidence), {o['citations']['lookup_failed']} lookups failed.", "",
          "## Per question", "",
          "| Question | Engine | Status | Written | Testable | Supported | Refuted | Inconclusive | Untestable | "
          "Circular | Post hoc | Repairs | Spend (USD) |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -1611,6 +1614,12 @@ def _self_test() -> int:
             ok(not leaked and ctx.get("datasets") and all("columns" in x and "rows" not in x for x in ctx["datasets"]),
                f"WT10b no input data value is in the seed context (datasets by file and column only): leaked "
                f"{leaked[:5]}, datasets {ctx.get('datasets')}")
+            # batch 2 (2026-11-13): template shadow prices were placed between the options' simulated
+            # cost-effectiveness, so the value would carry the simulation into the seed: it is withheld
+            ok("0.1" not in json.dumps(ctx["sweep"].get("shadow_price")) and ctx["sweep"].get("paired_tests") ==
+               "testable" and isinstance(ctx["sweep"].get("shadow_price"), str),
+               f"WT10d the shadow price's value is withheld from the seed (paired tests are said to be testable): "
+               f"{ctx['sweep'].get('shadow_price')!r}, {ctx['sweep'].get('paired_tests')!r}")
             got = {p: _seed_read_denied("Read", {"file_path": p}, rd) for p in
                    ("decision_spec.yaml", "units.csv", "_task_input.json", "world_model_seed.yaml",
                     os.path.join(REPO, "data", "world_model_trials", "tb_acf", "decision_spec.yaml"),
