@@ -1,0 +1,111 @@
+# World model v0 (seed), written before any simulation, from literature and reasoning only.
+# Decision: one package per district (10 districts), 2026-2028, budget US$17.0M, comparator "none"
+# (2022 nets expired, so no ITN/IRS/SMC is the funded-plan counterfactual here), outcome clinical cases averted.
+# Benefit per district = baseline incidence (inc_none) x population x relative reduction of the package;
+# the engine applies multiplicative relative effects, so relative reductions do not depend on inc_none and
+# the ranking of districts is driven by baseline burden, the ranking of packages by relative effect vs price.
+beliefs:
+  - id: B1
+    mechanism: "ITN mass campaign reduces clinical malaria incidence against no nets (trial rate ratio ~0.55 for uncomplicated episodes); a single campaign decays over 3 years, so the plan-average reduction is somewhat below the trial value"
+    about: {package: itn}
+    direction: reduces
+    magnitude: {band: [0.25, 0.55], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database Syst Rev 2018; CD000363", location: "Summary of findings 1 (ITN vs no nets, uncomplicated episodes rate ratio about 0.55); exact CI not recalled"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: "The engine's ITN reduction is monotone in its ITN log rate ratio: a larger (less negative) lrr gives a smaller reduction"
+    about: {package: itn, feature: "lrr:itn:cases"}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "Engine card (package_rate): rate = baseline x M(package), M a product of component RRs; structural, no external table", location: "engine mechanisms, _task_input.json card (structural reasoning, not a data value)"}
+    confidence: high
+  - id: B3
+    mechanism: "Adding IRS to ITN gives a small, uncertain extra reduction (sub-multiplicative interaction); IRS is the most expensive component per person, so ITN alone beats ITN+IRS at the budget's shadow price almost everywhere"
+    about: {pair: [itn, itn+irs]}
+    direction: none
+    source_type: literature
+    evidence:
+      - {citation: "Pryce J, Medley N, Choi L. Indoor residual spraying for preventing malaria in communities using insecticide-treated nets. Cochrane Database Syst Rev 2022; CD012688", location: "Summary of findings (IRS+ITN vs ITN alone, malaria incidence: little or no clear benefit, wide CI); values not recalled precisely"}
+      - {citation: "Pluess B, Tanser FC, Lengeler C, Sharp BL. Indoor residual spraying for preventing malaria. Cochrane Database Syst Rev 2010; CD006657", location: "Main results (IRS vs no IRS, incidence reductions in stable transmission settings); values not recalled precisely"}
+    confidence: medium
+    decision_relevant: true
+  - id: B4
+    mechanism: "ITN+IRS together reduce cases more than ITN alone but much less than the product of separate effects (declared interaction); combined reduction roughly 35-70%"
+    about: {package: itn+irs}
+    direction: reduces
+    magnitude: {band: [0.35, 0.7], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Pryce J, Medley N, Choi L. Cochrane Database Syst Rev 2022; CD012688", location: "Summary of findings; values not recalled precisely"}
+    confidence: low
+  - id: B5
+    mechanism: "ITN averts enough cases per dollar to beat no action where baseline incidence is moderate or high; at the lowest baselines cost can exceed the value at the shadow price"
+    about: {pair: [itn, none], feature: inc_none}
+    direction: flips
+    conditions: [{feature: inc_none, range: [0.06, 0.25]}]
+    source_type: literature
+    evidence:
+      - {citation: "Pryce J, Richardson M, Lengeler C. Cochrane Database Syst Rev 2018; CD000363", location: "Summary of findings 1 (effect size); cost reasoning from typical net + distribution cost of a few US$ per person, not a sourced table"}
+    confidence: low
+    decision_relevant: true
+  - id: B6
+    mechanism: "ITN dominates none at high baseline incidence: benefit scales with inc_none while cost does not"
+    about: {pair: [itn, none], feature: inc_none}
+    direction: none
+    conditions: [{feature: inc_none, range: [0.3, 0.69]}]
+    source_type: literature
+    evidence:
+      - {citation: "Pryce J, Richardson M, Lengeler C. Cochrane Database Syst Rev 2018; CD000363", location: "Summary of findings 1"}
+    confidence: medium
+    decision_relevant: true
+  - id: B7
+    mechanism: "SMC protects children 3-59 months (~75% reduction in clinical malaria during the season in trials); children are a minority of the population but carry a large share of clinical cases, so adding SMC to ITN raises the whole-population reduction by roughly 10-25 points in eligible districts"
+    about: {package: itn+smc}
+    direction: reduces
+    magnitude: {band: [0.4, 0.75], scale: relative_reduction}
+    conditions: [{feature: smc_eligible, range: [1.0, 1.0]}]
+    source_type: literature
+    evidence:
+      - {citation: "Meremikwu MM, Donegan S, Sinclair D, Esu E, Oringanje C. Intermittent preventive treatment for malaria in children living in areas with seasonal transmission. Cochrane Database Syst Rev 2012; CD003756", location: "Summary of findings (clinical malaria rate ratio about 0.26 in under-5s); population share of cases not from this source"}
+      - {citation: "ACCESS-SMC Partnership. Effectiveness of seasonal malaria chemoprevention at scale in west and central Africa. Lancet 2020;396:1829-40", location: "Results (effectiveness in routine delivery); values not recalled precisely"}
+    confidence: low
+    decision_relevant: true
+open_questions:
+  - {id: Q1, question: "What are the per-person plan costs of ITN, IRS and SMC relative to each other? The ITN vs ITN+IRS and ITN vs ITN+SMC choices turn on price, and the budget may not cover ITN everywhere.", beliefs: [B3, B5, B7], decision_relevant: true}
+  - {id: Q2, question: "Does the programme history support effects as large as the trials (the question asks to estimate effects from history)? Engine uses trial priors with no calibration, a declared departure.", beliefs: [B1, B4, B7], decision_relevant: true}
+  - {id: Q3, question: "What share of clinical cases falls in the SMC-eligible child population (smc_pop vs pop) and how seasonal is transmission? This sets the population-level SMC increment.", beliefs: [B7], decision_relevant: true}
+  - {id: Q4, question: "How fast do the campaign nets lose effect over 2026-2028 (attrition, insecticide decay)? A faster decay shrinks the ITN reduction and moves the ITN/none flip to higher incidence.", beliefs: [B1, B5], decision_relevant: true}
+  - {id: Q5, question: "Is the budget binding (shadow price 0.05 given) such that low-burden districts get none; is the comparator correctly 'none' rather than a funded plan?", beliefs: [B5, B6], decision_relevant: true}
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "ITN alone reduces cases by 25-55% at most design points"
+    test: {kind: effect_band, package: itn, band: [0.25, 0.55], min_share: 0.8}
+  - id: H2
+    belief: B2
+    claim: "ITN relative reduction falls as lrr:itn:cases rises (less protective trial prior)"
+    test: {kind: effect_direction, package: itn, feature: "lrr:itn:cases", direction: decreases}
+  - id: H3
+    belief: B3
+    claim: "ITN alone has higher net benefit than ITN+IRS at the shadow price across the incidence range"
+    test: {kind: paired_sign, a: itn, b: itn+irs, feature: inc_none, range: [0.06, 0.69], sign: positive, min_share: 0.7}
+  - id: H4
+    belief: B4
+    claim: "ITN+IRS reduces cases by 35-70% at most points"
+    test: {kind: effect_band, package: itn+irs, band: [0.35, 0.7], min_share: 0.8}
+  - id: H5
+    belief: B5
+    claim: "The ITN vs none transition along inc_none lies at low baseline incidence (0.06-0.25)"
+    test: {kind: flip_in, a: itn, b: none, feature: inc_none, range: [0.06, 0.25]}
+  - id: H6
+    belief: B6
+    claim: "At inc_none 0.3-0.69, ITN beats none at the shadow price in at least 90% of points"
+    test: {kind: paired_sign, a: itn, b: none, feature: inc_none, range: [0.3, 0.69], sign: positive, min_share: 0.9}
+  - id: H7
+    belief: B7
+    claim: "In SMC-eligible districts ITN+SMC reduces cases by 40-75%"
+    test: {kind: effect_band, package: itn+smc, band: [0.4, 0.75], min_share: 0.8, where: {smc_eligible: [1.0, 1.0]}}
