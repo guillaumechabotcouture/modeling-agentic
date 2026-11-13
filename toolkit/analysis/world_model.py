@@ -5,14 +5,25 @@ its numbers are bands and rough locations, never decision numbers (those come fr
 throughout: absence of evidence, weak evidence or too few usable points is `inconclusive`, never `supported`.
 
     python3 toolkit/analysis/world_model.py validate <seed.yaml>
-    python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml> [--out DIR]
-        [--engine-identity current|recorded] [--shadow-price LAMBDA]
+    python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml or a world_model.yaml> [--out DIR]
+        [--hypotheses hypotheses.yaml] [--engine-identity current|recorded] [--shadow-price LAMBDA]
     python3 toolkit/analysis/world_model.py --self-test
 
-NOT YET FOR USE IN A RUN: the simulation-derived beliefs this version writes are marginal associations, unscreened
-for multiple testing across package x feature x pair (`screened: false`). They must not seed or update a world model
-until the follow-up (multiplicity control, marginal labels, track-record identity, pre-registration) lands. Nothing
-is wired into the analysis or the stage machine. No LLM calls.
+Simulation beliefs are screened: every direction (package x feature) and flip (pair x feature) of the summary is one
+test in a Benjamini-Hochberg false-discovery control (q 0.05; the number tested is reported), and only discoveries
+become beliefs. They are marginal associations (`scope: marginal`, with the design features each is correlated
+with), not mechanisms: a hypothesis claims a conditional mechanism by default (`scope: conditional`), and a feature
+correlated (|rho| >= 0.5) with another in the tested points makes its direction or flip test inconclusive, never
+supported or refuted. Pre-registered hypotheses are single tests and are not corrected.
+
+Track record: each confrontation is identified by (sha256 of the test, sha256 of the evidence: the sweep tables or
+the plan). A replay or an alias of a confrontation already recorded counts once and moves no confidence; counters are
+recomputed from the history, never taken from the seed (`reconciled` records a difference). A hypothesis counts only
+if `registered_at` (ISO 8601 with a time zone) is before the evidence existed (the analysis manifest's finished_at,
+or point.yaml's written_at for plan tests); otherwise it is `post_hoc`, reported separately and never in the share
+confirmed. A produced world model can seed the next build: its simulation beliefs are replaced (`version`,
+`superseded_simulation`), literature and data beliefs kept, and hypotheses reloaded with --hypotheses. Ids starting
+`sim.` are reserved for generated beliefs. Nothing is wired into the analysis or the stage machine. No LLM calls.
 
 Seed (YAML), and the beliefs of analysis/world_model.yaml:
 
@@ -29,7 +40,7 @@ Seed (YAML), and the beliefs of analysis/world_model.yaml:
         confidence: low | medium | high
         decision_relevant: true   # optional
     hypotheses:                   # analysis/hypotheses.yaml: testable expectations with a refutation test
-      - {id: H1, belief: B1, claim: "...", test: {kind: ..., ...}}
+      - {id: H1, belief: B1, claim: "...", registered_at: "2026-11-12T09:00:00+00:00", test: {kind: ..., scope: ...}}
     open_questions: [{id, question, beliefs: [...], decision_relevant}]
 
 Tests (each declares its pass threshold; a test must concern its belief's package, pair, feature and conditions):
@@ -51,7 +62,9 @@ Statuses: open (not yet checked), supported, refuted, inconclusive, untestable.
 The comparison measure is net benefit per person at the budget's shadow price, dfac x (burden - outcome) - lambda x
 (cost - comparator cost): ranking by benefit per cost misranks options of different cost under a budget. lambda is
 `--shadow-price`, else the cost-effectiveness of the marginal funded package of the point plan (the least
-benefit / cost among units given a package, analysis/point.yaml), else none (paired tests untestable).
+benefit / cost among units given a package, analysis/point.yaml), else none (paired tests untestable). That
+estimate is an upper bound on the dual of the budget row: a lower lambda favours the costlier option, so a paired
+test or flip between options of different cost can move with it (the value used is in every result).
 
 Fail closed: a belief without evidence, a hypothesis without a refutation test or threshold, a non-finite value,
 a missing artifact, a result row not bound to its job (job_sha) and the expected engine identity.
@@ -84,7 +97,8 @@ TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("
 # and a one-feature logistic fit gaining >= 6.63 in deviance (chi-square 1 df, p 0.01). Its range is the fit's 25-75%
 # transition widened to the nearest sampled points on either side. At most 3 features are displayed per pair.
 SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
-            "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3}
+            "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3,
+            "fdr_q": 0.05, "correlated": 0.5}
 
 
 class WorldModelError(ValueError):
@@ -97,7 +111,7 @@ class Sweep:
     person}, the shadow price `lam` (outcome per $) and its source, and the artifacts they came from."""
 
     def __init__(self, features, packages, comparator, burden, y, cost, groups=None, points=None, kinds=None,
-                 artifacts=None, lam=None, lam_source=None, dfac=1.0):
+                 artifacts=None, lam=None, lam_source=None, dfac=1.0, evidence_time=None):
         self.features = {k: np.asarray(v, float) for k, v in features.items()}
         self.packages, self.comparator = {k: sorted(v) for k, v in packages.items()}, comparator
         self.burden = np.asarray(burden, float)
@@ -114,6 +128,13 @@ class Sweep:
                if len(v) != len(self.points) or not np.all(np.isfinite(v))]
         if bad or (lam is not None and not (isinstance(lam, (int, float)) and math.isfinite(lam) and lam >= 0)):
             raise WorldModelError(f"sweep: non-finite or misaligned values in {bad[:4]} or shadow price {lam!r}")
+        import hashlib
+        h = hashlib.sha256(json.dumps([self.points, self.comparator, self.packages, lam, self.dfac],
+                                      sort_keys=True, default=str).encode())
+        for d_ in (self.features, self.y, self.cost, {"burden": self.burden}):
+            for k in sorted(d_):
+                h.update(k.encode() + d_[k].tobytes())
+        self.evidence_sha, self.evidence_time = h.hexdigest(), evidence_time      # what a confrontation checked
 
     def reduction(self, p):
         """Relative reduction against the comparator; undefined (nan) where the baseline burden is not positive."""
@@ -145,6 +166,21 @@ def _band_ok(b):
 
 def _disjoint(a, b):
     return a[1] < b[0] or b[1] < a[0]
+
+
+def _when(x):
+    """An aware datetime from an ISO 8601 string with a time zone, else None."""
+    import datetime as dt
+    try:
+        v = dt.datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return v if v.tzinfo is not None else None
+
+
+def _sha(x):
+    import hashlib
+    return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- seed validation
@@ -201,6 +237,8 @@ def validate_seed(seed) -> dict:
         ids.add(bid)
         by[bid] = b
         w = f"belief {bid}"
+        if str(bid).startswith("sim."):
+            errs.append(f"{w}: the sim. prefix is reserved for generated simulation beliefs")
         if not str(b.get("mechanism") or "").strip():
             errs.append(f"{w}: mechanism (what causes what)")
         if not isinstance(b.get("about"), dict) or not b["about"]:
@@ -238,6 +276,8 @@ def validate_seed(seed) -> dict:
             errs.append(f"{w}: claim")
         if h.get("status", "open") not in STATUSES:
             errs.append(f"{w}: status one of {STATUSES}")
+        if h.get("registered_at") is not None and _when(h["registered_at"]) is None:
+            errs.append(f"{w}: registered_at an ISO 8601 time with a time zone")
         t = h.get("test")
         if not isinstance(t, dict) or t.get("kind") not in TESTS:
             errs.append(f"{w}: a machine-checkable refutation test, kind one of {sorted(TESTS)}")
@@ -256,6 +296,8 @@ def validate_seed(seed) -> dict:
         lo_share = 0.0 if t["kind"] == "plan_share" else 0.5
         if "min_share" in TESTS[t["kind"]] and not (_num(t["min_share"]) and lo_share < t["min_share"] <= 1):
             errs.append(f"{w}: min_share a number in ({lo_share}, 1]")
+        if t.get("scope", "conditional") not in ("conditional", "marginal"):
+            errs.append(f"{w}: scope conditional or marginal")
         if t["kind"] == "paired_sign" and t.get("sign") not in ("positive", "negative"):
             errs.append(f"{w}: sign positive or negative")
         if t["kind"] == "effect_direction":
@@ -291,7 +333,8 @@ def direction(x, y, equivalence=None):
     rmin = SETTINGS["rho_min"]
     d = "increases" if lo > 0 and rho >= rmin else "decreases" if hi < 0 and rho <= -rmin \
         else "negligible" if equivalence is not None and -equivalence <= lo and hi <= equivalence else "inconclusive"
-    return {"direction": d, "rho": _r(rho), "ci": [_r(lo), _r(hi)], "n": n}
+    return {"direction": d, "rho": _r(rho), "ci": [_r(lo), _r(hi)], "n": n,
+            "p": _r(math.erfc(abs(zr) / se / math.sqrt(2)))}
 
 
 def _logistic(x, s, lam=1e-2):
@@ -319,6 +362,7 @@ def flip_along(sw, a, b, f, mask=None):
     """Roughly where the choice between a and b flips along feature f, on the points in `mask` (a one-feature,
     marginal fit). status: flip, or why there is none to report (insufficient, one_sided, undefined, non_monotone,
     no_flip_detected); points: the ids used."""
+    from scipy.stats import chi2
     d, tol = sw.diff(a, b)
     m = np.ones(len(d), bool) if mask is None else mask
     win, lose = m & (d > tol), m & (d < -tol)
@@ -341,13 +385,13 @@ def flip_along(sw, a, b, f, mask=None):
     dev, t, b1 = _logistic(x, s)
     lo, hi = float(x.min()), float(x.max())
     if not (dev >= SETTINGS["flip_deviance_min"] and math.isfinite(t) and lo <= t <= hi):
-        return dict(out, status="no_flip_detected", deviance_gain=_r(dev))
+        return dict(out, status="no_flip_detected", deviance_gain=_r(dev), p=_r(chi2.sf(max(dev, 0.0), 1)))
     h = math.log(3) / abs(b1)
     below, above = x[x <= t], x[x >= t]
     rlo = min(t - h, float(below.max()) if len(below) else lo)      # widened to the nearest sampled points
     rhi = max(t + h, float(above.min()) if len(above) else hi)
     return dict(out, status="flip", at=_r(t), range=[_r(max(lo, rlo)), _r(min(hi, rhi))],
-                first_preferred_below=bool(b1 < 0), deviance_gain=_r(dev))
+                first_preferred_below=bool(b1 < 0), deviance_gain=_r(dev), p=_r(chi2.sf(dev, 1)))
 
 
 def flip(sw, a, b):
@@ -355,12 +399,32 @@ def flip(sw, a, b):
     if sw.lam is None:
         return {"a": a, "b": b, "status": "no_shadow_price", "along": []}
     d, tol = sw.diff(a, b)
-    fl = [flip_along(sw, a, b, f) for f in sorted(sw.features)]
-    along = sorted([{k: v for k, v in x.items() if k != "points"} for x in fl if x["status"] == "flip"],
-                   key=lambda r: (-r["deviance_gain"], r["feature"]))
-    return {"a": a, "b": b, "measure": "net_benefit", "n": len(d), "share_a": _r(np.mean(d > tol)),
-            "share_b": _r(np.mean(d < -tol)), "share_tie": _r(np.mean(np.abs(d) <= tol)),
-            "along": along[:SETTINGS["flips_max"]], "located": len(along)}
+    fl = [{k: v for k, v in flip_along(sw, a, b, f).items() if k != "points"} for f in sorted(sw.features)]
+    return {"a": a, "b": b, "measure": "net_benefit", "lambda": sw.lam, "n": len(d), "share_a": _r(np.mean(d > tol)),
+            "share_b": _r(np.mean(d < -tol)), "share_tie": _r(np.mean(np.abs(d) <= tol)), "along": [], "_all": fl}
+
+
+def correlations(sw, mask=None, only=None):
+    """{feature: [design features whose tie-aware rank correlation with it is >= SETTINGS correlated]} over the
+    points in `mask` (constant features excluded); `only`: just that feature's list."""
+    from scipy.stats import rankdata
+    m = np.ones(len(sw.points), bool) if mask is None else mask
+    names = [f for f in sorted(sw.features) if np.ptp(sw.features[f][m]) > 0] if m.sum() > 2 else []
+    R = {f: rankdata(sw.features[f][m]) for f in names}
+    out = {}
+    for i, f in enumerate(names):
+        for g in names[i + 1:]:
+            if only in (None, f, g) and abs(np.corrcoef(R[f], R[g])[0, 1]) >= SETTINGS["correlated"]:
+                out.setdefault(f, []).append(g)
+                out.setdefault(g, []).append(f)
+    return {f: sorted(v) for f, v in out.items()}
+
+
+def _bh(ps, q):
+    """The Benjamini-Hochberg cut: the largest p-value declared a discovery (-1 when none)."""
+    ps = sorted(ps)
+    m = len(ps)
+    return max([p for i, p in enumerate(ps, 1) if p <= q * i / m], default=-1.0)
 
 
 def default_pairs(sw):
@@ -386,9 +450,33 @@ def summarise(sw, pairs=None, packages=None):
                   "median": _r(np.median(u)) if len(u) else None,
                   "band": [_r(np.quantile(u, qlo)), _r(np.quantile(u, qhi))] if len(u) else None,
                   "direction": {f: direction(x, r) for f, x in sorted(sw.features.items())}}
+    flips = {f"{a}~{b}": flip(sw, a, b) for a, b in pairs}
+    corr = correlations(sw)
+    tested = [v for e in eff.values() for v in e["direction"].values() if v.get("p") is not None] + \
+        [x for fl in flips.values() for x in fl.get("_all", []) if x.get("p") is not None]
+    cut, found = _bh([v["p"] for v in tested], SETTINGS["fdr_q"]), 0
+    for e in eff.values():
+        for f, v in e["direction"].items():
+            v.update(scope="marginal", correlated_with=corr.get(f, []))
+            if v["direction"] in ("increases", "decreases"):
+                if v["p"] <= cut:
+                    found += 1
+                else:
+                    v.update(direction="inconclusive", why="not significant after false-discovery control")
+    for fl in flips.values():
+        keep = [dict(x, scope="marginal", correlated_with=corr.get(x["feature"], []))
+                for x in fl.pop("_all", []) if x["status"] == "flip" and x["p"] <= cut]
+        found += len(keep)
+        fl["along"] = sorted(keep, key=lambda r: (-r["deviance_gain"], r["feature"]))[:SETTINGS["flips_max"]]
+        fl["located"] = len(keep)
     return {"comparator": sw.comparator, "n_points": len(sw.points), "settings": dict(SETTINGS),
-            "shadow_price": {"value": sw.lam, "source": sw.lam_source}, "screened": False,
-            "effects": eff, "flips": {f"{a}~{b}": flip(sw, a, b) for a, b in pairs},
+            "evidence_sha": sw.evidence_sha, "screened": True,
+            "multiplicity": {"method": "Benjamini-Hochberg", "q": SETTINGS["fdr_q"], "tested": len(tested),
+                             "discoveries": found, "p_cut": cut if cut >= 0 else None},
+            "shadow_price": {"value": sw.lam, "source": sw.lam_source,
+                             "note": "the marginal funded package's benefit / cost: an upper bound on the budget row's "
+                                     "dual; paired results between options of different cost depend on it"},
+            "effects": eff, "flips": flips, "feature_correlations": corr,
             "domain": {f: [_r(x.min()), _r(x.max())] for f, x in sorted(sw.features.items())}}
 
 
@@ -453,7 +541,7 @@ def _test(t, ctx):
             return "inconclusive", obs, art, fa["points"]
         r, c = fa["range"], t["range"]
         st = "supported" if c[0] <= r[0] and r[1] <= c[1] else "refuted" if _disjoint(r, c) else "inconclusive"
-        return st, obs, art, fa["points"]
+        return (*_scope(sw, t, st, obs, _region(sw, t.get("where"))), art, fa["points"])
     m = _region(sw, t.get("where"), {t["feature"]: t["range"]} if k == "paired_sign" else None)
     if k == "paired_sign":
         d, tol = sw.diff(t["a"], t["b"])
@@ -479,7 +567,17 @@ def _test(t, ctx):
     res = direction(sw.features[t["feature"]][use], r[use], t.get("equivalence"))
     got, want = res["direction"], t["direction"]
     st = "supported" if got == want else "inconclusive" if got == "inconclusive" else "refuted"
-    return st, dict(obs, **res), art, _ids(sw, use)
+    return (*_scope(sw, t, st, dict(obs, **res), use), art, _ids(sw, use))
+
+
+def _scope(sw, t, st, obs, m):
+    """A conditional claim (the default) cannot be settled by a marginal association along a feature that is
+    correlated with another design feature in the tested points: supported or refuted becomes inconclusive."""
+    cw = correlations(sw, m, t["feature"]).get(t["feature"]) if st in ("supported", "refuted") else None
+    if t.get("scope", "conditional") != "conditional" or not cw:
+        return st, obs
+    return "inconclusive", dict(obs, marginal_only={"correlated_with": cw, "marginal_result": st, "why": (
+        "a marginal association along a feature correlated with others does not settle a conditional claim")})
 
 
 def check(hyps, ctx):
@@ -501,7 +599,8 @@ def _sim_beliefs(sw, summ):
         if e["band"] is None:
             continue
         along = {f: v["direction"] for f, v in e["direction"].items() if v["direction"] in ("increases", "decreases")}
-        out.append({"id": f"sim.effect.{p}", "about": {"package": p}, "screened": False,
+        out.append({"id": f"sim.effect.{p}", "about": {"package": p}, "screened": True, "scope": "marginal",
+                    "correlated_with": {f: e["direction"][f]["correlated_with"] for f in along},
                     "mechanism": f"marginal association in the sweep: {p} against {sw.comparator}, relative reduction "
                                  f"{e['band'][0]} to {e['band'][1]}" +
                                  (f", {', '.join(f'{v} with {f}' for f, v in along.items())}" if along else ""),
@@ -512,7 +611,8 @@ def _sim_beliefs(sw, summ):
         if fl["along"]:
             top = fl["along"][0]
             out.append({"id": f"sim.flip.{key}", "about": {"pair": [fl["a"], fl["b"]]}, "direction": "flips",
-                        "screened": False,
+                        "screened": True, "scope": "marginal",
+                        "correlated_with": {x["feature"]: x["correlated_with"] for x in fl["along"]},
                         "mechanism": f"marginal association in the sweep: {fl['a']} has the higher net benefit "
                                      f"{'below' if top['first_preferred_below'] else 'above'} roughly "
                                      f"{top['feature']} {top['range'][0]} to {top['range'][1]}",
@@ -556,11 +656,63 @@ def _conflicts(beliefs, sw):
                                                       " (kept side by side, not averaged)"})
 
 
-def build(seed, sw, plan=None, units=None, inputs=None):
-    """(world model, hypotheses): the validated seed, the sweep's simulation beliefs, conflicts, every hypothesis
-    checked, the track record and confidence updated, contradictions as open questions, and where to look next."""
+def _prior(seed, hypotheses):
+    """A seed, or a produced world model to build on: its simulation beliefs are superseded (recorded), its
+    literature and data beliefs kept with their confidence, and hypotheses reloaded only when given."""
     import copy
-    seed = copy.deepcopy(validate_seed(seed))
+    s = copy.deepcopy(seed) if isinstance(seed, dict) else seed
+    if isinstance(s, dict) and s.get("schema") == SCHEMA:
+        sims = [b["id"] for b in s.get("beliefs") or [] if str(b.get("id")).startswith("sim.")]
+        sup = list(s.get("superseded_simulation") or []) + [
+            {"version": s.get("version", 1), "beliefs": sims,
+             "evidence_sha": (s.get("simulation_summary") or {}).get("evidence_sha")}]
+        keep = [b for b in s.get("beliefs") or [] if b.get("id") not in sims]
+        for b in keep:
+            b["conflicts"] = [c for c in b.get("conflicts") or [] if c.get("belief") not in sims]
+            if not b["conflicts"]:
+                b.pop("conflicts")
+            for k in ("confirmed_by", "contradicted_by"):
+                b.pop(k, None)
+        s = {"beliefs": keep, "open_questions": s.get("open_questions") or [], "hypotheses": [],
+             "track_record": s.get("track_record"), "version": s.get("version", 1), "superseded_simulation": sup}
+    if hypotheses is not None and isinstance(s, dict):
+        s["hypotheses"] = [{k: v for k, v in h.items() if k not in ("status", "result", "confrontation")}
+                           for h in hypotheses]
+    return s
+
+
+NAMES = {"supported": "confirmed", "refuted": "contradicted"}
+
+
+def _record(hist, seed_tr):
+    """Counts from the identified confrontations (first occurrence of each (test, evidence) pair): pre-registered
+    ones in the main counts and the share confirmed, post-hoc ones apart. Seed counters are reconciled, not used."""
+    blank = lambda: {v: 0 for v in ("confirmed", "contradicted", "inconclusive", "untestable", "open")}  # noqa
+    pre, post, seen, unid = blank(), blank(), set(), 0
+    for e in hist:
+        k = (e.get("test_sha"), e.get("evidence_sha"))
+        if not k[0]:
+            unid += 1
+            continue
+        if e.get("repeat") or k in seen:
+            continue
+        seen.add(k)
+        (post if e.get("post_hoc", True) else pre)[NAMES.get(e["status"], e["status"])] += 1
+    n = pre["confirmed"] + pre["contradicted"]
+    tr = dict(pre, post_hoc=post, share_confirmed=_r(pre["confirmed"] / n) if n else None, history=hist)
+    if unid:
+        tr["unidentified_entries"] = unid
+    old = {k: v for k, v in (seed_tr or {}).items() if k in pre}
+    if any(old.get(k, 0) != pre[k] for k in old):
+        tr["reconciled"] = {"seed_counts": old, "recomputed": pre}
+    return tr
+
+
+def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_time=None):
+    """(world model, hypotheses): the validated seed (or the previous world model), the sweep's screened
+    simulation beliefs, conflicts, every hypothesis checked, the confrontations identified and recorded, confidence
+    moved only by new pre-registered ones, contradictions as open questions, and where to look next."""
+    seed = validate_seed(_prior(seed, hypotheses))
     hyps = seed.get("hypotheses") or []
     pairs = [(h["test"]["a"], h["test"]["b"]) for h in hyps if h["test"]["kind"] in ("paired_sign", "flip_in")]
     pk = [h["test"]["package"] for h in hyps if h["test"].get("package")] + \
@@ -569,39 +721,48 @@ def build(seed, sw, plan=None, units=None, inputs=None):
     beliefs = seed["beliefs"] + _sim_beliefs(sw, summ)
     _conflicts(beliefs, sw)
     checked = check(hyps, {"sweep": sw, "plan": plan, "units": units or {}})
-    tr = copy.deepcopy(seed.get("track_record") or {"history": []})
-    for s_ in STATUSES:
-        tr.setdefault({"supported": "confirmed", "refuted": "contradicted"}.get(s_, s_), 0)
+    hist = [e for e in (seed.get("track_record") or {}).get("history") or [] if isinstance(e, dict)]
+    seen = {(e.get("test_sha"), e.get("evidence_sha")) for e in hist if e.get("test_sha")}
+    plan_sha = _sha([plan, units]) if plan else None
     by = {b["id"]: b for b in beliefs}
     qs = list(seed.get("open_questions") or [])
     for h in checked:
-        tr[{"supported": "confirmed", "refuted": "contradicted"}.get(h["status"], h["status"])] += 1
-        tr["history"].append({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]})
+        on_plan = h["test"]["kind"] == "plan_share"
+        ev_sha, ev_time = (plan_sha, plan_time) if on_plan else (sw.evidence_sha, sw.evidence_time)
+        key = (_sha(h["test"]), ev_sha)
+        reg, at = _when(h.get("registered_at")), _when(ev_time)
+        post = reg is None or at is None or reg >= at
+        again = key in seen
+        seen.add(key)
+        h["confrontation"] = {"test_sha": key[0], "evidence_sha": ev_sha, "evidence_time": ev_time,
+                              "post_hoc": post, "repeat": again}
+        hist.append(dict({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]}, **h["confrontation"]))
         b = by[h["belief"]]
-        if h["status"] == "refuted":
-            b.setdefault("contradicted_by", []).append(h["id"])
-            qs.append({"id": f"Q.{h['id']}", "beliefs": [b["id"]],
+        if again:
+            continue
+        if h["status"] == "refuted" and f"Q.{h['id']}" not in {q.get("id") for q in qs}:
+            qs.append({"id": f"Q.{h['id']}", "beliefs": [b["id"]], "post_hoc": post,
                        "decision_relevant": bool(b.get("decision_relevant")),
                        "question": f"Why was {h['id']} refuted ({h['claim']}; observed {h['result']['observed']})? "
                                    "Either the world model misses a mechanism, or the source or the simulation is "
                                    "wrong: state the cause as a hypothesis and test it; never adjust inputs to agree."})
-        elif h["status"] == "supported":
-            b.setdefault("confirmed_by", []).append(h["id"])
+        if not post and h["status"] in NAMES:
+            b.setdefault("contradicted_by" if h["status"] == "refuted" else "confirmed_by", []).append(h["id"])
     for b in seed["beliefs"]:
         i = CONFIDENCE.index(b["confidence"])
         # a contradiction lowers confidence; a confirmation raises it only when no evidence conflicts with the belief
         j = i - 1 if b.get("contradicted_by") else i + 1 if b.get("confirmed_by") and not b.get("conflicts") else i
         if j != i:
-            b["confidence_seed"], b["confidence"] = b["confidence"], CONFIDENCE[min(max(j, 0), 2)]
-    n = tr["confirmed"] + tr["contradicted"]
-    tr["share_confirmed"] = _r(tr["confirmed"] / n) if n else None
-    wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "inputs": inputs or sw.artifacts,
+            b.setdefault("confidence_seed", b["confidence"])
+            b["confidence"] = CONFIDENCE[min(max(j, 0), 2)]
+    tr = _record(hist, seed.get("track_record"))
+    wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "version": seed.get("version", 0) + 1,
+          "inputs": inputs or sw.artifacts, "superseded_simulation": seed.get("superseded_simulation") or [],
           "structure": {"comparator": sw.comparator, "packages": sorted(sw.packages),
                         "terms": "net benefit per person = discount x baseline burden x relative reduction - shadow "
                                  "price x incremental cost per person"},
           "note": "a working understanding, meant to be mostly right; its bands are never decision numbers. "
-                  "Simulation beliefs are marginal associations unscreened for multiple testing (screened: false): "
-                  "not for seeding or updating a world model yet",
+                  "Simulation beliefs are screened marginal associations, not mechanisms",
           "beliefs": beliefs, "open_questions": qs, "track_record": tr, "simulation_summary": summ}
     wm["where_to_look"] = where_to_look(wm)
     return wm, {"schema": HSCHEMA, "producer": PRODUCER, "produced_by": "harness", "hypotheses": checked}
@@ -666,6 +827,43 @@ def bind_rows(rows, jobs, ident):
     return res
 
 
+def benchmark_record(bench_dir, ident):
+    """Where the engine's benchmark history records identity `ident` (version and code_sha256): its results.yaml
+    or history/*.yaml in the working tree, else results.yaml in a commit that is an ancestor of HEAD. Refused
+    (WorldModelError) otherwise, or when git is unavailable."""
+    import glob
+    import subprocess
+    import yaml
+    want = (str(ident.get("version")), ident.get("code_sha256"))
+    same = lambda doc: isinstance(doc, dict) and (str((doc.get("engine_identity") or {}).get("version")),  # noqa
+                                                  (doc.get("engine_identity") or {}).get("code_sha256")) == want
+    files = [os.path.join(bench_dir, "results.yaml")] + sorted(glob.glob(os.path.join(bench_dir, "history", "*.yaml")))
+    for f in files:
+        try:
+            if same(yaml.safe_load(open(f))):
+                return {"matched": "working tree", "file": os.path.relpath(f, bench_dir), "version": want[0],
+                        "code_sha256": want[1]}
+        except (OSError, yaml.YAMLError):
+            continue
+    try:
+        run = lambda *a: subprocess.run(["git", "-C", bench_dir, *a], capture_output=True, text=True,  # noqa
+                                        timeout=120)
+        log = run("log", "--format=%H", "-S", str(want[1]), "--", "results.yaml")
+        for c in log.stdout.split() if log.returncode == 0 else []:
+            if run("merge-base", "--is-ancestor", c, "HEAD").returncode != 0:
+                continue
+            for rev in (c, c + "^"):            # -S lists the commits that add or remove the string
+                show = run("show", f"{rev}:./results.yaml")
+                if show.returncode == 0 and same(yaml.safe_load(show.stdout)):
+                    sha = run("rev-parse", rev).stdout.strip()
+                    return {"matched": "git history", "file": "results.yaml", "commit": sha, "version": want[0],
+                            "code_sha256": want[1]}
+    except (OSError, subprocess.SubprocessError, yaml.YAMLError):
+        pass
+    raise WorldModelError(f"recorded engine identity {want[0]} ({want[1]}) is not in the engine's benchmark history "
+                          f"({bench_dir}: results.yaml, history/*, or results.yaml in an ancestor commit)")
+
+
 def _jobs(spec, design):
     """The jobs of a stored design (its own points, parameters and seeds), as batch.design() builds them."""
     from toolkit.analysis import batch as B
@@ -723,8 +921,11 @@ def load_sweep(run_dir, identity="current", lam=None):
             ident = read(run_dir, "analysis/point.yaml")["data"]["engine_identity"]
         except (OSError, KeyError, TypeError) as e:
             raise WorldModelError(f"--engine-identity recorded needs analysis/point.yaml engine_identity ({e})")
+        import inspect
+        bench = benchmark_record(os.path.join(os.path.dirname(inspect.getfile(type(spec.engine()))), "benchmarks"),
+                                 ident)
     elif identity == "current":
-        ident = engine_identity(spec.engine())
+        ident, bench = engine_identity(spec.engine()), {"matched": "the current engine"}
     else:
         raise WorldModelError(f"engine identity {identity!r}: current or recorded")
     jobs = _jobs(spec, design)
@@ -762,21 +963,30 @@ def load_sweep(run_dir, identity="current", lam=None):
     kinds = {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
     arts = {rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}
     lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price(run_dir)
-    arts.update(results=need["results"], engine_identity_mode=identity)
+    try:        # when the evidence existed: the analysis manifest's finish time, else the results file's mtime
+        et, ets = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))["finished_at"], "manifest"
+    except (OSError, ValueError, KeyError, TypeError):
+        import datetime as dt
+        et = dt.datetime.fromtimestamp(os.path.getmtime(os.path.join(run_dir, need["results"])),
+                                       dt.timezone.utc).isoformat()
+        ets = "results.jsonl modification time"
+    arts.update(results=need["results"], engine_identity_mode=identity, engine_identity_check=bench,
+                evidence_time={"value": et, "source": ets})
     sw = Sweep(F, pk, spec.comparator, burden, y, cost, groups, [p["point"] for p in design["points"]], kinds,
-               arts, lam_v, lam_s, discount_factor(spec))
+               arts, lam_v, lam_s, discount_factor(spec), evidence_time=et)
     return sw, spec
 
 
 def load_plan(run_dir, spec, sw):
-    """(plan, units) from analysis/point.yaml and the spec's units (columns, features, calibrated value), or
-    (None, None) when the run has no optimised plan. A plan missing units is kept as it is: a plan_share test over
-    a missing unit is untestable."""
+    """(plan, units, written_at) from analysis/point.yaml and the spec's units (columns, features, calibrated
+    value), or (None, None, None) when the run has no optimised plan. A plan missing units is kept as it is: a
+    plan_share test over a missing unit is untestable."""
     from toolkit.analysis import features as FT
     from toolkit.analysis.artifacts import read
     if not os.path.isfile(os.path.join(run_dir, "analysis", "point.yaml")):
-        return None, None
-    d = read(run_dir, "analysis/point.yaml")["data"]
+        return None, None, None
+    doc = read(run_dir, "analysis/point.yaml")
+    d = doc["data"]
     plan = {str(k): v for k, v in d["plan"].items()}
     bad = sorted(set(plan.values()) - set(sw.packages))
     by_id = {str(u[spec.uid]): u for u in spec.units()}
@@ -792,7 +1002,7 @@ def load_plan(run_dir, spec, sw):
         if attr and z is not None:
             row[f"{attr} (calibration scale)"] = float(z)
         units[i] = row
-    return plan, units
+    return plan, units, doc.get("written_at")
 
 
 def _cli(argv):
@@ -808,19 +1018,23 @@ def _cli(argv):
     b.add_argument("--out")
     b.add_argument("--engine-identity", default="current", choices=("current", "recorded"))
     b.add_argument("--shadow-price", type=float)
+    b.add_argument("--hypotheses", help="a hypotheses.yaml to reload (with a world_model.yaml as --seed)")
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
-        validate_seed(seed)
+        seed = validate_seed(_prior(seed, None))
         print(f"OK: {len(seed['beliefs'])} beliefs, {len(seed.get('hypotheses') or [])} hypotheses")
         return 0
     from toolkit.analysis.artifacts import _safe_io, sha256
     sw, spec = load_sweep(a.run_dir, a.engine_identity, a.shadow_price)
-    plan, units = load_plan(a.run_dir, spec, sw)
+    plan, units, plan_time = load_plan(a.run_dir, spec, sw)
+    hyps = (yaml.safe_load(open(a.hypotheses)) or {}).get("hypotheses") if a.hypotheses else None
     inputs = dict({k: v for k, v in sw.artifacts.items() if k != "results"}, seed=sha256(a.seed))
     if plan is not None:
         inputs["analysis/point.yaml"] = sha256(os.path.join(a.run_dir, "analysis", "point.yaml"))
-    wm, hy = build(seed, sw, plan, units, inputs)
+    if a.hypotheses:
+        inputs["hypotheses"] = sha256(a.hypotheses)
+    wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time)
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
     for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)
@@ -845,8 +1059,8 @@ def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
     sw = Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
                {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
                {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
-               groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"}, lam=lam)
-    sw.evidence_time = EVIDENCE_TIME    # tests-first shim: the current Sweep takes no evidence time (ι passes it)
+               groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"}, lam=lam,
+               evidence_time=EVIDENCE_TIME)
     return sw
 
 
@@ -876,12 +1090,14 @@ def _seed():
         {"id": "B4", "mechanism": "A beats B on net benefit where f1 is high", "about": {"pair": ["A", "B"]},
          "direction": "none", "source_type": "literature", "evidence": lit, "confidence": "medium"}],
         "hypotheses": [
-            {"id": "H1", "registered_at": REGISTERED, "belief": "B1", "claim": "A's effect is in [0.2, 0.4] at 80% of points",
+            {"id": "H1", "registered_at": REGISTERED, "belief": "B1",
+             "claim": "A's effect is in [0.2, 0.4] at 80% of points",
              "test": {"kind": "effect_band", "package": "A", "band": [0.2, 0.4], "min_share": 0.8}},
             {"id": "H2", "registered_at": REGISTERED, "belief": "B4", "claim": "A beats B wherever f1 is above 0.7",
              "test": {"kind": "paired_sign", "a": "A", "b": "B", "feature": "f1", "range": [0.7, 1.0],
                       "sign": "positive", "min_share": 0.8}},
-            {"id": "H3", "registered_at": REGISTERED, "belief": "B3", "claim": "the A/B choice flips for f1 in [0.3, 0.7]",
+            {"id": "H3", "registered_at": REGISTERED, "belief": "B3",
+             "claim": "the A/B choice flips for f1 in [0.3, 0.7]",
              "test": {"kind": "flip_in", "a": "A", "b": "B", "feature": "f1", "range": [0.3, 0.7]}},
             {"id": "H4", "registered_at": REGISTERED, "belief": "B2", "claim": "B's effect increases with f1",
              "test": {"kind": "effect_direction", "package": "B", "feature": "f1", "direction": "increases"}},
@@ -982,7 +1198,7 @@ def _self_test() -> int:
         rng = np.random.default_rng(1)
         units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
-        wm, hy = build(_seed(), sw, plan=plan, units=units)
+        wm, hy = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
         st = {h["id"]: h["status"] for h in hy["hypotheses"]}
         ok(st == {"H1": "supported", "H2": "refuted", "H3": "supported", "H4": "supported", "H5": "supported"},
            f"WM8 check() supports the true hypotheses and flags the false one (H2) as refuted: {st}")
@@ -1010,7 +1226,7 @@ def _self_test() -> int:
            "WM15 a plan hypothesis without a plan is untestable, never supported")
         sd = _seed()
         sd["beliefs"][3].update(decision_relevant=True, confidence="high")
-        wm2, _ = build(sd, sw, plan=plan, units=units)
+        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
         ok(any(x["belief"] == "B4" and x["kind"] == "contradiction" for x in where_to_look(wm2, top=0)),
            "WM33 where_to_look always lists a contradicted decision-relevant belief, even with no conditions or "
            "conflicts and top=0")
@@ -1113,7 +1329,8 @@ def _self_test() -> int:
         ok(s5 == "inconclusive", f"WM25 a non-monotone or rare regime is inconclusive, never refuted: {s5} "
                                  f"{r5['observed']['status']}")
         alias = _sw({f"x{k}": x2 for k in range(1, 5)}, np.where(x2 < 0.5, 0.5, 0.2), 0.35 + 0 * x2)
-        s6, _ = _one(alias, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x4", "range": [0.3, 0.7]})
+        s6, _ = _one(alias, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x4", "range": [0.3, 0.7],
+                             "scope": "marginal"})
         ok(s6 == "supported", f"WM26 a test evaluates its own feature, whatever the summary displays: {s6}")
         s7, r7 = _one(sh, {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0.0, 0.4],
                            "where": {"x": [0.3, 1.0]}, "sign": "positive", "min_share": 0.9})
@@ -1203,8 +1420,8 @@ def _self_test() -> int:
         rng = np.random.default_rng(1)
         units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
-        wm1, hy1 = build(_seed(), sw, plan=plan, units=units)
-        wm2, hy2 = build(wm1, sw, plan=plan, units=units, hypotheses=hy1["hypotheses"])
+        wm1, hy1 = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
+        wm2, hy2 = build(wm1, sw, plan=plan, units=units, hypotheses=hy1["hypotheses"], plan_time=EVIDENCE_TIME)
         ids = [b["id"] for b in wm2["beliefs"]]
         ok(len(ids) == len(set(ids)) and wm2.get("version") == 2 and wm2.get("superseded_simulation"),
            f"WM37 rebuilding from a produced world model replaces its simulation beliefs (versioned): {ids}")
@@ -1212,7 +1429,7 @@ def _self_test() -> int:
         ok(wm2["track_record"]["confirmed"] == wm1["track_record"]["confirmed"] and conf(wm2) == conf(wm1) and
            all(h["confrontation"]["repeat"] for h in hy2["hypotheses"]),
            f"WM38 replaying the same evidence counts once and moves no confidence: {wm2['track_record']}")
-        wm3, _ = build(wm2, sw, plan=plan, units=units, hypotheses=hy2["hypotheses"])
+        wm3, _ = build(wm2, sw, plan=plan, units=units, hypotheses=hy2["hypotheses"], plan_time=EVIDENCE_TIME)
         ok(len({b["id"] for b in wm3["beliefs"]}) == len(wm3["beliefs"]), "WM37b the output validates on reuse")
     tryit("WM37-38 reuse and replay", wm37)
 
@@ -1222,18 +1439,18 @@ def _self_test() -> int:
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
         sd = _seed()
         sd["hypotheses"].append(dict(sd["hypotheses"][0], id="H1b"))
-        wa, _ = build(sd, sw, plan=plan, units=units)
+        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
         ok(wa["track_record"]["confirmed"] == 4, f"WM39 an alias (identical test, same evidence) counts once: "
                                                  f"{wa['track_record']['confirmed']}")
         sd = _seed()
         sd["track_record"] = {"confirmed": 99, "contradicted": 0, "history": []}
-        wr, _ = build(sd, sw, plan=plan, units=units)
+        wr, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
         ok(wr["track_record"]["confirmed"] == 4 and wr["track_record"].get("reconciled"),
            f"WM40 seed counters are recomputed from the confrontations, not trusted: {wr['track_record']}")
         sd = _seed()
         sd["hypotheses"][0]["registered_at"] = "2026-02-01T00:00:00+00:00"
         sd["hypotheses"][3].pop("registered_at")
-        wp, hp = build(sd, sw, plan=plan, units=units)
+        wp, hp = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME)
         tr = wp["track_record"]
         ok(tr["confirmed"] == 2 and (tr.get("post_hoc") or {}).get("confirmed") == 2 and
            [h["confrontation"]["post_hoc"] for h in hp["hypotheses"]] == [True, False, False, True, False],
