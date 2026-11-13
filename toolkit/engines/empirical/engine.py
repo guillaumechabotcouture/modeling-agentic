@@ -55,6 +55,27 @@ RULES = ("multiplicative", "strongest")
 RATIO_DISTS = ("triangular", "uniform")         # drawn on the log scale
 WEIGHT_DISTS = ("triangular", "uniform", "loguniform")
 MEASURED_UNDER = ("coverage_attribute", "no_components")
+OVERLAPS = ("independent", "comonotone")
+MEASURES = ("rate_ratio", "risk_ratio", "hazard_ratio")     # applied as rate multipliers as they stand
+
+
+def _measure(d, where, conversions) -> list:
+    """A supported measure, or another one with its declared conversion to a supported one (recorded)."""
+    m, cv = d.get("measure"), d.get("conversion")
+    if m in MEASURES and cv is None:
+        return []
+    if not isinstance(cv, dict):
+        return [f"{where}.measure: one of {MEASURES}, or declare `conversion: {{to, method, inputs, source}}` from "
+                f"{m!r}"]
+    bad = [f"{where}.conversion.{k}: missing" for k in ("method", "source") if not str(cv.get(k) or "").strip()]
+    if cv.get("to") not in MEASURES:
+        bad.append(f"{where}.conversion.to: one of {MEASURES}")
+    if not isinstance(cv.get("inputs"), dict) or not cv["inputs"]:
+        bad.append(f"{where}.conversion.inputs: the values the conversion uses")
+    if not bad:
+        conversions.append(f"{where}: {m} converted to {cv['to']} by {cv['method']} with {cv['inputs']} "
+                           f"({cv['source']})")
+    return bad
 
 
 def combo_key(components) -> str:
@@ -72,16 +93,17 @@ def _value(d, where, key, dists, ratio):
         return None, [f"{where}: a mapping {{{key}, range, dist, source}}"]
     bad = []
     v, rng, src = d.get(key), d.get("range"), str(d.get("source") or "").strip()
-    if not _num(v) or (ratio and v <= 0):
-        bad.append(f"{where}.{key}: a finite number" + (" > 0" if ratio else ""))
+    if not _num(v) or (ratio and v <= 0) or v < 0:      # a weight is >= 0 over its whole support (review r1)
+        bad.append(f"{where}.{key}: a finite number" + (" > 0" if ratio else " >= 0"))
     if not src:
         bad.append(f"{where}.source: the citation is missing")
     if rng is None and ratio:
         bad.append(f"{where}.range: a trial value needs its range (the interval it is drawn over)")
     elif rng is not None:
+        pos = ratio or d.get("dist") == "loguniform"
         if not (isinstance(rng, list) and len(rng) == 2 and all(_num(x) for x in rng) and rng[0] < rng[1]
-                and (not ratio or rng[0] > 0)):
-            bad.append(f"{where}.range: [lo, hi] with lo < hi" + (", both > 0" if ratio else ""))
+                and (rng[0] > 0 if pos else rng[0] >= 0)):
+            bad.append(f"{where}.range: [lo, hi] with lo < hi" + (", both > 0" if pos else ", lo >= 0"))
         elif _num(v) and not rng[0] <= v <= rng[1]:
             bad.append(f"{where}: {key} {v} is outside its range {rng}")
         if d.get("dist") not in dists:
@@ -109,7 +131,21 @@ class PackageRateEngine:
             if extra:
                 raise ValueError(f"PackageRateEngine: {extra} are trial_priors settings; set mode: trial_priors")
             return
+        import copy
+        self._config = copy.deepcopy({"mode": mode, "components": self.components, "outcome": self.outcome,
+                                      "outcomes": outcomes, "baseline": baseline, "effects": effects,
+                                      "combination": combination, "compose": compose})
         self._setup_trial(outcomes, baseline, effects, combination, compose)
+
+    def config(self) -> dict | None:
+        """The full behavioural configuration (trial_priors): its digest is in the card version, so the engine
+        identity changes with the effect graph, rule, interactions, composition and baseline (review r1)."""
+        return getattr(self, "_config", None)
+
+    def _digest(self) -> str:
+        import hashlib
+        import json
+        return hashlib.sha256(json.dumps(self._config, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------ trial-prior mode
     def _setup_trial(self, outcomes, baseline, effects, combination, compose):
@@ -129,8 +165,11 @@ class PackageRateEngine:
             bad.append(f"baseline.measured_under: one of {MEASURED_UNDER} (what the baseline already includes)")
         if not self.baseline_note:
             bad.append("baseline.source: the basis of the coverage the baseline was measured under")
+        self.overlap = b.get("overlap", "independent")
+        if self.overlap not in OVERLAPS:
+            bad.append(f"baseline.overlap: one of {OVERLAPS} (how components' baseline coverages overlap)")
         effects = effects if isinstance(effects, dict) else {}
-        self.relative = {}
+        self.relative, self.conversions = {}, []
         for c in effects:
             if c not in self.components:
                 bad.append(f"effects.{c}: not a component")
@@ -148,7 +187,7 @@ class PackageRateEngine:
             bad += [f"effects.{c}.{k}: not a declared outcome" for k in e if k not in self.outcomes + ["relative_to"]]
             for o in self.outcomes:
                 v, why = _value(e.get(o), f"effects.{c}.{o}", "rr", RATIO_DISTS, True)
-                bad += why
+                bad += why + (_measure(e.get(o), f"effects.{c}.{o}", self.conversions) if v else [])
                 if v:
                     vs = f"vs {e['relative_to']}" if c in self.relative else "vs none"
                     P[f"lrr:{c}:{o}"] = (math.log(v[0]), math.log(v[1][0]), math.log(v[1][1]), v[2],
@@ -171,6 +210,9 @@ class PackageRateEngine:
                 continue
             if o not in self.outcomes:
                 bad.append(f"{w}.outcome: one of {self.outcomes}")
+                continue
+            if self.relative.get(cs[0], cs[0]) == self.relative.get(cs[1], cs[1]):
+                bad.append(f"{w}: {cs} are alternatives (one's effect is relative to the other); no interaction")
                 continue
             v, why = _value(it, w, "ratio", RATIO_DISTS, True)
             bad += why
@@ -200,6 +242,9 @@ class PackageRateEngine:
         if bad:
             raise ValueError("PackageRateEngine trial_priors: " + "; ".join(bad))
         self._p = P
+        # exposure groups: a component and those whose effect is relative to it are alternatives (one state each)
+        self.groups = [[c] + [x for x in self.components if self.relative.get(x) == c]
+                       for c in self.components if c not in self.relative]
 
     def priors_doc(self) -> dict | None:
         """The engine-card priors (toolkit/spec/priors.py), from the spec's engine.config: every ranged value is a
@@ -210,17 +255,45 @@ class PackageRateEngine:
                            for k, v in self._p.items() if v[1] is not None},
                 "fixed": {k: f"declared without a range: {v[4]}" for k, v in self._p.items() if v[1] is None}}
 
-    def _M(self, p, o, f) -> float:
-        def lrr(c):
-            return p[f"lrr:{c}:{o}"] + (p[f"lrr:{self.relative[c]}:{o}"] if c in self.relative else 0.0)
-        terms = [1.0 - float(f.get(c, 0.0)) * (1.0 - math.exp(lrr(c))) for c in self.components]
-        if self.rule == "strongest":
-            return min(terms)
-        m = math.prod(terms)
+    def _m(self, p, o, active) -> float:
+        """The rate multiplier of one exposure state (the set of components a person has)."""
+        rr = {c: math.exp(p[f"lrr:{c}:{o}"] + (p[f"lrr:{self.relative[c]}:{o}"] if c in self.relative else 0.0))
+              for c in active}
+        if self.rule == "strongest":            # over active components only: a harmful RR is never clipped
+            return min(rr.values()) if rr else 1.0
+        m = math.prod(rr.values())
         for (a, b), oo, name in self.interactions:
-            if oo == o:
-                m *= math.exp(p[name] * float(f.get(a, 0.0)) * float(f.get(b, 0.0)))
+            if oo == o and a in active and b in active:
+                m *= math.exp(p[name])
         return m
+
+    def _states(self, f) -> list:
+        """[(probability, active components)]: the joint exposure states of a population with coverage f. Within a
+        group the shares are exclusive; across groups `independent` multiplies them, `comonotone` nests them (one
+        uniform position decides every group: maximal overlap)."""
+        per = [[(f.get(c, 0.0), c) for c in g if f.get(c, 0.0) > 0] for g in self.groups]
+        if self.overlap == "independent":
+            out = []
+            for combo in itertools.product(*[s + [(1.0 - sum(q for q, _ in s), None)] for s in per]):
+                pr = math.prod(q for q, _ in combo)
+                if pr > 0:
+                    out.append((pr, frozenset(c for _, c in combo if c)))
+            return out
+        cuts = sorted({0.0, 1.0} | {min(1.0, sum(q for q, _ in s[:k + 1])) for s in per for k in range(len(s))})
+        out = []
+        for lo, hi in zip(cuts, cuts[1:]):
+            mid, act = (lo + hi) / 2, set()
+            for s in per:
+                acc = 0.0
+                for q, c in s:
+                    if acc <= mid < acc + q:
+                        act.add(c)
+                    acc += q
+            out.append((hi - lo, frozenset(act)))
+        return out
+
+    def _M(self, p, o, f) -> float:
+        return sum(pr * self._m(p, o, act) for pr, act in self._states(f))
 
     def _trial_run(self, p, unit, on, horizon) -> Outcomes:
         br = unit.attributes.get("baseline_rate")
@@ -229,9 +302,15 @@ class PackageRateEngine:
         cov = {}
         if self.measured_under == "coverage_attribute":
             cov = unit.attributes.get("baseline_coverage")
-            if not isinstance(cov, dict) or any(c not in self.components or not _num(v) or not 0 <= v <= 1
-                                                for c, v in cov.items()):
-                raise ValueError(f"unit {unit.id}: baseline_coverage must be {{component: share in [0, 1]}}")
+            if (not isinstance(cov, dict) or set(cov) != set(self.components)
+                    or any(not _num(v) or not 0 <= v <= 1 for v in cov.values())
+                    or any(sum(cov[c] for c in g) > 1 + 1e-9 for g in self.groups)):
+                raise ValueError(f"unit {unit.id}: baseline_coverage must give every component {self.components} a "
+                                 "share in [0, 1] (0 for none), alternatives summing to at most 1")
+        both = [g for g in self.groups if len(set(g) & set(on)) > 1]
+        if both:
+            raise ValueError(f"package {combo_key(on)}: {both[0]} are alternatives (an effect is relative to "
+                             "another); a package holds at most one of them")
         years = float(horizon.window[1] - horizon.window[0])
         pkg = {c: 1.0 for c in on}
         rate = {o: float(br[o]) * self._M(p, o, pkg) / self._M(p, o, cov) for o in self.outcomes}
@@ -246,10 +325,13 @@ class PackageRateEngine:
     def _trial_card(self) -> EngineCard:
         def show(k, x):
             return math.exp(x) if k.startswith("l") else x
-        f = ("M = prod_c (1 - f_c (1 - RR_c)) x the declared interactions" if self.rule == "multiplicative"
-             else "M = min_c (1 - f_c (1 - RR_c)): only the strongest component acts")
+        f = ("m(state) = product of the active components' RR x the declared interactions among them"
+             if self.rule == "multiplicative" else "m(state) = the smallest active RR (1 with none): only the "
+             "strongest component acts")
         mech = [f"trial priors: relative effects from trials, no calibration; combination rule {self.rule} "
-                f"({self.rule_source}): rate = baseline x M(package) / M(baseline coverage), {f}"]
+                f"({self.rule_source}): rate = baseline x M(package) / M(baseline coverage), M = the mean of "
+                f"m(state) over joint exposure states ({self.overlap} overlap across groups; alternatives "
+                f"{[g for g in self.groups if len(g) > 1]} exclusive), {f}"]
         mech += [f"interaction {combo_key(cs)} on {o}: ratio {math.exp(self._p[n][0]):.4g} "
                  f"[{math.exp(self._p[n][1]):.4g}, {math.exp(self._p[n][2]):.4g}] ({self._p[n][4]})"
                  for cs, o, n in self.interactions]
@@ -258,6 +340,7 @@ class PackageRateEngine:
         notes += [f"{k}: {show(k, v[0]):.4g}" + (f" [{show(k, v[1]):.4g}, {show(k, v[2]):.4g}]" if v[1] is not None
                                                  else " (no range: held fixed)") + f" ({v[6]}): {v[4]}"
                   for k, v in self._p.items()]
+        notes += [f"conversion: {x}" for x in self.conversions]
         notes.append("no transmission dynamics or time profile: each package delivers its trial effect at a constant "
                      "rate over the decision window")
         ua = {"baseline_rate": f"{{outcome: rate per person-year}} from external estimates, for {self.outcomes}"}
@@ -265,7 +348,7 @@ class PackageRateEngine:
             ua["baseline_coverage"] = "{component: share of its trial effect in place when the baseline was measured}"
         outs = self.outcomes + list(self.compose)
         return EngineCard(
-            name="package_rate", version=f"2-trial_priors-{self.rule}", mechanisms=mech,
+            name="package_rate", version=f"2-trial_priors-{self.rule}-{self._digest()}", mechanisms=mech,
             components={c: [0, 1] for c in self.components}, unit_attributes=ua,
             outputs={"per_capita": outs, "windows": ["rate"] + [f"rate_{o}" for o in outs],
                      "cost_drivers": [f"{c}_person_years" for c in self.components]},
@@ -354,7 +437,8 @@ def _self_test_trial(ok):
         ok(False, f"T0 the trial-prior configuration is accepted: {type(ex).__name__}: {ex}")
         return
     h = Horizon(0, 2, (0, 2), {"w": [0, 1]})
-    u = UnitSpec("u", {"baseline_rate": {"cases": 0.4, "deaths": 0.002}, "baseline_coverage": {"a": 0.5, "b": 0.0}})
+    u = UnitSpec("u", {"baseline_rate": {"cases": 0.4, "deaths": 0.002},
+                       "baseline_coverage": {"a": 0.5, "b": 0.0, "c": 0.0}})
     ok(check_engine(e, u, Package("ab", {"a": 1, "b": 1}), h) == [], "T1 the trial-prior engine passes the contract")
     ps = {p.name: p for p in e.parameters()}
     ok(not [p for p in ps.values() if p.kind in ("calibrated", "fitted")]
@@ -404,6 +488,7 @@ def _self_test_trial(ok):
         ok(False, "T10 a unit without its external baseline fails closed")
     except ValueError:
         ok(True, "T10 a unit without its external baseline fails closed")
+    _self_test_review1(ok, cfg, h)
     with tempfile.TemporaryDirectory() as d:
         try:
             R = _toy_trial_run(d)
@@ -414,6 +499,99 @@ def _self_test_trial(ok):
         ok(R["point"]["plan"] and "lrr:a:cases" in drawn and R["calibration"]["method"] == "none",
            f"T11 an end-to-end toy run through toolkit/analysis/run.py: a plan, no calibration, and draws over the "
            f"trial priors ({drawn})")
+
+
+def _self_test_review1(ok, cfg, h):
+    """PR #217 review round 1: each reproduction is a case."""
+    import copy
+    from toolkit.engines.contract import Package, UnitSpec, engine_identity
+
+    def eff(rr, lo, hi, measure="rate_ratio"):
+        return {"rr": rr, "range": [lo, hi], "dist": "triangular", "measure": measure, "source": "toy"}
+
+    def two(rr_a, rr_b, interaction=None, rule="multiplicative", overlap=None):
+        c = {"components": ["a", "b"], "outcome": "cases", "mode": "trial_priors",
+             "outcomes": {"cases": {"baseline_source": "toy"}},
+             "baseline": {"measured_under": "coverage_attribute", "source": "toy",
+                          **({"overlap": overlap} if overlap else {})},
+             "effects": {"a": {"cases": eff(rr_a, rr_a * 0.9, rr_a * 1.1)},
+                         "b": {"cases": eff(rr_b, rr_b * 0.9, rr_b * 1.1)}},
+             "combination": {"rule": rule, "source": "toy"}}
+        if interaction:
+            c["combination"]["interactions"] = [{"components": ["a", "b"], "outcome": "cases", "ratio": interaction,
+                                                 "range": [1.5, 2.5], "dist": "triangular", "source": "toy"}]
+        return PackageRateEngine(**c)
+
+    def rate(e, cov, comps, rate0=0.4, params=None):
+        u = UnitSpec("u", {"baseline_rate": {"cases": rate0}, "baseline_coverage": cov})
+        return e.run(params or {}, u, Package("p", comps), h, 1).per_capita["cases"]["all"] / 2
+
+    e = PackageRateEngine(**cfg)
+    full = {"a": 0.0, "b": 0.0, "c": 0.0}
+    try:
+        e.run({}, UnitSpec("u", {"baseline_rate": {"cases": 0.4, "deaths": 0.002}, "baseline_coverage": full}),
+              Package("ac", {"a": 1, "c": 1}), h, 1)
+        ok(False, "R1 a package with a component and the one its effect is relative to is refused (A+C)")
+    except ValueError:
+        ok(True, "R1 a package with a component and the one its effect is relative to is refused (A+C)")
+    try:
+        r = rate(two(0.6, 1.2, rule="strongest"), {"a": 0.0, "b": 0.0}, {"b": 1})
+        lrr_hi = {"lrr:b:cases": math.log(1.3)}
+        r2 = rate(two(0.6, 1.2, rule="strongest"), {"a": 0.0, "b": 0.0}, {"b": 1}, params=lrr_hi)
+        ok(abs(r - 0.4 * 1.2) < 1e-12 and abs(r2 - 0.4 * 1.3) < 1e-12,
+           f"R2 `strongest`: the minimum over active components only, so a harmful RR 1.2 (and a draw at 1.3) is "
+           f"not clipped to 1 ({r:.4g}, {r2:.4g})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"R2 `strongest` with a harmful RR: {type(ex).__name__}: {ex}")
+    try:
+        e2 = two(0.5, 0.5, interaction=2.0)
+        r = rate(e2, {"a": 0.5, "b": 0.5}, {"a": 1, "b": 1}, rate0=0.625)
+        rc = rate(two(0.5, 0.5, interaction=2.0, overlap="comonotone"), {"a": 0.5, "b": 0.5}, {"a": 1, "b": 1},
+                  rate0=0.75)
+        ok(abs(r - 0.5) < 1e-12 and abs(rc - 0.5) < 1e-12,
+           f"R3 fractional coverage is a mixture over joint exposure states (independent: baseline multiplier 0.625; "
+           f"comonotone: 0.75) ({r:.6g}, {rc:.6g})")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"R3 fractional coverage as a mixture: {type(ex).__name__}: {ex}")
+    for what, mut in (("an odds ratio without a declared conversion",
+                       lambda c: c["effects"]["a"]["cases"].update(measure="odds_ratio")),
+                      ("an unknown measure", lambda c: c["effects"]["a"]["cases"].update(measure="something")),
+                      ("a missing measure", lambda c: c["effects"]["a"]["cases"].pop("measure")),
+                      ("a negative DALY weight range",
+                       lambda c: c["compose"]["dalys"]["deaths"].update(range=[-35.0, 35.0])),
+                      ("a negative fixed DALY weight", lambda c: c["compose"]["dalys"]["cases"].update(value=-0.01)),
+                      ("a loguniform weight with a zero bound",
+                       lambda c: c["compose"]["dalys"]["deaths"].update(range=[0.0, 35.0], dist="loguniform"))):
+        c = copy.deepcopy(cfg)
+        mut(c)
+        try:
+            PackageRateEngine(**c)
+            ok(False, f"R4 {what} is refused")
+        except ValueError:
+            ok(True, f"R4 {what} is refused")
+    c = copy.deepcopy(cfg)
+    c["effects"]["a"]["cases"].update(measure="odds_ratio", conversion={
+        "to": "risk_ratio", "method": "RR = OR / (1 - p0 + p0 OR)", "inputs": {"p0": 0.5}, "source": "toy"})
+    try:
+        note = " ".join(PackageRateEngine(**c).describe().notes)
+        ok("odds_ratio" in note and "p0" in note, "R4 a declared conversion is accepted and recorded on the card")
+    except ValueError as ex:
+        ok(False, f"R4 a declared conversion is accepted and recorded on the card: {ex}")
+    try:
+        r = rate(two(0.6, 0.7), {"b": 0.0}, {"a": 1})
+        ok(False, f"R5 a coverage mapping that omits a component fails closed (got {r:.4g}; 0.24 vs 0.30)")
+    except ValueError:
+        r = rate(two(0.6, 0.7), {"a": 1.0, "b": 0.0}, {"a": 1})
+        ok(abs(r - 0.4) < 1e-12, "R5 a coverage mapping that omits a component fails closed; with it declared, "
+                                 "continued delivery keeps the baseline")
+    c = copy.deepcopy(cfg)
+    c["effects"]["c"].pop("relative_to")
+    c2 = dict(copy.deepcopy(cfg), outcome="deaths")
+    ids = [engine_identity(PackageRateEngine(**x)) for x in (cfg, c, c2)]
+    ok(ids[0] != ids[1] and ids[0] != ids[2] and ids[0] == engine_identity(PackageRateEngine(**copy.deepcopy(cfg)))
+       and callable(getattr(e, "config", None)),
+       "R6 the engine identity changes with the effect graph (relative_to) and the primary outcome, and the engine "
+       "gives its full configuration (config())")
 
 
 def toy_trial_config() -> dict:
@@ -441,9 +619,9 @@ def _toy_trial_run(d) -> dict:
     import yaml
     from toolkit.analysis import run as RUN
     with open(os.path.join(d, "units.csv"), "w") as f:
-        f.write("id,zone,pop,inc,mort,cov_a\n")
+        f.write("id,zone,pop,inc,mort,cov_a,cov_b,cov_c\n")
         for i in range(6):
-            f.write(f"u{i},z{i % 3},{10000 + 1000 * i},{0.1 + 0.1 * i:.2f},{0.001 * (1 + i % 3):.4f},{0.1 * i:.1f}\n")
+            f.write(f"u{i},z{i % 3},{10000 + 1000 * i},{0.1 + 0.1 * i:.2f},{0.001 * (1 + i % 3):.4f},{0.1 * i:.1f},0.2,0.0\n")
     spec = {
         "schema_version": 1, "question": "Which package per unit (step 0)?", "decision_maker": "programme manager",
         "decision_date": 2026,
@@ -452,7 +630,7 @@ def _toy_trial_run(d) -> dict:
         "decision_units": {"csv": "units.csv", "id": "id",
                            "populations": {"all": {"column": "pop", "age_groups": ["all"]}},
                            "engine_attributes": {"baseline_rate": {"columns": {"cases": "inc", "deaths": "mort"}},
-                                                 "baseline_coverage": {"columns": {"a": "cov_a"}}}},
+                                                 "baseline_coverage": {"columns": {"a": "cov_a", "b": "cov_b", "c": "cov_c"}}}},
         "options": {"populations": {"total": "pop"}, "components": {"a": {"group": "g"}, "b": {}, "c": {"group": "g"}},
                     "packages": {"generate": True},
                     "engine_map": {"a": {"a": 1}, "b": {"b": 1}, "c": {"c": 1}},
