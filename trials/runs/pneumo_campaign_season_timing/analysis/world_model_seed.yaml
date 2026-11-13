@@ -1,0 +1,269 @@
+beliefs:
+- id: B1
+  mechanism: Waiting until week 10 forfeits the acquisitions that occur before the campaign; that share grows with
+    the starting seed share because a larger seed reaches the epidemic's steep phase sooner
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS ONE
+      2007
+    location: renewal equation, Methods (location approximate)
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods, renewal equation (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Higher susceptible share raises R_eff (2 x s0), speeding growth so more of the season is over by week
+    10, and making the epidemic harder to suppress; relative reductions of both campaigns fall as s0 rises
+  about:
+    package: late
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (location approximate)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: chapter 2 (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: PRE acts before the epidemic grows; with a population-level effect on R of plausibly 0.4-0.7 (carriage
+    efficacy times campaign coverage), (1 - effect) x R_eff is near or below 1 across most of s0, so PRE averts
+    most of the season's acquisitions
+  about:
+    package: pre
+  direction: reduces
+  magnitude:
+    band:
+    - 0.55
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'PRE''s relative reduction falls with s0: at R_eff near 1 any effect suppresses the season, at R_eff
+    near 2 the reduced R may stay above 1'
+  about:
+    package: pre
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: chapter 2 (location approximate)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: PRE averts more acquisitions per resident than LATE in nearly every district and draw; the price gap
+    is negligible at the declared shadow price, so PRE wins the paired comparison, most clearly where the seed share
+    is high
+  about:
+    pair:
+    - pre
+    - late
+  direction: increases
+  conditions:
+  - feature: seed_share
+    range:
+    - 0.0003
+    - 0.00086232
+  source_type: literature
+  evidence:
+  - citation: Leimkugel J, Adams Forgor A, Gagneux S, et al. An outbreak of serotype 1 Streptococcus pneumoniae
+      meningitis in northern Ghana with features that are characteristic of Neisseria meningitidis meningitis epidemics.
+      J Infect Dis 2005
+    location: Results (epidemic, seasonal character; location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: In a deterministic closed-population renewal model with seed given as a share, relative reductions
+    are scale-invariant in population size
+  about:
+    package: pre
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: chapter 2, density-independent mass-action formulation (location approximate)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: Where the seed share is low the epidemic is still early at week 10, so LATE retains most of PRE's benefit;
+    waiting costs little there
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: seed_share
+    range:
+    - 1.177e-05
+    - 0.0001
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS ONE
+      2007
+    location: renewal equation, Methods (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is the generation interval of serotype-1 carriage acquisition (mean in weeks)? It sets how much
+    of the season is over by week 10 and so the loss from waiting.
+  beliefs:
+  - B1
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: Is the population-level effect of the campaign on R the same for PRE and LATE (same vaccine and coverage),
+    or does LATE's case-triggered coverage differ?
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Is the declared shadow price (1e-5 outcome per USD) on the same scale as acquisitions per person? If
+    lambda were orders of magnitude larger, LATE's lower price could win in low-seed districts.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: How measured is the susceptible share (survey s0 vs calibration scale), and does it vary by district?
+  beliefs:
+  - B2
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: LATE's relative reduction decreases as the starting seed share rises.
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H2
+  belief: B2
+  claim: LATE's relative reduction decreases as s0 rises.
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: PRE averts 55-100% of the season's acquisitions in at least 70% of usable points.
+  test:
+    kind: effect_band
+    package: pre
+    band:
+    - 0.55
+    - 1.0
+    min_share: 0.7
+- id: H4
+  belief: B4
+  claim: PRE's relative reduction decreases as s0 rises.
+  test:
+    kind: effect_direction
+    package: pre
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Where the seed share is high (>= 3e-4), PRE beats LATE on net benefit at the shadow price in at least 90%
+    of usable points.
+  test:
+    kind: paired_sign
+    a: pre
+    b: late
+    feature: seed_share
+    range:
+    - 0.0003
+    - 0.00086232
+    sign: positive
+    min_share: 0.9
+- id: H6
+  belief: B6
+  claim: PRE's relative reduction does not depend on district population (|rho| bound within 0.2).
+  test:
+    kind: effect_direction
+    package: pre
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H7
+  belief: B7
+  claim: Where the seed share is low (<= 1e-4), LATE still averts 40-100% of acquisitions in at least 70% of usable
+    points.
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.4
+    - 1.0
+    min_share: 0.7
+    where:
+      seed_share:
+      - 1.177e-05
+      - 0.0001
