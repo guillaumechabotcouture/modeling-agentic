@@ -1,0 +1,326 @@
+beliefs:
+- id: B1
+  mechanism: 'A stronger measure (larger proportional cut in R_t during weeks 4-16) averts a larger share of 2026
+    infections in every city: the multiplier (1 - effect) lowers R_t and, in the exponential phase, the in-year
+    incidence falls roughly geometrically with the number of generations under the measure.'
+  about:
+    package: measure
+    feature: effect:measure
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.6 (growth rate - R relation for a given generation-interval distribution)
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods (renewal equation); location approximate
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Higher remaining susceptibility s0 raises effective R, so the unmitigated epidemic grows faster, peaks
+    earlier and completes within 2026; a temporary measure then mostly delays it and trims overshoot, so the relative
+    reduction of 2026 infections falls as s0 rises. At low s0 the in-year epidemic is still in its exponential phase
+    and the delay removes a large share of in-year infections.
+  about:
+    package: measure
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation, main theorem; location approximate
+  - citation: Bootsma MCJ, Ferguson NM. The effect of public health measures on the 1918 influenza pandemic in U.S.
+      cities. PNAS 2007
+    location: 'Results: early lifting of measures followed by second peaks; location approximate'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: A larger seeded share brings the epidemic forward (fewer doublings to the peak), so more of it completes
+    within 2026 despite the delay the measure causes, and the relative reduction of 2026 infections falls as seed_share
+    rises. Seed share spans ~2 orders of magnitude, i.e. ~4.4 natural-log units, which at weekly growth factors
+    of ~1.1-1.4 moves the peak by roughly 13-45 weeks, comparable to the horizon.
+  about:
+    package: measure
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.6; the timing arithmetic is my own
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Population size does not change the relative effect: transmission is frequency-dependent and the seed
+    is a share, so a city''s trajectory in proportions is independent of N; N only scales cost and infections together
+    (and so sets how many cities the budget reaches, not which are best per dollar).'
+  about:
+    package: measure
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: frequency-dependent transmission (early chapters); exact page not verified
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: In fast cities (high s0 and large seed) the unmitigated epidemic peaks within or soon after the measure
+    window and completes within 2026; the measure only trims overshoot above the herd-immunity threshold, so it
+    averts a modest share of 2026 infections, well below its own effect on transmission.
+  about:
+    package: measure
+  direction: reduces
+  magnitude:
+    band:
+    - 0.02
+    - 0.3
+    scale: relative_reduction
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.9
+    - 0.9975267241708934
+  - feature: seed_share
+    range:
+    - 1.0e-05
+    - 2.864e-05
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC. Optimal timing of one-shot interventions for epidemic control. PLoS
+      Comput Biol 2021
+    location: 'Results: final-size reduction of a single fixed-duration intervention is bounded by overshoot; location
+      approximate'
+  - citation: 'Hollingsworth TD, Klinkenberg D, Heesterbeek H, Anderson RM. Mitigation strategies for pandemic influenza
+      A: balancing conflicting policy objectives. PLoS Comput Biol 2011'
+    location: Results on timing of temporary interventions; location approximate
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: With a binding budget, the measure beats no action on net benefit in most city-points when its effect
+    is at the top of its range, because averted infections per resident rise with the effect while the price per
+    resident is fixed; at the low end of the effect range fewer cities clear the shadow price.
+  about:
+    pair:
+    - measure
+    - none
+  direction: increases
+  conditions:
+  - feature: effect:measure
+    range:
+    - 0.35
+    - 0.45
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.6; the budget arithmetic (US$45M / US$3 = ~15M residents) is from the question
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'Averted 2026 infections per resident are non-monotone in epidemic speed: highest where the measure''s
+    delay pushes a large in-year epidemic past the year end or overlaps the peak, lowest where the epidemic is so
+    slow that little of it falls in 2026. In the slowest cities (lowest s0) the in-year burden is small, so the
+    measure does not clear the budget''s shadow price and no action wins.'
+  about:
+    pair:
+    - measure
+    - none
+  direction: decreases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.5539670294616372
+    - 0.65
+  source_type: literature
+  evidence:
+  - citation: 'Hollingsworth TD, Klinkenberg D, Heesterbeek H, Anderson RM. Mitigation strategies for pandemic influenza
+      A: balancing conflicting policy objectives. PLoS Comput Biol 2011'
+    location: timing of temporary interventions; location approximate
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: Trial evidence on community masking and physical measures shows small relative reductions in respiratory
+    infection (around 10% for community surgical masking in Bangladesh; uncertain, near-null pooled effects for
+    masks in the Cochrane review), so a 15-45% cut in transmission from masks, distancing and ventilation is optimistic
+    at its upper end; the lower part of the range is better supported.
+  about:
+    package: measure
+  direction: reduces
+  source_type: literature
+  evidence:
+  - citation: 'Abaluck J, Kwong LH, Styczynski A, et al. Impact of community masking on COVID-19: A cluster-randomized
+      trial in Bangladesh. Science 2022'
+    location: Abstract (relative reduction in symptomatic seroprevalence ~9-11%)
+  - citation: Jefferson T, Dooley L, Ferroni E, et al. Physical interventions to interrupt or reduce the spread
+      of respiratory viruses. Cochrane Database Syst Rev 2023
+    location: Summary of findings, medical/surgical masks vs no masks
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The relative reduction in 2026 infections from the measure rises with its effect on transmission.
+  test:
+    kind: effect_direction
+    package: measure
+    feature: effect:measure
+    direction: increases
+- id: H2
+  belief: B2
+  claim: The relative reduction in 2026 infections from the measure falls as s0 rises (faster epidemics complete
+    within the year, so the measure mostly delays them). Refuted if rho's interval lies above 0.
+  test:
+    kind: effect_direction
+    package: measure
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: The relative reduction in 2026 infections from the measure falls as seed_share rises (earlier epidemics
+    complete within the year). Refuted if rho's interval lies above 0.
+  test:
+    kind: effect_direction
+    package: measure
+    feature: seed_share
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: City population has no bearing on the measure's relative reduction (|rho| within 0.1).
+  test:
+    kind: effect_direction
+    package: measure
+    feature: pop
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: In fast cities (s0 >= 0.9, seed_share >= 1e-5) the measure averts 2-30% of 2026 infections in at least
+    70% of points; refuted if 30% or fewer of those points fall in the band.
+  test:
+    kind: effect_band
+    package: measure
+    band:
+    - 0.02
+    - 0.3
+    min_share: 0.7
+    where:
+      s0 (calibration scale):
+      - 0.9
+      - 0.9975267241708934
+      seed_share:
+      - 1.0e-05
+      - 2.864e-05
+- id: H6
+  belief: B6
+  claim: At effects of 35-45% the measure beats no action on net benefit at the budget's shadow price in at least
+    60% of usable points.
+  test:
+    kind: paired_sign
+    a: measure
+    b: none
+    feature: effect:measure
+    range:
+    - 0.35
+    - 0.45
+    sign: positive
+    min_share: 0.6
+- id: H7
+  belief: B7
+  claim: In the slowest cities (s0 between 0.554 and 0.65) no action beats the measure on net benefit at the budget's
+    shadow price in at least 60% of usable points.
+  test:
+    kind: paired_sign
+    a: measure
+    b: none
+    feature: s0 (calibration scale)
+    range:
+    - 0.5539670294616372
+    - 0.65
+    sign: negative
+    min_share: 0.6
+open_questions:
+- id: Q1
+  question: What is R0 (withheld)? It sets effective R = R0 x s0 and so whether each city's epidemic peaks inside
+    the measure window, later in 2026, or after the year end. All of B2, B5 and B7 change sign or size with it.
+  beliefs:
+  - B2
+  - B5
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: How many of the "averted" 2026 infections are only deferred to 2027? In a closed population with no
+    waning, a temporary measure that does not overlap the peak barely changes the final size, so a 2026-only outcome
+    can credit the measure with infections that still occur. Would the ranking change on a horizon that includes
+    the full epidemic?
+  beliefs:
+  - B2
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Is a 15-45% cut in transmission consistent with trial evidence for masks, distancing and ventilation,
+    or should the lower part of the range carry most weight? Where does the fund / do-not-fund line for each city
+    move across that range?
+  beliefs:
+  - B1
+  - B6
+  - B8
+  decision_relevant: true
+- id: Q4
+  question: The weekly generation-interval grid has a mean of ~1.45 weeks (~10 days), not the stated ~5 days. Which
+    one is intended? A shorter interval means faster growth, earlier peaks and less benefit from a temporary measure.
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q5
+  question: What is the shadow price of the US$45M budget? It sets which cities clear the bar. Total population
+    of the 24 cities against ~15M fundable residents decides how many cities get the measure.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
