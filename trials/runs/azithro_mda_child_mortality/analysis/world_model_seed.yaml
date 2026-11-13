@@ -1,0 +1,256 @@
+beliefs:
+- id: B1
+  mechanism: Biannual azithromycin to all children 1-59 months reduces all-cause 1-59 month mortality by roughly
+    14% (MORDOR pooled; AVENIR child arm similar), larger in Niger than in Malawi or Tanzania
+  about:
+    package: all
+  direction: reduces
+  magnitude:
+    band:
+    - 0.06
+    - 0.22
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Keenan JD et al. Azithromycin to Reduce Childhood Mortality in Sub-Saharan Africa. N Engl J Med 2018;378:1583-1592
+    location: Table 2 (mortality by country and overall; overall rate ratio about 0.86)
+  - citation: O'Brien KS et al. Azithromycin Distribution and Childhood Mortality. N Engl J Med 2024 (AVENIR, Niger)
+    location: Results, primary outcome table (exact title and table number uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Distribution to infants 1-11 months only averts mainly infant deaths; infants carry roughly 40-60%
+    of 1-59 month deaths in high-mortality Sahel settings and the infant relative effect is about the same as or
+    larger than the 1-59 month effect (MORDOR: largest effect at 1-5 months), so the reduction in all under-five
+    deaths is about half that of ''all'' or less'
+  about:
+    package: infants
+  direction: reduces
+  magnitude:
+    band:
+    - 0.02
+    - 0.12
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Keenan JD et al. Azithromycin to Reduce Childhood Mortality in Sub-Saharan Africa. N Engl J Med 2018;378:1583-1592
+    location: Age subgroup analysis (1-5 months largest reduction, about 25%); figure/table number uncertain
+  - citation: O'Brien KS et al. Azithromycin Distribution and Childhood Mortality. N Engl J Med 2024 (AVENIR, Niger)
+    location: 'Infant-only arm vs placebo (my recollection: smaller, possibly non-significant reduction in 1-59
+      month mortality); uncertain'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: Infants-only costs 30% of 'all' per child under five but buys about half (or more) of its deaths averted,
+    so per dollar it is the more efficient first purchase; at a shadow price set by the marginal all-upgrade, infants
+    beats none in nearly every district
+  about:
+    pair:
+    - infants
+    - none
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: WHO guideline on mass drug administration of azithromycin to children under five years of age to promote
+      child survival. World Health Organization 2020
+    location: Recommendation (targeting infants 1-11 months in high-mortality settings, with resistance monitoring)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: The upgrade from infants to all costs US$1.40 per child under five for the incremental reduction (RR_all
+    - RR_infants); it pays at the shadow price only where baseline mortality is high, so the all/infants choice
+    flips along inc inside its range, with all winning in the highest-mortality districts
+  about:
+    pair:
+    - all
+    - infants
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: Keenan JD et al. Azithromycin to Reduce Childhood Mortality in Sub-Saharan Africa. N Engl J Med 2018;378:1583-1592
+    location: 'Table 2 (larger absolute benefit where mortality is higher: Niger)'
+  - citation: WHO guideline on mass drug administration of azithromycin to children under five years of age to promote
+      child survival. World Health Organization 2020
+    location: Recommendation and remarks (mortality thresholds for eligibility)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Macrolide resistance rises with distribution (more with all than infants), but no trial has shown that
+    a community resistance level erodes the short-run mortality effect; in this engine the effect does not read
+    the resistance index, so the relative reduction should be flat in it. Resistance should enter the rule as a
+    cost or constraint (prefer infants, or exclude, at high index), not via the modelled effect
+  about:
+    package: all
+    feature: resistance_index
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Doan T et al. Macrolide Resistance in MORDOR I - A Cluster-Randomized Trial in Niger. N Engl J Med
+      2019;380:2271-2273
+    location: Main text and figure (higher nasopharyngeal macrolide resistance in azithromycin communities)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: The relative reduction is treated as constant across baseline mortality (multiplicative rate ratio);
+    MORDOR country heterogeneity suggests a larger effect at higher mortality but was not established as effect
+    modification by mortality, so within this inc range the relative effect is roughly flat and benefit scales with
+    inc
+  about:
+    package: all
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Keenan JD et al. Azithromycin to Reduce Childhood Mortality in Sub-Saharan Africa. N Engl J Med 2018;378:1583-1592
+    location: 'Table 2 (country-specific rate ratios: Niger, Malawi, Tanzania)'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: What is the infant-only effect on all under-five deaths relative to the all-children effect (ratio RR_infants/RR_all)?
+    If it is above about 0.3 (the price ratio) infants is the efficient first purchase; below it, all dominates
+    and infants drops out.
+  beliefs:
+  - B2
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: At what resistance index should a district be switched from all to infants or excluded? This needs a
+    declared valuation of resistance (a cost per course or a constraint); the mortality evidence alone cannot set
+    it.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Does the shadow price the harness declares match the marginal all-upgrade under the US$3M budget? A
+    lower one moves the all/infants flip to lower inc.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Does the effect wane with repeated rounds or with rising resistance over 2026-2027 (MORDOR extended
+    follow-up)? Not represented in a constant rate-ratio engine.
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The all package's relative reduction in child deaths lies in 6-22% in at least 80% of usable points; refuted
+    if 20% or fewer do.
+  test:
+    kind: effect_band
+    package: all
+    band:
+    - 0.06
+    - 0.22
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: The infants package's relative reduction in all under-five deaths lies in 2-12% in at least 70% of usable
+    points; refuted if 30% or fewer do.
+  test:
+    kind: effect_band
+    package: infants
+    band:
+    - 0.02
+    - 0.12
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: At the budget's shadow price infants has higher net benefit than none in at least 80% of usable points
+    across the whole inc range; refuted if none wins in that share.
+  test:
+    kind: paired_sign
+    a: infants
+    b: none
+    feature: inc
+    range:
+    - 0.01038
+    - 0.02989
+    sign: positive
+    min_share: 0.8
+- id: H4
+  belief: B4
+  claim: The all/infants transition along inc is located inside inc 0.014-0.026 (mid-range); refuted if its located
+    range lies wholly outside it.
+  test:
+    kind: flip_in
+    a: all
+    b: infants
+    feature: inc
+    range:
+    - 0.014
+    - 0.026
+- id: H5
+  belief: B4
+  claim: In the highest-mortality districts (inc 0.025-0.0299) all beats infants at the shadow price in at least
+    70% of usable points; refuted if infants wins in that share.
+  test:
+    kind: paired_sign
+    a: all
+    b: infants
+    feature: inc
+    range:
+    - 0.025
+    - 0.02989
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: 'The all package''s relative reduction is unrelated to the resistance index: Spearman |rho| interval inside
+    +/-0.1; refuted if it lies outside.'
+  test:
+    kind: effect_direction
+    package: all
+    feature: resistance_index
+    direction: negligible
+    equivalence: 0.1
+- id: H7
+  belief: B6
+  claim: 'The all package''s relative reduction is flat in baseline mortality: Spearman |rho| interval inside +/-0.1;
+    refuted if it lies outside.'
+  test:
+    kind: effect_direction
+    package: all
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
