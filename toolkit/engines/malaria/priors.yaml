@@ -102,8 +102,9 @@ priors:
       4's f_s vs at x), averaged over x uniform on 0-0.30, equals each CI bound: A. gambiae complex 0.511-0.912, A.
       funestus 0.316-0.513; union 0.316-0.912. The moderate category bounds the scale only from below (0.341, 0.400)"
     verified: unverified
-    note: "the upper end is raised from the rule's 0.912 to 1.0, the engine's point value, because a card prior must
-      contain it and v0.17 keeps the v0.16 outputs at the defaults. At scale 1 the rule gives 2.21 (A. gambiae) and
+    note: "the pooled Gleave estimate implies a scale of at most 0.912; the upper end is raised to 1.0, the engine's
+      point value, because a card prior must contain it and v0.17 keeps the v0.16 outputs at the defaults (owner, 13
+      Nov). The default therefore sits at the range's upper edge, outside what the evidence supports. At scale 1 the rule gives 2.21 (A. gambiae) and
       2.81 (A. funestus) against the pooled 1.84 (1.60-2.11): the hut trials say Equation 4 overstates PBO's killing
       gain at high resistance (a principle-4 finding; moving the point value is a later engine version). Uniform
       because the rule gives an interval, not a mode. Estimand: hut mortality ratio of unwashed nets, as Churcher's

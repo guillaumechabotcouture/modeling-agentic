@@ -126,7 +126,11 @@ The pack's PBO trials (B9, B9b, B9c) and their papers play no part in these rang
 - *Result at high resistance.* The A. gambiae complex gives 0.511–0.912, and A. funestus 0.316–0.513. Their union is 0.316–0.912.
 - *Result at moderate resistance.* This category only gives a lower bound (0.341 and 0.400), because Equation 4's gain there cannot reach the CI's upper end at any scale.
 - **A finding for principle 4.** At scale 1 (Equation 4 as published) the rule gives a mortality ratio of 2.21 (A. gambiae) and 2.81 (A. funestus), against the pooled 1.84 (1.60–2.11). The hut trials say Equation 4 overstates PBO's killing gain at high resistance.
-- *Why the drawn range ends at 1.0, not the rule's 0.912.* A card prior must contain the engine's point value, and v0.17 keeps v0.16's outputs at the defaults. Moving the point value into the range changes every PBO output. It is a later engine version, with a refit and the held-out PBO benchmarks scored once afterwards.
+- *Why the drawn range ends at 1.0, not the rule's 0.912* (owner, 13 Nov).
+  - The pooled Gleave estimate implies a scale of at most 0.912.
+  - The range is extended to 1.0 only because a card prior must contain the engine's point value, and v0.17 keeps v0.16's outputs at the defaults.
+  - So the default sits at the range's upper edge, above what the evidence supports.
+  - The principle-4 finding stands. Moving the point value into the range changes every PBO output, so it is a later engine version, with a refit and the held-out PBO benchmarks scored once afterwards.
 
 **`pbo_adv_decay`: LLINEUP, Table 2 (p. 1299).**
 - *Data.* As-treated prevalence ratio, children 2–10 years, PBO against non-PBO LLINs:
