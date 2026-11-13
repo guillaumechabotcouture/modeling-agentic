@@ -214,9 +214,11 @@ class RecalRunner(BM.Runner):
     def checkpoint(self, out_dir: str | None = None, resume_from: str | None = None):
         """Append each finished engine task to <out_dir>/CACHE_NAME as it lands; reuse the matching tasks of
         <resume_from>/CACHE_NAME (load_cache: refused rows fail closed), so a relaunch runs only the missing ones."""
-        self.ckpt = load_cache(resume_from, self.code_sha256()) if resume_from else {}
-        if out_dir:
+        rows = []
+        self.ckpt = load_cache(resume_from, self.code_sha256(), rows) if resume_from else {}
+        if out_dir:      # Codex r1 P2: a fresh file of the accepted rows (atomic), never appended after a cut row
             os.makedirs(out_dir, exist_ok=True)
+            _safe_io().write_nofollow(out_dir, CACHE_NAME, "".join(r + "\n" for r in rows).encode(), atomic=True)
             self.ckpt_out = out_dir
 
     def _map(self, jobs, chunk: int = 300):
@@ -295,7 +297,7 @@ def _task_key(code: str, task) -> str:
     return _sha(_jdump([code, task]))
 
 
-def load_cache(d: str, code: str) -> dict:
+def load_cache(d: str, code: str, accepted: list | None = None) -> dict:
     """{key: result JSON} of <d>/CACHE_NAME. Refused (ValueError, fail closed): no cache file; a malformed row; a row
     from other engine code; a key that is not its task's; a result whose sha256 is not the recorded one. A last row
     without its newline (cut by the stop) is dropped."""
@@ -321,6 +323,8 @@ def load_cache(d: str, code: str) -> dict:
         if _sha(s) != row.get("result_sha256"):
             raise ValueError(f"{p}: row {n}'s result does not match its result_sha256")
         out[row["key"]] = s
+        if accepted is not None:      # the accepted rows as read (checkpoint() rewrites them)
+            accepted.append(ln)
     return out
 
 
