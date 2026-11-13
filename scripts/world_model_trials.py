@@ -6,6 +6,7 @@ are they confirmed, and where does it fail.
     python3 scripts/world_model_trials.py run --total-cap-usd 1000 [--questions FILE] [--only id,id] [--batch B]
         [--limit N] [--trials-dir trials] [--task-cap-usd 2] [--llm-concurrency 5] [--push]
     python3 scripts/world_model_trials.py check-templates [--only id,id]   # inputs only: no LLM, no push
+    python3 scripts/world_model_trials.py rebuild [--only id,id]           # circular flags + build again: no LLM, no engine
     python3 scripts/world_model_trials.py score [--trials-dir trials]      # trials/summary.yaml and summary.md
     python3 scripts/world_model_trials.py --self-test
 
@@ -429,6 +430,11 @@ def seed_problems(seed, ctx) -> list[str]:
                 bad.append(f"hypothesis {h['id']}: feature {n!r} is not one of the sweep's {sorted(ft)}")
     files = [x["file"] for x in ctx.get("datasets") or []]
     for b in seed.get("beliefs") or []:
+        for e in (b.get("evidence") or []) if b.get("source_type") == "literature" else []:
+            harness = [x for x in HARNESS_NAMES if x in str(e.get("citation") or "")]
+            if harness:
+                bad.append(f"belief {b['id']}: literature evidence cites {harness}, a file the harness writes; cite "
+                           "the paper (authors, journal, year) and its table or page")
         if b.get("source_type") != "data":
             continue
         for e in b.get("evidence") or []:
@@ -471,7 +477,7 @@ def circular_tests(run_dir, seed, q) -> dict:
         pk = [t[x] for x in ("package", "a", "b") if t.get(x)]
         comps = {c for p in pk for c in sw.packages.get(p, [])}
         own = [f for f in sw.features if sw.kinds.get(f) == "parameter" and _own(f, comps)]
-        named = [n for n in [t.get("feature")] + list(t.get("where") or {}) + list(t.get("adjust_for") or []) if n]
+        named = [t["feature"]] if t.get("feature") else []      # a test against it; adjusting for it or a region is not
         hit = [n for n in named if n in own]
         if hit:
             out[h["id"]] = f"tests {pk}'s effect against its own effect parameter(s) {hit}"
@@ -724,7 +730,8 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
 # verifiable only with a year and a location naming a table, figure, page or section.
 SCORING = {"lenient_width": 0.6, "lenient_share": 0.6, "lenient_equivalence": 0.3}
 YEAR_RE = re.compile(r"\b(19|20)\d\d\b")
-LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix)", re.I)
+LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix|abstract|results|methods|"
+                    r"discussion|introduction|main text|summary of findings|eq\.|equation)", re.I)
 MODES = ("circular", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
          "inert_feature", "high_confidence_refuted", "contradiction_without_open_question", "citation_not_verifiable")
 
@@ -953,6 +960,28 @@ def check_templates(qs, out_root, max_engine_runs=50) -> dict:
     return out
 
 
+def rebuild(trials_root, qs, anchor_ref=None) -> dict:
+    """The circular classification and the build again for each completed question (after a scoring or flag fix): no
+    LLM call, no engine run, no new registration. The batch, the ledger and its anchor are as they were, so verdicts
+    and registration status are re-derived, not changed. A question that is not complete is skipped."""
+    out = {}
+    for q in qs:
+        rd = os.path.join(trials_root, "runs", q["id"])
+        t = _trial(rd)
+        if t.get("status") != "complete":
+            out[q["id"]] = {"status": "skipped", "why": f"status {t.get('status', 'not started')}"}
+            continue
+        try:
+            t["build"] = build_step(q, rd, anchor_ref if t.get("anchor") else None)
+            t["steps"]["rebuild"] = _now()
+            out[q["id"]] = {"status": "rebuilt", "statuses": t["build"]["statuses"], "circular": t["build"]["circular"]}
+        except Exception as e:  # noqa: BLE001
+            out[q["id"]] = {"status": "failed", "error": f"{type(e).__name__}: {e}"[:300]}
+            t["rebuild_error"] = out[q["id"]]["error"]
+        _save(rd, t)
+    return out
+
+
 def main(argv=None) -> int:
     import argparse
     argv = sys.argv[1:] if argv is None else argv
@@ -960,7 +989,7 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser(prog="world_model_trials.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "check-templates", "score"):
+    for name in ("run", "check-templates", "rebuild", "score"):
         p = sub.add_parser(name)
         p.add_argument("--trials-dir", default=os.path.join(REPO, "trials"))
         if name != "score":
@@ -981,6 +1010,12 @@ def main(argv=None) -> int:
         print(json.dumps(S["overall"], indent=1, default=str))
         return 0
     qs = select(load_questions(a.questions), set(a.only.split(",")) if a.only else None, a.batch, a.limit)
+    if a.cmd == "rebuild":
+        res = rebuild(a.trials_dir, qs, f"refs/remotes/{REMOTE}/{BRANCH}")
+        for i, r in res.items():
+            print(json.dumps({i: r}, default=str))
+        score(a.trials_dir)
+        return 0 if all(r["status"] != "failed" for r in res.values()) else 1
     if a.cmd == "check-templates":
         res = check_templates(qs, os.path.join(a.trials_dir, "checks"), a.max_engine_runs)
         return 0 if all(v["ok"] for v in res.values()) else 1
