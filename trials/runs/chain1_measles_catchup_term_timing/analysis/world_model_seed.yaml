@@ -1,0 +1,320 @@
+beliefs:
+- id: B1
+  mechanism: 'Threshold nonlinearity: SCHOOL removes enough susceptibles at day 0 to push Reff near or below 1 in
+    most districts, so it averts most infections'
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.5
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation and herd immunity threshold (early chapters); exact chapter and page not checked
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: R0 range, results section; exact table not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: SCHOOL protects 5-14 year olds only, so its relative effect rises with the 10-14 gap it reaches and
+    falls with the 1-4 gap it leaves behind (the residual Reff is higher)
+  about:
+    package: school
+    feature: gap_10_14
+  direction: increases
+  magnitude:
+    band:
+    - 0.1
+    - 0.6
+    scale: spearman_rho
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: age-targeted vaccination and the critical immunised fraction; chapter not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: SCHOOL's relative reduction decreases as the 1-4 gap grows, because those susceptibles stay unreached
+    and keep the residual Reff high
+  about:
+    package: school
+    feature: gap_1_4
+  direction: decreases
+  magnitude:
+    band:
+    - -0.6
+    - -0.1
+    scale: spearman_rho
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: critical immunised fraction; chapter not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: COMMUNITY reaches 1-9 year olds, so its relative effect increases with the 1-4 gap. The 70-day delay
+    costs little because ~6 generations from a small seed deplete few susceptibles
+  about:
+    package: community
+    feature: gap_1_4
+  direction: increases
+  magnitude:
+    band:
+    - 0.1
+    - 0.5
+    scale: spearman_rho
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: measles serial interval about 11-12 days, results table; table number not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'The choice between SCHOOL and COMMUNITY follows where the susceptibles are: where the 1-4 gap is large,
+    community removes more susceptibles despite its lower reach and its delay; where it is small, school wins, and
+    it also wins ties on price'
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_1_4
+  direction: flips
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.12
+    - 0.26
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: pooled effectiveness by age at vaccination (lower below 12 months, ~92% at >=12 months); exact table
+      not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Where the 10-14 gap is large (which only school reaches), SCHOOL beats COMMUNITY at the shadow price
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_10_14
+  direction: raises
+  conditions:
+  - feature: gap_10_14
+    range:
+    - 0.1
+    - 0.1396
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: 'homogeneous mixing: each susceptible removed counts equally; chapter not checked'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: 'The size of the importation barely changes SCHOOL''s relative effect: subcritical chains scale with
+    the seed (the ratio cancels), and a supercritical final size hardly depends on it'
+  about:
+    package: school
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation independent of a small initial seed; section not checked
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: A larger importation brings the epidemic forward, so more children are infected before the day-70 community
+    campaign; COMMUNITY's relative effect falls slightly with seed_share
+  about:
+    package: community
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: measles serial interval; table number not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: How does the engine represent the day-70 community campaign? Its card lists only interventions before
+    the epidemic. If the delay is folded into efficacy:community, depletion before day 70 is not mechanistic and
+    B4/B8 cannot be tested as written.
+  beliefs:
+  - B4
+  - B5
+  - B8
+  decision_relevant: true
+- id: Q2
+  question: Where is the baseline Reff (R0 x whole-population susceptible share) in each district? If most districts
+    are subcritical without a campaign, 'none' or the cheaper school option wins on cost alone; if most are well
+    above 1, neither option crosses the threshold and the delay matters more.
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: What are the engine's per-dose efficacy values by option (efficacy:school, efficacy:community)? Their
+    ratio moves the school/community flip on gap_1_4.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: What are the age-band population shares behind the gaps (n_groups / s0_groups)? They set how much each
+    gap weighs in the susceptible pool.
+  beliefs:
+  - B2
+  - B3
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: SCHOOL's relative reduction in infections against none lies in [0.5, 1.0] at >=60% of usable points
+  p: 0.6
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.5
+    - 1.0
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: SCHOOL's relative reduction increases with gap_10_14 (Spearman interval excludes 0, positive)
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_10_14
+    direction: increases
+- id: H3
+  belief: B3
+  claim: SCHOOL's relative reduction decreases with gap_1_4
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_1_4
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: COMMUNITY's relative reduction increases with gap_1_4
+  p: 0.55
+  test:
+    kind: effect_direction
+    package: community
+    feature: gap_1_4
+    direction: increases
+- id: H5
+  belief: B5
+  claim: 'The school/community transition along gap_1_4 lies within [0.12, 0.26]: school below, community above'
+  p: 0.35
+  test:
+    kind: flip_in
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.12
+    - 0.26
+- id: H6
+  belief: B6
+  claim: Where gap_10_14 is in [0.10, 0.1396] and gap_1_4 is below 0.17, SCHOOL's net benefit at the shadow price
+    exceeds COMMUNITY's at >=65% of usable points
+  p: 0.55
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: gap_10_14
+    range:
+    - 0.1
+    - 0.1396
+    sign: positive
+    min_share: 0.65
+    where:
+      gap_1_4:
+      - 0.0512
+      - 0.17
+- id: H7
+  belief: B7
+  claim: 'SCHOOL''s relative reduction is unrelated to seed_share: Spearman rho interval inside +/-0.15'
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: school
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.15
+- id: H8
+  belief: B8
+  claim: COMMUNITY's relative reduction decreases with seed_share (more infections before day 70)
+  p: 0.35
+  test:
+    kind: effect_direction
+    package: community
+    feature: seed_share
+    direction: decreases
