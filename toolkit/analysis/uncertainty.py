@@ -47,16 +47,24 @@ NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own str
 
 
 def posterior_input(spec) -> dict | None:
-    """{path, sha256} of the spec's uncertainty.net_effect_posterior (resolved against the spec), None without it.
-    run.py binds it into the manifest (engine block and the engine artifact's inputs); the Drawer loads it."""
+    """{path, sha256, data} of the spec's uncertainty.net_effect_posterior {path, sha256}: the path resolved against
+    the spec, the owner-signed sha256 and the file's bytes, read once per spec and refused unless their sha256 is the
+    signed one (Codex r1 P1-1, P2-4). The manifest, the engine artifact's input and the Drawer all use these bytes.
+    None without the field."""
     p = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
     if p is None:
         return None
-    if not isinstance(p, str) or not p.strip():
-        raise ValueError("uncertainty.net_effect_posterior: the path of net_effect_fit.py's output file")
-    from toolkit.analysis.artifacts import sha256
-    path = spec.resolve(p)
-    return {"path": path, "sha256": sha256(path)}
+    if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
+            or not isinstance(p.get("sha256"), str):
+        raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
+                         "signed digest}")
+    path, dig = spec.resolve(p["path"]), p["sha256"].lower()
+    got = getattr(spec, "_net_effect_posterior", None)
+    if got is None or (got["path"], got["sha256"]) != (path, dig):
+        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+        got = {"path": path, "sha256": dig, "data": NEF.read_signed(path, dig)}
+        spec._net_effect_posterior = got
+    return got
 
 
 def _pu():
@@ -107,7 +115,8 @@ class Drawer:
             if "engine_parameters" in self.src:
                 rng_.update({k: tuple(v[:2]) for k, v in A.fr.items()})
             held = self.jc_names | set(A.spec["calibration"].get("parameters") or [])
-            self.ne = NEF.load_posterior(post["path"], A.eng, {k: v for k, v in rng_.items() if k not in held})
+            self.ne = NEF.load_posterior(post["path"], A.eng, {k: v for k, v in rng_.items() if k not in held},
+                                         post["sha256"], post["data"])
             self.ne_rng = np.random.default_rng([int(seed), NE_STREAM])
 
     def posterior_provenance(self) -> dict | None:
@@ -450,9 +459,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         data["draw_provenance"] = prov
     ne = D.posterior_provenance()
     if ne is not None:
-        if (posterior_input(A.spec) or {}).get("sha256") != ne["sha256"]:
-            raise ValueError(f"uncertainty: the net-effect posterior {ne['path']} changed while the draws read it")
-        data["net_effect_posterior"] = ne
+        data["net_effect_posterior"] = ne      # the signed sha256 the manifest records: the bytes the draws used
     flagged = sorted((getattr(A, "flagged", None) or {}).values(), key=lambda f: str(f["unit"]))
     if flagged:        # calibration.joint.unmatched: flag: these units' values carry no calibrated match
         data["low_confidence_units"] = flagged

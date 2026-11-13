@@ -350,30 +350,50 @@ def placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> 
     pt = {"point": rows[0], "all_in_band": gate_ok, "calibration_check": {}}
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"all_in_band": True, "disproved_by_verification": [],
                                                                 "calibration_check": {}})
-    yaml.safe_dump(document(eng, reg, {"params": box}, False), open(path, "w"), sort_keys=False)
+    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []}), open(path, "w"),
+                   sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
     """The fit's output cannot be the draws' joint sample (fail closed)."""
 
 
-def load_posterior(path: str, engine, ranges: dict) -> dict:
-    """The fit's accepted joint sample as whole rows: {path, sha256 (of the bytes parsed), names, rows (n x k)}.
-    `ranges` {name: (lo, hi)}: the parameters the uncertainty draws vary and their ranges (engine-card priors from
-    priors.yaml, spec priors, fitted ranges). Refused (PosteriorRefused) when the file is missing, unreadable or not
-    this script's output; a smoke; the acceptance gate did not pass (finalize: sample_status verified, no reason, no
-    failed point); the engine name or code differs from `engine`; the sample is empty or a row lacks a fitted
-    parameter or holds a non-finite or non-numeric value; a column is not in `ranges`; a value is outside its range."""
+def read_signed(path: str, digest) -> bytes:
+    """The file's bytes, read once, if their sha256 is the owner-signed `digest` (Codex r1 P1-1); else refused."""
     import hashlib
-    import math
-    from toolkit.engines.contract import engine_identity
-
-    def no(why):
-        raise PosteriorRefused(f"net-effect posterior {path}: {why}")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise PosteriorRefused(f"net-effect posterior {path}: no signed sha256 (64 hex characters) for the file")
     try:
         data = open(path, "rb").read()
     except OSError as ex:
-        no(f"unreadable ({ex})")
+        raise PosteriorRefused(f"net-effect posterior {path}: unreadable ({ex})") from ex
+    if hashlib.sha256(data).hexdigest() != digest.lower():
+        raise PosteriorRefused(f"net-effect posterior {path}: its bytes are not the ones signed (sha256 "
+                               f"{hashlib.sha256(data).hexdigest()}, signed sha256 {digest})")
+    return data
+
+
+def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None) -> dict:
+    """The fit's accepted joint sample as whole rows: {path, sha256 (the signed one), names, rows (n x k)}.
+    `data`: the bytes already read by read_signed (read once, Codex r1 P2-4); they must match `digest` too.
+    `ranges` {name: (lo, hi)}: the parameters the uncertainty draws vary and their ranges. Refused (PosteriorRefused)
+    when the bytes are not the signed ones or the file is unreadable, malformed or not this script's output; a smoke;
+    the engine name or code differs from `engine`; the sample is empty, or a row lacks a fitted parameter or holds a
+    non-finite or non-numeric value; the acceptance gate fails when finalize() is replayed on the file's own evidence
+    (verified points, which must be sample rows, the chosen point, the calibration grid's edge record), whatever its
+    summary fields say (Codex r1 P1-2); a column is not in `ranges`; a value is outside its priors.yaml card range
+    (whatever `ranges` says, Codex r1 P2-3) or its draw range."""
+    import copy as _copy
+    import hashlib
+    import math
+    from toolkit.engines.contract import engine_identity
+    from toolkit.spec import priors as PR
+
+    def no(why):
+        raise PosteriorRefused(f"net-effect posterior {path}: {why}")
+    data = read_signed(path, digest) if data is None else data
+    if hashlib.sha256(data).hexdigest() != str(digest).lower():
+        no(f"the bytes given are not the ones signed (signed sha256 {digest})")
     try:
         doc = yaml.safe_load(data)
     except yaml.YAMLError as ex:
@@ -382,15 +402,13 @@ def load_posterior(path: str, engine, ranges: dict) -> dict:
         no("not an output of net_effect_fit.py run (producer, joint_region)")
     if doc.get("smoke") is not False:
         no("a smoke run is not evidence")
-    reg = doc["joint_region"]
-    if reg.get("sample_status") != "verified" or reg.get("acceptance") != [] or (reg.get("verified") or {}).get(
-            "failed") != []:
-        no(f"the fit's acceptance gate did not pass (sample_status {reg.get('sample_status')}: {reg.get('acceptance')})")
     have, want = doc.get("engine_identity") or {}, engine_identity(engine)
     for k in ("name", "code_sha256"):
         if have.get(k) != want[k]:
             no(f"fitted under engine {k} {have.get(k)}, this engine's is {want[k]}")
-    names, rows = list((doc.get("plan") or {}).get("params") or {}), reg.get("sample")
+    reg = doc["joint_region"]
+    names = list((doc.get("plan") or {}).get("params") or {})
+    rows = reg.get("sample") or reg.get("sample_unverified")
     if not names or not isinstance(rows, list) or not rows:
         no("no fitted parameters or an empty sample")
     X = []
@@ -400,17 +418,34 @@ def load_posterior(path: str, engine, ranges: dict) -> dict:
         if not all(isinstance(r[k], (int, float)) and not isinstance(r[k], bool) and math.isfinite(r[k]) for k in names):
             no(f"sample row {i} holds a non-numeric or non-finite value: {r}")
         X.append([float(r[k]) for k in names])
+    ver, edge = reg.get("verified") or {}, (doc.get("calibration_grid") or {}).get("at_grid_edge")
+    pts = ver.get("points")
+    if not isinstance(edge, list) or not isinstance(pts, list) or any(
+            not isinstance(p, dict) or p.get("point") not in rows for p in pts):
+        no("the fit's acceptance gate cannot be replayed: a calibration_grid.at_grid_edge record and verified points "
+           "that are rows of the sample are needed")
+    try:
+        rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
+                           edge)
+        why = rr["acceptance"]
+    except (KeyError, TypeError, ValueError, AttributeError) as ex:
+        code, why = 2, [f"{type(ex).__name__}: {ex}"]
+    if code != 0 or reg.get("sample") != rows:
+        no(f"the fit's acceptance gate (finalize, replayed on the file's evidence) does not pass: {why}")
     miss = [k for k in names if k not in ranges]
     if miss:
         no(f"{miss} are not varied by these draws (an engine-card or spec prior, or a fitted parameter under the "
            f"engine_parameters source, and not calibrated); the draws vary {sorted(ranges)}")
     X = np.asarray(X, float)
+    card = PR.load_card(engine)["priors"]
     for j, k in enumerate(names):
-        lo, hi = (float(x) for x in ranges[k])
-        tol = 1e-6 * max(1.0, hi - lo)          # the sample is rounded to 6 decimals
-        if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
-            no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its draw range [{lo}, {hi}]")
-    return {"path": os.path.abspath(path), "sha256": hashlib.sha256(data).hexdigest(), "names": names, "rows": X}
+        for lo, hi, what in ([(card[k].lo, card[k].hi, "priors.yaml range")] if k in card else []) + [
+                (*ranges[k], "draw range")]:
+            lo, hi = float(lo), float(hi)
+            tol = 1e-6 * max(1.0, hi - lo)          # the sample is rounded to 6 decimals
+            if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
+                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its {what} [{lo}, {hi}]")
+    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
 
 
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
