@@ -1997,12 +1997,19 @@ def _self_test() -> int:
             ok(not leaked and ctx.get("datasets") and all("columns" in x and "rows" not in x for x in ctx["datasets"]),
                f"WT10b no input data value is in the seed context (datasets by file and column only): leaked "
                f"{leaked[:5]}, datasets {ctx.get('datasets')}")
-            # batch 2 (2026-11-13): template shadow prices were placed between the options' simulated
-            # cost-effectiveness, so the value would carry the simulation into the seed: it is withheld
-            ok("0.1" not in json.dumps(ctx["sweep"].get("shadow_price")) and ctx["sweep"].get("paired_tests") ==
-               "testable" and isinstance(ctx["sweep"].get("shadow_price"), str),
-               f"WT10d the shadow price's value is withheld from the seed (paired tests are said to be testable): "
-               f"{ctx['sweep'].get('shadow_price')!r}, {ctx['sweep'].get('paired_tests')!r}")
+            # batch 2 withheld the shadow price (templates had placed it from a check sweep). From batch 4 on (owner,
+            # 2026-11-13) it is the pre-registered willingness to pay, question-independent: shown with its basis
+            sp = ctx["sweep"].get("shadow_price") or {}
+            ok(isinstance(sp, dict) and sp.get("value") == 0.1 and "toy threshold" in str(sp.get("basis"))
+               and ctx["sweep"].get("paired_tests") == "testable",
+               f"WT10d the seed is shown the pre-registered willingness to pay as the shadow price, with its basis: "
+               f"{sp!r}")
+            w = prepare({"id": "toy0", "question": "Which package per unit?", "engine": toy_ref,
+                         "template": "data/tpl/toy0", "shadow_price": 0.1, "withhold_shadow_price": True},
+                        os.path.join(d, "withheld"), repo)
+            ok(isinstance(w["sweep"]["shadow_price"], str) and "0.1" not in w["sweep"]["shadow_price"],
+               f"WT10e a question marked withhold_shadow_price (batches 1-3, seeded so) keeps it withheld: "
+               f"{w['sweep']['shadow_price']!r}")
             got = {p: _seed_read_denied("Read", {"file_path": p}, rd) for p in
                    ("decision_spec.yaml", "units.csv", "_task_input.json", "world_model_seed.yaml",
                     os.path.join(REPO, "data", "world_model_trials", "tb_acf", "decision_spec.yaml"),
@@ -2479,6 +2486,20 @@ def _self_test() -> int:
                f"WT21e an imported batch whose design is not the one the question was prepared with is refused: "
                f"{res3['toy1']}")
     tryit("WT21 remote engine", wt21)
+
+    def wt22():
+        S = {"overall": {"questions": {"complete": 1}, "spend_usd": {"llm": 1.0, "compute": 0.0},
+                         "hypotheses": {"written": 1, "circular": 0, "prior_echo": 0, "engine_blind": 0},
+                         "citations": {"questions_checked": 1, "found": 3, "not_found": 2, "not_a_citation": 1,
+                                       "lookup_failed": 0},
+                         "confidence": {}, "failure_modes": {}, "where_to_look": {"decision_relevant": 0,
+                                                                                    "questions": 0}},
+             "questions": {}}
+        md = summary_md(S)
+        ok("set to low" not in md and "2 not found (a flag only" in md and "1 not a citation (lowered to low" in md,
+           "WT22 summary.md states the citation rule in force: not found is a flag only, not a citation lowers "
+           "confidence")
+    tryit("WT22 summary wording", wt22)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
