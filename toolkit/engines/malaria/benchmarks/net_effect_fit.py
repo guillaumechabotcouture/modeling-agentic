@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import sys
 import time
@@ -224,7 +225,6 @@ class RecalRunner(BM.Runner):
         so a resumed run returns exactly what an uninterrupted one does."""
         if self.ckpt is None:
             return BM.Runner._map(self, jobs, chunk)
-        import json
         from concurrent.futures import ProcessPoolExecutor, as_completed
         by = {}
         for n, j in enumerate(jobs):
@@ -277,12 +277,10 @@ def _plain(x):
 
 
 def _jdump(x) -> str:
-    import json
     return json.dumps(x, sort_keys=True, default=_plain)
 
 
 def _rdump(x) -> str:
-    import json
     return json.dumps(x, default=_plain)
 
 
@@ -301,7 +299,6 @@ def load_cache(d: str, code: str) -> dict:
     """{key: result JSON} of <d>/CACHE_NAME. Refused (ValueError, fail closed): no cache file; a malformed row; a row
     from other engine code; a key that is not its task's; a result whose sha256 is not the recorded one. A last row
     without its newline (cut by the stop) is dropped."""
-    import json
     p = os.path.join(d, CACHE_NAME)
     if not os.path.isfile(p):
         raise ValueError(f"--resume-from {d}: no cache file {CACHE_NAME}")
@@ -801,7 +798,6 @@ def _self_test() -> int:
     case("F12", f12)
 
     def f16():
-        import json
         import tempfile
         from toolkit.engines.contract import ToyEngine
         hz = {"start": 0.0, "stop": 2.0, "window": [0.0, 2.0]}
