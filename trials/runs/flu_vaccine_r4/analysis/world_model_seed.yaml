@@ -1,0 +1,301 @@
+beliefs:
+- id: B1
+  mechanism: 'Vaccinating children (the high-contact rows of the contact matrix) cuts transmission to every age
+    group, so the total hospitalisation reduction is much larger than the children''s own share of hospitalisations:
+    with Reff only modestly above 1 (pre-season immunity from last season), removing ~15% of the population''s effective
+    susceptibility from the core transmitters moves the final size a lot.'
+  about:
+    package: vax_children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: Fig. 2 (optimal allocations by outcome measure); exact figure number uncertain
+  - citation: 'Loeb M et al. Effect of influenza vaccination of children on infection rates in Hutterite communities:
+      a randomized trial. JAMA 2010'
+    location: 'Abstract/Results: ~61% protection of unvaccinated community members (indirect effect) at ~80% child
+      coverage'
+  - citation: Mossong J et al. Social contacts and mixing patterns relevant to the spread of infectious diseases.
+      PLoS Med 2008
+    location: Fig. 2 (age-assortative contact matrices, children and teens most contacts)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: The children package's effect rises with the share of children actually reached (more effective immunisation
+    in the core group, and convex near the epidemic threshold).
+  about:
+    package: vax_children
+    feature: reach:vax_children (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: main text, sensitivity to coverage; location uncertain
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B3
+  mechanism: 'All-or-nothing protection: the children package''s effect rises with vaccine efficacy in children
+    (each unit of VE removes a proportional share of vaccinated susceptibles from transmission).'
+  about:
+    package: vax_children
+    feature: efficacy:vax_children
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Osterholm MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines:
+      a systematic review and meta-analysis. Lancet Infect Dis 2012'
+    location: 'Results: pooled TIV efficacy ~59% in adults 18-65; LAIV efficacy ~83% in children 6 mo-7 y'
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: 'Vaccinating 65+ protects mostly directly: this group carries a large share of hospitalisations (highest
+    hospitalisation-per-infection ratio), but it has few contacts, low attack rates and a weaker vaccine response,
+    so the total relative reduction is modest and bounded by coverage cap x VE x 65+ share of hospitalisations.'
+  about:
+    package: vax_65plus
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Goodwin K, Viboud C, Simonsen L. Antibody response to influenza vaccination in the elderly: a quantitative
+      review. Vaccine 2006'
+    location: 'Results: seroconversion/seroprotection markedly lower in elderly than young adults'
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: Fig. 2; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: With the same doses, the children allocation averts more total hospitalisations than the 65+ allocation,
+    because the indirect effect (B1) exceeds the direct gain from the higher hospitalisation ratio in 65+ (B4).
+    Could flip if children's VE is low and reach is low, or if Reff is far above 1 so indirect effects are weak.
+  about:
+    pair:
+    - vax_children
+    - vax_65plus
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: Medlock J, Galvani AP. Optimizing influenza vaccine distribution. Science 2009
+    location: 'Fig. 2: schoolchildren and their parents optimal for most outcomes incl. hospitalisations; location
+      uncertain'
+  - citation: Reichert TA et al. The Japanese experience with vaccinating schoolchildren against influenza. N Engl
+      J Med 2001
+    location: 'Fig. 1/2: excess deaths in elderly fell while schoolchildren were vaccinated (observational)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'Children outrank adults under 65 (vax_older) per dose: adults have fewer contacts and lower attack
+    rates than children, and adult hospitalisation ratios are lower than 65+, so vax_older is beaten by children
+    on indirect effect; it may be intermediate between children and 65+.'
+  about:
+    pair:
+    - vax_children
+    - vax_older
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Teunis P, Kretzschmar M. Using data on social contacts to estimate age-specific transmission
+      parameters for respiratory-spread infectious agents. Am J Epidemiol 2006
+    location: 'Results: highest age-specific transmission in school-age groups; location uncertain'
+  - citation: Bansal S, Pourbohloul B, Meyers LA. A comparative analysis of influenza vaccination programs. PLoS
+      Med 2006
+    location: 'Results: children prioritised under high transmission, elderly under low; location uncertain'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: The 65+ package's effect rises with vaccine efficacy in 65+ (direct all-or-nothing protection).
+  about:
+    package: vax_65plus
+    feature: efficacy:vax_65plus
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Goodwin K, Viboud C, Simonsen L. Antibody response to influenza vaccination in the elderly: a quantitative
+      review. Vaccine 2006'
+    location: Results; location uncertain
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B8
+  mechanism: 'Final-size nonlinearity: if the children allocation pushes Reff below 1 the epidemic is largely prevented
+    and the relative reduction approaches 1 for every group; marginal value of further blocks then collapses, so
+    the optimum spreads remaining blocks to 65+ (mixed allocation). Where this threshold lies depends on last season''s
+    Reff, which the serosurvey attack rates pin down.'
+  about:
+    package: vax_children
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, van Boven M, Lipsitch M. Optimizing infectious disease interventions during an emerging
+      epidemic. Proc Natl Acad Sci USA 2010
+    location: main text, leading-eigenvector targeting; location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is last season's effective reproduction number implied by the serosurvey seroconversion and pre-season
+    susceptibility? Close to 1 makes indirect effects dominate (children win); far above 1 favours direct protection
+    of 65+.
+  beliefs:
+  - B1
+  - B5
+  - B8
+  decision_relevant: true
+- id: Q2
+  question: How large is the gap in VE between children and 65+ in the vaccine_effectiveness file, and are the efficacy
+    draws correlated (no feature is sampled independently)?
+  beliefs:
+  - B3
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: What share of last season's hospitalisations fell in 65+ versus children, and does the hospitalisation-per-infection
+    ratio differ by more than an order of magnitude between them?
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Is the optimum a mixed allocation (children up to the 70% cap, remaining blocks to 65+), which the single-component
+    packages cannot represent? The sweep has no optimised plan.
+  beliefs:
+  - B8
+  - B5
+  decision_relevant: true
+- id: Q5
+  question: Do doses given to already-immune people (about a third or more of children after last season) count
+    as wasted in the engine, which lowers effective coverage?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Vaccinating children reduces total hospitalisations by 30-80% relative to no vaccination at most design
+    points.
+  test:
+    kind: effect_band
+    package: vax_children
+    band:
+    - 0.3
+    - 0.8
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: The children package's relative reduction increases with reach:vax_children; refuted if the rank correlation
+    interval excludes 0 on the negative side or sits inside the null.
+  test:
+    kind: effect_direction
+    package: vax_children
+    feature: reach:vax_children (calibration scale)
+    direction: increases
+- id: H3
+  belief: B3
+  claim: The children package's relative reduction increases with children's vaccine efficacy.
+  test:
+    kind: effect_direction
+    package: vax_children
+    feature: efficacy:vax_children
+    direction: increases
+- id: H4
+  belief: B4
+  claim: Vaccinating 65+ reduces total hospitalisations by only 5-30% relative to no vaccination at most points.
+  test:
+    kind: effect_band
+    package: vax_65plus
+    band:
+    - 0.05
+    - 0.3
+    min_share: 0.7
+- id: H5
+  belief: B5
+  claim: Across the sampled reach of children, vax_children beats vax_65plus on net benefit at the shadow price
+    in at least 75% of points; refuted if vax_65plus wins in at least 75%.
+  test:
+    kind: paired_sign
+    a: vax_children
+    b: vax_65plus
+    feature: reach:vax_children (calibration scale)
+    range:
+    - 0.4043030195869506
+    - 0.6965257519856095
+    sign: positive
+    min_share: 0.75
+- id: H6
+  belief: B6
+  claim: vax_children beats vax_older on net benefit in at least 75% of points across the sampled reach.
+  test:
+    kind: paired_sign
+    a: vax_children
+    b: vax_older
+    feature: reach:vax_children (calibration scale)
+    range:
+    - 0.4043030195869506
+    - 0.6965257519856095
+    sign: positive
+    min_share: 0.75
+- id: H7
+  belief: B7
+  claim: The 65+ package's relative reduction increases with 65+ vaccine efficacy.
+  test:
+    kind: effect_direction
+    package: vax_65plus
+    feature: efficacy:vax_65plus
+    direction: increases
