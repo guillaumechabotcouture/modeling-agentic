@@ -4,7 +4,8 @@
 # cloud/configs/ and scripts/compute.py, and every type seen on our clusters (budget.OBSERVED_VM_TYPES), is here.
 #   bound = usd_per_hour x margin + vcpu x credits_per_vcpu_hour x 0.061 (USD per Coiled credit)
 # usd_per_hour: Azure pay-as-you-go Linux list prices (US regions, approximate, 2026), per vCPU-hour: Dv5 and Dsv5
-# $0.048, Dasv5 $0.043, Esv5 $0.063, Easv5 $0.0565, Edsv5 $0.072. coiled 1.135.6 states no per-instance credit
+# $0.048, Dasv5 $0.043, Esv5 $0.063, Easv5 $0.0565, Edsv5 $0.072, Fsv2 $0.0423 (compute-optimised; Coiled picks it
+# for a --cpu request without --memory, e.g. Standard_F8s_v2 on cluster 2376181, 2026-11-13). coiled 1.135.6 states no per-instance credit
 # charge in its source. Evidence from our own records (read-only, 2026-11-11): the P6 cluster, 25 x Standard_E8s_v5
 # workers + 1 x Standard_D2_v5 scheduler for about 2.6 h, billed 510.3 credits (about 1.0 credit per vCPU-hour)
 # and cloud_total_cost $32.11 (about list price x hours). So credits_per_vcpu_hour 1.5 and margin 1.25 sit about
@@ -60,3 +61,11 @@ types:
   Standard_E48ds_v5:   {vcpu: 48, usd_per_hour: 3.456}
   Standard_E64ds_v5:   {vcpu: 64, usd_per_hour: 4.608}
   Standard_E96ds_v5:   {vcpu: 96, usd_per_hour: 6.912}
+  Standard_F2s_v2:        {vcpu: 2, usd_per_hour: 0.0846}
+  Standard_F4s_v2:        {vcpu: 4, usd_per_hour: 0.1692}
+  Standard_F8s_v2:        {vcpu: 8, usd_per_hour: 0.3384}
+  Standard_F16s_v2:       {vcpu: 16, usd_per_hour: 0.6768}
+  Standard_F32s_v2:       {vcpu: 32, usd_per_hour: 1.3536}
+  Standard_F48s_v2:       {vcpu: 48, usd_per_hour: 2.0304}
+  Standard_F64s_v2:       {vcpu: 64, usd_per_hour: 2.7072}
+  Standard_F72s_v2:       {vcpu: 72, usd_per_hour: 3.0456}
