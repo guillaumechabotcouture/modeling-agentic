@@ -1,0 +1,269 @@
+beliefs:
+- id: B1
+  mechanism: 'Routine reaches only children under five, so its relative reduction falls as the immunity gap in ages
+    5-9 (and 10-14) grows: those cohorts alone keep Reff above 1 after routine, and the epidemic proceeds among
+    them. This is the "gap too large for prevention in the youngest alone" rule.'
+  about:
+    package: routine
+    feature: gap_5_9
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: chapters on vaccination and herd immunity threshold 1 - 1/R0 (exact pages not verified)
+  - citation: Minetti A et al. Lessons and challenges for measles control from unexpected large outbreak, Malawi.
+      Emerging Infectious Diseases, 2013
+    location: age distribution of cases (older children and adolescents a large share); table not verified
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: 'Higher transmission (contact_rate, i.e. R0 toward 18) lowers routine''s relative reduction in districts
+    already above threshold: the residual susceptible pool after routine stays further above 1/R0, so the post-routine
+    epidemic is larger relative to the baseline epidemic.'
+  about:
+    package: routine
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.12
+    - 0.2
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infectious
+      Diseases, 2017'
+    location: R0 commonly 12-18 (Results / abstract)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation (exact pages not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Response at day 42 still arrives early in the epidemic from a single importation (about 3-4 generations,
+    tens of cases in a district of 150k-600k), and removes ~80% (85% reach x seroconversion ~0.9-0.95) of susceptibles
+    aged 1-9; the residual pool (infants, 10-14, unreached 15%) is usually near or below threshold, so response
+    averts most infections in districts with a substantial epidemic.
+  about:
+    package: response
+  direction: reduces
+  magnitude:
+    band:
+    - 0.75
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.15
+    - 0.287
+  - feature: gap_5_9
+    range:
+    - 0.1
+    - 0.2
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. Journal of the Royal Society Interface, 2008'
+    location: results on cases averted vs response delay (figure not verified)
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. Journal of Infectious Diseases, 2011'
+    location: pooled VE ~84% at 9-11 mo, ~92% at >=12 mo (summary tables)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'Per-person outcomes do not depend on district population size: homogeneous mixing and per-capita final
+    size make the relative reduction scale-free (one importation is a negligible fraction of 150k-600k residents).
+    Population only scales cost and infections averted in proportion.'
+  about:
+    package: routine
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: mass-action final-size relation is per capita (exact pages not verified)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B5
+  mechanism: 'Routine vs response flips along the older-child gap: where gap_5_9 is low, routine alone pushes Reff
+    near or below 1 at 2.6x lower cost and wins on net benefit; where gap_5_9 is high, only response (which covers
+    ages 5-9) removes enough susceptibles, and its larger absolute aversion outweighs its extra $0.80/resident at
+    the budget''s shadow price. Flip roughly at gap_5_9 0.08-0.16 (location depends on the shadow price, the age
+    shares, and the other gaps).'
+  about:
+    pair:
+    - response
+    - routine
+  direction: flips
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.08
+    - 0.16
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: herd immunity threshold argument (exact pages not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'In districts where the total susceptible share is clearly above threshold (high gap_1_4 and gap_5_9),
+    response beats routine on net benefit at the shadow price: its relative reduction is much larger and the baseline
+    burden is large, so the absolute infections averted per resident outweigh the $0.80 extra cost.'
+  about:
+    pair:
+    - response
+    - routine
+  direction: increases
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.15
+    - 0.287
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. Journal of the Royal Society Interface, 2008'
+    location: response benefit grows with outbreak size if delivered early (figure not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What are the districts' age shares (infants, 1-4, 5-9, 10-14) behind s0_groups? My threshold arithmetic
+    assumes a high-fertility pyramid; a flatter one moves every flip point.
+  beliefs:
+  - B1
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: What is the budget's shadow price? It sets where the costlier response overtakes routine, and whether
+    low-gap (Reff < 1) districts get anything at all.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Does routine's efficacy include infants under 9-12 months (maternal antibody interference lowers seroconversion),
+    and is it modelled as all-or-nothing among susceptibles reached at random?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: Does the engine treat the final size as deterministic from a single seed, or weight it by p_major? In
+    near-threshold districts this decides whether the baseline burden is near zero or substantial.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q5
+  question: How many infections occur before day 42 at R0 18 and the highest gaps (does the response delay ever
+    cost a meaningful share)?
+  beliefs:
+  - B3
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Routine's relative reduction decreases as gap_5_9 increases (older susceptibles untouched by an under-5
+    drive).
+  test:
+    kind: effect_direction
+    package: routine
+    feature: gap_5_9
+    direction: decreases
+- id: H2
+  belief: B2
+  claim: Where gap_5_9 is high (0.12-0.20), routine's relative reduction decreases with contact_rate (higher R0
+    leaves the residual pool further above threshold).
+  test:
+    kind: effect_direction
+    package: routine
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: Where gap_1_4 >= 0.15 and gap_5_9 >= 0.10, response averts 75-100% of infections in at least 70% of usable
+    points despite the 42-day delay.
+  test:
+    kind: effect_band
+    package: response
+    band:
+    - 0.75
+    - 1.0
+    min_share: 0.7
+- id: H4
+  belief: B4
+  claim: Routine's relative reduction is unrelated to district population (|rho| bound within 0.15).
+  test:
+    kind: effect_direction
+    package: routine
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+- id: H5
+  belief: B5
+  claim: The routine-to-response transition along gap_5_9 lies within 0.08-0.16.
+  test:
+    kind: flip_in
+    a: response
+    b: routine
+    feature: gap_5_9
+    range:
+    - 0.08
+    - 0.16
+- id: H6
+  belief: B6
+  claim: Where gap_1_4 >= 0.15 and gap_5_9 is 0.12-0.20, response beats routine on net benefit at the shadow price
+    in at least 65% of usable points.
+  test:
+    kind: paired_sign
+    a: response
+    b: routine
+    feature: gap_5_9
+    range:
+    - 0.12
+    - 0.2
+    sign: positive
+    min_share: 0.65
