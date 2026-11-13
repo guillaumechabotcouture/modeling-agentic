@@ -446,10 +446,10 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
     `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record;
-    `evidence`: the spec's evidence-dossier binding (toolkit/spec/evidence_dossier.py bind) when the caller already
-    made it from the same spec bytes; otherwise this entry point makes it (every signing path checks and binds)."""
+    `evidence`: the binding the caller made (toolkit/spec/evidence_dossier.py bind); never trusted: this entry point
+    recomputes it from the captured spec and the dossier and refuses one that differs."""
     import hashlib
-    from lib.safe_io import write_nofollow, LinkRefused
+    from lib.safe_io import write_nofollow, LinkRefused, read_nofollow
     captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
     shas = {f: hashlib.sha256(b).hexdigest() if b is not None else None for f, b in captured.items()}
     for f, want in (expect or {}).items():
@@ -479,7 +479,23 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         from toolkit.spec import signoff as SO
         SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
         from toolkit.spec import evidence_dossier as ED       # F6: refused here too, whoever signs
-        evidence = evidence or ED.bind(run_dir, captured[DECISION_SPEC])
+        # #218 review round 2: never trust a binding the caller hands in: recompute it from the captured spec and the
+        # dossier, and refuse one that differs (an empty one, or one made for another spec or dossier)
+        mine = ED.bind(run_dir, captured[DECISION_SPEC])
+        if evidence is not None and evidence != mine:
+            raise ValueError("the evidence binding supplied is not the one this spec and its dossier give: read the "
+                             "dossier and the sheet again before signing")
+        evidence = mine
+        if mine["record"]["dossier"]:     # the dossier the owner signs is the one the sheet showed
+            try:
+                sheet_text = read_nofollow(run_dir, SO.SHEET)[0].decode("utf-8", "replace")
+            except (FileNotFoundError, LinkRefused, OSError):
+                sheet_text = None
+            src = SO.sheet_sources(sheet_text)
+            if not isinstance(src, dict) or src.get("evidence_dossier_sha256") != mine["record"]["sha256"]:
+                raise ValueError(f"{SO.SHEET} was generated from another evidence dossier, or shows none (it is "
+                                 "stale): regenerate the sheet (python3 toolkit/spec/signoff.py sheet <run_dir> "
+                                 "--write) and read it again")
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence

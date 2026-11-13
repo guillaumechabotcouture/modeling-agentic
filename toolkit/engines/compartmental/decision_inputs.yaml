@@ -36,5 +36,14 @@ decision_inputs:
       - {kind: unit_attribute, name: seed, if_on_card: true, why: "initial infections: the epidemic's timing against
           the component's day"}
       - {kind: unit_attribute, name: intro, if_on_card: true, why: "the introduction group"}
+# What every arm uses to turn infections into the decision's outcome (#218 review round 2): the configured outcome's
+# ratio per infection, a unit attribute (ratio:<outcome>, one per group) or, with per_group_parameters
+# [ratio:<outcome>], one parameter per group; required whenever the primary or headline outcome is a ratio outcome.
+outcome_inputs:
+  "*":
+    - {kind: unit_attribute, name: "ratio:{outcome}", if_on_card: true, why: "the outcome per infection, one per group:
+        it converts infections prevented into the outcome"}
+    - {kind: parameter, name: "ratio:{outcome}:*", if_on_card: true, why: "the outcome per infection in each group
+        (per_group_parameters)"}
 not_decision_inputs:
   "unit_attribute:N": "group sizes: population counts from the units table, the same in every arm"

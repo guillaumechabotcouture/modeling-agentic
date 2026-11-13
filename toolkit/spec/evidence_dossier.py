@@ -133,19 +133,6 @@ def _vocab(ref: str, config: dict) -> dict:
     return {"parameter": [p.name for p in e.parameters()], "unit_attribute": list(e.describe().unit_attributes)}
 
 
-def _priors(ref: str) -> dict:
-    """{parameter: [lo, hi]} of the engine's card priors (priors.yaml beside its card), for prior_range tests."""
-    import yaml
-    d = _engine_dir(ref)
-    p = os.path.join(d, "priors.yaml") if d else None
-    if not p or not os.path.isfile(p):
-        return {}
-    with open(p, encoding="utf-8") as f:
-        doc = yaml.safe_load(f) or {}
-    return {n: q.get("range") for n, q in ((doc.get("priors") or {}) if isinstance(doc, dict) else {}).items()
-            if isinstance(q, dict)}
-
-
 def _engines(raw: dict, run_dir: str | None) -> tuple[list, list]:
     eng = raw.get("engine")
     if isinstance(eng, str) and eng != "auto":
@@ -195,7 +182,32 @@ def required_inputs(raw: dict, run_dir: str | None = None) -> tuple[dict, list]:
         if bad:
             probs.append(f"engine {ref}: its decision inputs are malformed: " + "; ".join(bad[:5]))
             continue
-        vocab, priors = None, _priors(ref)
+        try:
+            oi = engine_outcome_inputs(ref)
+            bad = DI.outcome_problems(oi)
+        except Exception as e:  # noqa: BLE001
+            oi, bad = None, [f"{type(e).__name__}: {e}"]
+        if bad:
+            probs.append(f"engine {ref}: its outcome inputs are malformed: " + "; ".join(bad[:5]))
+            continue
+        cache = {"vocab": None}
+
+        def add(ins, tag, where):
+            try:
+                if cache["vocab"] is None and any(i.get("if_on_card") or "*" in i["name"] for i in ins):
+                    cache["vocab"] = _vocab(ref, cfg)
+                ins = DI.resolve(ins, cache["vocab"])
+            except Exception as e:  # noqa: BLE001 -- an input the configured card cannot resolve is a refusal
+                probs.append(f"engine {ref}, {where}: {type(e).__name__}: {e}")
+                return
+            for i in ins:
+                e = req.setdefault(f"{i['kind']}:{i['name']}", {"kind": i["kind"], "name": i["name"],
+                                                                "why": i.get("why", ""), "used_by": [], "engines": []})
+                if tag not in e["used_by"]:
+                    e["used_by"].append(tag)
+                if (ref, cfg) not in e["engines"]:
+                    e["engines"].append((ref, cfg))
+        active = False
         for c in comps:
             m = emap.get(c)
             for k, v in (m.items() if isinstance(m, dict) else []):
@@ -204,34 +216,75 @@ def required_inputs(raw: dict, run_dir: str | None = None) -> tuple[dict, list]:
                     probs.append(f"engine {ref} declares no decision inputs for component {k} (options component "
                                  f"{c}): its effect cannot be checked (fail closed)")
                     continue
-                try:
-                    if vocab is None and any(i.get("if_on_card") or "*" in i["name"] for i in ins):
-                        vocab = _vocab(ref, cfg)
-                    ins = DI.resolve(ins, vocab)
-                except Exception as e:  # noqa: BLE001 -- an input the configured card cannot resolve is a refusal
-                    probs.append(f"engine {ref}, component {k}: {type(e).__name__}: {e}")
-                    continue
-                for i in ins:
-                    e = req.setdefault(f"{i['kind']}:{i['name']}", {
-                        "kind": i["kind"], "name": i["name"], "why": i.get("why", ""), "used_by": [],
-                        "prior_range": priors.get(i["name"]) if i["kind"] == "parameter" else None})
-                    tag = f"{c} ({k}={v})"
-                    if tag not in e["used_by"]:
-                        e["used_by"].append(tag)
+                active = active or DI.is_active(decl, k, v)
+                add(ins, f"{c} ({k}={v})", f"component {k}")
+        if active:                      # what every arm uses to compute the decision's outcome, whatever the components
+            outs = _decision_outcomes(raw)
+            add(DI.outcome_inputs(oi, outs), "outcome " + ", ".join(outs), "outcome inputs")
     return req, probs
 
 
-def _test_problems(key: str, r: dict, rng: list, tid: str, tests: dict, raw: dict) -> list[str]:
+def _decision_outcomes(raw: dict) -> list:
+    """The outcomes the decision turns on: the primary objective outcome and the headline's."""
+    o = [((raw.get("objective") or {}).get("outcome")),
+         (((raw.get("deliverable") or {}).get("headline") or {}).get("outcome"))]
+    return [x for i, x in enumerate(o) if isinstance(x, str) and x and x not in o[:i]]
+
+
+def engine_outcome_inputs(ref: str):
+    """An engine's `outcome_inputs` (decision_inputs.yaml beside its card, else a DECISION_OUTCOME_INPUTS attribute or
+    a base class's file); None when none is declared."""
+    d0 = _engine_dir(ref)
+    if d0 and DI.load(d0) is not None:
+        return DI.load_outcome_inputs(d0)
+    from toolkit.spec import schema
+    for k in schema.engine_class(ref).__mro__:
+        if k.__dict__.get("DECISION_OUTCOME_INPUTS") is not None:
+            return k.__dict__["DECISION_OUTCOME_INPUTS"]
+        if k.__dict__.get("DECISION_INPUTS") is not None:
+            return None
+        f = getattr(sys.modules.get(k.__module__), "__file__", None)
+        if f and DI.load(os.path.dirname(f)) is not None:
+            return DI.load_outcome_inputs(os.path.dirname(f))
+    return None
+
+
+_DRAWN: dict = {}
+
+
+def _drawn_ranges(raw: dict, run_dir: str | None, ref: str, cfg: dict) -> dict:
+    """{parameter: (lo, hi)} the draw plan draws for this spec on this engine (toolkit/spec/priors.py drawn: card
+    and spec priors, ranges on engine_parameters values, minus exclusions); {} when it cannot be computed."""
+    import json
+    key = json.dumps([raw.get("uncertainty"), raw.get("engine_parameters"), raw.get("decision_units"), ref, cfg],
+                     sort_keys=True, default=str)
+    if key not in _DRAWN:
+        try:
+            from toolkit.spec import priors as PRI, schema
+            s = schema.Spec(dict(raw, engine={"ref": ref, **({"config": dict(cfg)} if cfg else {})}),
+                            run_dir or ROOT, None)
+            _DRAWN[key] = {n: (float(p.lo), float(p.hi)) for n, p in PRI.drawn(s).items()}
+        except Exception:  # noqa: BLE001 -- not computable: nothing is drawn (fail closed)
+            _DRAWN[key] = {}
+    return _DRAWN[key]
+
+
+def _test_problems(key: str, r: dict, rng: list, tid: str, tests: dict, raw: dict,
+                   run_dir: str | None = None) -> list[str]:
     """Why decision test `tid` does not vary input `key` over the chosen range `rng` (empty: it does)."""
     if r["kind"] != "parameter":
         return [f"entry {key}: no decision test type varies a {r['kind']} (parameter_value varies engine parameters): "
                 "choose a value with its rule, and declare the range in the spec as a limitation"]
     name = r["name"]
     if tid == f"prior_range_{name}":
-        pri = (((raw.get("uncertainty") or {}).get("priors") or {}).get(name) or {}).get("range") or r.get("prior_range")
-        if not (isinstance(pri, list) and len(pri) == 2):
-            return [f"entry {key}: {tid} is generated only for a parameter with a prior, and {name} has none"]
-        vals = pri
+        # generated only for a prior the draw plan draws (an excluded prior gets no range test): every engine that
+        # may run the spec must draw it, over a range covering the chosen one
+        engines = r.get("engines") or []
+        got = [_drawn_ranges(raw, run_dir, ref, cfg).get(name) for ref, cfg in engines]
+        if not engines or any(g is None for g in got):
+            return [f"entry {key}: {tid} is generated only for a prior the draw plan draws, and {name} is not drawn "
+                    "(no prior, or excluded by uncertainty.excluded)"]
+        vals = [max(g[0] for g in got), min(g[1] for g in got)]
     else:
         t = tests.get(tid)
         if t is None:
@@ -246,7 +299,7 @@ def _test_problems(key: str, r: dict, rng: list, tid: str, tests: dict, raw: dic
     return []
 
 
-def _entry_problems(key: str, e, r: dict, tests: dict, raw: dict) -> list[str]:
+def _entry_problems(key: str, e, r: dict, tests: dict, raw: dict, run_dir: str | None = None) -> list[str]:
     if not isinstance(e, dict) or not e:
         return [f"entry {key} is blank: give model_value, model_source, observations or no_data, and chosen"]
     bad = [f"entry {key}: model_value is blank" for _ in [0] if _blank(e.get("model_value"))]
@@ -286,11 +339,52 @@ def _entry_problems(key: str, e, r: dict, tests: dict, raw: dict) -> list[str]:
         elif not _text(e.get("decision_test")):
             bad.append(f"entry {key}: a range needs its decision_test (one that varies this input over the range)")
         else:
-            bad += _test_problems(key, r, rg, e["decision_test"].strip(), tests, raw)
+            bad += _test_problems(key, r, rg, e["decision_test"].strip(), tests, raw, run_dir)
+    return bad + _value_problems(key, e, r, ch, raw)
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _executable(r: dict, raw: dict):
+    """(the value the spec itself runs for this input, where it is set), or (None, None): an engine_parameters value
+    for a parameter, a value binding (decision_units.engine_attributes {value}) for a unit attribute."""
+    if r["kind"] == "parameter":
+        e = ((raw.get("engine_parameters") or {}) if isinstance(raw.get("engine_parameters"), dict) else {}).get(r["name"])
+        where = f"engine_parameters.{r['name']}.value"
+    elif r["kind"] == "unit_attribute":
+        ea = (raw.get("decision_units") or {}).get("engine_attributes") if isinstance(raw.get("decision_units"), dict) \
+            else None
+        e = ea.get(r["name"]) if isinstance(ea, dict) else None
+        where = f"decision_units.engine_attributes.{r['name']}.value"
+    else:
+        return None, None
+    v = e.get("value") if isinstance(e, dict) else None
+    return (v, where) if _num(v) else (None, None)
+
+
+def _value_problems(key: str, e: dict, r: dict, ch: dict, raw: dict) -> list[str]:
+    """The dossier's model and chosen values reconcile with the value the spec runs: a number the spec sets must be
+    the model value and the chosen value, or lie in the chosen range (#218 review round 2)."""
+    x, where = _executable(r, raw)
+    if x is None:
+        return []
+    bad = []
+    mv = e.get("model_value")
+    if _num(mv) and not math.isclose(mv, x, rel_tol=1e-9, abs_tol=1e-12):
+        bad.append(f"entry {key}: model_value {mv} is not the value the spec runs ({where} = {x})")
+    if ch.get("range") is not None:
+        rg = ch["range"]
+        if isinstance(rg, list) and len(rg) == 2 and all(_num(y) for y in rg) and not rg[0] <= x <= rg[1]:
+            bad.append(f"entry {key}: the value the spec runs ({where} = {x}) is outside the chosen range {rg}")
+    elif ch.get("value") is not None and not (_num(ch["value"]) and math.isclose(ch["value"], x, rel_tol=1e-9,
+                                                                               abs_tol=1e-12)):
+        bad.append(f"entry {key}: chosen.value {ch['value']!r} is not the value the spec runs ({where} = {x})")
     return bad
 
 
-def check(raw: dict, data: bytes | None, req: dict, rel: str = DOSSIER_FILE) -> list[str]:
+def check(raw: dict, data: bytes | None, req: dict, rel: str = DOSSIER_FILE, run_dir: str | None = None) -> list[str]:
     """Why the dossier bytes do not cover `req` (empty: they do). Absent, unparseable or malformed: refused."""
     import yaml
     if data is None:
@@ -309,7 +403,7 @@ def check(raw: dict, data: bytes | None, req: dict, rel: str = DOSSIER_FILE) -> 
         if key not in ins:
             bad.append(f"no entry for {key} (used by {', '.join(req[key]['used_by'])})")
         else:
-            bad += _entry_problems(key, ins[key], req[key], tests, raw)
+            bad += _entry_problems(key, ins[key], req[key], tests, raw, run_dir)
     return bad
 
 
@@ -323,7 +417,7 @@ def _refusals(raw: dict, run_dir: str | None, data: bytes | None) -> tuple[list,
             return probs, req
         return probs + [f"the options need {len(req)} decision input(s) and the spec names no evidence dossier "
                         f"(evidence: {{dossier: {DOSSIER_FILE}}}): " + ", ".join(sorted(req))], req
-    return probs + check(raw, data, req, rel), req
+    return probs + check(raw, data, req, rel, run_dir), req
 
 
 def refusals(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]:
@@ -678,7 +772,9 @@ def _self_test_round1(ok, T) -> None:
         try:
             v = DI.card_vocabulary(p)
             cov = DI.coverage_problems(DI.load(p), DI.load_excluded(p),
-                                       {"parameter": v["parameters"], "unit_attribute": list(v["unit_attributes"])})
+                                       {"parameter": v["parameters"], "unit_attribute": list(v["unit_attributes"])},
+                                       DI.load_outcome_inputs(p))
+            cov += DI.outcome_problems(DI.load_outcome_inputs(p))
         except Exception as e:  # noqa: BLE001
             cov = [f"{type(e).__name__}: {e}"]
         ok(cov == [], f"ED-E3 {d_}: every card parameter and unit attribute is an input or excluded with a reason: "

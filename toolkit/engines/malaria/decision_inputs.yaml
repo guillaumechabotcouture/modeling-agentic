@@ -82,6 +82,32 @@ decision_inputs:
       - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria: the deaths treatment
           averts"}
       - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+# What every arm uses to turn infections into the decision's outcome (#218 review round 2), required whenever the
+# spec's primary or headline outcome depends on it, whatever the components. Read off model.py and engine.py:
+# treated clinical episodes clear infection (model.py, p.ft), so cm_ft shapes transmission and every outcome; deaths
+# are severe episodes x a fatality set by severe-care access min(1, severe_access_add + ft) between the treated and
+# untreated rates (model.py, the severe-outcome step); DALYs are deaths x life expectancy by age plus episodes x
+# disability weight x duration (engine.py, the DALY step).
+outcome_inputs:
+  "*":
+    - {kind: unit_attribute, name: cm_ft, why: "effective treatment: treated episodes clear infection, so it shapes
+        transmission and every outcome in every arm"}
+  deaths:
+    - {kind: parameter, name: severe_access_add, why: "severe-care access on top of effective treatment: the fatality
+        of each severe episode"}
+    - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria"}
+    - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+  dalys:
+    - {kind: parameter, name: severe_access_add, why: "severe-care access: the deaths behind years of life lost"}
+    - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria"}
+    - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+    - {kind: parameter, name: dw_moderate, why: "disability weight of an uncomplicated episode"}
+    - {kind: parameter, name: dw_severe, why: "disability weight of a severe episode"}
+    - {kind: parameter, name: dur_moderate_d, why: "duration of an uncomplicated episode"}
+    - {kind: parameter, name: dur_severe_d, why: "duration of a severe episode"}
+    - {kind: parameter, name: le_u5, why: "life expectancy at death under 5: years of life lost"}
+    - {kind: parameter, name: le_5_14, why: "life expectancy at death 5-14"}
+    - {kind: parameter, name: le_15p, why: "life expectancy at death 15 and over"}
 not_decision_inputs:
   "unit_attribute:m0": "transmission intensity: calibrated per unit to the prevalence target, whose frame the spec
     declares (the calibration is its evidence)"
@@ -100,10 +126,3 @@ not_decision_inputs:
   "parameter:n_agents": "a numerical setting"
   "parameter:burnin_years": "a numerical setting (its convergence evidence is benchmarks/equilibration.yaml)"
   "parameter:init_eir_per_m0": "a numerical setting of the start (its sensitivity is benchmarks/guess_sensitivity.yaml)"
-  "parameter:dw_moderate": "a DALY weight: it values every option's outcomes alike, not an intervention's effect"
-  "parameter:dw_severe": "a DALY weight (as dw_moderate)"
-  "parameter:dur_moderate_d": "an episode duration for DALYs (as dw_moderate)"
-  "parameter:dur_severe_d": "an episode duration for DALYs (as dw_moderate)"
-  "parameter:le_u5": "life expectancy for years of life lost (as dw_moderate)"
-  "parameter:le_5_14": "life expectancy for years of life lost (as dw_moderate)"
-  "parameter:le_15p": "life expectancy for years of life lost (as dw_moderate)"

@@ -1032,6 +1032,17 @@ def _self_test() -> int:
             ok("evidence dossier" in w1 and w2 and status(d) != "signed",
                f"ED14 a caller's binding is never trusted: an empty one and one made for another spec are refused "
                f"({w1[:120]} | {w2[:120]})")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            ED.toy_dossier_spec(other)
+            open(os.path.join(other, "evidence_dossier.yaml"), "a").write("# another dossier\n")
+            foreign = ED.bind(other, open(os.path.join(other, SPEC), "rb").read())
+            w3 = brief_refusal(d, evidence=foreign)
+            w4 = brief_refusal(d, evidence={"files": {}, "record": {"required": [], "dossier": None, "sha256": None}})
+            ok("binding supplied" in w3 and "binding supplied" in w4 and status(d) != "signed",
+               f"ED14b with a signable spec, a binding made from another dossier, or an empty one, is refused, not "
+               f"recorded: {w3[:100]} | {w4[:100]}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"ED13-ED14 the brief's signer: {type(e).__name__}: {e}")
     if fails:

@@ -83,14 +83,56 @@ def resolve(inputs: list, vocab: dict | None) -> list:
     return out
 
 
-def coverage_problems(decl: dict, excluded: dict, vocab: dict) -> list[str]:
-    """The card's parameters and unit attributes ("<kind>:<name>") that no component declares as an input (a glob or
-    {component} pattern covers what it matches) and that are not excluded with a reason: what the declaration may
-    have omitted. `excluded`: {"<kind>:<name>": reason}."""
+def outcome_inputs(oi, outcomes) -> list:
+    """The outcome-level inputs (`outcome_inputs: {<outcome> | "*": [inputs]}`) the decision's outcomes need: what
+    every arm uses to compute them (treatment, fatality, DALY weights), required whatever the components. "*" applies
+    to every outcome; "{outcome}" in a name is the outcome's name."""
+    out, seen = [], set()
+    for o in outcomes:
+        for i in list((oi or {}).get("*") or []) + list((oi or {}).get(o) or []):
+            if isinstance(i, dict) and isinstance(i.get("name"), str):
+                j = dict(i, name=i["name"].replace("{outcome}", str(o)))
+                if (j["kind"], j["name"]) not in seen:
+                    seen.add((j["kind"], j["name"]))
+                    out.append(j)
+    return out
+
+
+def outcome_problems(oi) -> list[str]:
+    """Problems of an `outcome_inputs` declaration (None: none declared)."""
+    if oi is None:
+        return []
+    if not isinstance(oi, dict):
+        return ["outcome_inputs: a mapping {outcome | \"*\": [inputs]}"]
+    bad = []
+    for o, ins in oi.items():
+        bad += _inputs_problems(f"outcome_inputs.{o}", ins, {})
+        if not ins:
+            bad.append(f"outcome_inputs.{o}: give its inputs, or leave the outcome out")
+    return bad
+
+
+def load_outcome_inputs(engine_dir: str):
+    """decision_inputs.yaml's `outcome_inputs`, or None."""
+    import yaml
+    p = os.path.join(engine_dir, FILE)
+    if not os.path.isfile(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    return doc.get("outcome_inputs") if isinstance(doc, dict) else None
+
+
+def coverage_problems(decl: dict, excluded: dict, vocab: dict, oi=None) -> list[str]:
+    """The card's parameters and unit attributes ("<kind>:<name>") that no component or outcome declares as an input
+    (a glob, {component} or {outcome} pattern covers what it matches) and that are not excluded with a reason: what
+    the declaration may have omitted. `excluded`: {"<kind>:<name>": reason}."""
     import fnmatch
     pats = [(i["kind"], i["name"].replace("{component}", "*")) for d in (decl or {}).values() if isinstance(d, dict)
             for i in list(d.get("inputs") or []) + [x for xs in (d.get("by_value") or {}).values() for x in xs or []]
             if isinstance(i, dict) and isinstance(i.get("name"), str)]
+    pats += [(i["kind"], i["name"].replace("{outcome}", "*")) for ins in (oi or {}).values() for i in ins or []
+             if isinstance(i, dict) and isinstance(i.get("name"), str)]
     ex = {k for k, why in (excluded or {}).items() if isinstance(why, str) and why.strip()}
     return [f"{k}:{n}" for k in ("parameter", "unit_attribute") for n in vocab.get(k) or []
             if f"{k}:{n}" not in ex and not any(pk == k and fnmatch.fnmatchcase(n, pn) for pk, pn in pats)]
@@ -181,6 +223,12 @@ def component_inputs(decl, component: str, value) -> list | None:
     bv = {str(k): v for k, v in (d.get("by_value") or {}).items()}
     return [dict(i, name=str(i.get("name", "")).replace("{component}", str(component)))
             for i in list(d.get("inputs") or []) + list(bv.get(str(value)) or []) if isinstance(i, dict)]
+
+
+def is_active(decl, component: str, value) -> bool:
+    """Whether component=value has an effect: declared, and not one of its inactive values."""
+    d = decl.get(component, decl.get("*")) if isinstance(decl, dict) else None
+    return isinstance(d, dict) and str(value) not in map(str, d.get("inactive") or [])
 
 
 def card_vocabulary(engine_dir: str) -> dict:
