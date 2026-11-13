@@ -1,0 +1,210 @@
+# World model v0 (seed), written before any simulation. Built from the question text, the engine card and
+# literature; no input data values, engine effect values or results were read.
+#
+# Decision: for each of 12 districts choose none / A_1to4 / B_1to9 under a US$850,000 budget (early-2026 campaign),
+# comparator none, outcome infections (final size of one importation-seeded outbreak, homogeneous-mixing SIR,
+# R0 ~ U(12, 18)). Benefit per cost = baseline burden (driven by the district's effective reproduction number
+# Reff = R0 x s) x relative reduction (whether the campaign moves Reff below 1) against cost (US$1.20 per targeted
+# child + US$22,000 fixed per district).
+#
+# Back-of-envelope arithmetic from the question's stated parameters (not from data values):
+# - Per-dose protection of a reached susceptible = 0.85 x 0.93 ~ 0.79 of targeted susceptibles removed.
+# - Infants (<1 y, 3% of population) are all susceptible: they alone give Reff ~ 0.36-0.54; no option touches them.
+# - Herd threshold susceptible share = 1/R0 ~ 0.056-0.083. The sweep's mean_susceptible range (0.057-0.100) straddles
+#   it, so districts sit close to the epidemic threshold and the final size is strongly non-linear in s.
+# - A removes ~0.79 x 0.12 x susc_1_4 of the population; B adds ~0.79 x 0.15 x susc_5_9. With susc_5_9 up to ~0.25,
+#   B can remove roughly 2-3x the susceptibles A removes, at ~2.25x the per-child cost (fixed cost equal).
+# What drives the choice: (1) relative burden — whether the district is supercritical at baseline (mean_susceptible
+# x R0 > 1); (2) whether A alone, or only B, pushes Reff below 1, which turns on the 5-9 year susceptibility gap.
+# Price differences matter only where both options cross the threshold (then A wins on cost).
+
+beliefs:
+  - id: B1
+    mechanism: >-
+      Threshold behaviour: a campaign's relative reduction in final-size infections is near 1 when it moves Reff
+      below 1, and modest when Reff stays above 1. Higher R0 (contact_rate) makes it harder for A, which leaves the
+      5-9 and infant susceptibles untouched, to cross the threshold in high-susceptibility districts, so A's
+      relative reduction falls as contact_rate rises.
+    about: {package: A_1to4, feature: "contact_rate (calibration scale)"}
+    direction: decreases
+    magnitude: {band: [0.2, 0.95], scale: relative_reduction}
+    conditions: [{feature: mean_susceptible, range: [0.075, 0.1004]}]
+    source_type: literature
+    evidence:
+      - {citation: "Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond A 1927", location: "final-size relation (section on epidemic size); exact page not recalled"}
+      - {citation: "Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious disease. Bull Math Biol 2006", location: "main result, eq. for final size; equation number not recalled"}
+      - {citation: "Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993", location: "threshold 1 - 1/R0 discussion; page not recalled"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B2
+    mechanism: >-
+      A_1to4 does not reach susceptible 5-9 year olds; the larger the 5-9 immunity gap, the larger the share of
+      district susceptibility A leaves behind and the higher the post-campaign Reff, so A's relative reduction
+      decreases with susc_5_9.
+    about: {package: A_1to4, feature: susc_5_9}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press 1991", location: "chapters on vaccination and age-structured immunity (ch. 5 area); location from memory, uncertain"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B3
+    mechanism: >-
+      B_1to9 removes ~79% of susceptibles aged 1-9; residual susceptibility (all infants plus the 10-14 gap plus
+      the unreached 21% of 1-9s) is usually below 1/R0 even in the most susceptible districts, so B averts nearly
+      all of the seeded outbreak where the baseline is supercritical.
+    about: {package: B_1to9}
+    direction: reduces
+    magnitude: {band: [0.85, 1.0], scale: relative_reduction}
+    conditions: [{feature: mean_susceptible, range: [0.085, 0.1004]}]
+    source_type: literature
+    evidence:
+      - {citation: "Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infect Dis 2017", location: "results / summary of R0 estimates; table number not recalled (the run's 12-18 range is stated in the question)"}
+      - {citation: "Kermack WO, McKendrick AG. Proc R Soc Lond A 1927", location: "final-size relation; page not recalled"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B4
+    mechanism: >-
+      Where the 5-9 immunity gap is large in a high-susceptibility district, only B crosses the threshold; the
+      infections B additionally averts (several per 100 population) far exceed the shadow-priced extra cost of
+      reaching the 5-9 cohort, so B beats A on net benefit.
+    about: {pair: [B_1to9, A_1to4]}
+    direction: raises
+    conditions: [{feature: mean_susceptible, range: [0.075, 0.1004]}, {feature: susc_5_9, range: [0.15, 0.2533]}]
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans. OUP 1991", location: "vaccination / critical coverage discussion; location uncertain"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B5
+    mechanism: >-
+      Where the 5-9 gap is small, B's extra removal (~0.79 x 0.15 x susc_5_9 of the population) lowers Reff by only
+      ~0.05-0.15; A then captures most of the benefit at under half the per-child cost, so A beats B on net benefit.
+      Exception: districts sitting right at the threshold after A, where the last increment matters.
+    about: {pair: [A_1to4, B_1to9]}
+    direction: raises
+    conditions: [{feature: susc_5_9, range: [0.0333, 0.08]}]
+    source_type: literature
+    evidence:
+      - {citation: "Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993", location: "threshold discussion; page not recalled"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B6
+    mechanism: >-
+      The A-versus-B preference flips along susc_5_9: A at low 5-9 gaps, B at high ones; the flip lies roughly in the
+      middle of the sweep's range, where B's extra removal is large enough to take Reff from above to below 1.
+    about: {pair: [A_1to4, B_1to9]}
+    direction: flips
+    conditions: [{feature: susc_5_9, range: [0.08, 0.18]}]
+    source_type: literature
+    evidence:
+      - {citation: "Ma J, Earn DJD. Bull Math Biol 2006", location: "final-size formula; equation number not recalled"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B7
+    mechanism: >-
+      Districts whose baseline susceptibility is low enough that Reff < 1 for most of the R0 range have only a minor
+      outbreak from one importation (expected size ~1/(1-Reff) cases), so infections averted per person are
+      negligible and the campaign's shadow-priced cost exceeds its benefit: none beats A_1to4 there.
+    about: {pair: [none, A_1to4]}
+    direction: raises
+    conditions: [{feature: mean_susceptible, range: [0.0568, 0.065]}]
+    source_type: literature
+    evidence:
+      - {citation: "Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993", location: "threshold discussion; page not recalled"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B8
+    mechanism: >-
+      Routine MCV1/MCV2 effectiveness sets the cohort immunity gaps the campaign fills; field effectiveness of one
+      dose given at >=12 months is ~85-95%, lower at 9-11 months; administrative coverage tends to overstate true
+      coverage, so serosurvey-measured susceptibility (susc_1_4, susc_5_9) is the better basis than coverage-derived
+      susceptibility when they disagree (principle 5).
+    about: {component: A_1to4}
+    direction: none
+    source_type: literature
+    evidence:
+      - {citation: "Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review of published literature. J Infect Dis 2011", location: "summary of median VE by age at vaccination; table number not recalled"}
+    confidence: medium
+    decision_relevant: false
+
+open_questions:
+  - id: Q1
+    question: >-
+      Does the engine's expected-cases outcome weight the deterministic final size by the probability of a major
+      outbreak (p_major), or report the final size alone? Near the threshold this changes subcritical districts'
+      burden and so whether none or A wins there.
+    beliefs: [B1, B7]
+    decision_relevant: true
+  - id: Q2
+    question: >-
+      How large is the 10-14 year immunity gap (not in any option)? It raises the residual susceptibility floor and
+      decides whether B crosses the threshold at the top of the R0 range.
+    beliefs: [B3, B4]
+    decision_relevant: true
+  - id: Q3
+    question: >-
+      Do the 2025 serosurvey and coverage-derived (cohort_history) susceptibility agree once ageing by one year and
+      administrative over-reporting are accounted for? A systematic gap would shift districts across the threshold.
+    beliefs: [B8, B2]
+    decision_relevant: true
+  - id: Q4
+    question: >-
+      District population sizes set how much the US$22,000 fixed cost weighs per person; small districts may lose
+      to none even when supercritical, and the budget may not cover B everywhere it wins.
+    beliefs: [B4, B7]
+    decision_relevant: true
+  - id: Q5
+    question: >-
+      The sweep samples no feature independently (unit features co-vary across districts), so a paired difference
+      along susc_5_9 may partly reflect mean_susceptible; is the A/B flip separable from overall susceptibility?
+    beliefs: [B6]
+    decision_relevant: true
+
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: >-
+      In high-susceptibility districts, A_1to4's relative reduction falls as contact_rate (R0) rises; refuted if
+      the Spearman interval lies entirely above 0.
+    test: {kind: effect_direction, package: A_1to4, feature: "contact_rate (calibration scale)", direction: decreases}
+  - id: H2
+    belief: B2
+    claim: >-
+      A_1to4's relative reduction decreases with the 5-9 susceptibility gap; refuted if the interval lies above 0.
+    test: {kind: effect_direction, package: A_1to4, feature: susc_5_9, direction: decreases}
+  - id: H3
+    belief: B3
+    claim: >-
+      In districts with mean_susceptible >= 0.085, B_1to9 averts 85-100% of infections in at least 70% of usable
+      points; refuted if 30% or fewer are in that band.
+    test: {kind: effect_band, package: B_1to9, band: [0.85, 1.0], min_share: 0.7}
+  - id: H4
+    belief: B4
+    claim: >-
+      Where susc_5_9 >= 0.15 in high-susceptibility districts, B_1to9 beats A_1to4 on net benefit at the shadow
+      price in at least 70% of usable points.
+    test: {kind: paired_sign, a: B_1to9, b: A_1to4, feature: susc_5_9, range: [0.15, 0.2533], sign: positive, min_share: 0.7}
+  - id: H5
+    belief: B5
+    claim: >-
+      Where susc_5_9 <= 0.08, A_1to4 beats B_1to9 on net benefit in at least 60% of usable points.
+    test: {kind: paired_sign, a: A_1to4, b: B_1to9, feature: susc_5_9, range: [0.0333, 0.08], sign: positive, min_share: 0.6}
+  - id: H6
+    belief: B6
+    claim: >-
+      The A/B transition along susc_5_9 lies within 0.08-0.18; refuted if it is located entirely outside that range.
+    test: {kind: flip_in, a: A_1to4, b: B_1to9, feature: susc_5_9, range: [0.08, 0.18]}
+  - id: H7
+    belief: B7
+    claim: >-
+      In the least susceptible districts (mean_susceptible <= 0.065), none beats A_1to4 on net benefit at the
+      shadow price in at least 60% of usable points.
+    test: {kind: paired_sign, a: none, b: A_1to4, feature: mean_susceptible, range: [0.0568, 0.065], sign: positive, min_share: 0.6}
