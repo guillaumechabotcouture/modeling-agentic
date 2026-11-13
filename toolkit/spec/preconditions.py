@@ -190,6 +190,11 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
                            "cannot rescale one given the other")
         if tc & wa:
             return False, f"components and with_any overlap ({sorted(tc & wa)})"
+        maps = effect.get("maps")
+        off = sorted(s_ for s_ in tc if not isinstance(maps, dict) or set(maps.get(s_) or ()) != {resc})
+        if off:
+            return False, (f"the rescaled spec component(s) {off} must deliver exactly the benchmark's rescaled engine "
+                           f"component {resc!r} (a bundle with another intervention would rescale it too)")
         if not (tc and wa and tc <= x and wa <= y):
             return False, (f"does not rescale the departed benchmark's own pair in its arms' orientation ({resc} "
                            f"given the other: components within {sorted(x)}, with_any within {sorted(y)}); it "
@@ -290,7 +295,7 @@ def _self_test() -> int:
         # round 4: before the run, inputs only. A parameter test spans the declared range (>= 2 distinct values);
         # an interaction test targets the failing benchmark's own interaction (its benchmark and component pair)
         IX = {"components": {"b"}, "benchmark": "T2", "estimand": "interaction", "pair": {"a": {"a"}, "b": {"b"}},
-              "rescaled": "b"}           # the benchmark's arms rescale b given a (a11 / a10)
+              "rescaled": "b", "maps": {"a": {"a"}, "b": {"b"}, "c": set()}}           # the benchmark's arms rescale b given a (a11 / a10)
         PB = {"components": {"b"}, "parameters": ["eff_b"]}
         cases = [  # (name, test, effect, spec change, expected)
             ("interaction reachable, the benchmark's own pair", I(v_ok), IX, {}, True),
@@ -300,6 +305,10 @@ def _self_test() -> int:
              dict(IX, components={"a"}), {}, False),
             ("with_any reaching beyond the pair (b given a or c)", I(v_ok, ("b",), ("a", "c")), IX,
              {"options": {"components": {"a": {}, "b": {}, "c": {}}}}, False),
+            ("a rescaled component bundled with another intervention (b plus x)", I(v_ok), dict(IX, maps={
+                "b": {"b", "x"}, "a": {"a"}}), {}, False),
+            ("the rescaled component maps to the rescaled engine component only", I(v_ok), dict(IX, maps={
+                "b": {"b"}, "a": {"a"}}), {}, True),
             ("a bundle delivering both benchmark components", I(v_ok, ("ab",), ("ab",)),
              dict(IX, pair={"a": {"ab"}, "b": {"ab"}}, components={"ab"}),
              {"options": {"components": {"ab": {}}, "engine_map": {"ab": {"a": 1, "b": 1}}}}, False),
