@@ -757,8 +757,8 @@ def _daly_check(outcomes, cfg, anchored) -> tuple[dict | None, str | None]:
     model's YLL x the deaths factor) wherever the model reports YLL (totals and engine age groups)."""
     dp = cfg["daly_parts"] if isinstance(cfg["daly_parts"], dict) else {}
     dn, de = dp.get("dalys", "dalys"), dp.get("deaths", "deaths")
-    if dn not in anchored or de not in outcomes:
-        return None, None
+    if dn not in anchored or (de not in outcomes and not dp.get("yll_per_death_by_age")):
+        return None, None       # #220 final: with the split declared, the check runs whether deaths are reported or not
     if not dp.get("yll_per_death_by_age"):
         return None, (f"{dn} is anchored directly and {de} is reported: daly_parts.yll_per_death_by_age (each engine "
                       f"age group's years of life lost per death) is needed to check that anchored {dn} stay at or "
@@ -813,17 +813,22 @@ def finish_parts(row, info, weights) -> None:
     from its window deaths, with the all-ages total when every group has it."""
     dn, de = info["dalys"], info["deaths"]
     for d in row["y"].values():
-        if YLL_OUT in d and YLD_OUT in d and dn in d:
+        if YLL_OUT in d and YLD_OUT in d:
             d[dn] = d[YLL_OUT] + d[YLD_OUT]
     for bg in (row.get("y_group") or {}).values():
-        if YLL_OUT in bg and YLD_OUT in bg and dn in bg:
-            bg[dn] = {g: bg[YLL_OUT].get(g, 0.0) + bg[YLD_OUT].get(g, 0.0) for g in bg[dn]}
+        if YLL_OUT in bg and YLD_OUT in bg:
+            bg[dn] = {g: bg[YLL_OUT].get(g, 0.0) + bg[YLD_OUT].get(g, 0.0) for g in set(bg[YLL_OUT]) | set(bg[YLD_OUT])}
     for arm, bg in (row.get("burden_group") or {}).items():
         yl = {P: float(v) * weights[P] for P, v in (bg.get(de) or {}).items() if P in weights}
-        if yl:
+        if yl:              # #220 final: the window's YLL and YLD per group (YLD = window DALYs - YLL, at least 0)
             bg[YLL_OUT] = yl
-            if set(yl) == set(weights) and de in ((row.get("burden") or {}).get(arm) or {}):
-                row["burden"][arm][YLL_OUT] = sum(yl.values())
+            if dn in bg:
+                bg[YLD_OUT] = {P: max(float(bg[dn][P]) - yl[P], 0.0) for P in yl if P in bg[dn]}
+            b = (row.get("burden") or {}).get(arm) or {}
+            if set(yl) == set(weights) and de in b:
+                b[YLL_OUT] = sum(yl.values())
+                if dn in b:
+                    b[YLD_OUT] = max(float(b[dn]) - b[YLL_OUT], 0.0)
 
 
 def window_weights(spec, info, value) -> dict:
@@ -1009,7 +1014,7 @@ def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_
                 d[YLD_OUT] = max(yld, 0.0)
             if len(item) == 5:
                 for o, x in d.items():
-                    item[3][o][item[4]] = x
+                    item[3].setdefault(o, {})[item[4]] = x
         for k, c in (out[i].get("cost") or {}).items():
             if k in sk:
                 continue
@@ -1769,6 +1774,89 @@ class _StepEngine:
                         {"age_shares": {"all": 1.0}})
 
 
+class _DALYEngine:
+    """Self-test engine (#220 final): deaths, cases and DALYs per person (DALYs = 0.5 x cases + 30 x deaths, the
+    engine's own split), window metrics of each; a package with any component lowers them by 40%."""
+
+    def describe(self):
+        from toolkit.engines.contract import EngineCard
+        return EngineCard("dalyeng", "1", ["toy"], {"a": [0, 1], "b": [0, 1]}, {"x": "unused"},
+                          {"per_capita": ["cases", "deaths", "dalys"], "windows": ["cases_w", "deaths_w", "dalys_w"],
+                           "cost_drivers": []}, ["all"], {})
+
+    def parameters(self):
+        return []
+
+    def run(self, params, unit, package, horizon, seed):
+        from toolkit.engines.contract import Outcomes
+        f = 0.6 if getattr(package, "components", None) else 1.0
+        cas, dth = 0.2 * f, 0.004 * f
+        pc = {"cases": {"all": cas}, "deaths": {"all": dth}, "dalys": {"all": 0.5 * cas + 30 * dth}}
+        return Outcomes(pc, {n: {"cases_w": cas * (w[1] - w[0]), "deaths_w": dth * (w[1] - w[0]),
+                                 "dalys_w": (0.5 * cas + 30 * dth) * (w[1] - w[0])}
+                             for n, w in (horizon.windows or {}).items()}, {}, {"age_shares": {"all": 1.0}})
+
+
+def _self_test_anchor_r5(ok, refused):
+    """#220 final round, on real DirectModel output: a directly anchored DALY run with model-window groups succeeds;
+    the DALY check runs whenever the model carries the YLL/YLD split, deaths reported or not."""
+    import copy
+    import tempfile
+    from toolkit.spec import schema
+    from toolkit.analysis.model import DirectModel
+    head = ",".join(COLUMNS + ("role", "interval", "group_by"))
+    with tempfile.TemporaryDirectory() as d:
+        raw0 = yaml.safe_load(open(schema.toy_spec(d)))
+        raw0["calibration"]["target_source_id"] = "SURVEY-T"
+        raw0["uncertainty"]["excluded"].append({"kind": "burden_anchor", "reason": "self-test"})
+
+        def spec(outs, rows, wm):
+            open(os.path.join(d, "r.csv"), "w").write("\n".join([head] + rows) + "\n")
+            r = copy.deepcopy(raw0)
+            r["outcomes_reported"] = outs
+            r["validation"] = {"burden": {"csv": "r.csv", "window": [1, 2], "window_metrics": wm,
+                                          "daly_parts": {"dalys": "dalys", "deaths": "deaths",
+                                                         "yll_per_death_by_age": {"all": 30}}}}
+            sp = schema.Spec(r, d)
+            sp._engine = _DALYEngine()
+            return sp
+
+        def row(rid, outcome, v):
+            return f"{rid},*,,{outcome},count,,1,{v},{v},{v},estimated,synthetic,ratio,,,SRC-{rid},,anchor,,"
+        wm = {"cases": "cases_w", "deaths": "deaths_w", "dalys": "dalys_w"}
+        s0 = spec(["dalys", "cases", "deaths"], [row("w", "cases", 1)], wm)
+        o0 = DirectModel(s0).predict({i: None for i in s0.unit_ids()}, {}, s0.unit_ids())
+        tot = {o: sum(o0[i]["burden"]["none"][o] for i in s0.unit_ids()) for o in ("cases", "deaths", "dalys")}
+        sp = spec(["dalys", "cases", "deaths"], [row("w", "cases", tot["cases"]), row("x", "deaths", 1.2 * tot["deaths"]),
+                                                 row("y", "dalys", 1.2 * tot["dalys"])], wm)
+        A = types_ns(sp)
+        try:
+            out = DirectModel(sp).predict({i: None for i in A.ids}, {}, A.ids)
+            fx = anchor_factors(A, config(sp), load_references(sp)[0], out, "none")
+            apply_anchor(fx, out, A.ids)
+            bg = out[A.ids[0]]["burden_group"]["none"]
+            ok(YLD_OUT in bg and YLL_OUT in bg and abs(out[A.ids[0]]["y"]["none"]["dalys"]
+                                                       - out[A.ids[0]]["y"]["none"][YLL_OUT]
+                                                       - out[A.ids[0]]["y"]["none"][YLD_OUT]) < 1e-9,
+               "BA45 (#220 final P1) a directly anchored DALY run on real DirectModel output (model-window groups "
+               "included) succeeds; the window groups carry YLL and YLD")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"BA45 (#220 final P1) a directly anchored DALY run on real DirectModel output: "
+                      f"{type(e).__name__}: {e}")
+        # DALYs and cases reported, deaths not: the model still carries the split, so the check runs
+        s2 = spec(["dalys", "cases"], [row("w", "cases", tot["cases"]), row("y", "dalys", tot["dalys"])],
+                  {"cases": "cases_w", "dalys": "dalys_w"})
+        A2 = types_ns(s2)
+        try:
+            o2 = DirectModel(s2).predict({i: None for i in A2.ids}, {}, A2.ids)
+            f2 = anchor_factors(A2, config(s2), load_references(s2)[0], o2, "none")
+            refused(lambda: apply_anchor(f2, copy.deepcopy(o2), A2.ids, factors={"w": 1.0, "y": 0.5}), "YLD",
+                    "DALYs and cases reported, deaths not, DALY factor 0.5 (anchored DALYs below the model's YLL)",
+                    "BA46 (#220 final P1)")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"BA46 (#220 final P1) the DALY check without reported deaths: {type(e).__name__}: {e}")
+
+
 def _self_test_s25b(ok, th):
     """F6 S2-5b: a model window over past years, report-only rows, rows with no published interval."""
     import copy
@@ -2384,6 +2472,7 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
        f"BA32 (#220 r2) an engine whose DALY level differs from the emulator's (factors 0.5 and 1): the unused filler "
        f"package keeps the emulator's anchoring and is not checked, so the comparison runs ({err!r})")
     _self_test_anchor_r4(ok, spec, row, chk, three, refused)
+    _self_test_anchor_r5(ok, refused)
     _ = np
 
 

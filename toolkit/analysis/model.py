@@ -349,9 +349,12 @@ class EmulatorModel:
             ev.append({"unit": ids[j], "package": "*", "kind": "extrapolation",
                        "inputs": [self.input_names[c] for c in np.flatnonzero(outside[j])]})
         y = [{"y": {k: {} for k in self.packages}, "cost": {k: {} for k in self.packages}, "diag": {}} for _ in ids]
+        skip = self.yll["dalys"] if self.yll and BV.YLD_OUT in self.outcomes else None
         for P, pm in self.pops.items():
             popv = np.array([float(u[pm["column"]]) for u in rows])
             for o in self.outcomes:
+                if o == skip:       # #220 final: DALYs are YLL + YLD (finish_parts); the DALY GP is never predicted
+                    continue
                 lb = self.gps[("base", P, o)].predict(X)
                 b = np.exp(lb + E[:, self.error.col[("emu", "base", P, o)]] if E is not None else lb)
                 for j in range(n):
@@ -837,6 +840,21 @@ def _self_test() -> int:
                and "YLL + YLD" in em.accuracy.get("dalys_from", "") and em.accuracy["reduction_mae_median"] != gp_mae,
                f"MD6 (#220 r4) the reported DALY accuracy is the held-out error of DALYs = predicted YLL + YLD "
                f"({em.accuracy['reduction_mae_median']:.3g}), not the DALY GP's ({gp_mae:.3g})")
+            class _Out:         # the superseded DALY GP, forced far outside its bounds
+                def predict(self, X):
+                    return np.full(len(X), 1.5)
+            saved_g = {k: v for k, v in em.gps.items() if k[0] == "red" and k[2] == "dalys"}
+            try:
+                for k in saved_g:
+                    em.gps[k] = _Out()
+                o7 = em.predict({i: 0.3 for i in ids}, {"eff_a": 0.5, "eff_b": 0.3}, ids)
+                ev7 = [e for e in em.last_events if e.get("outcome") == "dalys"]
+                ok7 = not ev7 and all(abs(o7[i]["y"][k]["dalys"] - o7[i]["y"][k][Y] - o7[i]["y"][k][D]) <= 1e-9
+                                      * max(o7[i]["y"][k]["dalys"], 1) for i in ids for k in pk)
+            finally:
+                em.gps.update(saved_g)
+            ok(ok7, f"MD7 (#220 final P2) the superseded DALY GP is not predicted: forced out of bounds it raises no "
+                    f"correction event, and DALYs stay YLL + YLD ({len(ev7)} events)")
             ok(np.allclose(tw, want) and good and n_ok == 4 and em.error is not None,
                "MD5 the emulator learns YLL from each design point's own weight parameter, predicts DALYs = YLL + YLD "
                "with both parts non-negative in every emulator-error draw, and anchored DALYs stay above anchored YLL")
