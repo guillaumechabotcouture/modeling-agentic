@@ -1,0 +1,300 @@
+beliefs:
+- id: B1
+  mechanism: Maternal Tdap in pregnancy transfers anti-pertussis IgG across the placenta and protects infants before
+    their own primary series; vaccine effectiveness against infant pertussis in the first 2-3 months is about 80-93%,
+    and higher against hospitalisation. Most infant pertussis hospitalisations occur under 3 months. At about 70%
+    coverage of births, the population-level reduction in first-year hospitalisations is roughly coverage x VE x
+    share of hospitalisations in the protected window.
+  about:
+    package: maternal
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.75
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Amirthalingam G et al. Effectiveness of maternal pertussis vaccination in England: an observational
+      study. Lancet 2014'
+    location: 'Abstract/Results: VE about 91% (95% CI 84-95) in infants <3 months; exact table not recalled'
+  - citation: Baxter R et al. Effectiveness of Vaccination During Pregnancy to Prevent Infant Pertussis. Pediatrics
+      2017
+    location: 'Abstract: VE about 91% in first 2 months, about 69% over the first year; exact table not recalled'
+  - citation: 'Skoff TH et al. Impact of the US Maternal Tetanus, Diphtheria, and Acellular Pertussis Vaccination
+      Program on Preventing Pertussis in Infants <2 Months of Age: A Case-Control Evaluation. Clinical Infectious
+      Diseases 2017'
+    location: 'Abstract: VE about 78% against pertussis, about 90% against hospitalisation, infants <2 months'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Cocooning (Tdap to parents and household contacts after birth) protects the infant only indirectly,
+    by preventing infection in vaccinated contacts; acellular vaccines prevent disease better than infection and
+    transmission, protection starts about 2 weeks after the dose (after birth, so the youngest infants are exposed),
+    mothers and siblings are frequent sources, and uptake beyond mothers is low. Observational evaluations found
+    little or no measurable reduction in infant pertussis.
+  about:
+    package: cocoon
+  direction: reduces
+  magnitude:
+    band:
+    - 0.0
+    - 0.3
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Healy CM et al. Evaluation of the impact of a pertussis cocooning program on infant pertussis infection.
+      Pediatric Infectious Disease Journal 2015
+    location: 'Abstract: no significant reduction in infant pertussis after postpartum maternal Tdap programme'
+  - citation: Castagnini LA et al. Impact of maternal postpartum tetanus and diphtheria toxoids and acellular pertussis
+      immunization on infant pertussis infection. Clinical Infectious Diseases 2012
+    location: 'Abstract: no significant protection; table not recalled'
+  - citation: 'Wiley KE et al. Sources of pertussis infection in young infants: a review of key evidence informing
+      targeting of the cocoon strategy. Vaccine 2013'
+    location: 'Review summary: mothers and siblings are the commonest identified sources'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: 'Maternal Tdap is both cheaper per infant (4 vs 6 USD) and more protective than cocooning, so at any
+    shadow price it has the higher net benefit than cocoon in every district: cocoon is dominated.'
+  about:
+    pair:
+    - maternal
+    - cocoon
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Skowronski DM et al. The number needed to vaccinate to prevent infant pertussis hospitalization and
+      death through parent cocoon immunization. Clinical Infectious Diseases 2012
+    location: 'Abstract: NNV to prevent one infant hospitalisation in the order of 1,000+ parents'
+  - citation: 'Amirthalingam G et al. Effectiveness of maternal pertussis vaccination in England: an observational
+      study. Lancet 2014'
+    location: Abstract/Results
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: Adding cocooning to maternal Tdap buys only the cocoon effect on the residual (unprotected) risk, under
+    the engine's multiplicative independent-action rule roughly (1 - maternal reduction) x cocoon reduction, i.e.
+    a few percent of baseline, for 6 USD more per infant; marginal cost-effectiveness is perhaps 5-20 times worse
+    than maternal alone, so at a shadow price set by a binding budget the add-on loses in nearly all districts.
+  about:
+    pair:
+    - cocoon+maternal
+    - maternal
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Skowronski DM et al. The number needed to vaccinate to prevent infant pertussis hospitalization and
+      death through parent cocoon immunization. Clinical Infectious Diseases 2012
+    location: Abstract
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: medium
+- id: B5
+  mechanism: The engine applies relative reductions multiplicatively to the baseline, so a package's relative reduction
+    should not vary with the district's baseline hospitalisation rate (inc); inc changes averted counts, not the
+    relative effect. (In reality protection in the first months could vary with force of infection, but no trial
+    measures that.)
+  about:
+    package: maternal
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Amirthalingam G et al. Effectiveness of maternal pertussis vaccination in England: an observational
+      study. Lancet 2014'
+    location: 'Results: high VE held across a high-incidence epidemic period'
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: With equal relative effect across districts and a binding budget, maternal Tdap is funded where births
+    x inc x reduction per dollar is highest, i.e. ranked by inc; the maternal-vs-none choice flips along inc at
+    the district whose benefit per dollar equals the shadow price, plausibly in the middle of the inc range since
+    the budget covers roughly half of births.
+  about:
+    pair:
+    - maternal
+    - none
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.0025
+    - 0.006
+  source_type: literature
+  evidence:
+  - citation: Skowronski DM et al. The number needed to vaccinate to prevent infant pertussis hospitalization and
+      death through parent cocoon immunization. Clinical Infectious Diseases 2012
+    location: 'Discussion: NNV scales inversely with infant incidence (reasoning applied to maternal)'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: Maternal Tdap is delivered at antenatal visits, so the share of births reached is capped by antenatal
+    care coverage; districts with higher anc_coverage should see a larger population-level reduction. If the engine
+    instead uses a fixed coverage (about 70%) everywhere, the relative reduction will not move with anc_coverage
+    and districts with low ANC attendance will be overstated.
+  about:
+    package: maternal
+    feature: anc_coverage
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Amirthalingam G et al. Effectiveness of maternal pertussis vaccination in England: an observational
+      study. Lancet 2014'
+    location: 'Introduction/Methods: programme delivered through antenatal care; coverage about 60% early in the
+      programme'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: low
+open_questions:
+- id: OQ1
+  question: Does the engine tie maternal coverage to each district's anc_coverage, or apply one fixed coverage?
+    If fixed, the ranking of low-ANC districts is biased upward.
+  beliefs:
+  - B7
+  - B6
+  decision_relevant: true
+- id: OQ2
+  question: What share of first-year hospitalisations falls in the window maternal antibody protects (<3 months)?
+    This sets the population-level maternal reduction and could narrow B1's band.
+  beliefs:
+  - B1
+  decision_relevant: true
+- id: OQ3
+  question: What is the currently funded plan in each district (any existing maternal or cocooning programme)? The
+    spec's comparator is none; principle 2 asks for the funded plan.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: OQ4
+  question: Is there any setting (very low ANC coverage, late ANC attendance after 32 weeks) where cocooning reaches
+    infants that maternal Tdap cannot, enough to make cocoon+maternal worthwhile?
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: true
+- id: OQ5
+  question: How large is blunting of the infant primary-series response after maternal Tdap, and does it raise later-infancy
+    hospitalisations enough to matter within the first year?
+  beliefs:
+  - B1
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Maternal Tdap reduces first-year infant pertussis hospitalisations by 40-75% relative to none in at least
+    70% of usable points.
+  test:
+    kind: effect_band
+    package: maternal
+    band:
+    - 0.4
+    - 0.75
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Cocooning reduces first-year infant hospitalisations by no more than 30% relative to none in at least 70%
+    of usable points.
+  test:
+    kind: effect_band
+    package: cocoon
+    band:
+    - 0.0
+    - 0.3
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: Maternal has a higher net benefit than cocoon at the shadow price across the whole inc range in at least
+    90% of usable points (cocoon is dominated).
+  test:
+    kind: paired_sign
+    a: maternal
+    b: cocoon
+    feature: inc
+    range:
+    - 0.001016
+    - 0.007988
+    sign: positive
+    min_share: 0.9
+- id: H4
+  belief: B4
+  claim: Adding cocooning to maternal lowers net benefit at the shadow price (cocoon+maternal minus maternal negative)
+    in at least 80% of usable points across the inc range.
+  test:
+    kind: paired_sign
+    a: cocoon+maternal
+    b: maternal
+    feature: inc
+    range:
+    - 0.001016
+    - 0.007988
+    sign: negative
+    min_share: 0.8
+- id: H5
+  belief: B5
+  claim: Maternal's relative reduction does not vary with inc (Spearman rho interval inside +/-0.1).
+  test:
+    kind: effect_direction
+    package: maternal
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H6
+  belief: B6
+  claim: 'The choice between maternal and none flips along inc within 0.0025-0.0060 hospitalisations per infant-year:
+    maternal wins above, none below.'
+  test:
+    kind: flip_in
+    a: maternal
+    b: none
+    feature: inc
+    range:
+    - 0.0025
+    - 0.006
+- id: H7
+  belief: B7
+  claim: Maternal's relative reduction increases with anc_coverage (Spearman rho interval above 0).
+  test:
+    kind: effect_direction
+    package: maternal
+    feature: anc_coverage
+    direction: increases
