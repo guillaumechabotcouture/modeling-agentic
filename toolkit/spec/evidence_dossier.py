@@ -1133,14 +1133,48 @@ def _self_test_round6(ok, T) -> None:
     ok({"parameter:lrr:a:cases", "parameter:lrr:c:cases", "parameter:lint:a+b:cases"} <= set(req) and probs == [],
        f"ED-Z1 a trial effect reached indirectly (c relative to a; baseline coverage and interactions over every "
        f"component) is required even when only c is an option: {sorted(req)[:8]}")
-    signed = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a", "tree:eng_b/card.yaml": "b"}
-    chosen = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a"}
-    ok(_closure_changes(signed, chosen) == [] and _closure_changes(signed, dict(chosen, **{"run:units.csv": "x"}))
-       == ["run:units.csv"] and _closure_changes(signed, {k: v for k, v in chosen.items() if k != "run:units.csv"})
-       == ["run:units.csv"] and _closure_changes(signed, dict(chosen, **{"tree:eng_c/card.yaml": "c"}))
+    signed = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a", "tree:eng_b/card.yaml": "b",
+              "tree:shared/binding.yaml": "x"}
+    owners = {"tree:eng_a/card.yaml": ["A"], "tree:eng_b/card.yaml": ["B"], "tree:shared/binding.yaml": ["A", "B"]}
+    chosen = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a",
+              "tree:shared/binding.yaml": "x"}
+    a_only = {"A"}
+    ok(_closure_changes(signed, chosen, owners, a_only) == []
+       and _closure_changes(signed, dict(chosen, **{"run:units.csv": "x"}), owners, a_only) == ["run:units.csv"]
+       and _closure_changes(signed, {k: v for k, v in chosen.items() if k != "run:units.csv"}, owners, a_only)
+       == ["run:units.csv"]
+       and _closure_changes(signed, {k: v for k, v in chosen.items() if k != "tree:eng_a/card.yaml"}, owners, a_only)
+       == ["tree:eng_a/card.yaml"]
+       and _closure_changes(signed, {k: v for k, v in chosen.items() if k != "tree:shared/binding.yaml"}, owners,
+                            a_only) == ["tree:shared/binding.yaml"]
+       and _closure_changes(signed, dict(chosen, **{"tree:eng_c/card.yaml": "c"}), owners, a_only)
        == ["tree:eng_c/card.yaml"],
-       "ED-Z2 after ENGINE_CHOICE the files of an engine not chosen are not 'deleted' (the subset rule); a run input "
-       "changed or missing, or an engine file not signed, is a change")
+       "ED-Z2 the subset rule exempts only files that belong exclusively to engines not chosen: a missing file of the "
+       "chosen engine (or one it shares), a run input changed or missing, or an engine file not signed is a change")
+    import shutil
+    import tempfile
+    import yaml
+    with tempfile.TemporaryDirectory() as top:
+        run1, shared = os.path.join(top, "a", "run"), os.path.join(top, "a", "shared")
+        os.makedirs(run1)
+        os.makedirs(shared)
+        toy_dossier_spec(run1)
+        shutil.move(os.path.join(run1, "units.csv"), os.path.join(shared, "units.csv"))
+        raw = yaml.safe_load(open(os.path.join(run1, "decision_spec.yaml")))
+        raw["decision_units"]["csv"] = "../shared/units.csv"
+        yaml.safe_dump(raw, open(os.path.join(run1, "decision_spec.yaml"), "w"), sort_keys=False)
+        spec_b = open(os.path.join(run1, "decision_spec.yaml"), "rb").read()
+        c1, p1 = input_closure(raw, spec_b, _reader(run1), run1, [])
+        shutil.copytree(os.path.join(top, "a"), os.path.join(top, "elsewhere"))
+        run2 = os.path.join(top, "elsewhere", "run")
+        c2, _ = input_closure(raw, spec_b, _reader(run2), run2, [])
+        ok("run:../shared/units.csv" in c1 and c1 == c2 and not p1,
+           f"ED-Z3 a parent-relative input keeps a run-relative key, so the same tree unpacked elsewhere has the same "
+           f"closure: {sorted(c1)[:4]}")
+        raw["calibration"]["targets"] = "unused"
+        _, p3 = input_closure(raw, spec_b, _reader(run1), run1, [])
+        ok(any("resolver" in p for p in p3),
+           f"ED-Z4 an input resolver that raises is a problem naming it, never swallowed: {p3}")
 
 
 def _self_test_round5(ok, T) -> None:

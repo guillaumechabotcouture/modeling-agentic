@@ -90,10 +90,30 @@ def code_files() -> dict:
             if os.path.isfile(p):
                 _CODE[n] = open(p, "rb").read()
     out = dict(_CODE)
+    extra = ""
     if "decl" in PATCH:                 # the declaration change the row made, in the shipped code
-        out["toolkit/spec/toy_engines.py"] = out["toolkit/spec/toy_engines.py"] + (
-            f"\n\nToyDossierEngine.DECISION_INPUTS = {PATCH['decl']!r}\n").encode()
+        extra += f"\n\nToyDossierEngine.DECISION_INPUTS = {PATCH['decl']!r}\n"
+    for name, value in sorted((PATCH.get("attrs") or {}).items()):     # engine attributes a row set
+        extra += f"\nToyDossierEngine.{name} = {value!r}\n"
+    if extra:
+        out["toolkit/spec/toy_engines.py"] = out["toolkit/spec/toy_engines.py"] + extra.encode()
     return out
+
+
+def _patch_attr(name, value):
+    """Set a toy dossier engine attribute in-process and in the shipped code (the launch checks the archive)."""
+    from toolkit.spec import toy_engines as T
+    had, old = name in T.ToyDossierEngine.__dict__, T.ToyDossierEngine.__dict__.get(name)
+    setattr(T.ToyDossierEngine, name, value)
+    PATCH.setdefault("attrs", {})[name] = value
+
+    def undo():
+        if had:
+            setattr(T.ToyDossierEngine, name, old)
+        else:
+            delattr(T.ToyDossierEngine, name)
+        PATCH.get("attrs", {}).pop(name, None)
+    return undo
 
 
 def _tar(d, state, signoff="owner"):
@@ -311,6 +331,8 @@ PRE_ROWS = [
      lambda d: (_spec(d, lambda s: (s["uncertainty"].__setitem__("priors", {"k": {
          "dist": "uniform", "range": [0.7, 0.9], "source": "toy"}}), s["uncertainty"]["excluded"].append(
          {"parameter": "k", "reason": "held"}))), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
+    ("R7-resolver-error", "an input resolver that raises (calibration.targets given as a string) is a refusal",
+     lambda d: _spec(d, lambda s: _set(s["calibration"], "targets", "unused")), True),
     ("R6-emulator-parameters", "calibration.parameters under emulator_inversion (which fits only the attribute) "
                                "used to exempt a range from its decision test",
      lambda d: (_spec(d, lambda s: _set(s["calibration"], "parameters", ["k"])),
@@ -398,6 +420,27 @@ def _produce_allocation(d):
     _fixture_write(d, out, "unit,package,dalys_averted\n0,a,1.0\n")
 
 
+_UNDO: list = []
+
+
+def _toy_priors_file(d):
+    """The chosen engine gets a priors file (an engine-side input the closure binds) for the row."""
+    p = os.path.join(d, "toy_priors.yaml")
+    _fixture_write(d, "toy_priors.yaml", "priors: {}\n")
+    _UNDO.append(_patch_attr("priors_path", p))
+
+
+def _two_candidates(d):
+    """engine: auto with two eligible candidates whose engine files differ (the toy dossier engine; the toy spec
+    engine with its benchmark pack)."""
+    _spec(d, lambda s: _set(s, "engine", {"auto": True, "candidates": [
+        "toolkit.spec.toy_engines:ToyDossierEngine", "toolkit.spec.toy_engines:ToySpecEngine"]}))
+
+
+def _choose_toy(d):
+    _fixture_write(d, "engine_choice.json", json.dumps({"engine": {"ref": "toolkit.spec.toy_engines:ToyDossierEngine"}}))
+
+
 # post-sign rows with a setup before signing (review r6): (id, what, mutate, setup)
 POST_SETUP_ROWS = [
     ("R6-allocation-produced", "the lifecycle: sign, the analysis writes its allocation (an output), then resume",
@@ -407,7 +450,13 @@ POST_SETUP_ROWS = [
     ("R6-no-dossier-edited", "a run that needs no dossier, its units table edited after signing",
      lambda d: _fixture_write(d, "units.csv", "\n", "a"), _no_dossier_run),
 ]
-ACCEPTED_ROWS = ("R6-allocation-produced",)
+POST_SETUP_ROWS += [
+    ("R7-engine-file-deleted", "the chosen engine's priors file deleted after signing (its parameters stop being drawn)",
+     lambda d: _fixture_remove(d, "toy_priors.yaml"), _toy_priors_file),
+    ("R7-engine-chosen", "engine: auto signed with two candidates, then ENGINE_CHOICE picks one (its files a subset)",
+     _choose_toy, _two_candidates),
+]
+ACCEPTED_ROWS = ("R6-allocation-produced", "R7-engine-chosen")
 
 # Why each row must be refused (any of these, case-insensitive), so a refusal for some other reason does not count.
 WANT = {
@@ -430,6 +479,7 @@ WANT = {
     "R5-declaration-shrank": ["declaration", "evidence_incomplete", "changed"],
     "R6-extensionless-units": ["changed", "units"], "R6-no-dossier-edited": ["changed", "units.csv"],
     "R6-emulator-parameters": ["needs its decision_test"],
+    "R7-resolver-error": ["resolver"], "R7-engine-file-deleted": ["changed", "toy_priors.yaml"],
 }
 
 
@@ -495,6 +545,8 @@ def _self_test_table(ok) -> None:
                 finally:
                     if callable(undo):
                         undo()
+                    while _UNDO:
+                        _UNDO.pop()()
             accept = rid == "control" or rid in ACCEPTED_ROWS
             ok((not why) if accept else _right(rid, why),
                f"ET {rid} via {pname}: {'accepted' if accept else 'refused'} ({what}): {why[:160]!r}")
