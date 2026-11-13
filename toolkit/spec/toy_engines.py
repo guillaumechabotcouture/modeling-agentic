@@ -105,4 +105,5 @@ class ToyDossierEngine(ToyEngine):
         "a": {"inactive": [0], "inputs": [
             {"kind": "parameter", "name": "eff_a", "why": "the relative reduction component a gives"},
             {"kind": "unit_attribute", "name": "x", "why": "the transmission index the reduction acts on"}]},
-        "b": {"inputs": [], "none_reason": "toy: the effect of b is not checked against field data"}}
+        "b": {"inactive": [0], "inputs": [
+            {"kind": "parameter", "name": "k", "why": "the toy transmission slope the reduction of b is scaled by"}]}}

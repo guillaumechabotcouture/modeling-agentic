@@ -565,6 +565,11 @@ def toy_entries() -> dict:
             "comparison": "the trial's 0.42 is below the card's 0.5, inside its fitted range [0.3, 0.7]",
             "chosen": {"range": [0.3, 0.6], "rule": "the trial's confidence interval, widened to the card's lower bound"},
             "decision_test": "DT_eff_a"},
+        "parameter:k": {
+            "model_value": 0.8, "model_source": "engine card default",
+            "no_data": {"reason": "no field measurement of the toy slope",
+                        "borrowing_rule": "the card's value, held fixed"},
+            "chosen": {"value": 0.8, "rule": "the card's value"}},
         "unit_attribute:x": {
             "model_value": "units.csv column cov (calibrated)", "model_source": "toy surface",
             "no_data": {"reason": "no field measurement of the toy index",
