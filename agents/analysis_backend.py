@@ -690,6 +690,99 @@ def write_toy_units(path: str, n: int = 24, seed: int = 3) -> None:
             f.write(f"u{i:02d},r{i % 3},g{i % 4},{x + rng.normal(0, 0.1):.4f},{1000 + 50 * i},{i % 2},{prev:.5f}\n")
 
 
+def _self_test_benchmark_gate(ok) -> None:
+    """F6 owner decision 2026-11-12: an engine is not eligible for a component whose benchmark is not in band, unless
+    the owner signs a departure in the spec (G1-G10)."""
+    import tempfile
+    import yaml
+    from toolkit.engines import benchmark as B
+    from toolkit.engines.contract import ToyEngine
+    from toolkit.spec import schema, signoff
+    cov = {"engine": "toy", "absent_values": {"a": [0], "b": [0]},
+           "benchmarks": {"T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none"},
+                          "T2": {"covers": {"b": [1]}, "estimand": "effect_vs_none"},
+                          "T3": {"covers": {}, "covers_none_because": "the baseline burden, not a component"}}}
+    rows_in = [{"id": "T1", "metric": "a vs none", "status": "out_of_band", "computed": 0.3, "band": [0.5, 0.7]},
+               {"id": "T2", "metric": "b vs none", "status": "in_band", "computed": 0.6, "band": [0.5, 0.7]},
+               {"id": "T3", "metric": "baseline", "status": "out_of_band", "computed": 9, "band": [1, 2]}]
+    with tempfile.TemporaryDirectory() as d:
+        cp, rp = os.path.join(d, "benchmark_coverage.yaml"), os.path.join(d, "results.yaml")
+        yaml.safe_dump(cov, open(cp, "w"))
+
+        def write_results(rows, **change):
+            doc = B.stamp({"benchmarks": rows}, ToyEngine(results_path=rp))
+            doc["engine_identity"].update(change)
+            yaml.safe_dump(doc, open(rp, "w"))
+        write_results(rows_in)
+        entry = [("toolkit.engines.contract:ToyEngine", None, lambda s: {"results_path": rp}, cp)]
+        spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}}}
+        spec_b = {"options": {"engine_map": {"b": {"b": 1}}}}
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(not r["eligible"] and any("T1" in w and "out_of_band" in w for w in r["why_not"])
+           and not any("T3" in w for w in r["why_not"]),
+           f"G1 an out-of-band benchmark covering a used component makes the engine ineligible, naming it ({r['why_not']})")
+        r = eligible_engines(spec_b, entry)[0]
+        ok(r["eligible"], f"G2 the same engine is eligible for a spec that does not use that component ({r['why_not']})")
+        dep = {"engine": "toy", "benchmark": "T1", "reason": "the trial measured a different net type",
+               "decision_test": "DT1"}
+        r = eligible_engines(dict(spec_ab, engine_departures=[dep]), entry)[0]
+        ok(not r["eligible"] and any("not signed" in w for w in r["why_not"]),
+           f"G3 a departure in a spec that is not signed is refused at the engine choice ({r['why_not']})")
+        r = eligible_engines(dict(spec_ab, engine_departures=[dep]), entry, departures="proposed")[0]
+        ok(r["eligible"] and r["departures"][0]["status"] == "proposed",
+           f"G3b before sign-off (the pre-sign check) a proposed departure counts, marked proposed ({r.get('departures')})")
+        run = os.path.join(d, "run")
+        os.makedirs(run)
+        p = schema.toy_spec(run)
+        raw = yaml.safe_load(open(p))
+        raw["engine_departures"] = [dep]
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        ok(schema.validate(schema.load(p), pending_ok=True) == [], "G4 the spec with a departure validates")
+        signoff.sign(run, "owner")
+        r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
+        ok(r["eligible"] and r["departures"] == [dict(dep, status="signed", benchmark_status="out_of_band",
+                                                       components=["a=1"])],
+           f"G5 an owner-signed departure makes the engine eligible and is recorded on the row ({r.get('departures')})")
+        rec = engine_choice_record(r["ref"], "test", [r])
+        ok(rec.get("engine_departures") == r["departures"], "G5b the departure is recorded in engine_choice.json")
+        sh = signoff.sheet(run, candidates=[r])
+        ok("## Engine departures from benchmark evidence" in sh and "T1" in sh and "DT1" in sh
+           and "the trial measured a different net type" in sh,
+           "G5c the sign-off sheet lists the departure with its reason and decision test")
+        with open(p, "a") as f:
+            f.write("\n# edited after sign-off\n")
+        r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
+        ok(not r["eligible"] and any("T1" in w for w in r["why_not"]),
+           f"G6 a spec edited after sign-off: its departure is refused ({r['why_not']})")
+        bad = [dict(dep, decision_test=None), {k: v for k, v in dep.items() if k != "reason"},
+               dict(dep, decision_test="DT9"), dict(dep, extra=1)]
+        for i, b in enumerate(bad):
+            raw2 = dict(raw, engine_departures=[{k: v for k, v in b.items() if v is not None}])
+            ok(any("engine_departures" in e for e in schema.validate(schema.Spec(raw2, run), pending_ok=True)),
+               f"G7.{i} a departure without a decision test or a reason for none, without a reason, naming an unknown "
+               "decision test, or with an unknown field is refused")
+        write_results(rows_in, version="0")
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(not r["eligible"] and any("record" in w for w in r["why_not"]),
+           f"G8 a benchmark record stamped for another engine version is refused (fail closed) ({r['why_not'][:2]})")
+        write_results([dict(rows_in[0], status="not_assessable"), rows_in[1], rows_in[2]])
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(not r["eligible"] and any("T1" in w and "not_assessable" in w for w in r["why_not"]),
+           "G9 a not_assessable benchmark covering a used component makes the engine ineligible (fail closed)")
+        write_results([dict(rows_in[0], status="in_band"), rows_in[1], rows_in[2]])
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(r["eligible"], f"G10 with every covering benchmark in band the engine is eligible ({r['why_not']})")
+        yaml.safe_dump(dict(cov, benchmarks={"T1": cov["benchmarks"]["T1"]}), open(cp, "w"))
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(not r["eligible"] and any("T2" in w and "coverage" in w for w in r["why_not"]),
+           f"G11 a record benchmark the coverage file does not map is refused, as is a component it does not cover "
+           f"({r['why_not']})")
+        os.remove(cp)
+        r = eligible_engines(spec_ab, entry)[0]
+        ok(not r["eligible"] and any("benchmark_coverage.yaml" in w for w in r["why_not"]),
+           "G12 an engine with benchmarks and no coverage file is not eligible")
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -860,6 +953,7 @@ def _self_test() -> int:
         rows2 = eligible_engines(dict(tspec, engine_needs=_api.engine_needs(tspec)))
         ok(not next(r for r in rows2 if r["ref"].endswith("RenewalEngine"))["eligible"],
            "B23b an allocation spec: the renewal engine is not eligible")
+    _self_test_benchmark_gate(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
