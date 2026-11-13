@@ -202,6 +202,130 @@ class RecalRunner(BM.Runner):
         key = (tuple(sorted(fitted.items())), self._calkey())
         return {a: self.cache[(a, key)] for a in arms}
 
+    # ---- checkpoint (owner, 13 Nov: a cap stop must not lose the finished tasks)
+    ckpt, ckpt_out = None, None       # {key: result JSON} loaded from --resume-from; the directory appended to
+    task_fn = staticmethod(BM._job_list)
+
+    def code_sha256(self) -> str:
+        from toolkit.engines.contract import code_fingerprint
+        return code_fingerprint(self.engine)
+
+    def checkpoint(self, out_dir: str | None = None, resume_from: str | None = None):
+        """Append each finished engine task to <out_dir>/CACHE_NAME as it lands; reuse the matching tasks of
+        <resume_from>/CACHE_NAME (load_cache: refused rows fail closed), so a relaunch runs only the missing ones."""
+        self.ckpt = load_cache(resume_from, self.code_sha256()) if resume_from else {}
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            self.ckpt_out = out_dir
+
+    def _map(self, jobs, chunk: int = 300):
+        """benchmark.Runner._map's tasks (the same grouping and order within a task), each run once: a task in the
+        checkpoint is read from it, a new one is appended as it finishes. Every result passes through its JSON form,
+        so a resumed run returns exactly what an uninterrupted one does."""
+        if self.ckpt is None:
+            return BM.Runner._map(self, jobs, chunk)
+        import json
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        by = {}
+        for n, j in enumerate(jobs):
+            ref, config, _, unit, _, horizon, seed = j
+            by.setdefault(_jdump([ref, config, unit, horizon, seed]) if self._shared(j) else n, []).append(j)
+        tasks, code = list(by.values()), self.code_sha256()
+        canon = [json.loads(_jdump(t)) for t in tasks]
+        keys = [_task_key(code, t) for t in canon]
+        res = [json.loads(self.ckpt[k]) if k in self.ckpt else None for k in keys]
+
+        def land(i, r):
+            s = _rdump(r)
+            res[i] = json.loads(s)
+            self.ckpt[keys[i]] = s
+            if self.ckpt_out:
+                with _safe_io().open_append_nofollow(self.ckpt_out, CACHE_NAME) as fh:
+                    fh.write(json.dumps({"key": keys[i], "code_sha256": code, "task": canon[i], "result": res[i],
+                                         "result_sha256": _sha(s)}) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        todo = [i for i, r in enumerate(res) if r is None]
+        if self.workers <= 1 or len(todo) <= 1:
+            for i in todo:
+                land(i, self.task_fn(tasks[i]))
+        else:
+            for c in range(0, len(todo), chunk):
+                part = todo[c:c + chunk]
+                with ProcessPoolExecutor(min(self.workers, len(part)), **BM._pool_kw()) as ex:
+                    fut = {ex.submit(self.task_fn, tasks[i]): i for i in part}
+                    for f in as_completed(fut):
+                        land(fut[f], f.result())
+                print(f"  ran {min(c + chunk, len(todo))}/{len(todo)} engine tasks ({len(tasks) - len(todo)} from "
+                      "the checkpoint)", flush=True)
+        done = {id(j): o for t, r in zip(tasks, res) for j, o in zip(t, r)}
+        return [done[id(j)] for j in jobs]
+
+
+CACHE_NAME = "netfit_cache.jsonl"
+
+
+def _safe_io():
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from lib import safe_io
+    return safe_io
+
+
+def _plain(x):
+    return x.tolist() if hasattr(x, "tolist") else repr(x)
+
+
+def _jdump(x) -> str:
+    import json
+    return json.dumps(x, sort_keys=True, default=_plain)
+
+
+def _rdump(x) -> str:
+    import json
+    return json.dumps(x, default=_plain)
+
+
+def _sha(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _task_key(code: str, task) -> str:
+    """A task's key: the engine code and every job's full parameter tuple (fitted values and the calibrated unit
+    attribute included, so the existing cache key's calibration is part of it)."""
+    return _sha(_jdump([code, task]))
+
+
+def load_cache(d: str, code: str) -> dict:
+    """{key: result JSON} of <d>/CACHE_NAME. Refused (ValueError, fail closed): no cache file; a malformed row; a row
+    from other engine code; a key that is not its task's; a result whose sha256 is not the recorded one. A last row
+    without its newline (cut by the stop) is dropped."""
+    import json
+    p = os.path.join(d, CACHE_NAME)
+    if not os.path.isfile(p):
+        raise ValueError(f"--resume-from {d}: no cache file {CACHE_NAME}")
+    lines = open(p).read().split("\n")
+    if lines[-1]:
+        print(f"  {p}: dropped a last row cut before its newline", flush=True)
+    out = {}
+    for n, ln in enumerate(lines[:-1], 1):
+        try:
+            row = json.loads(ln)
+        except ValueError as ex:
+            raise ValueError(f"{p}: row {n} is malformed ({ex})") from ex
+        if not isinstance(row, dict):
+            raise ValueError(f"{p}: row {n} is malformed (not an object)")
+        if row.get("code_sha256") != code:
+            raise ValueError(f"{p}: row {n} is from engine code_sha256 {row.get('code_sha256')}, this engine's is {code}")
+        if row.get("key") != _task_key(code, row.get("task")):
+            raise ValueError(f"{p}: row {n}'s key is not its task's")
+        s = _rdump(row.get("result"))
+        if _sha(s) != row.get("result_sha256"):
+            raise ValueError(f"{p}: row {n}'s result does not match its result_sha256")
+        out[row["key"]] = s
+    return out
+
 
 def _task_s(k: int) -> float:
     """Laptop seconds of one engine task: a burn-in group of k arms of one setting at one point and seed."""
@@ -449,7 +573,7 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
 
 
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
-        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None) -> int:
+        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None, resume_from: str | None = None) -> int:
     if os.path.basename(out_path) in PROTECTED:
         raise ValueError(f"net_effect_fit writes its own file, never {PROTECTED}")
     bad = check(pack, base)
@@ -465,6 +589,9 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
     runner = RecalRunner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
+    ck_out = None if smoke else os.environ.get("JOB_OUT")    # the job's outputs: each finished task as it lands
+    if ck_out or resume_from:
+        runner.checkpoint(out_dir=ck_out, resume_from=resume_from)
     t0 = time.time()
     names = list(pack["fit_joint"]["params"])
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
@@ -852,6 +979,7 @@ def main(argv=None) -> int:
     ap.add_argument("--vcpus", type=int, default=VCPUS, help="the VM's vCPUs (plan; run: defaults to --workers)")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--resume-from", default=None, help=f"a directory holding an earlier run's {CACHE_NAME}")
     a = ap.parse_args(argv)
     base = yaml.safe_load(open(PACK))
     pack = build_pack(base, a.smoke)
@@ -861,7 +989,8 @@ def main(argv=None) -> int:
     if a.smoke and not a.out:
         print("--smoke needs --out (a scratch file): a smoke is not evidence")
         return 2
-    return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify)
+    return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify,
+               resume_from=a.resume_from)
 
 
 if __name__ == "__main__":
