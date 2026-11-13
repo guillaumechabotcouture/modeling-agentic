@@ -154,10 +154,14 @@ def engine_tables(A, cands, z0, out0, res):
         dm._runs = lambda theta, ids, zs, rs=rs: rs
         eng[u] = (list(dm.packages), dm.predict(z0, A.theta0, [u])[u])
 
+    # F6 S2-5d review r3: with an anchor the filler is the emulator's own (un-anchored) prediction, so the evaluation
+    # below anchors every value once, at the decision's point factors
+    base = A.model.predict(z0, A.theta0, list(eng)) if getattr(A, "anchor", None) is not None else out0
+
     def hybrid(scale):
         hyb = {}
         for u, (pks, row) in eng.items():
-            h = copy.deepcopy(out0[u])
+            h = copy.deepcopy(base[u])
             for k in h["y"]:
                 if k in pks:
                     h["y"][k], h["cost"][k] = row["y"][k], row["cost"][k]

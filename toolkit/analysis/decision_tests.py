@@ -71,7 +71,13 @@ def _lowers_only_unchosen(ben0, ben, plan) -> bool:
 def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
-    for dt in list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A):
+    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A)
+    ids = [str(dt.get("id")) for dt in dts]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:     # F6 S2-5d review r3: declared and automatic tests share one result path per id
+        raise ValueError(f"decision tests: ids {dup} are used twice (a declared test shadows an automatic one); "
+                         "rename the declared test")
+    for dt in dts:
         rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
         if dt.get("automatic"):
             rec["automatic"] = True
@@ -129,13 +135,13 @@ def prior_range_tests(A) -> list[dict]:
                         "values": [], "automatic": True, "reason": exc[q_.name],
                         "finding": f"decision_test:{SCENARIO_EXCLUDED_PREFIX}{q_.name}",
                         "text": f"Does the plan change with the scenario value {q_.name}?"})
-    for rid, a in sorted(((getattr(A, "anchor", None) or {}).get("rows") or {}).items()):
-        if a["lower"] is not None and a["upper"] > a["lower"]:
-            out.append({"id": f"{ANCHOR_RANGE_PREFIX}{rid}", "type": "anchor_range", "anchor": rid,
-                        "values": [float(a["lower"]), float(a["upper"])], "automatic": True,
-                        "finding": f"decision_test:{ANCHOR_RANGE_PREFIX}{rid}",
-                        "text": f"Does the plan change when the external {a['outcome']} estimate {rid} is at either end "
-                                "of its published interval?"})
+    from toolkit.analysis.burden import anchor_groups
+    for g in anchor_groups(getattr(A, "anchor", None)):     # review r3: a group's coupled anchors together
+        out.append({"id": f"{ANCHOR_RANGE_PREFIX}{g['name']}", "type": "anchor_range", "anchors": g["rows"],
+                    "values": [0.025, 0.975], "ends": g["ends"], "automatic": True,
+                    "finding": f"decision_test:{ANCHOR_RANGE_PREFIX}{g['name']}",
+                    "text": f"Does the plan change when the external {', '.join(g['outcomes'])} estimates "
+                            f"{', '.join(g['rows'])} are together at either end of their published intervals?"})
     if A.method == "posterior":
         # v2d §3.2: a calibration parameter the data do not determine (prior-dominated or partly identified) gets the
         # same automatic test; the calibration is redone with the parameter held at each end of its declared range
@@ -220,11 +226,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             lowers.append(same_cost and _lowers_only_unchosen(ben0, ben, plan))
             cases.append((v, ben, cost, None, None))
     elif t == "anchor_range":
-        rid = dt["anchor"]
-        varied = f"the external estimate of anchor {rid} set to each end of its published interval"
+        varied = (f"the external estimates of anchors {', '.join(dt['anchors'])} set together to the 2.5% and 97.5% "
+                  "ends of their published intervals")
         cases, lowers = [], []
         for v in dt["values"]:
-            _, ben, cost = A.evaluate(A.theta0, z0, sampled={f"anchor:{rid}": float(v)})
+            _, ben, cost = A.evaluate(A.theta0, z0, sampled=dt["ends"][v])
             evs[v] = list(A.last_events)
             cases.append((v, ben, cost, None, None))
             lowers.append(False)

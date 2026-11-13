@@ -78,15 +78,15 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
             ends.append(_end(A, m, ben, cost, plan))
         rows.append({"name": it, "kind": "cost_item", "basis": "multiplier", "point": 1.0, "low": ends[0],
                      "high": ends[1]})
-    for rid, a in sorted(((getattr(A, "anchor", None) or {}).get("rows") or {}).items()):   # F6 S2-5d review r2
-        if a["lower"] is None or not a["upper"] > a["lower"]:
-            continue
+    from toolkit.analysis.burden import anchor_groups      # F6 S2-5d review r2-r3: a group's anchors together
+    for g in anchor_groups(getattr(A, "anchor", None)):
         ends = []
-        for v in (a["lower"], a["upper"]):
-            _, ben, cost = A.evaluate(A.theta0, z0, sampled={f"anchor:{rid}": float(v)})
-            ends.append(_end(A, v, ben, cost, plan))
-        rows.append({"name": f"burden_anchor_{rid}", "kind": "burden_anchor", "basis": f"published interval of the "
-                     f"external {a['outcome']} estimate", "point": a["value"], "low": ends[0], "high": ends[1]})
+        for q in (0.025, 0.975):
+            _, ben, cost = A.evaluate(A.theta0, z0, sampled=g["ends"][q])
+            ends.append(_end(A, q, ben, cost, plan))
+        rows.append({"name": f"burden_anchor_{g['name']}", "kind": "burden_anchor", "basis": "published intervals of "
+                     f"the external {', '.join(g['outcomes'])} estimates, together at their 2.5% and 97.5% ends",
+                     "point": 0.5, "low": ends[0], "high": ends[1]})
     for r in rows:
         r["swing_point_plan"] = abs(r["high"]["point_plan_objective"] - r["low"]["point_plan_objective"])
         r["swing_pct_of_point"] = 100.0 * r["swing_point_plan"] / obj0 if obj0 else None
