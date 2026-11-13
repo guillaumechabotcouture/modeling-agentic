@@ -1238,7 +1238,7 @@ def _self_test() -> int:
         anchor = GitAnchor(repo, os.path.join(troot, ".wm-trials")) if push else None
         res = run_trials(qs, troot, repo=repo, seed_fn=seed_fn, ledger=L, anchor=anchor, task_cap_usd=task_cap,
                          llm_concurrency=2, engine_workers=2, max_engine_runs=50, engines={toy_ref},
-                         engine_probe=engine_probe)
+                         engine_probe=engine_probe, citation_lookup=lambda query: [])     # no network in self-tests
         return repo, troot, res, calls, L, live
 
     def wt3():
@@ -1531,6 +1531,118 @@ def _self_test() -> int:
                f"WT13d rebuild re-runs only the circular classification and the build (no LLM, no engine), keeping "
                f"verdicts and anchoring: {out}")
     tryit("WT13 circular scope, harness citations, rebuild", wt13)
+
+    # Owner, 2026-11-13 (after the first 10): independent features by construction, citation lookup, tighter bands.
+    def _indep_template(d, decl):
+        _toy_template(d)
+        p = os.path.join(d, "decision_spec.yaml")
+        raw = yaml.safe_load(open(p))
+        raw["analysis"]["emulator"]["features"] = ["cov"]
+        if decl is not None:
+            raw["analysis"]["emulator"]["independent_features"] = decl
+        with open(p, "w") as f:
+            yaml.safe_dump(raw, f, sort_keys=False)
+        with open(os.path.join(d, "generate_units.py"), "w") as f:
+            f.write("# toy generator: cov drawn independently of every other column\n")
+
+    def wt14():
+        from toolkit.analysis import batch as B
+        from toolkit.analysis import world_model as W
+        from toolkit.spec import schema
+        good = {"features": ["cov"], "generator": "generate_units.py",
+                "basis": "the generator draws cov independently of every other column (synthetic units table)"}
+        with tempfile.TemporaryDirectory() as d:
+            _indep_template(d, good)
+            design, _ = B.design(schema.load(os.path.join(d, "decision_spec.yaml")))
+            ok(design.get("independent_features") == ["cov"] and
+               (design.get("independent_features_basis") or {}).get("generator_sha256"),
+               f"WT14 a declared independent feature of a synthetic units table is a design property, with its basis "
+               f"and the generator's sha256: {design.get('independent_features')}, "
+               f"{design.get('independent_features_basis')}")
+            os.makedirs(os.path.join(d, "analysis", "batch"))
+            with open(os.path.join(d, "analysis", "batch", "design.json"), "w") as f:
+                json.dump(design, f)
+            _, jobs = B.design(schema.load(os.path.join(d, "decision_spec.yaml")))
+            B.run(d, jobs, schema.load(os.path.join(d, "decision_spec.yaml")).engine(), max_workers=2)
+            sw, _ = W.load_sweep(d, "current", 0.1, use_plan=False)
+            ok(sw.design.get("independent") == ["cov"], f"WT14b world_model reads it as independent_features: "
+                                                         f"{sw.design}")
+        for bad, why in (({"features": ["tgt"], "generator": "generate_units.py", "basis": "b"},
+                          "a column that is not a declared design feature"),
+                         ({"features": ["cov"], "generator": "generate_units.py"}, "no basis"),
+                         ({"features": ["cov"], "basis": "b"}, "no generator"),
+                         ({"features": ["cov"], "generator": "nope.py", "basis": "b"}, "a generator that is not there")):
+            with tempfile.TemporaryDirectory() as d:
+                _indep_template(d, bad)
+                try:
+                    B.design(schema.load(os.path.join(d, "decision_spec.yaml")))
+                    ok(False, f"WT14c an independence declaration with {why} is refused")
+                except ValueError:
+                    ok(True, f"WT14c an independence declaration with {why} is refused")
+        with tempfile.TemporaryDirectory() as d:
+            _indep_template(d, None)
+            design, _ = B.design(schema.load(os.path.join(d, "decision_spec.yaml")))
+            ok("independent_features" not in design and "independent_features_basis" not in design,
+               "WT14d without a declaration the design is unchanged (no independent_features key)")
+    tryit("WT14 independent features", wt14)
+
+    def wt15():
+        seen = []
+
+        def lookup(query):
+            seen.append(query)
+            if "Doe" in query:
+                return [{"paperId": "abc123", "title": "A trial of things in places", "year": 2019,
+                         "authors": [{"name": "Jane Doe"}, {"name": "R Roe"}]}]
+            if "Boom" in query:
+                raise OSError("network down")
+            return []
+        seed = {"beliefs": [
+            {"id": "B1", "source_type": "literature", "confidence": "high",
+             "evidence": [{"citation": "Doe J et al. A trial of things in places. Lancet 2019;393:1-9",
+                           "location": "Table 2"}]},
+            {"id": "B2", "source_type": "literature", "confidence": "medium",
+             "evidence": [{"citation": "Imaginary A. Results that never were. J Nothing 2021", "location": "p. 3"}]},
+            {"id": "B3", "source_type": "literature", "confidence": "medium",
+             "evidence": [{"citation": "Boom B. Network failure as method. 2020", "location": "Table 1"}]},
+            {"id": "B4", "source_type": "data", "confidence": "medium",
+             "evidence": [{"dossier_entry": "units.csv column pop"}]}]}
+        out, rec = verify_citations(seed, lookup=lookup, pause_s=0)
+        conf = {b["id"]: b["confidence"] for b in out["beliefs"]}
+        st = {r["belief"]: r["status"] for r in rec}
+        ok(st == {"B1": "found", "B2": "not_found", "B3": "lookup_failed"} and
+           [r["paper_id"] for r in rec if r["belief"] == "B1"] == ["abc123"],
+           f"WT15 each literature citation is looked up (title, first author and year must match): {st}")
+        ok(conf == {"B1": "high", "B2": "low", "B3": "medium", "B4": "medium"} and
+           out["beliefs"][1]["citation_check"]["confidence_claimed"] == "medium",
+           f"WT15b a citation not found downgrades its belief to low (the claim is kept); a failed lookup is recorded "
+           f"and changes nothing; data beliefs are not looked up: {conf}")
+        wrong = [{"paperId": "x", "title": "A trial of things in places", "year": 2011,
+                  "authors": [{"name": "Jane Doe"}]}]
+        _, rec2 = verify_citations({"beliefs": [seed["beliefs"][0]]}, lookup=lambda q: wrong, pause_s=0)
+        ok(rec2[0]["status"] == "not_found", f"WT15c a title match with another year is not a match: {rec2}")
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            led = yaml.safe_load(open(os.path.join(rd, SEED)))
+            cites = json.load(open(os.path.join(rd, "analysis", "citations.json")))
+            S = score(troot)
+            ok(cites["records"] and all(b.get("citation_check") for b in led["beliefs"]
+                                        if b["source_type"] == "literature")
+               and S["questions"]["toy0"]["citations"]["not_found"] == len(cites["records"])
+               and "citations" in S["overall"],
+               f"WT15d in a run the check sits between the seed and its registration (the registered seed carries it) "
+               f"and the summary counts it: {S['questions']['toy0'].get('citations')}")
+    tryit("WT15 citations", wt15)
+
+    def wt16():
+        from agents.v2_sdk_tasks import seed_prompt_text
+        sp = seed_prompt_text()
+        ok("as tight as the cited evidence supports" in sp and "lenient" in sp,
+           "WT16 the seed prompt asks for bands as tight as the evidence supports and says a wider band is lenient")
+        ok(DEFAULT_MAX_ENGINE_RUNS >= 400, f"WT16b designs of 60-100 points fit the run limit "
+                                           f"({DEFAULT_MAX_ENGINE_RUNS} engine runs)")
+    tryit("WT16 prompt and design size", wt16)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
