@@ -124,6 +124,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+REGISTRY = "analysis/hypotheses_registry.jsonl"      # toolkit/analysis/world_model.py LEDGER
+
+
+def registry_head(run_dir: str) -> dict:
+    """{"registry_head": {at, lines, head}} when the run has a hypotheses registration ledger: its line count and last
+    line's sha256 with the time now. Recorded into run_state.json history at every transition (a step's start), it
+    is the anchor outside the ledger that toolkit/analysis/world_model.py requires before it counts a hypothesis as
+    pre-registered. An unreadable ledger records an error, never a head (the world model then refuses it)."""
+    if not os.path.isfile(os.path.join(run_dir, REGISTRY)):
+        return {}
+    from lib.safe_io import read_nofollow
+    try:
+        lines = [x for x in read_nofollow(run_dir, REGISTRY)[0].decode("utf-8").splitlines() if x.strip()]
+        head = json.loads(lines[-1])["line_sha"] if lines else None
+    except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+        return {"registry_head": {"at": _now(), "error": f"unreadable ledger ({type(e).__name__})"}}
+    return {"registry_head": {"at": _now(), "lines": len(lines), "head": head}} if lines else {}
+
+
 def load_state(run_dir: str) -> RunState | None:
     p = os.path.join(run_dir, STATE_FILE)
     if not os.path.exists(p):
@@ -886,7 +905,8 @@ class Machine:
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
         self.st.history.append({"at": _now(), "from": frm, "to": to, "why": why, "round": self.st.round,
-                                "spent_usd": round(self.st.spent_usd, 4), **(extra or {})})
+                                "spent_usd": round(self.st.spent_usd, 4), **registry_head(self.run_dir),
+                                **(extra or {})})
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
