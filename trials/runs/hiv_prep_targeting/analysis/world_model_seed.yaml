@@ -1,0 +1,119 @@
+# World model v0 for hiv_prep_targeting (synthetic question), written before any simulation.
+# Decision: for each of 12 groups (3 populations x 4 districts) choose none / oral / cab for 2026-2027,
+# within US$4M, to maximise HIV infections averted. Comparator: none (no PrEP).
+# Decomposition: infections averted per person = baseline incidence (units.csv inc) x relative reduction
+# of the option; cost per person-year oral 120, cab 300 (cab is 2.5x oral). Relative burden (inc) ranks
+# the groups; the gap in relative effect between cab and oral, set against the 180/person-year price
+# difference, decides oral vs cab. At roughly equal effectiveness ratios, oral averts more infections per
+# dollar (about 0.55/120 vs 0.9/300 per unit incidence), so under a binding budget oral is spread across the
+# highest-incidence groups first and cab is chosen only where incidence is high enough that cab's
+# increment (about 0.35 extra reduction for 180 extra dollars) beats the shadow price.
+beliefs:
+  - id: B1
+    mechanism: "Daily oral TDF/FTC PrEP reduces HIV acquisition versus no PrEP; pooled trial effect about half, larger with high adherence, null in trials with very low adherence (FEM-PrEP, VOICE)"
+    about: {package: oral}
+    direction: reduces
+    magnitude: {band: [0.35, 0.80], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Fonner VA et al. Effectiveness and safety of oral HIV pre-exposure prophylaxis for all populations. AIDS 2016;30(12):1973-1983", location: "meta-analysis main result (pooled RR about 0.49); exact table number not recalled"}
+      - {citation: "Baeten JM et al. Antiretroviral prophylaxis for HIV prevention in heterosexual men and women (Partners PrEP). N Engl J Med 2012;367:399-410", location: "primary efficacy results (TDF/FTC about 75% reduction)"}
+      - {citation: "Grant RM et al. Preexposure chemoprophylaxis for HIV prevention in men who have sex with men (iPrEx). N Engl J Med 2010;363:2587-2599", location: "primary efficacy results (about 44% reduction)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: "Long-acting cabotegravir every two months is superior to daily oral TDF/FTC (HR about 0.34 in MSM/TGW, about 0.12 in cisgender women); versus no PrEP its reduction is the product of oral's effect and this further reduction"
+    about: {package: cab}
+    direction: reduces
+    magnitude: {band: [0.75, 0.97], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Landovitz RJ et al. Cabotegravir for HIV prevention in cisgender men and transgender women (HPTN 083). N Engl J Med 2021;385:595-608", location: "primary efficacy results (HR 0.34 vs TDF/FTC)"}
+      - {citation: "Delany-Moretlwe S et al. Cabotegravir for the prevention of HIV-1 in women (HPTN 084). Lancet 2022;399:1779-1789", location: "primary efficacy results (HR about 0.12 vs TDF/FTC)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: "Oral PrEP's protection depends on adherence (drug levels); groups with low expected adherence get much less protection from oral, which is exactly where cab's advantage is largest. The engine card lists only baseline_rate as a unit attribute, so it may not represent this"
+    about: {package: oral, feature: adherence}
+    direction: increases
+    magnitude: {band: [0.1, 0.9], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Anderson PL et al. Emtricitabine-tenofovir concentrations and pre-exposure prophylaxis efficacy in men who have sex with men. Sci Transl Med 2012;4(151):151ra125", location: "estimated efficacy by doses per week (location within paper not recalled)"}
+      - {citation: "Fonner VA et al. AIDS 2016;30(12):1973-1983", location: "subgroup / meta-regression by adherence; table number not recalled"}
+    confidence: high
+    decision_relevant: true
+  - id: B4
+    mechanism: "The relative reduction of an option does not depend on baseline incidence (a rate multiplier); incidence changes absolute infections averted, not the relative effect"
+    about: {package: oral, feature: inc}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Fonner VA et al. AIDS 2016;30(12):1973-1983", location: "heterogeneity driven by adherence rather than population incidence; I am not sure of the exact location"}
+    confidence: medium
+  - id: B5
+    mechanism: "Oral vs none flips along incidence: at the shadow price (~0.0001 infections per dollar, ~US$10,000 per infection averted) oral is worth funding when inc x reduction exceeds ~0.012 per person-year, i.e. roughly inc above 0.015-0.035"
+    about: {pair: [oral, none]}
+    direction: flips
+    conditions: [{feature: inc, range: [0.01, 0.045]}]
+    source_type: literature
+    evidence:
+      - {citation: "Fonner VA et al. AIDS 2016;30(12):1973-1983", location: "pooled effect used in the arithmetic; the flip location is my arithmetic, not a published value"}
+    confidence: low
+    decision_relevant: true
+  - id: B6
+    mechanism: "Cab vs oral: the extra reduction (~0.15-0.5 of baseline) costs 180 more per person-year; at the shadow price cab beats oral only above inc of roughly 0.04-0.1, so in low- and moderate-incidence groups oral wins; with inc at most ~0.06 cab may win in few or no groups"
+    about: {pair: [cab, oral]}
+    direction: flips
+    source_type: literature
+    evidence:
+      - {citation: "Landovitz RJ et al. N Engl J Med 2021;385:595-608", location: "HR vs TDF/FTC; threshold is my arithmetic"}
+      - {citation: "Delany-Moretlwe S et al. Lancet 2022;399:1779-1789", location: "HR vs TDF/FTC; threshold is my arithmetic"}
+    confidence: medium
+    decision_relevant: true
+open_questions:
+  - id: Q1
+    question: "Does the engine let adherence modify oral (and cab) effect per group? If not, cab's advantage in low-adherence groups (e.g. adolescent girls and young women, per HPTN 084 vs FEM-PrEP/VOICE) is missed and the oral/cab rule is biased toward oral there."
+    beliefs: [B3, B6]
+    decision_relevant: true
+  - id: Q2
+    question: "Do the trial effects (per-protocol-like populations, ~1-2 years) carry to programme persistence? Real-world oral discontinuation is high; 'people expected to start' may not equal person-years on PrEP, which changes both cost and effect."
+    beliefs: [B1, B2]
+    decision_relevant: true
+  - id: Q3
+    question: "Which population does each group_code denote, and is the CAB price of US$300 per person-year current? The oral/cab flip moves directly with the price gap."
+    beliefs: [B6]
+    decision_relevant: true
+  - id: Q4
+    question: "Does the engine apply cab's trial HR relative to oral on top of oral's effect (correct), or as a reduction versus no PrEP (understating cab)?"
+    beliefs: [B2]
+    decision_relevant: true
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "Oral's relative reduction in infections versus none lies in 0.35-0.80 at most points"
+    test: {kind: effect_band, package: oral, band: [0.35, 0.80], min_share: 0.8}
+  - id: H2
+    belief: B2
+    claim: "Cab's relative reduction versus none lies in 0.75-0.97 at most points (oral effect times cab's further reduction)"
+    test: {kind: effect_band, package: cab, band: [0.75, 0.97], min_share: 0.8}
+  - id: H3
+    belief: B3
+    claim: "Oral's relative reduction rises with the group's adherence score; refuted or inconclusive if the engine ignores adherence"
+    test: {kind: effect_direction, package: oral, feature: adherence, direction: increases}
+  - id: H4
+    belief: B4
+    claim: "Oral's relative reduction does not vary with baseline incidence (|rho| bound within 0.2)"
+    test: {kind: effect_direction, package: oral, feature: inc, direction: negligible, equivalence: 0.2}
+  - id: H5
+    belief: B5
+    claim: "The oral-versus-none choice flips along incidence within 0.01-0.045"
+    test: {kind: flip_in, a: oral, b: none, feature: inc, range: [0.01, 0.045]}
+  - id: H6
+    belief: B5
+    claim: "In the highest-incidence groups (inc 0.04-0.062) oral beats none at the shadow price at 80% or more of points"
+    test: {kind: paired_sign, a: oral, b: none, feature: inc, range: [0.04, 0.06209], sign: positive, min_share: 0.8}
+  - id: H7
+    belief: B6
+    claim: "In low- and moderate-incidence groups (inc 0.00733-0.03) oral beats cab at the shadow price at 80% or more of points"
+    test: {kind: paired_sign, a: cab, b: oral, feature: inc, range: [0.00733, 0.03], sign: negative, min_share: 0.8}
