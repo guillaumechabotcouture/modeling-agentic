@@ -1,0 +1,271 @@
+beliefs:
+- id: B1
+  mechanism: School-based MDA reduces district infections only through school-age children; its district-level relative
+    reduction is the SAC infection share times the SAC reduction (coverage 75% x cure ~0.75, eroded by reinfection),
+    so it is diluted to well under half
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.35
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Zwang J, Olliaro PL. Clinical efficacy and tolerability of praziquantel for intestinal and urinary
+      schistosomiasis-a meta-analysis of comparative and non-comparative clinical trials. PLoS Negl Trop Dis 2014
+    location: Results, pooled cure rates at 40 mg/kg (exact table not recalled)
+  - citation: 'Turner HC, Truscott JE, Bettis AA, Farrell SH, Deol AK, Whitton JM, Fleming FM, Anderson RM. Evaluating
+      the variation in the projected benefit of community-wide mass treatment for schistosomiasis: Implications
+      for future economic evaluations. Parasites & Vectors 2017'
+    location: Results, share of infections in adults vs school-age children (location not recalled)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Community-wide MDA (60% of everyone 5+) reduces infections in both SAC and adults by roughly coverage
+    x cure less in-year reinfection, so its district relative reduction is ~0.25-0.55 and largely independent of
+    the age split of infection
+  about:
+    package: community
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.55
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Zwang J, Olliaro PL. Clinical efficacy and tolerability of praziquantel for intestinal and urinary
+      schistosomiasis-a meta-analysis of comparative and non-comparative clinical trials. PLoS Negl Trop Dis 2014
+    location: Results, pooled cure rates (exact table not recalled)
+  - citation: WHO guideline on control and elimination of human schistosomiasis. World Health Organization 2022
+    location: Recommendation on community-wide preventive chemotherapy where prevalence >= 10% (page not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B3
+  mechanism: School's district relative reduction rises with SAC prevalence and falls with adult prevalence, because
+    both move the SAC share of infections
+  about:
+    package: school
+    feature: prev_sac
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Turner HC, Truscott JE, Bettis AA, Farrell SH, Deol AK, Whitton JM, Fleming FM, Anderson RM. Evaluating
+      the variation in the projected benefit of community-wide mass treatment for schistosomiasis: Implications
+      for future economic evaluations. Parasites & Vectors 2017'
+    location: Discussion, dependence of benefit on adult burden (location not recalled)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Community MDA treats SAC and adults at the same nominal coverage, so its relative reduction barely
+    depends on how infection is split by age (any dependence comes only from different SAC vs adult effect sizes)
+  about:
+    package: community
+    feature: prev_sac
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: WHO guideline on control and elimination of human schistosomiasis. World Health Organization 2022
+    location: community-wide treatment of all ages >= 2 years (page not recalled)
+  confidence: low
+  citation_check:
+    confidence_claimed: low
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B5
+  mechanism: Upgrading school to community buys mainly the adult reduction (~0.3-0.5 of adult infections) at US$0.55
+    extra per resident; at the budget's shadow price it pays only where adult prevalence is high, so the community/school
+    choice flips along prev_adult, roughly in its upper half
+  about:
+    pair:
+    - community
+    - school
+    feature: prev_adult
+  direction: flips
+  conditions:
+  - feature: prev_adult
+    range:
+    - 0.055
+    - 0.1157
+  source_type: literature
+  evidence:
+  - citation: 'Turner HC, Truscott JE, Bettis AA, Farrell SH, Deol AK, Whitton JM, Fleming FM, Anderson RM. Evaluating
+      the variation in the projected benefit of community-wide mass treatment for schistosomiasis: Implications
+      for future economic evaluations. Parasites & Vectors 2017'
+    location: Results, cost-effectiveness of community-wide vs school-based by adult burden (location not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Where adult prevalence is low (below ~4.5%), community's extra adult benefit is too small to cover
+    its extra US$0.55 per resident at the shadow price, so school beats community
+  about:
+    pair:
+    - school
+    - community
+    feature: prev_adult
+  direction: raises
+  conditions:
+  - feature: prev_adult
+    range:
+    - 0.0196
+    - 0.045
+  source_type: literature
+  evidence:
+  - citation: 'Turner HC, Truscott JE, Bettis AA, Farrell SH, Deol AK, Whitton JM, Fleming FM, Anderson RM. Evaluating
+      the variation in the projected benefit of community-wide mass treatment for schistosomiasis: Implications
+      for future economic evaluations. Parasites & Vectors 2017'
+    location: Results (location not recalled)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: District population scales cost and infections averted proportionally; per-person relative reduction
+    does not depend on population size (no density effect within one year of MDA)
+  about:
+    package: community
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Toor J, Alsallaq R, Truscott JE, Turner HC, Werkman M, Gurarie D, King CH, Anderson RM. Are we on
+      our way to achieving the 2020 goals for schistosomiasis morbidity control using current World Health Organization
+      guidelines? Clin Infect Dis 2018
+    location: Methods, models are per-capita (location not recalled)
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What share of 2026 infections sits in adults vs school-age children in each district (the SAC population
+    fraction and the prev_sac / prev_adult ratio)? This sets school's dilution and the value of upgrading to community.
+  beliefs:
+  - B1
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: How large are the trial-based relative effects per group (lrr:school:sac, lrr:community:sac, lrr:community:adult),
+    including in-year reinfection, and does school have any indirect effect on adults (lrr:school:adult)?
+  beliefs:
+  - B1
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: What is the budget's shadow price, i.e. does US$2M cover school everywhere with money left for upgrades,
+    or must some low-prevalence districts get none?
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Are the delivery costs per resident (school 0.25, community 0.80) current procurement plus delivery
+    prices including donated praziquantel handling, and is community coverage of adults (60%) realistic given low
+    adult male compliance?
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: School's district-level relative reduction in infections lies in [0.05, 0.35] at most design points, diluted
+    by the SAC share of infections
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.05
+    - 0.35
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Community's district-level relative reduction lies in [0.25, 0.55] at most design points
+  test:
+    kind: effect_band
+    package: community
+    band:
+    - 0.25
+    - 0.55
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: School's relative reduction increases with SAC prevalence
+  test:
+    kind: effect_direction
+    package: school
+    feature: prev_sac
+    direction: increases
+- id: H4
+  belief: B4
+  claim: Community's relative reduction is negligibly related to SAC prevalence (|rho| bound within 0.3)
+  test:
+    kind: effect_direction
+    package: community
+    feature: prev_sac
+    direction: negligible
+    equivalence: 0.3
+- id: H5
+  belief: B5
+  claim: The community/school choice at the shadow price flips along adult prevalence, located within [0.055, 0.1157]
+  test:
+    kind: flip_in
+    a: community
+    b: school
+    feature: prev_adult
+    range:
+    - 0.055
+    - 0.1157
+- id: H6
+  belief: B6
+  claim: Where adult prevalence is below 0.045, school beats community on net benefit at the shadow price at >=
+    70% of points
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: prev_adult
+    range:
+    - 0.0196
+    - 0.045
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: Community's per-person relative reduction does not depend on district population (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: community
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
