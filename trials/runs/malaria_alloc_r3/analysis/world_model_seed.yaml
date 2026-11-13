@@ -1,0 +1,279 @@
+beliefs:
+- id: B1
+  mechanism: A mass ITN campaign cuts clinical malaria incidence by roughly 30-60% against no nets (Cochrane rate
+    ratio for uncomplicated episodes about 0.55); the engine applies a trial prior directly
+  about:
+    package: itn
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018; CD000363
+    location: Summary of findings table 1 (ITN vs no nets, uncomplicated episodes)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: IRS alone reduces clinical incidence, but trial evidence vs no IRS is sparse and heterogeneous; effect
+    plausibly 15-55%
+  about:
+    package: irs
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.55
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Pluess B, Tanser FC, Lengeler C, Sharp BL. Indoor residual spraying for preventing malaria. Cochrane
+      Database Syst Rev 2010; CD006657
+    location: Main results (IRS vs no IRS); exact table not recalled
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: Adding IRS to ITN gives a small, uncertain extra reduction (Cochrane IRS+ITN vs ITN alone is near null
+    with wide interval); combined reduction vs none about 40-75%, sub-multiplicative via the declared ITN x IRS
+    interaction
+  about:
+    package: itn+irs
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.75
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Medley N, Choi L. Indoor residual spraying for preventing malaria in communities using insecticide-treated
+      nets. Cochrane Database Syst Rev 2022; CD012688
+    location: Summary of findings table 1 (malaria incidence, IRS+ITN vs ITN)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: SMC cuts clinical malaria in treated children by about 75%, but only the SMC-eligible child population
+    (smc_pop) is covered, so at the district level ITN+SMC reduces all-age cases by roughly 40-70% in eligible districts
+  about:
+    package: itn+smc
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.7
+    scale: relative_reduction
+  conditions:
+  - feature: smc_eligible
+    range:
+    - 1.0
+    - 1.0
+  source_type: literature
+  evidence:
+  - citation: Meremikwu MM, Donegan S, Sinclair D, Esu E, Oringanje C. Intermittent preventive treatment for malaria
+      in children living in areas with seasonal transmission. Cochrane Database Syst Rev 2012; CD003756
+    location: Summary of findings table 1 (clinical malaria episodes)
+  - citation: 'ACCESS-SMC Partnership. Effectiveness of seasonal malaria chemoprevention at scale in west and central
+      Africa: an observational study. Lancet 2020'
+    location: Results; effectiveness against clinical malaria in children
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B5
+  mechanism: Under a multiplicative package-rate engine the relative reduction of a package does not depend on the
+    district's baseline incidence; baseline incidence scales absolute cases averted only
+  about:
+    package: itn
+    feature: inc_none
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018; CD000363
+    location: Subgroup analyses by transmission intensity (stable vs unstable); effect broadly similar
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'ITN dominates IRS: larger relative reduction at a several-fold lower cost per person covered over
+    the plan, so at any positive shadow price ITN has higher net benefit than IRS in every district'
+  about:
+    pair:
+    - itn
+    - irs
+    feature: inc_none
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: White MT, Conteh L, Cibulskis R, Ghani AC. Costs and cost-effectiveness of malaria control interventions
+      - a systematic review. Malaria Journal 2011
+    location: Results, cost per person protected per year for ITN vs IRS; exact table not recalled
+  - citation: Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria. Cochrane Database
+      Syst Rev 2018; CD000363
+    location: Summary of findings table 1
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Topping ITN up to ITN+IRS buys a small extra reduction at a high extra cost; it pays only in the highest-burden
+    districts and should lose to ITN alone in low-burden districts
+  about:
+    pair:
+    - itn
+    - itn+irs
+    feature: inc_none
+  direction: flips
+  conditions:
+  - feature: inc_none
+    range:
+    - 0.06363
+    - 0.25
+  source_type: literature
+  evidence:
+  - citation: Pryce J, Medley N, Choi L. Indoor residual spraying for preventing malaria in communities using insecticide-treated
+      nets. Cochrane Database Syst Rev 2022; CD012688
+    location: Summary of findings table 1
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: 'What shadow price does the US$17.0M budget imply: does it cover ITN everywhere with money left for
+    IRS or SMC top-ups in high-burden districts, or does it ration even ITN?'
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: Does the programme history (cases by package and year) support the trial-prior relative effects, especially
+    for IRS and IRS+ITN where trial evidence is weak?
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q3
+  question: What share of each eligible district's population is in smc_pop, and does the engine apply the SMC effect
+    only to that group? This sets the district-level value of ITN+SMC over ITN.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Where along inc_none does ITN+IRS overtake ITN at the budget's shadow price, if anywhere in the observed
+    range?
+  beliefs:
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: ITN's relative reduction in cases vs none lies in 30-60% at most design points
+  test:
+    kind: effect_band
+    package: itn
+    band:
+    - 0.3
+    - 0.6
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: IRS alone reduces cases by 15-55% at most design points
+  test:
+    kind: effect_band
+    package: irs
+    band:
+    - 0.15
+    - 0.55
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: ITN+IRS reduces cases by 40-75% vs none at most design points
+  test:
+    kind: effect_band
+    package: itn+irs
+    band:
+    - 0.4
+    - 0.75
+    min_share: 0.7
+- id: H4
+  belief: B4
+  claim: In SMC-eligible districts ITN+SMC reduces all-age cases by 40-70% vs none
+  test:
+    kind: effect_band
+    package: itn+smc
+    band:
+    - 0.4
+    - 0.7
+    min_share: 0.7
+    where:
+      smc_eligible:
+      - 1.0
+      - 1.0
+- id: H5
+  belief: B5
+  claim: ITN's relative reduction does not vary with baseline incidence (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: itn
+    feature: inc_none
+    direction: negligible
+    equivalence: 0.1
+    scope: marginal
+- id: H6
+  belief: B6
+  claim: ITN beats IRS on net benefit at the shadow price at nearly all points across the whole inc_none range
+  test:
+    kind: paired_sign
+    a: itn
+    b: irs
+    feature: inc_none
+    range:
+    - 0.06363
+    - 0.68557
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: In low-burden districts (inc_none 0.064-0.25) ITN alone beats ITN+IRS on net benefit at the shadow price
+  test:
+    kind: paired_sign
+    a: itn
+    b: itn+irs
+    feature: inc_none
+    range:
+    - 0.06363
+    - 0.25
+    sign: positive
+    min_share: 0.7
