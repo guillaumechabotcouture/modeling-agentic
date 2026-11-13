@@ -476,6 +476,28 @@ def _self_test_v017(ok, P) -> None:
         ok(not bad, f"V35 a negative PBO gain scale or decay, or a non-finite kill shift, fails closed (accepted: {bad})")
     case("V35", v35)
 
+    def v36():
+        # Gleave et al. 2021 Cochrane CD012776.pub3, abstract: unwashed PBO vs standard nets, mosquito mortality, high
+        # resistance (< 30% bioassay mortality) RR 1.84 (1.60-2.11). Rule: the scale whose category-mean hut-mortality
+        # ratio (Churcher Eq. 2 at Eq. 4's f_s vs at x, x uniform on 0-0.30) equals each CI bound
+        r1 = hut_mortality_ratio(1.0, 0.0, 0.30)
+        b = {cx: [pbo_gain_scale_for_hut_rr(t, 0.0, 0.30, cx) for t in (1.60, 2.11)] for cx in ("gambiae", "funestus")}
+        ok(abs(r1 - 2.211) < 0.002 and abs(b["gambiae"][0] - 0.511) < 0.002 and abs(b["gambiae"][1] - 0.912) < 0.002
+           and abs(b["funestus"][0] - 0.316) < 0.002 and abs(b["funestus"][1] - 0.513) < 0.002,
+           f"V36 the PBO gain scale range rule on Gleave 2021's high-resistance hut mortality RR 1.84 (1.60-2.11): "
+           f"Equation 4 (scale 1) gives {r1:.3f}; scales {b}")
+    case("V36", v36)
+
+    def v37():
+        # Staedke et al. 2020 Lancet 395:1292, Table 2 (p. 1299), as-treated PR 0.74 (0.62-0.87) at 6 months and 0.84
+        # (0.72-0.98) at 18 months. Rule: log PR(t) fades as exp(-decay t); delta method, the two estimates taken as
+        # independent (conservative), lower bound clipped at 0
+        pt, lo, hi = adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0)
+        ok(abs(pt - 0.546) < 0.002 and lo == 0.0 and abs(hi - 1.594) < 0.002,
+           f"V37 the PBO advantage decay range rule on LLINEUP's 6- and 18-month prevalence ratios: {pt:.3f} per year, "
+           f"95% range [{lo}, {hi:.3f}]")
+    case("V37", v37)
+
 
 def _self_test() -> int:
     fails = []

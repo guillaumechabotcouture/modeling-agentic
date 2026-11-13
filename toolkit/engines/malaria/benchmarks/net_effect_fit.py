@@ -205,6 +205,12 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
     base = yaml.safe_load(open(PACK))
     p = build_pack(base)
     train, held = split(base)
@@ -217,10 +223,10 @@ def _self_test() -> int:
         q = copy.deepcopy(p)
         q["fit_joint"]["targets"].append(t)
         ok(any(f"{t} is held out" in x for x in check(q, base)), f"F1b a held-out benchmark ({t}) as a target is refused")
-    ok(list(p["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill"]
-       and "pbo" not in train_nets(base, train),
-       "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets) with cfp_kill and irs_kill; the "
-       "PBO parameters stay out: no training arm has a PBO net")
+    ok(list(p["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill", "cfp_half"]
+       and "pbo" not in train_nets(base, train) and p["fit_joint"]["params"]["cfp_half"] == [547.5, 1277.5],
+       "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets), cfp_kill, irs_kill and cfp_half "
+       "(owner, 13 Nov; box 1.5-3.5 y); the PBO parameters stay out: no training arm has a PBO net")
     from toolkit.engines.malaria.engine import MalariaEngine
     from toolkit.spec import priors as PR
     e = MalariaEngine()
@@ -229,12 +235,19 @@ def _self_test() -> int:
     bx = p["fit_joint"]["params"]
     ok(all(bx[k][0] <= sp[k] <= bx[k][1] for k in bx) and [pr.lo, pr.hi] == bx["net_kill_shift"],
        "F3 the box holds every current value; the kill shift's box is its card prior (Churcher 2016 alpha1 CrI)")
-    q = plan(p)
-    ok(q["design_points"] == 41 and q["seeds"] == 8 and len(q["arms"]) == 8 and q["settings"] ==
-       ["benin", "irs_added", "misungwi", "muleba"] and q["arm_runs"] == (41 + 1 + 20) * 8 * 8 + 2 * 21 * 2
-       and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held,
-       f"F4 plan: 41 design points + 1 + 20 verified x 8 arms x 8 seeds; {q['arm_runs']} arm runs, "
-       f"{q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]}; held out listed")
+
+    def f4():
+        q = plan(p)
+        npt = 45 + 1 + 1 + 12
+        ok(q["design_points"] == 46 and q["seeds"] == 8 and len(q["arms"]) == 8
+           and q["settings"] == ["benin", "irs_added", "misungwi", "muleba"]
+           and q["calibration_runs"] == 5 * 21 * 2 and q["arm_runs"] == npt * 8 * 8 + q["calibration_runs"]
+           and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held
+           and q["usd"][1] <= CAP_USD,
+           f"F4 plan: 46 design points + the chosen value + 12 verified, x 8 arms x 8 seeds, plus a 5-point calibration "
+           f"grid in net_kill_shift; {q['arm_runs']} arm runs, {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]} "
+           f"(cap ${CAP_USD})")
+    case("F4", f4)
     # F5: a narrow trade-off (a + b = 1 +- 0.05) is kept by the joint sample and lost by independent marginal draws
     names, box = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
     g = np.linspace(0, 1, 7)
@@ -248,12 +261,17 @@ def _self_test() -> int:
        and np.mean(np.abs(ind.sum(1) - 1) <= 0.05) < 0.2,
        f"F5 the joint sample keeps a narrow trade-off (corr {r['correlation']['matrix'][0][1]}); independent draws "
        f"from the marginal hulls fall outside it {1 - np.mean(np.abs(ind.sum(1) - 1) <= 0.05):.0%} of the time")
-    for bad, kw in (("fitted.yaml", {"approved": "x", "smoke": False}), ("x.yaml", {"approved": None, "smoke": False})):
-        try:
-            run(p, base, 1, os.path.join(HERE, bad), **kw)
-            ok(False, f"F6 refused: {bad} {kw}")
-        except ValueError:
-            ok(True, f"F6 refused before any run: {'writing ' + bad if bad != 'x.yaml' else 'a full fit without --approved'}")
+
+    def f6():
+        for bad, kw, why in (("fitted.yaml", {"approved": "x", "smoke": False}, "writing fitted.yaml"),
+                             ("x.yaml", {"approved": None, "smoke": False}, "a full fit without --approved"),
+                             ("x.yaml", {"approved": "x", "smoke": False, "cap_usd": 5.0}, "a plan above the cap")):
+            try:
+                run(p, base, 1, os.path.join(HERE, bad), **kw)
+                ok(False, f"F6 refused: {why}")
+            except ValueError:
+                ok(True, f"F6 refused before any run: {why}")
+    case("F6", f6)
     s = build_pack(base, smoke=True)
     ok(s["seeds"] == base["seeds"][:1] and s["fit_joint"]["design"]["n"] == 3
        and all(v["params"]["n_agents"] == 600 for v in s["settings"].values()) and not check(s, base),
@@ -261,6 +279,55 @@ def _self_test() -> int:
     tb = target_bands(p)
     ok(set(tb) == set(train) and all(len(v) == 2 for v in tb.values()),
        "F8 the region step reads the bands of the fit's targets only (B16c has none; the first smoke's failure)")
+
+    def f9():
+        dep = calibration_params(p)
+        m = interp_calibration([-0.6, 0.0, 0.6], [10.0, 20.0, 40.0], 0.3)
+        ok(dep == {"net_kill_shift"}
+           and abs(interp_calibration([-0.6, 0.0, 0.6], [10.0, 20.0, 40.0], 0.0) - 20.0) < 1e-12
+           and abs(m - 20.0 * 2 ** 0.5) < 1e-9,
+           f"F9 (review P2) each site's calibration arm (pyrethroid nets, no IRS) depends on {sorted(dep)} only, so "
+           "every parameter point is calibrated by log-linear interpolation on a grid in net_kill_shift (exact at the "
+           f"nodes; {m:.3f} half-way between 20 and 40)")
+    case("F9", f9)
+
+    def f10():
+        rr = RecalRunner(p, e, 1, [11], mode="fit", evidence=BM.load_evidence(e, pack=p))
+        ran = []
+        rr._map = lambda jobs, chunk=300: (ran.append(len(jobs)), [{"windows": {}} for _ in jobs])[1]
+        th = {"net_kill_shift": 0.0, "cfp_kill": 0.4, "irs_kill": 0.4, "cfp_half": 912.5}
+        rr.set_calibration({"muleba": 60.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0})
+        rr.prefetch(["mul_pyr"], [th])
+        rr.prefetch(["mul_pyr"], [th])
+        rr.set_calibration({"muleba": 70.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0})
+        rr.prefetch(["mul_pyr"], [th])
+        ok(ran == [1, 1], f"F10 (review P2) the result cache is keyed on the calibration: the same point is reused "
+                          f"under the same calibration and re-run under another (jobs per prefetch {ran})")
+    case("F10", f10)
+
+    def f11():
+        reg = {"sample": [{"a": 0.1}, {"a": 0.2}], "hull": {"a": [0.1, 0.2]}}
+        good, c0 = finalize(copy.deepcopy(reg), [{"point": {"a": 0.1}, "all_in_band": True}])
+        bad, c1 = finalize(copy.deepcopy(reg), [{"point": {"a": 0.1}, "all_in_band": True},
+                                                {"point": {"a": 0.2}, "all_in_band": False}])
+        ok(c0 == 0 and good["sample_status"] == "verified" and len(good["sample"]) == 2
+           and c1 != 0 and bad["sample_status"] == "invalid" and bad["sample"] == []
+           and len(bad["sample_unverified"]) == 2 and bad["verified"]["failed"] == [{"a": 0.2}],
+           "F11 (review P2) a verified point out of band invalidates the exported sample (kept apart as "
+           "sample_unverified, with the failing points) and the run returns non-zero")
+    case("F11", f11)
+
+    def f12():
+        n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
+        g2 = np.linspace(0, 1, 9)
+        X2 = np.array([[u, v] for u in g2 for v in g2])
+        Y2 = {"T": np.exp(np.ones(len(X2)))}          # every candidate is in band: the region is the whole box
+        r2 = joint_region(X2, Y2, {"T": [2.0, 3.0]}, n2, b2, 17, n_sample=50)
+        ok(r2["hull"] == {"a": [0.0, 1.0], "b": [0.0, 1.0]} and r2["at_box_edge"] == ["a", "b"]
+           and len(r2["sample"]) == 50,
+           f"F12 (review P2) the hull and the box-edge flags come from every accepted candidate, not the 50-point "
+           f"subsample ({r2['hull']}, edges {r2['at_box_edge']})")
+    case("F12", f12)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
