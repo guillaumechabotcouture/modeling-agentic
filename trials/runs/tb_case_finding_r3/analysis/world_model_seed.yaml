@@ -1,0 +1,289 @@
+beliefs:
+- id: B1
+  mechanism: Three annual rounds of community-wide door-to-door sputum Xpert screening reduce prevalent bacteriologically
+    confirmed TB by removing prevalent cases (shortening infectious duration) and cutting onward transmission
+  about:
+    package: cacf
+  direction: reduces
+  magnitude:
+    band:
+    - 0.22
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Marks GB et al. Community-wide Screening for Tuberculosis in a High-Prevalence Setting. N Engl J Med
+      2019;381:1347-1357 (ACT3)
+    location: 'Abstract and main prevalence-survey results table: year-4 prevalence ratio about 0.56 (95% CI about
+      0.40-0.78); table number not verified'
+  - citation: 'Corbett EL et al. Comparison of two active case-finding strategies for community-based diagnosis
+      of symptomatic smear-positive tuberculosis and control of infectious tuberculosis in Harare, Zimbabwe (DETECTB):
+      a cluster-randomised trial. Lancet 2010;376:1244-1253'
+    location: 'Abstract: culture-positive prevalence fell by about 40% across both arms (before-after, no arm difference)'
+  - citation: 'Burke RM et al. Community-based active case-finding interventions for tuberculosis: a systematic
+      review. Lancet Public Health 2021;6:e283-e299'
+    location: Results on prevalence outcomes; location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Enhanced household-contact investigation finds cases among the highest-risk contacts and, at population
+    level, gives a modest reduction in prevalence; the only randomised population-level prevalence estimate has
+    an interval crossing no effect
+  about:
+    package: hhc
+  direction: reduces
+  magnitude:
+    band:
+    - 0.0
+    - 0.36
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern
+      Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-1194'
+    location: 'Abstract and prevalence results table: household intervention adjusted prevalence ratio about 0.82
+      (95% CI about 0.64-1.04); table number not verified'
+  - citation: Fox GJ et al. Household-Contact Investigation for Detection of Tuberculosis in Vietnam. N Engl J Med
+      2018;378:221-229 (ACT2)
+    location: 'Abstract: higher case detection with contact investigation; prevalence not the outcome'
+  - citation: 'Fox GJ et al. Contact investigation for tuberculosis: a systematic review and meta-analysis. Eur
+      Respir J 2013;41:140-156'
+    location: 'Abstract: pooled yield about 3% of household contacts in low- and middle-income settings'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: Per dollar, HHC buys more relative reduction than CACF (roughly 0.0-0.3 per $1.20 versus 0.2-0.6 per
+    $12), so where prevalence is low HHC beats CACF at a binding budget's shadow price; CACF's larger absolute effect
+    only pays where baseline prevalence is high enough. The HHC-versus-CACF choice flips along prevalence, roughly
+    mid-range
+  about:
+    pair:
+    - hhc
+    - cacf
+    feature: prev
+  direction: flips
+  conditions:
+  - feature: prev
+    range:
+    - 0.003
+    - 0.0075
+  source_type: literature
+  evidence:
+  - citation: Marks GB et al. Community-wide Screening for Tuberculosis in a High-Prevalence Setting. N Engl J Med
+      2019;381:1347-1357
+    location: Abstract (effect size used in the per-dollar arithmetic)
+  - citation: 'Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern
+      Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-1194'
+    location: Abstract (effect size used in the per-dollar arithmetic)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Adding HHC to CACF still gains: under independent action the HHC increment is RR_cacf x (1 - RR_hhc)
+    of baseline for $1.20 more per resident, which beats the shadow price where prevalence is moderate to high'
+  about:
+    pair:
+    - cacf+hhc
+    - cacf
+    feature: prev
+  direction: increases
+  conditions:
+  - feature: prev
+    range:
+    - 0.004
+    - 0.008283
+  source_type: literature
+  evidence:
+  - citation: 'Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern
+      Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-1194'
+    location: 'Factorial design: household arm effect estimated with and without community case finding; no interaction
+      test powered; location not verified'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'HHC beats doing nothing in nearly every district: its cost per resident is small relative to the benefit
+    at any plausible shadow price set by marginal CACF'
+  about:
+    pair:
+    - hhc
+    - none
+    feature: prev
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern
+      Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-1194'
+    location: Abstract
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Randomised trials do not establish an HIV gradient in the relative prevalence reduction from community
+    case finding (ACT3 in low-HIV Vietnam, DETECTB and ZAMSTAR in high-HIV settings with mixed results); epidemiologically,
+    high HIV shortens prevalent disease duration and should weaken prevalence-based screening, but the engine card
+    lists only the baseline rate as a unit attribute, so in the sweep the relative effect should not vary with HIV
+  about:
+    package: cacf
+    feature: hiv
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Corbett EL et al. Comparison of two active case-finding strategies for community-based diagnosis
+      of symptomatic smear-positive tuberculosis and control of infectious tuberculosis in Harare, Zimbabwe (DETECTB):
+      a cluster-randomised trial. Lancet 2010;376:1244-1253'
+    location: Abstract
+  - citation: 'Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern
+      Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-1194'
+    location: 'Abstract: enhanced community case finding showed no prevalence reduction'
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Does the CACF effect from ACT3 (low-HIV Vietnam, high coverage, three rounds) transfer to high-HIV districts,
+    where ZAMSTAR's community case finding showed no prevalence effect? A smaller effect at high HIV would move
+    CACF toward low-HIV, high-prevalence districts.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Is the population-level prevalence effect of HHC real? ZAMSTAR's interval crosses 1; if HHC has close
+    to no effect, the plan shifts from HHC everywhere to CACF in the top-prevalence districts.
+  beliefs:
+  - B2
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Where does the HHC/CACF flip sit along prevalence? That depends on district populations and the budget's
+    shadow price (withheld), and on whether CACF coverage and costs hold at scale.
+  beliefs:
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: Do CACF and HHC interact (sub-multiplicatively, since both find the same prevalent cases)? No trial
+    tested the combination factorially at adequate power; overlap would shrink the cacf+hhc increment.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q5
+  question: Is the 2024 survey prevalence still the 2026 baseline, and how precise is it per district (survey sampling
+    error at 0.2-0.8% prevalence is large)? District ranking by prevalence may be indicative only.
+  beliefs:
+  - B3
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CACF's relative reduction in prevalent TB lies within the ACT3 interval (0.22-0.60) at at least 80% of
+    usable points; refuted if 20% or fewer do.
+  test:
+    kind: effect_band
+    package: cacf
+    band:
+    - 0.22
+    - 0.6
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: HHC's relative reduction lies within the ZAMSTAR household-arm range (0.0-0.36) at at least 75% of usable
+    points; refuted if 25% or fewer do.
+  test:
+    kind: effect_band
+    package: hhc
+    band:
+    - 0.0
+    - 0.36
+    min_share: 0.75
+- id: H3
+  belief: B3
+  claim: In low-prevalence districts (prev 0.0016-0.003) HHC beats CACF on net benefit at the shadow price at at
+    least 70% of usable points; refuted if CACF wins there at 70% or more.
+  test:
+    kind: paired_sign
+    a: hhc
+    b: cacf
+    feature: prev
+    range:
+    - 0.0016
+    - 0.003
+    sign: positive
+    min_share: 0.7
+- id: H4
+  belief: B3
+  claim: The HHC/CACF transition along prevalence lies within 0.003-0.0075; refuted if the located flip range is
+    disjoint from it.
+  test:
+    kind: flip_in
+    a: hhc
+    b: cacf
+    feature: prev
+    range:
+    - 0.003
+    - 0.0075
+- id: H5
+  belief: B4
+  claim: Where prevalence is 0.004 or higher, cacf+hhc beats cacf alone at the shadow price at at least 80% of usable
+    points; refuted if cacf alone wins at 80% or more.
+  test:
+    kind: paired_sign
+    a: cacf+hhc
+    b: cacf
+    feature: prev
+    range:
+    - 0.004
+    - 0.008283
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B5
+  claim: HHC beats no action at the shadow price across the whole prevalence range at at least 80% of usable points;
+    refuted if none wins at 80% or more.
+  test:
+    kind: paired_sign
+    a: hhc
+    b: none
+    feature: prev
+    range:
+    - 0.001607
+    - 0.008283
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B6
+  claim: CACF's relative reduction does not vary with adult HIV prevalence in the sweep (Spearman rho 95% interval
+    inside +/-0.2); refuted if the interval lies outside it.
+  test:
+    kind: effect_direction
+    package: cacf
+    feature: hiv
+    direction: negligible
+    equivalence: 0.2
