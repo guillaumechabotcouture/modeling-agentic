@@ -373,9 +373,11 @@ def _self_test() -> int:
                f"ED-R4 an engine that declares no decision inputs for a mapped component fails closed: {probs}")
             raw["engine"] = {"ref": "toolkit.spec.toy_engines:ToySpecRateEngine", "config": {"components": ["a", "b"]}}
             req, probs = required_inputs(raw, d)
-            ok(sorted(req) == ["parameter:lrr:a", "parameter:lrr:b"] and probs == [],
-               f"ED-R5 a subclass inherits its base engine's declaration (here the package-rate engine's `*`): "
-               f"{sorted(req)} {probs}")
+            base = engine_declaration("toolkit.engines.empirical.engine:PackageRateEngine")
+            ok(req == {} and probs == [] and "*" in base
+               and engine_declaration(raw["engine"]["ref"], raw["engine"]["config"]) == base,
+               f"ED-R5 a subclass inherits its base engine's declaration (the package-rate engine's `*`: effects "
+               f"calibrated to the run's own panel, no outside input): {sorted(req)} {probs}")
         mal = {"engine": {"ref": "toolkit.engines.malaria.engine:MalariaEngine"},
                "options": {"components": {"n": {}, "s": {}}, "engine_map": {"n": {"net": "pbo"}, "s": {"smc": 0}}}}
         req, probs = required_inputs(mal)

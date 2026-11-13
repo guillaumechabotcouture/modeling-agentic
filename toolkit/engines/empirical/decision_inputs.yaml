@@ -1,10 +1,11 @@
 # Decision inputs of the package-rate engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components
 # are named by the spec's configuration, so one declaration covers every component ("*"). Not in code (the code
 # fingerprint covers *.py).
+# None, by design: every effect (one log rate ratio per component combination) is calibrated per run to the run's own
+# unit panel, never taken from outside the run. The panel's sampling frame and ascertainment are declared and checked
+# where the calibration is (calibration.targets.frame, the spec's measurement model), not in the dossier.
 decision_inputs:
   "*":
-    inactive: [0]
-    inputs:
-      - {kind: parameter, name: "lrr:{component}", why: "the log rate ratio of the component (and of each combination
-          containing it), estimated from the unit panel: its sampling frame and ascertainment are what the dossier
-          checks"}
+    inputs: []
+    none_reason: "each component's effect is calibrated per run to the run's own unit panel; the panel's frame is
+      declared with the calibration targets"
