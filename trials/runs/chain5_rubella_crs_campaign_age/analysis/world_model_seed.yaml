@@ -1,0 +1,310 @@
+beliefs:
+- id: B1
+  mechanism: 'Herd effect: CHILDREN removes ~80% of child susceptibles, who are most of all susceptibles, pushing
+    Reff below 1 in nearly every district; where the baseline is supercritical (a major outbreak would infect a
+    large share of susceptible women) this averts nearly all CRS'
+  about:
+    package: children
+    feature: s0_children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: s0_children
+    range:
+    - 0.4
+    - 0.5999
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5, critical vaccination proportion 1 - 1/R0 (page not checked)
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983'
+    location: location not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: WIDE adds direct protection of ~80% of susceptible women to the herd effect, so its CRS reduction is
+    at least about the direct share protected and near complete where the baseline is supercritical
+  about:
+    package: wide
+    feature: s0_women
+  direction: reduces
+  magnitude:
+    band:
+    - 0.78
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Rubella vaccines: WHO position paper. Wkly Epidemiol Rec 2011'
+    location: seroconversion of about 95% or more after one dose (section on immunogenicity; page not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Susceptible women and others are not reached by CHILDREN; a larger women's gap raises CHILDREN's residual
+    Reff towards 1 where transmission is high, so CHILDREN's relative reduction falls as s0_women rises (where the
+    baseline is subcritical the sign can reverse, but I expect the high-transmission regime to dominate)
+  about:
+    package: children
+    feature: s0_women
+  direction: decreases
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 28.0
+    - 34.914320199750364
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5 (page not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: Higher transmission makes the baseline supercritical (large CRS burden) while CHILDREN's residual Reff
+    stays mostly below 1, so CHILDREN's relative reduction rises with the contact rate (opposite to the measles
+    chains, where the residual sat near 1)
+  about:
+    package: children
+    feature: contact_rate (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation (page not checked)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'Price vs herd effect: WIDE costs US$1.10 more per woman 15-39 (~US$0.2 per resident); where CHILDREN
+    already pushes Reff below 1, WIDE''s extra CRS averted (residual stuttering chains among women) is tiny and
+    worth far less than its extra cost at the shadow price, so CHILDREN beats WIDE on net benefit; WIDE can win
+    only where CHILDREN leaves Reff above ~1 (highest s0_women, s0_other and R0). The stated shadow price (0.032
+    per USD) values cost heavily relative to CRS per person (~1e-4 per resident), reinforcing CHILDREN.'
+  about:
+    pair:
+    - children
+    - wide
+  direction: flips
+  conditions:
+  - feature: s0_women
+    range:
+    - 0.2
+    - 0.2925
+  source_type: literature
+  evidence:
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, Reef SE, Navar AM, Simons E, Yoshida LM, Brown DWJ, Jackson C, Strebel
+      PM, Dabbagh AJ. Using seroprevalence and immunisation coverage data to estimate the global burden of congenital
+      rubella syndrome, 1996-2010: a systematic review. PLoS One 2016'
+    location: CRS burden per susceptible woman, methods (page not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: All-or-nothing efficacy scales the women protected directly by WIDE, so WIDE's relative reduction rises
+    with efficacy:wide
+  about:
+    package: wide
+    feature: efficacy:wide
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Rubella vaccines: WHO position paper. Wkly Epidemiol Rec 2011'
+    location: immunogenicity section (page not checked)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Susceptible 'others' (men and women over 39) are reached by neither option and keep CHILDREN's residual
+    Reff higher; CHILDREN's relative reduction falls as s0_other rises, weakly (others' gap is small)
+  about:
+    package: children
+    feature: s0_other
+  direction: decreases
+  conditions:
+  - feature: contact_rate (calibration scale)
+    range:
+    - 28.0
+    - 34.914320199750364
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5 (page not checked)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: CRS risk per infection in a woman depends on pregnancy and gestational week (highest in the first 12
+    weeks); the per-district CRS ratio scales burden but not the relative reduction, so it ranks districts, not
+    options
+  about:
+    component: wide
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Miller E, Cradock-Watson JE, Pollock TM. Consequences of confirmed maternal rubella at successive
+      stages of pregnancy. Lancet 1982
+    location: table of congenital infection and defects by gestational week (table number not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: How many districts have a supercritical baseline (R0 x mean susceptibility > 1)? This sets how much
+    CRS any option can avert and whether 'none' beats either option at the shadow price where the baseline is a
+    stuttering chain.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Are seeded infections counted in the outcome and unavertable? If so they cap the relative reduction
+    (the chain1 seed refutation), most where the baseline is small.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q3
+  question: Is the shadow price 0.032 CRS per USD (as stated; a CRS case then worth ~US$31) or 32 DALYs x US$1000/DALY
+    per case (~3e-5 CRS per USD)? At the stated value no campaign beats none on net benefit, and WIDE never beats
+    CHILDREN; at the second WIDE may win where CHILDREN leaves Reff above 1.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Where exactly does CHILDREN's residual Reff cross 1 (high s0_women, s0_other and R0), i.e. where must
+    women be vaccinated directly? No optimised plan exists, so the budget allocation cannot be checked here.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Where s0_children is 0.4-0.6, CHILDREN's relative reduction in CRS is in [0.8, 1.0] at >= 70% of usable
+    points.
+  p: 0.6
+  test:
+    kind: effect_band
+    package: children
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.7
+    where:
+      s0_children:
+      - 0.4
+      - 0.5999
+- id: H2
+  belief: B2
+  claim: WIDE's relative reduction in CRS is in [0.78, 1.0] at >= 80% of usable points.
+  p: 0.7
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.78
+    - 1.0
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: At high contact rate, CHILDREN's relative reduction decreases with s0_women (Spearman interval below 0).
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_women
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: CHILDREN's relative reduction increases with the contact-rate calibration scale (Spearman interval above
+    0).
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: children
+    feature: contact_rate (calibration scale)
+    direction: increases
+- id: H5
+  belief: B5
+  claim: Where s0_women is below 0.2, CHILDREN beats WIDE on net benefit at the shadow price at >= 80% of usable
+    points.
+  p: 0.85
+  test:
+    kind: paired_sign
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.0617
+    - 0.2
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B6
+  claim: WIDE's relative reduction increases with efficacy:wide (Spearman interval above 0).
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: wide
+    feature: efficacy:wide
+    direction: increases
+- id: H7
+  belief: B7
+  claim: At high contact rate, CHILDREN's relative reduction decreases with s0_other (Spearman interval below 0).
+  p: 0.4
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_other
+    direction: decreases
