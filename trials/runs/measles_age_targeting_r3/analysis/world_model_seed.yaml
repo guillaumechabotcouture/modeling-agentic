@@ -1,0 +1,321 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold: in a homogeneously mixing closed population seeded once, a major outbreak occurs
+    only when R0 x susceptible share > 1, and its size rises steeply above 1. A campaign that pushes Reff below
+    1 averts nearly all infections; one that leaves Reff above 1 averts a smaller share, but still more than its
+    share of susceptibles removed (less overshoot).'
+  about:
+    package: D_9mto14y
+  direction: reduces
+  magnitude:
+    band:
+    - 0.85
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: susc_9_59m
+    range:
+    - 0.25
+    - 0.5394
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology
+    location: final size relation, Section 2 (location approximate)
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: chapter on herd immunity and vaccination (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: C_9to59m leaves the 5-14y immunity gap in place. Where that gap is large, residual Reff after C stays
+    above 1 and C's relative reduction falls well short of D's. Where the gap is small, C alone brings Reff below
+    1. C's relative reduction therefore falls as susc_5_14y rises.
+  about:
+    package: C_9to59m
+    feature: susc_5_14y
+  direction: decreases
+  magnitude:
+    band:
+    - 0.3
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: susc_9_59m
+    range:
+    - 0.25
+    - 0.5394
+  source_type: literature
+  evidence:
+  - citation: Funk S, Knapp JK, Lebo E, et al. (2019). Combining serological and contact data to derive target immunity
+      levels for achieving and maintaining measles elimination. BMC Medicine
+    location: Results, age-specific immunity targets (location approximate)
+  - citation: 'Verguet S, Johri M, Morris SK, et al. (2015). Controlling measles using supplemental immunization
+      activities: a mathematical model to inform optimal policy. Vaccine'
+    location: Results (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: A higher R0 (contact_rate scale) lowers the threshold susceptible share 1/R0 (0.10 at R0 10, 0.0625
+    at R0 16), so C is less often enough on its own and its relative reduction falls as contact_rate rises.
+  about:
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  conditions:
+  - feature: susc_9_59m
+    range:
+    - 0.25
+    - 0.5394
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. (2017). The basic reproduction number (R0) of measles: a systematic
+      review. The Lancet Infectious Diseases'
+    location: Results, distribution of R0 estimates
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: A larger 9-59m gap means C removes a larger share of all susceptibles, so C's relative reduction rises
+    with susc_9_59m (and the baseline epidemic is larger).
+  about:
+    package: C_9to59m
+    feature: susc_9_59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: chapter on herd immunity and vaccination (location approximate)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Choice between C and D at the shadow price: D costs roughly 2.5-3x C per district. It wins only where
+    C leaves a major outbreak (high older-child gap, high R0). Where C already pushes Reff below 1, D''s extra infections
+    averted are near zero, so C wins. The choice flips along susc_5_14y near the value where post-C Reff crosses
+    1, shifted upward by the extra cost of D. That value is about 0.10-0.16 at mid R0 under my assumed age shares.'
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+  direction: flips
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.07
+    - 0.17
+  source_type: literature
+  evidence:
+  - citation: 'Verguet S, Johri M, Morris SK, et al. (2015). Controlling measles using supplemental immunization
+      activities: a mathematical model to inform optimal policy. Vaccine'
+    location: Results (location approximate)
+  - citation: Funk S, Knapp JK, Lebo E, et al. (2019). Combining serological and contact data to derive target immunity
+      levels for achieving and maintaining measles elimination. BMC Medicine
+    location: Results, age-specific immunity targets (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Infants under 9 months cannot be protected by either option and stay fully susceptible. They set a
+    floor on post-campaign susceptibility (~0.02-0.03 of the population), which matters only at the top of the R0
+    range.
+  about:
+    component: D_9mto14y
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L (2011). Field effectiveness of live attenuated measles-containing vaccines:
+      a review of published literature. The Journal of Infectious Diseases'
+    location: Results, effectiveness by age at vaccination (location approximate)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'Low older-child gap regime (below the B5 flip zone): with susc_5_14y small, C alone pushes post-campaign
+    Reff below 1 at most R0 values, so D''s extra infections averted over C are near zero while D costs roughly
+    2.5-3x C. At any positive shadow price C beats D on net benefit.'
+  about:
+    pair:
+    - C_9to59m
+    - D_9mto14y
+  direction: raises
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.0135
+    - 0.07
+  source_type: literature
+  evidence:
+  - citation: 'Verguet S, Johri M, Morris SK, et al. (2015). Controlling measles using supplemental immunization
+      activities: a mathematical model to inform optimal policy. Vaccine'
+    location: Results (location approximate)
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: chapter on herd immunity and vaccination (location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: 'High older-child gap regime (above the B5 flip zone): with susc_5_14y large, C leaves post-campaign
+    Reff above 1 at most R0 values, so a major outbreak still occurs after C, while D brings Reff below 1. D''s
+    extra infections averted are a large share of the district''s population and outweigh its extra cost.'
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+  direction: raises
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.16
+    - 0.1953
+  source_type: literature
+  evidence:
+  - citation: Funk S, Knapp JK, Lebo E, et al. (2019). Combining serological and contact data to derive target immunity
+      levels for achieving and maintaining measles elimination. BMC Medicine
+    location: Results, age-specific immunity targets (location approximate)
+  - citation: 'Verguet S, Johri M, Morris SK, et al. (2015). Controlling measles using supplemental immunization
+      activities: a mathematical model to inform optimal policy. Vaccine'
+    location: Results (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: 'Actual age-cohort population shares per district (pop_9_59m, pop_9m_14y vs pop): they set both the
+    cost ratio D/C and the susceptibility weight of each gap, and so where the C/D flip falls.'
+  beliefs:
+  - B5
+  - B2
+  decision_relevant: true
+- id: Q2
+  question: What is the shadow price of the US$2.9M budget, and how many districts can afford D? A lower lambda
+    moves the flip toward lower susc_5_14y.
+  beliefs:
+  - B5
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q3
+  question: Range of the sampled campaign efficacy (reach x protection); if it is well below 0.77, D may no longer
+    bring Reff below 1 at high R0.
+  beliefs:
+  - B1
+  decision_relevant: true
+- id: Q4
+  question: In districts already below the threshold before any campaign (Reff < 1), the baseline burden is only
+    the seeded chain. Is any campaign worth its fixed cost there, compared with 'none'?
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Where the 9-59m gap is substantial, D_9mto14y brings Reff below 1 and averts 85-100% of infections in at
+    least 70% of points.
+  test:
+    kind: effect_band
+    package: D_9mto14y
+    band:
+    - 0.85
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: C_9to59m's relative reduction falls as susc_5_14y rises (Spearman interval below 0).
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_5_14y
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: C_9to59m's relative reduction falls as the contact-rate (R0) scale rises.
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: C_9to59m's relative reduction rises with susc_9_59m.
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_9_59m
+    direction: increases
+- id: H5
+  belief: B7
+  claim: Where the older-child gap is below the flip zone (susc_5_14y <= 0.07), C_9to59m beats D_9mto14y on net
+    benefit at the shadow price in at least 75% of points.
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.0135
+    - 0.07
+    sign: positive
+    min_share: 0.75
+- id: H6
+  belief: B8
+  claim: Where the older-child gap is large (susc_5_14y >= 0.16), D_9mto14y beats C_9to59m on net benefit at the
+    shadow price in at least 70% of points.
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.16
+    - 0.1953
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B5
+  claim: The C/D choice flips along susc_5_14y between 0.07 and 0.17.
+  test:
+    kind: flip_in
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.07
+    - 0.17
