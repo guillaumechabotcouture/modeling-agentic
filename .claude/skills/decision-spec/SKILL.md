@@ -111,6 +111,17 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
+12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
+    parameters and card tables its effect depends on (`decision_inputs`, read by
+    `toolkit/engines/decision_inputs.py`). When the options use such a component, name the
+    run's dossier (`evidence: {dossier: evidence_dossier.yaml}`) and give one entry per input
+    (`<kind>:<name>`, format in `toolkit/spec/evidence_dossier.py`): the value the model uses
+    and its source; field or trial observations (source, URL or table, year, sites, n,
+    sampling frame, value) and how they compare with the model value on the same estimand,
+    or `no_data` with the borrowing rule; the chosen value or range with its rule; and, for a
+    range, its decision test. Sign-off refuses a missing, unparseable or incomplete dossier
+    and a blank field, and lists what is missing. The sheet shows the table and the
+    signature binds the file, so an edit after sign-off needs a new sign-off.
 
 ## Closed-population epidemic questions (the compartmental engine)
 

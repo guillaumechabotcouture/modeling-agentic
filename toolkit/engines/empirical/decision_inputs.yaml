@@ -1,0 +1,10 @@
+# Decision inputs of the package-rate engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components
+# are named by the spec's configuration, so one declaration covers every component ("*"). Not in code (the code
+# fingerprint covers *.py).
+decision_inputs:
+  "*":
+    inactive: [0]
+    inputs:
+      - {kind: parameter, name: "lrr:{component}", why: "the log rate ratio of the component (and of each combination
+          containing it), estimated from the unit panel: its sampling frame and ascertainment are what the dossier
+          checks"}

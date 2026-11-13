@@ -1,0 +1,50 @@
+# Decision inputs of the malaria engine (toolkit/engines/decision_inputs.py; F6 evidence dossier, owner decision
+# 2026-11-12). Card metadata, merged with card.yaml's own `decision_inputs` (none) by the loader: kept in its own file
+# so that it never conflicts with an edit of card.yaml and survives `engine.py --card`, and is not engine code (the
+# code fingerprint covers *.py), so the benchmark results need no re-stamp.
+# Per package component: the unit attributes, engine parameters (values or priors) and card tables its effect depends
+# on. A run cannot be signed unless its evidence dossier has a checked, sourced entry for each one its options use.
+decision_inputs:
+  net:
+    inactive: [none]
+    inputs:
+      - {kind: unit_attribute, name: resistance, why: "bioassay mortality: the hut-trial relationships give each net's
+          killing and repeating from it"}
+      - {kind: unit_attribute, name: species, why: "vector species shares: the relationships and the bionomics differ
+          by species complex"}
+      - {kind: unit_attribute, name: itn_use, why: "net use after a campaign: the share of people a net protects"}
+      - {kind: parameter, name: net_retention_half, why: "median net retention: how long the protection lasts"}
+      - {kind: parameter, name: use_rate, why: "use among those with access"}
+      - {kind: card_table, name: hut_trial_coefficients, why: "the published hut-trial relationships (by net type and
+          species complex)"}
+      - {kind: card_table, name: species_bionomics, why: "per-species biting and resting behaviour the net acts on"}
+    by_value:
+      dual:
+        - {kind: parameter, name: cfp_kill, why: "the fitted chlorfenapyr kill of the dual active-ingredient net"}
+  irs:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: species, why: "vector species shares: indoor resting differs by species"}
+      - {kind: unit_attribute, name: irs_product, why: "the product sets the decay of the spray's effect"}
+      - {kind: parameter, name: irs_kill, why: "the fitted kill of indoor-resting fed mosquitoes"}
+      - {kind: parameter, name: irs_coverage, why: "the share of households sprayed"}
+      - {kind: card_table, name: irs_decay, why: "product-specific decay from wall cone bioassays"}
+      - {kind: card_table, name: species_bionomics, why: "per-species biting and resting behaviour the spray acts on"}
+  smc:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: smc_months, why: "the months of the rounds, against the transmission season"}
+      - {kind: unit_attribute, name: season, why: "the transmission season the rounds must cover"}
+      - {kind: parameter, name: smc_cov, why: "the mean per-round reach of the rounds"}
+      - {kind: parameter, name: smc_adh, why: "the full three-day course among those reached"}
+      - {kind: parameter, name: smc_e0, why: "protection against infection right after a dose"}
+      - {kind: parameter, name: smc_half, why: "how fast the protection wanes"}
+      - {kind: parameter, name: smc_partial, why: "the protection of an incomplete course"}
+  cm:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: cm_ft, why: "effective treatment without the package: the baseline the add-on
+          raises"}
+      - {kind: parameter, name: cm_add, why: "the gain in effective treatment the package gives"}
+      - {kind: parameter, name: cm_catchment_share, why: "the share of the unit's children the package can reach"}
+      - {kind: parameter, name: cm_severe_link, why: "the share of the gain that reaches severe care"}

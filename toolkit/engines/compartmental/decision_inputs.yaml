@@ -1,0 +1,12 @@
+# Decision inputs of the compartmental engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components
+# are named by the spec's configuration, so one declaration covers every component ("*"). Kept beside card.yaml, not in
+# it, so that `engine.py --card` (which rewrites card.yaml) keeps it, and not in code (the code fingerprint).
+decision_inputs:
+  "*":
+    inactive: [0]
+    inputs:
+      - {kind: parameter, name: "efficacy:{component}", why: "the share of reached susceptibles the component
+          protects"}
+      - {kind: parameter, name: r0, why: "transmissibility: how many infections removing susceptibles prevents"}
+      - {kind: unit_attribute, name: s0, why: "the susceptible share the component acts on (with a given
+          initialiser; cohort_history derives it from dose coverage)"}
