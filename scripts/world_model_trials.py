@@ -2739,6 +2739,44 @@ def _self_test() -> int:
                f"{[r.get('guard') for r in t['rows']]}")
     tryit("WT23 guard and belief table", wt23)
 
+    # Owner, 2026-11-13: seeds state p per claim; a learning chain carries earlier questions' belief tables.
+    def wt24():
+        ctx = {"packages": {"none": [], "a": ["a"], "b": ["b"], "a+b": ["a", "b"]},
+               "sweep": {"features": {"x (calibration scale)": {}, "eff_a": {}, "eff_b": {}}},
+               "datasets": [{"file": "units.csv", "columns": ["id"]}], "hypotheses": {"min": 5, "max": 8,
+                                                                                    "p_required": True}}
+        sd = _toy_seed()
+        bad = seed_problems(sd, ctx)
+        ok(any("p" in x and "H1" in x for x in bad), f"WT24 a hypothesis without its probability p is refused: {bad[:2]}")
+        for h, p in zip(sd["hypotheses"], (0.7, 0.6, 0.55, 0.8, 0.9)):
+            h["p"] = p
+        ok(not seed_problems(sd, ctx), f"WT24b with p in (0, 1) per claim the seed is accepted: {seed_problems(sd, ctx)}")
+        sd["hypotheses"][0]["p"] = 1.0
+        ok(any("H1" in x for x in seed_problems(sd, ctx)), "WT24c p of exactly 0 or 1 is refused (a claim that cannot "
+                                                          "surprise)")
+    tryit("WT24 p per claim", wt24)
+
+    def wt25():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd0 = os.path.join(troot, "runs", "toy0")
+            t = write_belief_table(rd0, {"id": "toy0", "batch": "c"}, at="2026-11-13T00:00:00+00:00")
+            ok(t["rows"] and all("p" in r for r in t["rows"]), "WT25 a question's belief table is written on its own")
+            q1 = {"id": "toy1", "question": "Which package per unit?", "engine": toy_ref, "template": "data/tpl/toy0",
+                  "inputs": "synthetic", "carry_from": ["toy0"]}
+            ctx = prepare(q1, os.path.join(troot, "runs", "toy1"), repo, trials_root=troot)
+            pw = ctx.get("prior_world_model") or []
+            ok(len(pw) == 1 and pw[0]["question"] == "toy0" and pw[0]["beliefs"] and "refuted" in pw[0],
+               f"WT25b a chained question's seed context carries the earlier belief tables (beliefs with updated p, "
+               f"refutations, open questions): {[list(x) for x in pw]}")
+            try:
+                prepare(dict(q1, id="toy2", carry_from=["missing"]), os.path.join(troot, "runs", "toy2"), repo,
+                        trials_root=troot)
+                ok(False, "WT25c a carry_from question without a belief table is refused")
+            except TrialError:
+                ok(True, "WT25c a carry_from question without a belief table is refused")
+    tryit("WT25 learning chain", wt25)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
