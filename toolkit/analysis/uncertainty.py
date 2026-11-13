@@ -291,10 +291,12 @@ def evaluate_draws(A, draws=None, seed=None) -> dict:
     return {"draws": nd, "seed": int(sd), "drawer": D, "rows": list(_draw_rows(A, D, nd))}
 
 
-def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=None) -> dict:
+def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=None, on_solve=None) -> dict:
     """`on_draw(out, events, cost)`: called with each draw's outcomes, model corrections and cost table, precomputed
     draws included (F6 S2-5: the burden references' values, and the guard on the validation arm; S2-6: each fixed
-    plan's outcome and cost)."""
+    plan's outcome and cost). `on_solve(d, sampled, ben, cost, solution, events)`: called after each draw's
+    re-optimised plan is solved and guarded (F6 value of information); it only reads, so the outputs are the same with
+    or without it."""
     sp = A.spec["uncertainty"]
     nd, sd = _n_seed(A, draws, seed)
     scope = A.spec.uncertainty_scope()
@@ -332,6 +334,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
         sol = A.solve(ben, cost)
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]], r["events"])
+        if on_solve is not None:
+            on_solve(d, sampled, ben, cost, sol, r["events"])
         opt_vals.append(sol["objective"])
         row["reoptimised_objective"] = sol["objective"]
         same += np.array([sol["choice"][i] == plan[i] for i in A.ids])
