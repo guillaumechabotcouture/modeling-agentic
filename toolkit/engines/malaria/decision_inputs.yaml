@@ -1,0 +1,138 @@
+# Decision inputs of the malaria engine (toolkit/engines/decision_inputs.py; F6 evidence dossier, owner decision
+# 2026-11-12). Card metadata, merged with card.yaml's own `decision_inputs` (none) by the loader: kept in its own file
+# so that it never conflicts with an edit of card.yaml and survives `engine.py --card`, and is not engine code (the
+# code fingerprint covers *.py), so the benchmark results need no re-stamp.
+# Per package component: the unit attributes, engine parameters (values or priors) and card tables its effect depends
+# on. A run cannot be signed unless its evidence dossier has a checked, sourced entry for each one its options use.
+# Completeness (#218 review round 1): every card parameter and unit attribute is an input of some component below or
+# is in not_decision_inputs with its reason; toolkit/spec/evidence_dossier.py ED-E3 checks this against card.yaml.
+# The component lists were read off the code that uses each name (model.py, vector.py, engine.py).
+decision_inputs:
+  net:
+    inactive: [none]
+    inputs:
+      - {kind: unit_attribute, name: resistance, why: "bioassay mortality: the hut-trial relationships give each net's
+          killing and repeating from it"}
+      - {kind: unit_attribute, name: species, why: "vector species shares: the relationships and the bionomics differ
+          by species complex"}
+      - {kind: unit_attribute, name: itn_use, why: "net use after a campaign: the share of people a net protects"}
+      - {kind: unit_attribute, name: itn_use_at, why: "when itn_use was measured: maps the survey's use to use at the
+          campaign"}
+      - {kind: unit_attribute, name: campaign_year, why: "when the package's nets arrive, against the decision window"}
+      - {kind: unit_attribute, name: season, why: "the transmission season: when biting happens against the
+          campaign and the decay of the nets' protection"}
+      - {kind: parameter, name: net_holes, why: "the physical-hole correction of net efficacy (vector.itn_effect):
+          it changes the repelled, killed and fed probabilities"}
+      - {kind: parameter, name: net_retention_half, why: "median net retention: how long the protection lasts"}
+      - {kind: parameter, name: net_survival_k, why: "the shape of net attrition around its median"}
+      - {kind: parameter, name: use_rate, why: "use among those with access"}
+      - {kind: parameter, name: use_persist, why: "the share of the use gap that is persistent non-use"}
+      - {kind: parameter, name: hh_size, why: "household size: the unit of correlated net use"}
+      - {kind: parameter, name: hh_net_corr, why: "within-household correlation of net use"}
+      - {kind: parameter, name: exp_corr, why: "correlation of biting exposure with net non-use: high-exposure people
+          use nets less"}
+      - {kind: card_table, name: hut_trial_coefficients, why: "the published hut-trial relationships (by net type and
+          species complex)"}
+      - {kind: card_table, name: species_bionomics, why: "per-species biting and resting behaviour the net acts on"}
+      - {kind: card_table, name: field_use, why: "the field-use relationships (retention, use and holes by net age)"}
+      - {kind: parameter, name: net_kill_shift, why: "the shift on the hut-trial mortality intercept: every net type's
+          killing"}
+    by_value:
+      pbo:
+        - {kind: parameter, name: pbo_gain_scale, why: "the scale on PBO's gain in bioassay mortality"}
+        - {kind: parameter, name: pbo_adv_decay, why: "how fast a PBO net's advantage over a pyrethroid net decays"}
+      dual:
+        - {kind: parameter, name: cfp_kill, why: "the fitted chlorfenapyr kill of the dual active-ingredient net"}
+        - {kind: parameter, name: cfp_half, why: "how fast the chlorfenapyr kill decays"}
+  irs:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: species, why: "vector species shares: indoor resting differs by species"}
+      - {kind: unit_attribute, name: irs_product, why: "the product sets the decay of the spray's effect"}
+      - {kind: unit_attribute, name: irs_month, why: "the month of spraying, against the transmission season"}
+      - {kind: unit_attribute, name: irs_years, why: "the years sprayed"}
+      - {kind: unit_attribute, name: season, why: "the transmission season: the spray's timing against it (the
+          default spray month is derived from its peak) and its decay"}
+      - {kind: parameter, name: irs_kill, why: "the fitted kill of indoor-resting fed mosquitoes"}
+      - {kind: parameter, name: irs_rep, why: "deterrence on entry"}
+      - {kind: parameter, name: irs_divert, why: "the share of deterred mosquitoes that bite outdoors instead"}
+      - {kind: parameter, name: irs_half, why: "decay of the generic short-lived product (used when irs_product is
+          short)"}
+      - {kind: parameter, name: irs_coverage, why: "the share of households sprayed"}
+      - {kind: parameter, name: cov_corr, why: "household correlation of net use and spraying: how much the spray
+          adds where nets already protect"}
+      - {kind: parameter, name: hh_size, why: "household size: the unit sprayed"}
+      - {kind: card_table, name: irs_decay, why: "product-specific decay from wall cone bioassays"}
+      - {kind: card_table, name: species_bionomics, why: "per-species biting and resting behaviour the spray acts on"}
+  smc:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: smc_months, why: "the months of the rounds, against the transmission season"}
+      - {kind: unit_attribute, name: season, why: "the transmission season the rounds must cover"}
+      - {kind: parameter, name: smc_cov, why: "the mean per-round reach of the rounds"}
+      - {kind: parameter, name: smc_rho, why: "intra-child correlation of reach: the same children missed round after
+          round"}
+      - {kind: parameter, name: smc_adh, why: "the full three-day course among those reached"}
+      - {kind: parameter, name: smc_e0, why: "protection against infection right after a dose"}
+      - {kind: parameter, name: smc_half, why: "how fast the protection wanes"}
+      - {kind: parameter, name: smc_k, why: "the shape of the protection's decay"}
+      - {kind: parameter, name: smc_partial, why: "the protection of an incomplete course"}
+  cm:
+    inactive: [0]
+    inputs:
+      - {kind: unit_attribute, name: cm_ft, why: "effective treatment without the package: the baseline the add-on
+          raises"}
+      - {kind: parameter, name: cm_add, why: "the gain in effective treatment the package gives"}
+      - {kind: parameter, name: cm_target, why: "the model switch: the targeted package (1) or the v0.11 add-on (0)"}
+      - {kind: parameter, name: cm_catchment_share, why: "the share of the unit's children the package can reach"}
+      - {kind: parameter, name: cm_age_lo_m, why: "the lower end of the ages the targeted package treats"}
+      - {kind: parameter, name: cm_age_hi_m, why: "the upper end of the ages the targeted package treats"}
+      - {kind: parameter, name: cm_ramp_years, why: "how fast the treatment gain appears after the start"}
+      - {kind: parameter, name: cm_severe_link, why: "the share of the gain that reaches severe care"}
+      - {kind: parameter, name: severe_access_add, why: "severe-care access on top of effective treatment"}
+      - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria: the deaths treatment
+          averts"}
+      - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+# What every arm uses to turn infections into the decision's outcome (#218 review round 2), required whenever the
+# spec's primary or headline outcome depends on it, whatever the components. Read off model.py and engine.py:
+# treated clinical episodes clear infection (model.py, p.ft), so cm_ft shapes transmission and every outcome; deaths
+# are severe episodes x a fatality set by severe-care access min(1, severe_access_add + ft) between the treated and
+# untreated rates (model.py, the severe-outcome step); DALYs are deaths x life expectancy by age plus episodes x
+# disability weight x duration (engine.py, the DALY step).
+outcome_inputs:
+  "*":
+    - {kind: unit_attribute, name: cm_ft, why: "effective treatment: treated episodes clear infection, so it shapes
+        transmission and every outcome in every arm"}
+  deaths:
+    - {kind: parameter, name: severe_access_add, why: "severe-care access on top of effective treatment: the fatality
+        of each severe episode"}
+    - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria"}
+    - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+  dalys:
+    - {kind: parameter, name: severe_access_add, why: "severe-care access: the deaths behind years of life lost"}
+    - {kind: parameter, name: cfr_severe_treated, why: "case fatality of treated severe malaria"}
+    - {kind: parameter, name: cfr_severe_untreated, why: "case fatality of untreated severe malaria"}
+    - {kind: parameter, name: dw_moderate, why: "disability weight of an uncomplicated episode"}
+    - {kind: parameter, name: dw_severe, why: "disability weight of a severe episode"}
+    - {kind: parameter, name: dur_moderate_d, why: "duration of an uncomplicated episode"}
+    - {kind: parameter, name: dur_severe_d, why: "duration of a severe episode"}
+    - {kind: parameter, name: le_u5, why: "life expectancy at death under 5: years of life lost"}
+    - {kind: parameter, name: le_5_14, why: "life expectancy at death 5-14"}
+    - {kind: parameter, name: le_15p, why: "life expectancy at death 15 and over"}
+not_decision_inputs:
+  "unit_attribute:m0": "transmission intensity: calibrated per unit to the prevalence target, whose frame the spec
+    declares (the calibration is its evidence)"
+  "unit_attribute:itn_hist_years": "past net campaigns: in every arm and uncharged, the baseline all options share,
+    bound to the units table through the signed derivation record"
+  "unit_attribute:hist_net": "the net type of past campaigns: baseline in every arm (as itn_hist_years)"
+  "unit_attribute:hist_net_by_year": "the net type per past campaign: baseline in every arm (as itn_hist_years)"
+  "unit_attribute:itn_routine_interval": "routine nets after the package's campaign, in every arm and uncharged:
+    baseline"
+  "unit_attribute:smc_routine": "routine SMC after the delivery period, in every arm and uncharged: baseline"
+  "unit_attribute:smc_hist_years": "past SMC before the delivery period, in every arm and uncharged: baseline"
+  "unit_attribute:smc_hist_rounds": "rounds per past SMC year: baseline (as smc_hist_years)"
+  "unit_attribute:smc_hist_cov": "reach of past SMC: baseline (as smc_hist_years)"
+  "parameter:import_eir": "imported infections in every arm: part of the baseline transmission the calibration fits"
+  "parameter:n_agents": "a numerical setting"
+  "parameter:burnin_years": "a numerical setting (its convergence evidence is benchmarks/equilibration.yaml)"
+  "parameter:init_eir_per_m0": "a numerical setting of the start (its sensitivity is benchmarks/guess_sensitivity.yaml)"

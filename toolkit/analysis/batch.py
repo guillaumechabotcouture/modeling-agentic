@@ -76,6 +76,31 @@ def test_value_ranges(spec, names) -> dict:
     return out
 
 
+def design_box(spec, eng) -> tuple:
+    """The emulator design's parameter inputs and their box: (box {name: (lo, hi, value)}, fitted names, prior names,
+    spec-value names, widened {name: [lo, hi]}). Fitted parameters, drawn priors (v2) and held spec values a decision
+    test varies are inputs; the box spans each parameter_value test's values. The batch design and the decision-test
+    planner (toolkit/analysis/decision_tests.py plan_test, before a run) read it here, so they cannot disagree."""
+    from toolkit.spec import engine_parameters as PV
+    fr = fitted_ranges(eng)
+    names = sorted(fr)
+    pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
+    pnames = list(pr)
+    fr = dict(fr, **pr)
+    sbox = PV.tested_boxes(spec)            # held spec values a decision test varies: design inputs over their box
+    snames = list(sbox)
+    sval = PV.values(spec)
+    fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
+    tv = test_value_ranges(spec, set(fr))
+    ext = {}
+    for nm, (tlo, thi) in tv.items():
+        lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
+        if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
+            ext[nm] = [lo_, hi_]
+            fr[nm] = (lo_, hi_, fr[nm][2])
+    return fr, names, pnames, snames, ext
+
+
 def calibrated_value(spec, z: float) -> float:
     return float(math.exp(z)) if spec["calibration"].get("scale", "log") == "log" else float(z)
 
@@ -126,22 +151,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     em = spec["analysis"].get("emulator") or {}
     n = int(em.get("points", 64))
     rng = np.random.default_rng(int(em.get("seed", 7)))
-    fr = fitted_ranges(eng)
-    names = sorted(fr)
-    pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
-    pnames = list(pr)
-    fr = dict(fr, **pr)
-    sbox = PV.tested_boxes(spec)            # held spec values a decision test varies: design inputs over their box
-    snames = list(sbox)
-    sval = PV.values(spec)
-    fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
-    tv = test_value_ranges(spec, set(fr))
-    ext = {}
-    for nm, (tlo, thi) in tv.items():
-        lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
-        if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
-            ext[nm] = [lo_, hi_]
-            fr[nm] = (lo_, hi_, fr[nm][2])
+    fr, names, pnames, snames, ext = design_box(spec, eng)
+    sbox = PV.tested_boxes(spec)
     sob = qmc.Sobol(d=1 + len(names) + len(pnames) + len(snames), scramble=True, seed=int(em.get("seed", 7))).random(n)
     lo, hi = spec["calibration"]["range"]
     order = list(rng.permutation(len(units)))

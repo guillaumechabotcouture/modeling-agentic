@@ -121,6 +121,13 @@ def needed(pk, comp, ch, ru) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def run_packages(A, c) -> list[str]:
+    """needed(), plus the anchor arm (#220 r2): the engine side is anchored on that arm's window burden."""
+    out = needed(A.pk, A.comp, c["chosen"], c["runner_up"])
+    arm = (getattr(A, "anchor", None) or {}).get("arm")
+    return out + ([arm] if arm is not None and arm not in out else [])
+
+
 def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
     """Engine jobs at the units' calibrated values and the point parameters (the design batch's job form)."""
     from toolkit.analysis import batch as Bt
@@ -131,7 +138,7 @@ def jobs(A, cands, z0, horizon, seed=1) -> list[dict]:
         a = sp.unit_attributes(A.by_id[u])
         if attr and z0.get(u) is not None:
             a[attr] = Bt.calibrated_value(sp, z0[u])
-        for k in needed(A.pk, A.comp, c["chosen"], c["runner_up"]):
+        for k in run_packages(A, c):
             out.append({"id": f"boundary:{u}|{k}", "point": f"boundary:{u}", "package": k,
                         "components": sp.engine_package(A.pk[k]), "unit": a, "params": dict(A.theta0), "seed": seed,
                         "engine": sp["engine"], "horizon": horizon, "windows": Bt.windows(sp)})
@@ -149,15 +156,44 @@ def engine_tables(A, cands, z0, out0, res):
     eng = {}
     for c in cands:
         u = c["unit"]
-        dm.packages = needed(A.pk, A.comp, c["chosen"], c["runner_up"])
+        dm.packages = run_packages(A, c)
         rs = {(u, k): Outcomes(**res[f"boundary:{u}|{k}"]) for k in dm.packages}
         dm._runs = lambda theta, ids, zs, rs=rs: rs
         eng[u] = (list(dm.packages), dm.predict(z0, A.theta0, [u])[u])
 
+    # F6 S2-5d review r3, #220 r1: with an anchor, each checked unit's engine outcomes are scaled so that its arm's
+    # window burden is that unit's anchored point burden (the emulator side's level): an engine whose absolute level
+    # differs from the emulator's then cannot hide a reversed ranking. The filler is the emulator's own prediction.
+    # #220 r2: packages not run on the engine keep the emulator's own anchored values and are left out of the anchor
+    # and its checks (their values never reach the compared packages: the scale test below)
+    anc = getattr(A, "anchor", None)
+    base = out0
+    uf = skip = None
+    if anc is not None:
+        from toolkit.analysis.burden import AnchorError
+        uf = {}
+        for u, (_pks, row) in eng.items():
+            uf[u] = {}
+            for o in anc["units"][u]:
+                try:
+                    e_b, a_b = float(row["burden"][anc["arm"]][o]), float(out0[u]["burden"][anc["arm"]][o])
+                except (KeyError, TypeError, ValueError):
+                    raise AnchorError(f"boundary ranking: unit {u}: no engine window burden for {o} on the "
+                                      f"{anc['arm']} arm (the arm must be among the packages run)") from None
+                # #220 r4: a unit with no engine burden (a low-incidence unit can have none in its run while its
+                # group's total is positive) takes its group's point factor, the one the decision applies there
+                uf[u][o] = a_b / e_b if e_b > 0 else float(anc["rows"][anc["units"][u][o]]["factor"])
+        skip = {u: [k for k in A.pk if k not in pks] for u, (pks, _row) in eng.items()}
+
     def hybrid(scale):
         hyb = {}
         for u, (pks, row) in eng.items():
-            h = copy.deepcopy(out0[u])
+            h = copy.deepcopy(base[u])
+            if anc is not None:     # the engine's own window and grouped outputs for the anchor and its checks
+                for key in ("burden", "burden_group"):
+                    if key in row:
+                        h[key] = row[key]
+                h["y_group"] = {k: v for k, v in (row.get("y_group") or {}).items() if k in pks}
             for k in h["y"]:
                 if k in pks:
                     h["y"][k], h["cost"][k] = row["y"][k], row["cost"][k]
@@ -180,11 +216,7 @@ def engine_tables(A, cands, z0, out0, res):
         tabs = []
         for scale in (1.0, 2.0):
             A.model = _Stub(hybrid(scale))
-            # F6 S2-5d review r2: the engine side at the decision's point anchor factors, as the emulator side (ben0,
-            # cost0) has them: the check compares orderings, and the hybrid's window burden is the emulator's
-            from toolkit.analysis.burden import point_factors
-            fx = None if getattr(A, "anchor", None) is None else point_factors(A.anchor)
-            tabs.append(A.evaluate(A.theta0, z0, ids=list(eng), anchor_factors=fx)[1:])
+            tabs.append(A.evaluate(A.theta0, z0, ids=list(eng), anchor_unit_factors=uf, anchor_skip=skip)[1:])
     finally:
         A.model, A.last_events, A.last_cost_floors = saved, saved_ev, saved_fl
     (ben, cost), (ben2, cost2) = tabs

@@ -217,13 +217,29 @@ def drop_added(x, added=ADDED_WINDOW_METRICS):
     return x
 
 
+def _window_metrics(x) -> set:
+    """Every metric name inside any `windows: {window: {metric: value}}` mapping of x."""
+    out = set()
+    if isinstance(x, dict):
+        for k, v in x.items():
+            if k == "windows" and isinstance(v, dict):
+                out |= {m for d in v.values() if isinstance(d, dict) for m in d}
+            else:
+                out |= _window_metrics(v)
+    elif isinstance(x, list):
+        for v in x:
+            out |= _window_metrics(v)
+    return out
+
+
 def compare(old: dict, new: dict, added=ADDED_WINDOW_METRICS) -> dict:
-    """Per case: equal (the outputs compared exactly as JSON, the new side without the `added` window metrics), and
-    the two digests of what was compared."""
+    """Per case: equal (the outputs compared exactly as JSON, the new side without those `added` window metrics the
+    old side does not report: v0.17, so a proof from v0.14 or later compares them too), and the two digests."""
     rows = {}
     for cid in sorted(set(old["cases"]) | set(new["cases"])):
         a, b = old["cases"].get(cid), new["cases"].get(cid)
-        b = None if b is None else drop_added(b, added)
+        drop = tuple(m for m in added if m not in _window_metrics(a))
+        b = None if b is None else drop_added(b, drop)
         rows[cid] = {"equal": a is not None and b is not None and json.dumps(a, sort_keys=True, default=repr)
                      == json.dumps(b, sort_keys=True, default=repr),
                      "old_sha256": digest(a), "new_sha256": digest(b)}
@@ -431,6 +447,12 @@ def _self_test() -> int:
     ok(compare(wa, wb)["z"]["equal"] and not compare(wa, wc)["z"]["equal"] and not compare(wa, wd)["z"]["equal"]
        and not compare(wb, wa)["z"]["equal"],
        "RP3b the added window metrics are left out of the new side only; a changed or other new metric differs")
+    # v0.17: once the old side reports them too (v0.14 and later), they are compared like any other metric
+    we = json.loads(json.dumps(wb))
+    we["cases"]["z"]["m0"]["windows"]["w"]["deaths_u5"] = 0.3
+    ok(compare(wb, json.loads(json.dumps(wb)))["z"]["equal"] and not compare(wb, we)["z"]["equal"],
+       "RP3c an added window metric the old side also reports is compared, not dropped from the new side only "
+       "(v0.16 to v0.17: every case differed until this)")
     pack = {"settings": {"s1": {}, "s2": {}}}
     cs = cases(pack, [11, 12])
     ok(sum(c["kind"] == "pack" for c in cs) == 4 and len({c["id"] for c in cs}) == len(cs),

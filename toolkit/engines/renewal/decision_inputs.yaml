@@ -1,0 +1,18 @@
+# Decision inputs of the renewal engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components are
+# named by the spec's configuration, so one declaration covers every component ("*"). Read off engine.py's
+# parameters() and run() (#218 review round 1). Kept beside card.yaml, not in it, so that `engine.py --card` (which
+# rewrites card.yaml) keeps it, and not in code (the code fingerprint).
+decision_inputs:
+  "*":
+    inactive: [0]
+    inputs:
+      - {kind: parameter, name: "effect:{component}", why: "the proportional reduction of R_t while the component is
+          active"}
+      - {kind: parameter, name: r0, why: "transmissibility: how many infections the reduction prevents"}
+      - {kind: parameter, name: "transmissibility:*", if_on_card: true, why: "the configured multipliers on R0 per
+          piece between knots: transmission while the component is active"}
+      - {kind: unit_attribute, name: s0, why: "the susceptible share at the start"}
+      - {kind: unit_attribute, name: seed, why: "initial infections: the epidemic's timing against the component's
+          window"}
+not_decision_inputs:
+  "unit_attribute:N": "population: a count from the units table, the same in every arm"

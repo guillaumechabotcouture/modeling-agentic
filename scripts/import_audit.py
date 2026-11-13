@@ -69,6 +69,9 @@ REVIEWED = {
         "__import__": (1, "the literal module toolkit.engines.horizon, in its own self-test")},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {
         "import_module": (1, "a module under toolkit.engines.malaria.benchmarks named by the shipped proof file")},
+    "toolkit/spec/preconditions.py": {"spec_from_file_location": (1, _REPO_FILE + ": the literal path "
+                                                                 "agents/analysis_backend.py, the engine-choice filter "
+                                                                 "(a script module, not a package import_guard serves)")},
     "toolkit/spec/schema.py": {"import_module": (1, "its self-test's literal (module, class) pairs of shipped engines")},
 }
 

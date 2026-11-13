@@ -1683,10 +1683,12 @@ def _ignored_columns(d: dict, run_dir: str) -> dict:
 
 def cited_paths(spec: dict, run_dir: str) -> list[str]:
     """Every path a decision spec names: by extension, by key (csv, file, path, table) and any value naming an existing
-    file or directory in the run (engine config included). The deliverable's paths are outputs, not inputs."""
+    file or directory in the run (engine config included). The deliverable's paths are outputs, not inputs. The
+    evidence section names the owner-signed evidence dossier (toolkit/spec/evidence_dossier.py), not data: it is
+    bound by hash in the signed input closure, not derived."""
     from_ext = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
     found = []
-    skip = ("deliverable", "deliverable_file")
+    skip = ("deliverable", "deliverable_file", "evidence")
 
     def walk(x, key=""):
         if isinstance(x, dict):

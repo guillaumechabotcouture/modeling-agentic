@@ -841,17 +841,41 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
+    from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
+    pre = PC.problems(run_dir, data, by)
+    if pre:
+        raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
     # toolkit/spec/signoff.py sign and scripts/decision_brief.py sign)
     from toolkit.spec import engine_parameters as PV
     held = PV.signoff_refusals(spec_doc if isinstance(spec_doc, dict) else {}, run_dir=run_dir)
     if held:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
+    from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
+    ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
+    rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
     _put(run_dir, SIGNOFF_FILE, json.dumps(rec, indent=1))
     return rec
+
+
+POST_CHOICE_STATES = ("CONFIGURE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE",
+                      "PRESENTATION")
+
+
+def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
+    """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
+    compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
+    on every resume past it, before any compute. Empty: they hold. Fail closed on an error."""
+    try:
+        from toolkit.spec import preconditions as PC
+        # signoff none (nobody signs): coverage without a record, the rule the launch preflight applies too
+        return PC.problems(run_dir, None, None, mode="unsigned" if signoff == "none" else "resume",
+                           engine=engine)          # every check: the benchmark verdict too
+    except Exception as e:  # noqa: BLE001
+        return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
 
 # ------------------------------------------------------------------ the machine
@@ -1078,6 +1102,12 @@ class Machine:
         return getattr(self, "h_" + s)()
 
     def run(self, max_steps: int = 200) -> str:
+        if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
+            miss = evidence_gate(self.run_dir, signoff=self.st.signoff)
+            if miss:
+                self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
+                save_state(self.run_dir, self.st)
+                return self.st.status or self.st.state
         for _ in range(max_steps):
             before = (self.st.state, len(self.st.history))
             self.step()
@@ -1200,6 +1230,11 @@ class Machine:
         else:
             why = (res.output or {}).get("why", "")
         cfg = next((r.get("config") for r in eligible if r["ref"] == pick), None) or {}
+        miss = evidence_gate(self.run_dir, engine=(pick, cfg), signoff=self.st.signoff)
+        if miss:            # F6: the signed dossier must cover the engine actually chosen, before any compute
+            _write_json(self.run_dir, AB.ENGINE_CHOICE, dict(rec, evidence_refused={"engine": pick, "why": miss}))
+            return self._go("FINAL", f"the signed evidence dossier does not cover {pick}'s decision inputs: "
+                                     + "; ".join(miss[:5]), "run_failed")
         rec.update(AB.engine_choice_record(pick, why, rows, config=cfg))
         if self.cross and len(eligible) > 1:
             try:
@@ -1848,6 +1883,15 @@ def _self_test() -> int:
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
+        _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
+        try:
+            sign(d, "owner", "ok")
+            ok(False, "T17p the spike sign-off refuses a spec failing a registered precondition")
+        except ValueError as e:
+            ok("refused for owner" in str(e), f"T17p the spike sign-off refuses a spec failing a registered precondition")
+        finally:
+            _PC.CHECKS.pop("_t17", None)
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
