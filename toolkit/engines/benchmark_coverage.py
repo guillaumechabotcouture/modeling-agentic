@@ -144,6 +144,10 @@ def gate(cov: dict | None, cov_problems: list, card, needs_components: dict, rec
                               f"{', '.join(sorted(relevant))} cannot be read for this engine version")
         return out
     byid = {r.get("id"): r for r in rows}
+    # the card's copied rows are never read for eligibility; a copy that disagrees with the record is flagged
+    out["card_rows_disagree"] = sorted(str(c.get("id")) for c in card.benchmarks or [] if isinstance(c, dict)
+                                       and c.get("id") in byid and (c.get("status"), c.get("computed")) !=
+                                       (byid[c["id"]].get("status"), byid[c["id"]].get("computed")))
     out["why_not"] += [f"benchmark {i} in the record has no entry in {FILE} (its coverage is unknown)"
                        for i in byid if i not in entries]
     deps = {d.get("benchmark"): d for d in departures or [] if isinstance(d, dict) and d.get("engine") == cov["engine"]}
@@ -280,6 +284,11 @@ def _self_test() -> int:
        "BC5 an interaction benchmark (match all) does not apply when only one of its components is used")
     ok([b["id"] for b in gate(cov, [], Card, {"p": [1], "q": [1]}, rec, [], "unsigned")["blocking"]] == ["I"],
        "BC6 it applies when both are used")
+    class Stale:
+        benchmarks = [{"id": "I", "status": "in_band", "computed": 1.0}]
+    g = gate(cov, [], Stale, {"p": [1], "q": [1]}, rec, [], "unsigned")
+    ok(g["card_rows_disagree"] == ["I"] and [b["id"] for b in g["blocking"]] == ["I"],
+       "BC6b the card's copied rows are not read (the record decides) and a copy that disagrees is flagged")
     ok(gate(None, [], Card, {"p": [1]}, rec, [], "unsigned")["why_not"] == [],
        "BC7 an engine with no benchmarks needs no coverage file")
     dep = {"engine": "e", "benchmark": "I", "reason": "why", "no_decision_test_because": "a structural choice"}

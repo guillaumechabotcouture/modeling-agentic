@@ -224,6 +224,7 @@ def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> li
                      "why_not": why, "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or []),
                      "departures": bg.get("departures") or [], "benchmark_record": bg.get("record"),
                      "benchmarks_not_in_band": bg.get("blocking") or [],
+                     "card_benchmark_rows_disagree_with_record": bg.get("card_rows_disagree") or [],
                      "components_without_benchmark": bg.get("uncovered") or {}})
     return rows
 
