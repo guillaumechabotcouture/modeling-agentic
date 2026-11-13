@@ -1,0 +1,339 @@
+beliefs:
+- id: B1
+  mechanism: 'Threshold and final size. In a closed population with no waning over one year, a large epidemic occurs
+    only if Reff = R0 * s0 > 1, i.e. s0 > 1/R0 (about 0.5 at R0 about 2). Above it the ultimate attack rate (share
+    of the whole population) solves z = s0 * (1 - exp(-R0 z)): roughly 0.75-0.82 at s0 = 1, 0.35-0.5 at s0 = 0.75,
+    and near 0 as s0 approaches 0.5. Below the threshold, infections are a small multiple (about 1/(1 - Reff)) of
+    the seed. The threshold is set by R0 alone, so its uncertainty is R0''s uncertainty, not s0''s: the data on
+    s0 locate each city relative to the threshold but do not determine the threshold.'
+  about:
+    package: none
+    feature: s0 (calibration scale)
+  direction: increases
+  magnitude:
+    band:
+    - 0.7
+    - 0.85
+    scale: ultimate_attack_rate_at_s0_1
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.45
+    - 0.6
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG (1927). A contribution to the mathematical theory of epidemics. Proceedings
+      of the Royal Society of London A
+    location: final-size relation (section on the threshold theorem); page not verified
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: chapter on threshold and final epidemic size; chapter number not verified
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: 'Control reduces R_t by a multiplier (1 - effect) for 22 weeks. Randomised evidence on routine or community
+    vector control for dengue is thin and modest: Camino Verde (community mobilisation) reported roughly a 30% lower
+    risk of serological infection in children; systematic review finds weak evidence that routine vector control
+    reduces dengue. A plausible effect on R is therefore about 10-40%. Because the control is temporary and the
+    horizon ends at week 52, its effect on 2026 infections is mostly a delay (lost growth of about effect x 22 weeks
+    of log-growth) and can exceed its effect on R; its effect on the ultimate final size above threshold is small.
+    Relative reduction of 2026 infections at high s0: roughly 0.1-0.7.'
+  about:
+    package: control
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.7
+    scale: relative_reduction
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.85
+    - 1.0
+  source_type: literature
+  evidence:
+  - citation: 'Andersson N, Nava-Aguilera E, Arostegui J, et al. (2015). Evidence based community mobilization for
+      dengue prevention in Nicaragua and Mexico (Camino Verde, the Green Way): cluster randomized controlled trial.
+      BMJ'
+    location: Abstract and Results (serological infection outcome); exact table not verified
+  - citation: 'Bowman LR, Donegan S, McCall PJ (2016). Is Dengue Vector Control Deficient in Effectiveness or Evidence?:
+      Systematic Review and Meta-analysis. PLoS Neglected Tropical Diseases'
+    location: Results / Discussion; table not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: The stronger the control's effect on R_t, the larger the relative reduction of 2026 infections (monotone
+    in the engine's multiplier form; in a renewal model with susceptible depletion a temporary reduction cannot
+    raise cumulative infections within the year by more than a small overshoot term).
+  about:
+    package: control
+    feature: effect:control
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Fraser C (2007). Estimating individual and household reproduction numbers in an emerging epidemic.
+      PLoS ONE
+    location: renewal-equation formulation (Methods)
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S (2013). A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. American Journal of Epidemiology
+    location: Methods (renewal equation)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: 'Above the threshold, the relative reduction by control falls as s0 rises: just above 1/R0 the control
+    pushes Reff below 1 for 22 weeks and the slow uncontrolled growth leaves little to recover by week 52, so most
+    2026 infections are averted; at s0 near 1 the epidemic grows fast, the delay is short relative to the year,
+    and the epidemic partly or largely completes within 2026 anyway. The relative reduction therefore peaks just
+    above the threshold (roughly s0 0.5-0.7) and declines toward s0 = 1.'
+  about:
+    package: control
+    feature: s0 (calibration scale)
+  direction: decreases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.6
+    - 1.0
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates
+      and reproductive numbers. Proceedings of the Royal Society B
+    location: Eq. relating r, R and the generation-interval distribution
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: threshold and final-size chapter; chapter number not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Below and at the threshold (s0 0.4-0.55, Reff about 0.8-1.1) 2026 infections are the seed's transmission
+    chains; their length grows as Reff approaches 1, so cutting R during weeks 8-30 removes a larger share of a
+    longer chain. The relative reduction by control therefore rises with s0 in this region (the rising limb of the
+    peak in B4). Baseline 2026 burden here is small (a few times the seed share), so this region matters for the
+    threshold estimate, not for total infections.
+  about:
+    package: control
+    feature: s0 (calibration scale)
+  direction: increases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.4
+    - 0.55
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM (1991). Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: subcritical chains and threshold; chapter number not verified
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Timing set by the seed. With R0 about 2 and a dengue generation interval of roughly 2-3 weeks, growth
+    is about 0.2-0.35 per week at s0 = 1; from a seed share of 1e-6 to 1e-4 the epidemic needs roughly 25-55 weeks
+    to peak, so the year-end cut-off falls during or after the epidemic for many cities. A smaller seed puts the
+    uncontrolled epidemic later, so the control''s delay pushes more of it past week 52: the relative reduction
+    falls as seed_share rises (where s0 is high enough for fast growth).'
+  about:
+    package: control
+    feature: seed_share
+  direction: decreases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.75
+    - 1.0
+  source_type: literature
+  evidence:
+  - citation: Siraj AS, Oidtman RJ, Huber JH, Kraemer MUG, Brady OJ, Johansson MA, Perkins TA (2017). Temperature
+      modulates dengue virus epidemic growth rates through its effects on reproduction numbers and generation intervals.
+      PLoS Neglected Tropical Diseases
+    location: generation-interval estimates (Results/figures); exact figure not verified
+  - citation: Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates
+      and reproductive numbers. Proceedings of the Royal Society B
+    location: growth-rate / R relation
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'City population size does not change attack rates or the relative reduction: the engine is a deterministic,
+    closed, homogeneous renewal model, so per-capita dynamics depend on s0, the seed share and R only, not on N.
+    (In reality small cities would show stochastic fade-out; the engine cannot represent it.)'
+  about:
+    package: control
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Fraser C (2007). Estimating individual and household reproduction numbers in an emerging epidemic.
+      PLoS ONE
+    location: renewal-equation formulation (Methods)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B8
+  mechanism: The susceptible share to DENV-3 is the dominant and least-determined input. Seroprevalence surveys
+    measure any-serotype dengue antibodies; serotype-specific susceptibility needs neutralisation assays, and temporary
+    heterotypic cross-protection (of the order of 1-2 years after a recent infection with another serotype) lowers
+    effective susceptibility below the share never infected with DENV-3. The survey column (s0_survey) is therefore
+    an upper-biased or noisy measure of effective s0; its comparability with the calibration scale must be checked
+    on the same estimand (principle 5). The cross-protection duration is from Reich NG et al. (2013), "Interactions
+    between serotypes of dengue highlight epidemiological impact of cross-immunity", Journal of the Royal Society
+    Interface (table not verified); it is noted here as context, the belief's formal evidence is the run's data
+    column.
+  about:
+    feature: s0 (calibration scale)
+  direction: none
+  source_type: data
+  evidence:
+  - dossier_entry: units.csv
+    file: units.csv
+    column: s0_survey
+  confidence: medium
+  decision_relevant: true
+open_questions:
+- id: Q1
+  question: What is R0 for DENV-3 in these cities, and with what uncertainty? The threshold 1/R0 moves from about
+    0.67 (R0 1.5) to about 0.4 (R0 2.5); the question fixes R0 at about 2, so the threshold interval will understate
+    true uncertainty unless R0 is given a range.
+  beliefs:
+  - B1
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: What is the effective susceptible share per city, and is the sweep's "s0 (calibration scale)" the susceptible
+    share itself or a multiplier on s0_survey? If a multiplier, the threshold regions in B4-B6 shift by the survey
+    values.
+  beliefs:
+  - B8
+  - B1
+  decision_relevant: true
+- id: Q3
+  question: How large is the intensified vector control's effect on R_t? Trial evidence is sparse and heterogeneous;
+    the 2026 relative reduction scales with it and with the delay it induces.
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: What generation interval does the engine use (mean and lags)? It sets epidemic speed and hence how much
+    of the epidemic, with and without control, falls inside 2026 (B6); seasonality is absent (constant transmissibility),
+    which likely overstates speed in the cool season.
+  beliefs:
+  - B6
+  - B4
+  decision_relevant: true
+- id: Q5
+  question: 'Is the 2026 horizon the right window? A delayed epidemic is not an averted one: infections pushed into
+    2027 count as averted in a 2026 attack rate. The report should show the ultimate final size alongside the 2026
+    one.'
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B3
+  claim: The relative reduction of 2026 infections by control increases with the control's effect on R_t, adjusted
+    for s0 and seed share.
+  test:
+    kind: effect_direction
+    package: control
+    feature: effect:control
+    direction: increases
+    adjust_for:
+    - s0 (calibration scale)
+    - seed_share
+- id: H2
+  belief: B4
+  claim: Above s0 0.6 the relative reduction by control decreases as s0 rises (adjusted for the control effect and
+    seed share); refuted if it increases.
+  test:
+    kind: effect_direction
+    package: control
+    feature: s0 (calibration scale)
+    direction: decreases
+    adjust_for:
+    - effect:control
+    - seed_share
+- id: H3
+  belief: B5
+  claim: Between s0 0.4 and 0.55 the relative reduction by control increases with s0 (rising limb near the threshold).
+  test:
+    kind: effect_direction
+    package: control
+    feature: s0 (calibration scale)
+    direction: increases
+    adjust_for:
+    - effect:control
+    - seed_share
+- id: H4
+  belief: B6
+  claim: Where s0 is at least 0.75, a larger seed share gives a smaller relative reduction of 2026 infections (the
+    uncontrolled epidemic completes earlier, so the control's delay matters less).
+  test:
+    kind: effect_direction
+    package: control
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B7
+  claim: City population has no association with the relative reduction by control (rank correlation inside +/-0.3,
+    the tightest equivalence a 100-point design can support).
+  test:
+    kind: effect_direction
+    package: control
+    feature: pop
+    direction: negligible
+    equivalence: 0.3
+- id: H6
+  belief: B2
+  claim: Where s0 is 0.85-1.0, control reduces 2026 infections by 10-70% at no fewer than 60% of points; refuted
+    if 40% or fewer fall in that band.
+  test:
+    kind: effect_band
+    package: control
+    band:
+    - 0.1
+    - 0.7
+    min_share: 0.6
