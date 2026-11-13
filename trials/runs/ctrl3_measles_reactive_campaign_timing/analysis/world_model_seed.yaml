@@ -1,0 +1,285 @@
+beliefs:
+- id: B1
+  mechanism: An early campaign (completed ~1 generation after detection) pushes post-campaign Reff below 1 in nearly
+    every district, so it averts most of the outbreak that would otherwise occur; the residual is the seed and the
+    generation already in flight.
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.98
+    scale: relative_reduction
+  conditions:
+  - feature: s0
+    range:
+    - 0.0847
+    - 0.1963
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. J R Soc Interface 2008'
+    location: Results, campaign-timing scenarios (exact figure/table not recalled)
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: 'Results / abstract: median effectiveness ~84% at 9 months, ~92.5% at >=12 months'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Delay costs infections: the late campaign (completed ~3.5 generations after detection) averts a smaller
+    share than early because transmission in days 14-42 is not prevented; at the stated shadow price the US$0.80
+    saving per resident is worth far less than the extra infections, so early beats late pairwise.'
+  about:
+    pair:
+    - early
+    - late
+  direction: increases
+  magnitude:
+    band:
+    - 0.05
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. J R Soc Interface 2008'
+    location: 'Results: cases averted decline with intervention delay (location not recalled)'
+  - citation: Klinkenberg D, Nishiura H. The correlation between infectivity and incubation period of measles, estimated
+      from households with two cases. J Theor Biol 2011
+    location: 'Results: serial interval ~11-12 days'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Higher susceptible share means higher Reff, a faster outbreak that is further along by day 42 and a
+    higher post-campaign Reff, so the late campaign averts a smaller share of the outbreak as s0 rises.
+  about:
+    package: late
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Ch. 4 (final size and threshold relations; chapter location approximate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: The share of the population already infected at detection (seed_share) is not preventable and seeds
+    a larger first generation before the campaign completes, so the averted share falls as seed_share rises.
+  about:
+    package: early
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. J R Soc Interface 2008'
+    location: 'Discussion: outbreak stage at response determines benefit (location not recalled)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Higher R0 (contact_rate calibration scale) speeds the outbreak, so more of it is over before the late
+    campaign completes; the late campaign's averted share falls with contact_rate.
+  about:
+    package: late
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infect
+      Dis 2017'
+    location: 'Results: R0 commonly 12-18 but wider range reported'
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'In a closed, homogeneously mixing, deterministic per-capita model, district population size does not
+    enter the per-capita dynamics: relative reduction is independent of pop once s0 and seed_share are held fixed.
+    Pop matters for total cost and total infections, not for the per-resident ranking.'
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Ch. 2-4 (frequency-dependent transmission; location approximate)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: 'Even the cheaper late campaign beats no campaign in net benefit at the harness shadow price wherever
+    an outbreak is under way: averted infections per resident (order 0.01-0.15) far exceed the cost-equivalent (~0.001
+    infections per resident at US$1.40), except possibly where s0 x R0 is near 1.'
+  about:
+    pair:
+    - late
+    - none
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. J R Soc Interface 2008'
+    location: 'Results: even delayed response averted cases (location not recalled)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Does the engine represent campaign timing dynamically (outbreak running from detection, campaign at
+    day 14 vs 42), or only through lower efficacy/reach for late applied before the epidemic? If the latter, the
+    timing penalty depends on the efficacy:late prior rather than on each district's outbreak speed, and the s0/seed_share-dependent
+    rule (B3, B4) would be weaker than reality.
+  beliefs:
+  - B2
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: Are seed infections (already infected at detection) counted in the burden of every package? If so, the
+    relative reduction in low-Reff, high-seed districts is small and their ranking falls.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Under the binding US$4M budget, which districts get early vs late vs none? Needs an optimised plan,
+    which this sweep does not produce; the rule (incremental infections averted per dollar, ranked) is untested
+    here.
+  beliefs:
+  - B2
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Where is the near-threshold region (s0 x R0 close to 1) in which no campaign is worth funding under
+    the budget, and how does R0 uncertainty (12-18) move districts in and out of it?
+  beliefs:
+  - B3
+  - B5
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Early campaign relative reduction in infections lies in [0.6, 0.98] at >= 70% of usable points.
+  p: 0.55
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.6
+    - 0.98
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Early beats late in net benefit at the shadow price at >= 80% of usable points across the s0 range.
+  p: 0.72
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.0847
+    - 0.1963
+    sign: positive
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: Late campaign relative reduction decreases with s0 (Spearman interval excludes 0, negative).
+  p: 0.55
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: Early campaign relative reduction decreases with seed_share.
+  p: 0.68
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Late campaign relative reduction decreases with contact_rate, adjusted for s0 and seed_share.
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: late
+    feature: contact_rate (calibration scale)
+    direction: decreases
+    adjust_for:
+    - s0
+    - seed_share
+- id: H6
+  belief: B6
+  claim: Early campaign relative reduction is unrelated to pop once s0 and seed_share are adjusted for (|partial
+    rho| < 0.1).
+  p: 0.65
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.1
+    adjust_for:
+    - s0
+    - seed_share
+- id: H7
+  belief: B7
+  claim: Late beats none in net benefit at the shadow price at >= 90% of usable points across the s0 range.
+  p: 0.78
+  test:
+    kind: paired_sign
+    a: late
+    b: none
+    feature: s0
+    range:
+    - 0.0847
+    - 0.1963
+    sign: positive
+    min_share: 0.9
