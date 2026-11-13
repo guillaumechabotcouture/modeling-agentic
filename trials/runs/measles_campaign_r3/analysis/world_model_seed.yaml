@@ -1,0 +1,265 @@
+beliefs:
+- id: B1
+  mechanism: A 1-9 year campaign removes roughly 2-4% of the district population from the susceptible pool, enough
+    in most districts to bring R0 x s near or below 1, so the major outbreak is largely prevented; relative reduction
+    in infections versus no campaign is large.
+  about:
+    package: B_1to9
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 (final size and threshold); Table 4.1 R0 for measles; exact table number uncertain
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 2006
+    location: final-size relation, Section 2
+  - citation: 'Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infectious
+      Diseases 2017'
+    location: Results; R0 range
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: The relative reduction from A_1to4 rises with the susceptible share among 1-4 year olds, since A removes
+    a fixed fraction (~0.79) of those susceptibles; holding overall susceptibility fixed, more 1-4 susceptibles
+    means a larger drop in R0 x s.
+  about:
+    package: A_1to4
+    feature: susc_1_4
+  direction: increases
+  source_type: data
+  evidence:
+  - dossier_entry: districts.csv
+    file: districts.csv
+    column: susc_1_4
+  confidence: high
+  decision_relevant: true
+- id: B3
+  mechanism: 'Higher transmission (contact rate scale, hence R0) lowers the relative reduction from a campaign:
+    the same removal of susceptibles is less likely to push R0 x s below 1, and the residual outbreak is larger.'
+  about:
+    package: B_1to9
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5, critical immunisation threshold 1 - 1/R0
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: The relative reduction from B_1to9 rises with the susceptible share among 5-9 year olds (older cohorts
+    with lower historical MCV coverage or missed second doses), holding overall and 1-4 susceptibility fixed.
+  about:
+    package: B_1to9
+    feature: susc_5_9
+  direction: increases
+  source_type: data
+  evidence:
+  - dossier_entry: districts.csv
+    file: districts.csv
+    column: susc_5_9
+  confidence: high
+  decision_relevant: true
+- id: B5
+  mechanism: Where few 5-9 year olds are susceptible, B's extra cost (US$1.20 per extra targeted child, 15% of N)
+    buys few extra susceptibles removed, so A_1to4 beats B_1to9 on net benefit at the budget's shadow price.
+  about:
+    pair:
+    - A_1to4
+    - B_1to9
+  direction: flips
+  conditions:
+  - feature: susc_5_9
+    range:
+    - 0.0333
+    - 0.08
+  source_type: literature
+  evidence:
+  - citation: 'Lessler J, Metcalf CJE, Grais RF, Luquero FJ, Cummings DAT, Grenfell BT. Measuring the performance
+      of vaccination programs using cross-sectional surveys: a likelihood framework and retrospective analysis.
+      PLoS Medicine 2011'
+    location: Results; campaigns reach a share of already-immune children, efficiency depends on susceptible share
+      in targeted ages
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Holding 1-4 susceptibility fixed, districts with higher overall susceptibility (including under-1s
+    and 10-14s, who no campaign reaches) keep more residual transmission after A_1to4, so A's relative reduction
+    falls with mean_susceptible while its absolute cases averted rises.
+  about:
+    package: A_1to4
+    feature: mean_susceptible
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 final-size relation; threshold behaviour
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'The A/B choice flips along 5-9 susceptibility: B wins where 5-9 susceptibility is high enough that
+    its increment crosses the threshold or removes susceptibles at a cost per susceptible similar to A''s; the flip
+    lies roughly where susc_5_9 is comparable to about half to the full value of susc_1_4. Location uncertain.'
+  about:
+    pair:
+    - A_1to4
+    - B_1to9
+  direction: flips
+  conditions:
+  - feature: susc_5_9
+    range:
+    - 0.06
+    - 0.16
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. Journal of Infectious Diseases 2011'
+    location: Table 2 (MCV1 effectiveness by age at vaccination); sets the routine immunity gap the campaign closes
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: 'Which susceptibility source is right per district: the 2025 serosurvey (aged one year to 2026, the
+    2025 under-1 cohort entering the 1-4 band) or the cohort-history reconstruction from administrative MCV1/MCV2
+    coverage, which usually overstates true coverage? They can disagree by several points of susceptibility, enough
+    to move R0 x s across 1.'
+  beliefs:
+  - B1
+  - B2
+  - B4
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Where in R0 12-18 each district's threshold sits relative to its post-A and post-B susceptibility; districts
+    near the threshold have regret that hinges on R0 draws.
+  beliefs:
+  - B1
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: 'The shadow price of the budget (district sizes are withheld): whether the budget covers B in most districts
+    or forces a choice between A widely and B in a few.'
+  beliefs:
+  - B5
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Whether expected cases include the minor-outbreak and extinction probability (p_major) or only the deterministic
+    final size; this changes relative reductions in districts already near or below threshold.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: B_1to9 reduces infections by 60-100% relative to no campaign in at least 70% of points with a baseline
+    outbreak.
+  test:
+    kind: effect_band
+    package: B_1to9
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: A_1to4's relative reduction increases with susc_1_4, adjusting for mean_susceptible; refuted if it decreases.
+  test:
+    kind: effect_direction
+    package: A_1to4
+    feature: susc_1_4
+    direction: increases
+    adjust_for:
+    - mean_susceptible
+- id: H3
+  belief: B3
+  claim: B_1to9's relative reduction decreases with the contact-rate scale, adjusting for mean_susceptible.
+  test:
+    kind: effect_direction
+    package: B_1to9
+    feature: contact_rate (calibration scale)
+    direction: decreases
+    adjust_for:
+    - mean_susceptible
+- id: H4
+  belief: B4
+  claim: B_1to9's relative reduction increases with susc_5_9, adjusting for mean_susceptible and susc_1_4.
+  test:
+    kind: effect_direction
+    package: B_1to9
+    feature: susc_5_9
+    direction: increases
+    adjust_for:
+    - mean_susceptible
+    - susc_1_4
+- id: H5
+  belief: B5
+  claim: Where susc_5_9 is at most 0.08, A_1to4 beats B_1to9 on net benefit at the shadow price in at least 60%
+    of points; refuted if B wins there.
+  test:
+    kind: paired_sign
+    a: A_1to4
+    b: B_1to9
+    feature: susc_5_9
+    range:
+    - 0.0333
+    - 0.08
+    sign: positive
+    min_share: 0.6
+- id: H6
+  belief: B6
+  claim: A_1to4's relative reduction decreases with mean_susceptible, adjusting for susc_1_4.
+  test:
+    kind: effect_direction
+    package: A_1to4
+    feature: mean_susceptible
+    direction: decreases
+    adjust_for:
+    - susc_1_4
+- id: H7
+  belief: B7
+  claim: The A_1to4/B_1to9 choice flips along susc_5_9 within 0.06-0.16; refuted if the located flip lies wholly
+    outside.
+  test:
+    kind: flip_in
+    a: A_1to4
+    b: B_1to9
+    feature: susc_5_9
+    range:
+    - 0.06
+    - 0.16
