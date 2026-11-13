@@ -1,0 +1,116 @@
+# World model v0 (before any simulation). Built from trial literature and the arithmetic of the decision.
+# Decision: one package per district (none / hhc / cacf / cacf+hhc), US$6M, 2026-2028, maximise prevalent
+# bacteriologically confirmed TB averted by end-2028. Comparator: none.
+# Arithmetic that drives the choice (per resident, 3 years): CACF costs 3 rounds x $4 = $12; HHC costs
+# 3 years x $0.40 = $1.20, i.e. CACF is ~10x the price of HHC. Benefit per resident = baseline prevalence x
+# relative reduction. The engine applies a constant relative reduction (multiplicative RR on baseline_rate), so
+# baseline prevalence ranks districts and the ratio (relative reduction / price) ranks packages. At the sweep's
+# shadow price (2e-4 prevalent cases per $, i.e. ~$5,000 per prevalent case averted) CACF must avert
+# >= 0.0024 prevalent cases per resident to pay for itself, which needs prevalence x reduction above that
+# threshold: with a ~40% reduction that is prevalence ~0.006, above the top of the district range (0.0054).
+# HHC needs only 0.00024 per resident, met at any district prevalence if its reduction is >= ~15%.
+beliefs:
+  - id: B1
+    mechanism: "Three annual rounds of community-wide door-to-door screening with sputum Xpert lower prevalence of bacteriologically confirmed pulmonary TB substantially by removing prevalent infectious cases and cutting transmission"
+    about: {package: cacf}
+    direction: reduces
+    magnitude: {band: [0.2, 0.6], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Marks GB et al. Community-wide screening for tuberculosis in a high-prevalence setting. N Engl J Med 2019;381:1347-57 (ACT3, Vietnam)", location: "Abstract / Results: prevalence ratio at year 4 about 0.56 (95% CI about 0.40-0.78) in intervention vs control clusters"}
+      - {citation: "Ayles H et al. Effect of household and community interventions on the burden of tuberculosis in southern Africa: the ZAMSTAR community-randomised trial. Lancet 2013;382:1183-94", location: "Abstract: enhanced community case finding (not door-to-door Xpert) had no significant effect on prevalence; location of exact estimate uncertain"}
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: "Enhanced household-contact investigation of notified cases reduces community TB prevalence modestly; it reaches only a small, high-risk fraction of the population"
+    about: {package: hhc}
+    direction: reduces
+    magnitude: {band: [0.05, 0.35], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Ayles H et al. ZAMSTAR community-randomised trial. Lancet 2013;382:1183-94", location: "Abstract: household intervention, adjusted prevalence ratio about 0.82 (95% CI about 0.64-1.04)"}
+      - {citation: "Fox GJ et al. Household-contact investigation for detection of tuberculosis in Vietnam. N Engl J Med 2018;378:221-9 (ACT2)", location: "Abstract: more cases detected and lower mortality; prevalence not the primary outcome, so indirect support only"}
+    confidence: low
+    decision_relevant: true
+  - id: B3
+    mechanism: "In this engine the relative reduction of a package is a fixed multiplier on the district baseline, so it does not vary with baseline prevalence; prevalence changes the absolute benefit, not the relative one"
+    about: {package: cacf, feature: prev}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Engine card in the run's task description: rate = baseline x M(package) / M(baseline coverage), multiplicative independent action", location: "engine mechanisms"}
+    confidence: high
+    decision_relevant: false
+  - id: B4
+    mechanism: "HIV prevalence does not modify the relative effect of HHC in the engine (HIV is not an engine input). In reality high HIV shortens the infectious period and lowers the prevalence-to-notification ratio, which could shrink what screening removes; that is an open structural gap, not modelled"
+    about: {package: hhc, feature: hiv}
+    direction: negligible
+    source_type: literature
+    evidence:
+      - {citation: "Engine card: unit_attributes is baseline_rate only", location: "engine unit_attributes"}
+      - {citation: "Ayles H et al. ZAMSTAR. Lancet 2013;382:1183-94", location: "high-HIV setting with smaller community-screening effects than ACT3 (qualitative contrast, not a measured interaction)"}
+    confidence: medium
+    decision_relevant: false
+  - id: B5
+    mechanism: "Price dominates: CACF costs ~10x HHC per resident while its relative reduction is at most ~2-4x HHC's, so at the budget's shadow price HHC beats CACF in net benefit across the district prevalence range; CACF could win only at prevalence above roughly 0.004-0.008 and with an effect near the top of its band"
+    about: {pair: [hhc, cacf]}
+    direction: flips
+    conditions: [{feature: prev, range: [0.004, 0.008]}]
+    source_type: literature
+    evidence:
+      - {citation: "Arithmetic from the question's prices with the B1 and B2 bands (Marks 2019 NEJM; Ayles 2013 Lancet)", location: "see header note"}
+    confidence: medium
+    decision_relevant: true
+  - id: B6
+    mechanism: "HHC beats doing nothing at the shadow price in every district: $1.20 per resident buys ~0.0003-0.0019 prevalent cases averted per resident against a hurdle of 0.00024"
+    about: {pair: [hhc, none]}
+    direction: increases
+    source_type: literature
+    evidence:
+      - {citation: "Ayles H et al. ZAMSTAR. Lancet 2013;382:1183-94", location: "household arm prevalence ratio about 0.82"}
+    confidence: medium
+    decision_relevant: true
+  - id: B7
+    mechanism: "Adding CACF on top of HHC adds less than CACF alone (it acts on the residual after HHC) at the full CACF price, so cacf+hhc loses to hhc at the shadow price in most districts"
+    about: {pair: [hhc, cacf+hhc]}
+    direction: increases
+    source_type: literature
+    evidence:
+      - {citation: "Marks GB et al. NEJM 2019 (ACT3); Ayles H et al. Lancet 2013 (ZAMSTAR); no trial tested the combination", location: "as in B1 and B2"}
+    confidence: medium
+    decision_relevant: true
+open_questions:
+  - {id: Q1, question: "How large is the CACF prevalence reduction in this setting: ACT3-like (~40%) or ZAMSTAR-like (near zero)? Near the top of the band CACF becomes worth buying in the highest-prevalence districts", beliefs: [B1, B5], decision_relevant: true}
+  - {id: Q2, question: "Is HHC's effect on community prevalence real (ZAMSTAR interval crosses no effect)? If it is near zero, the choice becomes none vs CACF in the highest-burden districts only", beliefs: [B2, B6], decision_relevant: true}
+  - {id: Q3, question: "Does HIV prevalence modify screening effects on prevalence (shorter infectious duration, more smear-negative disease)? The engine cannot represent it", beliefs: [B4], decision_relevant: true}
+  - {id: Q4, question: "Is the shadow price (budget binding) such that the $6M covers HHC everywhere; if HHC everywhere is affordable with money left, the leftover goes to CACF in the highest-prevalence districts and the HHC-vs-CACF ranking no longer settles the plan", beliefs: [B5, B7], decision_relevant: true}
+  - {id: Q5, question: "How representative is the 2024 survey prevalence of 2026 baseline per district (sampling error of a district-level survey is large at prevalence ~0.2-0.5%)?", beliefs: [B5], decision_relevant: true}
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "CACF's relative reduction in prevalent TB lies between 20% and 60% at most points (ACT3 interval)"
+    test: {kind: effect_band, package: cacf, band: [0.2, 0.6], min_share: 0.7}
+  - id: H2
+    belief: B2
+    claim: "HHC's relative reduction lies between 5% and 35% at most points (ZAMSTAR household arm)"
+    test: {kind: effect_band, package: hhc, band: [0.05, 0.35], min_share: 0.7}
+  - id: H3
+    belief: B3
+    claim: "CACF's relative reduction does not trend with district prevalence (|rho| bound within 0.3)"
+    test: {kind: effect_direction, package: cacf, feature: prev, direction: negligible, equivalence: 0.3}
+  - id: H4
+    belief: B4
+    claim: "HHC's relative reduction does not trend with district HIV prevalence (|rho| bound within 0.3)"
+    test: {kind: effect_direction, package: hhc, feature: hiv, direction: negligible, equivalence: 0.3}
+  - id: H5
+    belief: B5
+    claim: "HHC beats CACF in net benefit at the shadow price at >= 75% of points across the district prevalence range"
+    test: {kind: paired_sign, a: hhc, b: cacf, feature: prev, range: [0.001682, 0.005416], sign: positive, min_share: 0.75}
+  - id: H6
+    belief: B6
+    claim: "HHC beats no action in net benefit at the shadow price at >= 80% of points"
+    test: {kind: paired_sign, a: hhc, b: none, feature: prev, range: [0.001682, 0.005416], sign: positive, min_share: 0.8}
+  - id: H7
+    belief: B7
+    claim: "HHC alone beats CACF+HHC in net benefit at the shadow price at >= 75% of points"
+    test: {kind: paired_sign, a: hhc, b: cacf+hhc, feature: prev, range: [0.001682, 0.005416], sign: positive, min_share: 0.75}
