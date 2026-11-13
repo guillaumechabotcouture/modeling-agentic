@@ -1,0 +1,304 @@
+beliefs:
+- id: B1
+  mechanism: Community-wide biannual treatment of all ages reduces all-age STH infection-years in the treatment
+    year substantially, because it treats the adult reservoir (notably hookworm) as well as children and cuts reinfection
+    pressure; within one year the reduction is large but well short of interruption.
+  about:
+    package: community
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Pullan RL, Halliday KE, Oswald WE, et al. Effects, equity, and cost of school-based and community-wide
+      treatment strategies for soil-transmitted helminths in Kenya: a cluster-randomised controlled trial. Lancet
+      2019;393:2039-2050'
+    location: Results, primary outcome table (hookworm prevalence by arm at 24 months); exact table number not recalled
+  - citation: 'Clarke NE, Clements ACA, Doi SA, et al. Differential effect of mass and targeted anthelmintic drug
+      administration on soil-transmitted helminth infections: a systematic review and meta-analysis. Lancet 2017;389:287-297'
+    location: Results, meta-regression of prevalence reduction by treatment strategy; table number not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'School-based biannual treatment reaches only enrolled school-age children (roughly a quarter to a
+    third of residents, times enrolment), so its all-age relative reduction is smaller: direct effect in children
+    plus a modest indirect effect on untreated groups, weakest for hookworm where adults carry much of the burden.'
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.4
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Anderson RM, Truscott JE, Pullan RL, Brooker SJ, Hollingsworth TD. How effective is school-based deworming
+      for the community-wide control of soil-transmitted helminths? PLoS Negl Trop Dis 2013;7:e2027
+    location: Results and figures on community-wide prevalence under school-based treatment by species; figure numbers
+      not recalled
+  - citation: 'Clarke NE, Clements ACA, Doi SA, et al. Differential effect of mass and targeted anthelmintic drug
+      administration on soil-transmitted helminth infections: a systematic review and meta-analysis. Lancet 2017;389:287-297'
+    location: Results; child-targeted arm
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'Per resident, community averts more infection-years than school in every district: its relative reduction
+    exceeds school''s (TUMIKIA, Clarke 2017), and at the harness shadow price the extra US$0.45 per resident is
+    negligible in the net-benefit comparison, so community beats school across the whole prevalence range on the
+    paired per-person net benefit. Under the budget, though, community is only funded where prevalence is highest.'
+  about:
+    pair:
+    - community
+    - school
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.1186
+    - 0.4759
+  source_type: literature
+  evidence:
+  - citation: 'Pullan RL, Halliday KE, Oswald WE, et al. Effects, equity, and cost of school-based and community-wide
+      treatment strategies for soil-transmitted helminths in Kenya: a cluster-randomised controlled trial. Lancet
+      2019;393:2039-2050'
+    location: Results, comparison of community-wide arms with school-based arm
+  - citation: 'Clarke NE, Clements ACA, Doi SA, et al. Differential effect of mass and targeted anthelmintic drug
+      administration on soil-transmitted helminth infections: a systematic review and meta-analysis. Lancet 2017;389:287-297'
+    location: 'Abstract/Findings: community-wide vs child-targeted difference in prevalence reduction'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: School beats no treatment on per-person net benefit in every district at the harness shadow price (benefit
+    ~ prevalence x RRR_school >> lambda x US$0.25). This would not hold at a shadow price near 0.28 infection-years
+    per USD (see OQ1), where low-prevalence districts could fall to none.
+  about:
+    pair:
+    - school
+    - none
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.1186
+    - 0.4759
+  source_type: literature
+  evidence:
+  - citation: Pullan RL, Smith JL, Jasrasaria R, Brooker SJ. Global numbers of infection and disease burden of soil
+      transmitted helminth infections in 2010. Parasit Vectors 2014;7:37
+    location: Results, DALYs and infection totals (basis of the harness shadow price)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: In a multiplicative rate model the relative reduction of a package does not depend on baseline prevalence;
+    prevalence scales the absolute benefit only. (In the real system, transmission models predict larger relative
+    gains from community-wide treatment where transmission is lower and bounce-back slower, and smaller ones at
+    high transmission; over a one-year horizon this is second order.)
+  about:
+    package: community
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Truscott JE, Hollingsworth TD, Brooker SJ, Anderson RM. Can chemotherapy alone eliminate the transmission
+      of soil transmitted helminths? Parasit Vectors 2014;7:266
+    location: Results on dependence of treatment impact on baseline transmission (R0); figure numbers not recalled
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: School-based treatment reaches only enrolled children, so its population relative reduction should
+    rise with school enrolment; where enrolment is low, community gains relative to school. The engine card lists
+    only baseline_rate as a unit attribute, so the engine may not carry this; if it does not, that is a structural
+    gap bearing on low-enrolment districts.
+  about:
+    package: school
+    feature: school_enrol
+  direction: increases
+  conditions:
+  - feature: school_enrol
+    range:
+    - 0.54
+    - 0.933
+  source_type: literature
+  evidence:
+  - citation: Anderson RM, Truscott JE, Pullan RL, Brooker SJ, Hollingsworth TD. How effective is school-based deworming
+      for the community-wide control of soil-transmitted helminths? PLoS Negl Trop Dis 2013;7:e2027
+    location: Discussion of coverage of school-age children and non-enrolled children; page not recalled
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: District population size does not change the relative reduction of either package; it only scales total
+    cost and total benefit, and so matters to the plan only through budget packing.
+  about:
+    package: school
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Turner HC, Truscott JE, Bettis AA, et al. An economic evaluation of expanding hookworm control strategies
+      to target the whole community. Parasit Vectors 2015;8:570
+    location: 'Methods: per-capita costing; page not recalled'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: OQ1
+  question: Is the shadow price 3.6e-6 outcome per USD correct? US$1000/DALY x 0.0036 DALY per infection-year implies
+    a willingness to pay of ~US$3.6 per infection-year (lambda ~0.28 infection-years per USD). At the harness value
+    every paired test is decided by benefit alone; at ~0.28 the cost difference dominates in low-prevalence districts
+    and school vs none, and community vs school, could flip along prevalence.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: OQ2
+  question: What are the trial priors for the school and community relative effects, and do they refer to the same
+    outcome (all-age infection prevalence/infection-years), population and window as the survey baseline? A child-only
+    prevalence effect applied to an all-age baseline would overstate school's effect.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: OQ3
+  question: Does the engine scale school's effect by school enrolment? If not, low-enrolment districts are misranked
+    between school and community.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: OQ4
+  question: Is the ratio RRR_school/0.25 vs (RRR_community - RRR_school)/0.45 reliably on one side across the effect
+    uncertainty? That ratio decides whether the budget goes first to school coverage everywhere or to community
+    in the top-prevalence districts, and how many districts get community.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: OQ5
+  question: Is the baseline survey prevalence the right estimand (all-age, species-combined, any-intensity infection),
+    and what is the survey's sampling frame (school-based surveys under-represent adults)?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Community's relative reduction in infection-years vs none lies in [0.3, 0.7] in at least 75% of usable
+    points.
+  test:
+    kind: effect_band
+    package: community
+    band:
+    - 0.3
+    - 0.7
+    min_share: 0.75
+- id: H2
+  belief: B2
+  claim: School's relative reduction in infection-years vs none lies in [0.1, 0.4] in at least 75% of usable points.
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.1
+    - 0.4
+    min_share: 0.75
+- id: H3
+  belief: B3
+  claim: Community beats school on per-person net benefit at the harness shadow price in at least 85% of usable
+    points across the prevalence range; refuted if school wins in 85%.
+  test:
+    kind: paired_sign
+    a: community
+    b: school
+    feature: inc
+    range:
+    - 0.1186
+    - 0.4759
+    sign: positive
+    min_share: 0.85
+- id: H4
+  belief: B4
+  claim: School beats none on per-person net benefit at the harness shadow price in at least 95% of usable points
+    across the prevalence range.
+  test:
+    kind: paired_sign
+    a: school
+    b: none
+    feature: inc
+    range:
+    - 0.1186
+    - 0.4759
+    sign: positive
+    min_share: 0.95
+- id: H5
+  belief: B5
+  claim: 'Community''s relative reduction does not vary with baseline prevalence: |Spearman rho| bound within 0.15.'
+  test:
+    kind: effect_direction
+    package: community
+    feature: inc
+    direction: negligible
+    equivalence: 0.15
+- id: H6
+  belief: B6
+  claim: School's relative reduction increases with school enrolment (rho interval above 0); refuted if negligible
+    or decreasing, which would mean the engine ignores enrolment.
+  test:
+    kind: effect_direction
+    package: school
+    feature: school_enrol
+    direction: increases
+- id: H7
+  belief: B7
+  claim: 'School''s relative reduction does not vary with district population: |Spearman rho| bound within 0.15.'
+  test:
+    kind: effect_direction
+    package: school
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
