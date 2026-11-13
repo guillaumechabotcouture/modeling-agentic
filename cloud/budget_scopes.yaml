@@ -4,3 +4,4 @@
 floor_usd_per_instance_hour: 1.0   # the projection's lowest USD per live instance-hour (a measured median is used when higher)
 scopes:
   f6: [v2-nigeria-gf13-, f6-refit-, f6-prep-, lw-smoke-]
+  wmt: [wmt-]   # world-model trials (owner 2026-11-13: $1000 cap for the whole testing effort, LLM + compute)
