@@ -41,22 +41,35 @@ previous one cannot settle the decision. Cost grows with the question, not with 
 units. This applies `decision_design_principles.md` principle 0 (first principles, throughout)
 and principle 7 (granularity the evidence supports).
 
+**Scope.** The steps apply to allocation deliverables. Estimates-only runs (`deliverable.kind:
+estimates`, which have no options, comparator or objective) keep their existing route.
+
+**Two kinds of test per step.** A *validity* test says whether the step's result can be trusted
+(the engine matches its benchmarks; the emulator is accurate enough). A *sufficiency* test says
+whether the decision is settled or the next step is needed. A step is skipped only when the
+previous step is valid *and* sufficient; a valid step whose plan changes across plausible inputs
+is not sufficient. Unresolved findings carry forward to the next step.
+
 ## 3. The steps
 
 | Step | Question | Computation | Exit test | Artifact |
 |---|---|---|---|---|
-| 0. Arithmetic | What plan does external burden × trial effect ÷ current price give, and which term drives it? | Package-rate engine in trial-prior mode; no simulation | Plan, drivers and robustness recorded | `analysis/step0/` (a full analysis run with the package-rate engine) |
-| 1. One node, trial settings | Does the engine reproduce the trials for every component the options use? | The engine's benchmark pack; the trial fit of effect ranges | Every benchmark covering a used component in band, or an owner-signed departure (eligibility precondition) | Engine benchmark record for the version used |
-| 2. One node, setting sweep | How does each package's relative effect vary with the setting, and where does the winning package flip? | A designed sweep over a feature box spanning the evidence dossier's ranges, independent of real units; emulator; sensitivity; value of information | Emulator accurate near flip boundaries (held-out error below the gap between competing packages); the inputs that move the choice named | `analysis/sweep.yaml`, emulator, VOI |
+| 0. Arithmetic | What plan does external burden × trial effect ÷ current price give, and which term drives it? | Package-rate engine in trial-prior mode; no simulation | Validity: every input sourced. Sufficiency: the plan holds across the decision tests (regret against the per-draw optimum under a declared tolerance) | `analysis/step0/` (a full analysis run with the package-rate engine) |
+| 1. One node, trial settings | Does the engine reproduce the trials for every component the options use? | The engine's benchmark pack; the trial fit of effect ranges | Validity: every held-out benchmark covering a used component in band, or an owner-signed departure (eligibility precondition). Effect ranges are fitted only to the pack's training targets; held-out benchmarks stay validation | Engine benchmark record for the version used |
+| 2. One node, setting sweep | How does each package's relative effect vary with the setting, and where does the winning package flip? | A designed sweep over a feature box spanning the evidence dossier's ranges, independent of real units; emulator; sensitivity; value of information | Validity: emulator error small enough that the plan's regret from emulator error is under a declared tolerance, judged on feasible allocations under the shared budget, not only within-unit flips; near-ties within an indifference tolerance are reported as ties (as `boundary.py` does). Sufficiency: the inputs that move the choice named | `analysis/sweep.yaml`, emulator, VOI |
 | 3. Apply to units | Given each unit's external burden and features, what is the plan, and how robust? | Emulator lookup; burden anchor; optimisation over uncertainty draws; stability; decision tests | Plan compared with step 0; each difference explained by a named mechanism or flagged | The current analysis artifacts plus `analysis/step_comparison.yaml` |
-| 4. Space, only if needed | Do coupling, importation or campaign timing between units change the plan? | A multi-node model | Taken only when step 3 shows unit independence is the weak point (a critic or decision test names it) | Declared in the spec when taken |
+| 4. Space, only if needed | Do coupling, importation or campaign timing between units change the plan? | A multi-node model | Taken only when step 3 shows unit independence is the weak point. Needs a new engine contract first: with transmission between units, one unit's benefit depends on its neighbours' packages, so benefits are no longer a per-unit table and the optimiser must evaluate whole plans | Declared in the spec when taken |
 
 What each step passes forward:
 
 - Step 0 gives the reference plan and the terms that drive it, which tells step 2 where to look.
-- Step 1 gives fitted effect ranges, which become step 2's priors.
-- Step 2 gives the flip boundaries and the inputs that matter. Step 3 needs accuracy only there;
-  inputs with no value of information can stay at point values, with the omission declared.
+- Step 1 gives effect ranges fitted to training targets, which become step 2's priors. A failing
+  held-out benchmark is fixed by finding a mechanism or setup error that has its own evidence,
+  then re-checked; a held-out benchmark is never used to choose parameter values
+  (`toolkit/spec/engine_parameters.py` refuses that). Moving a benchmark from held-out to training
+  needs a replacement validation set and the owner's sign-off.
+- Step 2 gives the flip boundaries and the inputs that matter. An input with low value of
+  information is not researched further, but its uncertainty stays in the draws.
 - Step 3 gives the plan and its comparison with step 0. When the two agree, the report says the
   simulation added little for this decision.
 
@@ -139,7 +152,9 @@ After each step, the harness runs the same loop on the world model:
    touches are re-run, using the incremental rebuild (`model-library.md` §5.4).
 5. **Update the world model.** Supported hypotheses change it; refuted ones are kept with their
    evidence, so the next run does not repeat them.
-6. **Stop.** When no input has value of information above a threshold, when the remaining
+6. **Stop.** When neither any single input nor any declared group of inputs, nor all of them
+   together (the expected value of perfect information), has value above a threshold, since
+   inputs can matter only jointly; when the remaining
    uncertainty cannot be reduced with available data, or when the budget is reached. The stopping
    reason is recorded.
 
@@ -156,13 +171,22 @@ inputs toward an answer (principle 4).
 2. **Preconditions, not post-hoc gates.** Entry to the steps requires the signed evidence dossier
    (sign-off refuses a spec whose dossier does not cover every `decision_inputs` entry of the used
    components). TRIALS is the eligibility check on the engine's benchmark record.
-3. **Design over a feature box.** `batch.design()` gains a mode that samples unit features
-   (transmission level, seasonality, resistance, species shares, coverage) over a box spanning
-   the dossier's ranges, instead of copying real units. Real units are then always inside the
-   domain. The sweep is reusable across runs that share an engine version and box, which is how the
-   model library (`model-library.md`) accumulates.
-4. **Sequential refinement.** After the first sweep, further points are placed where the
-   emulator's uncertainty could flip a package choice, not uniformly.
+3. **Design over a feature space.** `batch.design()` gains a mode that samples unit features
+   (transmission level, seasonality, resistance, species shares, coverage) over the dossier's
+   ranges, instead of copying real units. Three things go with it:
+   - each synthetic point carries its own attributes into the emulator, which today rebuilds
+     features from the real units table by `unit_id` (`toolkit/analysis/model.py`);
+   - constrained sampling where inputs are joint: species shares on the simplex, seasonal profiles
+     as valid profiles; the effective attributes the engine used are recorded, since the engine
+     renormalises shares;
+   - the emulator's domain is the declared space, the design includes its boundaries, and the
+     harness checks that every real unit lies inside the sampled hull before step 3.
+   A sweep is reused only when the full job identity matches (`batch.job_sha()`,
+   `engine_identity()`: code, parameters, configuration, intervention history, delivery dates and
+   windows), never on engine version and range alone.
+4. **Sequential refinement.** After the first sweep, further points go where emulator uncertainty
+   could change the allocation (its regret under the shared budget), not uniformly. Refinement
+   stops at the indifference tolerance or the point budget; unresolved boundaries are reported.
 5. **Step comparison.** A harness artifact compares step 3's plan with step 0's: mix, cost, value,
    and the units and packages that differ, with the driver of each difference. It is cited in the
    report.
@@ -181,8 +205,10 @@ P6 (the full preview) becomes steps 2 and 3. Order:
 1. Step 0 on the F6 inputs, locally, no cloud spend (PR `f6-step0-baseline`).
 2. The evidence dossier for F6: species and resistance (done, local), burden, prices, trial
    effects, SMC and case-management inputs. The owner signs it with the amended spec.
-3. Step 1: the net-effect ranges fitted to the trials until B7 and B8 pass, or an owner-signed
-   departure (PR `f6-net-effect-ranges`; spend of $20 or more goes to the owner first).
+3. Step 1: the net-effect ranges fitted to the pack's training targets; B7 and B8 (held out)
+   then checked as validation. If they still fail, the cause is investigated as a mechanism or
+   setup error with its own evidence, or the owner signs a departure (PR `f6-net-effect-ranges`;
+   spend of $20 or more goes to the owner first).
 4. Steps 2 and 3 on the cloud, with the feature-box design once built; until then, the current
    design with the widened ranges.
 
@@ -192,8 +218,12 @@ P6 (the full preview) becomes steps 2 and 3. Order:
   components combine. Step 3 then tests that rule, which is one of the engine's real jobs.
 - **Prevalence versus incidence.** Several net trials report prevalence odds ratios; step 0 needs a
   declared conversion or a range, and the dossier records which.
-- **Box size.** Too wide a feature box wastes points outside any real unit; too narrow repeats the
-  canary's extrapolation. The box comes from the dossier's ranges plus the real units' hull.
+- **Space size.** Too wide a feature space wastes points outside any real unit; too narrow repeats
+  the canary's extrapolation. It comes from the dossier's ranges plus the real units' hull.
+- **Thresholds from simulation are conditional.** A flip point found with one set of fixed inputs
+  can move when a plausible input changes. Flip ranges come from the uncertainty draws jointly,
+  not from refitting the same sweep, and they widen rather than narrow as conflicting evidence
+  is added.
 - **Who decides a step is not needed.** Proposed: the harness decides from the exit tests; the
   owner can require a step in the spec.
 - **Mostly right, or confidently wrong.** A world model can feel right and mislead. Its track record
