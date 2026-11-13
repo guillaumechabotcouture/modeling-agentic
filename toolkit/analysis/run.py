@@ -2426,6 +2426,7 @@ def _self_test_unit_attr(ok, q):
             on_disk = {"error": f"{type(e).__name__}: {e}"}
         ok((on_disk.get("unit_attribute") or {}).get("cases", [{}])[0].get("table_sha256") == want,
            f"UA15 the result file names the column, units and modified-table sha256 ({str(on_disk)[:160]})")
+    _self_test_unit_attr_r1(ok, q)
     with tempfile.TemporaryDirectory() as d:     # end to end: the manifest binds the record and the set_from table
         r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
         with open(os.path.join(d, "override.csv"), "w") as f:
@@ -2447,6 +2448,98 @@ def _self_test_unit_attr(ok, q):
            and "models/decision_tests/DTu.yaml" in (man.get("deliverables") or {}) and contract.gate_findings(d) == [],
            f"UA16 a run records the test in analysis/decision_tests.yaml with the set_from table among its hashed "
            f"inputs, its record file is a manifest deliverable, and the contract checks pass ({str(art)[:200]})")
+
+
+def _self_test_unit_attr_r1(ok, q):
+    """#228 review round 1 (the reviewer's probes): each arm's analysis state is built from the modified table by the
+    headline's own constructor; identity on the built inputs; the set_from bytes executed are the bytes bound."""
+    import hashlib
+    import tempfile
+    import types
+    import yaml
+    from toolkit.analysis import variants as V
+
+    def setup(d, mut, pop=None, n=12):
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=n))))
+        if pop is not None:
+            rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+            with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows([dict(x, pop=pop) for x in rows])
+        mut(r)
+        sp = schema.Spec(r, d)
+        A = Analysis(sp, DirectModel(sp, log=q))
+        V.apply_headline(A)
+        z0 = {i: None for i in A.ids}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        return A, z0, out0, ben0, cost0, A.solve(ben0, cost0)["choice"]
+
+    def one(S_, ua):
+        A, z0, out0, ben0, cost0, plan = S_
+        try:
+            return DT.run_one(A, {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua},
+                              z0, ben0, cost0, plan, {}, out0)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return {"status": "error", "reason": f"{type(e).__name__}: {e}", "recommendation": {}}
+
+    def with_a(rec):      # units on a package holding a, in the re-solved plan (from its words)
+        parts = [x.split(": ") for x in str((rec.get("recommendation") or {}).get("without") or "").split("; ") if x]
+        return {k: int(n.split()[0]) for k, n in parts}
+    with tempfile.TemporaryDirectory() as d:     # P1: the headline minimum-service rule holds in every arm
+        S_ = setup(d, lambda r: (r["constraints"].update(envelope_usd=7000), r["analysis"].update(plan_variants={
+            "variants": [{"id": "ms", "type": "minimum_service", "components": ["a"], "text": "a everywhere"}],
+            "headline": "ms"})), n=6)
+        rec = one(S_, {"column": "cov", "units": ["0"], "values": [-1.5]})
+        got = with_a(rec)
+        ok(rec.get("status") == "run" and got and all("a" in k.split("+") for k in got),
+           f"UA-R1 a headline minimum-service rule holds in the test's arm ({rec.get('reason')}, {got})")
+    with tempfile.TemporaryDirectory() as d:     # P2: population-share caps from the arm's own table
+        S_ = setup(d, lambda r: (r["decision_units"]["engine_attributes"].update(x={"column": "pop"}),
+                                 r["constraints"].update(coverage={"a": {"max_population_share": 0.5}})), pop=1)
+        rec = one(S_, {"column": "pop", "values": [2.0]})
+        n_a = sum(n for k, n in with_a(rec).items() if "a" in k.split("+"))
+        ok(rec.get("status") == "run" and n_a == 6,
+           f"UA-R2 a population-share cap is computed from the arm's populations: a in 6 of 12 units ({n_a}, "
+           f"{rec.get('reason')})")
+    with tempfile.TemporaryDirectory() as d:     # P3: no package pruned away that an arm can afford
+        S_ = setup(d, lambda r: (r["decision_units"]["engine_attributes"].update(x={"column": "pop"}),
+                                 r["constraints"].update(envelope_usd=0.5),
+                                 r["options"]["packages"].update(within_envelope=True),
+                                 r["analysis"]["decision_tests"].append(
+                                     {"id": "DTu", "type": "unit_attribute", "text": "t",
+                                      "unit_attribute": {"column": "pop", "values": [0.1]}})), pop=2)
+        rec = one(S_, {"column": "pop", "values": [0.1]})
+        n_a = sum(n for k, n in with_a(rec).items() if "a" in k.split("+"))
+        ok(rec.get("status") == "run" and rec.get("decision_changes") is True and n_a == 5,
+           f"UA-R3 a package the arm can afford is not pruned by the headline table: a in 5 units ({n_a}, "
+           f"{rec.get('decision_changes')}, {rec.get('reason')})")
+    with tempfile.TemporaryDirectory() as d:     # P4: identity is judged on the built emulator inputs
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        r["decision_units"]["engine_attributes"] = {"group": {"columns": ["cov", "elig"]}}
+        r["analysis"]["emulator"] = {"features": [{"attribute": "group", "encoding": "count"}]}
+        card = types.SimpleNamespace(valid_ranges={"group": [-2, 2]})
+        pl = DT.plan_unit_attribute(schema.Spec(r, d), {"unit_attribute": {"column": "cov", "values": [0.5]}}, card,
+                                    "emulator", {"group.count": (2.0, 2.0)})
+        ok(pl["status"] == "not_run" and "identity" in pl["why"],
+           f"UA-R4 a change no built emulator input sees (a list's count) is an identity ({pl['status']}, {pl['why']})")
+    with tempfile.TemporaryDirectory() as d:     # P6: the bytes executed are the bytes the artifact binds
+        S_ = setup(d, lambda r: None)
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n0,1.8\n")
+        rec = one(S_, {"column": "cov", "set_from": "override.csv"})
+        ran = ((rec.get("unit_attribute") or {}).get("inputs") or {}).get("override.csv")
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n0,-1.8\n")
+        try:
+            st = Store(d, None, False, {})
+            rel = st.write("decision_tests", {"tests": []}, DT.PRODUCER, DT.artifact_inputs([rec], d))
+            bound = (yaml.safe_load(open(os.path.join(d, rel))).get("inputs") or {}).get("override.csv")
+        except Exception as e:  # noqa: BLE001
+            bound = f"{type(e).__name__}: {e}"
+        now = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        ok(ran is not None and bound == ran and bound != now,
+           f"UA-R6 the artifact binds the set_from bytes the test executed, not a later re-read ({ran}, {bound})")
 
 
 def _direct_toy(d):

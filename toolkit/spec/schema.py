@@ -1629,6 +1629,15 @@ def _self_test_unit_attribute(ok, s, d, bad):
     r = copy.deepcopy(s.raw)
     ua(unit_attribute={"column": "cov", "units": ["0", "1"], "values": [0.5, -0.5]})(r)
     ok(validate(Spec(r, d)) == [], f"SP-UA10 a well-formed unit_attribute test validates: {validate(Spec(r, d))[:3]}")
+    r = direct_toy(copy.deepcopy(s.raw))         # #228 r1 P2-5: sign-off reads the emulator design box too
+    r["analysis"].update(evaluation="emulator", emulator=copy.deepcopy(s.raw["analysis"]["emulator"]))
+    r["analysis"]["emulator"]["features"] = ["cov"]
+    r["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "t",
+                                        "unit_attribute": {"column": "cov", "values": [1.9]}}]
+    e11 = validate(Spec(r, d))
+    ok(any("design box" in e for e in e11),
+       f"SP-UA11 at sign-off a value inside the declared domain but outside the emulator's design box is refused: "
+       f"{e11[:2]}")
 
 
 def _self_test() -> int:
