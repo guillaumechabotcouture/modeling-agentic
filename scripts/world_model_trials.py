@@ -1391,6 +1391,193 @@ def sdk_seed_fn():
     return fn
 
 
+# ---------------------------------------------------------------- one guard and the belief table (owner, 2026-11-13)
+def _input_determined(sw, package, mask) -> tuple[bool, float | None]:
+    """Is the package's relative reduction over `mask` fixed by its own declared effect parameters alone (R^2 >=
+    CIRCULAR_R2, the fit classify_tests uses)? The comparator (no components) is: its reduction is zero."""
+    import numpy as np
+    comps = sw.packages.get(package) or []
+    if not comps:
+        return True, 1.0
+    own = [f for f in sw.features if sw.kinds.get(f) == "parameter" and _own(f, set(comps))]
+    if not own:
+        return False, None
+    red = sw.reduction(package)
+    m = mask & np.isfinite(red)
+    y, n = red[m], int(m.sum())
+    if n < 10:
+        return False, None
+    X = np.column_stack([sw.features[f][m] for f in own])
+    cols = [np.ones(n)] + [X[:, i] for i in range(X.shape[1])]
+    quad = cols + [X[:, i] * X[:, j] for i in range(X.shape[1]) for j in range(i, X.shape[1])]
+    A = np.column_stack(quad if n >= 2 * len(quad) else cols)
+    res = y - A @ np.linalg.lstsq(A, y, rcond=None)[0]
+    r2 = 1.0 - float(res @ res) / float(((y - y.mean()) ** 2).sum()) if np.ptp(y) > 0 else 1.0
+    return r2 >= CIRCULAR_R2, r2
+
+
+def guard_reasons(run_dir, seed, lam=None, template_dir=None) -> dict:
+    """{hypothesis id: {class, why}}: the one guard. A claim cannot be tested by a simulation whose declared inputs
+    determine its outcome without running the dynamics. Mechanically, from the run's own artifacts and code
+    (classify_tests, world_model.load_sweep and canonical_test, batch.realized_rank_correlations):
+      circular, prior_echo  the claimed quantity is a declared effect (tested against its own parameter, or a band on
+                            a reduction its declared parameters explain alone)
+      engine_blind          a direction claim on a feature the engine never reads
+      input_determined      a paired comparison (or flip) of packages whose reductions are each fixed by their declared
+                            parameters: the winner is arithmetic on declared burden, priors, prices and lambda
+      confounded_independence  a conditional claim settled on a feature declared independent whose realized units
+                            table correlates it with another declared feature (|Spearman| > 0.3)"""
+    from toolkit.analysis import batch as B
+    from toolkit.analysis import world_model as W
+    from toolkit.spec import schema
+    out = dict(classify_tests(run_dir, seed, lam, template_dir))
+    sw, spec = W.load_sweep(run_dir, "current", lam, use_plan=False)
+    ind = list(sw.design.get("independent") or [])
+    worst = {}
+    if ind:
+        for k, v in B.realized_rank_correlations(spec, ind).items():
+            for f in k.split("|"):
+                worst[f] = max(worst.get(f, 0.0), abs(v))
+    by = {b["id"]: b for b in seed.get("beliefs") or []}
+    for h in seed.get("hypotheses") or []:
+        if h["id"] in out:
+            continue
+        t = W.canonical_test(h["test"], by.get(h["belief"]))
+        k = t["kind"]
+        if k in ("paired_sign", "flip_in"):
+            m = W._region(sw, t.get("where"))
+            da, ra = _input_determined(sw, t["a"], m)
+            db, rb = _input_determined(sw, t["b"], m)
+            if da and db:
+                out[h["id"]] = {"class": "input_determined",
+                                "why": f"{t['a']} and {t['b']} reduce by their declared effects alone (R^2 {ra}, {rb}): "
+                                       "the winner is arithmetic on declared burden, priors, prices and lambda"}
+                continue
+        if k in ("effect_direction", "flip_in") and t.get("scope", "conditional") == "conditional" and \
+                not t.get("adjust_for") and t.get("feature") in ind and worst.get(t["feature"], 0.0) > 0.3:
+            out[h["id"]] = {"class": "confounded_independence",
+                            "why": f"{t['feature']} is declared independent but the realized units table correlates it "
+                                   f"with another declared feature (|Spearman| {worst[t['feature']]:.2f} > 0.3)"}
+    return out
+
+
+OUTCOME_OF = {"supported": "confirmed", "refuted": "refuted"}
+
+
+def _superseded(qs, trials_root) -> set:
+    done = {q["id"] for q in qs if _trial(os.path.join(trials_root, "runs", q["id"])).get("status") == "complete"}
+    return {q["rerun_of"] for q in qs if q.get("rerun_of") and q["id"] in done}
+
+
+def belief_rescore(trials_root, qs, fit_batches=("1r3", "2", "3"), at=None) -> dict:
+    """Every completed, current question rescored as a belief table from its stored artifacts (nothing re-run):
+    each hypothesis becomes a claim with p = the empirical (Laplace-smoothed) confirmation rate of its belief's stated
+    confidence label over `fit_batches`; the guard sets claims aside; surprise, calibration, Brier and log score per
+    batch; beliefs updated by the stated rule; the next simulation per question. Writes analysis/belief_table.yaml per
+    run and trials/belief_summary.yaml / .md."""
+    import yaml
+    from toolkit.analysis import belief_table as BT
+    at = at or _now()
+    sup = _superseded(qs, trials_root)
+    runs, rows = {}, []
+    for q in qs:
+        rd = os.path.join(trials_root, "runs", q["id"])
+        t = _trial(rd)
+        if t.get("status") != "complete" or q["id"] in sup:
+            continue
+        seed = yaml.safe_load(open(os.path.join(rd, SEED)))
+        hy = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))["hypotheses"]
+        lam = (t.get("shadow_price") or {}).get("value")
+        tpl = os.path.join(REPO, q["template"]) if q.get("template") else None
+        g = guard_reasons(rd, seed, lam, tpl)
+        by = {b["id"]: b for b in seed["beliefs"]}
+        rs = []
+        for h in hy:
+            b = by[h["belief"]]
+            lab = (b.get("citation_check") or {}).get("confidence_claimed") or b["confidence"]
+            r = {"question": q["id"], "batch": str(q.get("batch")), "id": h["id"], "belief": h["belief"],
+                 "claim": h.get("claim"), "label": lab, "outcome": OUTCOME_OF.get(h["status"], "undecided"),
+                 "status": h["status"], "guard": g.get(h["id"]),
+                 "post_hoc": bool((h.get("confrontation") or {}).get("post_hoc"))}
+            rs.append(r)
+        runs[q["id"]] = {"seed": seed, "rows": rs}
+        rows += rs
+    scored = [r for r in rows if not r["guard"] and not r["post_hoc"]]
+    rates = BT.label_rates([(r["label"], r["outcome"]) for r in scored if r["batch"] in fit_batches])
+    for r in rows:
+        r["p"] = rates[r["label"]]["p"]
+        r["surprise"] = None if r["guard"] or r["post_hoc"] else BT.surprise(r["p"], r["outcome"])
+    for qid, x in runs.items():
+        beliefs = []
+        for b in x["seed"]["beliefs"]:
+            lab = (b.get("citation_check") or {}).get("confidence_claimed") or b["confidence"]
+            ev = (b.get("evidence") or [{}])[0]
+            nb = {"id": b["id"], "claim": b.get("mechanism"), "p": rates[lab]["p"],
+                  "basis": f"{b.get('source_type')}: " + str(ev.get("citation") or ev.get("dossier_entry") or
+                                                               ev.get("artifact") or "")[:200],
+                  "decides": bool(b.get("decision_relevant")), "history": []}
+            for r in x["rows"]:
+                if r["belief"] == b["id"] and not r["guard"] and not r["post_hoc"]:
+                    nb = BT.update(nb, r["outcome"], at, observed=f"refuted by {r['id']}: not ({r['claim']})")
+            beliefs.append(nb)
+        nxt = [b["id"] for b in BT.next_simulation(beliefs)][:3]
+        x.update(beliefs=beliefs, next_simulation=nxt)
+        rd = os.path.join(trials_root, "runs", qid)
+        _sio().write_nofollow(rd, "analysis/belief_table.yaml", yaml.safe_dump(
+            {"schema": "analysis.belief_table/0", "producer": "scripts/world_model_trials.py belief_rescore",
+             "p_rule": {"labels": rates, "fit_batches": list(fit_batches),
+                        "update": {"confirm_step": BT.CONFIRM_STEP, "refuted_p": BT.REFUTED_P}},
+             "rows": x["rows"], "beliefs": beliefs, "next_simulation": nxt}, sort_keys=False, width=110).encode(),
+            atomic=True)
+    batches = sorted({r["batch"] for r in rows})
+    guard_counts = {}
+    for r in rows:
+        if r["guard"]:
+            guard_counts[r["guard"]["class"]] = guard_counts.get(r["guard"]["class"], 0) + 1
+    S = {"schema": "trials.belief_summary/0", "written_at": at, "questions": len(runs), "claims": len(rows),
+         "p_rule": {"labels": rates, "fit_batches": list(fit_batches)},
+         "overall": {"scores": BT.scores([dict(r, batch="all") for r in scored]).get("all", {}) if scored else {},
+                     "calibration": BT.calibration(scored), "guard": guard_counts},
+         "by_batch": {b: {"claims": sum(r["batch"] == b for r in rows),
+                          "guarded": sum(r["batch"] == b and bool(r["guard"]) for r in rows),
+                          "scores": BT.scores([r for r in scored if r["batch"] == b]).get(b),
+                          "calibration": BT.calibration([r for r in scored if r["batch"] == b])} for b in batches},
+         "top_surprises": sorted([{k: r[k] for k in ("question", "id", "claim", "label", "p", "outcome", "surprise")}
+                                  for r in scored if r["surprise"] is not None], key=lambda r: -r["surprise"])[:10],
+         "next_simulation": {qid: x["next_simulation"] for qid, x in runs.items()}}
+    _sio().write_nofollow(trials_root, "belief_summary.yaml", yaml.safe_dump(S, sort_keys=False, width=110).encode(),
+                          atomic=True)
+    _sio().write_nofollow(trials_root, "belief_summary.md", belief_summary_md(S).encode(), atomic=True)
+    return S
+
+
+def belief_summary_md(S) -> str:
+    L = ["# World-model trials: belief-table rescoring", "",
+         f"{S['questions']} questions, {S['claims']} claims, rescored from stored artifacts (nothing re-run). p of a "
+         f"claim = the Laplace-smoothed confirmation rate of its belief's stated confidence label over batches "
+         f"{', '.join(S['p_rule']['fit_batches'])}: " +
+         ", ".join(f"{k} {v['p']:.3f} ({v['confirmed']}/{v['n']})" for k, v in S["p_rule"]["labels"].items()) + ".",
+         "", "## Guard", "", "| Class | Claims set aside |", "|---|---|"]
+    for k, v in sorted(S["overall"]["guard"].items(), key=lambda kv: -kv[1]):
+        L.append(f"| {k} | {v} |")
+    L += ["", "## Scores per batch (decided, unguarded, pre-registered claims)", "",
+          "| Batch | Claims | Guarded | Decided | Brier | Log score (bits) |", "|---|---|---|---|---|---|"]
+    for b, v in S["by_batch"].items():
+        s = v["scores"] or {}
+        L.append(f"| {b} | {v['claims']} | {v['guarded']} | {s.get('decided', 0)} | "
+                 f"{'' if not s else round(s['brier'], 3)} | {'' if not s else round(s['log2'], 3)} |")
+    L += ["", "## Calibration (all batches)", "", "| p-bin | Decided | Mean p | Observed |", "|---|---|---|---|"]
+    for c in S["overall"]["calibration"]:
+        L.append(f"| {c['bin'][0]:.1f}-{min(c['bin'][1], 1):.1f} | {c['decided']} | "
+                 f"{'' if c['mean_p'] is None else round(c['mean_p'], 3)} | "
+                 f"{'' if c['observed'] is None else round(c['observed'], 3)} |")
+    L += ["", "## Top surprises", ""]
+    for r in S["top_surprises"]:
+        L.append(f"- {r['question']} {r['id']} ({r['label']}, p {r['p']:.2f}, {r['outcome']}, "
+                 f"{r['surprise']:.2f} bits): {str(r['claim'])[:160]}")
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------- the engine step in a VM job (owner, 2026-11-13)
 BATCH_FILES = ("results.jsonl", "first_seen.jsonl", "points.jsonl")     # what an imported batch brings
 
@@ -1524,10 +1711,11 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser(prog="world_model_trials.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "check-templates", "rebuild", "score", "engine-only", "import-engine", "vm-commands"):
+    for name in ("run", "check-templates", "rebuild", "score", "engine-only", "import-engine", "vm-commands",
+                 "belief-rescore"):
         p = sub.add_parser(name)
         p.add_argument("--trials-dir", default=os.path.join(REPO, "trials"))
-        if name != "score":
+        if name not in ("score", "belief-rescore"):
             p.add_argument("--questions", default=QUESTIONS)
             p.add_argument("--only", help="comma-separated question ids")
             p.add_argument("--batch", help="only questions with this batch value")
@@ -1555,6 +1743,10 @@ def main(argv=None) -> int:
     vc.add_argument("--store", default="outputs/wmt-b3")
     a = ap.parse_args(argv)
     os.environ.setdefault("OMP_NUM_THREADS", "2")
+    if a.cmd == "belief-rescore":
+        S = belief_rescore(a.trials_dir, load_questions(QUESTIONS))
+        print(json.dumps({k: S[k] for k in ("questions", "claims", "p_rule", "overall")}, indent=1, default=str))
+        return 0
     if a.cmd == "score":
         S = score(a.trials_dir)
         print(json.dumps(S["overall"], indent=1, default=str))
