@@ -1111,6 +1111,16 @@ def _self_test_benchmark_gate(ok) -> None:
             man_["deliverables"]["models/decision_tests/DTa.yaml"]["sha256"] = _sha(rp_)
             json.dump(dict(man_, engine={"name": "package-rate", "version": "1"}), open(mp_, "w"))
             fd = [f for f in CT.departure_findings(run)]
+            ok(fd and any("disagree" in f["claim"] for f in fd),
+               f"G30e0 a manifest engine name that disagrees with the spec's engine is a finding, not a scope "
+               f"({fd[:1]})")
+            sp_pr = dict(yaml.safe_load(open(os.path.join(run, "decision_spec.yaml"))),
+                         engine={"ref": "toolkit.engines.empirical.engine:PackageRateEngine",
+                                 "config": {"components": ["a", "b"], "outcome": "dalys"}})
+            yaml.safe_dump(sp_pr, open(os.path.join(run, "decision_spec.yaml"), "w"), sort_keys=False)
+            json.dump(dict(man_, engine={"name": "package_rate", "version": "1"}), open(mp_, "w"))
+            fd = [f for f in CT.departure_findings(run)]
+            yaml.safe_dump(raw_o, open(os.path.join(run, "decision_spec.yaml"), "w"), sort_keys=False)
             ok(fd == [], f"G30e a run of another engine (one without a coverage file) is not blocked by departures "
                          f"for this engine ({fd[:1]})")
             yaml.safe_dump(dict(good, perturbation_identity=[True, True]), open(rp_, "w"))

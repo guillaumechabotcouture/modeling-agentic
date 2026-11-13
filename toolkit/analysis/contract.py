@@ -253,15 +253,32 @@ def departure_findings(run_dir: str) -> list[dict]:
         man = json.load(open(os.path.join(run_dir, MANIFEST)))
     except (OSError, ValueError):
         man = {}
-    # r5: the scope is the engine the run used (the manifest's engine identity; before the analysis, the engine the
-    # spec resolves to), never the coverage file's own name
-    name = ((man or {}).get("engine") or {}).get("name") if isinstance(man, dict) else None
-    if not name:
-        try:
-            from toolkit.spec import schema
-            name = schema.engine_class(ref)(**cfg).describe().name
-        except Exception:  # noqa: BLE001
-            name = None
+    # r5: the scope is the engine the run used, never the coverage file's own name. Every source of its identity is
+    # read (the manifest, the hashed engine artifact's envelope and card, the engine the spec or engine_choice.json
+    # resolves to); when they disagree the scope is not trusted and the run gets the finding (fail closed)
+    names = {}
+    if isinstance(man, dict):
+        names["the manifest"] = ((man.get("engine") or {}).get("name"))
+        ent = (man.get("artifacts") or {}).get(os.path.join("analysis", "engine.yaml")) or \
+            (man.get("artifacts") or {}).get("analysis/engine.yaml")
+        ap = os.path.join(run_dir, "analysis", "engine.yaml")
+        if ent and os.path.exists(ap) and sha256(ap) == ent.get("sha256"):
+            try:
+                art = yaml.safe_load(open(ap)) or {}
+                names["the engine artifact"] = (art.get("engine") or {}).get("name")
+                names["the engine artifact's card"] = (((art.get("data") or {}).get("card")) or {}).get("name")
+            except (OSError, yaml.YAMLError):
+                pass
+    try:
+        from toolkit.spec import schema
+        names["the spec's engine"] = schema.engine_class(ref)(**cfg).describe().name
+    except Exception:  # noqa: BLE001 -- not resolvable here: the other sources decide
+        pass
+    known = {k: v for k, v in names.items() if isinstance(v, str) and v}
+    if len(set(known.values())) > 1:
+        return [f(f"the engine identity sources disagree ({known}): the departures' scope cannot be trusted",
+                  "departures")]
+    name = next(iter(known.values()), None)
     if not name:
         return [f("the spec declares engine departures but the engine the run used cannot be identified", "departures")]
     mine = [d for d in deps if d.get("engine") == name]
@@ -883,6 +900,21 @@ def _self_test() -> int:
            f"({len(bad1)}, {len(bad2)}, {len(bad3)} findings)")
     except Exception as e:  # noqa: BLE001
         ok(False, f"K13 posterior provenance in the gate: {type(e).__name__}: {e}")
+    # r5 (Codex on 21b6942): the engine identity comes from every source; an edited manifest name fails closed
+    with tempfile.TemporaryDirectory() as d:
+        dep = {"engine": "t", "benchmark": "B1", "reason": "r", "decision_test": "D"}
+        yaml.safe_dump({"engine_departures": [dep]}, open(os.path.join(d, SPEC), "w"))
+        complete_run(d)
+        before = [x for x in gate_findings(d) if x["kind"] == "departure_test_ineffective"]
+        man = json.load(open(os.path.join(d, MANIFEST)))
+        json.dump(dict(man, engine=dict(man["engine"], name="zz")), open(os.path.join(d, MANIFEST), "w"))
+        after = [x for x in gate_findings(d) if x["kind"] == "departure_test_ineffective"]
+        ok(before and after and any("disagree" in x["claim"] for x in after),
+           f"K-DEP1 editing only the manifest's engine name gives a finding, not an empty scope ({after[:1]})")
+        json.dump(man, open(os.path.join(d, MANIFEST), "w"))
+        yaml.safe_dump({"engine_departures": [dict(dep, engine="other")]}, open(os.path.join(d, SPEC), "w"))
+        out = [x for x in departure_findings(d)]
+        ok(out == [], f"K-DEP2 departures for an engine every source says the run did not use are out of scope ({out[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
