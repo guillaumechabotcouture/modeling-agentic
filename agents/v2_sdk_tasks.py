@@ -645,6 +645,7 @@ def _self_test() -> int:
             "fix": lambda: t.fix({"id": "T1", "brief": "b {x}", "findings": ["R-001"], "owner_state": "MODEL"},
                                  d, {"k": "{v}"}),
             "write": lambda: t.write(d, "accepted"),
+            "seed_world_model": lambda: t.seed_world_model({"question": "Q?", "packages": {"none": []}}, ["fb {x}"]),
         }
         for k, call in calls.items():
             try:
@@ -660,6 +661,43 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+    # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
+    # readable, one owned output outside the harness's analysis/ tree.
+    try:
+        import ast
+        wm_doc = ast.get_docstring(ast.parse(open(os.path.join(_REPO, "toolkit", "analysis", "world_model.py")).read()))
+        sp = seed_prompt_text()
+        ok("Seed (YAML)" in sp and "effect_band {package, band, min_share, where?}" in sp
+           and wm_doc[wm_doc.index("Tests (each declares"):wm_doc.index("Statuses:")] in sp and PRINCIPLES in sp,
+           "SW1 the seed prompt carries the world model's own seed and test documentation (read from world_model.py) "
+           "and the decision design principles")
+        ok("results" in sp.lower() and "5 to 8" in sp and SEED_FILE in sp,
+           "SW1b the seed prompt says no results are readable, asks for 5 to 8 hypotheses and names its output file")
+        with tempfile.TemporaryDirectory() as d:
+            rd = os.path.join(d, "run")
+            os.makedirs(os.path.join(rd, "analysis", "batch"))
+            got = {
+                "results": _seed_read_denied("Read", {"file_path": "analysis/batch/results.jsonl"}, rd),
+                "analysis glob": _seed_read_denied("Glob", {"pattern": "analysis/**"}, rd),
+                "grep root": _seed_read_denied("Grep", {"pattern": "rho"}, rd) is None,
+                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd) is None,
+                "sibling run": _seed_read_denied("Read", {"file_path": os.path.join(d, "other", "analysis",
+                                                                                     "hypotheses.yaml")}, rd),
+                "climb": _seed_read_denied("Glob", {"pattern": "../**/world_model.yaml"}, rd),
+                "repo world model": _seed_read_denied("Read", {"file_path": os.path.join(
+                    _REPO, "toolkit", "analysis", "world_model.py")}, rd) is None,
+            }
+            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "sibling run": True,
+                    "climb": True, "repo world model": True}
+            ok({k: bool(v) for k, v in got.items()} == want,
+               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) and can read "
+               f"the run's spec and the repository's code: {got}")
+            # a recursive search at the run root would reach analysis/: refused unless it is confined elsewhere
+            ok(_allowed(SEED_FILE, rd, OWNS["seed_world_model"]) is None
+               and _allowed("analysis/world_model_seed.yaml", rd, OWNS["seed_world_model"]) is not None,
+               "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
+    except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
+        ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
