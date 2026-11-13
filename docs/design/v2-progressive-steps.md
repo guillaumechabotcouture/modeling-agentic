@@ -62,84 +62,63 @@ What each step passes forward:
 
 ## 4. The world model: the modeller's working understanding
 
-A good modeller carries a model of the world in their head: simpler than any simulation,
-built up from reading papers, analysing data and running simulations. It holds what they
-believe drives the answer, how sure they are, and where they are unsure. It guides their intuition
-about what result to expect, and it tells them where a simulation would teach them something.
-The harness makes that model explicit as the **world model**: a compact, human-readable account
-of how the decision works, kept as a file that every step reads and updates.
+A good modeller carries a model of the world in their head: simpler than any simulation, and not
+meant to be precise, only mostly right. They build it from reading papers, analysing data and
+running simulations. They *run* it in their head to get expectations ("in the north, with this
+resistance, PBO nets should beat dual-AI on cost") and rough priors ("SMC should avert somewhere
+between a third and two thirds of cases in children it reaches"). They then confront it with
+papers, data and simulations, and refine it where it was wrong.
 
-It is an emulator for thinking, not for computing. It says which terms drive the choice, how they
-depend on the setting, where the preferred option changes, what the evidence for each belief is,
-and what is still unknown.
+The harness makes this explicit as the **world model**: a short, readable file of beliefs about
+how the decision works, which every step reads and refines. Precision is not its job; the
+simulation and the analysis provide the numbers. Its job is to generate the right hypotheses
+and sensible priors, and to say where it is unsure.
 
-**Where its beliefs come from.** Three sources, each recorded with each belief:
+**What it holds** (`analysis/world_model.yaml`):
 
-- **Literature.** Trial effect sizes, reviews and mechanism papers: "PBO nets roughly halve
-  prevalence against pyrethroid nets at 9 months under high resistance (Protopopoff 2018, Table 2);
-  the advantage was not seen at 24 months in a second trial (Mosha 2022)". Each needs its citation
-  and the table or page it was read from, checked the same way as a dossier entry.
-- **Data analysis.** The evidence dossier and analyses of the run's own data: "field species
-  surveys in this state find 3% *An. arabiensis*; the modelled map says 83%".
-- **Simulation.** Results of the engine steps: forms, thresholds and intervals fitted by harness
-  code, with links to the points that produced them.
+- **Mechanisms and their direction.** What causes what, and which way: "PBO restores net killing
+  where pyrethroid resistance is high; the advantage fades as the synergist decays".
+- **Rough magnitudes.** Bands, not point values: "about half", "small (under 10%)", "a factor of 2
+  to 5".
+- **Conditions and branching points.** Where the answer changes, roughly located: "dual-AI is
+  preferred where resistance is strong, somewhere below 20–40% bioassay mortality, at today's
+  price ratio".
+- **Each belief's basis and confidence.** Its source type (literature, data, simulation), the
+  evidence (citation and table, dossier entry, or the simulation artifact), how confident we are,
+  and any conflicting evidence kept side by side, never averaged.
+- **Open questions.** What is unknown and would change the choice if known.
+- **Track record.** How often its expectations have been confirmed when confronted. This is how
+  "mostly right" is measured, and it falls when the world model needs rethinking.
 
-It exists before any simulation. Version 0 is written from literature and data, together with
-step 0's arithmetic, and states what the modeller would expect the simulation to show.
-Disagreements between sources are kept side by side, never averaged away.
+**Running it.** For a setting or a question, the world model is read through to produce:
 
-**What it holds** (`analysis/world_model.yaml`, versioned per step):
+- **Hypotheses**: testable expectations, each with what would refute it ("the plan puts
+  dual-AI nets in the northern states and PBO nets in the south"; refuted if a northern state
+  gets PBO in most draws).
+- **Priors**: ranges for inputs and effects, which go into the evidence dossier as proposals and
+  into the signed spec only after the dossier's checks and the owner's sign-off.
+- **Where to look**: which simulation runs or which evidence would most change a belief that
+  matters to the decision.
 
-- **Structure.** The decision decomposed into its terms: baseline burden per unit, the relative effect
-  of each component in a setting, how components combine, and cost: benefit = burden × effect,
-  against cost.
-- **Each term's current form**, the simplest one the evidence supports: a constant, a range, a
-  function of one or two setting features, or a piecewise form. Each form carries its source (trial,
-  dossier entry, sweep), its uncertainty and the domain it is valid in. Example: "the gain of
-  dual-AI over PBO nets falls with bioassay mortality: about X at 0.1, about Y at 0.5 (sweep S2,
-  n points); outside 0.05–0.9 not measured".
-- **Branching points.** The thresholds where the preferred option flips, with an interval. Example:
-  "PBO is preferred over dual-AI above a bioassay mortality of T (interval T1–T2) at the 2026 price
-  ratio; the threshold moves by D per 10% change in that ratio".
-- **Beliefs and their confidence.** Each element states its source type (literature, data,
-  simulation), its evidence and a confidence, and keeps conflicting evidence side by side.
-- **Expectations.** What the next step is expected to show, written before it runs.
-- **Open questions.** What is unknown and would change the choice if known, ranked by value of
-  information.
-- **Rules.** Short statements of the form "in settings with ..., option ... is preferred", each with
-  the share of units it covers and how often the full analysis agrees with it.
-- **Fidelity.** How well the world model reproduces the full analysis: agreement with the plan and the
-  value lost by following the world model's rules instead of the optimised plan.
+A bounded reasoning task can run it, because this is judgement, not arithmetic. What it produces
+must be testable: each hypothesis names the result that would refute it, so the harness can
+check it mechanically.
 
-**How it is built.** Literature and data beliefs are added by bounded tasks that read sources,
-each with a citation the harness checks against the dossier format. Simulation-derived
-elements are computed by harness code: from step 2's sweep, an interpretable surrogate of the
-paired difference between competing options (a shallow tree or a monotone piecewise fit on a few
-features, with a simplicity budget such as at most three features per rule, and bootstrap
-intervals on each threshold). Step 3 measures its fidelity on the real units. Every number links
-to its source: a citation, a dossier entry, or the sweep points or artifact that produced it.
+**Confronting it.** After a paper is read, a dataset analysed or a simulation step run, its
+hypotheses are compared with what was found. Confirmed beliefs gain confidence. A contradiction
+is the most informative event in a run: either the world model is missing a mechanism, or the
+source or the simulation is wrong. The contradiction is recorded, its likely cause stated as a new
+hypothesis, and the belief revised once the cause is tested. It is never resolved by adjusting
+the simulation's inputs until they agree.
 
-**Expectation, then surprise.** Before a step runs, the world model states what it expects the
-step to show, for example "the dual-AI net is preferred wherever bioassay mortality is below
-about 0.3". After the step, the harness compares. Where the result differs, that is the most
-informative event in the run: either the world model is missing something or the simulation is
-wrong. Both get a hypothesis and a test; neither is resolved by adjusting the simulation's inputs.
+**It exists before any simulation.** Version 0 comes from literature, data and step 0's
+arithmetic, and states what the modeller expects the engine to show. A world model from one run is
+the starting point for the next run on a similar question.
 
-**What it is for.**
-
-- **Focusing simulation.** The next engine runs go where the world model is both uncertain and
-  decision-relevant: near a branching point whose interval is wide, or where literature and
-  data disagree about a term that could flip the choice. Settings where the world model already
-  predicts the choice with confidence get few runs.
-- **Focusing the search for evidence.** Terms with wide intervals that sit near a branching point
-  say which papers or data to look for (§5).
-- **Explaining the result.** The report explains the plan through the world model's rules, and states
-  their fidelity. Decision numbers in the report still come from the full analysis' claims.
-- **Carrying knowledge forward.** A world model from one run is the starting point (version 0) for
-  the next run with the same engine and similar settings. This is how the model library grows
-  in knowledge as well as code.
-- **Exposing what is missing.** When fidelity is poor, the world model lacks a term. That is a
-  hypothesis to state and test, not a number to tune.
+**What it is not.** It is not a quantitative surrogate of the engine (the emulator does that),
+and its numbers are never decision numbers: the report's figures come from the analysis' claims.
+The report may use the world model to explain the result in plain terms, citing which beliefs the
+analysis confirmed.
 
 ## 5. The learning loop
 
@@ -187,12 +166,13 @@ inputs toward an answer (principle 4).
 5. **Step comparison.** A harness artifact compares step 3's plan with step 0's: mix, cost, value,
    and the units and packages that differ, with the driver of each difference. It is cited in the
    report.
-6. **World model and hypotheses.** Two new run artifacts, `analysis/world_model.yaml` and
-   `analysis/hypotheses.yaml`. Simulation-derived numbers come only from harness code (surrogate
-   fit, thresholds, fidelity). Literature and data beliefs may be added by a bounded reading task,
-   each with a citation and table or page that the harness checks in the dossier's format; a task
-   never writes a simulation-derived number. A stage `LEARN` after each step runs
-   the loop of §5 and routes to the owner when it proposes dossier changes.
+6. **World model and hypotheses.** Two run artifacts, `analysis/world_model.yaml` (beliefs) and
+   `analysis/hypotheses.yaml` (each with its refutation test and status). A bounded reasoning task
+   runs the world model and proposes hypotheses, priors and where to look; literature beliefs
+   carry a citation and location the harness checks. Harness code checks each hypothesis against
+   results mechanically, keeps the track record, and summarises simulation results coarsely
+   (direction, rough size, where a choice flips) for the confrontation. A stage `LEARN` after each
+   step runs the loop of §5 and routes to the owner when it proposes dossier changes.
 
 ## 7. What this means for F6
 
@@ -216,9 +196,9 @@ P6 (the full preview) becomes steps 2 and 3. Order:
   canary's extrapolation. The box comes from the dossier's ranges plus the real units' hull.
 - **Who decides a step is not needed.** Proposed: the harness decides from the exit tests; the
   owner can require a step in the spec.
-- **World model simplicity versus fidelity.** Too simple and its rules mislead; too complex and it
-  is the emulator again. Proposed: a simplicity budget, fidelity always reported, and rules below a
-  fidelity floor marked as not reliable.
+- **Mostly right, or confidently wrong.** A world model can feel right and mislead. Its track record
+  is kept and shown; beliefs with low confidence or a poor record are labelled, and a falling
+  record triggers a rethink of the world model rather than more simulation.
 - **Hypotheses in an LLM's words.** Proposals may come from a bounded task, but each must map to a
   test the harness can compute; a hypothesis with no computable test is recorded as untestable.
 - **v1.** Unchanged; this applies to v2 only.
