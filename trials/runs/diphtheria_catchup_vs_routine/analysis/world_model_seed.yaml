@@ -1,0 +1,339 @@
+beliefs:
+- id: B1
+  mechanism: Catch-up reaching ~75% of susceptibles pushes Reff below one across the whole s0 range, so where the
+    unvaccinated district would have a major outbreak it averts nearly all infections (only seeded chains remain).
+  about:
+    package: catchup
+    feature: s0
+  direction: reduces
+  magnitude:
+    band:
+    - 0.9
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: s0
+    range:
+    - 0.25
+    - 0.3482
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM (1991) Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: Table 4.1 (R0 estimates; diphtheria about 6-7)
+  - citation: 'Truelove SA, Keegan LT, Moss WJ, et al. (2020) Clinical and epidemiological aspects of diphtheria:
+      a systematic review and pooled analysis. Clinical Infectious Diseases 71(1):89-97'
+    location: Results, vaccine effectiveness (about 87% for 3+ doses; location within paper not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Routine reaching ~30% of susceptibles cuts Reff by about a quarter; in high-s0 districts Reff stays
+    above one, so the outbreak still occurs and routine averts only part of it (final-size overshoot is dampened,
+    not prevented).
+  about:
+    package: routine
+    feature: s0
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.85
+    scale: relative_reduction
+  conditions:
+  - feature: s0
+    range:
+    - 0.3
+    - 0.3482
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG (1927) A contribution to the mathematical theory of epidemics. Proceedings
+      of the Royal Society of London A 115:700-721
+    location: 'final-size relation (my worked values: Reff 1.1-2.8 baseline vs 0.73x that under routine gives 0.37-0.8
+      reduction)'
+  - citation: 'Anderson RM, May RM (1991) Infectious Diseases of Humans: Dynamics and Control. Oxford University
+      Press'
+    location: Table 4.1
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Where routine fails to bring Reff below one (high s0), the infections catch-up averts beyond routine
+    (~0.1-0.2 per resident) exceed the extra US$1.50 per resident at the budget's shadow price, so catch-up beats
+    routine there.
+  about:
+    pair:
+    - catchup
+    - routine
+  direction: increases
+  conditions:
+  - feature: s0
+    range:
+    - 0.28
+    - 0.3482
+  source_type: literature
+  evidence:
+  - citation: 'Fine P, Eames K, Heymann DL (2011) ''Herd immunity'': a rough guide. Clinical Infectious Diseases
+      52(7):911-916'
+    location: threshold 1 - 1/R0 discussion
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: medium
+- id: B4
+  mechanism: The catchup/routine choice flips along s0 near the point where routine alone stops holding Reff below
+    one, about s0 = 1/(0.73 R0), shifted up slightly because just above threshold routine still leaves a small outbreak;
+    below it routine (half price) is enough.
+  about:
+    pair:
+    - catchup
+    - routine
+  direction: flips
+  conditions:
+  - feature: s0
+    range:
+    - 0.18
+    - 0.32
+  source_type: literature
+  evidence:
+  - citation: 'Fine P, Eames K, Heymann DL (2011) ''Herd immunity'': a rough guide. Clinical Infectious Diseases
+      52(7):911-916'
+    location: herd immunity threshold
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: In districts whose susceptible share is below the herd threshold (s0 < 1/R0) importations cause only
+    short stuttering chains (~seed/(1-Reff) infections, of order 1e-4 to 1e-3 per resident), so any vaccination
+    averts too little to justify its cost at the shadow price; none beats routine there.
+  about:
+    pair:
+    - none
+    - routine
+  direction: increases
+  conditions:
+  - feature: s0
+    range:
+    - 0.1145
+    - 0.14
+  source_type: literature
+  evidence:
+  - citation: 'Diekmann O, Heesterbeek JAP (2000) Mathematical Epidemiology of Infectious Diseases: Model Building,
+      Analysis and Interpretation. Wiley'
+    location: branching-process minor-outbreak size (chapter not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'Catch-up''s relative reduction rises with s0: in subcritical districts it only shortens chains (reduction
+    ~0.4-0.7), in supercritical ones it prevents the whole outbreak (~1).'
+  about:
+    package: catchup
+    feature: s0
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG (1927) A contribution to the mathematical theory of epidemics. Proceedings
+      of the Royal Society of London A 115:700-721
+    location: final-size relation
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Among supercritical districts, routine's relative reduction falls as transmission (contact_rate, hence
+    R0) rises, because the 27% cut in susceptibles leaves Reff further above one.
+  about:
+    package: routine
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  conditions:
+  - feature: s0
+    range:
+    - 0.22
+    - 0.3482
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG (1927) A contribution to the mathematical theory of epidemics. Proceedings
+      of the Royal Society of London A 115:700-721
+    location: final-size relation
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: District susceptible share (serosurvey s0) is the main driver of baseline burden and therefore of the
+    ranking of districts; population only scales totals, seed_share matters only in subcritical districts.
+  about:
+    feature: s0
+  direction: increases
+  source_type: data
+  evidence:
+  - dossier_entry: units.csv
+    file: units.csv
+    column: s0
+  confidence: high
+  decision_relevant: true
+open_questions:
+- id: Q1
+  question: What is R0 in each district (contact_rate calibration vs the 5-8 stated range, and the r0_target column)?
+    The routine-sufficient s0 threshold moves from ~0.17 to ~0.27 across it, which decides how many districts can
+    take the cheaper option.
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: Are the 30% and 75% reach figures of susceptibles independent of efficacy, and does the engine target
+    susceptibles or waste doses on immune people? Wasted doses would lower effective reach and could push catch-up
+    Reff above one in the highest-s0, highest-R0 districts.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q3
+  question: Toxoid protects against disease more than against carriage; if infection (not disease) protection is
+    lower than the all-or-nothing engine assumes, both options are overstated and the catch-up threshold could fall
+    inside the s0 range.
+  beliefs:
+  - B1
+  decision_relevant: true
+- id: Q4
+  question: Is the serosurvey s0 representative (sampling frame, assay cut-off 0.1 IU/mL vs protection), and is
+    there age structure that concentrates susceptibles in school-age children reached by routine boosters?
+  beliefs:
+  - B8
+  - B2
+  decision_relevant: true
+- id: Q5
+  question: Where does the shadow price sit? A low lambda moves the catchup/routine flip toward lower s0 and lets
+    some subcritical districts take routine.
+  beliefs:
+  - B3
+  - B4
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: In districts with s0 >= 0.25, catchup's relative reduction in infections is between 0.9 and 1.0 at >= 80%
+    of usable points; refuted if <= 20% are.
+  test:
+    kind: effect_band
+    package: catchup
+    band:
+    - 0.9
+    - 1.0
+    min_share: 0.8
+    where:
+      s0:
+      - 0.25
+      - 0.3482
+- id: H2
+  belief: B2
+  claim: In districts with s0 >= 0.30, routine's relative reduction is between 0.25 and 0.85 at >= 75% of usable
+    points; refuted if <= 25% are.
+  test:
+    kind: effect_band
+    package: routine
+    band:
+    - 0.25
+    - 0.85
+    min_share: 0.75
+    where:
+      s0:
+      - 0.3
+      - 0.3482
+- id: H3
+  belief: B3
+  claim: For s0 in [0.28, 0.3482], catchup beats routine on net benefit at the shadow price at >= 80% of usable
+    points; refuted if routine wins that often.
+  test:
+    kind: paired_sign
+    a: catchup
+    b: routine
+    feature: s0
+    range:
+    - 0.28
+    - 0.3482
+    sign: positive
+    min_share: 0.8
+- id: H4
+  belief: B4
+  claim: The routine-to-catchup transition along s0 lies within s0 in [0.18, 0.32]; refuted if located entirely
+    outside.
+  test:
+    kind: flip_in
+    a: catchup
+    b: routine
+    feature: s0
+    range:
+    - 0.18
+    - 0.32
+- id: H5
+  belief: B5
+  claim: For s0 in [0.1145, 0.14], none beats routine on net benefit at the shadow price at >= 80% of usable points;
+    refuted if routine wins that often.
+  test:
+    kind: paired_sign
+    a: none
+    b: routine
+    feature: s0
+    range:
+    - 0.1145
+    - 0.14
+    sign: positive
+    min_share: 0.8
+- id: H6
+  belief: B6
+  claim: Catchup's relative reduction increases with s0 (Spearman rho interval above 0); refuted if it excludes
+    0 on the negative side.
+  test:
+    kind: effect_direction
+    package: catchup
+    feature: s0
+    direction: increases
+- id: H7
+  belief: B7
+  claim: Among districts with s0 >= 0.22, routine's relative reduction decreases with contact_rate (rho interval
+    below 0); refuted if it excludes 0 on the positive side.
+  test:
+    kind: effect_direction
+    package: routine
+    feature: contact_rate (calibration scale)
+    direction: decreases
+    where:
+      s0:
+      - 0.22
+      - 0.3482
