@@ -1,0 +1,311 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold: the season''s infection burden is set by Reff0 = R0 x s0. With R0 1.3-2.2 and
+    s0 0.56-0.94, Reff0 spans about 0.7-2.1, so some districts are near or below threshold (small burden, seed-driven)
+    and others face attack rates of tens of percent. Burden increases with s0 and contact_rate.'
+  about:
+    feature: s0
+  direction: increases
+  conditions:
+  - feature: s0
+    range:
+    - 0.5609
+    - 0.9393
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 2 (threshold and final-size relation); exact page uncertain
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: A preventive campaign at 85% reach with a conjugate MenC vaccine (high short-term efficacy, plus herd
+    protection) pushes Reff below 1 in nearly every district, so it averts most of the season's infections.
+  about:
+    package: preventive
+  direction: reduces
+  magnitude:
+    band:
+    - 0.7
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Trotter CL, Andrews NJ, Kaczmarski EB, Miller E, Ramsay ME. Effectiveness of meningococcal serogroup
+      C conjugate vaccine 4 years after introduction. Lancet 2004
+    location: vaccine effectiveness by age cohort table; table number uncertain
+  - citation: 'Ramsay ME, Andrews NJ, Trotter CL, Kaczmarski EB, Miller E. Herd immunity from meningococcal serogroup
+      C conjugate vaccination in England: database analysis. BMJ 2003'
+    location: results on carriage/unvaccinated cohorts; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: medium
+- id: B3
+  mechanism: A reactive campaign completing about 8 weeks into the season arrives after part of the epidemic has
+    occurred (and after the peak in fast epidemics), so it averts a clearly smaller share than preventive.
+  about:
+    package: reactive
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Woods CW, Armstrong G, Sackey SO, et al. Emergency vaccination against epidemic meningitis in Ghana:
+      implications for the control of meningococcal disease in West Africa. Lancet 2000'
+    location: estimate of cases prevented by the reactive campaign; location uncertain
+  - citation: 'Leake JA, Kone ML, Yada AA, et al. Early detection and response to meningococcal disease epidemics
+      in sub-Saharan Africa: appraisal of the WHO strategy. Bull World Health Organ 2002'
+    location: share of cases preventable by response time; location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'Reactive relative reduction falls as s0 rises: a higher Reff0 makes the epidemic faster (more of it
+    over by week 8) and harder to push below threshold with a late, partial campaign.'
+  about:
+    package: reactive
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: cases averted by intervention delay figure; figure number uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'Reactive relative reduction falls as seed_share rises: a larger initial infected share brings the
+    epidemic forward, so a campaign fixed at about week 8 lands later in the epidemic''s course. Holds only if the
+    engine represents the reactive delay in time rather than only as a lower efficacy.'
+  about:
+    package: reactive
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: delay analysis; location uncertain
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Reactive relative reduction falls as transmission (contact_rate, i.e. R0) rises, for the same reasons
+    as s0: faster growth and a higher bar to bring Reff below 1.'
+  about:
+    package: reactive
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: delay analysis; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Preventive vs reactive at the budget's shadow price flips along s0. At low s0 (Reff0 near or below
+    1, slow or minor epidemics) reactive averts nearly as much per resident and costs US$0.50 less, so it wins (or
+    neither is worth funding); at high s0 the extra infections preventive averts per resident exceed the price gap,
+    so preventive wins. Flip roughly at Reff0 about 1.3-1.6, i.e. s0 about 0.62-0.90 for the R0 range; location
+    depends on R0 and the shadow price.
+  about:
+    pair:
+    - preventive
+    - reactive
+    feature: s0
+  direction: flips
+  conditions:
+  - feature: s0
+    range:
+    - 0.62
+    - 0.9
+  source_type: literature
+  evidence:
+  - citation: 'Leake JA, Kone ML, Yada AA, et al. Early detection and response to meningococcal disease epidemics
+      in sub-Saharan Africa: appraisal of the WHO strategy. Bull World Health Organ 2002'
+    location: location uncertain
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 2; page uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: low
+- id: B8
+  mechanism: District population size does not change per-capita outcomes in a closed, homogeneously mixing group
+    with per-capita seeding; pop matters to the plan only through total cost against the budget.
+  about:
+    package: preventive
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: frequency-dependent transmission; page uncertain
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Does the engine represent the reactive campaign's 8-week delay in time (protection after transmission
+    has started) or only as a lower efficacy applied before the epidemic? If the latter, the "too late" rule is
+    carried entirely by efficacy:reactive and seed_share has no timing effect.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Does the budget bind (total population x US$1.60 is close to US$12M), and what is the shadow price?
+    A low shadow price favours preventive everywhere; a binding one opens room for reactive in low-s0 districts.
+  beliefs:
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Where in 1.3-2.2 is R0, and how does contact_rate map to it? The flip location in s0 moves inversely
+    with R0.
+  beliefs:
+  - B1
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Is reactive cost incurred only in districts that cross the threshold (expected cost) or always? And
+    does the infections outcome count the seeded infections, which no option can avert?
+  beliefs:
+  - B2
+  - B3
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B2
+  claim: Preventive averts 70-100% of infections at at least 80% of usable points.
+  test:
+    kind: effect_band
+    package: preventive
+    band:
+    - 0.7
+    - 1.0
+    min_share: 0.8
+- id: H2
+  belief: B3
+  claim: Reactive averts 25-80% of infections at at least 60% of usable points (clearly less than preventive, clearly
+    more than nothing).
+  test:
+    kind: effect_band
+    package: reactive
+    band:
+    - 0.25
+    - 0.8
+    min_share: 0.6
+- id: H3
+  belief: B4
+  claim: Reactive relative reduction decreases with s0; refuted if the rank correlation interval lies above 0.
+  test:
+    kind: effect_direction
+    package: reactive
+    feature: s0
+    direction: decreases
+- id: H4
+  belief: B5
+  claim: Reactive relative reduction decreases with seed_share (earlier epidemics make a week-8 campaign later).
+  test:
+    kind: effect_direction
+    package: reactive
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B6
+  claim: Reactive relative reduction decreases with contact_rate, adjusted for the two efficacy parameters.
+  test:
+    kind: effect_direction
+    package: reactive
+    feature: contact_rate (calibration scale)
+    direction: decreases
+    adjust_for:
+    - efficacy:reactive
+    - efficacy:preventive
+- id: H6
+  belief: B7
+  claim: In high-susceptibility districts (s0 0.85-0.94) preventive beats reactive on net benefit at the shadow
+    price at at least 70% of usable points.
+  test:
+    kind: paired_sign
+    a: preventive
+    b: reactive
+    feature: s0
+    range:
+    - 0.85
+    - 0.9393
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: In low-susceptibility districts (s0 0.56-0.65) reactive beats preventive on net benefit at the shadow price
+    at at least 60% of usable points.
+  test:
+    kind: paired_sign
+    a: preventive
+    b: reactive
+    feature: s0
+    range:
+    - 0.5609
+    - 0.65
+    sign: negative
+    min_share: 0.6
+- id: H8
+  belief: B7
+  claim: The preventive/reactive choice flips along s0 within 0.62-0.90.
+  test:
+    kind: flip_in
+    a: preventive
+    b: reactive
+    feature: s0
+    range:
+    - 0.62
+    - 0.9
