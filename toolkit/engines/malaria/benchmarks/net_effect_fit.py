@@ -336,6 +336,83 @@ def _control_check(runner, pack: dict, ctrl: dict, point: dict) -> dict:
         [BM.get(r, pack["settings"][s]["calibrate"]["value_path"]) for r in res[a]])), 4)} for s, a in ctrl.items()}
 
 
+PURPOSE = ("trial fit of the v0.17 net-effect parameters on the pack's training targets (ENGINE_NOTES.md, v0.17); "
+           "adopted only through a signed spec's uncertainty.net_effect_posterior (load_posterior)")
+
+
+def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
+    """The output file's document (run() writes it; load_posterior reads it): the plan's box, the joint region."""
+    return BM.stamp(dict({"purpose": PURPOSE, "smoke": smoke, "plan": q}, **rest, joint_region=reg), eng)
+
+
+def placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
+    """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
+    pt = {"point": rows[0], "all_in_band": gate_ok, "calibration_check": {}}
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"all_in_band": True, "disproved_by_verification": [],
+                                                                "calibration_check": {}})
+    yaml.safe_dump(document(eng, reg, {"params": box}, False), open(path, "w"), sort_keys=False)
+
+
+class PosteriorRefused(ValueError):
+    """The fit's output cannot be the draws' joint sample (fail closed)."""
+
+
+def load_posterior(path: str, engine, ranges: dict) -> dict:
+    """The fit's accepted joint sample as whole rows: {path, sha256 (of the bytes parsed), names, rows (n x k)}.
+    `ranges` {name: (lo, hi)}: the parameters the uncertainty draws vary and their ranges (engine-card priors from
+    priors.yaml, spec priors, fitted ranges). Refused (PosteriorRefused) when the file is missing, unreadable or not
+    this script's output; a smoke; the acceptance gate did not pass (finalize: sample_status verified, no reason, no
+    failed point); the engine name or code differs from `engine`; the sample is empty or a row lacks a fitted
+    parameter or holds a non-finite or non-numeric value; a column is not in `ranges`; a value is outside its range."""
+    import hashlib
+    import math
+    from toolkit.engines.contract import engine_identity
+
+    def no(why):
+        raise PosteriorRefused(f"net-effect posterior {path}: {why}")
+    try:
+        data = open(path, "rb").read()
+    except OSError as ex:
+        no(f"unreadable ({ex})")
+    try:
+        doc = yaml.safe_load(data)
+    except yaml.YAMLError as ex:
+        no(f"malformed YAML ({ex})")
+    if not isinstance(doc, dict) or not isinstance(doc.get("joint_region"), dict) or doc.get("producer") != BM.PRODUCER:
+        no("not an output of net_effect_fit.py run (producer, joint_region)")
+    if doc.get("smoke") is not False:
+        no("a smoke run is not evidence")
+    reg = doc["joint_region"]
+    if reg.get("sample_status") != "verified" or reg.get("acceptance") != [] or (reg.get("verified") or {}).get(
+            "failed") != []:
+        no(f"the fit's acceptance gate did not pass (sample_status {reg.get('sample_status')}: {reg.get('acceptance')})")
+    have, want = doc.get("engine_identity") or {}, engine_identity(engine)
+    for k in ("name", "code_sha256"):
+        if have.get(k) != want[k]:
+            no(f"fitted under engine {k} {have.get(k)}, this engine's is {want[k]}")
+    names, rows = list((doc.get("plan") or {}).get("params") or {}), reg.get("sample")
+    if not names or not isinstance(rows, list) or not rows:
+        no("no fitted parameters or an empty sample")
+    X = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict) or sorted(r) != sorted(names):
+            no(f"sample row {i} holds {sorted(r) if isinstance(r, dict) else r}, the fit's parameters are {names}")
+        if not all(isinstance(r[k], (int, float)) and not isinstance(r[k], bool) and math.isfinite(r[k]) for k in names):
+            no(f"sample row {i} holds a non-numeric or non-finite value: {r}")
+        X.append([float(r[k]) for k in names])
+    miss = [k for k in names if k not in ranges]
+    if miss:
+        no(f"{miss} are not varied by these draws (an engine-card or spec prior, or a fitted parameter under the "
+           f"engine_parameters source, and not calibrated); the draws vary {sorted(ranges)}")
+    X = np.asarray(X, float)
+    for j, k in enumerate(names):
+        lo, hi = (float(x) for x in ranges[k])
+        tol = 1e-6 * max(1.0, hi - lo)          # the sample is rounded to 6 decimals
+        if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
+            no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its draw range [{lo}, {hi}]")
+    return {"path": os.path.abspath(path), "sha256": hashlib.sha256(data).hexdigest(), "names": names, "rows": X}
+
+
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
         verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None) -> int:
     if os.path.basename(out_path) in PROTECTED:
@@ -384,13 +461,10 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                         "computed": {t: round(r["computed"], 4) for t, r in rows.items()},
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
     reg, code = finalize(reg, checked, chosen, grid_edge)
-    doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters on the pack's training targets "
-                               "(ENGINE_NOTES.md, v0.17); not adopted",
-                    "smoke": smoke, "approved": approved, "cap_usd": cap_usd, "plan": q, "n_sims": runner.nsims,
-                    "wall_s": round(time.time() - t0, 1), "fitted_at": time.strftime("%F %T"),
-                    "calibration_grid": {CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
-                                         "at_grid_edge": grid_edge},
-                    "joint_region": reg, **fit}, eng)
+    doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims,
+                   wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
+                   calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
+                                     "at_grid_edge": grid_edge}, **fit)
     yaml.safe_dump(doc, open(out_path, "w"), sort_keys=False)
     job_out = os.environ.get("JOB_OUT")
     if job_out and not smoke:
@@ -568,7 +642,7 @@ def _self_test() -> int:
         import tempfile
         box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
                "cfp_half": [547.5, 1277.5]}
-        u = np.random.default_rng(5).uniform(0, 1, 40)
+        u = [float(v) for v in np.random.default_rng(5).uniform(0, 1, 40)]
         rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
                  "cfp_half": round(700 + 300 * x, 6)} for x in u]
         rg = {"net_kill_shift": (pr.lo, pr.hi), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
@@ -587,9 +661,9 @@ def _self_test() -> int:
             def refuse(label, path, ranges=rg):
                 try:
                     load_posterior(path, e, ranges)
-                    got[label] = False
-                except PosteriorRefused:
-                    got[label] = True
+                    got[label] = ""
+                except PosteriorRefused as ex:
+                    got[label] = str(ex)
 
             def variant(label, mut):
                 doc = yaml.safe_load(open(good))
@@ -622,9 +696,18 @@ def _self_test() -> int:
             other = os.path.join(d, "other.yaml")
             placeholder(other, e, rows2, box)
             sha2 = load_posterior(other, e, rg)["sha256"]
-        ok(all(got.values()) and len(got) == 17 and sha2 != P["sha256"],
-           f"F15 the loader fails closed on every refusal case ({sorted(k for k, v in got.items() if not v) or 'all'} "
-           f"not refused of {len(got)}), and a changed sample has another sha256")
+        gate = ("acceptance gate failed (finalize)", "status edited to invalid", "acceptance reasons left",
+                "a failed verified point")
+        why = {**dict.fromkeys(gate, "acceptance gate"), "missing file": "unreadable", "malformed YAML": "malformed",
+               "not a mapping": "not an output", "another producer": "not an output", "a smoke": "smoke",
+               "other engine code": "code_sha256", "empty sample": "empty sample",
+               "a row lacks a parameter": "the fit's parameters", "a non-finite value": "non-finite",
+               "a non-numeric value": "non-numeric", "a column the fit did not fit": "the fit's parameters",
+               "a parameter these draws do not vary": "not varied", "a value outside its priors.yaml range": "outside"}
+        wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
+        ok(not wrong and set(got) == set(why) and sha2 != P["sha256"],
+           f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
+           f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

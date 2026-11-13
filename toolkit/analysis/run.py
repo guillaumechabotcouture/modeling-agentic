@@ -152,8 +152,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         raise PermissionError(f"decision spec is not signed (status: {st}); sign it (toolkit/spec/signoff.py) or pass "
                               "--unsigned for a test run")
     eng = spec.engine()
-    S = Store(run_dir, spec.sha256, st == "signed", _engine_info(eng), spec.settings_sha256,
-              spec.engine_choice_sha256)
+    from toolkit.analysis import uncertainty as UQ_
+    post = UQ_.posterior_input(spec)        # uncertainty.net_effect_posterior: its sha256 is an engine input
+    info = dict(_engine_info(eng), **({"net_effect_posterior_sha256": post["sha256"]} if post else {}))
+    S = Store(run_dir, spec.sha256, st == "signed", info, spec.settings_sha256, spec.engine_choice_sha256)
     holder["S"] = S
     from toolkit.engines.benchmark_sources import load_evidence
     stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
@@ -164,7 +166,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
     from toolkit.spec import priors as PRI
     eng_files = [f for f in (getattr(eng, "results_path", None), getattr(eng, "fitted_path", None),
-                             PRI.priors_path(eng)) if f and os.path.exists(f)]
+                             PRI.priors_path(eng)) if f and os.path.exists(f)] + ([post["path"]] if post else [])
     from toolkit.spec import engine_parameters as PV
     eng_data = {"card": card.to_dict(), "parameters": [vars(p) for p in eng.parameters()]}
     svr = PV.rows(spec, eng)            # spec-declared engine parameter values, with the card values they replace
