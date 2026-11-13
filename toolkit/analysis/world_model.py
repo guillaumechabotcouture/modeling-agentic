@@ -8,7 +8,7 @@ throughout: absence of evidence, weak evidence or too few usable points is `inco
     python3 toolkit/analysis/world_model.py register <seed.yaml> <run_dir>      # before the evidence exists
     python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml or a world_model.yaml> [--out DIR]
         [--hypotheses hypotheses.yaml] [--registry ledger.jsonl] [--engine-identity current|recorded]
-        [--shadow-price LAMBDA] [--without-plan] [--anchor-ref origin/<branch>]
+        [--shadow-price LAMBDA] [--without-plan] [--anchor-ref <remote>/<branch>]
     python3 toolkit/analysis/world_model.py --self-test
 
 Simulation beliefs are screened: every direction (package x feature) and flip (pair x feature) of the summary is one
@@ -25,16 +25,15 @@ sha256 of its evidence. A replay or an alias counts once and moves no confidence
 history, never taken from the seed (`reconciled` records a difference). Registration is a separate, append-only
 ledger (`register`, analysis/hypotheses_registry.jsonl): each line holds a canonical test, its sha256, the time it
 was registered, the previous line's sha256 and its own, and the chain is verified on every read (an edited, removed,
-reordered or backdated line is refused). The ledger cannot attest itself, so it needs an anchor outside it: a
-recorded head (its line count and last line sha256, with a time). In a run the harness records the head into
-run_state.json history at the start of each step (`registry_head`; run_state.json is a harness file protected by
-agents/integrity.py's hash record); offline, a head is the ledger as committed in a git commit that is an ancestor of
-the fetched remote ref (--anchor-ref, e.g. origin/v2), recorded as "anchored in git (remote commit <sha>)" with its
-residual trust (the commit time is the committer's clock). A ledger that does not extend every recorded head
-(rewritten or truncated) is refused. A hypothesis is pre-registered only when its current canonical test sha256 is in
-a ledger line covered by a head recorded before its evidence existed; an edit after registration, a test not in the
-ledger, a line after the last recorded head, or a `registered_at` written in the seed alone is `post_hoc`: reported
-separately and never in the share confirmed.
+reordered or backdated line is refused). The ledger cannot attest itself, and no file on a machine the same actor
+controls can prove when a registration happened, so the claim is narrow: a hypothesis is "remote-anchored" only
+when its current canonical test sha256 is in a ledger line covered by a ledger commit reachable from a fetched
+remote-tracking ref (--anchor-ref refs/remotes/<remote>/<branch>; HEAD, local branches and commit ids are refused)
+whose commit time is before its evidence existed, recorded as "anchored in remote git (commit <sha>); the commit
+time is the committer's clock". Everything else is "post hoc": reported separately and never in the share
+confirmed. A ledger that does not extend every such head (rewritten or truncated) is refused. run_state.json
+heads are not used (v2 does not yet hash-protect run_state.json). The track record is not tamper-proof: whoever
+controls the machine and can push to the remote can rewrite both.
 A produced world model can seed the next build: its simulation beliefs are replaced (`version`,
 `superseded_simulation`), literature and data beliefs kept, and hypotheses reloaded with --hypotheses. Ids starting
 `sim.` are reserved for generated beliefs. Nothing is wired into the analysis or the stage machine. No LLM calls.
@@ -89,7 +88,9 @@ The comparison measure is net benefit per person at the budget's shadow price, d
 records that its budget does not bind (solver.budget_slack: true); otherwise there is none and paired tests are
 untestable. No value is inferred from average benefit / cost. A lower lambda favours the costlier option, so a
 paired test or flip between options of different cost moves with it (the value used is in every result).
-analysis/point.yaml is used only when bound to this run: its spec sha256 and engine identity must match, and its
+analysis/point.yaml is used only when the run's completed analysis manifest (analysis/manifest.json) lists it, at
+its current sha256, together with the current batch (analysis/batch.yaml bound to the current design and results),
+and when it is bound to this run: its spec sha256 and engine identity must match, and its
 inputs (it must record some) must verify all the way down the artifact graph (point.yaml -> calibration.yaml -> the
 units table and the files that artifact records ...), else the build is refused; --without-plan builds without it.
 Every data and settings file consumed (the units table, the settings file, the
@@ -133,7 +134,7 @@ PROVISIONAL = ("provisional: the track record's scores are not to be relied on u
 SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
             "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3,
             "fdr_q": 0.05, "correlated": 0.5, "tie_share_max": 0.5,
-            "alpha": 0.05, "perm_n_max": 50, "perm_resamples": 20000, "perm_seed": 0}
+            "alpha": 0.05, "perm_n_max": 50, "perm_resamples": 20000, "perm_seed": 0, "perm_minority_min": 10}
 
 
 class WorldModelError(ValueError):
@@ -482,7 +483,8 @@ def flip_along(sw, a, b, f, mask=None):
         return dict(out, status="non_monotone", bin_shares=[_r(v) for v in sh])
     dev, t, b1 = _logistic(x, s)
     lo, hi = float(x.min()), float(x.max())
-    if len(x) < SETTINGS["perm_n_max"]:      # small samples: a permutation p-value of the winners' rank sum
+    k_min = int(min(s.sum(), len(s) - s.sum()))
+    if len(x) < SETTINGS["perm_n_max"] or k_min < SETTINGS["perm_minority_min"]:   # permutation: winners' rank sum
         from scipy.stats import rankdata
         rk, k = rankdata(x), int(s.sum())
         perm = np.argsort(np.random.default_rng(SETTINGS["perm_seed"]).random((SETTINGS["perm_resamples"], len(x))),
@@ -561,9 +563,9 @@ def summarise(sw, pairs=None, packages=None):
                   "direction": {f: direction(x, r) for f, x in sorted(sw.features.items())}}
     flips = {f"{a}~{b}": flip(sw, a, b) for a, b in pairs}
     corr = correlations(sw)
-    tested = [v for e in eff.values() for v in e["direction"].values() if v.get("p") is not None] + \
-        [x for fl in flips.values() for x in fl.get("_all", []) if x.get("p") is not None]
-    cut, found = _bh([v["p"] for v in tested], SETTINGS["fdr_q"]), 0
+    tested = [1.0 if v.get("p") is None else v["p"] for e in eff.values() for v in e["direction"].values()] + \
+        [1.0 if x.get("p") is None else x["p"] for fl in flips.values() for x in fl.get("_all", [])]
+    cut, found = _bh(tested, SETTINGS["fdr_q"]), 0
     for e in eff.values():
         for f, v in e["direction"].items():
             v.update(scope="marginal", correlated_with=corr.get(f, []))
@@ -882,29 +884,30 @@ def anchor_cover(led, anchors):
     return cov
 
 
-def run_state_anchors(run_dir):
-    """The ledger heads the harness recorded into run_state.json history (`registry_head` at a step's start)."""
-    try:
-        st = json.load(open(os.path.join(run_dir, "run_state.json")))
-    except (OSError, ValueError):
-        return []
-    return [dict(h["registry_head"], source="run_state.json history (recorded by the harness at a step's start)")
-            for h in st.get("history") or [] if isinstance(h, dict) and isinstance(h.get("registry_head"), dict)]
+def cli_anchors(run_dir, reg_path, ref):
+    """The anchors a build uses: ledger commits reachable from a fetched remote-tracking ref, and nothing else
+    (run_state.json heads are not anchors until v2 hash-protects run_state.json)."""
+    return git_anchors(reg_path, ref) if ref else []
 
 
 def git_anchors(path, ref):
     """Recorded heads from git: each commit of the ledger file that is an ancestor of the fetched remote `ref`, with
-    the verified ledger it held and its commit time. Residual trust: the commit time is the committer's clock; the
-    remote shows the commit was pushed by the time it was fetched. Fetch before use; git unavailable: none."""
+    the verified ledger it held and its commit time. `ref` must resolve to refs/remotes/... (refused otherwise).
+    Residual trust: the commit time is the committer's clock; the remote shows the commit was pushed by the time it
+    was fetched. Fetch before use; git unavailable: none."""
     import subprocess
     d, name = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
     out = []
     try:
         run = lambda *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=120)  # noqa
-        log = run("log", "--format=%H %cI", ref, "--", name)
+        full = run("rev-parse", "--symbolic-full-name", ref).stdout.strip()
+        if not full.startswith("refs/remotes/"):
+            raise WorldModelError(f"--anchor-ref {ref!r} resolves to {full or 'no symbolic ref'}: a fetched "
+                                  "remote-tracking ref (refs/remotes/<remote>/<branch>) is required")
+        log = run("log", "--format=%H %cI", full, "--", name)
         for row in (log.stdout.splitlines() if log.returncode == 0 else []):
             c, at = row.split()
-            if run("merge-base", "--is-ancestor", c, ref).returncode != 0:
+            if run("merge-base", "--is-ancestor", c, full).returncode != 0:
                 continue
             show = run("show", f"{c}:./{name}")
             try:
@@ -913,8 +916,10 @@ def git_anchors(path, ref):
                 continue
             if show.returncode == 0 and lines:
                 out.append({"at": at, "lines": len(lines), "head": lines[-1]["line_sha"], "commit": c,
-                            "source": f"anchored in git (remote commit {c}); residual trust: the commit time is the "
-                                      "committer's clock"})
+                            "source": f"anchored in remote git (commit {c}); the commit time is the committer's "
+                                      "clock", "ref": full})
+    except WorldModelError:
+        raise
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     return out
@@ -1004,7 +1009,8 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
         seen.add(key)
         h["confrontation"] = {"test_sha": key[0], "evidence_sha": ev_sha, "evidence_time": ev_time,
                               "post_hoc": post, "repeat": again, "registration": e["line_sha"] if e else None,
-                              "anchor": {"at": anchor[0], "source": anchor[1]} if anchor else None}
+                              "anchor": {"at": anchor[0], "source": anchor[1]} if anchor else None,
+                              "registration_status": "post hoc" if post else "remote-anchored"}
         hist.append(dict({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]}, **h["confrontation"]))
         b = by[h["belief"]]
         if again:
@@ -1024,7 +1030,10 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
         if j != i:
             b.setdefault("confidence_seed", b["confidence"])
             b["confidence"] = CONFIDENCE[min(max(j, 0), 2)]
-    tr = dict(_record(hist, seed.get("track_record")), provisional=PROVISIONAL,
+    tr = dict(_record(hist, seed.get("track_record")), provisional=PROVISIONAL, tamper_proof=False,
+              note="pre-registration is remote-anchored (a ledger commit reachable from a fetched remote-tracking "
+                   "ref, whose commit time is the committer's clock) or post hoc; the track record is not "
+                   "tamper-proof: whoever controls the machine and can push to the remote can rewrite both",
               registry={"lines": len(led), "head": led[-1]["line_sha"] if led else None,
                         "anchors": [{k: a.get(k) for k in ("at", "lines", "source")} for a in anchors or []]})
     wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "version": seed.get("version", 0) + 1,
@@ -1163,9 +1172,37 @@ def shadow_price(point):
     return None, "no recorded dual of the budget row (analysis/point.yaml solver.budget_dual): pass --shadow-price"
 
 
+def _manifest_problems(run_dir):
+    """Why the run's completed analysis manifest does not vouch for its point plan with the current batch (empty when
+    it does): it must be complete and list analysis/point.yaml and analysis/batch.yaml at their current sha256, and
+    batch.yaml must record the current design and results."""
+    import yaml
+    from toolkit.analysis.artifacts import sha256
+    try:
+        m = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))
+    except (OSError, ValueError):
+        return ["no completed analysis manifest (analysis/manifest.json)"]
+    arts = m.get("artifacts") if isinstance(m, dict) else None
+    if not (isinstance(arts, dict) and m.get("complete") is True):
+        return ["the analysis manifest is not complete"]
+    bad = [f"the manifest does not list {rel} at its current sha256" for rel in ("analysis/point.yaml",
+                                                                               "analysis/batch.yaml")
+           if (arts.get(rel) or {}).get("sha256") is None
+           or (arts.get(rel) or {}).get("sha256") != sha256(os.path.join(run_dir, rel))]
+    try:
+        inp = (yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml"))) or {}).get("inputs") or {}
+    except (OSError, yaml.YAMLError, AttributeError):
+        inp = {}
+    bad += [f"analysis/batch.yaml does not record the current {rel}" for rel in
+            ("analysis/batch/design.json", "analysis/batch/results.jsonl")
+            if inp.get(rel) is None or inp.get(rel) != sha256(os.path.join(run_dir, rel))]
+    return bad
+
+
 def point_doc(run_dir, ident):
-    """analysis/point.yaml when it is bound to this run (its spec sha256, its engine identity and every input it
-    records match), None when absent; a stale or unbound plan is refused."""
+    """analysis/point.yaml when the completed analysis manifest lists it with the current batch and it is bound to
+    this run (its spec sha256, its engine identity and every input it records match), None when absent; a stale or
+    unbound plan is refused."""
     from toolkit.analysis.artifacts import read, sha256
     rel = "analysis/point.yaml"
     if not os.path.isfile(os.path.join(run_dir, rel)):
@@ -1173,7 +1210,8 @@ def point_doc(run_dir, ident):
     doc = read(run_dir, rel)
     if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
         raise WorldModelError(f"{rel}: not an analysis artifact")
-    bad = [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
+    bad = _manifest_problems(run_dir)
+    bad += [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
     bad += [] if doc["data"].get("engine_identity") == ident else ["the engine identity"]
     bad += _input_problems(run_dir, rel, doc, set())
     if bad:
@@ -1385,7 +1423,7 @@ def _cli(argv):
     reg_path = a.registry or os.path.join(a.run_dir, LEDGER)
     if os.path.isfile(reg_path):
         inputs["registry"] = sha256(reg_path)
-    anchors = run_state_anchors(a.run_dir) + (git_anchors(reg_path, a.anchor_ref) if a.anchor_ref else [])
+    anchors = cli_anchors(a.run_dir, reg_path, a.anchor_ref)
     wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time,
                    registry={"lines": jsonl(reg_path), "anchors": anchors})
     out = a.out or os.path.join(a.run_dir, "analysis")
@@ -2228,7 +2266,7 @@ def _self_test() -> int:
             open(path, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in more))
             vcs(work, "commit", "-qam", "local only")
             an = git_anchors(path, "origin/main")
-            ok(len(an) == 1 and an[0]["lines"] == 5 and an[0]["source"].startswith("anchored in git (remote commit ")
+            ok(len(an) == 1 and an[0]["lines"] == 5 and an[0]["source"].startswith("anchored in remote git (commit ")
                and len(an[0]["commit"]) == 40, f"WM68 a ledger head in a commit on the fetched remote is an anchor; an "
                                                f"unpushed commit is not: {an}")
     tryit("WM68 git anchor", wm68)
@@ -2372,7 +2410,8 @@ def _self_test() -> int:
 
     def wm78():
         with tempfile.TemporaryDirectory() as d:
-            json.dump({"history": [{"registry_head": {"at": "2025-01-01T00:00:00+00:00", "lines": 1, "head": "0" * 64}}]},
+            head = {"at": "2025-01-01T00:00:00+00:00", "lines": 1, "head": "0" * 64}
+            json.dump({"history": [{"registry_head": head}]},
                       open(os.path.join(d, "run_state.json"), "w"))
             ok(cli_anchors(d, os.path.join(d, LEDGER), None) == [],
                "WM78 run_state.json heads are not anchors (v2 does not hash-protect run_state.json): none without a "
