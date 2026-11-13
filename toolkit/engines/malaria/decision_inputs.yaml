@@ -35,7 +35,12 @@ decision_inputs:
           species complex)"}
       - {kind: card_table, name: species_bionomics, why: "per-species biting and resting behaviour the net acts on"}
       - {kind: card_table, name: field_use, why: "the field-use relationships (retention, use and holes by net age)"}
+      - {kind: parameter, name: net_kill_shift, why: "the shift on the hut-trial mortality intercept: every net type's
+          killing"}
     by_value:
+      pbo:
+        - {kind: parameter, name: pbo_gain_scale, why: "the scale on PBO's gain in bioassay mortality"}
+        - {kind: parameter, name: pbo_adv_decay, why: "how fast a PBO net's advantage over a pyrethroid net decays"}
       dual:
         - {kind: parameter, name: cfp_kill, why: "the fitted chlorfenapyr kill of the dual active-ingredient net"}
         - {kind: parameter, name: cfp_half, why: "how fast the chlorfenapyr kill decays"}
