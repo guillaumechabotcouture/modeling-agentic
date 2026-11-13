@@ -124,6 +124,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+REGISTRY = "analysis/hypotheses_registry.jsonl"      # toolkit/analysis/world_model.py LEDGER
+
+
+def registry_head(run_dir: str) -> dict:
+    """{"registry_head": {at, lines, head}} when the run has a hypotheses registration ledger: its line count and last
+    line's sha256 with the time now. Recorded into run_state.json history at every transition (a step's start), it
+    is the anchor outside the ledger that toolkit/analysis/world_model.py requires before it counts a hypothesis as
+    pre-registered. An unreadable ledger records an error, never a head (the world model then refuses it)."""
+    if not os.path.isfile(os.path.join(run_dir, REGISTRY)):
+        return {}
+    from lib.safe_io import read_nofollow
+    try:
+        lines = [x for x in read_nofollow(run_dir, REGISTRY)[0].decode("utf-8").splitlines() if x.strip()]
+        head = json.loads(lines[-1])["line_sha"] if lines else None
+    except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+        return {"registry_head": {"at": _now(), "error": f"unreadable ledger ({type(e).__name__})"}}
+    return {"registry_head": {"at": _now(), "lines": len(lines), "head": head}} if lines else {}
+
+
 def load_state(run_dir: str) -> RunState | None:
     p = os.path.join(run_dir, STATE_FILE)
     if not os.path.exists(p):
@@ -886,7 +905,8 @@ class Machine:
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
         self.st.history.append({"at": _now(), "from": frm, "to": to, "why": why, "round": self.st.round,
-                                "spent_usd": round(self.st.spent_usd, 4), **(extra or {})})
+                                "spent_usd": round(self.st.spent_usd, 4), **registry_head(self.run_dir),
+                                **(extra or {})})
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
@@ -2429,6 +2449,10 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"IG machine tests: {type(e).__name__}: {e}")
+        try:
+            _self_test_registry_head(ok, td)
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RH registry head: {type(e).__name__}: {e}")
         # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
         from toolkit.spec import schema as _S, signoff as _SO
         d70 = os.path.join(td, "t61")
@@ -2926,6 +2950,25 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        f"T62 a restored run dir whose joint-calibration bench batch lost one task to infra is resumable 'infra' "
        f"(summaries matched by pipeline run id, not mtimes; an earlier run's model failure is ignored; a model "
        f"failure in this run is not resumable), so --resume reopens it at ANALYZE: {got2}")
+
+
+def _self_test_registry_head(ok, td: str) -> None:
+    """RH (F6 world model): every transition records the hypotheses registration ledger's head into run_state.json
+    history, so toolkit/analysis/world_model.py can anchor the ledger outside itself."""
+    import inspect
+    d = os.path.join(td, "rh")
+    os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+    ok(registry_head(d) == {}, "RH1 a run without a registration ledger records no head")
+    with open(os.path.join(d, REGISTRY), "w") as f:
+        f.write(json.dumps({"line_sha": "a" * 64}) + "\n" + json.dumps({"line_sha": "b" * 64}) + "\n")
+    h = registry_head(d).get("registry_head") or {}
+    ok(h.get("lines") == 2 and h.get("head") == "b" * 64 and datetime.fromisoformat(h["at"]).tzinfo is not None,
+       f"RH2 the head is the ledger's line count, last line sha256 and the time now: {h}")
+    with open(os.path.join(d, REGISTRY), "a") as f:
+        f.write("not json\n")
+    h = registry_head(d).get("registry_head") or {}
+    ok("error" in h and "head" not in h, f"RH3 an unreadable last line records an error, never a head: {h}")
+    ok("registry_head(self.run_dir)" in inspect.getsource(Machine._go), "RH4 every transition records the head")
 
 
 def _self_test_geometry(ok, td: str) -> None:
