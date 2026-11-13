@@ -2,8 +2,9 @@
 # public eval-suite questions (question text verbatim from evals/<q>/question.txt; inputs derived from the public
 # data/evals/<q>/ files only, never an answer key) and five synthetic questions. Each template under
 # data/world_model_trials/<id>/ is a decision spec on a cheap engine (package-rate in trial_priors mode,
-# compartmental, renewal) with <= 50 engine runs. shadow_price (outcome per USD) makes paired tests testable without
-# an optimised plan; its basis is an assumed willingness to pay, not a budget dual. Add later batches below with
+# compartmental, renewal) with <= 50 engine runs. the willingness to pay (paired tests' shadow price, outcome per USD) is pre-registered in each
+# template's wtp.yaml against data/world_model_trials/wtp.yaml (a published threshold and DALYs per outcome type);
+# it is never set here (round 1-2 values were placed from check sweeps and are removed). Add later batches below with
 # batch: 2, 3, ...; a completed question is skipped on rerun.
 version: 1
 questions:
@@ -28,9 +29,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/malaria_alloc
-  shadow_price: 0.05
-  shadow_price_basis: about 1 / US$20 per clinical case averted (ITN alone is about US$12 per case in the sweep);
-    not a budget dual
   inputs: 'derived from data/evals/malaria_alloc public inputs: population and SMC eligibility from districts.csv;
     baseline = mean recorded cases per person in the district''s ''none'' years of programme_history.csv; unit costs
     from unit_costs.csv; packages restricted to 5 of the question''s 7 (none, itn, irs, itn+irs, itn+smc) to keep
@@ -56,8 +54,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/measles_campaign
-  shadow_price: 0.02
-  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed willingness to pay)
   inputs: 'derived from data/evals/measles_campaign public inputs: districts.csv populations; group sizes from the
     stated 3% birth cohort; s0 = 1 - 2025 serosurvey seropositive share by band (under 1 = 1, 15+ = 0); transmission
     swept through contact_rate (R0 = q x contact_rate, 12-18)'
@@ -79,9 +75,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_acf
-  shadow_price: 0.001
-  shadow_price_basis: about 1 / US$1,000 per additional case detected (SYM about US$930, CXR about US$1,400 per
-    case in the sweep)
   inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
     = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
     from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
@@ -105,8 +98,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/flu_vaccine
-  shadow_price: 0.001
-  shadow_price_basis: 'cost units are doses: one hospitalisation averted is worth 1,000 doses (assumed)'
   inputs: 'derived from data/evals/flu_vaccine public inputs: population, susceptible-titre share as s0, hospitalisations
     / (seroconverted share x population) as ratio:hosp, VE weighted by population over targeted groups; contact
     matrix x 0.815 fitted outside the harness to last season''s seroconversion (transmission uncertainty not swept);
@@ -130,9 +121,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/dengue_outbreak
-  shadow_price: 0.05
-  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed); the question is mainly
-    an estimation; the campaign cost (US$1 per resident) is assumed
   inputs: 'derived from data/evals/dengue_outbreak public inputs: city population, the generation interval; R0 fixed
     at the engine default 2.0 and the 2026 susceptible share swept 0.3-1.0, so the R0 the question asks to estimate
     is not swept'
@@ -151,8 +139,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/measles_age_targeting
-  shadow_price: 0.02
-  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed)
   inputs: 'synthetic (seeded 20261113): 10 districts, MCV1 0.55-0.92, susceptible gaps derived from coverage'
 - id: cholera_ocv_siting
   batch: 1
@@ -167,8 +153,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/cholera_ocv_siting
-  shadow_price: 0.0004
-  shadow_price_basis: about 1 / US$2,500 per suspected case averted (OCV2 about US$2,600 per case in the sweep)
   inputs: 'synthetic (seed 11): 12 districts, log-uniform incidence 0.0005-0.008 per person-year scaled by (1.4
     - sanitation share); direct protection only, no herd effect'
 - id: outbreak_growth_peak
@@ -185,8 +169,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/outbreak_growth_peak
-  shadow_price: 0.05
-  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed)
   inputs: 'synthetic (seeded 1113): 8 cities, population, seed share 10^-6.5 to 10^-4.5; the s0 sweep overrides
     each city''s prior immunity'
 - id: tb_case_finding
@@ -203,9 +185,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_case_finding
-  shadow_price: 0.0002
-  shadow_price_basis: about 1 / US$5,000 per prevalent case averted (HHC about US$2,000, CACF about US$8,600 in
-    the sweep)
   inputs: 'synthetic (seed 23): 12 districts, log-uniform prevalence 0.0015-0.009, adult HIV prevalence 1-25% (a
     feature the engine does not read)'
 - id: hiv_prep_targeting
@@ -223,9 +202,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/hiv_prep_targeting
-  shadow_price: 0.0001
-  shadow_price_basis: about 1 / US$10,000 per infection averted (oral about US$9,600, CAB about US$13,000 in the
-    sweep)
   inputs: 'synthetic (seed 37): 4 districts x 3 groups; incidence log-uniform per group; adherence score 0.3-0.8
     (a feature the engine does not read)'
 - id: tb_acf_r2
@@ -246,9 +222,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_acf
-  shadow_price: 0.001
-  shadow_price_basis: about 1 / US$1,000 per additional case detected (SYM about US$930, CXR about US$1,400 per
-    case in the sweep)
   inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
     = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
     from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
@@ -277,9 +250,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/malaria_alloc
-  shadow_price: 0.05
-  shadow_price_basis: about 1 / US$20 per clinical case averted (ITN alone is about US$12 per case in the sweep);
-    not a budget dual
   inputs: 'derived from data/evals/malaria_alloc public inputs: population and SMC eligibility from districts.csv;
     baseline = mean recorded cases per person in the district''s ''none'' years of programme_history.csv; unit costs
     from unit_costs.csv; packages restricted to 5 of the question''s 7 (none, itn, irs, itn+irs, itn+smc) to keep
@@ -309,8 +279,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/measles_campaign
-  shadow_price: 0.02
-  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed willingness to pay)
   inputs: 'derived from data/evals/measles_campaign public inputs: districts.csv populations; group sizes from the
     stated 3% birth cohort; s0 = 1 - 2025 serosurvey seropositive share by band (under 1 = 1, 15+ = 0); transmission
     swept through contact_rate (R0 = q x contact_rate, 12-18)'
@@ -336,9 +304,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_acf
-  shadow_price: 0.001
-  shadow_price_basis: about 1 / US$1,000 per additional case detected (SYM about US$930, CXR about US$1,400 per
-    case in the sweep)
   inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
     = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
     from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
@@ -366,8 +331,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/flu_vaccine
-  shadow_price: 0.001
-  shadow_price_basis: 'cost units are doses: one hospitalisation averted is worth 1,000 doses (assumed)'
   inputs: 'derived from data/evals/flu_vaccine public inputs: population, susceptible-titre share as s0, hospitalisations
     / (seroconverted share x population) as ratio:hosp, VE weighted by population over targeted groups; contact
     matrix x 0.815 fitted outside the harness to last season''s seroconversion (transmission uncertainty not swept);
@@ -395,9 +358,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/dengue_outbreak
-  shadow_price: 0.05
-  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed); the question is mainly
-    an estimation; the campaign cost (US$1 per resident) is assumed
   inputs: 'derived from data/evals/dengue_outbreak public inputs: city population, the generation interval; R0 fixed
     at the engine default 2.0 and the 2026 susceptible share swept 0.3-1.0, so the R0 the question asks to estimate
     is not swept'
@@ -420,8 +380,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/measles_age_targeting
-  shadow_price: 0.02
-  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed)
   inputs: 'synthetic (seeded 20261113): 10 districts, MCV1 0.55-0.92, susceptible gaps derived from coverage'
   rerun_of: measles_age_targeting
   rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
@@ -440,8 +398,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/cholera_ocv_siting
-  shadow_price: 0.0004
-  shadow_price_basis: about 1 / US$2,500 per suspected case averted (OCV2 about US$2,600 per case in the sweep)
   inputs: 'synthetic (seed 11): 12 districts, log-uniform incidence 0.0005-0.008 per person-year scaled by (1.4
     - sanitation share); direct protection only, no herd effect'
   rerun_of: cholera_ocv_siting
@@ -462,8 +418,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/outbreak_growth_peak
-  shadow_price: 0.05
-  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed)
   inputs: 'synthetic (seeded 1113): 8 cities, population, seed share 10^-6.5 to 10^-4.5; the s0 sweep overrides
     each city''s prior immunity'
   rerun_of: outbreak_growth_peak
@@ -484,9 +438,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_case_finding
-  shadow_price: 0.0002
-  shadow_price_basis: about 1 / US$5,000 per prevalent case averted (HHC about US$2,000, CACF about US$8,600 in
-    the sweep)
   inputs: 'synthetic (seed 23): 12 districts, log-uniform prevalence 0.0015-0.009, adult HIV prevalence 1-25% (a
     feature the engine does not read)'
   rerun_of: tb_case_finding
@@ -508,9 +459,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/hiv_prep_targeting
-  shadow_price: 0.0001
-  shadow_price_basis: about 1 / US$10,000 per infection averted (oral about US$9,600, CAB about US$13,000 in the
-    sweep)
   inputs: 'synthetic (seed 37): 4 districts x 3 groups; incidence log-uniform per group; adherence score 0.3-0.8
     (a feature the engine does not read)'
   rerun_of: hiv_prep_targeting
@@ -531,9 +479,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/rotavirus_intro_ranking
-  shadow_price: 0.003
-  shadow_price_basis: about US$330 per hospitalisation averted (assumed willingness to pay, placed near the options'
-    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (ranking)
   area: vaccines
@@ -551,10 +496,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/hpv_dose_schedule
-  shadow_price: 0.02
-  shadow_price_basis: about US$50 per persistent infection averted (assumed willingness to pay, placed near the
-    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
-    dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (schedule choice)
   area: vaccines
@@ -571,9 +512,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/dengue_wolbachia_vs_spraying
-  shadow_price: 0.0005
-  shadow_price_basis: about US$2,000 per dengue case averted (assumed willingness to pay, placed near the options'
-    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (intervention choice)
   area: vector control
@@ -591,9 +529,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/malaria_repellent_vs_itn_topup
-  shadow_price: 0.04
-  shadow_price_basis: about US$25 per clinical case averted (assumed willingness to pay, placed near the options'
-    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (package choice)
   area: vector control
@@ -611,10 +546,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/lf_mda_ida_vs_da
-  shadow_price: 0.017
-  shadow_price_basis: about US$60 per microfilaraemic person-year averted (assumed willingness to pay, placed near
-    the options' average cost-effectiveness in the template check so the paired comparisons are informative; not
-    a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (regimen choice)
   area: MDA / NTDs
@@ -631,10 +562,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/trachoma_mda_frequency
-  shadow_price: 0.2
-  shadow_price_basis: about US$5 per ocular infection person-year averted (assumed willingness to pay, placed near
-    the options' average cost-effectiveness in the template check so the paired comparisons are informative; not
-    a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (frequency choice)
   area: MDA / NTDs
@@ -652,10 +579,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/hcv_test_treat_targeting
-  shadow_price: 0.001
-  shadow_price_basis: about US$1,000 per viraemic person-year averted (assumed willingness to pay, placed near the
-    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
-    dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: targeting
   area: screening
@@ -672,10 +595,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/nutrition_sqlns_vs_mnp
-  shadow_price: 0.0003
-  shadow_price_basis: about US$3,300 per wasted child-year averted (assumed willingness to pay, placed near the
-    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
-    dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: allocation (product choice)
   area: nutrition
@@ -694,9 +613,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/measles_reactive_campaign_timing
-  shadow_price: 0.048
-  shadow_price_basis: about US$21 per infection averted (assumed willingness to pay, placed near the options' average
-    cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: timing
   area: outbreak response
@@ -714,8 +630,6 @@ questions:
   engine: toolkit.engines.compartmental.engine:CompartmentalEngine
   engine_mode: null
   template: data/world_model_trials/school_influenza_estimation
-  shadow_price: null
-  shadow_price_basis: 'estimation question: the vaccination day is secondary; paired tests are not the point'
   inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
   decision_type: estimation
   area: outbreak response
@@ -733,8 +647,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/amr_crp_delayed_prescribing
-  shadow_price: 0.5
-  shadow_price_basis: about 1 / US$2 per inappropriate prescription averted (assumed willingness to pay)
   inputs: 'synthetic: data/world_model_trials/amr_crp_delayed_prescribing/generate_units.py (seeded)'
   decision_type: allocation
   area: AMR stewardship
@@ -751,8 +663,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/amr_hospital_stewardship
-  shadow_price: 0.0002
-  shadow_price_basis: about 1 / US$5,000 per C. difficile infection averted (assumed)
   inputs: 'synthetic: data/world_model_trials/amr_hospital_stewardship/generate_units.py (seeded)'
   decision_type: allocation
   area: AMR stewardship
@@ -769,8 +679,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/ntd_schisto_mda_strategy
-  shadow_price: 0.2
-  shadow_price_basis: about 1 / US$5 per infection averted (assumed)
   inputs: 'synthetic: data/world_model_trials/ntd_schisto_mda_strategy/generate_units.py (seeded)'
   decision_type: allocation
   area: NTDs
@@ -787,8 +695,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/ntd_vl_irs_vs_acd
-  shadow_price: 0.002
-  shadow_price_basis: about 1 / US$500 per VL case averted (assumed)
   inputs: 'synthetic: data/world_model_trials/ntd_vl_irs_vs_acd/generate_units.py (seeded)'
   decision_type: allocation
   area: NTDs
@@ -806,8 +712,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/tb_tpt_3hp_vs_6h
-  shadow_price: 0.001
-  shadow_price_basis: about 1 / US$1,000 per TB case averted (assumed)
   inputs: 'synthetic: data/world_model_trials/tb_tpt_3hp_vs_6h/generate_units.py (seeded)'
   decision_type: allocation
   area: screening / TB prevention
@@ -824,8 +728,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/cervical_hpv_vs_via
-  shadow_price: 0.0001
-  shadow_price_basis: about 1 / US$10,000 per advanced cancer averted (assumed)
   inputs: 'synthetic: data/world_model_trials/cervical_hpv_vs_via/generate_units.py (seeded)'
   decision_type: allocation
   area: screening / cancer
@@ -843,8 +745,6 @@ questions:
   engine: toolkit.engines.empirical.engine:PackageRateEngine
   engine_mode: trial_priors
   template: data/world_model_trials/typhoid_tcv_age_targeting
-  shadow_price: 0.002
-  shadow_price_basis: about 1 / US$500 per typhoid case averted (assumed)
   inputs: 'synthetic: data/world_model_trials/typhoid_tcv_age_targeting/generate_units.py (seeded)'
   decision_type: targeting
   area: vaccines
@@ -861,8 +761,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/flu_school_closure_timing
-  shadow_price: 0.25
-  shadow_price_basis: about 1 / US$4 per infection averted (assumed)
   inputs: 'synthetic: data/world_model_trials/flu_school_closure_timing/generate_units.py (seeded)'
   decision_type: timing
   area: outbreak response
@@ -880,8 +778,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/ebola_ring_vaccination
-  shadow_price: 0.5
-  shadow_price_basis: about 1 / US$2 per infection averted (assumed)
   inputs: 'synthetic: data/world_model_trials/ebola_ring_vaccination/generate_units.py (seeded)'
   decision_type: estimation
   area: outbreak response
@@ -898,8 +794,6 @@ questions:
   engine: toolkit.engines.renewal.engine:RenewalEngine
   engine_mode: null
   template: data/world_model_trials/early_growth_doubling_time
-  shadow_price: null
-  shadow_price_basis: 'estimation question: no shadow price (paired tests untestable by design)'
   inputs: 'synthetic: data/world_model_trials/early_growth_doubling_time/generate_units.py (seeded)'
   decision_type: estimation
   area: outbreak response

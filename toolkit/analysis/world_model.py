@@ -9,6 +9,7 @@ throughout: absence of evidence, weak evidence or too few usable points is `inco
     python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml or a world_model.yaml> [--out DIR]
         [--hypotheses hypotheses.yaml] [--registry ledger.jsonl] [--engine-identity current|recorded]
         [--shadow-price LAMBDA] [--without-plan] [--anchor-ref <remote>/<branch>] [--circular FILE]
+        [--set-aside FILE]
     python3 toolkit/analysis/world_model.py --self-test
 
 Simulation beliefs are screened: every attempted direction (package x feature) and flip (pair x feature) of the
@@ -1039,7 +1040,8 @@ def _record(hist, seed_tr, n_imported=0):
     post-hoc ones apart. An imported entry this build did not re-derive is unverified: listed, never scored. Seed
     counters are reconciled, not used."""
     blank = lambda: {v: 0 for v in ("confirmed", "contradicted", "inconclusive", "untestable", "open")}  # noqa
-    pre, post, circ, seen, unid = blank(), blank(), blank(), set(), 0
+    pre, post, seen, unid = blank(), blank(), set(), 0
+    apart = {c: blank() for c in SET_ASIDE}
     now = {(e.get("test_sha"), e.get("evidence_sha")) for e in hist[n_imported:]}
     unverified = [{"hypothesis": e.get("hypothesis"), "test_sha": e.get("test_sha"),
                    "why": "not re-derived from this run's artifacts with the same test and evidence"}
@@ -1052,10 +1054,11 @@ def _record(hist, seed_tr, n_imported=0):
         if k in seen:
             continue
         seen.add(k)
-        bucket = post if e.get("post_hoc", True) else circ if e.get("circular") else pre
+        cls = (e.get("set_aside") or {}).get("class") or ("circular" if e.get("circular") else None)
+        bucket = post if e.get("post_hoc", True) else apart[cls] if cls in apart else pre
         bucket[NAMES.get(e["status"], e["status"])] += 1
     n = pre["confirmed"] + pre["contradicted"]
-    tr = dict(pre, post_hoc=post, circular=circ, share_confirmed=_r(pre["confirmed"] / n) if n else None, history=hist)
+    tr = dict(pre, post_hoc=post, **apart, share_confirmed=_r(pre["confirmed"] / n) if n else None, history=hist)
     if unverified:
         tr["unverified"] = unverified
     if unid:
@@ -1066,15 +1069,27 @@ def _record(hist, seed_tr, n_imported=0):
     return tr
 
 
+SET_ASIDE = ("circular", "prior_echo", "engine_blind")
+
+
 def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_time=None, registry=None,
-          circular=None):
+          circular=None, set_aside=None):
     """(world model, hypotheses): the validated seed (or the previous world model), the sweep's screened
     simulation beliefs, conflicts, every hypothesis checked, the confrontations identified and recorded, confidence
     moved only by new pre-registered ones, contradictions as open questions, and where to look next. `circular`:
     {hypothesis id: why its verdict is fixed by a spec input} (the caller's classification, e.g.
     scripts/world_model_trials.py circular_tests): those verdicts are reported (confrontation.circular), counted
-    apart in the track record (track_record.circular) and never move a belief's confidence."""
-    circ = {str(k): str(v) for k, v in (circular or {}).items()}
+    apart in the track record (track_record.circular) and never move a belief's confidence. `set_aside`: {hypothesis
+    id: {class, why}} with class circular, prior_echo (its claimed quantity is a declared engine prior, so its verdict
+    measures agreement with that prior, not skill) or engine_blind (a direction test on a feature the engine never
+    reads: untestable by this engine, its status set to untestable); each is reported (confrontation.set_aside),
+    counted apart (track_record.<class>) and never moves confidence."""
+    aside = {str(k): {"class": "circular", "why": str(v)} for k, v in (circular or {}).items()}
+    for k, v in (set_aside or {}).items():
+        if not (isinstance(v, dict) and v.get("class") in SET_ASIDE):
+            raise WorldModelError(f"set_aside {k}: {{class: one of {SET_ASIDE}, why}}")
+        aside[str(k)] = {"class": v["class"], "why": str(v.get("why") or "")}
+    circ = {k: v["why"] for k, v in aside.items() if v["class"] == "circular"}
     seed = validate_seed(_prior(seed, hypotheses))
     hyps = seed.get("hypotheses") or []
     pairs = [(h["test"]["a"], h["test"]["b"]) for h in hyps if h["test"]["kind"] in ("paired_sign", "flip_in")]
@@ -1110,8 +1125,14 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
                               "post_hoc": post, "repeat": again, "registration": e["line_sha"] if e else None,
                               "anchor": {"at": anchor[0], "source": anchor[1]} if anchor else None,
                               "registration_status": "post hoc" if post else "remote-anchored"}
-        if h["id"] in circ:          # its verdict is fixed by a spec input: reported, never a confirmation
-            h["confrontation"]["circular"] = circ[h["id"]]
+        if h["id"] in aside:         # set apart by the caller: reported, never a confirmation
+            if aside[h["id"]]["class"] == "engine_blind":
+                h["status"] = "untestable"
+                h["result"]["observed"] = dict(h["result"]["observed"] if isinstance(h["result"]["observed"], dict)
+                                               else {}, reason=aside[h["id"]]["why"])
+            h["confrontation"]["set_aside"] = dict(aside[h["id"]])
+            if h["id"] in circ:
+                h["confrontation"]["circular"] = circ[h["id"]]
         hist.append(dict({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]}, **h["confrontation"]))
         b = by[h["belief"]]
         if again:
@@ -1123,7 +1144,7 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
                                    "Either the world model misses a mechanism, or the source or the simulation is "
                                    "wrong: state the cause as a hypothesis and test it; never adjust inputs to agree."})
         marginal = h["result"]["test_applied"].get("scope") == "marginal"
-        if not post and h["id"] not in circ and h["status"] in NAMES and \
+        if not post and h["id"] not in aside and h["status"] in NAMES and \
                 not (marginal and h["status"] == "supported"):
             b.setdefault("contradicted_by" if h["status"] == "refuted" else "confirmed_by", []).append(h["id"])
     for b in seed["beliefs"]:
@@ -1588,6 +1609,7 @@ def _cli(argv):
     b.add_argument("--without-plan", action="store_true", help="build without analysis/point.yaml")
     b.add_argument("--anchor-ref", help="a fetched remote ref (origin/<branch>) whose commits anchor the ledger")
     b.add_argument("--circular", help="a JSON file {hypothesis id: why its verdict is fixed by a spec input}")
+    b.add_argument("--set-aside", help="a JSON file {hypothesis id: {class: circular|prior_echo|engine_blind, why}}")
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
@@ -1624,9 +1646,12 @@ def _cli(argv):
     anchors = cli_anchors(a.run_dir, reg_path, a.anchor_ref)
     if a.circular:
         inputs["circular"] = sha256(a.circular)
+    if a.set_aside:
+        inputs["set_aside"] = sha256(a.set_aside)
     wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time,
                    registry={"lines": jsonl(reg_path), "anchors": anchors},
-                   circular=json.load(open(a.circular)) if a.circular else None)
+                   circular=json.load(open(a.circular)) if a.circular else None,
+                   set_aside=json.load(open(a.set_aside)) if a.set_aside else None)
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
     for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)

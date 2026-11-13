@@ -134,9 +134,9 @@ def load_questions(path=QUESTIONS, root=REPO, engines=CHEAP_ENGINES) -> list[dic
             bad.append(f"{w}: question text")
         if q.get("engine") not in engines:
             bad.append(f"{w}: engine {q.get('engine')!r} is not one of {sorted(engines)}")
-        sp = q.get("shadow_price")
-        if sp is not None and not (isinstance(sp, (int, float)) and not isinstance(sp, bool) and sp > 0):
-            bad.append(f"{w}: shadow_price a positive number or null")
+        if "shadow_price" in q:
+            bad.append(f"{w}: shadow_price is not set in the questions file: the template pre-registers its willingness "
+                       f"to pay ({WTP_FILE}, against {WTP_TABLE})")
         tpl = os.path.realpath(os.path.join(root, str(q.get("template") or "")))
         spec = os.path.join(tpl, "decision_spec.yaml")
         if not q.get("template") or not os.path.isfile(spec) or not tpl.startswith(os.path.realpath(root) + os.sep):
@@ -148,9 +148,43 @@ def load_questions(path=QUESTIONS, root=REPO, engines=CHEAP_ENGINES) -> list[dic
             ref = None
         if ref != q.get("engine"):
             bad.append(f"{w}: the template's engine {ref!r} is not the question's {q.get('engine')!r}")
+        try:
+            shadow_price_of(q, root)
+        except TrialError as e:
+            bad.append(f"{w}: {e}")
     if bad:
         raise TrialError(f"{path}: " + "; ".join(bad))
     return qs
+
+
+WTP_TABLE = "data/world_model_trials/wtp.yaml"     # one published threshold per DALY and DALYs per outcome type
+WTP_FILE = "wtp.yaml"                              # in a template: {outcome_type}; none for an estimation question
+
+
+def shadow_price_of(q, root=REPO) -> dict:
+    """{value, basis}: the template's pre-registered willingness to pay as a shadow price (outcome per USD) = DALYs per
+    outcome of its outcome type / the threshold (USD per DALY), both from the question-independent table WTP_TABLE with
+    their sources. A template without wtp.yaml has none (paired tests are then untestable). Refused (TrialError): an
+    outcome type the table lacks, or a table without a positive threshold and a source."""
+    import yaml
+    p = os.path.join(root, str(q.get("template") or ""), WTP_FILE)
+    if not os.path.isfile(p):
+        return {"value": None, "basis": f"no {WTP_FILE} in the template: no willingness to pay (paired tests "
+                                        "untestable)"}
+    ot = (yaml.safe_load(open(p)) or {}).get("outcome_type")
+    try:
+        tab = yaml.safe_load(open(os.path.join(root, WTP_TABLE))) or {}
+    except OSError:
+        raise TrialError(f"{q.get('id')}: {WTP_TABLE} is missing")
+    th, row = tab.get("threshold") or {}, (tab.get("outcome_types") or {}).get(ot)
+    usd = th.get("usd_per_daly")
+    if not (isinstance(usd, (int, float)) and usd > 0 and str(th.get("source") or "").strip()):
+        raise TrialError(f"{WTP_TABLE}: threshold.usd_per_daly a positive number with its source")
+    if not (isinstance(row, dict) and isinstance(row.get("dalys"), (int, float)) and row["dalys"] > 0 and
+            str(row.get("source") or "").strip()):
+        raise TrialError(f"{q.get('id')}: outcome type {ot!r} is not in {WTP_TABLE} with its DALYs and source")
+    return {"value": float(row["dalys"]) / float(usd), "outcome_type": ot,
+            "basis": f"{row['dalys']} DALYs per {ot} ({row['source']}) / US${usd} per DALY ({th['source']})"}
 
 
 def select(qs, only=None, batch=None, limit=None) -> list[dict]:
@@ -463,17 +497,42 @@ def _own(name, comps) -> bool:
     return any(c in toks or name.endswith("_" + c) for c in comps)
 
 
-def circular_tests(run_dir, seed, q) -> dict:
-    """{hypothesis id: why} for tests whose verdict a spec input fixes, from the spec's inputs and the engine's own
-    sweep (world_model.load_sweep, canonical_test and the sweep's reduction, as the build reads them):
-      - a test of a package's effect against one of its own effect parameters (feature, region or adjustment);
-      - an effect band on a package whose relative reduction its own declared effect parameters explain alone
-        (R^2 >= CIRCULAR_R2 of a quadratic fit, linear below twice the quadratic's columns of points) and whose
-        range over the design (which spans the declared ranges) lies inside the band.
-    Applied in world_model build (--circular): reported, counted apart, never a confirmation, never moving confidence."""
+def engine_read_columns(spec) -> set:
+    """Units-table columns the engine reads: those bound to its unit attributes (decision_units.engine_attributes:
+    column or columns). A declared feature on any other column is something the engine never reads."""
+    out = set()
+    for b in ((spec["decision_units"].get("engine_attributes") or {}).values()):
+        if not isinstance(b, dict):
+            continue
+        if b.get("column"):
+            out.add(str(b["column"]))
+        cols = b.get("columns")
+        out |= {str(c) for c in (cols.values() if isinstance(cols, dict) else cols or [])}
+    return out
+
+
+def classify_tests(run_dir, seed, lam=None) -> dict:
+    """{hypothesis id: {class, why}} from the spec's inputs and the engine's own sweep (world_model.load_sweep,
+    canonical_test and the sweep's reduction, as the build reads them). Classes, applied in world_model build
+    (--set-aside): reported, counted apart, never a confirmation, never moving confidence.
+      circular      a test of a package's effect against one of its own effect parameters (its feature); or an effect
+                    band on a reduction that its own declared effect parameters explain alone (R^2 >= CIRCULAR_R2 of a
+                    quadratic fit, linear below twice the quadratic's columns of points) whose range over the design
+                    (which spans the declared ranges) lies inside the band: its verdict is fixed by a spec input
+      prior_echo    such a band whose range is not inside the band: its claimed quantity is a declared engine prior,
+                    so its verdict measures agreement with that prior, not skill
+      engine_blind  a direction test on a feature the engine never reads (a units-table column bound to no engine
+                    attribute, or a calibration axis the engine card does not list): untestable by this engine"""
     import numpy as np
     from toolkit.analysis import world_model as W
-    sw, _ = W.load_sweep(run_dir, "current", q.get("shadow_price"), use_plan=False)
+    sw, spec = W.load_sweep(run_dir, "current", lam, use_plan=False)
+    read = engine_read_columns(spec)
+    attr = spec["calibration"].get("attribute")
+    card_attrs = set(spec.engine().describe().to_dict().get("unit_attributes") or {})
+    from toolkit.analysis import features as FT
+    unread = {FT.name(f) for f in FT.declared(spec.raw) if isinstance(f, str) and f not in read}
+    if attr and attr not in card_attrs:
+        unread.add(f"{attr} (calibration scale)")
     by = {b["id"]: b for b in seed.get("beliefs") or []}
     out = {}
     for h in seed.get("hypotheses") or []:
@@ -483,10 +542,14 @@ def circular_tests(run_dir, seed, q) -> dict:
         pk = [t[x] for x in ("package", "a", "b") if t.get(x)]
         comps = {c for p in pk for c in sw.packages.get(p, [])}
         own = [f for f in sw.features if sw.kinds.get(f) == "parameter" and _own(f, comps)]
-        named = [t["feature"]] if t.get("feature") else []      # a test against it; adjusting for it or a region is not
-        hit = [n for n in named if n in own]
-        if hit:
-            out[h["id"]] = f"tests {pk}'s effect against its own effect parameter(s) {hit}"
+        if t.get("feature") in own:     # a test against it; adjusting for it or a region of it is not
+            out[h["id"]] = {"class": "circular",
+                            "why": f"tests {pk}'s effect against its own effect parameter {t['feature']}"}
+            continue
+        if t["kind"] == "effect_direction" and t.get("feature") in unread:
+            out[h["id"]] = {"class": "engine_blind",
+                            "why": f"the engine never reads {t['feature']} (bound to no engine attribute): untestable "
+                                   "by this engine"}
             continue
         if t["kind"] != "effect_band" or not own:
             continue
@@ -501,12 +564,21 @@ def circular_tests(run_dir, seed, q) -> dict:
         A = np.column_stack(quad if n >= 2 * len(quad) else cols)
         res = y - A @ np.linalg.lstsq(A, y, rcond=None)[0]
         r2 = 1.0 - float(res @ res) / float(((y - y.mean()) ** 2).sum()) if np.ptp(y) > 0 else 1.0
+        if r2 < CIRCULAR_R2:
+            continue
         lo, hi = float(y.min()), float(y.max())
-        if r2 >= CIRCULAR_R2 and t["band"][0] <= lo and hi <= t["band"][1]:
-            out[h["id"]] = (f"{t['package']}'s relative reduction is fixed by its declared effect parameter(s) {own} "
-                            f"(R^2 {r2:.4f}); its range over the design [{lo:.3g}, {hi:.3g}] lies inside the band "
-                            f"{t['band']}")
+        inside = t["band"][0] <= lo and hi <= t["band"][1]
+        out[h["id"]] = {"class": "circular" if inside else "prior_echo",
+                        "why": f"{t['package']}'s relative reduction is fixed by its declared effect parameter(s) {own} "
+                               f"(R^2 {r2:.4f}); its range over the design [{lo:.3g}, {hi:.3g}] "
+                               + (f"lies inside the band {t['band']}" if inside else
+                                  f"against the band {t['band']}: the verdict compares the seed with the prior")}
     return out
+
+
+def circular_tests(run_dir, seed, lam=None) -> dict:
+    """{hypothesis id: why} of the circular class of classify_tests."""
+    return {k: v["why"] for k, v in classify_tests(run_dir, seed, lam).items() if v["class"] == "circular"}
 
 
 def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
@@ -554,31 +626,98 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
 
 # ---------------------------------------------------------------- citation lookup (no LLM)
 S2_SEARCH = "https://api.semanticscholar.org/graph/v1/paper/search"
-_S2_LOCK, _S2_LAST = threading.Lock(), [0.0]
-TITLE_OVERLAP = 0.5           # share of the found title's words (4+ letters) that appear in the citation
-
-
+OPENALEX = "https://api.openalex.org/works"
 CROSSREF = "https://api.crossref.org/works"
+_S2_LOCK, _S2_LAST = threading.Lock(), [0.0]
+TITLE_OVERLAP = 0.5           # share of the found title's words (4+ letters) in the citation, for a named first author
+STRONG_OVERLAP = 0.8          # both ways, for an organisation or anonymous author (no surname to check)
+S2_BACKOFF = (2, 4, 8, 16)    # seconds between Semantic Scholar retries after a 429, then the next source answers
+ORG_RE = re.compile(r"\b(WHO|UNICEF|UNAIDS|CDC|ECDC|World Health Organi[sz]ation|Committee|Team|Partnership|Group|"
+                    r"Union|Organi[sz]ation|Ministry|Collaborat\w*|Consortium|Network|Initiative|Agency|Institute|"
+                    r"Council|Foundation|Programme|Program)\b")
+# not a reference to a published source: the engine, the question's own arithmetic, the run's data, an assumption
+NOT_CITATION_RE = re.compile(r"(engine card|\bcard\b|question'?s? arithmetic|\barithmetic\b|no external source|"
+                             r"\.csv\b|\bcolumn\b|decision_spec|task (input|description)|_task_input|\bharness\b|"
+                             r"\bsweep\b|\bassumption\b|my reading|own reasoning)", re.I)
 
 
 class RateLimited(OSError):
     """The lookup service refused for rate (HTTP 429) after its retries."""
 
 
-def crossref_lookup(query, pause_s=1.1, author=None) -> list[dict]:
-    """Works matching `query` from the Crossref public API (no key), in the Semantic Scholar shape."""
-    import urllib.parse
+def _throttle(pause_s):
+    wait = _S2_LAST[0] + pause_s - time.time()
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _get_json(url, opener=None):
     import urllib.request
-    first = author or (re.findall(r"[A-Za-z][A-Za-z'\-]+", query) or [""])[0]     # the first author
-    url = CROSSREF + "?" + urllib.parse.urlencode({"query.bibliographic": query[:300], "query.author": first, "rows": 10})
+    req = urllib.request.Request(url, headers={"User-Agent": "world-model-trials"})
+    with (opener or urllib.request.urlopen)(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def s2_lookup(query, hint=None, pause_s=1.1, opener=None, sleep=None) -> list[dict]:
+    """Papers matching `query` from the Semantic Scholar public search API (no key; one call at a time across threads,
+    at least `pause_s` apart). A 429 backs off exponentially (S2_BACKOFF), then RateLimited: the next source answers."""
+    import urllib.error
+    import urllib.parse
+    url = S2_SEARCH + "?" + urllib.parse.urlencode({"query": query[:300], "limit": 8,
+                                                    "fields": "title,year,authors,externalIds,venue"})
+    sleep = sleep or time.sleep
+    for k in range(len(S2_BACKOFF) + 1):
+        with _S2_LOCK:
+            _throttle(pause_s)
+            try:
+                return [dict(p, source="semantic_scholar") for p in _get_json(url, opener).get("data") or []]
+            except urllib.error.HTTPError as e:
+                if e.code != 429:
+                    raise OSError(f"Semantic Scholar: HTTP {e.code}")
+            finally:
+                _S2_LAST[0] = time.time()
+        if k < len(S2_BACKOFF):
+            sleep(S2_BACKOFF[k])
+    raise RateLimited("Semantic Scholar: rate limited after exponential backoff")
+
+
+def openalex_url(query, hint=None) -> str:
+    """The OpenAlex search URL: within one year of the cited year when known; its polite-pool `mailto` only from the
+    environment variable OPENALEX_MAILTO (never written to code or files; absent, the lookup works without it)."""
+    import urllib.parse
+    p = {"search": query[:300], "per-page": 8, "select": "id,display_name,publication_year,authorships,doi"}
+    y = (hint or {}).get("year")
+    if y:
+        p["filter"] = f"publication_year:{y - 1}-{y + 1}"
+    if os.environ.get("OPENALEX_MAILTO"):
+        p["mailto"] = os.environ["OPENALEX_MAILTO"]
+    return OPENALEX + "?" + urllib.parse.urlencode(p)
+
+
+def openalex_lookup(query, hint=None, pause_s=0.2) -> list[dict]:
+    """Works matching `query` from the OpenAlex public API (no key)."""
     with _S2_LOCK:
-        wait = _S2_LAST[0] + pause_s - time.time()
-        if wait > 0:
-            time.sleep(wait)
+        _throttle(pause_s)
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "world-model-trials"}),
-                                        timeout=30) as r:
-                items = (json.loads(r.read().decode("utf-8")).get("message") or {}).get("items") or []
+            res = _get_json(openalex_url(query, hint)).get("results") or []
+        finally:
+            _S2_LAST[0] = time.time()
+    return [{"paperId": it.get("id"), "title": it.get("display_name") or "", "year": it.get("publication_year"),
+             "source": "openalex",
+             "authors": [{"name": (a.get("author") or {}).get("display_name") or ""} for a in it.get("authorships") or []]}
+            for it in res]
+
+
+def crossref_lookup(query, hint=None, pause_s=1.1) -> list[dict]:
+    """Works matching `query` from the Crossref public API (no key); an organisation author keeps its name."""
+    import urllib.parse
+    p = {"query.bibliographic": query[:300], "rows": 10}
+    if (hint or {}).get("author"):
+        p["query.author"] = hint["author"]
+    with _S2_LOCK:
+        _throttle(pause_s)
+        try:
+            items = (_get_json(CROSSREF + "?" + urllib.parse.urlencode(p)).get("message") or {}).get("items") or []
         finally:
             _S2_LAST[0] = time.time()
     out = []
@@ -586,126 +725,182 @@ def crossref_lookup(query, pause_s=1.1, author=None) -> list[dict]:
         dp = ((it.get("issued") or {}).get("date-parts") or [[None]])[0]
         out.append({"paperId": f"doi:{it.get('DOI')}", "title": (it.get("title") or [""])[0],
                     "year": dp[0] if dp else None, "source": "crossref",
-                    "authors": [{"name": f"{a.get('given', '')} {a.get('family', '')}".strip()}
+                    "authors": [{"name": a.get("name") or f"{a.get('given', '')} {a.get('family', '')}".strip()}
                                 for a in it.get("author") or []]})
     return out
 
 
-class Lookup:
-    """Semantic Scholar first; when it refuses for rate, Crossref answers. After `breaker` refusals in a row, Semantic
-    Scholar is not called again by this lookup (the public endpoint shares one rate pool). `source` is the last one
-    used, and each found record carries its own."""
-
-    def __init__(self, primary=None, fallback=None, breaker=3):
-        self.primary, self.fallback = primary or s2_lookup, fallback or crossref_lookup
-        self.breaker, self.refusals, self.source = breaker, 0, "semantic_scholar"
-
-    def __call__(self, query, author=None):
-        if self.refusals < self.breaker:
-            try:
-                hits = self.primary(query)
-                self.refusals, self.source = 0, "semantic_scholar"
-                return [dict(h, source=h.get("source", "semantic_scholar")) for h in hits]
-            except RateLimited:
-                self.refusals += 1
-        self.source = "crossref"
-        return self.fallback(query) if author is None else self.fallback(query, author)
+def _norm(s):
+    """Lower case, accents and typographic quotes and dashes folded, hyphens inside words joined (pre-exposure ->
+    preexposure), other punctuation a space."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii") if s else ""
+    s = re.sub(r"[‘’`]", "'", s).lower()
+    s = re.sub(r"(?<=\w)[-‐‑](?=\w)", "", s)
+    return re.sub(r"[^a-z0-9' ]+", " ", s)
 
 
-def s2_lookup(query, pause_s=1.1, tries=3) -> list[dict]:
-    """Papers matching `query` from the Semantic Scholar public search API (no key; one call at a time across threads,
-    at least `pause_s` apart; a 429 backs off 2, 4 s, then RateLimited). Raises OSError when it cannot answer."""
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-    url = S2_SEARCH + "?" + urllib.parse.urlencode({"query": query[:300], "limit": 5,
-                                                    "fields": "title,year,authors,externalIds,venue"})
-    for k in range(tries):
-        with _S2_LOCK:
-            wait = _S2_LAST[0] + pause_s - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "world-model-trials"}),
-                                            timeout=30) as r:
-                    return json.loads(r.read().decode("utf-8")).get("data") or []
-            except urllib.error.HTTPError as e:
-                if e.code != 429 or k == tries - 1:
-                    raise (RateLimited if e.code == 429 else OSError)(f"Semantic Scholar: HTTP {e.code}")
-            finally:
-                _S2_LAST[0] = time.time()
-        time.sleep(2 ** (k + 1))
-    raise RateLimited("Semantic Scholar: rate limited")
+def _norm_u(s):
+    import unicodedata
+    s = re.sub(r"[‘’`]", "'", str(s or ""))
+    s = re.sub(r"[‐‑‒–—]", "-", s)
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
 
 
 def _words(s):
-    return {w for w in re.findall(r"[a-z]{4,}", str(s).lower())}
+    return {w for w in re.findall(r"[a-z]{4,}", _norm(_norm_u(s)))}
 
 
-def citation_match(citation, paper) -> bool:
-    """A found paper matches a citation when its year is the cited year (or one off: online versus print), its
-    first author's surname is the citation's first word, and most of its title's words are in the citation."""
-    yrs = [int(m.group(0)) for m in re.finditer(r"\b(19|20)\d\d\b", citation)]
-    first = (re.findall(r"[A-Za-z][A-Za-z'\-]+", citation) or [""])[0].lower()
-    authors = paper.get("authors") or []
-    a0 = str((authors[0] if authors else {}).get("name") or "").lower()
-    tw = _words(paper.get("title"))
-    return bool(yrs and paper.get("year") and any(abs(int(paper["year"]) - y) <= 1 for y in yrs) and first and
-                first in re.findall(r"[a-z'\-]+", a0) and tw and len(tw & _words(citation)) / len(tw) >= TITLE_OVERLAP)
-
-
-_LOOKUP = []
+def _sentences(c):
+    return [p.strip() for p in re.split(r"\.\s+", _norm_u(c)) if p.strip()]
 
 
 def _title_guess(c):
     """The title part of an author-title-venue citation: the longest sentence between full stops (None if short)."""
-    parts = [p.strip() for p in re.split(r"\.\s+", c) if p.strip()]
+    parts = _sentences(c)
     best = max(parts, key=lambda p: len(_words(p)), default="")
-    return best if len(_words(best)) >= 3 and best != c else None
+    return best if len(_words(best)) >= 3 and best != _norm_u(c) else None
+
+
+def _author_part(c):
+    """(kind, surname): 'person' with the first author's surname when the citation opens with "Surname XX" or "et
+    al"; 'organisation' when its first sentence names an organisation; else 'anonymous' (it opens with its title)."""
+    first = (_sentences(c) or [""])[0]
+    m = re.match(r"^((?:[a-z]+['’]?[a-z]*\s)?[A-Z][A-Za-z'’\-]+(?:[\s-][A-Z][A-Za-z'’\-]+)?)\s+[A-Z]{1,3}\b",
+                 first)
+    if m or re.search(r"\bet al\b", first):
+        name = m.group(1) if m else first.split()[0]
+        return "person", _norm(name.split()[-1] if " " in name and not re.match(r"^[a-z]", name) else name).replace(" ",
+                                                                                                                    "")
+    if ORG_RE.search(first):
+        return "organisation", None
+    return "anonymous", None
+
+
+def citation_class(c):
+    """'not_a_citation' for a source that is not a reference to a published work (the engine card, the question's own
+    arithmetic, a data column of the run, an assumption), else None."""
+    return "not_a_citation" if NOT_CITATION_RE.search(str(c or "")) else None
+
+
+def citation_match(citation, paper) -> bool:
+    """A found paper matches a citation when its year is within one of a cited year (online versus print) and its title
+    matches the citation's (case, punctuation, accents, hyphens and a subtitle after a colon folded): for a named first
+    author, most of the found title's words are in the citation and the first author's surname is the citation's; for
+    an organisation or an anonymous note there is no surname to check, so the titles must match closely both ways."""
+    yrs = [int(m.group(0)) for m in re.finditer(r"\b(19|20)\d\d\b", citation)]
+    py = paper.get("year")
+    if not (yrs and py and any(abs(int(py) - y) <= 1 for y in yrs)):
+        return False
+    title = _norm_u(paper.get("title"))
+    tw, cw = _words(title), _words(citation)
+    main = _words(re.split(r"\s[-:]\s|:\s", title)[0]) or tw
+    if not tw:
+        return False
+    fwd = max(len(tw & cw) / len(tw), len(main & cw) / len(main))
+    kind, surname = _author_part(citation)
+    if kind == "person":
+        authors = paper.get("authors") or []
+        a0 = _norm(_norm_u((authors[0] if authors else {}).get("name"))).replace(" ", "")
+        return bool(surname) and surname in a0 and fwd >= TITLE_OVERLAP
+    # no surname to check: the whole found title (its subtitle too: a paper about a guideline is not the guideline)
+    ct = _words(_title_guess(citation) or (_sentences(citation) or [""])[0])
+    back = len(ct & tw) / len(ct) if ct else 0.0
+    return len(tw & cw) / len(tw) >= STRONG_OVERLAP and back >= STRONG_OVERLAP
+
+
+class Lookup:
+    """Sources in order (default: OpenAlex, then Semantic Scholar with exponential backoff on a 429, then Crossref),
+    each asked with the citation and then its title alone, until one returns a matching paper. A source that fails is
+    skipped for that citation; after `breaker` rate refusals in a row Semantic Scholar is skipped, and asked again every
+    `reprobe` lookups (its public endpoint shares one rate pool)."""
+
+    def __init__(self, sources=None, breaker=3, reprobe=25, pause_s=1.1):
+        self.sources = sources or [("openalex", lambda q, h=None: openalex_lookup(q, h)),
+                                   ("semantic_scholar", lambda q, h=None: s2_lookup(q, h, pause_s)),
+                                   ("crossref", lambda q, h=None: crossref_lookup(q, h, pause_s))]
+        self.breaker, self.reprobe, self.refusals, self.n = breaker, reprobe, 0, 0
+
+    def find(self, citation):
+        """(matching paper or None, sources tried); OSError when every source failed."""
+        self.n += 1
+        yrs = [int(m.group(0)) for m in re.finditer(r"\b(19|20)\d\d\b", citation)]
+        kind, surname = _author_part(citation)
+        hint = {"year": yrs[0] if yrs else None, "author": surname if kind == "person" else None}
+        tried, errors = [], 0
+        for name, fn in self.sources:
+            if name == "semantic_scholar" and self.refusals >= self.breaker and self.n % self.reprobe:
+                continue
+            tried.append(name)
+            try:
+                for q in dict.fromkeys(x for x in (citation, _title_guess(citation)) if x):
+                    m = next((p for p in fn(q, hint) if citation_match(citation, p)), None)
+                    if m:
+                        if name == "semantic_scholar":
+                            self.refusals = 0
+                        return dict(m, source=m.get("source") or name), tried
+                if name == "semantic_scholar":
+                    self.refusals = 0
+            except RateLimited:
+                errors += 1
+                if name == "semantic_scholar":
+                    self.refusals += 1
+            except (OSError, ValueError):
+                errors += 1
+        if errors == len(tried):
+            raise OSError(f"every citation source failed ({tried})")
+        return None, tried
+
+
+_LOOKUP = []
 
 
 def _default_lookup(pause_s):
     """One Lookup per process, shared by the questions' threads, so the circuit breaker holds across questions."""
     with _S2_LOCK:
         if not _LOOKUP:
-            _LOOKUP.append(Lookup(lambda q: s2_lookup(q, pause_s), lambda q, a=None: crossref_lookup(q, pause_s, a)))
+            _LOOKUP.append(Lookup(pause_s=pause_s))
         return _LOOKUP[0]
 
 
 def verify_citations(seed, lookup=None, pause_s=1.1) -> tuple[dict, list[dict]]:
-    """(seed, records): every literature citation looked up (s2_lookup unless `lookup` is given); a belief with a
-    citation not found is set to confidence low, keeping the claimed confidence in citation_check. A lookup that
-    fails is recorded as lookup_failed and changes nothing. Data beliefs are not looked up."""
+    """(seed, records): every literature citation classified and looked up (the default Lookup unless `lookup`, a Lookup
+    or a function query -> papers, is given). Owner rule (2026-11-13): until matching is validated, not found is a flag
+    and changes nothing; a citation that is not a reference to a published work lowers its belief to low; a failed
+    lookup changes nothing. The claimed confidence is kept in citation_check. Data beliefs are not looked up."""
     import copy
     out, recs = copy.deepcopy(seed), []
     look = lookup or _default_lookup(pause_s)
     for b in out.get("beliefs") or []:
         if b.get("source_type") != "literature":
             continue
+        claimed = (b.get("citation_check") or {}).get("confidence_claimed") or b["confidence"]
         rows = []
         for e in b.get("evidence") or []:
             c = str(e.get("citation") or "")
-            first = (re.findall(r"[A-Za-z][A-Za-z'\-]+", c) or [""])[0]      # the first author, as citation_match reads it
+            r = {"belief": b["id"], "citation": c[:300]}
+            if citation_class(c):
+                rows.append(dict(r, status=citation_class(c)))
+                continue
             try:
-                m = None
-                for qq in dict.fromkeys(x for x in (c, _title_guess(c)) if x):    # the citation, then its title alone
-                    hits = look(qq, first) if isinstance(look, Lookup) else look(qq)
-                    m = next((p for p in hits if citation_match(c, p)), None)
-                    if m:
-                        break
-                r = {"belief": b["id"], "citation": c[:300], "status": "found" if m else "not_found",
-                     "paper_id": (m or {}).get("paperId"), "title": (m or {}).get("title"),
-                     "year": (m or {}).get("year"), "source": (m or {}).get("source")}
+                if isinstance(look, Lookup):
+                    m, tried = look.find(c)
+                else:
+                    m, tried = None, ["injected"]
+                    for q in dict.fromkeys(x for x in (c, _title_guess(c)) if x):
+                        m = next((p for p in look(q) if citation_match(c, p)), None)
+                        if m:
+                            break
+                r.update(status="found" if m else "not_found", paper_id=(m or {}).get("paperId"),
+                         title=(m or {}).get("title"), year=(m or {}).get("year"), source=(m or {}).get("source"),
+                         sources_tried=tried)
             except (OSError, ValueError) as ex:
-                r = {"belief": b["id"], "citation": c[:300], "status": "lookup_failed", "error": str(ex)[:200]}
+                r.update(status="lookup_failed", error=str(ex)[:200])
             rows.append(r)
         recs += rows
-        miss = [r["citation"] for r in rows if r["status"] == "not_found"]
-        b["citation_check"] = {"confidence_claimed": b["confidence"],
-                               "found": sum(r["status"] == "found" for r in rows), "not_found": len(miss),
-                               "lookup_failed": sum(r["status"] == "lookup_failed" for r in rows)}
-        if miss:
-            b["confidence"] = "low"
+        n = {k: sum(r["status"] == k for r in rows) for k in ("found", "not_found", "not_a_citation", "lookup_failed")}
+        b["citation_check"] = dict(n, confidence_claimed=claimed)
+        b["confidence"] = "low" if n["not_a_citation"] else claimed
     return out, recs
 
 
@@ -719,9 +914,10 @@ def citation_step(run_dir, lookup=None) -> dict:
     W.validate(out)
     _sio().write_nofollow(run_dir, SEED, yaml.safe_dump(out, sort_keys=False, width=110).encode(), atomic=True)
     _sio().write_nofollow(run_dir, "analysis/citations.json", json.dumps(
-        {"source": S2_SEARCH if lookup is None else "injected lookup", "at": _now(), "records": recs},
+        {"sources": "OpenAlex, Semantic Scholar, Crossref" if lookup is None else "injected lookup", "at": _now(),
+         "rule": "not found is a flag only; not a citation lowers confidence to low", "records": recs},
         indent=1).encode(), atomic=True)
-    return {k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "lookup_failed")}
+    return {k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "not_a_citation", "lookup_failed")}
 
 
 def register_step(run_dir) -> dict:
@@ -768,11 +964,14 @@ def build_step(q, run_dir, anchor_ref=None) -> dict:
     import yaml
     from toolkit.analysis import world_model as W
     seed = yaml.safe_load(open(os.path.join(run_dir, SEED)))
-    circ = circular_tests(run_dir, seed, q)
+    aside = classify_tests(run_dir, seed, q.get("shadow_price"))
+    circ = {k: v["why"] for k, v in aside.items() if v["class"] == "circular"}
     _sio().write_nofollow(run_dir, "analysis/circular.json", json.dumps(circ, indent=1, sort_keys=True).encode(),
                           atomic=True)
+    _sio().write_nofollow(run_dir, "analysis/set_aside.json", json.dumps(aside, indent=1, sort_keys=True).encode(),
+                          atomic=True)
     argv = ["build", run_dir, "--seed", os.path.join(run_dir, SEED), "--without-plan",
-            "--circular", os.path.join(run_dir, "analysis", "circular.json")]
+            "--set-aside", os.path.join(run_dir, "analysis", "set_aside.json")]
     if q.get("shadow_price") is not None:
         argv += ["--shadow-price", repr(float(q["shadow_price"]))]
     if anchor_ref:
@@ -784,7 +983,8 @@ def build_step(q, run_dir, anchor_ref=None) -> dict:
     st = {}
     for h in hy["hypotheses"]:
         st[h["status"]] = st.get(h["status"], 0) + 1
-    return {"statuses": st, "circular": sorted(circ), "note": buf.getvalue().strip()}
+    return {"statuses": st, "circular": sorted(circ), "set_aside": {k: v["class"] for k, v in sorted(aside.items())},
+            "note": buf.getvalue().strip()}
 
 
 def _wait_past(at):
@@ -827,6 +1027,8 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
             return record(q["id"], dict(t, skipped=True))
         t = dict(t, id=q["id"], engine_ref=q["engine"], rerun_of=q.get("rerun_of"),
                  steps=dict(t.get("steps") or {}), status="running")
+        t["shadow_price"] = shadow_price_of(q, root)
+        q = dict(q, shadow_price=t["shadow_price"]["value"])
         try:
             if "prepare" not in t["steps"]:
                 t["context"] = prepare(q, rd, root, max_engine_runs)
@@ -915,8 +1117,17 @@ SCORING = {"lenient_width": 0.6, "lenient_share": 0.6, "lenient_equivalence": 0.
 YEAR_RE = re.compile(r"\b(19|20)\d\d\b")
 LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix|abstract|results|methods|"
                     r"discussion|introduction|main text|summary of findings|eq\.|equation)", re.I)
-MODES = ("circular", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
+MODES = ("circular", "prior_echo", "engine_blind", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
          "inert_feature", "high_confidence_refuted", "contradiction_without_open_question", "citation_not_verifiable")
+
+
+ASIDE = ("circular", "prior_echo", "engine_blind")
+
+
+def _aside(h):
+    """The set-aside class of a checked hypothesis (circular, prior_echo, engine_blind), or None."""
+    c = h.get("confrontation") or {}
+    return (c.get("set_aside") or {}).get("class") or ("circular" if c.get("circular") else None)
 
 
 def failure_modes(hyps, seed, wm, ctx=None) -> dict:
@@ -928,10 +1139,11 @@ def failure_modes(hyps, seed, wm, ctx=None) -> dict:
     for h in hyps:
         t, st, obs = h.get("test") or {}, h.get("status"), (h.get("result") or {}).get("observed") or {}
         b = by.get(h.get("belief")) or {}
-        if st == "untestable":
+        if st == "untestable" and cls != "engine_blind":
             out["untestable"].append(h["id"])
-        if (h.get("confrontation") or {}).get("circular"):
-            out["circular"].append(h["id"])
+        cls = _aside(h)
+        if cls:
+            out[cls].append(h["id"])
         if (h.get("confrontation") or {}).get("post_hoc"):
             out["post_hoc"].append(h["id"])
         if isinstance(obs, dict) and obs.get("marginal_only"):
@@ -998,7 +1210,7 @@ def score_question(run_dir) -> dict:
     by = {b["id"]: b for b in seed["beliefs"]}
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     for h in hs:
-        if (h.get("confrontation") or {}).get("post_hoc") or (h.get("confrontation") or {}).get("circular"):
+        if (h.get("confrontation") or {}).get("post_hoc") or _aside(h):
             continue
         c = by[h["belief"]]["confidence"]
         conf[c][h["status"] if h["status"] in ("supported", "refuted") else "other"] += 1
@@ -1013,7 +1225,7 @@ def score_question(run_dir) -> dict:
     wl = (wm.get("where_to_look") or [None])[0]
     wb = {b["id"]: b for b in wm["beliefs"]}.get((wl or {}).get("belief")) or {}
     out.update(hypotheses={"written": len(hs), "testable": sum(h["status"] != "untestable" for h in hs),
-                           "by_status": st, "circular": sum(bool((h.get("confrontation") or {}).get("circular")) for h in hs),
+                           "by_status": st, **{c: sum(_aside(h) == c for h in hs) for c in ASIDE},
                            "post_hoc": sum(bool((h.get("confrontation") or {}).get("post_hoc"))
                                                             for h in hs)},
                confidence=conf, contradictions=contra, conflicts=conflicts,
@@ -1039,7 +1251,7 @@ def score(trials_root) -> dict:
         spend = L.by_question()
         for i, q in Q.items():
             q["spend_usd"] = spend.get(i, {"llm_usd": 0.0, "compute_usd": 0.0})
-    tot = {"written": 0, "testable": 0, "circular": 0, "post_hoc": 0, "by_status": {}}
+    tot = dict({"written": 0, "testable": 0, "post_hoc": 0, "by_status": {}}, **{c: 0 for c in ASIDE})
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     fm, wtl = {}, {"decision_relevant": 0, "questions": 0}
     cit = {"found": 0, "not_found": 0, "lookup_failed": 0, "questions_checked": 0}
@@ -1051,7 +1263,7 @@ def score(trials_root) -> dict:
         h = q.get("hypotheses")
         if not h:
             continue
-        for k in ("written", "testable", "circular", "post_hoc"):
+        for k in ("written", "testable", "post_hoc") + ASIDE:
             tot[k] += h[k]
         for s, n in h["by_status"].items():
             tot["by_status"][s] = tot["by_status"].get(s, 0) + n
@@ -1151,6 +1363,7 @@ def check_templates(qs, out_root, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> di
     for q in qs:
         rd = os.path.join(out_root, f"{q['id']}-{stamp}")          # a fresh directory per check: nothing is removed
         try:
+            q = dict(q, shadow_price=shadow_price_of(q, REPO)["value"])
             ctx = prepare(q, rd, REPO, max_engine_runs)
             e = engine_step(q, rd, max_engine_runs)
             sw, _ = W.load_sweep(rd, "current", q.get("shadow_price"), use_plan=False)
@@ -1162,7 +1375,7 @@ def check_templates(qs, out_root, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> di
     return out
 
 
-def rebuild(trials_root, qs, anchor_ref=None) -> dict:
+def rebuild(trials_root, qs, anchor_ref=None, recheck_citations=False, lookup=None, root=None) -> dict:
     """The circular classification and the build again for each completed question (after a scoring or flag fix): no
     LLM call, no engine run, no new registration. The batch, the ledger and its anchor are as they were, so verdicts
     and registration status are re-derived, not changed. A question that is not complete is skipped."""
@@ -1174,7 +1387,13 @@ def rebuild(trials_root, qs, anchor_ref=None) -> dict:
             out[q["id"]] = {"status": "skipped", "why": f"status {t.get('status', 'not started')}"}
             continue
         try:
-            t["build"] = build_step(q, rd, anchor_ref if t.get("anchor") else None)
+            if recheck_citations and "citations" in t["steps"]:
+                t["citations"] = citation_step(rd, lookup)
+                t["steps"]["citations_rechecked"] = _now()
+            lam = shadow_price_of(q, REPO if root is None else root) if q.get("template") else \
+                (t.get("shadow_price") or {"value": None, "basis": "not recorded"})
+            t["shadow_price"] = lam
+            t["build"] = build_step(dict(q, shadow_price=lam["value"]), rd, anchor_ref if t.get("anchor") else None)
             t["steps"]["rebuild"] = _now()
             out[q["id"]] = {"status": "rebuilt", "statuses": t["build"]["statuses"], "circular": t["build"]["circular"]}
         except Exception as e:  # noqa: BLE001
@@ -1837,9 +2056,9 @@ def _self_test() -> int:
         ok(st == {"B1": "found", "B2": "not_found", "B3": "lookup_failed"} and
            [r["paper_id"] for r in rec if r["belief"] == "B1"] == ["abc123"],
            f"WT15 each literature citation is looked up (title, first author and year must match): {st}")
-        ok(conf == {"B1": "high", "B2": "low", "B3": "medium", "B4": "medium"} and
+        ok(conf == {"B1": "high", "B2": "medium", "B3": "medium", "B4": "medium"} and
            out["beliefs"][1]["citation_check"]["confidence_claimed"] == "medium",
-           f"WT15b a citation not found downgrades its belief to low (the claim is kept); a failed lookup is recorded "
+           f"WT15b (owner rule 2026-11-13) a citation not found is a flag and keeps its belief's confidence; a failed lookup is recorded "
            f"and changes nothing; data beliefs are not looked up: {conf}")
         wrong = [{"paperId": "x", "title": "A trial of things in places", "year": 2011,
                   "authors": [{"name": "Jane Doe"}]}]
@@ -1859,24 +2078,6 @@ def _self_test() -> int:
                f"and the summary counts it: {S['questions']['toy0'].get('citations')}")
     tryit("WT15 citations", wt15)
 
-    def wt15e():
-        calls_ = {"s2": 0, "cr": 0}
-
-        def s2(q):
-            calls_["s2"] += 1
-            raise RateLimited("429")
-
-        def cr(q):
-            calls_["cr"] += 1
-            return [{"paperId": "doi:10.1/x", "title": "A trial of things in places", "year": 2019,
-                     "authors": [{"name": "Jane Doe"}], "source": "crossref"}]
-        look = Lookup(s2, cr, breaker=2)
-        c = "Doe J et al. A trial of things in places. Lancet 2019"
-        hits = [look(c) for _ in range(4)]
-        ok(all(citation_match(c, h[0]) for h in hits) and calls_ == {"s2": 2, "cr": 4} and look.source == "crossref",
-           f"WT15e when Semantic Scholar rate-limits, Crossref answers, and after {2} refusals in a row Semantic "
-           f"Scholar is not called again in this run: {calls_}, source {look.source}")
-    tryit("WT15e citation fallback", wt15e)
 
     def wt16():
         from agents.v2_sdk_tasks import seed_prompt_text
@@ -1942,6 +2143,24 @@ def _self_test() -> int:
                                          f"way: {sleeps}")
     tryit("WT17 citations, round 3", wt17)
 
+    def wt17g():
+        names = [n for n, _ in Lookup().sources]
+        old = os.environ.pop("OPENALEX_MAILTO", None)
+        try:
+            u0 = openalex_url("a title", {"year": 2020})
+            os.environ["OPENALEX_MAILTO"] = "someone@example.org"
+            u1 = openalex_url("a title", {"year": 2020})
+        finally:
+            os.environ.pop("OPENALEX_MAILTO", None)
+            if old is not None:
+                os.environ["OPENALEX_MAILTO"] = old
+        ok(names == ["openalex", "semantic_scholar", "crossref"] and "mailto" not in u0
+           and "mailto=someone%40example.org" in u1,
+           f"WT17g OpenAlex first, then Semantic Scholar, then Crossref; OpenAlex's polite-pool mailto comes only from "
+           f"OPENALEX_MAILTO in the environment (no address in code or files), and the lookup works without it: "
+           f"{names}")
+    tryit("WT17g lookup order and mailto", wt17g)
+
     def wt18():
         with tempfile.TemporaryDirectory() as d:
             repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
@@ -1949,10 +2168,10 @@ def _self_test() -> int:
             ok(t["shadow_price"]["value"] == 0.1 and "toy threshold" in t["shadow_price"]["basis"],
                f"WT18 the shadow price is the template's pre-registered willingness to pay (DALYs per outcome over the "
                f"published threshold), recorded with its basis: {t['shadow_price']}")
-            _toy_template(os.path.join(d, "nowtp"), wtp=False)
-            lam = shadow_price_of({"template": "nowtp"}, d)
+            _toy_template(os.path.join(repo, "nowtp"), wtp=False)
+            lam = shadow_price_of({"template": "nowtp"}, repo)
             ok(lam["value"] is None, f"WT18b a template without a willingness to pay has no shadow price: {lam}")
-            with open(os.path.join(d, "nowtp", "wtp.yaml"), "w") as f:
+            with open(os.path.join(repo, "nowtp", "wtp.yaml"), "w") as f:
                 yaml.safe_dump({"outcome_type": "unknown_outcome"}, f)
             try:
                 shadow_price_of({"template": "nowtp"}, repo)
@@ -1973,13 +2192,17 @@ def _self_test() -> int:
                                   "about": {"package": "a", "feature": "cov"}, "direction": "negligible",
                                   "source_type": "literature", "confidence": "low",
                                   "evidence": [{"citation": "Toy (2020) J Toy 1:1", "location": "Table 1"}]})
+            sd["beliefs"].append({"id": "B8", "mechanism": "a's effect rises with x",
+                                  "about": {"package": "a", "feature": "x (calibration scale)"}, "direction": "increases",
+                                  "source_type": "literature", "confidence": "low",
+                                  "evidence": [{"citation": "Toy (2020) J Toy 1:1", "location": "Table 1"}]})
             sd["hypotheses"] = [h for h in sd["hypotheses"] if h["id"] in ("H1", "H4")] + [
                 {"id": "E1", "belief": "B1", "claim": "a reduces by 70-90%",
                  "test": {"kind": "effect_band", "package": "a", "band": [0.7, 0.9], "min_share": 0.7}},
                 {"id": "E2", "belief": "B7", "claim": "cov does not change a's effect",
                  "test": {"kind": "effect_direction", "package": "a", "feature": "cov", "direction": "negligible",
                           "equivalence": 0.2}},
-                {"id": "E3", "belief": "B3", "claim": "a's effect rises with x",
+                {"id": "E3", "belief": "B8", "claim": "a's effect rises with x",
                  "test": {"kind": "effect_direction", "package": "a", "feature": "x (calibration scale)",
                           "direction": "increases", "scope": "marginal"}}]
 
@@ -1994,6 +2217,8 @@ def _self_test() -> int:
                              anchor=GitAnchor(repo, os.path.join(troot, ".wm-trials")), engines={toy_ref},
                              citation_lookup=lambda q: [])
             rd = os.path.join(troot, "runs", "toy0")
+            if res["toy0"]["status"] != "complete":
+                print("WT19 run:", res["toy0"].get("status"), res["toy0"].get("error"), res["toy0"].get("seed"))
             hy = {h["id"]: h for h in yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))["hypotheses"]}
             cls = {k: (h["confrontation"].get("set_aside") or {}).get("class") for k, h in hy.items()}
             ok(res["toy0"]["status"] == "complete" and cls == {"H1": "circular", "H4": None, "E1": "prior_echo",
