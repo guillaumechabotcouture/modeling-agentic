@@ -1561,7 +1561,11 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
+    only = os.environ.get("WMT_SELF_TEST_ONLY")       # one case locally (owner, 2026-11-13: CI runs the suite)
+
     def tryit(name, fn):
+        if only and not name.startswith(only):
+            return
         try:
             fn()
         except Exception as e:  # noqa: BLE001 -- the failure is the finding
@@ -2259,6 +2263,67 @@ def _self_test() -> int:
                f"WT20 a rebuild under the new rule restores the claimed confidence of a belief whose citation was not "
                f"found, keeping the flag: {b['confidence']}, {b['citation_check']}")
     tryit("WT20 recheck citations", wt20)
+
+    # Owner, 2026-11-13: no engine compute on the laptop. The engine step runs in a VM job (cloud/vm_job.py) on the
+    # questions' prepared run directories; the laptop seeds, registers and anchors first, then imports and builds.
+    def wt21():
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            for i in range(2):
+                _toy_template(os.path.join(repo, "data", "tpl", f"toy{i}"))
+            qs = [{"id": f"toy{i}", "question": "Which package per unit?", "engine": toy_ref,
+                   "template": f"data/tpl/toy{i}", "inputs": "synthetic"} for i in range(2)]
+
+            def seed_fn(run_dir, ctx, feedback, cap_usd):
+                from agents.v2_tasks import TaskResult
+                with open(os.path.join(run_dir, "world_model_seed.yaml"), "w") as f:
+                    yaml.safe_dump(_toy_seed(), f, sort_keys=False)
+                return TaskResult(True, {"ok": True}, 0.25, "stub")
+            troot = os.path.join(repo, "trials")
+            L = SpendLedger(os.path.join(troot, "spend.jsonl"), 20.0)
+            A = GitAnchor(repo, os.path.join(troot, ".wm-trials"))
+            probe = []
+            res = run_trials(qs, troot, repo=repo, seed_fn=seed_fn, ledger=L, anchor=A, engines={toy_ref},
+                             citation_lookup=lambda q: [], engine="remote", engine_probe=probe.append)
+            rd = os.path.join(troot, "runs", "toy0")
+            ok(all(r["status"] == "awaiting_engine" for r in res.values()) and not probe
+               and not os.path.exists(os.path.join(rd, "analysis", "batch", "results.jsonl")),
+               f"WT21 with the engine remote the laptop seeds, registers and anchors, and runs no engine: "
+               f"{ {k: r['status'] for k, r in res.items()} }")
+            cmds = vm_commands(qs, per_job=1, cap_usd=3.0, prefix="wmt-b3-", store="outputs/wmt-b3")
+            ok(len(cmds) == 2 and all(c["name"].startswith("wmt-b3-") and "--cap-usd 3.0" in c["command"] and
+                                      "engine-only" in c["command"] and "$JOB_OUT" in c["command"] for c in cmds)
+               and sorted(i for c in cmds for i in c["ids"]) == ["toy0", "toy1"],
+               f"WT21b the VM jobs: prefix, a USD cap, the engine-only step into $JOB_OUT, each question once: "
+               f"{[c['name'] for c in cmds]}")
+            vm = os.path.join(d, "vm_out")                       # what the VM job writes (run here on the toy engine)
+            out = engine_only(qs, vm, root=repo)
+            ok(all(v["ok"] for v in out.values()), f"WT21c the VM's engine-only step: {out}")
+            res2 = import_engine(troot, vm, qs, usd_total=0.5, source="coiled:wmt-b3-1/j1", ledger=L, repo=repo,
+                                 anchor_ref=A.ref)
+            hy = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
+            comp = [json.loads(x) for x in open(os.path.join(troot, "spend.jsonl")) if '"compute"' in x]
+            ok(all(r["status"] == "complete" for r in res2.values())
+               and all(h["confrontation"]["registration_status"] == "remote-anchored" for h in hy["hypotheses"])
+               and sorted((e["question"], e["usd"], e["source"]) for e in comp) ==
+               [("toy0", 0.25, "coiled:wmt-b3-1/j1"), ("toy1", 0.25, "coiled:wmt-b3-1/j1")],
+               f"WT21d imported results are built (anchored before the VM's evidence) and the job's real USD is in the "
+               f"spend ledger, split over its questions: {[(e['question'], e['usd']) for e in comp]}")
+            bad = os.path.join(vm, "runs", "toy1", "analysis", "batch", "design.json")
+            dd = json.load(open(bad))
+            dd["points"] = dd["points"][:-1]
+            with open(bad, "w") as f:
+                json.dump(dd, f)
+            t1 = json.load(open(os.path.join(troot, "runs", "toy1", TRIAL)))
+            t1.update(status="awaiting_engine")
+            t1["steps"].pop("engine", None)
+            with open(os.path.join(troot, "runs", "toy1", TRIAL), "w") as f:
+                json.dump(t1, f)
+            res3 = import_engine(troot, vm, qs[1:], usd_total=0.0, source="x", ledger=L, repo=repo, anchor_ref=A.ref)
+            ok(res3["toy1"]["status"] == "failed" and "design" in res3["toy1"]["error"],
+               f"WT21e an imported batch whose design is not the one the question was prepared with is refused: "
+               f"{res3['toy1']}")
+    tryit("WT21 remote engine", wt21)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
