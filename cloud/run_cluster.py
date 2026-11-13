@@ -410,7 +410,9 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
     SIGN after the cluster is paid for (2026-11-12 canary). Fail closed: a missing or unparsable sheet is a
     problem. A run past SIGN, a launch that resumes no run, or a v1 launch (no run_state.json, no sheet) has
     nothing to check here. `--resume <dir>` and `--resume=<dir>` are both read, the dir normalised as main.py
-    resolves it (Codex review of #207)."""
+    resolves it (Codex review of #207). F6 evidence dossier: when the spec names one (`evidence.dossier`), the sheet
+    must record the shipped dossier's sha256 too; a run past SIGN must ship the dossier its sign-off record hashed
+    (an edit after signing makes the signature stale)."""
     import hashlib
     if pipeline != "v2":
         return []
@@ -434,7 +436,13 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if state != "SIGN" or st.get("signoff") == "none":   # signoff none: h_SIGN does not sign
+        if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+            continue
+        if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "unsigned")]
+            continue
+        if state != "SIGN":
+            out += _signed_run_problems(code, rel)
             continue
         spec = _archive_member(code, f"{rel}/decision_spec.yaml")
         sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
@@ -457,7 +465,95 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
                        f"({str(src.get('spec_sha256'))[:12]}, shipped {hashlib.sha256(spec).hexdigest()[:12]}); {regen}")
         elif src.get("derivations_sha256") != (hashlib.sha256(rec).hexdigest() if rec is not None else "none"):
             out.append(f"{rel}: the sign-off sheet was generated from another data/derivations_record.json; {regen}")
+        else:       # F6 (#218): what signing will check (coverage too), so an unsignable run never starts a cluster
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "sign")]
     return out
+
+
+TEST_ENGINE_REFS: tuple = ()      # self-tests only (set in-process, never from the environment): toy engines to enable
+_CHECKER = r"""
+import json, os, sys
+tree, rel, signer, refs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+sys.path[:0] = [tree, os.path.join(tree, "scripts")]
+if refs:
+    from toolkit import import_guard as G
+    G.allow_test_refs("engine", refs)
+from toolkit.spec import preconditions as PC
+print("PRECONDITIONS " + json.dumps(PC.problems(os.path.join(tree, rel), None, None, mode=signer)))
+"""
+
+
+def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
+    """The run's registered preconditions (toolkit/spec/preconditions.py) checked with the code the launch ships, not
+    the launcher's checkout (#218 review round 4): the archive is extracted and its own toolkit checks its own run
+    dir, engine declarations, cards, priors and fitted values, in a child process. signer "sign" for a run at SIGN
+    (what the signer will check), "launch" past it (the sign-off record compared), "unsigned" for signoff none.
+    Fail closed: an archive without the checks, or a checker that does not answer, is a problem."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
+                t.extractall(tmp, filter="data")
+        except (tarfile.TarError, OSError, ValueError) as e:
+            return [f"the code to launch cannot be unpacked to check its preconditions ({type(e).__name__}: {e})"]
+        if not os.path.isfile(os.path.join(tmp, "toolkit", "spec", "preconditions.py")):
+            return ["the code to launch has no toolkit/spec/preconditions.py: its preconditions cannot be checked"]
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", _CHECKER, tmp, rel, signer,
+                                json.dumps(list(TEST_ENGINE_REFS))], capture_output=True, text=True, timeout=900,
+                               cwd=tmp, env={k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG",
+                                                                                         "OMP_NUM_THREADS",
+                                                                                         "OPENBLAS_NUM_THREADS")})
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return [f"the preconditions check of the code to launch did not finish ({type(e).__name__})"]
+        line = next((x for x in reversed(r.stdout.splitlines()) if x.startswith("PRECONDITIONS ")), None)
+        if line is None:
+            return [f"the preconditions check of the code to launch failed: {(r.stderr or r.stdout)[-400:]}"]
+        try:
+            got = json.loads(line[len("PRECONDITIONS "):])
+        except ValueError:
+            return ["the preconditions check of the code to launch gave an unreadable answer"]
+        return [str(x) for x in got] if isinstance(got, list) else ["the preconditions check gave no list"]
+
+
+SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
+
+
+PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
+
+
+def _signoff_record(code: bytes, rel: str) -> tuple:
+    """(record, sha256 it holds for decision_spec.yaml) from the shipped sign-off records: the spec-only record
+    (toolkit/spec/signoff.py `sha256`, or the stage machine's `spec_sha256`), else the brief's when it hashed the spec;
+    (None, None) when there is none."""
+    for f in SIGNOFF_RECORDS:
+        try:
+            doc = json.loads((_archive_member(code, f"{rel}/{f}") or b"null").decode())
+        except (ValueError, UnicodeDecodeError):
+            doc = None
+        if not isinstance(doc, dict):
+            continue
+        s = (doc.get("sha256") or {}).get("decision_spec.yaml") if isinstance(doc.get("sha256"), dict) else None
+        s = s or doc.get("spec_sha256")
+        if s:
+            return doc, s
+    return None, None
+
+
+def _signed_run_problems(code: bytes, rel: str) -> list[str]:
+    """A run past SIGN: it ships a sign-off record of the spec it ships, and every registered precondition holds on
+    the archive's bytes (toolkit/spec/preconditions.py: for the evidence dossier, the record's spec and dossier sha256,
+    the sheet's, coverage on the engine chosen, recomputed; an empty or partial evidence binding is refused)."""
+    import hashlib
+    spec = _archive_member(code, f"{rel}/decision_spec.yaml")
+    rec, signed = _signoff_record(code, rel)
+    if spec is None or rec is None:
+        return [f"{rel}: past SIGN with no decision_spec.yaml or no sign-off record of it in the code to launch"]
+    if hashlib.sha256(spec).hexdigest() != signed:
+        return [f"{rel}: decision_spec.yaml is not the one signed (edited after its sign-off): the owner amends and "
+                "re-signs the spec before launch"]
+    return [f"{rel}: {p}" for p in _preconditions(code, rel, "launch")]
 
 
 def archive_commit(code: bytes) -> str | None:
@@ -1899,6 +1995,9 @@ def relaunch(cfg, label) -> int:
                                  "not relaunching")
         code, commit = code_tarball(cfg)
         pipeline = pipeline_preflight(cfg, code)
+        stale = stale_sheet_problems(code, cfg.flags, pipeline)   # F6 (#218): the launch's checks, on these bytes
+        if stale:
+            raise SystemExit(f"{label}: refusing: " + "; ".join(stale))
         client.upload_file(os.path.join(HERE, "worker_side.py"))
         question, keys = open(cfg.question_file).read().strip(), read_keys()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
@@ -4606,10 +4705,15 @@ def _self_test_sheet(ok) -> None:
     sheet does not record the shipped spec's and derivation record's sha256."""
     import hashlib
 
+    root = os.path.dirname(HERE)        # the launch check runs the archive's own code (#218 r4): ship this tree's
+    names = subprocess.run(["git", "-C", root, "ls-files", "toolkit", "agents", "scripts", "cloud"],
+                           capture_output=True, text=True).stdout.split()
+    code_files = {n: open(os.path.join(root, n), "rb").read() for n in names if os.path.isfile(os.path.join(root, n))}
+
     def tar_of(files: dict) -> bytes:
         bio = io.BytesIO()
         with tarfile.open(fileobj=bio, mode="w:gz") as t:
-            for n, data in files.items():
+            for n, data in {**code_files, **files}.items():
                 ti = tarfile.TarInfo(n)
                 ti.size = len(data)
                 t.addfile(ti, io.BytesIO(data))
@@ -4630,8 +4734,16 @@ def _self_test_sheet(ok) -> None:
     stale_rec = stale_sheet_problems(tar_of({**base, f"{R}/data/derivations_record.json": b'{"r": 2}'}), flags)
     nosheet = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".md")}), flags)
     garbled = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.signoff_sheet.md": b"# no sources\n"}), flags)
+    # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
+    def rec_for(sp, ev=None):
+        return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
+                           "evidence": ev or {"required": [], "dossier": None, "sha256": None,
+                                                 "declarations": {}, "closure": dict(sorted({   # its input closure
+                                                     "run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                                                     "run:data/derivations_record.json":
+                                                         hashlib.sha256(rec).hexdigest()}.items()))}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
-                                          f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+                                          f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
        f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
@@ -4656,6 +4768,56 @@ def _self_test_sheet(ok) -> None:
     # resume flag is read as main.py's argparse reads it (an abbreviation, the last value wins).
     none_mode = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "SIGN",
                                      "signoff": "none"}).encode(), f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    # RC81 (F6 evidence dossier): the sheet and the signature bind the dossier the spec names; a launch refuses a
+    # run whose shipped dossier is not the one its sheet (at SIGN) or its sign-off (past SIGN) recorded
+    dspec, dos = b"spec: 1\nevidence: {dossier: evidence_dossier.yaml}\n", b"inputs: {}\n"
+
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import evidence_dossier as ED
+
+    def closure_of(sp, rc, ds):         # the input closure state() computes for these run files (no engine)
+        return dict(sorted({"run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                            "run:evidence_dossier.yaml": hashlib.sha256(ds).hexdigest(),
+                            "run:data/derivations_record.json": hashlib.sha256(rc).hexdigest()}.items()))
+
+    def sheet_d(sp, rc, ds):
+        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
+            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest(),
+             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest(),
+             "input_closure_sha256": ED.closure_digest(closure_of(sp, rc, ds))}) + " -->\n").encode()
+    dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos,
+             f"{R}/decision_spec.signoff_sheet.md": sheet_d(dspec, rec, dos)}
+    d_fresh = stale_sheet_problems(tar_of(dbase), flags)
+    d_edit = stale_sheet_problems(tar_of({**dbase, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
+    signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
+                                        "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
+                             "evidence": {"required": [], "dossier": "evidence_dossier.yaml",
+                                          "sha256": hashlib.sha256(dos).hexdigest(), "declarations": {},
+                                          "closure": closure_of(dspec, rec, dos)}}).encode()
+    past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
+    p_ok = stale_sheet_problems(tar_of(past), flags)
+    p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    ok(d_fresh == [] and p_ok == [] and any("another evidence dossier" in x for x in d_edit)
+       and any("does not exist" in x for x in d_gone) and any("not the one the sign-off recorded" in x for x in p_edit),
+       f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
+       f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
+    # RC82 (#218 review round 1)
+    nspec = (b"options: {components: {n: {}}, engine_map: {n: {net: pyr}}}\n"
+             b"engine: {ref: 'toolkit.engines.malaria.engine:MalariaEngine'}\n")
+    spec_state = stale_sheet_problems(tar_of({**dbase, f"{R}/run_state.json": st("SPEC")}), flags)
+    edited = stale_sheet_problems(tar_of({**past, f"{R}/decision_spec.yaml": b"spec: 1\n"}), flags)
+    legacy = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.yaml": nspec,
+                                          f"{R}/decision_spec.signoff.json": json.dumps({"sha256": {
+                                              "decision_spec.yaml": hashlib.sha256(nspec).hexdigest()}}).encode()}),
+                                  flags)
+    unsigned = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE")}), flags)
+    ok(spec_state == [] and any("not the one signed" in x for x in edited)
+       and any("unsigned_evidence" in x for x in legacy) and any("no sign-off record" in x for x in unsigned),
+       f"RC82 a draft at SPEC is not refused; past SIGN, a spec edited after its sign-off (removing `evidence` too), a "
+       f"sign-off made before the dossier requirement of a spec that needs one, and no sign-off at all are refused: "
+       f"{spec_state} {edited} {legacy} {unsigned}")
     abbrev = stale_sheet_problems(stale_tar, ("--res", R))
     last = stale_sheet_problems(stale_tar, ("--resume", "runs/old", "--resume=" + R))
     ok(none_mode == [] and len(abbrev) == 1 and len(last) == 1 and "runs/old" not in last[0],

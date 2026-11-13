@@ -111,6 +111,29 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
+12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
+    parameters and card tables its effect depends on (`decision_inputs`, read by
+    `toolkit/engines/decision_inputs.py`). When the options use such a component, name the
+    run's dossier (`evidence: {dossier: evidence_dossier.yaml}`) and give one entry per input
+    (`<kind>:<name>`, format in `toolkit/spec/evidence_dossier.py`): the value the model uses
+    and its source; field or trial observations (source, URL or table, year, sites, n,
+    sampling frame, value) and how they compare with the model value on the same estimand,
+    or `no_data` with the borrowing rule; the chosen value or range with its rule; and, for a
+    range, the decision test that varies that input over the range (a `parameter_value` test
+    of the parameter whose values cover the range, or the generated `prior_range_<parameter>`
+    of a drawn prior; a unit attribute or card table takes a value). Sign-off refuses a
+    missing, unparseable or incomplete dossier and a blank field, and lists what is missing,
+    whether or not the spec names a dossier. The sheet shows the table and the signature
+    binds the file, so an edit after sign-off needs a new sign-off.
+    The gate checks coverage and validity only. A range must cite a decision test the run
+    executes that varies the input: the automatic test the runner generates for it
+    (`prior_range_<p>` or `fitted_range_<p>`), or a `parameter_value` test that runs on this
+    run's path and covers the range. An input the run calibrates is varied by the
+    calibration itself. The sheet shows, next to each choice, the value or range execution
+    will use, and lists at its top every input where they differ, for the owner to decide;
+    a difference never blocks signing. Signing binds every file the run reads (the spec, the
+    files it names, the dossier and the engine's files), so any later change makes the run
+    stale. Give observations as a list.
 
 ## Closed-population epidemic questions (the compartmental engine)
 

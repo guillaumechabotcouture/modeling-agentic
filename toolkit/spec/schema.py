@@ -107,6 +107,9 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # price case in which the listed unit costs change together
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
+    evidence:                              # F6: required when the options use a component whose engine card declares
+      dossier: evidence_dossier.yaml       # decision inputs: signing refuses until each has a checked, sourced entry
+                                           # (toolkit/spec/evidence_dossier.py); the signature binds the file's sha256
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv
