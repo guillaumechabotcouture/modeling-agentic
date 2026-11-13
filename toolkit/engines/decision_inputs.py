@@ -183,6 +183,35 @@ def _self_test() -> int:
             broken = True
         ok(got == decl and broken and load(os.path.join(d, "nowhere")) is None,
            "DI5 the card's key and decision_inputs.yaml merge; an unparseable file raises; no file declares nothing")
+    # DI6-DI9 (#218 review round 1): configured engines, malformed entries, completeness against the card
+    try:
+        conf = {"*": {"inputs": [
+            {"kind": "parameter", "name": "efficacy:{component}", "why": "w"},
+            {"kind": "parameter", "name": "r0", "why": "w", "if_on_card": True},
+            {"kind": "parameter", "name": "q", "why": "w", "if_on_card": True},
+            {"kind": "parameter", "name": "s0:*", "why": "w", "if_on_card": True},
+            {"kind": "unit_attribute", "name": "reach:{component}", "why": "w", "if_on_card": True}]}}
+        vocab = {"parameter": ["q", "efficacy:c", "s0:g1", "s0:g2"], "unit_attribute": ["N", "reach:c"]}
+        got = sorted(f"{i['kind']}:{i['name']}" for i in resolve(component_inputs(conf, "c", 1), vocab))
+        ok(got == ["parameter:efficacy:c", "parameter:q", "parameter:s0:g1", "parameter:s0:g2", "unit_attribute:reach:c"],
+           f"DI6 inputs marked if_on_card (and globs) resolve against the configured card: q, not r0; s0 per group; "
+           f"the campaign's reach: {got}")
+        try:
+            resolve([{"kind": "parameter", "name": "efficacy:c", "why": "w"}], {"parameter": ["q"]})
+            ok(False, "DI7 an input that is not if_on_card and is not on the configured card is refused")
+        except ValueError:
+            ok(True, "DI7 an input that is not if_on_card and is not on the configured card is refused")
+        bad = problems({"a": {"inputs": ["eff_a", {"kind": "parameter", "name": "s*", "why": "w"},
+                                         {"kind": "parameter", "name": "x", "why": "w", "colour": 1}]}})
+        ok(any("each input" in s for s in bad) and any("glob" in s for s in bad) and any("colour" in s for s in bad),
+           f"DI8 a non-mapping input, a glob not marked if_on_card and an unknown input field are problems: {bad}")
+        cov = coverage_problems({"a": {"inputs": [{"kind": "parameter", "name": "eff_a", "why": "w"}]}},
+                                {"unit_attribute:x": "the toy's transmission index is calibrated"},
+                                {"parameter": ["eff_a", "base"], "unit_attribute": ["x", "group"]})
+        ok(cov == ["parameter:base", "unit_attribute:group"],
+           f"DI9 every card parameter and unit attribute is a declared input or excluded with a reason: {cov}")
+    except NameError as e:
+        ok(False, f"DI6-DI9: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

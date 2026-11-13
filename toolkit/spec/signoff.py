@@ -922,7 +922,7 @@ def _self_test() -> int:
             md = open(os.path.join(d, SHEET)).read()
             sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
             ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.6" in sec
-               and "DT1" in sec and "no data" in sec and "0.5" in sec,
+               and "DT_eff_a" in sec and "no data" in sec and "0.5" in sec,
                f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
                f"test): {sec[:600]!r}")
             src = sheet_sources(md) or {}
@@ -944,6 +944,57 @@ def _self_test() -> int:
                "ED8 a spec whose options use no component with decision inputs signs with no dossier")
     except Exception as e:  # noqa: BLE001 -- before the dossier exists (step α) this is the failure
         ok(False, f"ED1-ED9 evidence dossier sign-off: {type(e).__name__}: {e}")
+    # ED10-ED12 (#218 review round 1): every signing path checks and binds the dossier; the inputs the options need
+    # decide, not whether the spec names a dossier
+    try:
+        def brief(d):
+            yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+            write_sheet(d)
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            brief(d)
+            try:
+                DB.sign(d, "owner", note="n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("evidence dossier" in why and "parameter:eff_a" in why and status(d) != "signed",
+               f"ED10a the brief's sign-off refuses a spec whose options need decision inputs and have no dossier: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            rec = DB.sign(d, "owner", note="n")
+            ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
+               and rec["sha256"].get("evidence_dossier.yaml") and status(d) == "signed",
+               f"ED10b the brief's sign-off binds the dossier (hash and evidence record): {sorted(rec)}")
+        from agents import stage_machine as SM
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            try:
+                SM.sign(d, "owner", "n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("evidence dossier" in why and "parameter:eff_a" in why,
+               f"ED11a the stage machine's sign-off refuses it too: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            rec = SM.sign(d, "owner", "n")
+            ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
+               and (rec.get("evidence_sha256") or {}).get("evidence_dossier.yaml"),
+               f"ED11b the stage machine's sign-off binds the dossier: {rec}")
+        with tempfile.TemporaryDirectory() as d:
+            p = ED.toy_dossier_spec(d, dossier=False)
+            json.dump({"signed_by": "owner", "sha256": {SPEC: DB._sha(p)}}, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+            ok(status(d) == "unsigned_evidence",
+               f"ED12 a sign-off made before the dossier requirement, of a spec whose options need decision inputs, is "
+               f"unsigned_evidence (it must be re-signed), not signed: {status(d)}")
+            ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
+            json.dump({"signed_by": "owner", "sha256": {SPEC: DB._sha(p)}}, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+            ok(status(d) == "signed", f"ED12b ... one whose options need none stays signed: {status(d)}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"ED10-ED12 every signing path: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -283,7 +283,7 @@ def toy_entries() -> dict:
                               "n": 1200, "sampling_frame": "cluster-randomised, children under 5", "value": 0.42}],
             "comparison": "the trial's 0.42 is below the card's 0.5, inside its fitted range [0.3, 0.7]",
             "chosen": {"range": [0.3, 0.6], "rule": "the trial's confidence interval, widened to the card's lower bound"},
-            "decision_test": "DT1"},
+            "decision_test": "DT_eff_a"},
         "unit_attribute:x": {
             "model_value": "units.csv column cov (calibrated)", "model_source": "toy surface",
             "no_data": {"reason": "no field measurement of the toy index",
@@ -300,6 +300,9 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     p = schema.toy_spec(d)
     raw = yaml.safe_load(open(p))
     raw["engine"] = {"ref": ref}
+    raw["analysis"]["decision_tests"].append({"id": "DT_eff_a", "type": "parameter_value", "parameter": "eff_a",
+                                              "values": [0.3, 0.6], "text": "Does the plan change across the trial "
+                                                                           "range of the effect of a?"})
     if dossier:
         raw["evidence"] = {"dossier": DOSSIER_FILE}
         with open(os.path.join(d, DOSSIER_FILE), "w") as f:
@@ -307,6 +310,122 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     with open(p, "w") as f:
         yaml.safe_dump(raw, f, sort_keys=False)
     return p
+
+
+def _self_test_round1(ok, T) -> None:
+    """#218 review round 1: each reproduction is a case."""
+    import copy
+    import tempfile
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_dossier_spec(d)))
+        req, _ = required_inputs(raw, d)
+        for name, mut, want in (
+                ("nested blank model value", lambda e: e["parameter:eff_a"].__setitem__("model_value", {"all": None}),
+                 "model_value"),
+                ("list of blanks as the source", lambda e: e["parameter:eff_a"].__setitem__("model_source", [""]),
+                 "model_source"),
+                ("nested blank chosen value", lambda e: e["unit_attribute:x"]["chosen"].__setitem__(
+                    "value", [None, " "]), "chosen.value"),
+                ("a rule that is not text", lambda e: e["unit_attribute:x"]["chosen"].__setitem__("rule", [""]),
+                 "rule"),
+                ("an observation value that is a list of blanks", lambda e: e["parameter:eff_a"]["observations"][0]
+                 .__setitem__("value", [None]), "value"),
+                ("a range whose test varies another quantity", lambda e: e["parameter:eff_a"].__setitem__(
+                    "decision_test", "DT1"), "does not vary"),
+                ("a range wider than its test's values", lambda e: e["parameter:eff_a"]["chosen"].__setitem__(
+                    "range", [0.2, 0.6]), "does not cover"),
+                ("a range on a unit attribute", lambda e: e["unit_attribute:x"].__setitem__("chosen", {
+                    "range": [0, 1], "rule": "r"}) or e["unit_attribute:x"].__setitem__("decision_test", "DT1"),
+                 "unit_attribute:x")):
+            e = copy.deepcopy(toy_entries())
+            mut(e)
+            got = check(raw, yaml.safe_dump({"inputs": e}).encode(), req)
+            ok(any(want in g for g in got), f"ED-C4 {name} is refused, naming {want!r}: {got[:3]}")
+        for name, decl, want in (("a component declared {}", {"a": {}, "b": {"inputs": [], "none_reason": "r"}},
+                                  "none_reason"),
+                                 ("a non-mapping input", {"a": {"inputs": ["eff_a"]}, "b": {"inputs": [],
+                                                                                           "none_reason": "r"}},
+                                  "each input")):
+            full = T.ToyDossierEngine.DECISION_INPUTS
+            T.ToyDossierEngine.DECISION_INPUTS = decl
+            try:
+                req2, probs = required_inputs(raw, d)
+            finally:
+                T.ToyDossierEngine.DECISION_INPUTS = full
+            ok(any(want in p for p in probs), f"ED-R7 a malformed declaration ({name}) fails closed at sign time: {probs}")
+        for name, emap in (("missing", {"b": {"b": 1}}), ("empty", {"a": {}, "b": {"b": 1}}),
+                           ("not a mapping", {"a": "a=1", "b": {"b": 1}})):
+            r2 = copy.deepcopy(raw)
+            r2["options"]["engine_map"] = emap
+            _, probs = required_inputs(r2, d)
+            ok(any("engine mapping" in p and "a" in p for p in probs),
+               f"ED-R8 a used component whose engine_map entry is {name} is refused: {probs}")
+        # ED-R10: engine: auto takes the backend's full eligibility (what ENGINE_CHOICE uses), not the card filter
+        from agents import analysis_backend as AB
+        seen = {}
+
+        class Stub:
+            def eligible_engines(self, spec, engines=None):
+                seen["run_dir"] = spec.get("_run_dir")
+                return [{"ref": TOY, "eligible": True, "config": {}},
+                        {"ref": "toolkit.engines.malaria.engine:MalariaEngine", "eligible": False}]
+        orig = AB.backend
+        AB.backend = lambda *a, **k: Stub()
+        try:
+            r3 = dict(raw, engine={"auto": True, "candidates": [TOY, "toolkit.engines.malaria.engine:MalariaEngine"]})
+            req3, probs3 = required_inputs(r3, d)
+        finally:
+            AB.backend = orig
+        ok(sorted(req3) == ["parameter:eff_a", "unit_attribute:x"] and seen.get("run_dir") == d and probs3 == [],
+           f"ED-R10 engine: auto requires the inputs of the engines the backend finds eligible, with the run dir: "
+           f"{sorted(req3)} {seen}")
+        # ED-S1: ENGINE_CHOICE re-checks the signed dossier against the engine actually chosen
+        r4 = dict(raw, engine={"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]})
+        r4.pop("evidence", None)
+        ok(any("parameter:eff_a" in p for p in choice_refusals(d, r4, TOY, {}))
+           and choice_refusals(d, r4, "toolkit.engines.contract:ToyEngine", {}) == [],
+           "ED-S1 the dossier is re-checked against the chosen engine: an engine whose inputs it does not cover is "
+           "refused")
+        # ED-B1: one check-and-bind for every signing path
+        b = bind(d, open(os.path.join(d, "decision_spec.yaml"), "rb").read())
+        ok(b["files"] == {DOSSIER_FILE: sha(open(os.path.join(d, DOSSIER_FILE), "rb").read())}
+           and b["record"]["required"] == ["parameter:eff_a", "unit_attribute:x"]
+           and b["record"]["dossier"] == DOSSIER_FILE, f"ED-B1 bind returns the hashes and the evidence record: {b}")
+        os.remove(os.path.join(d, DOSSIER_FILE))
+        try:
+            bind(d, open(os.path.join(d, "decision_spec.yaml"), "rb").read())
+            ok(False, "ED-B2 bind refuses a spec it cannot bind")
+        except ValueError as e:
+            ok("does not exist" in str(e), f"ED-B2 bind refuses a spec it cannot bind: {e}")
+    # ED-R9: a configured engine's inputs follow its configuration
+    comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": {
+        "groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "transmission": "q",
+        "per_group_parameters": ["s0"], "components": {"camp": {"kind": "campaign", "targets": ["g1"],
+                                                                 "reach": 0.8}}}},
+        "options": {"components": {"c": {}}, "engine_map": {"c": {"camp": 1}}}}
+    req, probs = required_inputs(comp)
+    ok({"parameter:q", "parameter:s0:g1", "parameter:s0:g2", "parameter:efficacy:camp", "unit_attribute:reach:camp"}
+       <= set(req) and "parameter:r0" not in req and "unit_attribute:s0" not in req and probs == [],
+       f"ED-R9 compartmental: q (not r0), s0 per group, the campaign's efficacy and reach: {sorted(req)} {probs}")
+    # ED-E3: every card parameter and unit attribute of each shipped card is declared or excluded with a reason
+    for d_ in ("malaria", "compartmental", "renewal"):
+        p = os.path.join(ROOT, "toolkit", "engines", d_)
+        try:
+            v = DI.card_vocabulary(p)
+            cov = DI.coverage_problems(DI.load(p), DI.load_excluded(p),
+                                       {"parameter": v["parameters"], "unit_attribute": list(v["unit_attributes"])})
+        except Exception as e:  # noqa: BLE001
+            cov = [f"{type(e).__name__}: {e}"]
+        ok(cov == [], f"ED-E3 {d_}: every card parameter and unit attribute is an input or excluded with a reason: "
+                      f"{cov}")
+    mal = DI.load(os.path.join(ROOT, "toolkit", "engines", "malaria"))
+    names = {c: {i["name"] for i in (v.get("inputs") or []) + [x for xs in (v.get("by_value") or {}).values()
+                                                               for x in xs]} for c, v in mal.items()}
+    want = {"smc": {"smc_rho", "smc_k"}, "net": {"cfp_half"}, "irs": {"irs_rep", "irs_divert", "irs_half"},
+            "cm": {"cm_ramp_years", "cm_target", "cm_age_lo_m", "cm_age_hi_m"}}
+    ok(all(w <= names.get(c, set()) for c, w in want.items()),
+       f"ED-E4 the malaria inputs the review found omitted are declared: {[(c, sorted(w - names.get(c, set()))) for c, w in want.items()]}")
 
 
 def _self_test() -> int:
@@ -378,6 +497,7 @@ def _self_test() -> int:
                and engine_declaration(raw["engine"]["ref"], raw["engine"]["config"]) == base,
                f"ED-R5 a subclass inherits its base engine's declaration (the package-rate engine's `*`: effects "
                f"calibrated to the run's own panel, no outside input): {sorted(req)} {probs}")
+        _self_test_round1(ok, T)
         mal = {"engine": {"ref": "toolkit.engines.malaria.engine:MalariaEngine"},
                "options": {"components": {"n": {}, "s": {}}, "engine_map": {"n": {"net": "pbo"}, "s": {"smc": 0}}}}
         req, probs = required_inputs(mal)

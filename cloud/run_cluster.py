@@ -4683,8 +4683,12 @@ def _self_test_sheet(ok) -> None:
     stale_rec = stale_sheet_problems(tar_of({**base, f"{R}/data/derivations_record.json": b'{"r": 2}'}), flags)
     nosheet = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".md")}), flags)
     garbled = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.signoff_sheet.md": b"# no sources\n"}), flags)
+    # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
+    def rec_for(sp, ev=None):
+        return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
+                           "evidence": ev or {"required": [], "dossier": None}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
-                                          f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+                                          f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
        f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
@@ -4722,7 +4726,9 @@ def _self_test_sheet(ok) -> None:
     d_fresh = stale_sheet_problems(tar_of(dbase), flags)
     d_edit = stale_sheet_problems(tar_of({**dbase, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
     d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
-    signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest()}}).encode()
+    signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
+                                        "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
+                             "evidence": {"required": ["x"], "dossier": "evidence_dossier.yaml"}}).encode()
     past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
     p_ok = stale_sheet_problems(tar_of(past), flags)
     p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
@@ -4730,6 +4736,21 @@ def _self_test_sheet(ok) -> None:
        and len(p_edit) == 1 and "evidence dossier" in p_edit[0] and "sign" in p_edit[0],
        f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
        f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
+    # RC82 (#218 review round 1)
+    nspec = (b"options: {components: {n: {}}, engine_map: {n: {net: pyr}}}\n"
+             b"engine: {ref: 'toolkit.engines.malaria.engine:MalariaEngine'}\n")
+    spec_state = stale_sheet_problems(tar_of({**dbase, f"{R}/run_state.json": st("SPEC")}), flags)
+    edited = stale_sheet_problems(tar_of({**past, f"{R}/decision_spec.yaml": b"spec: 1\n"}), flags)
+    legacy = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.yaml": nspec,
+                                          f"{R}/decision_spec.signoff.json": json.dumps({"sha256": {
+                                              "decision_spec.yaml": hashlib.sha256(nspec).hexdigest()}}).encode()}),
+                                  flags)
+    unsigned = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE")}), flags)
+    ok(spec_state == [] and len(edited) == 1 and "signed" in edited[0] and len(legacy) == 1
+       and "unsigned_evidence" in legacy[0] and len(unsigned) == 1,
+       f"RC82 a draft at SPEC is not refused; past SIGN, a spec edited after its sign-off (removing `evidence` too), a "
+       f"sign-off made before the dossier requirement of a spec that needs one, and no sign-off at all are refused: "
+       f"{spec_state} {edited} {legacy} {unsigned}")
     abbrev = stale_sheet_problems(stale_tar, ("--res", R))
     last = stale_sheet_problems(stale_tar, ("--resume", "runs/old", "--resume=" + R))
     ok(none_mode == [] and len(abbrev) == 1 and len(last) == 1 and "runs/old" not in last[0],
