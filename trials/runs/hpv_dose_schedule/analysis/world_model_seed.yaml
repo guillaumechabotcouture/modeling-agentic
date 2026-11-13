@@ -1,0 +1,277 @@
+beliefs:
+- id: B1
+  mechanism: A single HPV dose gives high efficacy against persistent HPV16/18 infection (individual VE roughly
+    0.9-0.98 in KEN SHE, India IARC cohort, Costa Rica CVT). Applied to about 80% of girls reached, the population-level
+    relative reduction in persistent HPV16/18 is roughly 0.6-0.85 (no herd effect in a package-rate engine). If
+    the engine's RR is the individual efficacy without coverage, values near 0.9+ would show up instead, which would
+    refute this band.
+  about:
+    package: one_dose
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.85
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Barnabas RV et al. Efficacy of Single-Dose Human Papillomavirus Vaccination among Young African Women.
+      NEJM Evidence 2022
+    location: Table 2 (VE vs persistent HPV16/18 at 18 months, ~97-98%)
+  - citation: 'Basu P et al. Vaccine efficacy against persistent human papillomavirus (HPV) 16/18 infection at 10
+      years after one, two, and three doses of quadrivalent HPV vaccine in girls in India: a multicentre, prospective,
+      cohort study. Lancet Oncology 2021'
+    location: results table of VE by dose group (one-dose ~95%); table number unsure
+  - citation: 'Kreimer AR et al. Evaluation of Durability of a Single Dose of the Bivalent HPV Vaccine: The CVT
+      Trial. Journal of the National Cancer Institute 2020'
+    location: Table 2 (one-dose efficacy sustained over ~11 years); table number unsure
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Two doses give individual efficacy against persistent HPV16/18 no better than one dose by more than
+    a few percentage points; with 80% receiving dose 1 and 65% completing, the population relative reduction is
+    about 0.6-0.8 if partial (one-dose) recipients are credited, about 0.6 if only completers are. So two_dose's
+    population effect is at most equal to one_dose's and plausibly lower.
+  about:
+    package: two_dose
+  direction: reduces
+  magnitude:
+    band:
+    - 0.55
+    - 0.82
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Whitworth HS et al. Efficacy and immunogenicity of a single dose of human papillomavirus vaccine
+      compared to no vaccination or standard three and two-dose vaccination regimens: A systematic review of evidence
+      from clinical trials. Vaccine 2020'
+    location: summary of efficacy by dose number (no meaningful one- vs two-dose difference); page unsure
+  - citation: 'Human papillomavirus vaccines: WHO position paper (2022 update). Weekly Epidemiological Record 2022'
+    location: 'dosing schedule section: one- or two-dose schedule for girls 9-14'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B3
+  mechanism: 'one_dose dominates two_dose in every district: equal or larger population effect at 6/11 of the price
+    per girl. Because both effects are relative and the engine is multiplicative, the dominance holds at every baseline
+    incidence; only a two_dose relative reduction above ~1.8x one_dose''s would reverse it, which trial evidence
+    excludes.'
+  about:
+    pair:
+    - one_dose
+    - two_dose
+    feature: inc
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 0.027
+    - 0.0701
+  source_type: literature
+  evidence:
+  - citation: Barnabas RV et al. Efficacy of Single-Dose Human Papillomavirus Vaccination among Young African Women.
+      NEJM Evidence 2022
+    location: Table 2
+  - citation: 'Basu P et al. Vaccine efficacy against persistent human papillomavirus (HPV) 16/18 infection at 10
+      years after one, two, and three doses of quadrivalent HPV vaccine in girls in India: a multicentre, prospective,
+      cohort study. Lancet Oncology 2021'
+    location: VE by dose group; table number unsure
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: In a package-rate engine the relative reduction does not depend on baseline incidence (rate = baseline
+    x RR ratio); absolute infections averted per girl scale linearly with inc, so inc ranks districts and the relative
+    reduction is flat across inc.
+  about:
+    package: one_dose
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Human papillomavirus vaccines: WHO position paper (2022 update). Weekly Epidemiological Record 2022'
+    location: efficacy described as relative protection independent of setting; page unsure
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B5
+  mechanism: Net benefit of one_dose over none per girl = inc x relative reduction x 5 years - lambda x 6 USD. With
+    a binding budget the lowest-incidence districts fall below the shadow price and get none; the highest- incidence
+    districts (inc above ~0.055) are funded in essentially every draw. The flip incidence sits inside the inc range
+    only if the budget binds; roughly, $3.0M buys one_dose for ~500k girls, close to the plausible total target
+    population, so it may bind only weakly.
+  about:
+    pair:
+    - one_dose
+    - none
+    feature: inc
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.055
+    - 0.0701
+  source_type: literature
+  evidence:
+  - citation: Barnabas RV et al. Efficacy of Single-Dose Human Papillomavirus Vaccination among Young African Women.
+      NEJM Evidence 2022
+    location: Table 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: School enrolment would drive real school-based delivery coverage, but the engine reads only baseline_rate,
+    so in the sweep school_enrol has no effect on the relative reduction. Real-world relevance is an open question
+    (low-enrolment districts need community outreach at higher cost).
+  about:
+    package: one_dose
+    feature: school_enrol
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Human papillomavirus vaccines: WHO position paper (2022 update). Weekly Epidemiological Record 2022'
+    location: delivery strategies (school- and community-based); page unsure
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B7
+  mechanism: Waning of one-dose protection over the 2026-2030 window is negligible (CVT and India follow-up show
+    sustained protection for >10 years), so durability does not separate the options within this horizon.
+  about:
+    pair:
+    - one_dose
+    - two_dose
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Kreimer AR et al. Evaluation of Durability of a Single Dose of the Bivalent HPV Vaccine: The CVT
+      Trial. Journal of the National Cancer Institute 2020'
+    location: main results; table number unsure
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+hypotheses:
+- id: H1
+  belief: B1
+  claim: one_dose relative reduction in persistent HPV16/18 lies in [0.6, 0.85] at most design points; refuted if
+    <=20% of points fall in the band (e.g. engine applies individual VE ~0.95 without coverage).
+  test:
+    kind: effect_band
+    package: one_dose
+    band:
+    - 0.6
+    - 0.85
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: two_dose relative reduction lies in [0.55, 0.82] at most design points; refuted if <=20% fall in the band.
+  test:
+    kind: effect_band
+    package: two_dose
+    band:
+    - 0.55
+    - 0.82
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: one_dose beats two_dose on net benefit at the shadow price at >=90% of usable points across the whole inc
+    range; refuted if two_dose wins at >=90%.
+  test:
+    kind: paired_sign
+    a: one_dose
+    b: two_dose
+    feature: inc
+    range:
+    - 0.027
+    - 0.0701
+    sign: positive
+    min_share: 0.9
+- id: H4
+  belief: B4
+  claim: one_dose relative reduction is flat in inc (Spearman rho interval inside +/-0.1); refuted if it lies outside.
+  test:
+    kind: effect_direction
+    package: one_dose
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: In high-incidence districts (inc 0.055-0.0701) one_dose beats none at the shadow price at >=90% of usable
+    points; refuted if none wins at >=90%.
+  test:
+    kind: paired_sign
+    a: one_dose
+    b: none
+    feature: inc
+    range:
+    - 0.055
+    - 0.0701
+    sign: positive
+    min_share: 0.9
+- id: H6
+  belief: B6
+  claim: one_dose relative reduction does not vary with school_enrol (rho interval inside +/-0.1); refuted if outside.
+  test:
+    kind: effect_direction
+    package: one_dose
+    feature: school_enrol
+    direction: negligible
+    equivalence: 0.1
+open_questions:
+- id: Q1
+  question: Does the engine's one_dose / two_dose RR already include coverage (80% / 65%) and credit partial two-dose
+    recipients, or is it individual efficacy? This sets the absolute total averted, not the option ranking.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q2
+  question: Does the budget bind (total target girls x US$6 vs US$3.0M)? If not, one_dose everywhere is optimal
+    and inc ranking is moot; if it binds, the inc cut-off decides which districts get none.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Does delivery cost or achievable coverage depend on school enrolment (outreach for out-of-school girls)?
+    The engine ignores it; a real programme might not.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Is the synthetic cohort incidence of persistent HPV16/18 in girls 9-14 over 2026-2030 a sensible baseline,
+    given most are not yet sexually exposed? Infections averted within the window may be small relative to lifetime
+    benefit.
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: false
