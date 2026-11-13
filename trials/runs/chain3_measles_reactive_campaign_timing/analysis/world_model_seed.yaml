@@ -1,0 +1,301 @@
+beliefs:
+- id: B1
+  mechanism: 'Threshold: an ~80%-reach campaign with ~85-95% efficacy removes ~70% of remaining susceptibles and
+    pushes Reff below 1, so EARLY (day 14, ~1.2 generations after detection) averts most of the outbreak; what it
+    cannot avert is the seed plus roughly one generation already infected and their short residual chains.'
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: ch. 4 (herd immunity threshold 1 - 1/R0); page not checked
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Results, one-dose effectiveness summary (median ~84% at 9-11 months, ~92% at >=12 months); table number
+      not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Delay cost: LATE lands ~3.6 serial intervals (~11-12 days each) after detection, ~2.5 generations
+    after EARLY; with Reff 1.5-3.5 cumulative infection roughly doubles to triples each generation until depletion,
+    so by day 42 a large share of the baseline final size is already infected or infectious. LATE''s relative reduction
+    is clearly below EARLY''s and spans a wide range across districts.'
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.2
+    - 0.75
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: measles serial interval estimate (~11-12 days); table number not checked
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: 'Results: cases averted fall steeply with delay of the response; figure number not checked'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: A larger share already infected at detection puts the epidemic further along when the campaign lands,
+    so more of the final size is beyond reach; LATE's relative reduction decreases with seed_share (strongly, because
+    3.6 generations from a large seed reach the peak). Carries forward chain1's refutation of the 'seed cancels'
+    claim.
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results on intervention timing relative to the epidemic curve; page not checked
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: 'Same mechanism for EARLY, weaker: with ~1.2 generations before the campaign, a larger seed still means
+    a larger share of the final size is already committed; EARLY''s relative reduction decreases with seed_share.'
+  about:
+    package: early
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation; page not checked
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Faster growth (higher Reff from a higher susceptible share s0) means more generations' worth of infections,
+    and an earlier peak, before day 42; LATE's relative reduction decreases with s0. The baseline final size saturates
+    at high Reff, so this also holds for the denominator.
+  about:
+    package: late
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: epidemic growth rate and final size vs R; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5b
+  mechanism: 'Same mechanism through transmission intensity: a higher contact-rate calibration scale raises R0 and
+    so Reff at detection, the epidemic grows faster and peaks earlier, and more of it is past by day 42; LATE''s
+    relative reduction decreases with the contact-rate calibration scale. Weaker than via s0 if the scale''s sampled
+    range is narrow (~60-90, a ~1.5x spread) and is partly offset by saturation of the baseline.'
+  about:
+    package: late
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: epidemic growth rate and final size vs R; page not checked
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'Price vs delay: EARLY costs US$0.80 per resident more than LATE, worth ~0.0007 infections per resident
+    at lambda = 0.00086; the extra infections LATE lets through (~2.5 generations from a seed of 0.08-0.77% of the
+    population) are several times larger wherever Reff is above ~1.1, so EARLY beats LATE on net benefit in nearly
+    every district at the shadow price. LATE could only win where the outbreak is barely supercritical and slow
+    (lowest s0 and contact rate, smallest seed), roughly located at R0 x s0 < ~1.2.'
+  about:
+    pair:
+    - early
+    - late
+  direction: raises
+  conditions:
+  - feature: s0
+    range:
+    - 0.0847
+    - 0.1963
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: 'Results: earlier response averts substantially more cases; figure number not checked'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'Under the binding US$4M budget, the per-district choice is not EARLY-everywhere: the marginal infections
+    averted per dollar of EARLY over LATE (delay cost / US$0.80) competes with LATE over none (late averted / US$1.40).
+    Districts where the epidemic is slow (low Reff, small seed) lose little by waiting and should get LATE first;
+    fast districts with large seeds gain most from EARLY; districts where even EARLY comes after much of the outbreak
+    may get none. Not testable here (no optimised plan).'
+  about:
+    pair:
+    - early
+    - late
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: general dynamics; page not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: 'How does the engine represent campaign timing, given its card lists interventions ''before the epidemic''
+    only: through reach:early / reach:late and efficacy:early / efficacy:late as an effective share of susceptibles
+    protected, or by applying the campaign at day 14 / 42 in the transmission run? If timing is folded into a fixed
+    effective efficacy, the delay cost will not scale with seed_share or Reff (B3, B5).'
+  beliefs:
+  - B2
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Are the infections already present at detection (seed_share) counted in the burden of every package?
+    If so they cap the relative reduction of both options below 1 - seed/final size.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q3
+  question: Under the binding budget, which districts get LATE or none instead of EARLY, and does the ranking follow
+    the growth rate (R0 x s0) and seed size as B7 expects? Needs the optimised plan, which this sweep does not produce.
+  beliefs:
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Is there any region of s0 / contact rate where LATE beats EARLY at the shadow price (slow, barely supercritical
+    outbreaks), and where is that boundary?
+  beliefs:
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: EARLY's relative reduction in infections is between 0.6 and 0.95 at >= 70% of usable points.
+  p: 0.55
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.6
+    - 0.95
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: LATE's relative reduction in infections is between 0.2 and 0.75 at >= 65% of usable points.
+  p: 0.45
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.2
+    - 0.75
+    min_share: 0.65
+- id: H3
+  belief: B3
+  claim: LATE's relative reduction decreases with seed_share (Spearman interval below 0).
+  p: 0.75
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: EARLY's relative reduction decreases with seed_share (Spearman interval below 0).
+  p: 0.65
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: LATE's relative reduction decreases with s0 (faster growth, more of the outbreak before day 42).
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0
+    direction: decreases
+- id: H6
+  belief: B5b
+  claim: LATE's relative reduction decreases with the contact-rate calibration scale.
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: late
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H7
+  belief: B6
+  claim: At the shadow price, EARLY has higher net benefit than LATE at >= 80% of usable points across the full
+    s0 range.
+  p: 0.75
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.0847
+    - 0.1963
+    sign: positive
+    min_share: 0.8
