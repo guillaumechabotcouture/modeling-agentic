@@ -47,24 +47,32 @@ Tests (each declares its pass threshold; a test must concern its belief's packag
     effect_band {package, band, min_share, where?}  share of usable points whose relative reduction is in the band:
         supported at >= min_share, refuted at <= 1 - min_share; points with no baseline burden are excluded
     effect_direction {package, feature, direction: increases|decreases|negligible, equivalence?, where?}
-        tie-aware Spearman rho with its 95% interval: increases / decreases when the interval excludes 0;
-        negligible only when it lies inside +/- equivalence (required for that claim); else inconclusive
+        tie-aware Spearman rho with its 95% interval: increases / decreases when the interval excludes 0; a
+        negligible claim is judged on its bound alone (interval inside +/- equivalence: supported; outside it:
+        refuted; crossing it: inconclusive); inputs where one value holds more than half the points are inconclusive
     paired_sign {a, b, feature, range, sign: positive|negative, min_share, where?}  net benefit of a minus b at the
         budget's shadow price; supported when the claimed option wins at >= min_share of usable points, refuted
         when the other one does; ties are indifferent, counted separately
     flip_in {a, b, feature, range, where?}  the a/b transition along the feature, refitted on the `where` points:
         supported when its whole located range lies inside `range`, refuted when disjoint, else inconclusive; a
         one-sided, rare or non-monotone regime is inconclusive, never refuted
-    plan_share {component, where, min_share}  share of matching units whose point plan contains it; a matching unit
-        missing from the plan, or a unit missing a filter column, makes it untestable
+    plan_share {component | package, where, min_share}  share of matching units whose point-plan package contains
+        the component (its composition), or is the package; a numeric filter reads the column as a number (a value
+        that is not one fails closed); a matching unit missing from the plan, or a missing column, is untestable
+A belief's conditions are applied to its hypotheses' checks (intersected with the test's own region; for a belief
+that a choice flips, its condition on the test's own feature locates the flip and is not applied). Every numeric
+region is an exact, finite, ordered pair. Verdicts compare full-precision values; numbers are rounded on output.
 Statuses: open (not yet checked), supported, refuted, inconclusive, untestable.
 
 The comparison measure is net benefit per person at the budget's shadow price, dfac x (burden - outcome) - lambda x
 (cost - comparator cost): ranking by benefit per cost misranks options of different cost under a budget. lambda is
-`--shadow-price`, else the cost-effectiveness of the marginal funded package of the point plan (the least
-benefit / cost among units given a package, analysis/point.yaml), else none (paired tests untestable). That
-estimate is an upper bound on the dual of the budget row: a lower lambda favours the costlier option, so a paired
-test or flip between options of different cost can move with it (the value used is in every result).
+`--shadow-price`, else the budget row's dual recorded in analysis/point.yaml (solver.budget_dual), or 0 when the plan
+records that its budget does not bind (solver.budget_slack: true); otherwise there is none and paired tests are
+untestable. No value is inferred from average benefit / cost. A lower lambda favours the costlier option, so a
+paired test or flip between options of different cost moves with it (the value used is in every result).
+analysis/point.yaml is used only when bound to this run: its spec sha256, engine identity and recorded inputs must
+match, else the build is refused. Every data and settings file consumed (the units table, the settings file, the
+engine choice) is fingerprinted in the output.
 
 Fail closed: a belief without evidence, a hypothesis without a refutation test or threshold, a non-finite value,
 a missing artifact, a result row not bound to its job (job_sha) and the expected engine identity.
@@ -90,7 +98,7 @@ DIRECTIONS = ("reduces", "raises", "increases", "decreases", "negligible", "flip
 STATUSES = ("open", "supported", "refuted", "inconclusive", "untestable")
 TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("package", "feature", "direction"),
          "paired_sign": ("a", "b", "feature", "range", "sign", "min_share"), "flip_in": ("a", "b", "feature", "range"),
-         "plan_share": ("component", "where", "min_share")}
+         "plan_share": ("where", "min_share")}
 # Settings (recorded in the output): bands are 10th-90th percentiles; a direction needs its 95% interval to exclude 0
 # and |rho| >= 0.1, on at least 10 usable points with 3 or more distinct feature values; a flip needs each option to
 # win at >= 5% of the non-tied points, no reversal of more than 0.25 in the winning share across 5 quantile bins,
@@ -98,7 +106,7 @@ TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("
 # transition widened to the nearest sampled points on either side. At most 3 features are displayed per pair.
 SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
             "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3,
-            "fdr_q": 0.05, "correlated": 0.5}
+            "fdr_q": 0.05, "correlated": 0.5, "tie_share_max": 0.5}
 
 
 class WorldModelError(ValueError):
@@ -153,7 +161,16 @@ class Sweep:
 
 
 def _r(x):
-    return None if x is None or not math.isfinite(float(x)) else float(f"{float(x):.{SETTINGS['digits']}g}")
+    """A finite float at full precision, or None: verdicts compare these; `_rounded` rounds only the output."""
+    return None if x is None or not math.isfinite(float(x)) else float(x)
+
+
+def _rounded(x):
+    if isinstance(x, float):
+        return float(f"{x:.{SETTINGS['digits']}g}") if math.isfinite(x) else x
+    if isinstance(x, dict):
+        return {k: _rounded(v) for k, v in x.items()}
+    return [_rounded(v) for v in x] if isinstance(x, (list, tuple)) else x
 
 
 def _num(v):
@@ -166,6 +183,28 @@ def _band_ok(b):
 
 def _disjoint(a, b):
     return a[1] < b[0] or b[1] < a[0]
+
+
+def _where_problem(where, sweep):
+    """Why a `where` filter is malformed (None when it is fine). A numeric region is an exact, finite, ordered pair;
+    a plan filter may instead list categories (text values); a sweep test filters on numbers only."""
+    if not isinstance(where, dict):
+        return "where: a mapping"
+    for f, v in where.items():
+        nums = isinstance(v, (list, tuple)) and any(isinstance(e, (int, float)) for e in v)
+        if sweep or nums or isinstance(v, (int, float)):
+            if not _band_ok(v):
+                return f"where.{f}: an exact, finite, ordered numeric pair [lo, hi]"
+        elif not (isinstance(v, str) or (isinstance(v, (list, tuple)) and v and all(isinstance(e, str) for e in v))):
+            return f"where.{f}: a numeric pair or a list of category values"
+    return None
+
+
+def _intersect(region, f, r):
+    """region with feature f's range intersected with r (r added when f is not there)."""
+    out = {k: list(v) for k, v in region.items()}
+    out[f] = [max(out[f][0], r[0]), min(out[f][1], r[1])] if f in out and _band_ok(out[f]) else list(r)
+    return out
 
 
 def _when(x):
@@ -210,13 +249,15 @@ def _related(t, b):
     if k in ("paired_sign", "flip_in") and sorted([t.get("a"), t.get("b")]) != sorted(ab.get("pair") or []):
         return f"tests the pair {[t.get('a'), t.get('b')]}, the belief is about {ab}"
     named = {ab.get("package"), ab.get("component"), *(ab.get("pair") or [])}
-    if k == "plan_share" and t.get("component") not in named:
-        return f"tests component {t.get('component')!r}, the belief is about {ab}"
-    reg = dict(t.get("where") or {}, **({t["feature"]: t["range"]} if t.get("range") and t.get("feature") else {}))
+    if k == "plan_share" and (t.get("component") or t.get("package")) not in named:
+        return f"tests {t.get('component') or t.get('package')!r}, the belief is about {ab}"
+    reg = {f: v for f, v in (t.get("where") or {}).items() if _band_ok(v)}
+    if t.get("range") and t.get("feature"):
+        reg = _intersect(reg, t["feature"], t["range"])
     for c in b.get("conditions") or []:
         r = reg.get(c.get("feature"))
-        if _band_ok(r) and _band_ok(c.get("range")) and _disjoint(r, c["range"]):
-            return f"its region {c['feature']} {r} lies outside the belief's condition {c['range']}"
+        if r and _band_ok(c.get("range")) and (r[0] > r[1] or _disjoint(r, c["range"])):
+            return f"its region {c['feature']} {r} is empty or lies outside the belief's condition {c['range']}"
     return None
 
 
@@ -289,10 +330,10 @@ def validate_seed(seed) -> dict:
         for f in ("band", "range"):
             if f in t and not _band_ok(t[f]):
                 errs.append(f"{w}: test {f} [lo, hi] of finite numbers")
-        for f, v in (t.get("where") or {}).items() if isinstance(t.get("where"), dict) else []:
-            if isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v) \
-                    and not _band_ok(v):
-                errs.append(f"{w}: where.{f} [lo, hi] of finite numbers")
+        if t.get("where") is not None and _where_problem(t["where"], t["kind"] != "plan_share"):
+            errs.append(f"{w}: {_where_problem(t['where'], t['kind'] != 'plan_share')}")
+        if t["kind"] == "plan_share" and bool(t.get("component")) == bool(t.get("package")):
+            errs.append(f"{w}: plan_share names exactly one of component (package composition) or package")
         lo_share = 0.0 if t["kind"] == "plan_share" else 0.5
         if "min_share" in TESTS[t["kind"]] and not (_num(t["min_share"]) and lo_share < t["min_share"] <= 1):
             errs.append(f"{w}: min_share a number in ({lo_share}, 1]")
@@ -305,8 +346,6 @@ def validate_seed(seed) -> dict:
                 errs.append(f"{w}: direction increases, decreases or negligible")
             elif t["direction"] == "negligible" and not (_num(t.get("equivalence")) and 0 < t["equivalence"] < 1):
                 errs.append(f"{w}: a negligible claim needs an explicit equivalence bound on |rho| in (0, 1)")
-        if t["kind"] == "plan_share" and not isinstance(t.get("where"), dict):
-            errs.append(f"{w}: where {{feature or column: [lo, hi] or [values]}}")
         if h.get("belief") in by and not errs:
             why = _related(t, by[h["belief"]])
             if why:
@@ -317,9 +356,10 @@ def validate_seed(seed) -> dict:
 
 
 # ---------------------------------------------------------------- coarse summary of a sweep
-def direction(x, y, equivalence=None):
-    """Tie-aware Spearman association of y with x: increases, decreases, negligible (only with an equivalence bound
-    the interval lies inside) or inconclusive (too few points, a constant or categorical input, or no clear sign)."""
+def direction(x, y):
+    """Tie-aware Spearman association of y with x with its 95% interval: increases, decreases, or inconclusive (too
+    few points, a constant or categorical input, an input where one value holds more than tie_share_max of the
+    points, for which the interval is not calibrated, or no clear sign)."""
     from scipy.stats import rankdata
     m = np.isfinite(x) & np.isfinite(y)
     n = int(m.sum())
@@ -327,12 +367,14 @@ def direction(x, y, equivalence=None):
     if n < SETTINGS["min_points"] or len(np.unique(x)) < 3 or np.ptp(y) == 0:
         return {"direction": "inconclusive", "n": n,
                 "why": f"{n} usable points" if n < SETTINGS["min_points"] else "constant or categorical: undefined"}
+    tied = max(np.unique(v, return_counts=True)[1].max() for v in (x, y)) / n
+    if tied > SETTINGS["tie_share_max"]:
+        return {"direction": "inconclusive", "n": n, "why": f"heavily tied: one value holds {tied:.0%} of the points"}
     rho = float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
     zr, se = math.atanh(max(min(rho, 1 - 1e-12), -1 + 1e-12)), 1 / math.sqrt(n - 3)
     lo, hi = math.tanh(zr - SETTINGS["z"] * se), math.tanh(zr + SETTINGS["z"] * se)
     rmin = SETTINGS["rho_min"]
-    d = "increases" if lo > 0 and rho >= rmin else "decreases" if hi < 0 and rho <= -rmin \
-        else "negligible" if equivalence is not None and -equivalence <= lo and hi <= equivalence else "inconclusive"
+    d = "increases" if lo > 0 and rho >= rmin else "decreases" if hi < 0 and rho <= -rmin else "inconclusive"
     return {"direction": d, "rho": _r(rho), "ci": [_r(lo), _r(hi)], "n": n,
             "p": _r(math.erfc(abs(zr) / se / math.sqrt(2)))}
 
@@ -474,8 +516,8 @@ def summarise(sw, pairs=None, packages=None):
             "multiplicity": {"method": "Benjamini-Hochberg", "q": SETTINGS["fdr_q"], "tested": len(tested),
                              "discoveries": found, "p_cut": cut if cut >= 0 else None},
             "shadow_price": {"value": sw.lam, "source": sw.lam_source,
-                             "note": "the marginal funded package's benefit / cost: an upper bound on the budget row's "
-                                     "dual; paired results between options of different cost depend on it"},
+                             "note": "the budget row's recorded dual, or the value passed: paired results between "
+                                     "options of different cost depend on it"},
             "effects": eff, "flips": flips, "feature_correlations": corr,
             "domain": {f: [_r(x.min()), _r(x.max())] for f, x in sorted(sw.features.items())}}
 
@@ -498,8 +540,14 @@ def _match(row, where):
         x = row.get(f)
         if x is None or (isinstance(x, float) and not math.isfinite(x)):
             return None
-        if _band_ok(v) and not isinstance(x, str):
-            if not (v[0] <= float(x) <= v[1]):
+        if _band_ok(v):
+            try:
+                x = float(x)
+            except (TypeError, ValueError):
+                raise WorldModelError(f"filter {f}: value {x!r} is not a number under the numeric range {v}")
+            if not math.isfinite(x):
+                return None
+            if not (v[0] <= x <= v[1]):
                 return False
         elif str(x) not in {str(e) for e in (v if isinstance(v, list) else [v])}:
             return False
@@ -527,8 +575,13 @@ def _test(t, ctx):
         if nocol or absent or not hit:
             return "untestable", {"reason": f"{len(nocol)} units lack a filter column, {len(absent)} matching units "
                                             f"are missing from the plan, {len(hit)} match"}, "analysis/point.yaml", []
-        c = t["component"]
-        share = sum(c in sw.packages.get(plan[u], []) or plan[u] == c for u in hit) / len(hit)
+        if t.get("package"):
+            share = sum(plan[u] == t["package"] for u in hit) / len(hit)
+        else:
+            c = t["component"]
+            if not any(c in v for v in sw.packages.values()):
+                raise WorldModelError(f"plan_share: no package contains component {c!r}")
+            share = sum(c in sw.packages.get(plan[u], []) for u in hit) / len(hit)
         cut = float(t["min_share"])
         st = "supported" if share >= cut else "refuted" if share <= 1 - cut else "inconclusive"
         return st, {"share": _r(share), "units": len(hit)}, "analysis/point.yaml", hit
@@ -564,9 +617,14 @@ def _test(t, ctx):
         cut = float(t["min_share"])
         st = "supported" if cov >= cut else "refuted" if cov <= 1 - cut else "inconclusive"
         return st, dict(obs, coverage=_r(cov), median=_r(np.median(r[use]))), art, _ids(sw, use)
-    res = direction(sw.features[t["feature"]][use], r[use], t.get("equivalence"))
+    res = direction(sw.features[t["feature"]][use], r[use])
     got, want = res["direction"], t["direction"]
-    st = "supported" if got == want else "inconclusive" if got == "inconclusive" else "refuted"
+    if want == "negligible":           # judged on its equivalence bound alone, whatever the significance
+        eq, ci = float(t["equivalence"]), res.get("ci")
+        st = "inconclusive" if not ci else "supported" if -eq <= ci[0] and ci[1] <= eq else \
+            "refuted" if ci[0] > eq or ci[1] < -eq else "inconclusive"
+    else:
+        st = "supported" if got == want else "inconclusive" if got == "inconclusive" else "refuted"
     return (*_scope(sw, t, st, dict(obs, **res), use), art, _ids(sw, use))
 
 
@@ -580,14 +638,30 @@ def _scope(sw, t, st, obs, m):
         "a marginal association along a feature correlated with others does not settle a conditional claim")})
 
 
+def _constrained(t, b):
+    """The test as checked: its belief's conditions intersected into its `where` (a flip belief's condition on the
+    test's own feature locates the flip, so it is not applied)."""
+    conds = {c["feature"]: c["range"] for c in (b or {}).get("conditions") or []}
+    if (b or {}).get("direction") == "flips":
+        conds.pop(t.get("feature"), None)
+    if not conds:
+        return t
+    w = dict(t.get("where") or {})
+    for f, r in conds.items():
+        w = _intersect(w, f, r)
+    return dict(t, where=w)
+
+
 def check(hyps, ctx):
-    """Evaluate each hypothesis' refutation test against the run's artifacts; returns the hypotheses with status and
-    result (observed value, artifact, ids of the points or units used)."""
-    out = []
+    """Evaluate each hypothesis' refutation test, constrained by its belief's conditions (ctx["beliefs"]), against
+    the run's artifacts; returns the hypotheses with status and result (observed value, artifact, the test as
+    applied, ids of the points or units used)."""
+    out, by = [], ctx.get("beliefs") or {}
     for h in hyps:
-        st, obs, art, ids = _test(h["test"], ctx)
+        t = _constrained(h["test"], by.get(h.get("belief")))
+        st, obs, art, ids = _test(t, ctx)
         out.append(dict(h, status=st, result={"observed": obs, "artifact": art or "analysis/batch/results.jsonl",
-                                              "points": ids}))
+                                              "test_applied": t, "points": ids}))
     return out
 
 
@@ -720,7 +794,8 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
     summ = summarise(sw, pairs, pk)
     beliefs = seed["beliefs"] + _sim_beliefs(sw, summ)
     _conflicts(beliefs, sw)
-    checked = check(hyps, {"sweep": sw, "plan": plan, "units": units or {}})
+    checked = check(hyps, {"sweep": sw, "plan": plan, "units": units or {},
+                           "beliefs": {b["id"]: b for b in seed["beliefs"]}})
     hist = [e for e in (seed.get("track_record") or {}).get("history") or [] if isinstance(e, dict)]
     seen = {(e.get("test_sha"), e.get("evidence_sha")) for e in hist if e.get("test_sha")}
     plan_sha = _sha([plan, units]) if plan else None
@@ -729,7 +804,7 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
     for h in checked:
         on_plan = h["test"]["kind"] == "plan_share"
         ev_sha, ev_time = (plan_sha, plan_time) if on_plan else (sw.evidence_sha, sw.evidence_time)
-        key = (_sha(h["test"]), ev_sha)
+        key = (_sha(h["result"]["test_applied"]), ev_sha)
         reg, at = _when(h.get("registered_at")), _when(ev_time)
         post = reg is None or at is None or reg >= at
         again = key in seen
@@ -882,16 +957,46 @@ def _jobs(spec, design):
     return jobs
 
 
-def shadow_price(run_dir):
-    """(lambda, source): the cost-effectiveness of the marginal funded package of the point plan, or (None, why)."""
-    from toolkit.analysis.artifacts import read
-    if not os.path.isfile(os.path.join(run_dir, "analysis", "point.yaml")):
-        return None, "no analysis/point.yaml"
-    pu = (read(run_dir, "analysis/point.yaml")["data"].get("per_unit") or {}).values()
-    r = [float(v["benefit"]) / float(v["cost"]) for v in pu if _num(v.get("cost")) and v["cost"] > 0
-         and _num(v.get("benefit"))]
-    return (min(r), "analysis/point.yaml: least benefit / cost among units given a package (the marginal funded "
-                    "package)") if r else (None, "point.yaml has no funded unit")
+def shadow_price(point):
+    """(lambda, source) from a point plan's data: the budget row's recorded dual, or 0 when the plan records that its
+    budget does not bind; else (None, why). Never inferred from average benefit / cost."""
+    sol = (point or {}).get("solver") or {}
+    if _num(sol.get("budget_dual")) and sol["budget_dual"] >= 0:
+        return float(sol["budget_dual"]), "analysis/point.yaml solver.budget_dual (the budget row's dual)"
+    if sol.get("budget_slack") is True:
+        return 0.0, "analysis/point.yaml solver.budget_slack: the budget does not bind"
+    return None, "no recorded dual of the budget row (analysis/point.yaml solver.budget_dual): pass --shadow-price"
+
+
+def point_doc(run_dir, ident):
+    """analysis/point.yaml when it is bound to this run (its spec sha256, its engine identity and every input it
+    records match), None when absent; a stale or unbound plan is refused."""
+    from toolkit.analysis.artifacts import read, sha256
+    rel = "analysis/point.yaml"
+    if not os.path.isfile(os.path.join(run_dir, rel)):
+        return None
+    doc = read(run_dir, rel)
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        raise WorldModelError(f"{rel}: not an analysis artifact")
+    bad = [] if doc.get("spec_sha256") == sha256(os.path.join(run_dir, "decision_spec.yaml")) else ["the spec"]
+    bad += [] if doc["data"].get("engine_identity") == ident else ["the engine identity"]
+    bad += [p for p, h in (doc.get("inputs") or {}).items() if sha256(os.path.join(run_dir, p)) != h]
+    if bad:
+        raise WorldModelError(f"{rel} is not bound to this run: {bad} differ from what it was computed with")
+    return doc
+
+
+def consumed_inputs(spec, run_dir):
+    """{path relative to the run: sha256} of the data and settings files the world model reads beyond the spec and
+    the batch: the units table, the settings file and the engine choice. A missing one fails closed."""
+    from toolkit.analysis.artifacts import sha256
+    from toolkit.spec import schema
+    paths = [spec.resolve(spec["decision_units"]["csv"])] + ([spec.settings_path] if spec.settings_path else []) + \
+        ([os.path.join(run_dir, schema.ENGINE_CHOICE)] if getattr(spec, "engine_auto", False) else [])
+    out = {os.path.relpath(q, run_dir): sha256(q) for q in paths}
+    if any(v is None for v in out.values()):
+        raise WorldModelError(f"inputs the world model reads are missing: {[k for k, v in out.items() if v is None]}")
+    return out
 
 
 def load_sweep(run_dir, identity="current", lam=None):
@@ -961,8 +1066,9 @@ def load_sweep(run_dir, identity="current", lam=None):
             F[n_].append(float(v))
     groups = {c: (d or {}).get("group") for c, d in spec["options"]["components"].items() if (d or {}).get("group")}
     kinds = {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
-    arts = {rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}
-    lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price(run_dir)
+    arts = dict({rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}, **consumed_inputs(spec, run_dir))
+    point = point_doc(run_dir, ident)
+    lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price((point or {}).get("data"))
     try:        # when the evidence existed: the analysis manifest's finish time, else the results file's mtime
         et, ets = json.load(open(os.path.join(run_dir, "analysis", "manifest.json")))["finished_at"], "manifest"
     except (OSError, ValueError, KeyError, TypeError):
@@ -974,6 +1080,7 @@ def load_sweep(run_dir, identity="current", lam=None):
                 evidence_time={"value": et, "source": ets})
     sw = Sweep(F, pk, spec.comparator, burden, y, cost, groups, [p["point"] for p in design["points"]], kinds,
                arts, lam_v, lam_s, discount_factor(spec), evidence_time=et)
+    sw.point = point
     return sw, spec
 
 
@@ -982,10 +1089,9 @@ def load_plan(run_dir, spec, sw):
     value), or (None, None, None) when the run has no optimised plan. A plan missing units is kept as it is: a
     plan_share test over a missing unit is untestable."""
     from toolkit.analysis import features as FT
-    from toolkit.analysis.artifacts import read
-    if not os.path.isfile(os.path.join(run_dir, "analysis", "point.yaml")):
+    doc = getattr(sw, "point", None)          # bound to the run by load_sweep (point_doc)
+    if doc is None:
         return None, None, None
-    doc = read(run_dir, "analysis/point.yaml")
     d = doc["data"]
     plan = {str(k): v for k, v in d["plan"].items()}
     bad = sorted(set(plan.values()) - set(sw.packages))
@@ -1038,7 +1144,7 @@ def _cli(argv):
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
     for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)
-        _safe_io().write_nofollow(out, name, yaml.safe_dump(json.loads(json.dumps(doc)), sort_keys=False,
+        _safe_io().write_nofollow(out, name, yaml.safe_dump(_rounded(json.loads(json.dumps(doc))), sort_keys=False,
                                                            width=110).encode(), atomic=True)
     st = {}
     for h in hy["hypotheses"]:
@@ -1102,7 +1208,7 @@ def _seed():
             {"id": "H4", "registered_at": REGISTERED, "belief": "B2", "claim": "B's effect increases with f1",
              "test": {"kind": "effect_direction", "package": "B", "feature": "f1", "direction": "increases"}},
             {"id": "H5", "registered_at": REGISTERED, "belief": "B3", "claim": "most low-f1 units get A",
-             "test": {"kind": "plan_share", "component": "A", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
+             "test": {"kind": "plan_share", "package": "A", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
 
 
 def _one(sw, t, plan=None, units=None):
@@ -1549,7 +1655,8 @@ def _self_test() -> int:
         s1, r1 = _one(cs, dict(t, equivalence=0.3))
         s2, r2 = _one(cs, dict(t, equivalence=0.16))
         ok(s1 == "supported" and s2 == "inconclusive", "WM47 an equivalence claim is judged on its bound, whatever the "
-           f"significance (interval inside 0.3: supported; crossing 0.16: inconclusive): {s1} {r1['observed'].get('ci')}"
+           f"significance (interval inside 0.3: supported; crossing 0.16: inconclusive): {s1} "
+           f"{r1['observed'].get('ci')}"
            f", {s2}")
     tryit("WM47 equivalence", wm47)
 
