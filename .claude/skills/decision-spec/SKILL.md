@@ -205,6 +205,20 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   test at both ends of its declared range, and each output is classed `determined_by_data` or
   `set_by_declared_ranges`.
 
+## Engine benchmarks that are not in band
+
+An engine is not eligible for a component the options use when a benchmark covering it (the engine's
+`benchmark_coverage.yaml`) is `out_of_band`, `not_assessable` or `band_mis_based` in its verified record.
+The pre-sign check names each such benchmark. Prefer options and an engine the evidence supports. When the
+decision still needs that engine, declare a departure for the owner to sign, never a silent one:
+
+    engine_departures:
+      - {engine: <card name>, benchmark: <id>, reason: "<why the decision may still use it>",
+         decision_test: <an analysis.decision_tests id that moves the effect over the trial's range>}
+      # or, instead of decision_test: no_decision_test_because: "<why no test can be computed>"
+
+The report declares each signed departure as a limitation.
+
 ## What not to do
 
 - Do not type a result, an effect size from the data, or an interval into the spec: the
