@@ -1,0 +1,307 @@
+beliefs:
+- id: B1
+  mechanism: Early campaign protects ~50% reach x booster efficacy of susceptibles before transmission; through
+    the final-size relation the relative reduction in infections exceeds the protected share (indirect effect),
+    approaching 1 where the post-campaign Reff falls below 1 and shrinking toward the protected share (~0.3) where
+    Reff is ~2.
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.97
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (location within paper not checked)
+  - citation: Andrews N et al. Covid-19 Vaccine Effectiveness against the Omicron (B.1.1.529) Variant. N Engl J
+      Med 2022
+    location: booster VE vs symptomatic infection by weeks since dose (figure; exact panel not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Relative reduction from the early campaign falls as the share susceptible rises: higher s0 means higher
+    Reff, a larger post-vaccination epidemic and a smaller herd effect (absolute infections averted still rise).'
+  about:
+    package: early
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 5 (vaccination and herd immunity); page not checked
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: high
+- id: B3
+  mechanism: The early campaign acts at day 0, before meaningful depletion, so the seed share (which only sets timing,
+    not final size, in a closed population) barely changes its relative reduction.
+  about:
+    package: early
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (location within paper not checked)
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'The late campaign at day 42 loses value the further the wave has progressed: a higher seed share puts
+    the city closer to (or past) its peak by day 42, so more infections have already happened and more doses go
+    to already-immune residents. Holds only if the engine represents the campaign''s timing.'
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  conditions:
+  - feature: s0
+    range:
+    - 0.75
+    - 0.9403
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: growth rate vs R relation for SEIR generation intervals (equation location not checked)
+  - citation: Matrajt L, Longini IM. Optimizing vaccine allocation at different points in time during an epidemic.
+      PLoS ONE 2010
+    location: results on vaccination timing vs epidemic phase (section not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Where the wave is slow or lightly seeded, day 42 is well before the peak (cumulative infections ~1%
+    or less), so the late campaign's 80% reach protects more susceptibles than the early 50% and late beats early
+    at equal cost.
+  about:
+    pair:
+    - early
+    - late
+    feature: seed_share
+  direction: increases
+  conditions:
+  - feature: seed_share
+    range:
+    - 1.09e-06
+    - 0.0001
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: growth rate vs R relation (equation location not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: The early/late choice flips toward early only in fast, heavily seeded cities (high s0 and seed share
+    of a few 1e-4 or more), where day 42 is within ~1-2 doubling times of the peak. Elsewhere late wins. The flip
+    may be one-sided (early never wins) if the efficacy draws or engine timing make late dominate.
+  about:
+    pair:
+    - early
+    - late
+    feature: seed_share
+  direction: flips
+  conditions:
+  - feature: seed_share
+    range:
+    - 0.00015
+    - 0.00079664
+  - feature: s0
+    range:
+    - 0.8
+    - 0.9403
+  source_type: literature
+  evidence:
+  - citation: Matrajt L, Longini IM. Optimizing vaccine allocation at different points in time during an epidemic.
+      PLoS ONE 2010
+    location: results on vaccination timing vs epidemic phase (section not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: The late campaign (80% reach x efficacy) protects ~0.3-0.6 of susceptibles; in most cities it is still
+    ahead of the peak, so its relative reduction is larger than early's, ~0.4 to near 1.
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.99
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Andrews N et al. Covid-19 Vaccine Effectiveness against the Omicron (B.1.1.529) Variant. N Engl J
+      Med 2022
+    location: booster VE vs symptomatic infection by weeks since dose (figure; exact panel not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: Both timings cost ~US$3 per resident, so within a city the choice is decided by benefit alone; the
+    US$30M budget (~10M residents) decides which cities are boosted at all, ranked by infections averted per resident
+    (high s0 cities avert most in absolute terms). If total population is near 10M the budget barely binds.
+  about:
+    pair:
+    - early
+    - late
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 5; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The early campaign's relative reduction in infections lies in 0.3-0.97 at >=75% of usable points.
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.3
+    - 0.97
+    min_share: 0.75
+- id: H2
+  belief: B2
+  claim: The early campaign's relative reduction decreases with s0 (Spearman interval below 0).
+  test:
+    kind: effect_direction
+    package: early
+    feature: s0
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: The early campaign's relative reduction is unaffected by seed_share (|rho| bound within 0.2).
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.2
+- id: H4
+  belief: B4
+  claim: In high-s0 cities the late campaign's relative reduction decreases with seed_share; refuted if it does
+    not.
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: With seed_share <= 1e-4, late beats early at >=75% of usable points.
+  test:
+    kind: paired_sign
+    a: late
+    b: early
+    feature: seed_share
+    range:
+    - 1.09e-06
+    - 0.0001
+    sign: positive
+    min_share: 0.75
+- id: H6
+  belief: B6
+  claim: Among cities with s0 >= 0.8, the late-to-early transition along seed_share lies above 1.5e-4.
+  test:
+    kind: flip_in
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 0.00015
+    - 0.00079664
+- id: H7
+  belief: B7
+  claim: The late campaign's relative reduction lies in 0.4-0.99 at >=70% of usable points.
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.4
+    - 0.99
+    min_share: 0.7
+open_questions:
+- id: Q1
+  question: Does the engine represent the day-42 timing of the late campaign (infections before day 42, doses wasted
+    on the recently infected), or apply all interventions before the epidemic so late is simply 80% reach? If the
+    latter, late dominates everywhere and the question's rule (when waiting misses the peak) cannot be answered.
+  beliefs:
+  - B4
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: What are the booster's efficacy against infection, early vs late, and does protection need 1-2 weeks
+    to build after the dose?
+  beliefs:
+  - B1
+  - B7
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: How does the contact_rate calibration scale map to R0 (1.4-2.2), and so which cities are near Reff 1
+    where the herd effect is strongest?
+  beliefs:
+  - B1
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does the total population of the 24 cities exceed the ~10M residents the budget can cover, making the
+    budget bind?
+  beliefs:
+  - B8
+  decision_relevant: true
