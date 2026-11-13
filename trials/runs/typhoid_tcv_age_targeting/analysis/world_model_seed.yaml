@@ -1,0 +1,290 @@
+beliefs:
+- id: B1
+  mechanism: TCV direct protection in vaccinated children is about 80% over 2-4 years (trials). At 80% coverage
+    that is roughly a 0.6-0.7 reduction in the targeted age band. u5 covers only the 9m-4y band, which carries a
+    minority (roughly 8-25%) of all-age district cases, so its whole-population relative reduction is small
+  about:
+    package: u5
+  direction: reduces
+  magnitude:
+    band:
+    - 0.04
+    - 0.22
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Shakya M et al. Phase 3 Efficacy Analysis of a Typhoid Conjugate Vaccine Trial in Nepal. N Engl J
+      Med 2019
+    location: Abstract / Table 2 (efficacy 81.6%)
+  - citation: Patel PD et al. Safety and Efficacy of a Typhoid Conjugate Vaccine in Malawian Children. N Engl J
+      Med 2021
+    location: Abstract (efficacy ~80.7%)
+  - citation: 'Qadri F et al. Protection by vaccination of children against typhoid fever with a Vi-tetanus toxoid
+      conjugate vaccine in urban Bangladesh: a cluster-randomised trial. Lancet 2021'
+    location: Abstract (~85% total protection)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: wide covers 9m-14y, the age bands that carry the majority (roughly 40-75%) of blood-culture-confirmed
+    typhoid. Its whole-population relative reduction is several times that of u5. A small indirect effect on adults
+    may add a few points
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Shakya M et al. Efficacy of typhoid conjugate vaccine in Nepal: final results of a phase 3, randomised,
+      controlled trial. Lancet Glob Health 2021'
+    location: Abstract (~79% over 4 years; durability)
+  - citation: 'Marks F et al. Incidence of invasive salmonella disease in sub-Saharan Africa: a multicentre population-based
+      surveillance study. Lancet Glob Health 2017'
+    location: age-specific incidence table (exact table number uncertain)
+  - citation: 'Garrett DO et al. Incidence of typhoid and paratyphoid fever in Bangladesh, Nepal, and Pakistan:
+      results of the Surveillance for Enteric Fever in Asia Project. Lancet Glob Health 2022'
+    location: age-specific incidence (table number uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: The share of district burden in 5-14-year-olds rises with inc_5_14, so wide's relative reduction increases
+    with inc_5_14
+  about:
+    package: wide
+    feature: inc_5_14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Shakya M et al. Phase 3 Efficacy Analysis of a Typhoid Conjugate Vaccine Trial in Nepal. N Engl J
+      Med 2019
+    location: Abstract
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: u5's relative reduction increases with inc_u5, because the targeted band's share of burden grows
+  about:
+    package: u5
+    feature: inc_u5
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Patel PD et al. Safety and Efficacy of a Typhoid Conjugate Vaccine in Malawian Children. N Engl J
+      Med 2021
+    location: Abstract
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: The relative reduction is a ratio of rates and does not depend on district population size. pop moves
+    total cases averted and cost, not the relative effect
+  about:
+    package: wide
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Qadri F et al. Protection by vaccination of children against typhoid fever with a Vi-tetanus toxoid
+      conjugate vaccine in urban Bangladesh: a cluster-randomised trial. Lancet 2021'
+    location: Abstract
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Where 5-14 incidence is high, the extra US$0.70 per resident for wide averts more cases than the budget's
+    marginal use, so wide beats u5 on net benefit
+  about:
+    pair:
+    - wide
+    - u5
+  direction: increases
+  conditions:
+  - feature: inc_5_14
+    range:
+    - 0.0018
+    - 0.002925
+  source_type: literature
+  evidence:
+  - citation: 'Garrett DO et al. Incidence of typhoid and paratyphoid fever in Bangladesh, Nepal, and Pakistan:
+      results of the Surveillance for Enteric Fever in Asia Project. Lancet Glob Health 2022'
+    location: age-specific incidence (table number uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Where 5-14 incidence is low, the extra spend for wide buys few cases, so u5 beats wide at a binding
+    budget's shadow price
+  about:
+    pair:
+    - wide
+    - u5
+  direction: decreases
+  conditions:
+  - feature: inc_5_14
+    range:
+    - 0.000308
+    - 0.0008
+  source_type: literature
+  evidence:
+  - citation: 'Marks F et al. Incidence of invasive salmonella disease in sub-Saharan Africa: a multicentre population-based
+      surveillance study. Lancet Glob Health 2017'
+    location: age-specific incidence table (exact table number uncertain)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: Indirect (herd) protection of unvaccinated adults from child campaigns is small and uncertain. The
+    Bangladesh cluster trial did not show clear indirect protection, so the adult-group effect of either option
+    is a minor term
+  about:
+    component: wide
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Qadri F et al. Protection by vaccination of children against typhoid fever with a Vi-tetanus toxoid
+      conjugate vaccine in urban Bangladesh: a cluster-randomised trial. Lancet 2021'
+    location: indirect-protection results (location uncertain)
+  confidence: low
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What are the population shares of 9m-4y and 5-14y in each district? They set each option's burden share
+    and cases averted per $, and units.csv gives only total population.
+  beliefs:
+  - B1
+  - B2
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: What is the budget's shadow price? It locates where along inc_5_14 (and the ratio inc_5_14/inc_u5) wide
+    stops beating u5.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: How large is the indirect effect on adults (engine lrr:*:c_adult)? A non-trivial herd effect favours
+    wide in high-adult-incidence districts.
+  beliefs:
+  - B8
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: Does blood-culture surveillance under-ascertain cases differently by age (more blood drawn from older
+    children)? Differential ascertainment would bias the u5/wide comparison.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q5
+  question: How fast does protection wane over 2026-2028 in under-2s compared with older children?
+  beliefs:
+  - B1
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: u5's whole-population relative reduction in cases lies in 0.04-0.22 at >=70% of points
+  test:
+    kind: effect_band
+    package: u5
+    band:
+    - 0.04
+    - 0.22
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: wide's whole-population relative reduction lies in 0.25-0.60 at >=70% of points
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.25
+    - 0.6
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: wide's relative reduction increases with inc_5_14
+  test:
+    kind: effect_direction
+    package: wide
+    feature: inc_5_14
+    direction: increases
+- id: H4
+  belief: B4
+  claim: u5's relative reduction increases with inc_u5
+  test:
+    kind: effect_direction
+    package: u5
+    feature: inc_u5
+    direction: increases
+- id: H5
+  belief: B5
+  claim: wide's relative reduction does not depend on pop (|rho| bound inside 0.25)
+  test:
+    kind: effect_direction
+    package: wide
+    feature: pop
+    direction: negligible
+    equivalence: 0.25
+- id: H6
+  belief: B6
+  claim: wide beats u5 on net benefit at >=70% of points with inc_5_14 >= 0.0018
+  test:
+    kind: paired_sign
+    a: wide
+    b: u5
+    feature: inc_5_14
+    range:
+    - 0.0018
+    - 0.002925
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: u5 beats wide on net benefit at >=60% of points with inc_5_14 <= 0.0008
+  test:
+    kind: paired_sign
+    a: wide
+    b: u5
+    feature: inc_5_14
+    range:
+    - 0.000308
+    - 0.0008
+    sign: negative
+    min_share: 0.6
