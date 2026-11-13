@@ -10,7 +10,8 @@ Spec (optional section; checked by toolkit/spec/schema.py, no values in code):
         csv: data/burden_references.csv   # the reference estimates, under the contract below
         group: region                     # the units-table column the references' groups name (default: the region)
         arm: none                         # the continuation package (default: the comparator)
-        daly_parts: {dalys: dalys, deaths: deaths, yll_per_death: {<population group> | all: <number | parameter>}}
+        daly_parts: {dalys: dalys, deaths: deaths, cases: cases,
+                     yll_per_death_by_age: {<engine age group>: <number | parameter>}}   # YLL from per-age deaths
         window: [2019, 2024]              # optional (S2-5b): the years the model value is averaged over (default: the
                                           # decision window); inside the simulated horizon
         window_metrics: {cases: {<population group>: <metric>}}   # with window: per outcome and population group,
@@ -42,7 +43,7 @@ uncertainty source `burden_anchor` (declared or excluded whenever an anchor has 
 external value from a lognormal whose central 95% is [lower, upper], from its own seeded stream. `cost_scaling:
 {cost output: anchored outcome}` scales burden-driven cost outputs (the rest are declared not burden-driven; the sheet
 shows both). A reported DALY outcome that is not anchored itself follows its anchored parts through daly_parts
-(deaths, cases, yll_per_death `all`), else the spec is refused. An anchor may derive from a calibration source (it
+(deaths, cases, and the model's own YLL from yll_per_death_by_age), else the spec is refused. An anchor may derive from a calibration source (it
 sets a level, it validates nothing; the artifact records the overlap), but no other row may share an anchor's source.
 
 Independence is declared, not inferred: every calibration input names its source ids (observation targets per row in
@@ -83,6 +84,7 @@ TOLERANCES = ("ratio", "overlap")
 STATUSES = ("within", "outside", "information", "unmatched")
 OPTIONAL = {"role": ("checked", "report_only", "anchor"), "interval": ("published", "none")}  # blank = the first
 ANCHOR = "anchor"                   # S2-5d: a row that sets its group's absolute level (anchor_factors)
+YLL_OUT = "__yll"                   # #220 r3: the model's YLL, derived per engine age group (yll_weights)
 GROUP_PREFIX = "group_"             # reserved: automatic names of anchor groups with several rows (anchor_groups)
 WINDOW = "burden_validation"        # the engine's named window for validation.burden.window
 
@@ -309,18 +311,19 @@ def load_references(s, data=None) -> tuple[list[dict], list[str]]:
         bad.append(f"{P}.arm: {cfg['arm']!r} is not a package")
     dp = cfg["daly_parts"]
     if dp is not None:
-        y = dp.get("yll_per_death") if isinstance(dp, dict) else None
         names = {p.name for p in s.engine().parameters()}
         ya = dp.get("yll_per_death_by_age") if isinstance(dp, dict) else None
         ages = set(s.engine().describe().age_groups)
+        if isinstance(dp, dict) and "yll_per_death" in dp:     # #220 r3: deprecated, refused with the new route
+            bad.append(f"{P}.daly_parts.yll_per_death: a constant per death misstates YLL whenever a package shifts the "
+                       "ages of deaths; declare daly_parts.yll_per_death_by_age instead ({every engine age group: a "
+                       "positive number or an engine parameter}): the harness derives YLL from the engine's own deaths "
+                       "of each age group")
         if not isinstance(dp, dict) or set(dp) - {"dalys", "deaths", "cases", "yll_per_death", "yll_per_death_by_age"} or (
-                y is not None and not (isinstance(y, dict) and (set(y) == {"all"} or set(y) == set(pops))
-                                       and all((_num(x) or 0) > 0 or x in names for x in y.values()))) or (
                 ya is not None and not (isinstance(ya, dict) and set(ya) == ages
                                         and all((_num(x) or 0) > 0 or x in names for x in ya.values()))):
-            bad.append(f"{P}.daly_parts: {{dalys, deaths, cases, yll_per_death: {{all or every population group: a positive "
-                       "number or an engine parameter}}, yll_per_death_by_age (optional): {{every engine age group "
-                       f"{sorted(ages)}: the same}}}}")
+            bad.append(f"{P}.daly_parts: {{dalys, deaths, cases, yll_per_death_by_age: {{every engine age group "
+                       f"{sorted(ages)}: a positive number or an engine parameter}}}}")
     if not isinstance(cfg["csv"], str) or not cfg["csv"]:
         return [], bad + [f"{P}.csv: the reference estimates file"]
     if "\\" in cfg["csv"]:          # refused before any read (Codex #165 r5)
@@ -480,12 +483,9 @@ def _anchor_problems(s, cfg, refs, wm, P) -> list[str]:
     why = why or why2
     if why:
         bad.append(f"{P}: {why}")
-    if chk and chk["outcome"] in (wm or {}) and not set(wm[chk["outcome"]]) <= set(wm.get(chk["deaths"]) or {}):
-        bad.append(f"{P}.window_metrics: {chk['outcome']} is anchored directly and needs {chk['deaths']} in the model "
-                   "window for the same population groups (its YLD check)")
-    if comp and comp["outcome"] in (wm or {}) and not set(wm[comp["outcome"]]) <= set(wm.get(comp["deaths"]) or {}):
-        bad.append(f"{P}.window_metrics: {comp['outcome']} is built from anchored outcomes (daly_parts) and needs "
-                   f"{comp['deaths']} in the model window for the same population groups")
+    if comp and comp["outcome"] in (wm or {}):     # #220 r3: the window has no YLL to compose DALYs from
+        bad.append(f"{P}.window_metrics: {comp['outcome']} is built from anchored outcomes (daly_parts) and the model "
+                   "window carries no YLL; leave it out of window_metrics, or anchor it directly")
     u = s.raw.get("uncertainty") or {}
     inc = {x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)}
     exc = {x.get("kind") for x in u.get("excluded") or [] if isinstance(x, dict) and str(x.get("reason") or "").strip()}
@@ -661,17 +661,15 @@ def _daly_parts(A, cfg, arm, out0, by_pop, point) -> dict:
     av = point["averted"]
     if av[de] > 0:
         res["dalys_averted_per_death_averted"] = av[dn] / av[de]
-    y = dp.get("yll_per_death")
+    has = all(YLL_OUT in out0[i]["y"][arm] for i in A.ids)
     tot = sum(out0[i]["y"][arm][dn] for i in A.ids)
-    if not y or tot <= 0:
-        res["statement"] = "share from deaths not computed: " + ("no yll_per_death declared" if not y else "no DALYs")
+    if not has or tot <= 0:
+        res["statement"] = "share from deaths not computed: " + ("no daly_parts.yll_per_death_by_age declared"
+                                                                 if not has else "no DALYs")
         return res
-    if "all" in y:
-        yll = sum(out0[i]["y"][arm][de] for i in A.ids) * _param(A, y["all"])
-    else:
-        yll = sum(by_pop[b][i]["y"][arm][de] * _param(A, x) for b, x in y.items() for i in A.ids)
-    res["deaths_share_of_dalys"] = yll / tot
-    res["statement"] = "deaths x declared years of life lost per death, over the arm's DALYs in the window"
+    res["deaths_share_of_dalys"] = sum(out0[i]["y"][arm][YLL_OUT] for i in A.ids) / tot     # #220 r3: model's YLL
+    res["statement"] = ("the model's YLL (deaths of each engine age group x its years of life lost per death) over "
+                        "the arm's DALYs in the window")
     return res
 
 
@@ -679,9 +677,7 @@ def run(A, out0, z0, point, col: Collector, level=0.95, events0=()) -> dict:
     """The burden_validation artifact's payload. `events0`: the point evaluation's model corrections."""
     cfg, arm, refs = col.cfg, col.cfg["arm"], col.refs
     guard_point(A, arm, events0)
-    yp = (cfg["daly_parts"] or {}).get("yll_per_death") or {}
-    bands = sorted({r["age_band"] for r in refs if r["age_band"] and not r["window"]} | ({b for b in yp
-                                                                                           if b != "all"}))
+    bands = sorted({r["age_band"] for r in refs if r["age_band"] and not r["window"]})
     by_pop = by_population(A, A.theta0, z0, bands, arm) if bands else {}
     rows = []
     for r in refs:
@@ -722,55 +718,67 @@ def anchor_rows(refs) -> list[dict]:
 
 
 def _daly_composition(outcomes, cfg, anchored) -> tuple[dict | None, str | None]:
-    """(composition, problem). A reported DALY outcome that is not anchored itself follows its anchored parts:
-    YLL = deaths x yll_per_death, YLD = DALYs - YLL, anchored DALYs = f_deaths x YLL + f_cases x YLD (f = 1 for an
-    outcome with no anchor). None when no DALY outcome is reported, it is anchored itself, or nothing else is. A problem
-    when daly_parts cannot say how: DALYs are never left unanchored silently."""
+    """(composition, problem). A reported DALY outcome that is not anchored itself follows its anchored parts with the
+    model's own split (#220 r3): YLL is the model's (derived per engine age group: yll_weights), YLD = DALYs - YLL, and
+    anchored DALYs = DALYs + (f_deaths - 1) x YLL + (f_cases - 1) x YLD (f = 1 for an outcome with no anchor). None
+    when no DALY outcome is reported, it is anchored itself, or nothing else is. A problem when daly_parts cannot say
+    how: DALYs are never left unanchored silently."""
     dp = cfg["daly_parts"] if isinstance(cfg["daly_parts"], dict) else {}
     dn, de, dc = dp.get("dalys", "dalys"), dp.get("deaths", "deaths"), dp.get("cases", "cases")
     parts = set(anchored) - {dn}
     if dn not in outcomes or dn in anchored or not parts:
         return None, None
-    y = dp.get("yll_per_death")
     why = ("none is declared" if not dp else f"{de} is not reported" if de not in outcomes else
-           "yll_per_death must be {all: <number | parameter>} (by population group needs deaths by group, which the "
-           "evaluation does not carry)" if not (isinstance(y, dict) and set(y) == {"all"}) else
+           "daly_parts.yll_per_death_by_age is needed (each engine age group's years of life lost per death, so YLL "
+           "is the model's own)" if not dp.get("yll_per_death_by_age") else
            f"the anchored {sorted(parts - {de, dc})} are neither daly_parts.deaths nor daly_parts.cases"
            if parts - {de, dc} else None)
     if why:
         return None, (f"{dn} is reported and built from the anchored {sorted(parts)}: validation.burden.daly_parts must "
                       f"say how ({why}); DALYs are never left unanchored")
-    return {"outcome": dn, "deaths": de, "cases": dc, "yll_per_death": y["all"],
-            "yll_per_death_by_age": dp.get("yll_per_death_by_age"),
-            "statement": f"{dn} = f({de}) x {de} x years of life lost per death + f({dc}) x the rest; f = 1 for an "
+    return {"outcome": dn, "deaths": de, "cases": dc, "yll": YLL_OUT,
+            "statement": f"{dn} + (f({de}) - 1) x YLL + (f({dc}) - 1) x YLD, with the model's own YLL (deaths of each "
+                         f"engine age group x its years of life lost per death) and YLD = {dn} - YLL; f = 1 for an "
                          "outcome with no anchor"}, None
 
 
 def _daly_check(outcomes, cfg, anchored) -> tuple[dict | None, str | None]:
-    """(check, problem). Review r2: DALYs anchored directly beside reported deaths must keep YLD = DALYs - deaths x
-    yll_per_death >= 0 in every evaluation (point and draws); daly_parts.yll_per_death `all` says how."""
+    """(check, problem). DALYs anchored directly beside reported deaths must stay at or above the anchored YLL (the
+    model's YLL x the deaths factor) wherever the model reports YLL (totals and engine age groups)."""
     dp = cfg["daly_parts"] if isinstance(cfg["daly_parts"], dict) else {}
     dn, de = dp.get("dalys", "dalys"), dp.get("deaths", "deaths")
     if dn not in anchored or de not in outcomes:
         return None, None
-    y = dp.get("yll_per_death")
-    if not (isinstance(y, dict) and set(y) == {"all"}):
-        return None, (f"{dn} is anchored directly and {de} is reported: daly_parts.yll_per_death {{all: <number | "
-                      f"parameter>}} is needed to check that YLD = {dn} - {de} x yll_per_death stays >= 0")
-    ya = dp.get("yll_per_death_by_age")
-    return {"outcome": dn, "deaths": de, "yll_per_death": y["all"], "yll_per_death_by_age": ya,
-            "aggregate": ("checked with age-specific years of life lost per death, weighted by the deaths of each age "
-                          "group where they are known, else at the smallest age-specific value (a bound that holds "
-                          "under any age mix)" if ya else "not checked: only an all-age yll_per_death is declared, "
-                          "and a package that shifts the deaths' ages changes it (declare "
-                          "daly_parts.yll_per_death_by_age to check it)"),
-            "grouped": ("checked per engine age group (y_group) with daly_parts.yll_per_death_by_age wherever the "
-                        "outcome model reports grouped outcomes (direct engine runs; the emulator predicts totals, so "
-                        "there it does not apply), and per population group in the model window (its engine age "
-                        "group's value, or the smallest of its age groups')"
-                        if ya else "not checked: only an all-age yll_per_death is declared, and an age group's years "
-                        "of life lost per death differ (declare daly_parts.yll_per_death_by_age to check them); on the "
-                        "emulator path there are no grouped outcomes either")}, None
+    if not dp.get("yll_per_death_by_age"):
+        return None, (f"{dn} is anchored directly and {de} is reported: daly_parts.yll_per_death_by_age (each engine "
+                      f"age group's years of life lost per death) is needed to check that anchored {dn} stay at or "
+                      "above the anchored YLL")
+    return {"outcome": dn, "deaths": de, "yll": YLL_OUT,
+            "statement": f"anchored {dn} >= the model's YLL x f({de}), in the totals and per engine age group where "
+                         "the outcome model reports them (direct engine runs; the emulator predicts totals)"}, None
+
+
+def yll_weights(spec) -> tuple[str, dict] | None:
+    """(deaths outcome, {engine age group: years of life lost per death}) when validation.burden.daly_parts declares
+    yll_per_death_by_age: the outcome models then derive YLL (YLL_OUT) from the engine's own per-age deaths."""
+    dp = (section(getattr(spec, "raw", None)) or {}).get("daly_parts")
+    ya = dp.get("yll_per_death_by_age") if isinstance(dp, dict) else None
+    return (dp.get("deaths", "deaths"), dict(ya)) if isinstance(ya, dict) and ya else None
+
+
+def with_yll(res, info, value) -> dict:
+    """An engine result with per_capita[YLL_OUT][g] = per_capita[deaths][g] x g's years of life lost per death, per
+    engine age group (before any aggregation over population bands, so mixed-age or repeated-age bands add up).
+    `value`: a number or engine parameter name -> its value in this run."""
+    de, ya = info
+    d = (res.get("per_capita") or {}).get(de)
+    if not isinstance(d, dict):
+        raise ValueError(f"YLL: the engine result has no per-capita {de} by age group")
+    miss = sorted(set(d) - set(ya))
+    if miss:
+        raise ValueError(f"YLL: engine age groups {miss} have no daly_parts.yll_per_death_by_age")
+    return dict(res, per_capita=dict(res["per_capita"], **{YLL_OUT: {g: float(v) * float(value(ya[g]))
+                                                                     for g, v in d.items()}}))
 
 
 def _row_scale(U, cfg, r) -> float:
@@ -857,32 +865,25 @@ def anchor_object(A, cfg, record) -> dict:
         raise AnchorError(why or why2)
     return {"rows": rows, "units": {i: {o: v[0] for o, v in d.items()} for i, d in units.items()},
             "arm": record["arm"], "dalys": comp, "daly_check": chk,
-            "pop_ages": {P: list(pm["age_groups"]) for P, pm in A.spec["decision_units"]["populations"].items()},
             "cost_scaling": dict(record.get("cost_scaling") or {}), "record": record}
 
 
-def _scale(d, fu, comp, yll_pd, where, ratio=None):
-    """Scale one outcome dict by its unit's factors; a DALY outcome built from anchored parts is f_deaths x YLL +
-    f_cases x YLD with YLL = deaths x `yll_pd` (the dict's years of life lost per death), or, with `ratio` (a grouped
-    value whose ages have no YLL of their own), its raw value times the total's composed / raw ratio."""
+def _scale(d, fu, comp, where):
+    """Scale one outcome dict by its unit's factors (the model's YLL with the deaths factor). A DALY outcome built
+    from anchored parts is DALYs + (f_deaths - 1) x YLL + (f_cases - 1) x YLD with the dict's own YLL and YLD =
+    DALYs - YLL (exactly the model's DALYs at factors 1). A YLD below zero (an emulator's DALYs below its YLL) counts
+    as zero."""
     orig = dict(d)
     for o, x in fu.items():
         if o in d:
             d[o] = orig[o] * x
     if comp and comp["outcome"] in d:
-        if ratio is not None:
-            d[comp["outcome"]] = orig[comp["outcome"]] * ratio
-            return
-        if comp["deaths"] not in orig:
-            raise AnchorError(f"{where}: {comp['outcome']} is built from anchored outcomes but {comp['deaths']} is not "
-                              "beside it in the outputs")
-        dal, yll = orig[comp["outcome"]], orig[comp["deaths"]] * yll_pd
-        yld = dal - yll
-        if yld < -1e-9 * max(abs(dal), 1.0):
-            raise AnchorError(f"{where}: YLD {yld:.4g} = {comp['outcome']} {dal:.4g} - {comp['deaths']} "
-                              f"{orig[comp['deaths']]:.4g} x {yll_pd:.4g} years per death is negative: daly_parts does "
-                              "not decompose this outcome")
-        d[comp["outcome"]] = fu.get(comp["deaths"], 1.0) * yll + fu.get(comp["cases"], 1.0) * max(yld, 0.0)
+        if comp["yll"] not in orig:
+            raise AnchorError(f"{where}: {comp['outcome']} is built from anchored outcomes but the model's YLL is not "
+                              "beside it (daly_parts.yll_per_death_by_age)")
+        dal, yll = orig[comp["outcome"]], orig[comp["yll"]]
+        d[comp["outcome"]] = (dal + (fu.get(comp["deaths"], 1.0) - 1.0) * yll
+                              + (fu.get(comp["cases"], 1.0) - 1.0) * max(dal - yll, 0.0))
 
 
 def _groups(bg):
@@ -895,13 +896,10 @@ def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_
     window burden, by population group too) and the cost outputs in cost_scaling, are multiplied by the unit's factor:
     the row's external value (the draw's, in `sampled` as anchor:<id>, else the point) over THIS evaluation's model
     value for its group (every member must be evaluated: Analysis.evaluate widens a partial evaluation to whole
-    groups), so the anchored level is the external one in every evaluation. `param`: a yll value (the evaluation's
-    parameters); `factors`: fixed factors by row; `unit_factors`: {unit: {outcome: factor}} (the boundary check);
-    `skip`: {unit: packages left as they are}. Years of life lost per death are age-specific
-    (daly_parts.yll_per_death_by_age) wherever the deaths' ages are known (#220 r2). The model's own dicts are never
-    changed (a model may return the same objects twice). Returns the factors."""
+    groups), so the anchored level is the external one in every evaluation. `factors`: fixed factors by row;
+    `unit_factors`: {unit: {outcome: factor}} (the boundary check); `skip`: {unit: packages left as they are}. DALYs
+    follow the model's own YLL and YLD (#220 r3). The model's own dicts are never changed. Returns the factors."""
     import copy
-    P_ = param or float
     idset, arm, f = set(ids), anchor["arm"], {}
     for rid, r in sorted(anchor["rows"].items()):
         if unit_factors is not None:        # #220 r1: given per unit (the boundary check's engine side)
@@ -920,78 +918,35 @@ def apply_anchor(anchor, out, ids, param=None, sampled=None, factors=None, unit_
             raise AnchorError(f"anchor {rid}: this evaluation's model value over the window is {m}; no factor")
         f[rid] = ext / m
     comp, chk = anchor["dalys"], anchor.get("daly_check")
-    yll_all = P_((comp or chk)["yll_per_death"]) if (comp or chk) else None
-    ya_raw = (comp or chk or {}).get("yll_per_death_by_age")
-    ya = {g: P_(v) for g, v in ya_raw.items()} if ya_raw else None
-    pages = anchor.get("pop_ages") or {}
     de = (comp or chk or {}).get("deaths")
-
-    def age_rate(gd, where):        # years of life lost per death, weighted by the deaths of each age group
-        if not ya or not gd:
-            return None
-        miss = sorted(set(gd) - set(ya))
-        if miss:
-            raise AnchorError(f"{where}: age groups {miss} have no daly_parts.yll_per_death_by_age")
-        t = sum(gd.values())
-        return sum(v * ya[g] for g, v in gd.items()) / t if t > 0 else min(ya[g] for g in gd)
-
-    def pop_rate(P):                # a population group's: its single engine age group's, else the smallest
-        ages = [a for a in pages.get(P) or [] if ya and a in ya]
-        return None if not ages else ya[ages[0]] if len(ages) == 1 else min(ya[a] for a in ages)
-
-    def burden_rate(bg, where):     # window totals: weighted over population groups of one engine age group each
-        pd = (bg or {}).get(de) if bg else None
-        if not ya or not pd or not all(len(pages.get(P) or []) == 1 for P in pd):
-            return None
-        return age_rate({pages[P][0]: v for P, v in pd.items()}, where)
     for i in ids:
-        src = out[i]                                    # the model's own values (never changed)
-        sk = set((skip or {}).get(i) or ())
+        src, sk = out[i], set((skip or {}).get(i) or ())
         fu = dict(unit_factors[i]) if unit_factors is not None else {o: f[rid] for o, rid in anchor["units"][i].items()}
+        if de in fu:
+            fu[YLL_OUT] = fu[de]            # the model's YLL moves with its deaths
         out[i] = dict(src, **{k: copy.deepcopy(src[k]) for k in ("y", "y_group", "cost", "burden", "burden_group")
                               if k in src})
-        yg_src, bg_src = src.get("y_group") or {}, src.get("burden_group") or {}
-        rates = {}
-        for k, d in out[i]["y"].items():
-            if k in sk:
-                continue
-            rates[("y", k)] = age_rate((yg_src.get(k) or {}).get(de), f"unit {i}, {k}")
-            _scale(d, fu, comp, rates[("y", k)] or yll_all, f"unit {i}, {k}")
-        for k, d in (out[i].get("burden") or {}).items():
-            rates[("b", k)] = burden_rate(bg_src.get(k), f"unit {i}, {k} window")
-            _scale(d, fu, comp, rates[("b", k)] or yll_all, f"unit {i}, {k} window")
-        for grp, tot_src, tot_key in (("y_group", src["y"], "y"), ("burden_group", src.get("burden") or {}, "burden")):
+        ds = [(f"{k}", d) for k, d in out[i]["y"].items() if k not in sk]
+        ds += [(f"{k} window", d) for k, d in (out[i].get("burden") or {}).items()]
+        for grp in ("y_group", "burden_group"):
             for k, bg in (out[i].get(grp) or {}).items():
                 if k in sk:
                     continue
-                raw_t = (tot_src.get(k) or {}).get((comp or {}).get("outcome"))
-                new_t = (out[i][tot_key].get(k) or {}).get((comp or {}).get("outcome")) if comp else None
                 for P, d in _groups(bg).items():
-                    r = (ya.get(P) if grp == "y_group" else pop_rate(P)) if ya else None
-                    ratio = None if r is not None or not comp else (new_t / raw_t if raw_t else 1.0) \
-                        if raw_t is not None else None
-                    _scale(d, fu, comp, r if r is not None else yll_all, f"unit {i}, {k}, {grp} {P}", ratio)
-                    for o, x in d.items():
-                        bg[o][P] = x
-        if chk:         # DALYs anchored directly: YLD = DALYs - deaths x YLL per death >= 0 wherever it is known
-            ds = []
-            for k, d in out[i]["y"].items():
-                if k not in sk:
-                    ds.append((f"{k}", d, rates.get(("y", k)) or (min(ya.values()) if ya else None)))
-            for k, d in (out[i].get("burden") or {}).items():
-                ds.append((f"{k} window", d, rates.get(("b", k)) or (min(ya.values()) if ya else None)))
-            for k, bg in (out[i].get("y_group") or {}).items() if ya else []:
-                if k not in sk:
-                    ds += [(f"{k}, y_group {P}", d, age_rate({P: 1.0}, f"unit {i}, {k}")) for P, d in _groups(bg).items()]
-            for k, bg in (out[i].get("burden_group") or {}).items() if ya else []:
-                ds += [(f"{k}, burden_group {P}", d, pop_rate(P)) for P, d in _groups(bg).items()]
-            for where, d, rate in ds:
-                if rate is not None and chk["outcome"] in d and chk["deaths"] in d:
-                    yld = d[chk["outcome"]] - d[chk["deaths"]] * rate
-                    if yld < -1e-9 * max(abs(d[chk["outcome"]]), 1.0):
-                        raise AnchorError(f"unit {i}, {where}: anchored {chk['outcome']} {d[chk['outcome']]:.4g} is "
-                                          f"below anchored {chk['deaths']} {d[chk['deaths']]:.4g} x {rate:.4g} years "
-                                          f"per death (YLD {yld:.4g}): the DALY and death anchors are inconsistent")
+                    ds.append((f"{k}, {grp} {P}", d, bg, P))
+        for item in ds:
+            where, d = item[0], item[1]
+            raw = dict(d)
+            _scale(d, fu, comp, f"unit {i}, {where}")
+            if chk and chk["outcome"] in d and chk["yll"] in d and raw[chk["outcome"]] >= raw[chk["yll"]]:
+                yld = d[chk["outcome"]] - d[chk["yll"]]
+                if yld < -1e-9 * max(abs(d[chk["outcome"]]), 1.0):
+                    raise AnchorError(f"unit {i}, {where}: anchored {chk['outcome']} {d[chk['outcome']]:.4g} is below "
+                                      f"the anchored YLL {d[chk['yll']]:.4g} (the model's {raw[chk['yll']]:.4g} x "
+                                      f"f({chk['deaths']})): the DALY and death anchors are inconsistent")
+            if len(item) == 4:
+                for o, x in d.items():
+                    item[2][o][item[3]] = x
         for k, c in (out[i].get("cost") or {}).items():
             if k in sk:
                 continue
@@ -1411,10 +1366,11 @@ def _self_test() -> int:
             self.pops, self.packages, self.last_events = dict(_G.spec["decision_units"]["populations"]), ["none", "a"], []
 
         def predict(self, zs, theta, ids, noise=None):
-            rate = {"young": {"deaths": 0.01, "dalys": 0.8}, "old": {"deaths": 0.002, "dalys": 0.1}}
+            rate = {"young": {"deaths": 0.01, "dalys": 0.8, YLL_OUT: 0.6},          # YLL: 60 and 20 years
+                    "old": {"deaths": 0.002, "dalys": 0.1, YLL_OUT: 0.04}}           # per death (#220 r3)
             self.last_events = list(clip) if self.clip else []
             return {i: {"y": {k: {o: sum(rate[b][o] * _G.by_id[i][pm["column"]] for b, pm in self.pops.items())
-                                  for o in ("deaths", "dalys")} for k in self.packages}} for i in ids}
+                                  for o in ("deaths", "dalys", YLL_OUT)} for k in self.packages}} for i in ids}
     _G.model = _M()
     col = Collector.__new__(Collector)
     col.A, col.cfg, col.refs, col.draws = _G, {"arm": "a", "group": "g"}, [], {}
@@ -1445,7 +1401,7 @@ def _self_test() -> int:
     _G.model.clip = False
     bp = by_population(_G, {}, {}, ["young", "old"], "a")
     full = _G.model.predict({}, {}, _G.ids)
-    cfg = {"arm": "a", "group": "g", "daly_parts": {"yll_per_death": {"young": 60.0, "old": 20.0}}}
+    cfg = {"arm": "a", "group": "g", "daly_parts": {"yll_per_death_by_age": {"young": 60.0, "old": 20.0}}}
     yr = dict(ref, group="g1", age_band="young", outcome="deaths", measure="rate", per=1000.0)
     dpa = daly_parts(_G, cfg, "a", full, bp, {"averted": {"dalys": 8.0, "deaths": 0.2}})
     want = (1.5 * 60 + 0.7 * 20) / 155.0
@@ -1705,12 +1661,12 @@ def _self_test() -> int:
         outcomes = ["dalys", "deaths"]
         ids = ["u"]
         theta0 = {"le": 30.0}
-    out = {"u": {"y": {"none": {"dalys": 600.0, "deaths": 10.0}}}}
-    dp = daly_parts(_A, {"daly_parts": {"yll_per_death": {"all": "le"}}}, "none", out, {},
+    out = {"u": {"y": {"none": {"dalys": 600.0, "deaths": 10.0, YLL_OUT: 300.0}}}}      # the model's own YLL
+    dp = daly_parts(_A, {"daly_parts": {"yll_per_death_by_age": {"all": "le"}}}, "none", out, {},
                     {"averted": {"dalys": 90.0, "deaths": 3.0}})
     ok(abs(dp["deaths_share_of_dalys"] - 0.5) < 1e-12 and abs(dp["dalys_averted_per_death_averted"] - 30) < 1e-12,
        f"BV16 share of DALYs from deaths and DALYs averted per death averted: {dp}")
-    dpw = daly_parts(_A, {"daly_parts": {"yll_per_death": {"all": "le"}}, "window": [0, 2]}, "none", out, {},
+    dpw = daly_parts(_A, {"daly_parts": {"yll_per_death_by_age": {"all": "le"}}, "window": [0, 2]}, "none", out, {},
                      {"averted": {"dalys": 90.0, "deaths": 3.0}})
     ok("decision window" in dpw["statement"] and "not the model window" in dpw["statement"],
        f"BV38 (Codex S2-5b r2 P2) with a model window the DALY parts say they are over the decision window: {dpw}")
@@ -1953,7 +1909,7 @@ def _self_test_anchor(ok):
            f"BA1 anchor rows and group_by validate; an anchor may come from a calibration source, a checked row may "
            f"not; a section with only anchor rows is accepted: {bad} {b_g} {b_c}")
         three = lambda r: r.update(outcomes_reported=["dalys", "cases", "deaths"])  # noqa: E731
-        dp = {"dalys": "dalys", "deaths": "deaths", "yll_per_death": {"all": 30}}
+        dp = {"dalys": "dalys", "deaths": "deaths", "yll_per_death_by_age": {"all": 30}}
         for name, lines, blk, mut, needle in (
                 ("an anchor with an age band", [row(band="all"), chk], W, None, "age band"),
                 ("an anchor without a model window", [row(), chk], {}, None, "validation.burden.window"),
@@ -1973,8 +1929,8 @@ def _self_test_anchor(ok):
                 ("cost_scaling to an outcome no anchor sets", regions + [chk], dict(W, cost_scaling={"q": "dalys"}),
                  lambda r: r.update(outcomes_reported=["cases"]), "no anchor row sets"),
                 # review r1 P2-11: DALYs in the model window need deaths there too to be composed
-                ("DALYs composed without deaths in the window", regions + [chk],
-                 dict(W, daly_parts=dp), three, "window_metrics"),
+                ("DALYs composed in the model window (no YLL there)", regions + [chk],
+                 dict(W, daly_parts=dp), three, "carries no YLL"),
                 ("DALYs composed with no daly_parts", regions + [chk], W, three, "daly_parts"),
                 ("an anchor interval with a zero lower bound", [row(lo="0"), chk], W, None, "lower > 0"),
                 ("the burden_anchor uncertainty source neither drawn nor excluded", regions + [dal, chk], W,
@@ -2067,33 +2023,6 @@ def _self_test_anchor(ok):
         ok(g1 == g1b and g1 != g2 and set(g1) == {"anchor:a", "anchor:c", "anchor:d"} and 0.93 <= inside <= 0.97,
            f"BA9 (review r1 P2-3) external values are drawn lognormal with [lower, upper] as their central 95% "
            f"(share inside {inside:.3f}); no draw for a row with no interval; deterministic for a seeded stream")
-        # BA4 DALYs composed of anchored deaths or cases: YLL = deaths x yll_per_death, YLD = dalys - YLL
-        Wc = {"window": [1, 2], "window_metrics": {"cases": "prev"}}
-        sd = spec(regions + [chk], dict(Wc, daly_parts=dict(dp, yll_per_death={"all": "le"})), three)
-        Ad = types.SimpleNamespace(**dict(vars(A), spec=sd, outcomes=sd.outcomes(), theta0={"le": 30.0}))
-        rd = load_references(sd)[0]
-
-        def od(dal_a=40.0):
-            return {i: {"y": {"none": {"cases": 10.0, "deaths": 2.0, "dalys": 100.0},
-                              "a": {"cases": 5.0, "deaths": 1.0, "dalys": dal_a}},
-                        "burden": {"none": {"cases": 100.0}}} for i in A.ids}
-        fd = anchor_factors(Ad, config(sd), rd, od(), "none")
-        o4 = od()
-        apply_anchor(fd, o4, A.ids, param=lambda x: {"le": 30.0}.get(x, x))
-        o4b = od()
-        apply_anchor(fd, o4b, A.ids, param=lambda x: {"le": 20.0}.get(x, x))
-        i0 = [i for i in A.ids if reg[i] == "r0"][0]
-        ok(o4[i0]["y"]["none"] == {"cases": 50.0, "deaths": 2.0, "dalys": 60.0 + 5.0 * 40.0}
-           and o4[i0]["y"]["a"]["dalys"] == 30.0 + 5.0 * 10.0 and fd["record"]["dalys"]["outcome"] == "dalys",
-           f"BA4 anchored DALYs = f_deaths x YLL + f_cases x YLD: {o4[i0]['y']}")
-        ok(o4b[i0]["y"]["none"]["dalys"] == 40.0 + 5.0 * 60.0,
-           "BA10 (review r1 P2-4) a parameter-valued yll_per_death is read at the evaluation's parameters")
-        try:
-            apply_anchor(fd, od(dal_a=10.0), A.ids, param=lambda x: {"le": 30.0}.get(x, x))
-            ok(False, "BA4 (review r1 P2-5) a negative residual YLD is refused, never floored")
-        except AnchorError as e:
-            ok("YLD" in str(e) and "-20" in str(e), f"BA4 (review r1 P2-5) a negative residual YLD is refused, never "
-               f"floored: {e}")
         # gate: the artifact against the declared anchor rows and the signed spec
         rec = fac["record"]
         anc = [x for x in refs if x["role"] == "anchor"]
@@ -2127,23 +2056,15 @@ def _self_test_anchor(ok):
         # review r2 P2: directly anchored DALYs must stay consistent with anchored deaths (YLD >= 0)
         both = lambda r: r.update(outcomes_reported=["dalys", "cases", "deaths"])  # noqa: E731
         Wd = {"window": [1, 2], "window_metrics": {"cases": "prev", "deaths": "prev", "dalys": "prev"},
-              "daly_parts": dict(dp, yll_per_death_by_age={"all": 30})}     # #220 r2: the check needs it
+              "daly_parts": dp}
         dd = [row("x", "*", outcome="deaths", value="240", lo="240", hi="240"),
               row("y", "*", outcome="dalys", value="7200", lo="7200", hi="7200")]
         s5 = spec(regions + dd + [chk], Wd, both)
         ok(load_references(spec(regions + dd + [chk], dict(Wd, daly_parts=None), both))[1] != [],
-           "BA15 (review r2) DALYs anchored directly beside reported deaths need daly_parts.yll_per_death to be "
-           "checked")
-        A5 = types.SimpleNamespace(**dict(vars(A), spec=s5, outcomes=s5.outcomes()))
+           "BA15 (review r2) DALYs anchored directly beside reported deaths need daly_parts.yll_per_death_by_age to "
+           "be checked")
         o5 = {i: {"y": {"none": {"cases": 10.0, "deaths": 1.0, "dalys": 10.0}},
                   "burden": {"none": {"cases": 100.0, "deaths": 10.0, "dalys": 200.0}}} for i in A.ids}
-        f5 = anchor_factors(A5, config(s5), load_references(s5)[0], o5, "none")
-        try:
-            apply_anchor(f5, copy.deepcopy(o5), A.ids)
-            ok(False, "BA15 (review r2) directly anchored DALYs below anchored deaths x yll_per_death are refused")
-        except AnchorError as e:
-            ok("-30" in str(e), f"BA15 (review r2) directly anchored DALYs below anchored deaths x yll_per_death are "
-               f"refused, with the numbers: {e}")
         dd2 = [row("x", "*", outcome="deaths", value="240", lo="120", hi="480"),
                row("y", "*", outcome="dalys", value="7200", lo="3600", hi="14400")]
         s6 = spec(regions + dd2 + [chk], Wd, both)
@@ -2210,11 +2131,13 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
         rows = {}
         for n, i in enumerate(A0.ids):
             m = 1.0 + int(i) % 3
-            rows[i] = {"y": {k: ({"cases": 10 * m, "deaths": m, "dalys": 100 * m} if k == A0.comp else
-                                 {"cases": 6 * m * (1 - 0.05 * len(A0.pk[k])), "deaths": 0.6 * m,
-                                  "dalys": 60 * m * (1 - 0.05 * len(A0.pk[k]))}) for k in A0.pk},
+            rows[i] = {"y": {k: ({"cases": 10 * m, "deaths": m, "dalys": 100 * m, YLL_OUT: 30 * m} if k == A0.comp
+                                 else {"cases": 6 * m * (1 - 0.05 * len(A0.pk[k])), "deaths": 0.6 * m,
+                                       "dalys": 60 * m * (1 - 0.05 * len(A0.pk[k])), YLL_OUT: 18 * m})
+                             for k in A0.pk},
                        "cost": {k: {"q": 1.0, "q2": 1.0} for k in A0.pk}, "diag": {},
-                       "burden": {config(sp_)["arm"]: {"cases": 100 * m, "deaths": 10 * m, "dalys": 1000 * m}}}
+                       "burden": {config(sp_)["arm"]: {"cases": 100 * m, "deaths": 10 * m, "dalys": 1000 * m,
+                                                       YLL_OUT: 300 * m}}}
         A0.model = _Stub(rows)
         A0.anchor = anchor_factors(A0, config(sp_), load_references(sp_)[0], A0.model.predict(None, {}, A0.ids),
                                    config(sp_)["arm"])
@@ -2277,49 +2200,6 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
            f"test, as in the draws, so a valid run completes: {sorted(names)}, {pair['id']}")
     except (ValueError, StopIteration, KeyError) as e:
         ok(False, f"BA22 (review r3) coupled anchors in the tornado and range tests: {type(e).__name__}: {e}")
-    # review r3 P2 / #220 r1: the grouped YLD check uses each age group's own years of life lost per death
-    # (daly_parts.yll_per_death_by_age); with only an all-age value it is skipped, and the artifact says so
-    def grouped(child_dalys, by_age):
-        xg = row("x", "*", outcome="deaths", value="24", lo="24", hi="24")
-        yg = row("y", "*", outcome="dalys", value=str(12 * (child_dalys + 31.0)),
-                 lo=str(12 * (child_dalys + 31.0)), hi=str(12 * (child_dalys + 31.0)))
-        dpa = dict(dp, yll_per_death={"all": 50}, **({"yll_per_death_by_age": {"child": 70, "adult": 30}}
-                                                     if by_age else {}))
-        s9 = spec(regions + [xg, yg, chk], {"window": [1, 2], "daly_parts": dpa,
-                                            "window_metrics": {"cases": "prev", "deaths": "prev", "dalys": "prev"}},
-                  three)
-        A9 = types_ns(s9)
-        o9 = {i: {"y": {"none": {"cases": 10.0, "deaths": 2.0, "dalys": child_dalys + 31.0}},
-                  "y_group": {"none": {"cases": {"child": 5.0, "adult": 5.0}, "deaths": {"child": 1.0, "adult": 1.0},
-                                       "dalys": {"child": child_dalys, "adult": 31.0}}},
-                  "burden": {"none": {"cases": 100.0, "deaths": 2.0, "dalys": child_dalys + 31.0}}} for i in A9.ids}
-        f9 = anchor_factors(A9, config(s9), load_references(s9)[0], o9, "none")
-        return f9, o9, A9
-    f9, o9, A9 = grouped(71.0, True)
-    try:
-        apply_anchor(f9, copy.deepcopy(o9), A9.ids)
-        ok(True, "BA23 (#220 r1) a heterogeneous-age valid case passes the grouped check (child 71 DALYs for 1 death "
-           "at 70 years, adult 31 at 30)")
-    except AnchorError as e:
-        ok(False, f"BA23 (#220 r1) a heterogeneous-age valid case passes the grouped check: {e}")
-    f9, o9, A9 = grouped(69.0, True)
-    refused(lambda: apply_anchor(f9, copy.deepcopy(o9), A9.ids), "y_group child",
-            "an age group's DALYs below its deaths x that age group's years of life lost per death", "BA23 (#220 r1)")
-    f9, o9, A9 = grouped(69.0, False)
-    try:
-        apply_anchor(f9, copy.deepcopy(o9), A9.ids)
-        why = (f9["record"].get("daly_check") or {}).get("grouped") or ""
-        ok("not checked" in why and "yll_per_death_by_age" in why and "emulator" in why,
-           f"BA23 (#220 r1) with only an all-age value the grouped check is skipped, with the reason recorded: {why}")
-    except AnchorError as e:
-        ok(False, f"BA23 (#220 r1) with only an all-age value the grouped check is skipped: {e}")
-    # #220 r1 P2: directly anchored DALYs in the model window need deaths there for the same groups
-    got = load_references(spec(regions + [
-                                          row("y", "*", outcome="dalys", value="99", lo="99", hi="99"), chk],
-                               {"window": [1, 2], "daly_parts": dp,
-                                "window_metrics": {"cases": "prev", "dalys": "prev"}}, three))[1]
-    ok(any("window_metrics" in x and "same population groups" in x for x in got),
-       f"BA26 (#220 r1) DALYs anchored directly in the model window need deaths there for the same groups: {got}")
     # #220 r1 P2: automatic group names are unambiguous; a row id cannot take the reserved form
     fake = {"rows": {k: {"outcome": "cases", "lower": 1.0, "upper": 2.0, "group_key": g}
                      for k, g in (("a-b", "region=r0"), ("c", "region=r0"), ("a", "region=r1"), ("b-c", "region=r1"))}}
@@ -2365,63 +2245,6 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
                            for c in cd10 for k in (c["chosen"], c["runner_up"])),
        f"BA25 (#220 r1 P1) an engine at twice the emulator's level, with fixed and burden-driven costs: anchored per "
        f"unit to the same burden, its benefits and costs equal the emulator side's ({err!r})")
-    # #220 r2: years of life lost per death by age wherever the deaths' ages are known
-    ya = {"child": 70, "adult": 30}
-
-    def direct(by_age, gdal=(71.0, 31.0), wdal=None):
-        xg = row("x", "*", outcome="deaths", value="24", lo="24", hi="24")
-        yg = row("y", "*", outcome="dalys", value="1224", lo="1224", hi="1224")
-        sx = spec(regions + [xg, yg, chk], {"window": [1, 2], "daly_parts": dict(dp, yll_per_death={"all": 50}, **(
-            {"yll_per_death_by_age": ya} if by_age else {})),
-            "window_metrics": {"cases": "prev", "deaths": "prev", "dalys": "prev"}}, three)
-        Ax = types_ns(sx)
-        ox = {i: {"y": {"none": {"cases": 10.0, "deaths": 2.0, "dalys": sum(gdal)},
-                        "a": {"cases": 5.0, "deaths": 1.0, "dalys": 31.0}},
-                  "y_group": {"none": {"deaths": {"child": 1.0, "adult": 1.0},
-                                       "dalys": {"child": gdal[0], "adult": gdal[1]}},
-                              "a": {"deaths": {"child": 0.0, "adult": 1.0}, "dalys": {"child": 0.0, "adult": 31.0}}},
-                  "burden": {"none": {"cases": 100.0, "deaths": 2.0, "dalys": 102.0}}} for i in Ax.ids}
-        if wdal:            # window values by population group, one engine age group each
-            for i in Ax.ids:
-                ox[i]["burden_group"] = {"none": {"deaths": {"child": 1.0, "adult": 1.0},
-                                                  "dalys": {"child": wdal[0], "adult": wdal[1]}}}
-        fx = anchor_factors(Ax, config(sx), load_references(sx)[0], ox, "none")
-        fx["pop_ages"] = {"child": ["child"], "adult": ["adult"]}       # singleton age bands
-        return fx, ox, Ax
-    for by_age in (True, False):
-        fx, ox, Ax = direct(by_age)
-        try:
-            apply_anchor(fx, copy.deepcopy(ox), Ax.ids)
-            agg = (fx["record"].get("daly_check") or {}).get("aggregate", "")
-            ok(by_age or "not checked" in agg, f"BA28 (#220 r2) the 71/31 baseline and an intervention leaving one "
-               f"adult death pass ({'age-specific' if by_age else 'all-age only: ' + agg[:60]})")
-        except AnchorError as e:
-            ok(False, f"BA28 (#220 r2) the 71/31 baseline and an intervention leaving one adult death pass "
-                      f"({'age-specific' if by_age else 'all-age only'}): {e}")
-    fx, ox, Ax = direct(True, wdal=(60.0, 42.0))
-    refused(lambda: apply_anchor(fx, copy.deepcopy(ox), Ax.ids), "burden_group child",
-            "a window age band with 60 DALYs for 1 child death at 70 years", "BA29 (#220 r2)")
-    # composed DALYs (cases and deaths anchored) with grouped outcomes: per-age YLL, else the total's ratio
-    for by_age in (True, False):
-        xc = row("x", "*", outcome="deaths", value="24", lo="24", hi="24")
-        sc = spec(regions + [xc, chk], {"window": [1, 2], "daly_parts": dict(dp, yll_per_death={"all": 50}, **(
-            {"yll_per_death_by_age": ya} if by_age else {})), "window_metrics": {"cases": "prev", "deaths": "prev"}},
-                  three)
-        Ac = types_ns(sc)
-        oc = {i: {"y": {"none": {"cases": 10.0, "deaths": 2.0, "dalys": 102.0}},
-                  "y_group": {"none": {"cases": {"child": 5.0, "adult": 5.0}, "deaths": {"child": 1.0, "adult": 1.0},
-                                       "dalys": {"child": 71.0, "adult": 31.0}}},
-                  "burden": {"none": {"cases": 100.0, "deaths": 2.0}}} for i in Ac.ids}
-        fc = anchor_factors(Ac, config(sc), load_references(sc)[0], oc, "none")
-        try:
-            o2 = copy.deepcopy(oc)
-            apply_anchor(fc, o2, Ac.ids)
-            u = Ac.ids[0]
-            ok(abs(sum(o2[u]["y_group"]["none"]["dalys"].values()) - o2[u]["y"]["none"]["dalys"]) < 1e-9,
-               f"BA30 (#220 r2) composed DALYs with grouped outcomes ({'per-age YLL' if by_age else 'the total ratio'})"
-               f": the groups sum to the composed total {o2[u]['y']['none']['dalys']:.4g}")
-        except AnchorError as e:
-            ok(False, f"BA30 (#220 r2) composed DALYs with grouped outcomes ({'per-age' if by_age else 'ratio'}): {e}")
     # boundary: a non-comparator anchor arm is run on the engine; unused filler keeps the emulator's own anchoring
     arm_k = sorted(k for k in A7.pk if len(A7.pk[k]) == 1)
     s11 = spec(regions + [chk], {"window": [1, 2], "daly_parts": dp, "arm": arm_k[0],
@@ -2454,7 +2277,7 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
                                         for c in cd11),
        f"BA31 (#220 r2) a non-comparator anchor arm ({arm_k[0]}) is among the boundary jobs and engine packages "
        f"({have_arm}, {err!r})")
-    s12 = spec(regions + [x, y, chk], {"window": [1, 2], "daly_parts": dict(dp, yll_per_death_by_age={"all": 30}),
+    s12 = spec(regions + [x, y, chk], {"window": [1, 2], "daly_parts": dp,
                                        "window_metrics": {"cases": "prev", "deaths": "prev", "dalys": "prev"}}, none_cal)
     A12, rows12 = analysis(s12)
     o12, b12, c12 = A12.evaluate(A12.theta0, z0)
@@ -2478,7 +2301,79 @@ def _self_test_anchor_r3(ok, spec, row, regions, chk, dp, three, refused):
     ok(err is None and all(close(be4[c["unit"]][k], b12[c["unit"]][k]) for c in cd12 for k in arm_k),
        f"BA32 (#220 r2) an engine whose DALY level differs from the emulator's (factors 0.5 and 1): the unused filler "
        f"package keeps the emulator's anchoring and is not checked, so the comparison runs ({err!r})")
+    _self_test_anchor_r4(ok, spec, row, chk, three, refused)
     _ = np
+
+
+def _self_test_anchor_r4(ok, spec, row, chk, three, refused):
+    """#220 r3: DALYs follow the model's own YLL and YLD (YLL derived from the engine's per-age deaths x each age
+    group's years of life lost per death, before any aggregation or emulation), never deaths x a constant."""
+    import copy
+    Y = globals().get("YLL_OUT", "__yll")
+    dpa = {"dalys": "dalys", "deaths": "deaths", "yll_per_death_by_age": {"all": 30}}
+    both = [row("x", "*", outcome="deaths", value="24", lo="24", hi="24"),
+            row("w", "*", outcome="cases", value="1200", lo="1200", hi="1200")]
+    W2 = {"window": [1, 2], "window_metrics": {"cases": "prev", "deaths": "prev"}, "daly_parts": dpa}
+    sp = spec(both + [chk], W2, three)
+    A = types_ns(sp)
+
+    def out(rows):          # totals only, as the emulator predicts them (no grouped outcomes)
+        return {i: {"y": {k: dict(v) for k, v in rows.items()},
+                    "burden": {"none": {"cases": 100.0, "deaths": 1.0}}} for i in A.ids}
+    pk = {"none": {"cases": 10.0, "deaths": 3.0, "dalys": 220.0, Y: 150.0},
+          "a": {"cases": 10.0, "deaths": 2.0, "dalys": 100.0, Y: 60.0},       # two adult deaths (30 years each)
+          "b": {"cases": 10.0, "deaths": 1.0, "dalys": 120.0, Y: 70.0}}       # one child death (70 years)
+    try:
+        fx = anchor_factors(A, config(sp), load_references(sp)[0], out(pk), "none")
+        o = out(pk)
+        apply_anchor(fx, o, A.ids)
+        u = A.ids[0]
+        ok(abs(o[u]["y"]["a"]["dalys"] - 160.0) < 1e-9 and abs(o[u]["y"]["b"]["dalys"] - 190.0) < 1e-9,
+           f"BA33 (#220 r3 P1) with totals only, deaths anchored x2: DALYs follow each package's own YLL (A 160, B 190), "
+           f"so an age-shifting package keeps its ranking: {o[u]['y']['a']['dalys']:.4g}, {o[u]['y']['b']['dalys']:.4g}")
+        o1 = out(pk)
+        apply_anchor(fx, o1, A.ids, factors={k: 1.0 for k in fx["rows"]})
+        ok(all(o1[i]["y"][k]["dalys"] == pk[k]["dalys"] for i in A.ids for k in pk),
+           "BA37 (#220 r3) anchor factors of 1 reproduce the model's DALYs exactly")
+        g = out(pk)
+        for i in A.ids:       # engine age groups; a population band of several ages or bands sharing one are summed
+            g[i]["y_group"] = {"a": {"deaths": {"child": 0.0, "adult": 2.0}, "dalys": {"child": 0.0, "adult": 100.0},
+                                     Y: {"child": 0.0, "adult": 60.0}, "cases": {"child": 4.0, "adult": 6.0}}}
+        apply_anchor(fx, g, A.ids)
+        ok(abs(sum(g[u]["y_group"]["a"]["dalys"].values()) - g[u]["y"]["a"]["dalys"]) < 1e-9,
+           "BA34 (#220 r3) grouped DALYs follow each age group's own YLL and YLD, so the groups sum to the total")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA33/BA34/BA37 (#220 r3) DALYs from the model's own YLL and YLD: {type(e).__name__}: {e}")
+    # single-age engine, DALYs and deaths anchored directly: anchored DALYs below anchored YLL are refused
+    dd = [row("x", "*", outcome="deaths", value="24", lo="24", hi="24"),
+          row("y", "*", outcome="dalys", value="372", lo="372", hi="372")]
+    s5 = spec(dd + [row("w", "*", outcome="cases", value="1200", lo="1200", hi="1200"), chk],
+              {"window": [1, 2], "window_metrics": {"cases": "prev", "deaths": "prev", "dalys": "prev"},
+               "daly_parts": dpa}, three)
+    A5 = types_ns(s5)
+    o5 = {i: {"y": {"none": {"cases": 10.0, "deaths": 1.0, "dalys": 31.0, Y: 30.0}},
+              "burden": {"none": {"cases": 100.0, "deaths": 1.0, "dalys": 31.0}}} for i in A5.ids}
+    try:
+        f5 = anchor_factors(A5, config(s5), load_references(s5)[0], o5, "none")
+        refused(lambda: apply_anchor(f5, copy.deepcopy(o5), A5.ids, factors={"x": 2.0, "y": 1.0, "w": 1.0}), "YLL",
+                "a single-age engine: anchored DALYs 31 below anchored YLL 60 (deaths x2, DALYs x1)", "BA35 (#220 r3)")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA35 (#220 r3) a single-age engine's direct DALY check: {type(e).__name__}: {e}")
+
+    class _A1:
+        outcomes, ids, theta0 = ["dalys", "deaths"], ["u"], {}
+    dp1 = daly_parts(_A1, {"daly_parts": dpa}, "none", {"u": {"y": {"none": {"dalys": 31.0, "deaths": 1.0, Y: 30.0}}}},
+                     {}, {"averted": {"dalys": 31.0, "deaths": 1.0}})
+    ok(abs((dp1.get("deaths_share_of_dalys") or 0) - 30.0 / 31.0) < 1e-12,
+       f"BA36 (#220 r3) the published share of DALYs from deaths is the model's own YLL over its DALYs "
+       f"({dp1.get('deaths_share_of_dalys')})")
+    for name, blk, needle in (
+            ("yll_per_death (a constant per death)", dict(W2, daly_parts={"yll_per_death": {"all": 30}}),
+             "yll_per_death_by_age"),
+            ("composed DALYs in the model window (it carries no YLL)",
+             dict(W2, window_metrics={"cases": "prev", "deaths": "prev", "dalys": "prev"}), "carries no YLL")):
+        got = load_references(spec(both + [chk], blk, three))[1]
+        ok(any(needle in x for x in got), f"BA38 (#220 r3) the contract refuses {name}: {got}")
 
 
 def types_ns(sp_):

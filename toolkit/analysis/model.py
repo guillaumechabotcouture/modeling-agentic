@@ -81,6 +81,14 @@ def _group(res, o, pm):
     return sum(res["per_capita"][o][g] * sh[g] for g in gs) / w if w > 0 else 0.0
 
 
+def _yll_value(spec, theta):
+    """A years-of-life-lost weight: a number, or an engine parameter at this run's values (else the spec's or the
+    engine card's)."""
+    from toolkit.spec import engine_parameters as PV
+    base = dict({p.name: p.value for p in spec.engine().parameters()}, **PV.values(spec))
+    return lambda x: float(x) if not isinstance(x, str) else float((theta or {}).get(x, base[x]))
+
+
 def group_sizes(res, pops: dict, unit: dict) -> dict:
     """{engine group: people} with the weighting the aggregate outcomes use: within each population band of
     decision_units.populations, the engine's age shares renormalised and multiplied by the band's population column,
@@ -136,6 +144,12 @@ class EmulatorModel:
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.fv = {i: FT.vector(spec, u) for i, u in self.by_id.items()}
         pts = design["points"]
+        yw = BV.yll_weights(spec)        # F6 S2-5d #220 r3: YLL emulated beside the outcomes, from per-age deaths
+        if yw:
+            self.outcomes = self.outcomes + [BV.YLL_OUT]
+            th = {str(p["point"]): p["theta"] for p in pts}
+            results = {key: BV.with_yll(r, yw, _yll_value(spec, th.get(key.rsplit("|", 1)[0])))
+                       if isinstance(r, dict) and "per_capita" in r else r for key, r in results.items()}
         missing = [f"{p['point']}|{k}" for p in pts for k in self.packages if f"{p['point']}|{k}" not in results]
         if missing:
             raise ValueError(f"{len(missing)} engine results missing (e.g. {missing[:3]}): the analysis fails closed")
@@ -459,7 +473,8 @@ class DirectModel:
         self.pk = spec.packages()
         self.comp = spec.comparator
         self.pops = spec["decision_units"]["populations"]
-        self.outcomes = spec.outcomes()
+        self.yll = BV.yll_weights(spec)      # F6 S2-5d #220 r3: YLL from the engine's per-age deaths
+        self.outcomes = spec.outcomes() + ([BV.YLL_OUT] if self.yll else [])
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.attrs = {i: spec.unit_attributes(u) for i, u in self.by_id.items()}
         self.cal_attr = spec["calibration"].get("attribute")
@@ -514,11 +529,13 @@ class DirectModel:
             for k in self.packages:
                 r = runs[(i, k)]
                 res = {"per_capita": r.per_capita, "meta": r.meta}
+                if self.yll:
+                    res = BV.with_yll(res, self.yll, _yll_value(self.spec, theta))
                 row["y"][k] = {o: sum(_group(res, o, pm) * float(u[pm["column"]]) for pm in self.pops.values())
                                for o in self.outcomes}
                 # per engine group (deliverables by group), weighted as the aggregate is (group_sizes)
                 gsz = group_sizes(res, self.pops, u)
-                row["y_group"][k] = {o: {g: float((r.per_capita.get(o) or {}).get(g, 0.0)) * n
+                row["y_group"][k] = {o: {g: float((res["per_capita"].get(o) or {}).get(g, 0.0)) * n
                                          for g, n in gsz.items()} for o in self.outcomes}
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
@@ -710,6 +727,24 @@ def _self_test() -> int:
     ok(gs == {"a": 100.0, "b": 120.0, "c": 80.0} and abs(sum(res["per_capita"]["o"][g] * n for g, n in gs.items())
                                                         - agg) < 1e-12,
        f"MD3 group sizes follow the population bands, so group counts add up to the aggregate ({gs})")
+    # MD4 (F6 S2-5d #220 r3): YLL derived per engine age group from the engine's own deaths, before aggregation, so
+    # population bands of several ages, or several bands sharing one age, add up exactly
+    try:
+        from toolkit.analysis import burden as BVm
+        r4 = {"meta": {"age_shares": {"c": 0.4, "a": 0.6}}, "per_capita": {"deaths": {"c": 0.01, "a": 0.002}}}
+        d4 = BVm.with_yll(r4, ("deaths", {"c": 70, "a": "le_a"}), lambda x: {"le_a": 30.0}.get(x, x))
+        b1 = {"one": {"column": "p1", "age_groups": ["c", "a"]}}
+        b2 = {"kids": {"column": "p2", "age_groups": ["c"]}, "ad1": {"column": "p3", "age_groups": ["a"]},
+              "ad2": {"column": "p4", "age_groups": ["a"]}}
+        u4 = {"p1": 1000.0, "p2": 400.0, "p3": 500.0, "p4": 100.0}
+        t1 = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in b1.values())
+        t2 = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in b2.values())
+        t2r = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in reversed(list(b2.values())))
+        ok(abs(t1 - (400 * 0.01 * 70 + 600 * 0.002 * 30)) < 1e-9 and abs(t2 - t1) < 1e-9 and t2 == t2r
+           and d4["per_capita"]["deaths"] == r4["per_capita"]["deaths"],
+           f"MD4 YLL per engine age group from its own deaths: mixed-age and repeated-age bands add up ({t1}, {t2})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"MD4 YLL per engine age group from its own deaths: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
