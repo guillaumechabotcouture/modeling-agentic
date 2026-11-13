@@ -1,0 +1,392 @@
+beliefs:
+- id: B1
+  mechanism: 'Which timing is better depends on where each window sits relative to the city''s own epidemic curve.
+    A temporary cut in R_t during exponential growth mostly delays the curve. A cut that spans the weeks just before
+    the peak reduces overshoot and final size. So the EARLY/PEAK ranking flips along s0 (which sets R_eff and growth
+    speed): EARLY is at least as good at low s0, where the epidemic is slow and incomplete in-year, and PEAK wins
+    at high s0, where the epidemic peaks near weeks 12-20 and completes in-year.'
+  about:
+    pair:
+    - early
+    - peak
+    feature: s0 (calibration scale)
+  direction: flips
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.6
+    - 0.9
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC (2021). The timing of one-shot interventions for epidemic control.
+      PLoS Computational Biology 17(3):e1008763
+    location: 'Results: optimal start time of a fixed-duration intervention relative to the peak (figure numbers
+      not verified)'
+  - citation: Handel A, Longini IM, Antia R (2007). What is the best control strategy for multiple infectious disease
+      outbreaks? Proceedings of the Royal Society B 274:833-837
+    location: Figure 1 / main text on overshoot and timing of limited control (location not verified)
+  - citation: Morris DH, Rossine FW, Plotkin JB, Levin SA (2021). Optimal, near-optimal, and robust epidemic control.
+      Communications Physics 4:78
+    location: main text, single time-limited intervention (location not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: In fast epidemics (s0 high, seed large), the PEAK window (weeks 12-20) falls just before or at the
+    peak and reduces overshoot. EARLY only delays a curve that still completes within the year. So PEAK averts more
+    infections than EARLY. Their costs are equal, so this holds at any shadow price.
+  about:
+    pair:
+    - early
+    - peak
+  direction: flips
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.85
+    - 1.0
+  - feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.000275
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC (2021). The timing of one-shot interventions for epidemic control.
+      PLoS Computational Biology 17(3):e1008763
+    location: Results on interventions started well before the peak (delay only) vs near the peak (location not
+      verified)
+  - citation: Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates
+      and reproductive numbers. Proceedings of the Royal Society B 274:599-604
+    location: Equation linking r, R and the generation-interval distribution; used for peak-timing arithmetic
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: In slow epidemics (R_eff = R0*s0 near 1-1.4), the year ends before the epidemic does, and both windows
+    fall in the linear growth phase. Each window scales all later in-year incidence by roughly the same factor,
+    and EARLY also cuts weeks 4-12. So EARLY averts at least as much as PEAK, though the margin is small and the
+    independently drawn effect sizes may decide it.
+  about:
+    pair:
+    - early
+    - peak
+  direction: flips
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.5
+    - 0.7
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates
+      and reproductive numbers. Proceedings of the Royal Society B 274:599-604
+    location: growth-rate / R relation (arithmetic for slow growth near R=1)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: In fast, completing epidemics, an 8-week PEAK campaign that cuts R_t by a trial-plausible amount (community
+    source reduction about 30% in Camino Verde; space spraying alone is weakly evidenced) lowers final size toward
+    the herd-immunity bound 1 - 1/R_eff. The relative reduction is bounded by about (z - (1-1/R))/z, about 0.35-0.40
+    at R_eff of 1.8-2, and realistically reaches only part of that.
+  about:
+    package: peak
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.35
+    scale: relative_reduction
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.85
+    - 1.0
+  - feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.000275
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 68:679-702
+    location: final size relation (used for the herd-immunity bound arithmetic)
+  - citation: "Andersson N, Nava-Aguilera E, Arostegu\xED J, et al. (2015). Evidence based community mobilization\
+      \ for dengue prevention in Nicaragua and Mexico (Camino Verde, the Green Way): cluster randomized controlled\
+      \ trial. BMJ 351:h3267"
+    location: 'Abstract/main results: about 30% lower risk of dengue infection in children (value from memory, location
+      not verified)'
+  - citation: 'Bowman LR, Donegan S, McCall PJ (2016). Is Dengue Vector Control Deficient in Effectiveness or Evidence?:
+      Systematic Review and Meta-analysis. PLoS Neglected Tropical Diseases 10(3):e0004551'
+    location: pooled results by method; space spraying evidence weak (location not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: In fast epidemics that complete within the year, EARLY control mostly shifts the curve later without
+    changing its final size. The in-year relative reduction is therefore small, and almost all of it comes from
+    the part of the delay that pushes the tail past year-end.
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.0
+    - 0.12
+    scale: relative_reduction
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.9
+    - 1.0
+  - feature: seed_share
+    range:
+    - 5.0e-05
+    - 0.000275
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC (2021). The timing of one-shot interventions for epidemic control.
+      PLoS Computational Biology 17(3):e1008763
+    location: early interventions mainly delay the epidemic (location not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: EARLY's relative reduction falls as s0 rises. At low s0 the epidemic is slow and truncated by the year's
+    end, so a delay converts into averted in-year infections. At high s0 the epidemic completes and the delay averts
+    little.
+  about:
+    package: early
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Di Lauro F, Kiss IZ, Miller JC (2021). The timing of one-shot interventions for epidemic control.
+      PLoS Computational Biology 17(3):e1008763
+    location: delay vs final-size effects (location not verified)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: EARLY's relative reduction falls as seed_share rises. A larger seed brings the peak forward, so the
+    epidemic completes in-year and early control acts only as a delay.
+  about:
+    package: early
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M (2007). How generation intervals shape the relationship between growth rates
+      and reproductive numbers. Proceedings of the Royal Society B 274:599-604
+    location: 'growth-rate arithmetic: time to peak scales with log(1/seed)/r'
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: The renewal model is in population shares within one closed city, and cost is per resident. Relative
+    reduction therefore does not depend on city population. Population scales absolute infections averted and cost
+    equally, so it does not rank cities by value for money.
+  about:
+    package: peak
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 68:679-702
+    location: final size depends on R and initial susceptible fraction, not population size
+  confidence: high
+  citation_check:
+    found: 0
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: high
+open_questions:
+- id: Q1
+  question: What generation interval does the engine declare for chikungunya (human plus extrinsic incubation, plausibly
+    1.5-3 weeks)? It sets the growth rate, and with it whether each city peaks before, inside or after weeks 12-20.
+    That locates the EARLY/PEAK flip.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Are the EARLY and PEAK effect sizes drawn from the same prior, or does the spec make reactive (peak)
+    control less or more effective (for example heavier breeding in the rainy season, or a delayed response)? Where
+    timing differences are small (slow epidemics), the effect draw decides the sign.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Is s0 one scale shared by all cities or varied per city around s0_survey? It decides whether the rule
+    can be stated per city (use the survey s0 and seed) or only as a region-wide regime.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does the US$20M budget bind (sum of populations x about US$2 against US$20M)? If it does not, every
+    city with positive burden is treated and only timing matters. If it does, the cities with R_eff near 1 (almost
+    no in-year burden) are dropped first.
+  beliefs:
+  - B4
+  - B8
+  decision_relevant: true
+- id: Q5
+  question: Is the horizon exactly calendar 2026 (52 weeks), with infections after year-end not counted? Truncation
+    is what turns delay into averted infections. A longer horizon would shrink EARLY's apparent benefit in slow
+    epidemics.
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Along s0, the choice between EARLY and PEAK flips from EARLY (or a tie) at low s0 to PEAK at high s0. The
+    transition lies within s0 0.6-0.9. Refuted if the located transition lies wholly outside that range.
+  test:
+    kind: flip_in
+    a: early
+    b: peak
+    feature: s0 (calibration scale)
+    range:
+    - 0.6
+    - 0.9
+- id: H2
+  belief: B2
+  claim: For fast epidemics (s0 0.85-1.0, seed_share at least 3e-5), PEAK has the higher net benefit than EARLY
+    in at least 70% of usable points. Refuted if EARLY wins in at least 70%.
+  test:
+    kind: paired_sign
+    a: peak
+    b: early
+    feature: s0 (calibration scale)
+    range:
+    - 0.85
+    - 1.0
+    sign: positive
+    min_share: 0.7
+    where:
+      seed_share:
+      - 3.0e-05
+      - 0.000275
+- id: H3
+  belief: B3
+  claim: For slow epidemics (s0 0.5-0.7), EARLY has net benefit at least as high as PEAK and wins in at least 60%
+    of usable points. Refuted if PEAK wins in at least 60%.
+  test:
+    kind: paired_sign
+    a: early
+    b: peak
+    feature: s0 (calibration scale)
+    range:
+    - 0.5
+    - 0.7
+    sign: positive
+    min_share: 0.6
+- id: H4
+  belief: B4
+  claim: In fast epidemics, PEAK's relative reduction in in-year infections lies in 0.05-0.35 in at least 70% of
+    usable points. Refuted if 30% or fewer of the points are in that band.
+  test:
+    kind: effect_band
+    package: peak
+    band:
+    - 0.05
+    - 0.35
+    min_share: 0.7
+    where:
+      s0 (calibration scale):
+      - 0.85
+      - 1.0
+      seed_share:
+      - 3.0e-05
+      - 0.000275
+- id: H5
+  belief: B5
+  claim: In fast, completing epidemics, EARLY's relative reduction is at most 0.12 in at least 60% of usable points.
+    Refuted if 40% or fewer of the points are in that band.
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.0
+    - 0.12
+    min_share: 0.6
+    where:
+      s0 (calibration scale):
+      - 0.9
+      - 1.0
+      seed_share:
+      - 5.0e-05
+      - 0.000275
+- id: H6
+  belief: B6
+  claim: 'EARLY''s relative reduction decreases with s0: Spearman rho''s 95% interval lies below 0. Refuted if it
+    lies above 0.'
+  test:
+    kind: effect_direction
+    package: early
+    feature: s0 (calibration scale)
+    direction: decreases
+    scope: marginal
+- id: H7
+  belief: B7
+  claim: EARLY's relative reduction decreases with seed_share, after adjusting for s0. Refuted if the interval lies
+    above 0.
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: decreases
+    adjust_for:
+    - s0 (calibration scale)
+- id: H8
+  belief: B8
+  claim: 'PEAK''s relative reduction does not depend on city population: |rho| is within 0.2. Refuted if the interval
+    lies outside +/-0.2.'
+  test:
+    kind: effect_direction
+    package: peak
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
