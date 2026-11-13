@@ -37,6 +37,16 @@ should each district get?". Two pipelines share the rigor gates:
 
 v1 stays supported until the owner retires it.
 
+## Decision design principles (owner default)
+
+Every run follows `.claude/orchestration/decision_design_principles.md` unless its spec declares a departure
+and its reason (the report repeats it); a principle the harness cannot yet compute is declared the same way. In short: think from first principles, and keep doing so at every stage; start from the decision, using the reprogramming framing from the decision date, with the
+funded plan as comparator. Anchor baseline burden to external data-driven estimates, relative effects to trials,
+and costs to current procurement prices. When engine and trials disagree, the trial wins unless the engine
+explains why. Prefer measured data over modelled surfaces. Treat decision-moving inputs as ranges with
+decision tests, and decide at the granularity the evidence supports. v2 tasks carry the file in their system
+prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt).
+
 ## The layers
 
 ```

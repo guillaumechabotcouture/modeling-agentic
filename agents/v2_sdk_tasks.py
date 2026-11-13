@@ -32,11 +32,17 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
 HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
 
+# The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
+PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
+PRINCIPLES = open(PRINCIPLES_FILE).read().strip()
+
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
 uses and never edit harness outputs (analysis/, run_state.json, findings.jsonl, gate files).
 Work only in the run directory, which is your working directory. Finish by writing the output
-file named below, then stop."""
+file named below, then stop.
+
+""" + PRINCIPLES.replace("{", "{{").replace("}", "}}")
 
 PROMPTS = {
     "draft_spec": COMMON + """
@@ -435,6 +441,18 @@ def _self_test() -> int:
             if raise_after:
                 raise raise_after
         return q
+    # Owner, 2026-11-12: the decision design principles are the default of every task (one file, the source of truth).
+    try:
+        ptxt = open(PRINCIPLES_FILE).read().strip()
+        # As delivered: the templates hold the file with its braces doubled for .format().
+        every = {k: (ptxt in v.replace("{{", "{").replace("}}", "}")) for k, v in PROMPTS.items()}
+        banned = [w for w in ("malaria", "nigeria", "lga", "pbo", "smc", "itn", "net ", "anopheles")
+                  if w in ptxt.lower()]
+        ok(len(ptxt) > 500 and all(every.values()),
+           f"DP1 every v2 task prompt carries the decision design principles from {PRINCIPLES_FILE}: {every}")
+        ok(not banned, f"DP2 the principles name no disease, place or intervention (disease-agnostic): {banned}")
+    except Exception as e:  # noqa: BLE001 -- before the file and the wiring exist this is the failure
+        ok(False, f"DP1/DP2: {type(e).__name__}: {e}")
     with tempfile.TemporaryDirectory() as d:
         init = NS(subtype="init", data={"session_id": "s1"})
         res = NS(total_cost_usd=0.42, session_id="s1", is_error=False)
