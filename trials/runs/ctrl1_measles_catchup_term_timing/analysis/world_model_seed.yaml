@@ -1,0 +1,290 @@
+beliefs:
+- id: B1
+  mechanism: Final-size threshold. Under homogeneous mixing an option averts most of the epidemic when it pushes
+    Reff = R0 x s below 1. Where the baseline is supercritical and the option makes it subcritical, the relative
+    reduction is near 1 (only seed-driven chains remain). Where the baseline is already subcritical, the relative
+    reduction is only partial (chain size scales like 1/(1-Reff)).
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2 (section number uncertain)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 6 (threshold and final size; chapter uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Only school reaches the 10-14 susceptibles. A larger gap_10_14 raises the baseline burden but barely
+    changes school's residual Reff, so school's relative reduction rises with gap_10_14.
+  about:
+    package: school
+    feature: gap_10_14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993'
+    location: threshold for herd immunity, 1 - 1/R0 (page uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Only community reaches the 1-4 susceptibles. A larger gap_1_4 raises the baseline, and community removes
+    75% of it, so community's relative reduction rises with gap_1_4. For school the same gap is residual and unreached,
+    so school's relative reduction falls with gap_1_4. That is partly offset where a higher gap_1_4 tips a subcritical
+    baseline into a supercritical one, so school's relation is the less certain of the two.
+  about:
+    package: community
+    feature: gap_1_4
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993'
+    location: threshold for herd immunity (page uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: School's residual susceptibles are the infants, all unreached 1-4 year olds and 10% of school-age susceptibles.
+    As gap_1_4 rises, school's residual Reff approaches or exceeds 1, so its relative reduction falls.
+  about:
+    package: school
+    feature: gap_1_4
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter on vaccination age and herd immunity (chapter uncertain)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Seed size. In a supercritical epidemic the final size hardly depends on a small seed. In a subcritical
+    one, infections scale linearly with the seed. Either way the relative reduction from a day-0 intervention does
+    not depend on seed_share. Community's day-70 timing could add a weak seed dependence (more infections before
+    day 70), but at seed_share up to 1e-4 that is small.
+  about:
+    package: school
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size independent of small initial infective fraction (section uncertain)
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'Choice between school and community. Where gap_1_4 is low, school suppresses the outbreak at two-thirds
+    of the price, so school wins on net benefit at the shadow price. Where gap_1_4 is high, school leaves the residual
+    Reff above 1 and community, which removes the 1-4 gap, averts far more infections than the $0.40 per resident
+    price gap is worth. My rough location for the flip is gap_1_4 0.12-0.26: the susceptibles-removed break-even
+    is about g14 = 0.22 g59 + 1.2 g1014 (~0.13 at mid gaps), pushed upward because the extra susceptibles community
+    removes avert little once school is already subcritical, and blurred by gap_10_14 and contact_rate, which vary
+    independently.'
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_1_4
+  direction: flips
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.12
+    - 0.26
+  source_type: literature
+  evidence:
+  - citation: 'Fine PEM. Herd immunity: history, theory, practice. Epidemiol Rev 1993'
+    location: threshold for herd immunity (page uncertain)
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Abstract (median effectiveness about 92-94% at >= 12 months; value recalled, uncertain)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: Timing. With a measles generation of about 12 days and a seed of 1e-6 to 1e-4, by day 70 an outbreak
+    in these districts has infected well under 1% of the population. Reaching the youngest 70 days late therefore
+    loses little protection. The early-vs-late question is decided by who is reached (age gaps) and the price, not
+    by the delay, unless R0 and the seed are both at the top of their ranges.
+  about:
+    package: community
+  direction: reduces
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table 2 (measles serial interval about 11-12 days; value recalled)
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results (R0 range; page uncertain)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: How does the engine represent the community campaign 70 days after importation? Is it a mid-epidemic
+    removal of the remaining susceptibles, or a pre-epidemic removal discounted through efficacy:community? A heavy
+    discount would move the flip toward school.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: What share of districts has a baseline Reff above 1 (from s0_groups and r0_target)? In subcritical districts
+    the averted infections are below the price-equivalent, so neither campaign is worth its cost at the shadow price.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: What are the age shares within each district's population, and are doses to already-immune children
+    wasted (no targets_susceptible)? These set how many susceptibles each dollar removes.
+  beliefs:
+  - B2
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does the $5M budget cover school in every district? If not, which districts does the budget leave out,
+    and does the best use of the money mix the two options? No optimised plan exists in this sweep.
+  beliefs:
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B2
+  claim: School's relative reduction in infections increases with gap_10_14 (the 10-14 gap only school reaches).
+  p: 0.75
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_10_14
+    direction: increases
+- id: H2
+  belief: B3
+  claim: Community's relative reduction increases with gap_1_4 (the 1-4 gap only community reaches).
+  p: 0.68
+  test:
+    kind: effect_direction
+    package: community
+    feature: gap_1_4
+    direction: increases
+- id: H3
+  belief: B4
+  claim: School's relative reduction decreases with gap_1_4 (residual unreached young susceptibles).
+  p: 0.55
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_1_4
+    direction: decreases
+- id: H4
+  belief: B5
+  claim: School's relative reduction does not depend on seed_share (|Spearman rho| within 0.15).
+  p: 0.7
+  test:
+    kind: effect_direction
+    package: school
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.15
+- id: H5
+  belief: B1
+  claim: School averts 60-100% of infections in at least 60% of usable points (most districts pushed below Reff
+    1).
+  p: 0.5
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.6
+- id: H6
+  belief: B6
+  claim: Where gap_1_4 is low (0.0512-0.12), school beats community on net benefit at the shadow price in at least
+    75% of points.
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.0512
+    - 0.12
+    sign: positive
+    min_share: 0.75
+- id: H7
+  belief: B6
+  claim: Where gap_1_4 is high (0.22-0.2827), community beats school on net benefit in at least 60% of points.
+  p: 0.42
+  test:
+    kind: paired_sign
+    a: community
+    b: school
+    feature: gap_1_4
+    range:
+    - 0.22
+    - 0.2827
+    sign: positive
+    min_share: 0.6
+- id: H8
+  belief: B6
+  claim: The school/community transition along gap_1_4 lies within 0.12-0.26.
+  p: 0.35
+  test:
+    kind: flip_in
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.12
+    - 0.26
