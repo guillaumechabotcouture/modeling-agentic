@@ -1,0 +1,292 @@
+beliefs:
+- id: B1
+  mechanism: A reactive campaign that starts protecting in week 3, during early exponential growth, pushes R_t to
+    or below 1 before most of the outbreak's infections occur, so it averts most infections relative to no vaccination.
+  about:
+    package: fast
+  direction: reduces
+  magnitude:
+    band:
+    - 0.5
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Bi Q, Ferreras E, Pezzoli L, et al. Protection against cholera from killed whole-cell oral cholera
+      vaccines: a systematic review and meta-analysis. Lancet Infect Dis 2017'
+    location: Results / abstract (pooled two-dose efficacy ~58%, effectiveness ~76%); exact table not recalled
+  - citation: Reyburn R, Deen JL, Grais RF, et al. The case for reactive mass oral cholera vaccinations. PLoS Negl
+      Trop Dis 2011
+    location: Results (cases averted fall as the campaign delay grows); figure number not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: A campaign protecting from week 8 arrives later in the growth phase. The higher the share infected
+    at detection, the closer week 8 is to the peak and the smaller the share of infections it can still avert.
+  about:
+    package: standard
+    feature: seed_share
+  direction: decreases
+  magnitude:
+    band:
+    - 0.1
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Reyburn R, Deen JL, Grais RF, et al. The case for reactive mass oral cholera vaccinations. PLoS Negl
+      Trop Dis 2011
+    location: Results (impact versus delay to vaccination); exact figure not recalled
+  - citation: 'Azman AS, Luquero FJ, Ciglenecki I, Grais RF, Sack DA, Lessler J. The impact of a one-dose versus
+      two-dose oral cholera vaccine regimen in outbreak settings: a modeling study. PLoS Med 2015'
+    location: Results (cases averted fall steeply with time to campaign start); figure not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: FAST beats STANDARD on net benefit at the shadow price wherever the outbreak can grow. Five weeks earlier
+    means roughly 2^5 fewer committed infections at R_eff 2. The extra infections averted per resident (order 0.01-0.5)
+    dwarf the price difference ($0.80 x 3e-4 = 2.4e-4 infections-equivalent per resident).
+  about:
+    pair:
+    - fast
+    - standard
+    feature: seed_share
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Azman AS, Luquero FJ, Ciglenecki I, Grais RF, Sack DA, Lessler J. The impact of a one-dose versus
+      two-dose oral cholera vaccine regimen in outbreak settings: a modeling study. PLoS Med 2015'
+    location: Results (speed of deployment matters more than dosing); location not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: The share susceptible sets R_eff = R0 x s0 (about 1.0-2.0). Higher s0 means faster growth and a larger
+    final size, so a fixed week-8 delay loses a larger share of the outbreak. STANDARD's relative reduction falls
+    with s0, while its absolute benefit rises.
+  about:
+    package: standard
+    feature: s0 (calibration scale)
+  direction: decreases
+  magnitude:
+    band:
+    - 0.1
+    - 0.9
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation, main result
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: In one closed, homogeneously mixing population, the relative effect depends on the seed share and s0,
+    not on population size. Population scales cost and absolute burden equally, so it does not change which option
+    is better per resident; it only weights districts in the budget.
+  about:
+    package: fast
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation (scale-free in N)
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B6
+  mechanism: 'Both campaigns beat no action where s0 is clearly above 1/R0 (R_eff >= ~1.4): attack rates of tens
+    of percent of residents make $2.20-3.00 per resident cheap at ~$3,300 per infection. Near s0 = 0.5 (R_eff ~1)
+    the outbreak barely grows within the year, and the value of any campaign falls towards its cost.'
+  about:
+    pair:
+    - standard
+    - none
+    feature: s0 (calibration scale)
+  direction: increases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.7
+    - 0.9971440066583455
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: FAST's week-3 start is early for nearly every seed share in range, so its relative reduction falls
+    only mildly as the seed share rises (fewer infections already committed before week 3 at low seed share).
+  about:
+    package: fast
+    feature: seed_share
+  direction: decreases
+  magnitude:
+    band:
+    - 0.5
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Reyburn R, Deen JL, Grais RF, et al. The case for reactive mass oral cholera vaccinations. PLoS Negl
+      Trop Dis 2011
+    location: Results (impact versus delay); figure not recalled
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+hypotheses:
+- id: H1
+  belief: B1
+  claim: FAST averts at least half of infections relative to no vaccination at most design points.
+  test:
+    kind: effect_band
+    package: fast
+    band:
+    - 0.5
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: STANDARD's relative reduction falls as the share infected at detection rises; refuted if Spearman rho's
+    interval lies above 0.
+  test:
+    kind: effect_direction
+    package: standard
+    feature: seed_share
+    direction: decreases
+    scope: conditional
+- id: H3
+  belief: B3
+  claim: FAST beats STANDARD on net benefit at the shadow price at >= 85% of usable points across the full seed-share
+    range; refuted if STANDARD wins at that share.
+  test:
+    kind: paired_sign
+    a: fast
+    b: standard
+    feature: seed_share
+    range:
+    - 1.399e-05
+    - 0.00091033
+    sign: positive
+    min_share: 0.85
+- id: H4
+  belief: B4
+  claim: STANDARD's relative reduction falls as s0 rises (marginal association; s0 is not declared independent).
+  test:
+    kind: effect_direction
+    package: standard
+    feature: s0 (calibration scale)
+    direction: decreases
+    scope: marginal
+- id: H5
+  belief: B5
+  claim: Population size has no material association with FAST's relative reduction (|rho| bound within 0.15).
+  test:
+    kind: effect_direction
+    package: fast
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+    scope: conditional
+- id: H6
+  belief: B6
+  claim: Where s0 >= 0.7, STANDARD beats no action on net benefit at >= 90% of usable points.
+  test:
+    kind: paired_sign
+    a: standard
+    b: none
+    feature: s0 (calibration scale)
+    range:
+    - 0.7
+    - 0.9971440066583455
+    sign: positive
+    min_share: 0.9
+- id: H7
+  belief: B7
+  claim: FAST's relative reduction falls as seed share rises, but less steeply than STANDARD's.
+  test:
+    kind: effect_direction
+    package: fast
+    feature: seed_share
+    direction: decreases
+    scope: conditional
+open_questions:
+- id: Q1
+  question: What are the effect sizes (coverage x single-campaign effectiveness) applied to R_t, and over what period?
+    An effect large enough to push R_t below 1 at s0 = 1 makes the start week the dominant lever; a small one makes
+    both campaigns only partial.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: Does the budget bind, and which districts then drop to STANDARD or none? FAST everywhere likely costs
+    more than $12M if total population exceeds 4M. The marginal choice is then between FAST in low-seed districts
+    and any vaccination in the rest.
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Near s0 ~ 0.5 (R_eff ~ 1), does STANDARD or none overtake FAST at the shadow price? Where is the flip
+    in s0 located, if it lies inside the range at all?
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: How does the surveyed s0 (units.csv s0_survey) compare with the calibration scale? It sets each district's
+    R_eff and so its ranking.
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: true
+- id: Q5
+  question: Is the protection-start timing (week 3 vs week 8) itself uncertain? Real reactive campaigns through
+    the ICG stockpile have often taken longer than 2 months, which would widen the gap.
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: false
