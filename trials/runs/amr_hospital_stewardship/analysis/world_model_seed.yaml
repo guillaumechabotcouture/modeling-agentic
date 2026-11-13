@@ -1,0 +1,298 @@
+beliefs:
+- id: B1
+  mechanism: Prospective audit and feedback lowers hospital-onset CDI by reducing total and high-risk antibiotic
+    exposure (cephalosporins, fluoroquinolones, clindamycin); the pooled stewardship effect on CDI incidence is
+    roughly a one-third reduction
+  about:
+    package: audit
+  direction: reduces
+  magnitude:
+    band:
+    - 0.12
+    - 0.47
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Baur D, et al. Effect of antibiotic stewardship on the incidence of infection and colonisation with
+      antibiotic-resistant bacteria and Clostridium difficile infection: a systematic review and meta-analysis.
+      Lancet Infect Dis 2017'
+    location: 'Abstract / Results: pooled CDI incidence ratio about 0.68 (95% CI about 0.53-0.88); location of the
+      forest plot not verified'
+  - citation: 'Feazel LM, et al. Effect of antibiotic stewardship programmes on Clostridium difficile incidence:
+      a systematic review and meta-analysis. J Antimicrob Chemother 2014'
+    location: 'Abstract: pooled risk ratio about 0.48; larger than Baur, likely publication and regression-to-mean
+      bias'
+  - citation: Davey P, et al. Interventions to improve antibiotic prescribing practices for hospital inpatients.
+      Cochrane Database Syst Rev 2017
+    location: Results, CDI outcomes; exact table not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Restrictive formulary with pre-authorisation of broad-spectrum agents lowers CDI by removing the highest-risk
+    agents; its effect on CDI is at least comparable to audit's, faster in onset, and with restriction of fluoroquinolones/cephalosporins
+    linked to large falls in some settings
+  about:
+    package: restrict
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.5
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Davey P, et al. Interventions to improve antibiotic prescribing practices for hospital inpatients.
+      Cochrane Database Syst Rev 2017
+    location: 'Results: restrictive versus enabling/persuasive interventions; restrictive effects larger early,
+      similar by 12 months (table not verified)'
+  - citation: 'Feazel LM, et al. Effect of antibiotic stewardship programmes on Clostridium difficile incidence:
+      a systematic review and meta-analysis. J Antimicrob Chemother 2014'
+    location: Subgroup analysis by intervention type (location not verified)
+  - citation: 'Dingle KE, et al. Effects of control interventions on Clostridium difficile infection in England:
+      an observational study. Lancet Infect Dis 2017'
+    location: 'Results: decline associated with fluoroquinolone restriction (observational; table not verified)'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Relative effect of a policy does not depend on the hospital''s baseline CDI rate: the engine applies
+    a multiplicative RR, and the evidence gives no reliable effect modification by baseline incidence (regression
+    to the mean in high-rate hospitals is a known bias of the before-after literature, not a real modifier)'
+  about:
+    package: audit
+    feature: cdi_rate
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Baur D, et al. Effect of antibiotic stewardship on the incidence of infection and colonisation with
+      antibiotic-resistant bacteria and Clostridium difficile infection: a systematic review and meta-analysis.
+      Lancet Infect Dis 2017'
+    location: Subgroup/heterogeneity analyses (not verified)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Surgical case mix might plausibly modify restriction's effect (perioperative prophylaxis with cephalosporins),
+    but there is no quantified trial evidence and the engine does not read surgical_share, so in this model the
+    relative reduction does not vary with it
+  about:
+    package: restrict
+    feature: surgical_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Davey P, et al. Interventions to improve antibiotic prescribing practices for hospital inpatients.
+      Cochrane Database Syst Rev 2017
+    location: No ward-type effect modification reported for CDI to my knowledge (not verified)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Restrict dominates audit on net benefit per admission: similar relative reduction at two-thirds of
+    the price, so audit wins only where its reduction exceeds restrict''s by more than lambda x US$2 / cdi_rate'
+  about:
+    pair:
+    - restrict
+    - audit
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Davey P, et al. Interventions to improve antibiotic prescribing practices for hospital inpatients.
+      Cochrane Database Syst Rev 2017
+    location: Restrictive vs enabling comparison (not verified)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'Baseline burden ranks the hospitals: absolute CDI averted per US$ scales linearly with cdi_rate, so
+    stewardship''s net benefit over none rises with cdi_rate and is clearly positive in high-burden hospitals'
+  about:
+    pair:
+    - restrict
+    - none
+  direction: increases
+  conditions:
+  - feature: cdi_rate
+    range:
+    - 0.0035
+    - 0.00734
+  source_type: literature
+  evidence:
+  - citation: Magill SS, et al. Multistate point-prevalence survey of health care-associated infections. N Engl
+      J Med 2014
+    location: 'Table 2: C. difficile among the most common HAI pathogens (baseline context, not a unit value)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'At a binding budget''s shadow price, the lowest-burden hospitals may not justify even restriction:
+    the restrict-versus-none choice, if it flips, flips at low cdi_rate'
+  about:
+    pair:
+    - restrict
+    - none
+  direction: flips
+  conditions:
+  - feature: cdi_rate
+    range:
+    - 0.00115
+    - 0.0035
+  source_type: literature
+  evidence:
+  - citation: 'Baur D, et al. Effect of antibiotic stewardship on the incidence of infection and colonisation with
+      antibiotic-resistant bacteria and Clostridium difficile infection: a systematic review and meta-analysis.
+      Lancet Infect Dis 2017'
+    location: Pooled effect (used with the price ratio; the flip location is reasoning, not a cited value)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Is audit's relative reduction on CDI larger than restrict's by the factor (about 1.5x) its price requires?
+    No head-to-head randomised evidence on CDI exists to my knowledge.
+  beliefs:
+  - B1
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Does the budget bind (restrict everywhere plus audit upgrades exceeds US$3M), and what is the shadow
+    price? This sets whether low-burden hospitals receive any policy.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Are the 2025 hospital-onset CDI rates comparable across hospitals (testing method PCR vs toxin EIA,
+    surveillance definitions), or does ascertainment drive part of the ranking?
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Do the effects combine (audit plus restriction) or substitute? Not decidable here since one policy per
+    hospital, but it matters for future years.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q5
+  question: Does surgical case mix modify restriction's effect on CDI in reality, even though the engine ignores
+    it?
+  beliefs:
+  - B4
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Audit's relative reduction in CDI lies in [0.12, 0.47] (pooled stewardship CI) at >= 80% of points; refuted
+    if <= 20% do
+  test:
+    kind: effect_band
+    package: audit
+    band:
+    - 0.12
+    - 0.47
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Restrict's relative reduction in CDI lies in [0.15, 0.50] at >= 80% of points; refuted if <= 20% do
+  test:
+    kind: effect_band
+    package: restrict
+    band:
+    - 0.15
+    - 0.5
+    min_share: 0.8
+- id: H3
+  belief: B1
+  claim: Audit's relative reduction falls as its log relative risk rises (engine carries the trial prior through)
+  test:
+    kind: effect_direction
+    package: audit
+    feature: lrr:audit:cdi
+    direction: decreases
+- id: H4
+  belief: B3
+  claim: Audit's relative reduction does not vary with baseline cdi_rate (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: audit
+    feature: cdi_rate
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B4
+  claim: Restrict's relative reduction does not vary with surgical_share (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: restrict
+    feature: surgical_share
+    direction: negligible
+    equivalence: 0.1
+- id: H6
+  belief: B5
+  claim: Restrict beats audit on net benefit at the shadow price at >= 65% of points across the cdi_rate range;
+    refuted if audit wins at >= 65%
+  test:
+    kind: paired_sign
+    a: restrict
+    b: audit
+    feature: cdi_rate
+    range:
+    - 0.00115
+    - 0.00734
+    sign: positive
+    min_share: 0.65
+- id: H7
+  belief: B6
+  claim: In high-burden hospitals (cdi_rate >= 0.0035) restrict beats none on net benefit at >= 90% of points
+  test:
+    kind: paired_sign
+    a: restrict
+    b: none
+    feature: cdi_rate
+    range:
+    - 0.0035
+    - 0.00734
+    sign: positive
+    min_share: 0.9
+- id: H8
+  belief: B7
+  claim: If restrict-versus-none flips along cdi_rate, the flip lies in the low-burden range [0.00115, 0.0035]
+  test:
+    kind: flip_in
+    a: restrict
+    b: none
+    feature: cdi_rate
+    range:
+    - 0.00115
+    - 0.0035
