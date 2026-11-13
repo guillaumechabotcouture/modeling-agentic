@@ -841,6 +841,10 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
+    from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
+    pre = PC.problems(run_dir, data, by)
+    if pre:
+        raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
     # toolkit/spec/signoff.py sign and scripts/decision_brief.py sign)
     from toolkit.spec import engine_parameters as PV
@@ -868,7 +872,8 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
     try:
         from toolkit.spec import preconditions as PC
         # signoff none (nobody signs): coverage without a record, the rule the launch preflight applies too
-        return PC.problems(run_dir, None, "unsigned" if signoff == "none" else "resume", engine=engine)
+        return PC.problems(run_dir, None, None, mode="unsigned" if signoff == "none" else "resume",
+                           only=("evidence_dossier",), engine=engine)
     except Exception as e:  # noqa: BLE001
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
@@ -1878,6 +1883,15 @@ def _self_test() -> int:
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
+        _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
+        try:
+            sign(d, "owner", "ok")
+            ok(False, "T17p the spike sign-off refuses a spec failing a registered precondition")
+        except ValueError as e:
+            ok("refused for owner" in str(e), f"T17p the spike sign-off refuses a spec failing a registered precondition")
+        finally:
+            _PC.CHECKS.pop("_t17", None)
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")

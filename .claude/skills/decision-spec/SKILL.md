@@ -228,6 +228,32 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   test at both ends of its declared range, and each output is classed `determined_by_data` or
   `set_by_declared_ranges`.
 
+## Engine benchmarks that are not in band
+
+An engine is not eligible for a component the options use when a benchmark covering it (the engine's
+`benchmark_coverage.yaml`) is `out_of_band`, `not_assessable` or `band_mis_based` in its verified record, or when
+no benchmark covers the component. A cost-per-outcome benchmark gates only when the spec charges the component
+through the engine cost output it prices; otherwise it is reported. The pre-sign check names each problem.
+Prefer options and an engine the evidence supports. When the decision still needs that engine, declare a
+departure for the owner to sign, never a silent one:
+
+    engine_departures:
+      - {engine: <card name>, benchmark: <id>, reason: "<why the decision may still use it>",
+         decision_test: <an analysis.decision_tests id that varies that effect>}
+      - {engine: <card name>, component: <engine component>, reason: "...", decision_test: <id>}
+
+The decision test must run on this run's path and change the related effect
+(toolkit/spec/preconditions.py `decision_test_runs`): a parameter_value test on an effect parameter the coverage
+file names for it, with at least two values spanning its declared range (or `range_fraction` of it, stated in the
+departure) and, on the emulator path, on an emulator input (a fitted parameter, a drawn prior or a spec value); or,
+for an interaction benchmark only, an interaction_rescale test on that benchmark that rescales one of its two
+components given the other. The run then checks what the test actually did; a departure whose test did not take
+effect is a finding only the owner can resolve. Only components some
+allowed package holds are checked. Only the owner's signature makes a departure
+count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
+limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
+fit target out of band means the engine's fit failed; it gates the same way.
+
 ## What not to do
 
 - Do not type a result, an effect size from the data, or an interval into the spec: the

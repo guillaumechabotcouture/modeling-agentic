@@ -567,12 +567,19 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
         spec.derived = derived
     try:
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
+        from toolkit.engines import benchmark_coverage as BC      # owner decision 2026-11-12: signed departures
+        pres = pres + BC.departure_problems(spec.raw)
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
                         "cannot be checked)"] + pres
-            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
-        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
+            from toolkit.spec import preconditions as PC       # every candidate the engine choice could pick
+            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else []) \
+                + PC.problems(spec.base, None, None, spec=spec)
+        # the signed spec's preconditions at the execution boundary (the analysis validates here; #215, #218)
+        from toolkit.spec import preconditions as PC
+        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else []) \
+            + PC.problems(spec.base, None, None, spec=spec)
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
 

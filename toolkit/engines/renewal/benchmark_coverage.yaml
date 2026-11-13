@@ -1,0 +1,37 @@
+# Which package components each benchmark of the renewal pack covers (owner decision 2026-11-12;
+# toolkit/engines/benchmark_coverage.py). Every benchmark here verifies the engine's mathematics; none judges
+# a package component's effect against a trial, so none gates the engine choice.
+engine: renewal
+absent_values: {none: [0]}
+effects_from_spec:
+  '*': >-
+    components are configured by the spec (doses, campaigns, interventions over a period); their effect sizes are spec inputs with their sources (engine_parameters), so no engine benchmark against a trial applies
+reasons:
+  rw: &rw "verification against closed forms, a second implementation and the Cori estimator; no package component"
+  pub: &pub "published reproduction-number estimates (not transcribed): the estimator, no component"
+benchmarks:
+  RW1a: {covers: {}, covers_none_because: *rw}
+  RW1b: {covers: {}, covers_none_because: *rw}
+  RW1c: {covers: {}, covers_none_because: *rw}
+  RW2a: {covers: {}, covers_none_because: *rw}
+  RW2b: {covers: {}, covers_none_because: *rw}
+  RW2c: {covers: {}, covers_none_because: *rw}
+  RW2d: {covers: {}, covers_none_because: *rw}
+  RW2e: {covers: {}, covers_none_because: *rw}
+  RW2f: {covers: {}, covers_none_because: *rw}
+  RW3a: {covers: {}, covers_none_because: *rw}
+  RW3b: {covers: {}, covers_none_because: *rw}
+  RW3c: {covers: {}, covers_none_because: *rw}
+  RW3d: {covers: {}, covers_none_because: *rw}
+  RW3e: {covers: {}, covers_none_because: *rw}
+  RW4: {covers: {}, covers_none_because: *rw}
+  RW5a: {covers: {}, covers_none_because: *rw}
+  RW5b: {covers: {}, covers_none_because: *rw}
+  RW5c: {covers: {}, covers_none_because: *rw}
+  RW5d: {covers: {}, covers_none_because: *rw}
+  RW6a: {covers: {}, covers_none_because: *rw}
+  RW6b: {covers: {}, covers_none_because: *rw}
+  RW6c: {covers: {}, covers_none_because: *rw}
+  RW7: {covers: {}, covers_none_because: *rw}
+  RW8: {covers: {}, covers_none_because: *rw}
+  RW9: {covers: {}, covers_none_because: *pub}

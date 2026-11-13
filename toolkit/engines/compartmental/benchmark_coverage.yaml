@@ -1,0 +1,82 @@
+# Which package components each benchmark of the compartmental-starsim pack covers (owner decision 2026-11-12;
+# toolkit/engines/benchmark_coverage.py). Every benchmark here verifies the engine's mathematics; none judges
+# a package component's effect against a trial, so none gates the engine choice.
+engine: compartmental-starsim
+absent_values: {none: [0]}
+effects_from_spec:
+  '*': >-
+    components are configured by the spec (doses, campaigns, interventions over a period); their effect sizes are spec inputs with their sources (engine_parameters), so no engine benchmark against a trial applies
+reasons:
+  fs: &fs "final-size verification against the closed form and the reference ODE; no package component"
+  br: &br "branching-process verification against closed forms; no package component"
+  rn: &rn "renewal-form verification (growth rate, attack rate, reproduction number); no package component"
+  ci: &ci "cohort-immunity arithmetic checked by hand; the dose effects it combines are spec inputs with a source"
+  ob: &ob "observation-model arithmetic checked by hand (coverage, assay, frame, waning); no package component"
+  as: &as "age-structured verification (closed forms, next-generation threshold); dose effects are spec inputs"
+  pubfs: &pubfs "published age-specific final sizes (not transcribed): the transmission structure, no component"
+  pub: &pub "published reproduction-number estimates (not transcribed): the estimator, no component"
+benchmarks:
+  FS1a: {covers: {}, covers_none_because: *fs}
+  FS1b: {covers: {}, covers_none_because: *fs}
+  FS1c: {covers: {}, covers_none_because: *fs}
+  FS1d: {covers: {}, covers_none_because: *fs}
+  FS1e: {covers: {}, covers_none_because: *fs}
+  FS2a: {covers: {}, covers_none_because: *fs}
+  FS2b: {covers: {}, covers_none_because: *fs}
+  FS2c: {covers: {}, covers_none_because: *fs}
+  FS3: {covers: {}, covers_none_because: *fs}
+  FS4a: {covers: {}, covers_none_because: *fs}
+  FS4b: {covers: {}, covers_none_because: *fs}
+  FS4c: {covers: {}, covers_none_because: *fs}
+  FS5: {covers: {}, covers_none_because: *fs}
+  FS6a: {covers: {}, covers_none_because: *fs}
+  FS6b: {covers: {}, covers_none_because: *fs}
+  FS6c: {covers: {}, covers_none_because: *fs}
+  FS8a: {covers: {}, covers_none_because: *fs}
+  FS8b: {covers: {}, covers_none_because: *fs}
+  BR1a: {covers: {}, covers_none_because: *br}
+  BR1b: {covers: {}, covers_none_because: *br}
+  BR1c: {covers: {}, covers_none_because: *br}
+  BR1d: {covers: {}, covers_none_because: *br}
+  BR1e: {covers: {}, covers_none_because: *br}
+  RN1: {covers: {}, covers_none_because: *rn}
+  RN2a: {covers: {}, covers_none_because: *rn}
+  RN2b: {covers: {}, covers_none_because: *rn}
+  RN2c: {covers: {}, covers_none_because: *rn}
+  RN2d: {covers: {}, covers_none_because: *rn}
+  RN3a: {covers: {}, covers_none_because: *rn}
+  RN3b: {covers: {}, covers_none_because: *rn}
+  RN3c: {covers: {}, covers_none_because: *rn}
+  RN3d: {covers: {}, covers_none_because: *rn}
+  RN3e: {covers: {}, covers_none_because: *rn}
+  RN4: {covers: {}, covers_none_because: *rn}
+  CI1a: {covers: {}, covers_none_because: *ci}
+  CI1b: {covers: {}, covers_none_because: *ci}
+  CI1c: {covers: {}, covers_none_because: *ci}
+  CI1d: {covers: {}, covers_none_because: *ci}
+  CI1e: {covers: {}, covers_none_because: *ci}
+  CI2: {covers: {}, covers_none_because: *ci}
+  CI3: {covers: {}, covers_none_because: *ci}
+  CI4a: {covers: {}, covers_none_because: *ci}
+  CI4b: {covers: {}, covers_none_because: *ci}
+  OB1a: {covers: {}, covers_none_because: *ob}
+  OB1b: {covers: {}, covers_none_because: *ob}
+  OB1c: {covers: {}, covers_none_because: *ob}
+  OB1d: {covers: {}, covers_none_because: *ob}
+  OB1e: {covers: {}, covers_none_because: *ob}
+  OB1f: {covers: {}, covers_none_because: *ob}
+  OB1g: {covers: {}, covers_none_because: *ob}
+  OB1h: {covers: {}, covers_none_because: *ob}
+  AS1: {covers: {}, covers_none_because: *as}
+  AS1b: {covers: {}, covers_none_because: *as}
+  AS2: {covers: {}, covers_none_because: *as}
+  AS3a: {covers: {}, covers_none_because: *as}
+  AS3b: {covers: {}, covers_none_because: *as}
+  AS3c: {covers: {}, covers_none_because: *as}
+  AS4: {covers: {}, covers_none_because: *as}
+  AS5a: {covers: {}, covers_none_because: *as}
+  AS5b: {covers: {}, covers_none_because: *as}
+  AS7: {covers: {}, covers_none_because: *as}
+  AS6: {covers: {}, covers_none_because: *as}
+  FS7: {covers: {}, covers_none_because: *pubfs}
+  RN5: {covers: {}, covers_none_because: *pub}

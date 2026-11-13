@@ -100,7 +100,7 @@ def preconditions_state(run_dir: str, rec: dict | None = None) -> tuple:
     "preconditions_failed"."""
     from toolkit.spec import preconditions as PC
     cap: dict = {}
-    bad = PC.problems(run_dir, None, "status", record=rec, capture=cap)
+    bad = PC.problems(run_dir, None, None, mode="status", only=("evidence_dossier",), record=rec, capture=cap)
     if not bad:
         return "ok", []
     ev = cap.get("evidence_status")
@@ -184,7 +184,7 @@ def sign_preconditions(run_dir: str, spec_bytes: bytes) -> dict:
     ({files, record}) to record."""
     from toolkit.spec import preconditions as PC
     cap: dict = {}
-    bad = PC.problems(run_dir, spec_bytes, "sign", capture=cap)
+    bad = PC.problems(run_dir, spec_bytes, None, mode="sign", only=("evidence_dossier",), capture=cap)
     if bad:
         raise ValueError("spec not signable (preconditions): " + "; ".join(bad[:12])
                          + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
@@ -260,6 +260,10 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
+    if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
+        from toolkit.spec import preconditions as PC
+        errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
+                for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -458,6 +462,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
         except ValueError:
             dossier_bytes = None
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
+    from toolkit.engines import benchmark_coverage as BC
+    out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

@@ -479,7 +479,8 @@ if refs:
     from toolkit import import_guard as G
     G.allow_test_refs("engine", refs)
 from toolkit.spec import preconditions as PC
-print("PRECONDITIONS " + json.dumps(PC.problems(os.path.join(tree, rel), None, signer)))
+print("PRECONDITIONS " + json.dumps(PC.problems(os.path.join(tree, rel), None, None, mode=signer,
+                                                    only=("evidence_dossier",))))
 """
 
 

@@ -478,6 +478,10 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         # sign does, and refuses the same)
         from toolkit.spec import signoff as SO
         SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
+        from toolkit.spec import preconditions as PC      # every signing path checks the spec's preconditions (#215)
+        pre = PC.problems(run_dir, captured[DECISION_SPEC], by)
+        if pre:
+            raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
         # F6 (#218): every registered precondition, recomputed from the files (toolkit/spec/preconditions.py), whoever
         # signs; a binding the caller hands in is never trusted: it must be the one recomputed here
         mine = SO.sign_preconditions(run_dir, captured[DECISION_SPEC])

@@ -510,10 +510,7 @@ def _test_problems(key: str, r: dict, rng: list, tid: str, run: dict, run_dir: s
                        f"drawn; the runner generates {gen or 'none'} for it)")
             continue
         draws = dict(ex["fitted"], **ex["drawn"])
-        try:
-            res = PC.decision_test_runs(run, tid, f"parameter:{r['name']}", drawn=draws)
-        except TypeError:           # the (spec, test_id, effect) -> (ok, why) form
-            res = PC.decision_test_runs(run, tid, f"parameter:{r['name']}")
+        res = PC.chosen_range_test_runs(run, tid, f"parameter:{r['name']}", drawn=draws)
         if not res[0]:
             bad.append(f"entry {key}: decision_test {tid} {res[1]}")
             continue
@@ -1007,11 +1004,14 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
     return {"status": status, "problems": problems, "binding": binding}
 
 
-def _precondition(run_dir, spec_bytes, signer, **ctx) -> list:
-    """The evidence check as a registered precondition (toolkit/spec/preconditions.py). signer "sign": a signer;
-    "unsigned": a run nobody signs (signoff none): coverage only; otherwise the record is compared."""
-    st = state(run_dir, spec_bytes=spec_bytes, read=ctx.get("read"), signing=signer in ("sign", "unsigned"),
-               engine=ctx.get("engine"), record=ctx.get("record"), require_sheet=signer != "unsigned")
+def _precondition(run_dir, spec, signer, spec_bytes=None, mode=None, **ctx) -> list:
+    """The evidence check as a registered context precondition (toolkit/spec/preconditions.py). `mode` "sign": a
+    signer; "unsigned": a run nobody signs (signoff none): coverage only; "status", "launch", "resume": a signed run,
+    its record compared. Without a mode (schema validation, the benchmark callers) it does not run."""
+    if mode is None:
+        return []
+    st = state(run_dir, spec_bytes=spec_bytes, read=ctx.get("read"), signing=mode in ("sign", "unsigned"),
+               engine=ctx.get("engine"), record=ctx.get("record"), require_sheet=mode != "unsigned")
     cap = ctx.get("capture")
     if isinstance(cap, dict):           # the caller's view of this check: its status and the binding a signer records
         cap.update(evidence_status=st["status"], evidence_binding=st["binding"])
@@ -1020,7 +1020,7 @@ def _precondition(run_dir, spec_bytes, signer, **ctx) -> list:
 
 def _register():
     from toolkit.spec import preconditions as PC
-    PC.register("evidence_dossier", _precondition)
+    PC.register("evidence_dossier", _precondition, context=True)
 
 
 def _cell(v, n=160) -> str:
