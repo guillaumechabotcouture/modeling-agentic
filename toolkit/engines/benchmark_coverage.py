@@ -344,6 +344,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                             effect_parameters(entries[i], version), {s for s, _c, _v in hits},
                             {"benchmark_status": st, "role": role, "components": comps},
                             {"benchmark": i, "estimand": entries[i].get("estimand"), "rescaled": entries[i].get("rescaled"),
+                             "maps": {s_: {c_ for c_, _v in prs} for s_, prs in smap.items()},
                              "pair": {c: {s for s, cc, _v in hits if cc == c} for c in (entries[i].get("covers") or {})}}))
     counts = departures_status in ("signed", "proposed")
     for key, kind, params, comps, failing, ctx in pending:
