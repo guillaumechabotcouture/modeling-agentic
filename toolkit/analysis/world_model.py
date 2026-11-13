@@ -2031,6 +2031,113 @@ def _self_test() -> int:
         d2 = direction(x, x + 0.3 * np.random.default_rng(4).standard_normal(60))
         ok(d2.get("p_method") == "fisher", f"WM58b from {SETTINGS.get('perm_n_max')} points on, Fisher: {d2}")
     tryit("WM58 small samples", wm58)
+
+    def wm60():
+        rng = np.random.default_rng(31)
+        x = rng.standard_normal(600)
+        z = 0.3 * x + math.sqrt(1 - 0.09) * rng.standard_normal(600)
+        cs = _sw({"x": x, "z": z}, 0.3 + 0 * x, 0.5 + 0.01 * x - 0.10 * z)
+        t = {"kind": "effect_direction", "package": "B", "feature": "x"}
+        s1, r1 = _one(cs, dict(t, direction="decreases"))
+        ok(s1 == "inconclusive", "WM60 a conditional claim is inconclusive on a design that does not make its feature "
+                                 f"independent of the others, at any correlation (here 0.3): {s1} {r1['observed']}")
+        s2, r2 = _one(cs, dict(t, direction="increases", adjust_for=["z"]))
+        ok(s2 == "supported" and r2["observed"].get("adjusted_for") == ["z"],
+           f"WM60b adjusted for the declared covariate (partial rank correlation), the true direction is supported: "
+           f"{s2} {r2['observed']}")
+        ind = _sw({"x": x, "z": rng.permutation(z)}, 0.3 + 0 * x, 0.5 + 0.05 * x - 0.10 * rng.permutation(z))
+        ind.design = {"independent": ["x", "z"]}
+        s3, _ = _one(ind, dict(t, direction="increases"))
+        ok(s3 == "supported", f"WM60c on a design that samples its features independently, a conditional claim is "
+                              f"judged directly: {s3}")
+        one = {"beliefs": [dict(_seed()["beliefs"][0])], "hypotheses": [{
+            "id": "M1", "belief": "B1", "claim": "A's effect does not vary with f1",
+            "test": {"kind": "effect_direction", "package": "A", "feature": "f1", "direction": "negligible",
+                     "equivalence": 0.3, "scope": "marginal"}}]}
+        wm, hy = build(one, sw, registry=register(one, [], REGISTERED))
+        ok(hy["hypotheses"][0]["status"] == "supported" and wm["beliefs"][0]["confidence"] == "medium",
+           f"WM61 a marginal-scope confirmation never raises confidence in a mechanism belief: "
+           f"{hy['hypotheses'][0]['status']} {wm['beliefs'][0]['confidence']}")
+    tryit("WM60-61 conditional claims", wm60)
+
+    def wm62():
+        rng = np.random.default_rng(13)
+        feats = {f"n{k:03d}": rng.uniform(0, 1, 30) for k in range(100)}
+        null = _sw(feats, 0.3 + 0.02 * rng.standard_normal(30), 0.3 + 0.02 * rng.standard_normal(30))
+        mu = summarise(null)["multiplicity"]
+        ok(mu["tested"] == 300 and mu["discoveries"] == 0, f"WM62 every attempted test enters the false-discovery "
+                                                           f"family (failed fits with p = 1): {mu}")
+    tryit("WM62 multiplicity family", wm62)
+
+    def wm63():
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        one = {"beliefs": [dict(_seed()["beliefs"][0])], "hypotheses": [dict(_seed()["hypotheses"][0])]}
+        reg = register(one, [], REGISTERED)
+        wm1, hy1 = build(one, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg)
+        f = Sweep(sw.features, sw.packages, sw.comparator, sw.burden, sw.y, dict(sw.cost, B=sw.cost["B"] * 3),
+                  groups=sw.groups, points=sw.points, artifacts=sw.artifacts, lam=0.2, evidence_time=EVIDENCE_TIME)
+        wm2, hy2 = build(wm1, f, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg,
+                         hypotheses=hy1["hypotheses"])
+        ok(hy2["hypotheses"][0]["confrontation"]["repeat"] and wm2["track_record"]["confirmed"] == 1,
+           f"WM63 an effect test's evidence is the slice it read: a new shadow price or another package's cost is not "
+           f"new evidence: {hy2['hypotheses'][0]['confrontation']} {wm2['track_record']['confirmed']}")
+    tryit("WM63 evidence slice", wm63)
+
+    def wm64():
+        import yaml
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        sd = _seed()
+        sd["hypotheses"][0]["test"].update(band=[0.20004, 0.39996], min_share=0.80001)
+        reg = register(sd, [], REGISTERED)
+        wm1, hy1 = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg)
+        wm_r, hy_r = (yaml.safe_load(dump(x)) for x in (wm1, hy1))
+        ok(hy_r["hypotheses"][0]["test"]["band"] == [0.20004, 0.39996] and
+           hy_r["hypotheses"][0]["test"]["min_share"] == 0.80001,
+           f"WM64 saved tests and state keep full precision: {hy_r['hypotheses'][0]['test']}")
+        wm2, hy2 = build(wm_r, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg,
+                         hypotheses=hy_r["hypotheses"])
+        ok(all(h["confrontation"]["repeat"] for h in hy2["hypotheses"]) and
+           wm2["track_record"]["confirmed"] == wm1["track_record"]["confirmed"],
+           f"WM64b a save then reload replays as repeats: {wm2['track_record']['confirmed']} vs "
+           f"{wm1['track_record']['confirmed']}")
+    tryit("WM64 save and reload", wm64)
+
+    def wm65():
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis", "batch"))
+            res = os.path.join(d, "analysis", "batch", "results.jsonl")
+            open(res, "w").write("{}\n")
+            from toolkit.analysis.artifacts import sha256
+            json.dump({"finished_at": "2026-03-01T00:00:00+00:00"}, open(os.path.join(d, "analysis", "manifest.json"),
+                                                                            "w"))
+            ok(evidence_time(d)[0] is None, "WM65 an analysis finish time is not when the evidence first existed")
+            yaml.safe_dump({"written_at": "2026-01-01T00:00:00+00:00", "inputs": {
+                "analysis/batch/results.jsonl": sha256(res)}}, open(os.path.join(d, "analysis", "batch.yaml"), "w"))
+            ok(evidence_time(d)[0] == "2026-01-01T00:00:00+00:00", f"WM65b the batch record bound to the results "
+                                                                     f"dates them: {evidence_time(d)}")
+            open(res, "w").write("{}\n{}\n")
+            ok(evidence_time(d)[0] is None, "WM65c a batch record bound to other results does not date these")
+    tryit("WM65 evidence time", wm65)
+
+    def wm66():
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        sd = _seed()
+        sd["track_record"] = {"history": [{"hypothesis": f"X{k}", "belief": "B1", "status": "supported",
+                                           "test_sha": f"{k:064d}", "evidence_sha": None, "post_hoc": False}
+                                          for k in range(20)]}
+        wf, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
+        tr = wf["track_record"]
+        ok(tr["confirmed"] == 4 and len(tr.get("unverified") or []) == 20,
+           f"WM66 imported history entries that do not verify (evidence, registration) are listed, never scored: "
+           f"{tr['confirmed']} confirmed, {len(tr.get('unverified') or [])} unverified")
+    tryit("WM66 imported history", wm66)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
