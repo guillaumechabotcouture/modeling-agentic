@@ -224,9 +224,11 @@ def gate_findings(run_dir: str) -> list[dict]:
 
 
 def departure_findings(run_dir: str) -> list[dict]:
-    """#215 round 4: a signed engine departure whose decision test did not take effect in the run (not run, an
-    identity at the calibrated point, a targeted package skipped, no realised benefit change), or with no check
-    recorded, is a non-declarable finding that bears on the decision: only the owner can resolve it."""
+    """#215: a signed engine departure of the engine the run used whose decision test did not take effect (not run,
+    an identity at the calibrated point, a targeted package skipped, no realised change in a package holding the
+    departed pair or component) is a non-declarable finding that bears on the decision. The verdict is recomputed
+    from the decision-test records the manifest lists with matching hashes (decision_tests.departure_verdicts); a
+    record missing from the manifest, or changed since, counts as not run."""
     import yaml
     try:
         spec = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
@@ -238,17 +240,49 @@ def departure_findings(run_dir: str) -> list[dict]:
 
     def f(claim, key):
         return dict(_f("departure_test_ineffective", claim, key), decision_bearing=True)
-    p = os.path.join(run_dir, "models", "decision_tests", "departure_checks.yaml")
+    e = spec.get("engine")
+    ref = e.get("ref") if isinstance(e, dict) else e
+    if not (isinstance(ref, str) and ":" in ref):
+        try:
+            ref = ((json.load(open(os.path.join(run_dir, ENGINE_CHOICE))) or {}).get("engine") or {}).get("ref")
+        except (OSError, ValueError, AttributeError):
+            ref = None
+    from toolkit.engines import benchmark_coverage as BC
     try:
-        checks = (yaml.safe_load(open(p)) or {}).get("checks") or []
-    except (OSError, yaml.YAMLError, AttributeError):
-        return [f("the spec declares engine departures but the run recorded no check of their decision tests "
-                  "(models/decision_tests/departure_checks.yaml)", "departures")]
-    out = [f(f"engine departure {c.get('departure')}: {c.get('why')}", str(c.get("departure")))
-           for c in checks if isinstance(c, dict) and c.get("effective") is not True]
-    seen = {str(c.get("departure")) for c in checks if isinstance(c, dict)}
-    out += [f(f"engine departure {k}: no check of its decision test was recorded", k)
-            for k in (str(d.get("benchmark") or d.get("component")) for d in deps) if k not in seen]
+        name = (BC.load(BC.path_for(ref))[0] or {}).get("engine")
+    except Exception:  # noqa: BLE001
+        name = None
+    if not name:
+        return [f("the spec declares engine departures but the engine the run used, or its coverage file, cannot be "
+                  "identified", "departures")]
+    mine = [d for d in deps if d.get("engine") == name]
+    if not mine:
+        return []
+    try:
+        man = json.load(open(os.path.join(run_dir, MANIFEST)))
+    except (OSError, ValueError):
+        man = {}
+    records = {}
+    for rel, ent in ((man or {}).get("deliverables") or {}).items():
+        p = os.path.join(run_dir, rel)
+        if ent.get("role") == "decision_test" and os.path.exists(p) and sha256(p) == ent.get("sha256"):
+            try:
+                doc = yaml.safe_load(open(p)) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            if doc.get("produced_by") == "harness":
+                records[str(doc.get("test_id"))] = doc
+    from toolkit.analysis import decision_tests as DT
+    try:
+        raw = dict(spec, engine={"ref": ref, "config": (e.get("config") if isinstance(e, dict) else None) or {}})
+        targets = BC.departure_targets(raw, ref, run_dir)
+    except Exception as ex:  # noqa: BLE001
+        return [f(f"the departed components cannot be resolved: {type(ex).__name__}: {ex}", "departures")]
+    out = []
+    for v in DT.departure_verdicts(mine, targets, records):
+        if not v["effective"]:
+            note = "" if v["test"] in records else " (its record is not in the manifest, or changed since the run)"
+            out.append(f(f"engine departure {v['departure']} of {v['engine']}: {v['why']}{note}", str(v["departure"])))
     return out
 
 

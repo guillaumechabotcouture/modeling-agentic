@@ -1070,18 +1070,40 @@ def _self_test_benchmark_gate(ok) -> None:
             write_results(rows_in)
             # round 4: a departure whose test did not take effect during the run is a non-declarable finding that
             # bears on the decision (it goes to the owner; it blocks delivery)
+            # λ: the contract recomputes each departure's verdict from the manifest-hashed decision-test records;
+            # there is no separate check file to edit
             from toolkit.analysis import contract as CT
             dk = os.path.join(run, "models", "decision_tests")
             os.makedirs(dk, exist_ok=True)
-            yaml.safe_dump({"checks": [{"departure": "T1", "test": "DTa", "effective": False,
-                                        "why": "every perturbation is an identity at the calibrated point"}]},
-                           open(os.path.join(dk, "departure_checks.yaml"), "w"))
             fd = [f for f in CT.gate_findings(run) if f["kind"] == "departure_test_ineffective"]
             ok(fd and fd[0]["scope_declarable"] is False and fd[0].get("decision_bearing") is True,
-               f"G30 an ineffective departure test is a non-declarable, decision-bearing finding ({fd[:1]})")
-            os.remove(os.path.join(dk, "departure_checks.yaml"))
-            fd = [f for f in CT.gate_findings(run) if f["kind"] == "departure_test_ineffective"]
-            ok(bool(fd), "G30b a signed departure with no departure check recorded is the same finding (fail closed)")
+               f"G30 a departure whose test has no record in the manifest is a non-declarable, decision-bearing "
+               f"finding ({fd[:1]})")
+            pk_ab = next(k for k, cs in schema.load(p).packages().items() if cs == {"a"})
+            good = {"test_id": "DTa", "status": "run", "produced_by": "harness", "perturbation_identity": [False, False],
+                    "benefit_change_by_package": {pk_ab: 1.0}, "missing_subtraction": [],
+                    "package_components": {k: sorted(v) for k, v in schema.load(p).packages().items()}}
+            rp_ = os.path.join(dk, "DTa.yaml")
+            yaml.safe_dump(good, open(rp_, "w"))
+            from toolkit.analysis.artifacts import sha256 as _sha
+            json.dump({"deliverables": {"models/decision_tests/DTa.yaml": {"role": "decision_test",
+                                                                           "sha256": _sha(rp_)}}},
+                      open(os.path.join(run, "analysis", "manifest.json") if os.path.isdir(os.path.join(run, "analysis"))
+                           else (os.makedirs(os.path.join(run, "analysis")) or os.path.join(run, "analysis",
+                                                                                          "manifest.json")), "w"))
+            fd = [f for f in CT.departure_findings(run)]
+            ok(fd == [], f"G30c a manifest-listed record showing the test ran and changed the pair's benefit: no "
+                         f"finding ({fd[:1]})")
+            yaml.safe_dump(dict(good, benefit_change_by_package={}), open(rp_, "w"))
+            fd = [f for f in CT.departure_findings(run)]
+            ok(fd and "not in the manifest" in fd[0]["claim"],
+               f"G30b a record edited after the run no longer matches its manifest hash: refused ({fd[:1]})")
+            raw_o = yaml.safe_load(open(p))
+            yaml.safe_dump(dict(raw_o, engine_departures=[dict(dep, engine="other-engine")]),
+                           open(os.path.join(run, "decision_spec.yaml"), "w"), sort_keys=False)
+            fd = [f for f in CT.departure_findings(run)]
+            ok(fd == [], f"G30d departures for an engine the run did not use are out of the check's scope ({fd[:1]})")
+            yaml.safe_dump(raw_o, open(os.path.join(run, "decision_spec.yaml"), "w"), sort_keys=False)
             # review: the configuration the run uses, and the named-engine sheet
             write_cov(cov)
             write_results(rows_in)

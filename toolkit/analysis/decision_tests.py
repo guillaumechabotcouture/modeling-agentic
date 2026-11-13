@@ -86,55 +86,62 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
                                       atomic=True)
             rec["path"] = os.path.relpath(p, run_dir)
         out.append(rec)
-    from toolkit.analysis.artifacts import _safe_io
-    rel = f"{DIR}/{DEPARTURE_CHECKS}".replace(os.sep, "/")
-    if A.spec.raw.get("engine_departures"):
-        _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(plain({"producer": PRODUCER, "checks": check_departures(
-            A, out)}), sort_keys=False, width=120).encode(), atomic=True)
-    else:
-        _safe_io().remove_nofollow(run_dir, rel)
     return out
 
 
-DEPARTURE_CHECKS = "departure_checks.yaml"
+def departure_verdicts(departures, targets, records) -> list[dict]:
+    """#215: each departure's verdict from what its decision test recorded (records: test id -> the harness's
+    decision-test record, whose file the manifest hashes). Effective only when the test ran, at least one of its
+    perturbations was not an identity at the calibrated point, it skipped no targeted package for want of a
+    subtraction package, and it changed the benefit of a targeted package: one holding the departed benchmark's own
+    pair (an interaction), or a departed component. The run's contract recomputes this from the records."""
+    out = []
+    for d in departures:
+        key, tid = d.get("benchmark") or d.get("component"), str(d.get("decision_test"))
+        tgt = targets.get(key) or {}
+        rec = records.get(tid)
+        pkc = {k: set(v) for k, v in ((rec or {}).get("package_components") or {}).items()}
+        pair = [set(v) for v in (tgt.get("pair") or {}).values()]
+        if tgt.get("estimand") == "interaction" and len(pair) == 2:
+            target = {k for k, cs in pkc.items() if all(side & cs for side in pair)}
+            what = f"a package holding the benchmark's pair ({[sorted(x) for x in pair]})"
+        else:
+            comps = set(tgt.get("components") or [])
+            target = {k for k, cs in pkc.items() if cs & comps}
+            what = f"a package holding {sorted(comps) or 'the departed component'}"
+        why = None
+        if rec is None or rec.get("status") != "run":
+            why = f"its decision test {tid} was not run ({(rec or {}).get('reason', 'no harness record')})"
+        elif not any(x is False for x in rec.get("perturbation_identity") or []):
+            why = f"every perturbation of {tid} is an identity at the calibrated point"
+        elif set(rec.get("missing_subtraction") or []) & target:
+            why = (f"{tid} skipped targeted packages for want of their subtraction package "
+                   f"({sorted(set(rec['missing_subtraction']) & target)})")
+        elif not target or max(float((rec.get("benefit_change_by_package") or {}).get(k) or 0.0) for k in target) <= 0:
+            why = f"{tid} changed no benefit of {what}"
+        out.append({"engine": d.get("engine"), "departure": key, "test": tid, "effective": why is None,
+                    "why": why or f"{tid} ran and changed the benefit of {what}"})
+    return out
 
 
 def check_departures(A, recs) -> list[dict]:
-    """#215 round 4: during the run, each signed engine departure's decision test is checked against what actually
-    ran: run (not not_run), a non-identity perturbation at the calibrated point (plan_test with runtime_evidence), no
-    targeted package skipped for want of its subtraction package, and a realised change in the benefit of a
-    package holding a departed component. A failed check is a non-declarable finding for the owner
-    (toolkit/analysis/contract.py departure_test_ineffective)."""
+    """The same verdicts during the run, with each record's identity flags recomputed at the analysis's calibrated
+    point (plan_test with runtime_evidence) and its packages from the analysis."""
     from toolkit.engines import benchmark_coverage as BC
     name = A.eng.describe().name
     ref = f"{type(A.eng).__module__}:{type(A.eng).__name__}"
-    targets = BC.departure_targets(A.spec.raw, ref, A.spec.base)
     tests = {str(t.get("id")): t for t in A.spec["analysis"].get("decision_tests") or []}
-    byid = {str(r.get("test_id")): r for r in recs}
-    out = []
-    for d in A.spec.raw.get("engine_departures") or []:
-        if not isinstance(d, dict) or d.get("engine") != name:
-            continue
-        key, tid = d.get("benchmark") or d.get("component"), str(d.get("decision_test"))
-        comps = set((targets.get(key) or {}).get("components") or [])
-        rec, dt = byid.get(tid), tests.get(tid)
-        why = None
-        if rec is None or dt is None or rec.get("status") != "run":
-            why = f"its decision test {tid} was not run ({(rec or {}).get('reason', 'no result')})"
-        else:
-            pl = plan_test(A.spec, dt, runtime_evidence(A))
-            live = [x for x in pl["perturbations"] if not x.get("identity")]
-            if pl["status"] != "runs" or not live:
-                why = (f"every perturbation of {tid} is an identity at the calibrated point" if pl["status"] == "runs"
-                       else f"{tid} would not run at the calibrated point: {pl['why']}")
-            elif set(rec.get("missing_subtraction") or []) & {k for k, cs in A.pk.items() if comps & cs}:
-                why = (f"{tid} skipped packages holding the departed components for want of their subtraction "
-                       f"package ({sorted(set(rec['missing_subtraction']))})")
-            elif not comps or max(float((rec.get("benefit_change") or {}).get(c) or 0.0) for c in comps) <= 0:
-                why = f"{tid} changed no benefit of a package holding {sorted(comps) or 'the departed component'}"
-        out.append({"departure": key, "test": tid, "components": sorted(comps), "effective": why is None,
-                    "why": why or f"{tid} ran and changed the benefit of packages holding {sorted(comps)}"})
-    return out
+    recs2 = {}
+    for r in recs:
+        tid = str(r.get("test_id"))
+        r = dict(r, package_components={k: sorted(v) for k, v in A.pk.items()})
+        if r.get("status") == "run" and tid in tests:
+            pl = plan_test(A.spec, tests[tid], runtime_evidence(A))
+            r["perturbation_identity"] = [bool(x.get("identity")) for x in pl["perturbations"]] \
+                if pl["status"] == "runs" else []
+        recs2[tid] = r
+    deps = [d for d in A.spec.raw.get("engine_departures") or [] if isinstance(d, dict) and d.get("engine") == name]
+    return departure_verdicts(deps, BC.departure_targets(A.spec.raw, ref, A.spec.base), recs2)
 
 
 PRIOR_RANGE_PREFIX = "prior_range_"
@@ -352,6 +359,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                   " range" if t == "fitted_range" else f"engine parameter {p} set to each tested value")
         cases, lowers = [], []
         vals, rejected = [x["value"] for x in pl["perturbations"]], pl["rejected"]
+        extra["_ident"] = [bool(x.get("identity")) for x in pl["perturbations"]]
         from toolkit.spec import engine_parameters as PV
         if t == "parameter_value" and p in PV.values(A.spec):   # the headline runs at the spec value: record the card
             # value it replaces
@@ -491,7 +499,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            # #215 round 4: the realised change in each component's benefit, and the packages a test had to skip
            "benefit_change": {c: max(float(r["benefit_change"].get(c, 0.0)) for r in results)
                               for c in (A.spec["options"].get("components") or {})},
-           "missing_subtraction": list(extra.get("_missing") or [])}
+           "missing_subtraction": list(extra.get("_missing") or []),
+           "perturbation_identity": list(extra.get("_ident") or []),
+           "benefit_change_by_package": {k: max(max((abs(float(c_[1][i][k]) - float(ben0[i][k])) for i in A.ids),
+                                                    default=0.0) for c_ in cases) for k in A.pk},
+           "package_components": {k: sorted(v) for k, v in A.pk.items()}}
     if sv:
         rec["spec_value"] = sv
     if t == "cost_items":
@@ -524,7 +536,8 @@ def _interaction(A, dt, ben0, cost0, plan_, out0) -> dict:
     comp = set(dt["components"])
     cases, lowers, rejected = [], [], pl["rejected"]
     extra = {"_arm": arm, "_int": eng_int, "_src": f"verified benchmark results ({dt.get('benchmark')}), {info['src']}",
-             "_inputs": info["inputs"], "_missing": list(info.get("missing_subtraction") or [])}
+             "_inputs": info["inputs"], "_missing": list(info.get("missing_subtraction") or []),
+             "_ident": [bool(x.get("identity")) for x in pl["perturbations"]]}
     o = A.primary
     for pt in pl["perturbations"]:
         v, g = pt["value"], pt["scale"]

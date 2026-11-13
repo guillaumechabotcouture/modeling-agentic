@@ -43,7 +43,7 @@ benchmarks:
          note: "Pirimiphos-methyl IRS added to pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
   B13: {covers: {smc: [1]}, estimand: effect_vs_none,
         note: "SMC vs none, in-season clinical incidence 3-59 months (Thwing 2024)"}
-  B15: {covers: {net: [pbo], irs: [1]}, match: all, estimand: interaction,
+  B15: {covers: {net: [pbo], irs: [1]}, match: all, estimand: interaction, rescaled: irs,
         note: "PBO net x IRS interaction, 2x2 factorial (Protopopoff 2018)"}
   B16c:
     covers: {}

@@ -343,7 +343,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                                "for it without an owner-signed engine_departures entry",
                             effect_parameters(entries[i], version), {s for s, _c, _v in hits},
                             {"benchmark_status": st, "role": role, "components": comps},
-                            {"benchmark": i, "estimand": entries[i].get("estimand"),
+                            {"benchmark": i, "estimand": entries[i].get("estimand"), "rescaled": entries[i].get("rescaled"),
                              "pair": {c: {s for s, cc, _v in hits if cc == c} for c in (entries[i].get("covers") or {})}}))
     counts = departures_status in ("signed", "proposed")
     for key, kind, params, comps, failing, ctx in pending:
@@ -450,6 +450,7 @@ def departure_targets(raw: dict, ref: str, base: str | None = None) -> dict:
     for i, e in (cov.get("benchmarks") or {}).items():
         h = _hits(e, smap, raw)
         out[i] = {"components": {s for s, _c, _v in h}, "benchmark": i, "estimand": e.get("estimand"),
+                  "rescaled": e.get("rescaled"),
                   "pair": {c: {s for s, cc, _v in h if cc == c} for c in (e.get("covers") or {})}}
     for s_, pairs in smap.items():
         for c, _v in pairs:
@@ -557,6 +558,19 @@ def _self_test() -> int:
         got = {i: sorted(e.get("cost_drivers") or []) for i, e in (doc or {}).get("benchmarks", {}).items()
                if e.get("estimand") == "cost_per_outcome"}
         ok(drv == got, f"BC2b {name}: each cost benchmark's cost_drivers are the pack's priced drivers ({drv}, {got})")
+        # an interaction entry says which component its arms rescale: the one a11 adds to a10 (the increment a11 / a10)
+        arms = pack.get("arms") or {}
+        bad_r = []
+        for b in pack.get("benchmarks") or []:
+            e = (doc or {}).get("benchmarks", {}).get(b["id"]) or {}
+            if b["estimand"].get("type") == "interaction_or":
+                a10 = (arms.get(b["estimand"]["a10"]) or {}).get("package") or {}
+                a11 = (arms.get(b["estimand"]["a11"]) or {}).get("package") or {}
+                want = sorted(k for k, v in a11.items() if a10.get(k) != v and v not in
+                              ((doc or {}).get("absent_values") or {}).get(k, []))
+                if [e.get("rescaled")] != want:
+                    bad_r.append((b["id"], e.get("rescaled"), want))
+        ok(not bad_r, f"BC2c {name}: each interaction entry's rescaled component is the one its arms rescale ({bad_r})")
     ok(problems({"engine": "x", "benchmarks": {"A": {"covers": {}}}}) != [],
        "BC3 a benchmark covering nothing without saying why is refused")
     ok(problems({"engine": "x", "benchmarks": {"A": {"covers": {"c": [1]}, "estimand": "vibes"}}}) != [],

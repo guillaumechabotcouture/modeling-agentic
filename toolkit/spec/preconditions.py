@@ -115,10 +115,20 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
         if str(t.get("benchmark")) != str(effect["benchmark"]):
             return False, (f"tests benchmark {t.get('benchmark')!r}'s interaction, not the departed "
                            f"{effect['benchmark']!r}")
-        pair = [set(v) for v in (effect.get("pair") or {}).values()]
+        pm = {c: set(v) for c, v in (effect.get("pair") or {}).items()}
         tc, wa = set(t.get("components") or []), set(t.get("with_any") or [])
-        if len(pair) != 2 or not any(tc & x and tc <= x and wa & y for x, y in (pair, pair[::-1])):
-            return False, (f"does not rescale the departed benchmark's pair ({[sorted(x) for x in pair]}): it "
+        resc = effect.get("rescaled")
+        if len(pm) != 2 or resc not in pm:
+            return False, "the coverage file does not say which of the benchmark's components its arms rescale"
+        x, y = pm[resc], next(v for c, v in pm.items() if c != resc)
+        if x & y:
+            return False, (f"a spec component delivers both of the benchmark's components ({sorted(x & y)}): a bundle "
+                           "cannot rescale one given the other")
+        if tc & wa:
+            return False, f"components and with_any overlap ({sorted(tc & wa)})"
+        if not (tc and wa and tc <= x and wa <= y):
+            return False, (f"does not rescale the departed benchmark's own pair in its arms' orientation ({resc} "
+                           f"given the other: components within {sorted(x)}, with_any within {sorted(y)}); it "
                            f"rescales {sorted(tc)} given {sorted(wa)}")
     else:
         return False, f"is a {typ} test, which does not vary a component's effect"
@@ -139,16 +149,18 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
         if rng is None:
             return False, f"{t['parameter']} has no declared range (a prior or the engine's) to span"
         frac = float(effect.get("range_fraction") or 1.0)
-        need = frac * (rng[1] - rng[0])
-        if len(vals) < 2 or vals[-1] - vals[0] < need * (1 - 1e-9):
-            return False, (f"its values {vals} do not span {frac:g} of {t['parameter']}'s declared range "
-                           f"{list(rng)} (at least two distinct values)")
+        c, half = (rng[0] + rng[1]) / 2, frac * (rng[1] - rng[0]) / 2
+        lo, hi = c - half, c + half                    # the interval to cover: the declared one, or its central share
+        tol = 1e-9 * max(1.0, abs(rng[1] - rng[0]))
+        if len(vals) < 2 or vals[0] > lo + tol or vals[-1] < hi - tol:
+            return False, (f"its values {vals} do not cover [{lo:g}, {hi:g}] ({frac:g} of {t['parameter']}'s declared "
+                           f"range {list(rng)}, around its centre; at least two distinct values)")
         return True, ""
     live = [x for x in pl["perturbations"] if not x.get("identity")]
     if not live:
         return False, "changes nothing: every tested value leaves the interaction where it is (scale 1)"
     pair = [set(v) for v in (effect.get("pair") or {}).values()]
-    if not any(pair[0] & pks[k] and pair[1] & pks[k] for x in live for k in x["packages"]):
+    if not any(all(side & pks[k] for side in pair) for x in live for k in x["packages"]):
         return False, "modifies no package that holds the departed benchmark's pair"
     return True, ""
 
@@ -195,13 +207,20 @@ def _self_test() -> int:
         excl = {"components": {"a": {"group": "g"}, "b": {"group": "g"}, "c": {}}}
         # round 4: before the run, inputs only. A parameter test spans the declared range (>= 2 distinct values);
         # an interaction test targets the failing benchmark's own interaction (its benchmark and component pair)
-        IX = {"components": {"b"}, "benchmark": "T2", "estimand": "interaction", "pair": {"a": {"a"}, "b": {"b"}}}
+        IX = {"components": {"b"}, "benchmark": "T2", "estimand": "interaction", "pair": {"a": {"a"}, "b": {"b"}},
+              "rescaled": "b"}           # the benchmark's arms rescale b given a (a11 / a10)
         PB = {"components": {"b"}, "parameters": ["eff_b"]}
         cases = [  # (name, test, effect, spec change, expected)
             ("interaction reachable, the benchmark's own pair", I(v_ok), IX, {}, True),
             ("interaction unreachable", I(v_bad), IX, {}, False),
             ("interaction at the engine's own value (scale 1)", I(v_id), IX, {}, False),
-            ("the pair swapped (a rescaled given b)", I(v_ok, ("a",), ("b",)), dict(IX, components={"a"}), {}, True),
+            ("the pair reversed (a rescaled given b): the arms' orientation is b given a", I(v_ok, ("a",), ("b",)),
+             dict(IX, components={"a"}), {}, False),
+            ("with_any reaching beyond the pair (b given a or c)", I(v_ok, ("b",), ("a", "c")), IX,
+             {"options": {"components": {"a": {}, "b": {}, "c": {}}}}, False),
+            ("a bundle delivering both benchmark components", I(v_ok, ("ab",), ("ab",)),
+             dict(IX, pair={"a": {"ab"}, "b": {"ab"}}, components={"ab"}),
+             {"options": {"components": {"ab": {}}, "engine_map": {"ab": {"a": 1, "b": 1}}}}, False),
             ("another interaction's context (b with c for an a x b benchmark)", I(v_ok, ("b",), ("c",)),
              dict(IX, pair={"a": {"a"}, "b": {"b"}}), {"options": {"components": {"a": {}, "b": {}, "c": {}}}}, False),
             ("interaction test of another benchmark", dict(I(v_ok), benchmark="T9"), IX, {}, False),
@@ -215,8 +234,13 @@ def _self_test() -> int:
             ("parameter spanning its declared range", P("eff_b", [0.1, 0.5]), PB, {}, True),
             ("parameter, one value only", P("eff_b", [0.2]), PB, {}, False),
             ("parameter, two values not spanning the range", P("eff_b", [0.2, 0.3]), PB, {}, False),
-            ("parameter spanning the stated fraction of its range", P("eff_b", [0.2, 0.3]), dict(PB, range_fraction=0.25),
-             {}, True),
+            ("parameter spanning the stated fraction of its range, around the centre", P("eff_b", [0.25, 0.35]),
+             dict(PB, range_fraction=0.25), {}, True),
+            ("parameter matching the fraction's width off the centre", P("eff_b", [0.1, 0.2]),
+             dict(PB, range_fraction=0.25), {}, False),
+            ("parameter shifted above its range (the width matches)", P("eff_b", [0.5, 0.9]), PB, {}, False),
+            ("parameter shifted below its range", P("eff_a", [0.01, 0.41]), {"components": {"a"}, "parameters": ["eff_a"]},
+             {}, False),
             ("parameter not an emulator input", P("k", [0.5, 1.0]), {"components": {"b"}, "parameters": ["k"]}, {},
              False),
             ("parameter not carrying the effect", P("eff_a", [0.3, 0.7]), PB, {}, False),
@@ -241,7 +265,7 @@ def _self_test() -> int:
         import yaml as _y
         cpth = os.path.join(d, "cov.yaml")
         _y.safe_dump({"engine": "toy", "absent_values": {"a": [0], "b": [0]}, "benchmarks": {
-            "T2": {"covers": {"a": [1], "b": [1]}, "match": "all", "estimand": "interaction"},
+            "T2": {"covers": {"a": [1], "b": [1]}, "match": "all", "estimand": "interaction", "rescaled": "b"},
             "T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none", "effect_parameters": ["eff_a"]}}},
             open(cpth, "w"))
         BC.OVERRIDES["toolkit.engines.contract:ToyEngine"] = cpth
@@ -251,8 +275,10 @@ def _self_test() -> int:
             A.set_joint({"shared": ["eff_a"], "best": {"theta": {"eff_a": 0.4}, "z": {}},
                          "region": {"ranges": {"eff_a": [0.3, 0.7]}},
                          "sample": {"sample_id": "s", "names": ["eff_a"], "rows": [[0.4]]}})
-            recs = [{"test_id": "X", "status": "run", "benefit_change": {"a": 1.0}, "missing_subtraction": []},
-                    {"test_id": "Z", "status": "run", "benefit_change": {"a": 0.0, "b": 0.0}, "missing_subtraction": []}]
+            ab = next(k for k, cs in A.pk.items() if cs == {"a", "b"})
+            only_b = next(k for k, cs in A.pk.items() if cs == {"b"})
+            recs = [{"test_id": "X", "status": "run", "benefit_change_by_package": {ab: 1.0}, "missing_subtraction": []},
+                    {"test_id": "Z", "status": "run", "benefit_change_by_package": {}, "missing_subtraction": []}]
             chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
             ok(not chk["T1"]["effective"] and "identity" in chk["T1"]["why"],
                f"PC6 runtime: joint calibration moved eff_a onto the test's only value, so the departure's test is an "
@@ -260,8 +286,12 @@ def _self_test() -> int:
             ok(not chk["T2"]["effective"] and "no benefit" in chk["T2"]["why"],
                f"PC7 runtime: an interaction test that changed no benefit of the departed components is ineffective "
                f"({chk['T2']['why'][:90]})")
-            recs[1]["benefit_change"] = {"a": 0.2, "b": 0.2}
-            recs[1]["missing_subtraction"] = [k for k, cs in A.pk.items() if cs == {"a", "b"}]
+            recs[1]["benefit_change_by_package"] = {only_b: 0.5}
+            chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
+            ok(not chk["T2"]["effective"], f"PC7b runtime: a change only in packages without the benchmark's pair does "
+                                           f"not count ({chk['T2']['why'][:90]})")
+            recs[1]["benefit_change_by_package"] = {ab: 0.2}
+            recs[1]["missing_subtraction"] = [ab]
             chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
             ok(not chk["T2"]["effective"] and "subtraction" in chk["T2"]["why"],
                "PC8 runtime: a test that skipped a targeted package (missing subtraction package) is ineffective")
