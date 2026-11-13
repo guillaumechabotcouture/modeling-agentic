@@ -166,3 +166,60 @@ outcome_types:
       in low-income settings x about 65 years of life lost = 2.0 (order of magnitude; Lawn JE et al. Every Newborn:
       progress, priorities, and potential beyond survival. Lancet 2014;384:189-205); later-life morbidity not counted;
       undiscounted'
+  je_case:
+    dalys: 18.0
+    source: 'arithmetic: case fatality about 25% x about 60 years of life lost = 15, plus about 40% of survivors
+      with lasting neurological sequelae at a disability weight about 0.2 for about 55 years (0.75 x 0.4 x 0.2 x
+      55 = 3.3); case fatality 20-30% and sequelae in 30-50% of survivors as summarised by Campbell GL, Hills SL,
+      Fischer M et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull World Health
+      Organ 2011;89:766-774; disability weights from Salomon JA et al. Lancet Glob Health 2015;3:e712-e723'
+  polio_type2_infection:
+    dalys: 0.01
+    source: 'arithmetic: about 1 paralytic case per 2,000 type 2 infections (Nathanson N, Kew OM. From emergence
+      to eradication: the epidemiology of poliomyelitis deconstructed. Am J Epidemiol 2010;172:1213-1229) x about
+      20 DALYs per paralytic case (lifelong paralysis at a disability weight about 0.3 for about 50 years, plus
+      case fatality about 5% x 60 years: 15 + 3) = 0.009, about 0.01'
+  varicella_infection:
+    dalys: 0.003
+    source: 'arithmetic: about 95% clinical x disability weight 0.051 for a moderate infectious episode (Salomon
+      JA et al. Disability weights for the Global Burden of Disease 2013 study. Lancet Glob Health 2015;3:e712-e723)
+      x 7 days (0.019 years) = 0.0009, plus case fatality about 3 per 100,000 x 60 years = 0.002: about 0.003'
+  covid_like_infection:
+    dalys: 0.02
+    source: 'arithmetic: infection fatality about 0.2% in a population with earlier immunity x about 10 years of
+      life lost = 0.02 (order of magnitude; assumed for a COVID-like virus), plus disability weight 0.051 x 7 days
+      = 0.001'
+  oncho_mf_person_year:
+    dalys: 0.065
+    source: 'order of magnitude: about 1.3 million DALYs a year from onchocerciasis over about 20 million infected
+      people (GBD 2017 Disease and Injury Incidence and Prevalence Collaborators. Lancet 2018;392:1789-1858), so
+      about 0.065 DALYs per infected person-year (uncertain)'
+  pneumococcal_carriage_acquisition:
+    dalys: 0.01
+    source: 'order of magnitude, uncertain: about 1 pneumococcal meningitis case per 1,000 serotype-1 carriage acquisitions
+      (assumption) x about 11 DALYs per case (case fatality about 20% x 40 years of life lost = 8, plus disabling
+      sequelae in about 25% of survivors x disability weight about 0.3 x 40 years = 3; sequelae from Edmond K et
+      al. Global and regional risk of disabling sequelae from bacterial meningitis: a systematic review and meta-analysis.
+      Lancet Infect Dis 2010;10:317-28) = 0.011; undiscounted'
+  cholera_infection:
+    dalys: 0.3
+    source: about 20% of infections symptomatic (King AA, Ionides EL, Pascual M, Bouma MJ. Inapparent infections
+      and cholera dynamics. Nature 2008;454:877-80, a large inapparent fraction) x 1.5 DALYs per cholera case (the
+      central table's cholera_case row) = 0.3; undiscounted
+  mpox_infection:
+    dalys: 0.04
+    source: case fatality about 0.1% in the 2022 clade IIb outbreak (WHO multi-country outbreak situation reports)
+      x about 35 years of life lost = 0.035, plus acute illness (DW 0.051, infectious disease acute episode moderate;
+      Salomon JA et al. Disability weights for the Global Burden of Disease 2013 study. Lancet Glob Health 2015;3:e712-23)
+      x 3 weeks = 0.003; undiscounted
+  sth_infection_year:
+    dalys: 0.0036
+    source: 5.18 million DALYs over about 1.45 billion infected people in 2010 (Pullan RL, Smith JL, Jasrasaria
+      R, Brooker SJ. Global numbers of infection and disease burden of soil transmitted helminth infections in 2010.
+      Parasit Vectors 2014;7:37) = 0.0036 DALYs per infection-year
+  rsv_infant_hospitalisation:
+    dalys: 0.73
+    source: 'in-hospital case fatality about 0.85% (Shi T et al. Global, regional, and national disease burden estimates
+      of acute lower respiratory infections due to respiratory syncytial virus in young children in 2015: a systematic
+      review and modelling study. Lancet 2017;390:946-58: about 27,300 in-hospital deaths among about 3.2 million
+      admissions) x about 85 years of life lost = 0.72, plus acute illness (DW 0.133 x 1 week) = 0.003; undiscounted'

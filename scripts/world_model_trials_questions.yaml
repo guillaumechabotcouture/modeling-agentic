@@ -1154,3 +1154,343 @@ questions:
   mechanism: 'no dynamics: relative effects are the trial priors and burden ranks districts; anaemia is drawn but
     not read by the engine (a test on it is engine-blind)'
   withhold_shadow_price: true
+- id: flu_vaccine_r4
+  batch: 4
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): the population, numbers and files below are synthetic,
+    generated for this test; they do not describe a real place. A health ministry will receive 770,000 influenza
+    vaccine doses (11 blocks of 70,000) before next season for a population of 4.6 million in five age groups (0-4,
+    5-17, 18-49, 50-64, 65+). Allocate whole blocks to age groups, with at most 70% of any group vaccinated, to
+    minimise expected influenza hospitalisations next season. Assume next season''s transmissibility and pre-season
+    susceptibility equal last season''s, vaccination before the season with all-or-nothing protection against infection
+    at the effectiveness given, and an age-structured SIR epidemic with the contact matrix given (mean daily contacts
+    of a person in the row group with people in the column group). Input files: data/evals/flu_vaccine/population.csv,
+    data/evals/flu_vaccine/contact_matrix.csv, data/evals/flu_vaccine/serosurvey_last_season.csv (pre-season susceptible
+    titres and paired seroconversion by age group, no vaccination last season), data/evals/flu_vaccine/hospitalisations_last_season.csv,
+    data/evals/flu_vaccine/vaccine_effectiveness.csv. Report hospitalisations averted against no vaccination, with
+    a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run directory
+    with columns age_group, doses (a multiple of 70,000) and hospitalisations_averted; and the uncertainty analysis
+    must report the total as an output named hospitalisations_averted.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/flu_vaccine
+  inputs: 'derived from data/evals/flu_vaccine public inputs: population, susceptible-titre share as s0, hospitalisations
+    / (seroconverted share x population) as ratio:hosp, VE weighted by population over targeted groups; contact
+    matrix x 0.815 fitted outside the harness to last season''s seroconversion (transmission uncertainty not swept);
+    three targeting packages, not whole-block allocations'
+  rerun_of: flu_vaccine_r3
+  rerun_reason: costs in USD (a declared US$4.00 per dose delivered) so the USD willingness to pay applies; batch
+    4 rules (the pre-registered willingness to pay shown to the seed)
+- id: je_campaign_age
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Japanese encephalitis
+    is endemic in 24 districts; transmission is from pigs and birds to people through mosquitoes, not between people,
+    so vaccinating one age group does not protect another. A one-dose campaign in 2026 can target CHILD (ages 1-14,
+    about 85% reached, US$1.00 per resident) or WIDE (ages 1-29, about 85% reached, US$1.90 per resident), or no
+    campaign. Children are thought to carry 60-85% of cases in these districts, people aged 15-29 most of the rest.
+    The budget is US$6 million. Input file: units.csv (population, Japanese encephalitis cases per person-year without
+    vaccination, a pig-density index). Choose the option per district that maximises Japanese encephalitis cases
+    averted in 2026-2028 within the budget, report the total with a 95% uncertainty interval, and state the decision
+    rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/je_campaign_age
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4114 (searched from 4110): max |Spearman| among [''pop'',
+    ''inc'', ''pig_density''] = 0.187); each declared design feature drawn independently and uncorrelated in the
+    realized table'
+  decision_type: targeting (age)
+  area: vaccines
+  mechanism: 'package-rate: no herd effect (zoonotic transmission); the choice turns on the burden ranking and on
+    the price of the wider age band against the share of cases it adds'
+- id: flu_antiviral_stockpile_timing
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. An influenza epidemic
+    is starting in 24 cities. Each city can release its antiviral stockpile for early treatment and household prophylaxis
+    for eight weeks, starting in week 2 (EARLY, before most cases, US$3.00 per resident because of the outreach
+    needed) or in week 6 (LATE, through clinics, US$1.80 per resident), or not at all. Pre-season immunity is uncertain.
+    The budget is US$10 million. Input file: units.csv (population, infections at the start of 2026 as a share of
+    the population). Choose the option per city that maximises influenza infections averted in the first half of
+    2026 within the budget, report the total with a 95% uncertainty interval, and say when the earlier, costlier
+    release is worth it.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/flu_antiviral_stockpile_timing
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4220 (searched from 4220): max |Spearman| among [''pop'',
+    ''seed_share''] = 0.180); each declared design feature drawn independently and uncorrelated in the realized
+    table'
+  decision_type: timing
+  area: outbreak response
+  mechanism: 'temporary measure and epidemic timing: an eight-week cut in transmission flattens the epidemic only
+    if it covers the peak; too early it can merely delay it, too late most infections have happened'
+- id: measles_catchup_term_timing
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A second-dose measles
+    catch-up is planned in 24 districts, where an importation is expected early in the school year. Each district
+    can run it as SCHOOL (in schools during the first school term, before the importation: day 0, reaching 90% of
+    children aged 5-14, US$0.80 per resident) or COMMUNITY (a house-to-house campaign in the long holiday, 70 days
+    after the importation, reaching 75% of children aged 1-9, US$1.20 per resident), or not at all. R0 is between
+    12 and 18 with homogeneous mixing; everyone aged 15 or older is immune and infants under one are susceptible.
+    The budget is US$5 million. Input file: units.csv (population; susceptible shares of children aged 1-4, 5-9
+    and 10-14 from a synthetic serosurvey; the expected importation as a share of the population). Choose the option
+    per district that maximises measles infections averted, report the total with a 95% uncertainty interval, and
+    state when reaching school-age children early beats reaching the youngest late.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/measles_catchup_term_timing
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4567 (searched from 4330): max |Spearman| among [''pop'',
+    ''gap_1_4'', ''gap_5_9'', ''gap_10_14'', ''seed_share''] = 0.189); each declared design feature drawn independently
+    and uncorrelated in the realized table'
+  decision_type: timing and targeting
+  area: vaccines
+  mechanism: 'a campaign before the importation removes susceptibles at the start; one 70 days in acts on what the
+    outbreak left: it wins only where R_eff is near one and the outbreak is slow, or where the gap is in the youngest'
+- id: polio_nopv2_response_delay
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Circulating vaccine-derived
+    type 2 poliovirus has been detected in 24 districts in January 2026. Each district can run two nOPV2 campaign
+    rounds starting in week 4 (FAST, with pre-positioned vaccine, US$1.60 per resident) or in week 12 (STANDARD,
+    after the usual approvals and shipment, US$1.10 per resident), or no campaign. Type 2 immunity is uncertain.
+    The budget is US$15 million. Input file: units.csv (population, poliovirus infections at the start of 2026 as
+    a share of the population). Choose the option per district that maximises type 2 poliovirus infections averted
+    in 2026 within the budget, report the total with a 95% uncertainty interval, and say how much the eight weeks
+    of delay cost and where.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/polio_nopv2_response_delay
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4440 (searched from 4440): max |Spearman| among [''pop'',
+    ''seed_share''] = 0.121); each declared design feature drawn independently and uncorrelated in the realized
+    table'
+  decision_type: timing
+  area: outbreak response
+  mechanism: 'response delay: where R_eff is well above one the eight weeks of delay let most of the outbreak happen;
+    near one the slower, cheaper response is enough'
+- id: varicella_school_entry_saturation
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Varicella vaccination
+    is being introduced in 24 districts, where a varicella season will begin in each in 2026. Each district can
+    choose: none; ENTRY (one dose for children starting school, aged 5-9, about 90% reached, US$0.90 per resident);
+    SCHOOL (one dose for all school children aged 5-14, about 90% reached, US$1.70 per resident). R0 is between
+    8 and 12 with homogeneous mixing; adults are almost all immune (5% susceptible). The budget is US$4 million.
+    Input file: units.csv (population; susceptible shares of children under 5, 5-9 and 10-14; the expected seed
+    as a share of the population). Choose the option per district that maximises varicella infections averted in
+    the season, report the total with a 95% uncertainty interval, and say where vaccinating the older school children
+    adds little (saturation) and where it is needed to stop transmission.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/varicella_school_entry_saturation
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4588 (searched from 4550): max |Spearman| among [''pop'',
+    ''s_u5'', ''s_5_9'', ''s_10_14'', ''seed_share''] = 0.191); each declared design feature drawn independently
+    and uncorrelated in the realized table'
+  decision_type: targeting (saturation)
+  area: vaccines
+  mechanism: 'saturation: once vaccinating school entrants brings R_eff near or below one, adding the older children
+    buys little; where the under-fives'' susceptibility keeps R_eff high, neither option stops the outbreak'
+- id: covid_isolation_threshold
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A new respiratory
+    virus with COVID-like transmission is spreading in 24 cities in 2026. Each city can fund case isolation with
+    contact quarantine from week 1 at one of two coverage levels: ISO40 (about 40% of cases isolated, US$4.00 per
+    resident) or ISO80 (about 80%, US$9.00 per resident), or not at all. Population immunity from earlier waves
+    is uncertain. The budget is US$60 million. Input file: units.csv (population, infections at the start of 2026
+    as a share of the population). Choose the option per city that maximises infections averted in 2026 within the
+    budget, report the total with a 95% uncertainty interval, and state the coverage threshold that brings the effective
+    reproduction number below one.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/covid_isolation_threshold
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4660 (searched from 4660): max |Spearman| among [''pop'',
+    ''seed_share''] = 0.114); each declared design feature drawn independently and uncorrelated in the realized
+    table'
+  decision_type: threshold
+  area: outbreak response
+  mechanism: 'control threshold: R_eff = 2 s0 (1 - effect) below one ends the epidemic; ISO80 is worth its price
+    only where ISO40 leaves R_eff above one'
+- id: typhoid_reactive_wash_timing
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Typhoid outbreaks
+    linked to contaminated piped water have been detected in 24 towns in early 2026. Each town can start emergency
+    water chlorination and household water treatment in week 2 (FAST, with emergency supplies, US$2.50 per resident)
+    or in week 7 (STANDARD, US$1.20 per resident), or not at all. The share of residents still susceptible is uncertain.
+    The budget is US$6 million. Input file: units.csv (population, typhoid cases at detection as a share of the
+    population). Choose the option per town that maximises typhoid cases averted in 2026 within the budget, report
+    the total with a 95% uncertainty interval, and say what the five weeks of delay cost and where.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/typhoid_reactive_wash_timing
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4770 (searched from 4770): max |Spearman| among [''pop'',
+    ''seed_share''] = 0.101); each declared design feature drawn independently and uncorrelated in the realized
+    table'
+  decision_type: timing
+  area: outbreak response
+  mechanism: 'reactive delay against a slow water-borne outbreak: the five weeks matter where R_eff is high; near
+    one both end it'
+- id: oncho_ivermectin_frequency
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Onchocerciasis control
+    in 24 implementation units can give community-directed ivermectin in 2026-2027 either ANNUAL (one round a year,
+    about 75% therapeutic coverage, US$0.60 per resident per year) or BIANNUAL (two rounds a year, US$1.10 per resident
+    per year), or no treatment. The budget is US$3 million. Input file: units.csv (population; skin-microfilaria
+    prevalence; a vector-density index). Choose the option per unit that maximises microfilaridermic person-years
+    averted in 2026-2027 within the budget, report the total with a 95% uncertainty interval, and state the decision
+    rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/oncho_ivermectin_frequency
+  inputs: 'synthetic: units.csv from generate_units.py (seed 4880 (searched from 4880): max |Spearman| among [''pop'',
+    ''inc'', ''vector_density''] = 0.171); each declared design feature drawn independently and uncorrelated in
+    the realized table'
+  decision_type: frequency choice
+  area: NTDs
+  mechanism: 'package-rate: the trial-derived effect of annual treatment and the relative gain of a second round,
+    against its price; burden ranks the units'
+- id: hpv_catchup_age_range
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national HPV programme
+    in 2026 can run one multi-age vaccination campaign in each of 24 provinces. For each province choose the age
+    range: none; TO14 (ages 9-14 only, US$0.90 per resident); TO19 (ages 9-19, US$1.60 per resident); TO26 (ages
+    9-26, US$2.60 per resident). Each campaign reaches 80% of the targeted ages. Infection spreads through homogeneous
+    mixing among the age groups (basic reproduction number uncertain, 1.2-3.0); vaccination protects only those
+    not yet infected. About one infection in ten becomes persistent. The budget is US$20 million. Input file: units.csv
+    (population; the share of 9-14, 15-19 and 20-26 year olds not yet infected, from a synthetic serosurvey). Choose
+    the age range per province that maximises persistent HPV infections averted over the coming transmission cycle
+    within the budget, report the total with a 95% uncertainty interval, and state the rule (when does extending
+    the catch-up past 14 still pay?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/hpv_catchup_age_range
+  inputs: 'synthetic: data/world_model_trials/hpv_catchup_age_range/generate_units.py (seeded; declared design features
+    drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: targeting (age range)
+  area: vaccines
+  mechanism: 'a herd threshold and saturation: where the young cohorts carry most remaining susceptibles, vaccinating
+    9-14 pushes R_eff below 1 and wider ranges add little; where older groups are still largely susceptible the
+    catch-up''s direct protection matters'
+- id: pneumo_campaign_season_timing
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A season of serotype-1
+    pneumococcal transmission and meningitis is expected in 24 districts in 2026 (basic reproduction number of carriage
+    acquisition about 2; the share of residents still susceptible to carriage is uncertain, 50-100%). Each district
+    can run one conjugate-vaccine campaign: PRE (completed by week 2, before the season builds, US$2.50 per resident)
+    or LATE (completed by week 10, after the first cases, US$2.00 per resident because only districts with cases
+    are covered), or none. Input file: units.csv (population, share carrying the serotype at the start). The budget
+    is US$15 million. Choose the timing per district that maximises carriage acquisitions (and so meningitis cases)
+    averted in 2026 within the budget, report the total with a 95% uncertainty interval, and state the rule (when
+    does waiting for cases cost too much?).'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/pneumo_campaign_season_timing
+  inputs: 'synthetic: data/world_model_trials/pneumo_campaign_season_timing/generate_units.py (seeded; declared
+    design features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: timing
+  area: vaccines / outbreak response
+  mechanism: 'a late campaign acts only on the transmission left after week 10: it saves little where the season
+    grows fast (large seed, high s0) and nearly as much as a pre-season campaign where R_eff is near 1'
+- id: cholera_reactive_ocv_delay
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Cholera outbreaks
+    have just been detected in 24 districts at the start of 2026 (basic reproduction number about 2; the share of
+    residents susceptible is uncertain, 50-100%). Each district can run a reactive oral cholera vaccine campaign
+    that starts protecting FAST (week 3, from a pre-positioned stockpile, US$3.00 per resident) or STANDARD (week
+    8, through the usual request and shipment, US$2.20 per resident), or none. The budget is US$12 million. Input
+    file: units.csv (population, share infected at detection). Choose the option per district that maximises infections
+    averted in 2026 within the budget, report the total with a 95% uncertainty interval, and state the rule (how
+    much does each week of delay cost, and where is the stockpile worth it?).'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/cholera_reactive_ocv_delay
+  inputs: 'synthetic: data/world_model_trials/cholera_reactive_ocv_delay/generate_units.py (seeded; declared design
+    features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: timing (delay)
+  area: outbreak response
+  mechanism: the share averted falls with each week of delay, fastest where the outbreak grows quickly (high s0,
+    large seed) and least where R_eff is near 1; a short generation interval makes delay costly
+- id: mpox_targeted_coverage_threshold
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Mpox (clade IIb) is
+    spreading in a high-contact sexual network in 24 cities in 2026. Each city can offer targeted vaccination to
+    the high-contact group (1-4% of residents) from day 0: VAX (a two-dose campaign in the group, US$0.80 per resident
+    of the city), or none. Coverage achieved in the group is uncertain (20-90%). Transmission is concentrated in
+    the group (its members have many more contacts, mostly with each other); the rest of the population mixes little
+    and is largely protected by past vaccination or low contact. The budget is US$15 million. Input file: units.csv
+    (population, high-contact share, share of the group still susceptible, infections at the start). Choose where
+    to vaccinate to maximise mpox infections averted within the budget, report the total with a 95% uncertainty
+    interval, and state the rule (what coverage in the group stops transmission, and where is a campaign wasted?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/mpox_targeted_coverage_threshold
+  inputs: 'synthetic: data/world_model_trials/mpox_targeted_coverage_threshold/generate_units.py (seeded; declared
+    design features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: threshold (coverage)
+  area: outbreak response / vaccines
+  mechanism: 'a coverage threshold in the core group: R_eff in the group = R0 x s0_high x (1 - coverage x efficacy);
+    above the threshold coverage transmission stops and extra coverage adds nothing, below it the campaign only
+    slows the outbreak; where s0_high is low the outbreak is near its threshold already'
+- id: deworming_school_vs_community
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A deworming programme
+    has US$1.5 million for 2026 across 24 districts. For each district choose: none; SCHOOL (school-based treatment
+    of children twice a year, US$0.25 per resident); COMMUNITY (community-wide treatment of all ages twice a year,
+    US$0.70 per resident). Input file: units.csv (population, soil-transmitted helminth infection prevalence from
+    a synthetic survey, school enrolment). Choose the strategy per district that maximises infection-years averted
+    in 2026 within the budget, report the total with a 95% uncertainty interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/deworming_school_vs_community
+  inputs: 'synthetic: data/world_model_trials/deworming_school_vs_community/generate_units.py (seeded; declared
+    design features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: allocation (strategy)
+  area: NTDs / MDA
+  mechanism: 'no dynamics: relative effects are the trial priors and prevalence ranks districts against the price
+    difference; school enrolment is drawn but not read by the engine (a test on it is engine-blind)'
+- id: rsv_maternal_vs_monoclonal
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A child health programme
+    has US$3 million for RSV prevention for infants born in 2026 in 24 districts. For each district choose one product:
+    none; MATERNAL (an RSV prefusion F vaccine in late pregnancy, US$30 per birth); MAB (one dose of a long-acting
+    monoclonal antibody at birth, US$50 per birth). Input file: units.csv (births expected in 2026, RSV hospitalisations
+    per infant in the first six months without prevention, antenatal care attendance). Choose the products that
+    maximise infant RSV hospitalisations averted within the budget, report the total with a 95% uncertainty interval,
+    and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/rsv_maternal_vs_monoclonal
+  inputs: 'synthetic: data/world_model_trials/rsv_maternal_vs_monoclonal/generate_units.py (seeded; declared design
+    features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: product choice
+  area: vaccines / screening
+  mechanism: 'no dynamics: the two trial priors overlap, so the price difference decides; burden ranks districts;
+    antenatal attendance is drawn but not read by the engine (a test on it is engine-blind)'
+- id: dengue_serotype_replacement_estimation
+  batch: 4
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A dengue serotype
+    that has not circulated for many years (DENV-3) has been introduced into 24 cities at the start of 2026. The
+    share of residents still susceptible to it is uncertain (40-100%, depending on how long ago it last circulated);
+    with the same transmissibility as recent seasons its basic reproduction number is about 2. Estimate, for each
+    city and in total, (1) the attack rate of DENV-3 in 2026 with and without a routine vector-control intensification
+    from week 8 to week 30, and (2) the threshold susceptible share below which no large epidemic occurs; report
+    each with a 95% uncertainty interval and state what the data do and do not determine. Input file: units.csv
+    (population, share infected at introduction).'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/dengue_serotype_replacement_estimation
+  inputs: 'synthetic: data/world_model_trials/dengue_serotype_replacement_estimation/generate_units.py (seeded;
+    declared design features drawn independently, realized pairwise |Spearman| <= 0.2)'
+  decision_type: estimation
+  area: outbreak response / vector control
+  mechanism: 'final-size nonlinearity: the attack rate is near zero below s0 = 1/R0 = 0.5 and rises steeply above
+    it; a time-limited control matters most just above the threshold'
