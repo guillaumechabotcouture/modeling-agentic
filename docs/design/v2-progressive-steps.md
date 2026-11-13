@@ -50,26 +50,36 @@ whether the decision is settled or the next step is needed. A step is skipped on
 previous step is valid *and* sufficient; a valid step whose plan changes across plausible inputs
 is not sufficient. Unresolved findings carry forward to the next step.
 
+Transitions: an *invalid* result goes to the owner or to SPEC (the inputs or the engine are wrong);
+a *valid but insufficient* result goes to the next step; a *valid and sufficient* result may end
+the progression. The deliverable always comes from a valid, sufficient step that produces a plan
+per unit, that is step 0 or step 3; a sweep (step 2) cannot end the progression. Sufficiency
+always requires the plan to be feasible under the spec's declared affordability rule in the
+draws, not only to have low regret.
+
 ## 3. The steps
 
 | Step | Question | Computation | Exit test | Artifact |
 |---|---|---|---|---|
-| 0. Arithmetic | What plan does external burden × trial effect ÷ current price give, and which term drives it? | Package-rate engine in trial-prior mode; no simulation | Validity: every input sourced. Sufficiency: the plan holds across the decision tests (regret against the per-draw optimum under a declared tolerance) | `analysis/step0/` (a full analysis run with the package-rate engine) |
-| 1. One node, trial settings | Does the engine reproduce the trials for every component the options use? | The engine's benchmark pack; the trial fit of effect ranges | Validity: every held-out benchmark covering a used component in band, or an owner-signed departure (eligibility precondition). Effect ranges are fitted only to the pack's training targets; held-out benchmarks stay validation | Engine benchmark record for the version used |
+| 0. Arithmetic | What plan does external burden × trial effect ÷ current price give, and which term drives it? | Package-rate engine in trial-prior mode; no simulation | Validity: every input sourced, and each burden and effect matched on comparator, outcome, population and window (principle 3); the combination rule is uncertain in the draws (from independent action to substantial overlap) unless evidence supports one rule. Sufficiency: the plan holds across the decision tests (regret against the per-draw optimum under a declared tolerance) | `analysis/step0/` (a full analysis run with the package-rate engine) |
+| 1. One node, trial settings | Does the engine reproduce the trials for every component the options use? | The engine's benchmark pack; the trial fit of effect ranges | Validity: every held-out benchmark covering a used component in band at the run's effective configuration (the benchmarks at spec values, including overrides), or an owner-signed departure (eligibility precondition). Effect ranges are fitted only to the pack's training targets; held-out benchmarks stay validation | Engine benchmark record for the version used |
 | 2. One node, setting sweep | How does each package's relative effect vary with the setting, and where does the winning package flip? | A designed sweep over a feature box spanning the evidence dossier's ranges, independent of real units; emulator; sensitivity; value of information | Validity: emulator error small enough that the plan's regret from emulator error is under a declared tolerance, judged on feasible allocations under the shared budget, not only within-unit flips; near-ties within an indifference tolerance are reported as ties (as `boundary.py` does). Sufficiency: the inputs that move the choice named | `analysis/sweep.yaml`, emulator, VOI |
 | 3. Apply to units | Given each unit's external burden and features, what is the plan, and how robust? | Emulator lookup; burden anchor; optimisation over uncertainty draws; stability; decision tests | Plan compared with step 0; each difference explained by a named mechanism or flagged | The current analysis artifacts plus `analysis/step_comparison.yaml` |
-| 4. Space, only if needed | Do coupling, importation or campaign timing between units change the plan? | A multi-node model | Taken only when step 3 shows unit independence is the weak point. Needs a new engine contract first: with transmission between units, one unit's benefit depends on its neighbours' packages, so benefits are no longer a per-unit table and the optimiser must evaluate whole plans | Declared in the spec when taken |
+| 4. Space, only if needed | Do coupling, importation or campaign timing between units change the plan? | A multi-node model | Triggered by evidence, not by step 3's own tests, which assume independence: a coupling stress test (importation varied with neighbours' coverage) that changes the plan, or evidence of strong connectivity between units. Needs a new engine contract first: with transmission between units, one unit's benefit depends on its neighbours' packages, so benefits are no longer a per-unit table and the optimiser must evaluate whole plans | Declared in the spec when taken |
 
 What each step passes forward:
 
 - Step 0 gives the reference plan and the terms that drive it, which tells step 2 where to look.
-- Step 1 gives effect ranges fitted to training targets, which become step 2's priors. A failing
+- Step 1 gives a joint sample of trial-compatible effect parameters fitted to training targets,
+  which becomes step 2's prior. Marginal ranges are not enough: the trials can admit a narrow
+  trade-off (for example efficacy against duration) that independent draws would break. A failing
   held-out benchmark is fixed by finding a mechanism or setup error that has its own evidence,
   then re-checked; a held-out benchmark is never used to choose parameter values
   (`toolkit/spec/engine_parameters.py` refuses that). Moving a benchmark from held-out to training
   needs a replacement validation set and the owner's sign-off.
 - Step 2 gives the flip boundaries and the inputs that matter. An input with low value of
-  information is not researched further, but its uncertainty stays in the draws.
+  information alone is still a candidate for research when it belongs to a group of inputs whose
+  joint value is high; in all cases its uncertainty stays in the draws.
 - Step 3 gives the plan and its comparison with step 0. When the two agree, the report says the
   simulation added little for this decision.
 
@@ -198,13 +208,28 @@ inputs toward an answer (principle 4).
    (direction, rough size, where a choice flips) for the confrontation. A stage `LEARN` after each
    step runs the loop of §5 and routes to the owner when it proposes dossier changes.
 
+7. **Unit-attribute uncertainty.** Today the uncertainty draws vary engine parameters,
+   calibration, costs and emulator error, but each unit's features (resistance, species shares,
+   seasonality) stay at their point values: `spec.priors` refuses priors on bound unit attributes
+   and the emulator caches unit features. So a range found in the dossier would be explored in
+   the sweep but never in the allocation draws, and the plan would look robust to it. Needed: a
+   contract for drawing unit attributes (per unit or as shared shifts by group, with their
+   dependence), propagated through calibration and emulator prediction. Until it exists, such
+   ranges enter only as decision tests and the omission is declared.
+8. **Burden-dependent costs.** When burden is anchored to external estimates, cost drivers that
+   scale with cases (treatment volume) scale with it, through a signed mapping (PR #210);
+   population-based delivery quantities do not.
+
 ## 7. What this means for F6
 
 P6 (the full preview) becomes steps 2 and 3. Order:
 
-1. Step 0 on the F6 inputs, locally, no cloud spend (PR `f6-step0-baseline`).
+1. An exploratory step 0 on the F6 inputs, locally, no cloud spend (PR `f6-step0-baseline`).
+   It is unsigned and labelled exploratory: it can inform the dossier but cannot satisfy any exit
+   test.
 2. The evidence dossier for F6: species and resistance (done, local), burden, prices, trial
-   effects, SMC and case-management inputs. The owner signs it with the amended spec.
+   effects, SMC and case-management inputs. The owner signs it with the amended spec, and step 0
+   is re-run on the signed inputs as the reference.
 3. Step 1: the net-effect ranges fitted to the pack's training targets; B7 and B8 (held out)
    then checked as validation. If they still fail, the cause is investigated as a mechanism or
    setup error with its own evidence, or the owner signs a departure (PR `f6-net-effect-ranges`;
@@ -215,7 +240,8 @@ P6 (the full preview) becomes steps 2 and 3. Order:
 ## 8. Risks and open questions
 
 - **Combination rules at step 0.** Trials measure components mostly alone; step 0 must declare how
-  components combine. Step 3 then tests that rule, which is one of the engine's real jobs.
+  components combine and carry that rule's uncertainty, since step 0 can end the progression.
+  Step 3 tests the rule when it runs, which is one of the engine's real jobs.
 - **Prevalence versus incidence.** Several net trials report prevalence odds ratios; step 0 needs a
   declared conversion or a range, and the dossier records which.
 - **Space size.** Too wide a feature space wastes points outside any real unit; too narrow repeats
