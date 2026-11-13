@@ -1015,7 +1015,7 @@ def register(seed, ledger, at=None):
     `at` (default now; never before the ledger's last line). The ledger is verified first."""
     import datetime as dt
     led = list(verify_ledger([dict(e) for e in ledger or []]))
-    seed = validate_seed(_prior(seed, None))
+    seed = validate(seed)
     by = {b["id"]: b for b in seed["beliefs"]}
     at = at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     if _when(at) is None or (led and _when(at) < _when(led[-1]["registered_at"])):
@@ -1415,13 +1415,37 @@ def consumed_inputs(spec, run_dir):
     return out
 
 
+def design_features(spec, design):
+    """({feature name: value at each design point}, {name: unit | parameter}): the sweep's inputs, from the stored
+    design and the spec alone (no result is read): the calibrated attribute on its calibration scale, the declared
+    unit features and every design parameter (fitted, prior and tested spec values). load_sweep reads its features
+    here, so a task told these names before the sweep is told the names its tests will be checked against."""
+    from toolkit.analysis import features as FT
+    attr = spec["calibration"].get("attribute")
+    by_id = {str(u[spec.uid]): u for u in spec.units()}
+    feats = [FT.name(x) for x in FT.declared(spec.raw)]
+    pnames = list(design.get("fitted_names") or []) + list(design.get("prior_names") or []) + \
+        list(design.get("spec_value_names") or [])
+    F = {n_: [] for n_ in ([f"{attr} (calibration scale)"] if attr else []) + feats + pnames}
+    for p in design["points"]:
+        u = by_id[str(p["unit_id"])]
+        vals = ([p["z"]] if attr else []) + FT.vector(spec, u) + [float(p["theta"][nm]) for nm in pnames]
+        for n_, v in zip(F, vals):
+            F[n_].append(float(v))
+    return F, {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
+
+
+def validate(seed) -> dict:
+    """A seed (or a produced world model to build on) validated exactly as `register` and `build` read it."""
+    return validate_seed(_prior(seed, None))
+
+
 def load_sweep(run_dir, identity="current", lam=None, use_plan=True):
     """The per-person sweep tables of a run's engine batch (analysis/batch/design.json and results.jsonl, rows bound
     to the stored design's jobs) and the signed spec (packages, populations, cost items). `identity`: the engine
     identity the rows must carry: `current` (the spec's engine as now) or `recorded` (analysis/point.yaml's
     engine_identity, for an offline retro-check of an older engine; recorded in the output)."""
     from toolkit.alloc import costs as acosts
-    from toolkit.analysis import features as FT
     from toolkit.analysis.artifacts import read, sha256
     from toolkit.analysis.core import discount_factor
     from toolkit.analysis.model import _driver, _group
@@ -1461,10 +1485,7 @@ def load_sweep(run_dir, identity="current", lam=None, use_plan=True):
     co = (spec["analysis"].get("cost_outputs") or {})
     alloc, attr = spec.alloc_spec(), spec["calibration"].get("attribute")
     by_id = {str(u[spec.uid]): u for u in spec.units()}
-    feats = [FT.name(x) for x in FT.declared(spec.raw)]
-    pnames = list(design.get("fitted_names") or []) + list(design.get("prior_names") or []) + \
-        list(design.get("spec_value_names") or [])
-    F = {n_: [] for n_ in ([f"{attr} (calibration scale)"] if attr else []) + feats + pnames}
+    F, kinds = design_features(spec, design)
     y, cost, burden = {k: [] for k in names}, {k: [] for k in names}, []
     for p in design["points"]:
         u = by_id[str(p["unit_id"])]
@@ -1477,11 +1498,7 @@ def load_sweep(run_dir, identity="current", lam=None, use_plan=True):
         for k in names:
             cost[k].append(cm[str(u[spec.uid])][k]["total"] / tot)
         burden.append(y[spec.comparator][-1])
-        vals = ([p["z"]] if attr else []) + FT.vector(spec, u) + [float(p["theta"][nm]) for nm in pnames]
-        for n_, v in zip(F, vals):
-            F[n_].append(float(v))
     groups = {c: (d or {}).get("group") for c, d in spec["options"]["components"].items() if (d or {}).get("group")}
-    kinds = {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
     arts = dict({rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}, **consumed_inputs(spec, run_dir))
     point = point_doc(run_dir, ident) if use_plan else None
     lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price((point or {}).get("data"))
@@ -1564,7 +1581,7 @@ def _cli(argv):
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
-        seed = validate_seed(_prior(seed, None))
+        seed = validate(seed)
         print(f"OK: {len(seed['beliefs'])} beliefs, {len(seed.get('hypotheses') or [])} hypotheses")
         return 0
     from toolkit.analysis.artifacts import _safe_io, sha256

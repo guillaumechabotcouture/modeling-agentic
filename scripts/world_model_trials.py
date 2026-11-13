@@ -1,13 +1,58 @@
 #!/usr/bin/env python3
-"""World-model trials (F6): the world model (toolkit/analysis/world_model.py) on many low-compute questions.
+"""World-model trials (F6, owner 2026-11-13): the world model (toolkit/analysis/world_model.py) on many low-compute
+questions, to see how it behaves: does a version 0 written before any simulation give testable hypotheses, how often
+are they confirmed, and where does it fail.
 
-Not yet implemented: the self-tests below define the behaviour (α).
+    python3 scripts/world_model_trials.py run --total-cap-usd 1000 [--questions FILE] [--only id,id] [--batch B]
+        [--limit N] [--trials-dir trials] [--task-cap-usd 2] [--llm-concurrency 5] [--push]
+    python3 scripts/world_model_trials.py check-templates [--only id,id]   # inputs only: no LLM, no push
+    python3 scripts/world_model_trials.py score [--trials-dir trials]      # trials/summary.yaml and summary.md
+    python3 scripts/world_model_trials.py --self-test
+
+Per question (scripts/world_model_trials_questions.yaml: {id, question, engine, template, shadow_price, ...}):
+  1. prepare  copy the template (a decision spec and its synthetic or public inputs) into trials/runs/<id>/, load
+              the spec (toolkit/spec/schema.py), build the engine design (toolkit/analysis/batch.py design) and
+              store it; the design's features come from world_model.design_features, the function load_sweep uses
+  2. seed     the bounded seed task (agents/v2_sdk_tasks.py seed_world_model: one SDK session, file tools, a USD
+              cap, the decision design principles and the world model's own seed documentation in its prompt) writes
+              world_model_seed.yaml before any result exists (it cannot read analysis/ or other runs). The harness
+              checks it with world_model.validate (the validator register and build use) and against the design's
+              package and feature names, and asks for one repair with every error; refused twice, the question stops
+  3. register world_model register (the CLI's locked append to analysis/hypotheses_registry.jsonl)
+  4. anchor   with --push: the ledger and the seed (only those two files, checked against an allow-list before
+              every commit) are committed to branch wm-trials in its own git worktree (the main working tree is
+              never touched), pushed without force and fetched; the build anchors on refs/remotes/origin/wm-trials.
+              Without --push every confrontation is post hoc
+  5. engine   the batch (toolkit/analysis/batch.py run, a local process pool of at most 2 workers, OMP_NUM_THREADS=2),
+              one batch at a time across all questions; refused when a cloud scheduler is configured or the design
+              exceeds --max-engine-runs; then world_model.record_first_seen (the driver records the batch's first
+              appearance; batch.py does not yet)
+  6. build    world_model build --without-plan [--shadow-price] --anchor-ref refs/remotes/origin/wm-trials (the CLI)
+LLM steps run in parallel (--llm-concurrency, default 5); engine and build steps in one queue.
+
+Spend. trials/spend.jsonl is an append-only, hash-chained ledger across invocations: a reservation of a task's cap
+before it is launched, then its charge (the SDK-reported cost; the whole cap when none is reported). Committed spend
+is the charges plus every open reservation at its cap. A task is launched only when committed spend plus its cap is
+within --total-cap-usd (required); otherwise it and every later LLM step are refused and the question is recorded as
+budget_refused. The engine runs locally: its compute is recorded at $0 with its backend. Spend per question is in
+trials/runs/<id>/trial.json and the summary.
+
+Resumable: trials/runs/<id>/trial.json records each step; a completed question is skipped, a partial one resumes at
+its first missing step (a validated seed is never re-asked; a registered one is not re-registered). Nothing in this
+file names a disease, a place or an intervention: those are in the questions file and the templates.
 """
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
+import io
 import json
 import os
+import re
+import subprocess
 import sys
+import threading
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (REPO, os.path.join(REPO, "scripts")):
@@ -19,30 +64,829 @@ class TrialError(ValueError):
     """An input the trials cannot use, or a refused action (budget, push scope): fails closed with the reason."""
 
 
-def load_questions(path, root=REPO, engines=None):
-    raise NotImplementedError
+QUESTIONS = os.path.join(REPO, "scripts", "world_model_trials_questions.yaml")
+CHEAP_ENGINES = frozenset({"toolkit.engines.compartmental.engine:CompartmentalEngine",
+                           "toolkit.engines.renewal.engine:RenewalEngine",
+                           "toolkit.engines.empirical.engine:PackageRateEngine"})
+SEED_FILE = "world_model_seed.yaml"                      # what the seed task writes (agents/v2_sdk_tasks.SEED_FILE)
+SEED = "analysis/world_model_seed.yaml"                  # the validated copy the harness registers and builds from
+TRIAL = "trial.json"
+BRANCH, REMOTE = "wm-trials", "origin"
+HYPOTHESES = (5, 8)
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+STEPS = ("prepare", "seed", "register", "anchor", "engine", "build")
+_CLI_LOCK = threading.Lock()                      # world_model CLI calls print; their capture swaps sys.stdout
+CLOUD_ENV = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS")
 
 
+class TrialError(ValueError):
+    """An input the trials cannot use, or a refused action (budget, push scope): fails closed with the reason."""
+
+
+def _sio():
+    from lib import safe_io
+    return safe_io
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _sha(x) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- questions
+def load_questions(path=QUESTIONS, root=REPO, engines=CHEAP_ENGINES) -> list[dict]:
+    """The questions file's entries, checked as inputs before any run: a plain unique id, the question text, an engine
+    among the cheap engines, a template directory holding decision_spec.yaml whose engine is that engine, and a
+    shadow price that is a positive number or null. Any problem refuses the whole file."""
+    import yaml
+    try:
+        doc = yaml.safe_load(open(path))
+    except (OSError, yaml.YAMLError) as e:
+        raise TrialError(f"{path}: unreadable ({e})")
+    qs = (doc or {}).get("questions") if isinstance(doc, dict) else None
+    if not isinstance(qs, list) or not qs:
+        raise TrialError(f"{path}: questions: a non-empty list")
+    bad, seen = [], set()
+    for k, q in enumerate(qs):
+        w = f"questions[{k}]"
+        if not isinstance(q, dict):
+            bad.append(f"{w}: a mapping")
+            continue
+        qid = str(q.get("id") or "")
+        w = f"question {qid or k}"
+        if not ID_RE.match(qid):
+            bad.append(f"{w}: id a plain name ({ID_RE.pattern})")
+        elif qid in seen:
+            bad.append(f"{w}: duplicate id")
+        seen.add(qid)
+        if not str(q.get("question") or "").strip():
+            bad.append(f"{w}: question text")
+        if q.get("engine") not in engines:
+            bad.append(f"{w}: engine {q.get('engine')!r} is not one of {sorted(engines)}")
+        sp = q.get("shadow_price")
+        if sp is not None and not (isinstance(sp, (int, float)) and not isinstance(sp, bool) and sp > 0):
+            bad.append(f"{w}: shadow_price a positive number or null")
+        tpl = os.path.realpath(os.path.join(root, str(q.get("template") or "")))
+        spec = os.path.join(tpl, "decision_spec.yaml")
+        if not q.get("template") or not os.path.isfile(spec) or not tpl.startswith(os.path.realpath(root) + os.sep):
+            bad.append(f"{w}: template {q.get('template')!r} is not a directory under {root} holding decision_spec.yaml")
+            continue
+        try:
+            ref = ((yaml.safe_load(open(spec)) or {}).get("engine") or {}).get("ref")
+        except (OSError, yaml.YAMLError, AttributeError):
+            ref = None
+        if ref != q.get("engine"):
+            bad.append(f"{w}: the template's engine {ref!r} is not the question's {q.get('engine')!r}")
+    if bad:
+        raise TrialError(f"{path}: " + "; ".join(bad))
+    return qs
+
+
+def select(qs, only=None, batch=None, limit=None) -> list[dict]:
+    out = [q for q in qs if (not only or q["id"] in only) and (batch is None or str(q.get("batch")) == str(batch))]
+    if only and set(only) - {q["id"] for q in out}:
+        raise TrialError(f"--only names unknown questions {sorted(set(only) - {q['id'] for q in out})}")
+    return out[:limit] if limit else out
+
+
+# ---------------------------------------------------------------- spend
 class SpendLedger:
+    """Append-only, hash-chained spend ledger across invocations (trials/spend.jsonl). Lines: {kind: reserve, rid,
+    question, task, cap_usd} before a task is launched, then {kind: charge, rid, usd, source}; {kind: compute, ...}
+    records an engine step's cost. Committed spend = charges + compute + every open reservation at its cap. The chain
+    (each line's sha256 and the previous line's) is verified on every read: an edited, removed or reordered line
+    refuses the ledger. One lock (threads and processes) spans each read-check-append."""
+
     def __init__(self, path, total_cap_usd):
-        raise NotImplementedError
+        if isinstance(total_cap_usd, bool) or not isinstance(total_cap_usd, (int, float)) or not total_cap_usd > 0:
+            raise TrialError(f"total cap {total_cap_usd!r}: a positive number of USD")
+        self.path, self.cap = os.path.abspath(path), float(total_cap_usd)
+        self.root, self.rel = os.path.dirname(self.path), os.path.basename(self.path)
+        os.makedirs(self.root, exist_ok=True)
+        self._lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def _locked(self):
+        import fcntl
+        with self._lock, _sio().open_append_nofollow(self.root, self.rel) as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                yield f
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _lines(self) -> list[dict]:
+        out, prev = [], "0" * 64
+        if not os.path.isfile(self.path):
+            return out
+        for k, raw in enumerate(open(self.path)):
+            if not raw.strip():
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                raise TrialError(f"{self.path} line {k + 1}: malformed")
+            if e.get("prev") != prev or e.get("line_sha") != _sha({x: v for x, v in e.items() if x != "line_sha"}):
+                raise TrialError(f"{self.path} line {k + 1}: edited, removed or reordered (the chain does not verify)")
+            prev = e["line_sha"]
+            out.append(e)
+        return out
+
+    def _append(self, f, lines, e):
+        e = dict(e, at=_now(), total_cap_usd=self.cap, prev=lines[-1]["line_sha"] if lines else "0" * 64)
+        e["line_sha"] = _sha(e)
+        f.write(json.dumps(e, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+        return e
+
+    @staticmethod
+    def _committed(lines) -> float:
+        charged = {e["rid"]: float(e["usd"]) for e in lines if e["kind"] == "charge"}
+        return sum(charged.get(e["rid"], float(e["cap_usd"])) for e in lines if e["kind"] == "reserve") + \
+            sum(float(e["usd"]) for e in lines if e["kind"] == "compute")
+
+    def committed(self) -> float:
+        with self._locked():
+            return self._committed(self._lines())
+
+    def spent(self) -> float:
+        with self._locked():
+            L = self._lines()
+            return sum(float(e["usd"]) for e in L if e["kind"] in ("charge", "compute"))
+
+    def reserve(self, question, task, cap_usd):
+        """A reservation id, or None when committed spend plus this cap would exceed the total cap (refused)."""
+        with self._locked() as f:
+            L = self._lines()
+            if self._committed(L) + float(cap_usd) > self.cap + 1e-9:
+                return None
+            rid = _sha([question, task, _now(), len(L), os.getpid(), threading.get_ident()])[:16]
+            self._append(f, L, {"kind": "reserve", "rid": rid, "question": question, "task": task,
+                                "cap_usd": float(cap_usd)})
+            return rid
+
+    def charge(self, rid, usd, source):
+        with self._locked() as f:
+            L = self._lines()
+            if rid not in {e["rid"] for e in L if e["kind"] == "reserve"} or \
+                    rid in {e["rid"] for e in L if e["kind"] == "charge"}:
+                raise TrialError(f"spend ledger: no open reservation {rid}")
+            self._append(f, L, {"kind": "charge", "rid": rid, "usd": float(usd), "source": source})
+
+    def compute(self, question, usd, backend):
+        with self._locked() as f:
+            self._append(f, self._lines(), {"kind": "compute", "rid": None, "question": question, "usd": float(usd),
+                                            "source": backend})
+
+    def by_question(self) -> dict:
+        with self._locked():
+            L = self._lines()
+        charged = {e["rid"]: float(e["usd"]) for e in L if e["kind"] == "charge"}
+        out = {}
+        for e in L:
+            if e["kind"] == "reserve":
+                q = out.setdefault(e["question"], {"llm_usd": 0.0, "compute_usd": 0.0, "open_reservations": 0})
+                q["llm_usd"] += charged.get(e["rid"], 0.0)
+                q["open_reservations"] += e["rid"] not in charged
+            elif e["kind"] == "compute":
+                q = out.setdefault(e["question"], {"llm_usd": 0.0, "compute_usd": 0.0, "open_reservations": 0})
+                q["compute_usd"] += float(e["usd"])
+        return out
 
 
+# ---------------------------------------------------------------- the wm-trials branch
 class GitAnchor:
-    def __init__(self, repo, worktree, branch="wm-trials", remote="origin", trials_rel="trials"):
-        raise NotImplementedError
+    """The wm-trials branch in its own git worktree: commits the registration ledger and the seed of a question (only
+    those, at their paths in the main working tree, which is where world_model.git_anchors looks them up), pushes
+    without force and fetches, so refs/remotes/<remote>/<branch> anchors the ledger. Every commit is checked: the
+    paths staged and every path the branch holds match the allow-list."""
+
+    def __init__(self, repo, worktree, branch=BRANCH, remote=REMOTE, trials_rel="trials"):
+        self.repo, self.wt = os.path.realpath(repo), os.path.abspath(worktree)
+        self.branch, self.remote = branch, remote
+        self.ref = f"refs/remotes/{remote}/{branch}"
+        self.allowed = re.compile(rf"^{re.escape(trials_rel.strip('/'))}/runs/[A-Za-z0-9][A-Za-z0-9_.-]*/analysis/"
+                                  r"(hypotheses_registry\.jsonl|world_model_seed\.yaml)$")
+        self._lock = threading.Lock()
+
+    def _git(self, *a, cwd=None, check=True):
+        r = subprocess.run(["git", *a], cwd=cwd or self.repo, capture_output=True, text=True, timeout=300)
+        if check and r.returncode:
+            raise TrialError(f"git {' '.join(a)}: {r.stderr.strip()[:400]}")
+        return r
+
+    def ensure(self):
+        if os.path.isdir(self.wt) and os.path.exists(os.path.join(self.wt, ".git")):
+            cur = self._git("symbolic-ref", "--short", "HEAD", cwd=self.wt, check=False).stdout.strip()
+            if cur != self.branch:
+                raise TrialError(f"{self.wt} is checked out on {cur!r}, not {self.branch}")
+            return
+        self._git("fetch", "-q", self.remote, self.branch, check=False)
+        has = lambda r: self._git("show-ref", "--verify", "-q", r, check=False).returncode == 0  # noqa: E731
+        if has(f"refs/heads/{self.branch}"):
+            self._git("worktree", "add", "-q", self.wt, self.branch)
+        elif has(self.ref):
+            self._git("worktree", "add", "-q", "-b", self.branch, self.wt, self.ref)
+        else:
+            self._git("worktree", "add", "-q", "--orphan", "-b", self.branch, self.wt)
+
+    def _check(self, rel):
+        if os.path.normpath(rel) != rel or not self.allowed.match(rel):
+            raise TrialError(f"{rel!r}: only a question's registration ledger and seed go to {self.branch}")
+        src = os.path.join(self.repo, rel)
+        if os.path.islink(src) or not os.path.isfile(src):
+            raise TrialError(f"{rel}: not a regular file in the working tree")
+
+    def publish(self, rels, qid) -> dict:
+        for rel in rels:
+            self._check(rel)
+        with self._lock:
+            self.ensure()
+            for rel in rels:
+                data, _ = _sio().read_nofollow(self.repo, rel)
+                _sio().write_nofollow(self.wt, rel, data, atomic=True)
+            self._git("add", "--", *rels, cwd=self.wt)
+            staged = [x for x in self._git("diff", "--cached", "--name-only", cwd=self.wt).stdout.splitlines() if x]
+            held = [x for x in self._git("ls-files", cwd=self.wt).stdout.splitlines() if x]
+            stray = sorted(set(staged) - set(rels)) + [x for x in held if not self.allowed.match(x)]
+            if stray:
+                raise TrialError(f"{self.branch}: refusing to commit paths outside the allow-list: {stray[:5]}")
+            if staged:
+                self._git("commit", "-q", "-m", f"wm-trials: register {qid} ({len(staged)} file(s))", cwd=self.wt)
+            self._git("push", "-q", self.remote, f"{self.branch}:{self.branch}", cwd=self.wt)
+            self._git("fetch", "-q", self.remote, self.branch, cwd=self.wt)
+            head = self._git("rev-parse", "HEAD", cwd=self.wt).stdout.strip()
+            if self._git("merge-base", "--is-ancestor", head, self.ref, check=False).returncode:
+                raise TrialError(f"{head} is not reachable from {self.ref} after the push and fetch")
+            at = self._git("show", "-s", "--format=%cI", head, cwd=self.wt).stdout.strip()
+            return {"commit": head, "at": at, "ref": self.ref}
 
 
-def run_trials(*a, **k):
-    raise NotImplementedError
+# ---------------------------------------------------------------- per-question steps
+def _trial(run_dir) -> dict:
+    p = os.path.join(run_dir, TRIAL)
+    return json.load(open(p)) if os.path.isfile(p) else {}
 
 
-def score(*a, **k):
-    raise NotImplementedError
+def _save(run_dir, t):
+    _sio().write_nofollow(run_dir, TRIAL, json.dumps(t, indent=1, sort_keys=True, default=str).encode(), atomic=True)
 
 
-def seed_problems(*a, **k):
-    raise NotImplementedError
+def prepare(q, run_dir, root=REPO, max_engine_runs=50) -> dict:
+    """Copy the template, load the spec, build and store the engine design, and return the seed context (inputs
+    only: no result exists). A design over the engine-run limit is refused here and again at run time."""
+    from toolkit.analysis import batch as B
+    from toolkit.analysis import world_model as W
+    from toolkit.spec import schema
+    tpl = os.path.join(root, q["template"])
+    os.makedirs(run_dir, exist_ok=True)
+    for dp, dn, fn in os.walk(tpl):
+        dn[:] = [x for x in dn if x != "analysis"]
+        for name in fn:
+            rel = os.path.relpath(os.path.join(dp, name), tpl)
+            data, _ = _sio().read_nofollow(tpl, rel)
+            _sio().write_nofollow(run_dir, rel, data, atomic=True)
+    spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
+    design, jobs = B.design(spec)
+    if len(jobs) > max_engine_runs:
+        raise TrialError(f"{q['id']}: the design has {len(jobs)} engine runs, over the limit of {max_engine_runs}")
+    _sio().write_nofollow(run_dir, "analysis/batch/design.json", json.dumps(design).encode(), atomic=True)
+    F, kinds = W.design_features(spec, design)
+    card = spec.engine().describe().to_dict()
+    attr = spec["calibration"].get("attribute")
+    feats = {}
+    for n, v in F.items():
+        f = {"kind": "calibration" if attr and n == f"{attr} (calibration scale)" else kinds[n],
+             "range": [min(v), max(v)], "distinct_values": len(set(v))}
+        if f["kind"] == "calibration":
+            f["read_by_engine"] = attr in (card.get("unit_attributes") or {})
+        feats[n] = f
+    return {"question": q["question"], "spec": "decision_spec.yaml",
+            "engine": {k: card.get(k) for k in ("name", "version", "mechanisms", "components", "unit_attributes",
+                                                 "notes")},
+            "packages": {k: sorted(v) for k, v in spec.packages().items()}, "comparator": spec.comparator,
+            "primary_outcome": spec.outcomes()[0],
+            "sweep": {"design_points": len(design["points"]), "engine_runs": len(jobs), "features": feats,
+                      "independent_features": list(design.get("independent_features") or []),
+                      "shadow_price": q.get("shadow_price"), "optimised_plan": False,
+                      "min_points": W.SETTINGS["min_points"], "small_sample_below": W.SETTINGS["perm_n_max"]},
+            "hypotheses": {"min": HYPOTHESES[0], "max": HYPOTHESES[1]}}
+
+
+def seed_problems(seed, ctx) -> list[str]:
+    """Why the harness refuses a seed (empty when it is accepted): the world model's own validator (world_model.validate,
+    as register and build call it), the number of hypotheses, and every package and feature a test names being one of
+    the design's (a name the sweep lacks would fail the build)."""
+    from toolkit.analysis import world_model as W
+    try:
+        W.validate(seed)
+    except W.WorldModelError as e:
+        msg = str(e).replace("world-model seed refused: ", "")
+        return [x for x in msg.split("; ") if x]
+    bad, hs = [], seed.get("hypotheses") or []
+    if not HYPOTHESES[0] <= len(hs) <= HYPOTHESES[1]:
+        bad.append(f"{len(hs)} hypotheses: write {HYPOTHESES[0]} to {HYPOTHESES[1]}")
+    pk, ft = set(ctx["packages"]), set(ctx["sweep"]["features"])
+    for h in hs:
+        t = h["test"]
+        for x in ("package", "a", "b"):
+            if t.get(x) and t["kind"] != "plan_share" and t[x] not in pk:
+                bad.append(f"hypothesis {h['id']}: package {t[x]!r} is not one of {sorted(pk)}")
+        if t["kind"] == "plan_share":
+            continue
+        names = ([t["feature"]] if t.get("feature") else []) + list(t.get("where") or {}) + list(t.get("adjust_for")
+                                                                                              or [])
+        for n in names:
+            if n not in ft:
+                bad.append(f"hypothesis {h['id']}: feature {n!r} is not one of the sweep's {sorted(ft)}")
+    return bad
+
+
+def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
+    """The seed task, repaired once. Each session's cap is reserved before it is launched (refused: budget) and
+    charged with the reported cost after it."""
+    import yaml
+    out = {"sessions": 0, "repairs": 0, "usd": 0.0, "notes": []}
+    feedback = None
+    for attempt in range(2):
+        rid = ledger.reserve(q["id"], "seed" if attempt == 0 else "seed repair", task_cap_usd)
+        if rid is None:
+            return dict(out, status="budget_refused")
+        try:
+            r = seed_fn(run_dir, ctx, feedback, task_cap_usd)
+        except Exception as e:  # noqa: BLE001 -- the reservation is charged in full, then the question stops
+            ledger.charge(rid, task_cap_usd, f"crashed: {type(e).__name__}: whole cap")
+            return dict(out, status="seed_failed", error=f"{type(e).__name__}: {e}"[:300], usd=out["usd"] + task_cap_usd)
+        usd = float(r.usd) if r is not None and isinstance(r.usd, (int, float)) else task_cap_usd
+        ledger.charge(rid, usd, "sdk reported" if r is not None else "no result: whole cap")
+        out["sessions"] += 1
+        out["usd"] += usd
+        out["notes"].append(getattr(r, "note", ""))
+        path = os.path.join(run_dir, SEED_FILE)
+        try:
+            seed = yaml.safe_load(open(path)) if r is not None and r.ok else None
+        except (OSError, yaml.YAMLError) as e:
+            seed, feedback = None, [f"{SEED_FILE} is not readable YAML: {e}"]
+        if seed is not None:
+            feedback = seed_problems(seed, ctx) if isinstance(seed, dict) else [f"{SEED_FILE}: a mapping"]
+        elif feedback is None or attempt == 0 and not os.path.isfile(path):
+            feedback = [f"no {SEED_FILE} was written" + (f" ({r.note})" if r is not None and r.note else "")]
+        if not feedback:
+            data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
+            _sio().write_nofollow(run_dir, SEED, data, atomic=True)
+            return dict(out, status="ok", hypotheses=len(seed["hypotheses"]), refusals=out.get("refusals", []))
+        out.setdefault("refusals", []).append(feedback)
+        if attempt == 0:
+            out["repairs"] = 1
+    return dict(out, status="seed_refused")
+
+
+def register_step(run_dir) -> dict:
+    from toolkit.analysis import world_model as W
+    buf = io.StringIO()
+    with _CLI_LOCK, contextlib.redirect_stdout(buf):      # sys.stdout is process-wide: one at a time
+        W._cli(["register", os.path.join(run_dir, SEED), run_dir])
+    return {"note": buf.getvalue().strip()}
+
+
+def engine_step(q, run_dir, max_engine_runs=50, workers=2) -> dict:
+    """The batch on the stored design (re-derived from the spec and required to be identical), on a local pool of at
+    most `workers` processes; a cloud scheduler in the environment or a design over the limit is refused. Then the
+    batch's first appearance is recorded (world_model.record_first_seen)."""
+    from toolkit.analysis import batch as B
+    from toolkit.analysis import world_model as W
+    from toolkit.spec import schema
+    if any(os.environ.get(k) for k in CLOUD_ENV):
+        raise TrialError(f"a cloud scheduler is configured ({[k for k in CLOUD_ENV if os.environ.get(k)]}); the "
+                         "trials run locally unless the owner approves a cloud backend")
+    if workers > 2:
+        raise TrialError("at most 2 worker processes (owner's laptop rule)")
+    spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
+    design, jobs = B.design(spec)
+    stored = json.load(open(os.path.join(run_dir, "analysis", "batch", "design.json")))
+    if json.loads(json.dumps(design)) != stored:
+        raise TrialError(f"{q['id']}: the design re-derived from the spec differs from the one the seed was told")
+    if len(jobs) > max_engine_runs:
+        raise TrialError(f"{q['id']}: {len(jobs)} engine runs, over the limit of {max_engine_runs}")
+    t0 = time.time()
+    r = B.run(run_dir, jobs, spec.engine(), max_workers=workers)
+    s = r["summary"]
+    if s.get("backend") != "local" or (s.get("workers") or 0) > workers:
+        raise TrialError(f"{q['id']}: the batch ran on {s.get('backend')} with {s.get('workers')} workers")
+    if r["problems"] or s.get("n_failed"):
+        raise TrialError(f"{q['id']}: {s.get('n_failed')} engine runs failed, {len(r['problems'])} rows refused "
+                         f"({r['problems'][:2]})")
+    first = W.record_first_seen(run_dir)
+    return {"jobs": len(jobs), "wall_s": round(time.time() - t0, 2), "backend": s.get("backend"),
+            "workers": s.get("workers"), "first_seen": first, "compute_usd": 0.0}
+
+
+def build_step(q, run_dir, anchor_ref=None) -> dict:
+    import yaml
+    from toolkit.analysis import world_model as W
+    argv = ["build", run_dir, "--seed", os.path.join(run_dir, SEED), "--without-plan"]
+    if q.get("shadow_price") is not None:
+        argv += ["--shadow-price", repr(float(q["shadow_price"]))]
+    if anchor_ref:
+        argv += ["--anchor-ref", anchor_ref]
+    buf = io.StringIO()
+    with _CLI_LOCK, contextlib.redirect_stdout(buf):      # sys.stdout is process-wide: one at a time
+        W._cli(argv)
+    hy = yaml.safe_load(open(os.path.join(run_dir, "analysis", "hypotheses.yaml")))
+    st = {}
+    for h in hy["hypotheses"]:
+        st[h["status"]] = st.get(h["status"], 0) + 1
+    return {"statuses": st, "note": buf.getvalue().strip()}
+
+
+def _wait_past(at):
+    """Sleep until the wall clock is past `at` (an ISO time to the second), so the batch's first-seen time is after
+    the anchor commit's time (a tie would make every confrontation post hoc)."""
+    t = dt.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+    while time.time() < t + 1.05:
+        time.sleep(0.1)
+
+
+def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anchor=None, task_cap_usd=2.0,
+               llm_concurrency=5, engine_workers=2, max_engine_runs=50, engines=CHEAP_ENGINES, engine_probe=None,
+               root=None) -> dict:
+    """Every question through prepare, seed, register, anchor, engine and build (module docstring). Returns {id:
+    trial record}; each record is also trials/runs/<id>/trial.json."""
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+    if ledger is None or seed_fn is None:
+        raise TrialError("run_trials needs a spend ledger and a seed task")
+    root = root or repo
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    rel_root = os.path.relpath(os.path.realpath(trials_root), os.path.realpath(repo)).replace(os.sep, "/")
+    if anchor is not None and (rel_root.startswith("..") or os.path.isabs(rel_root)):
+        raise TrialError(f"{trials_root} must be inside {repo} for the anchor to find the ledger at its path")
+    if anchor is not None:
+        anchor.allowed = GitAnchor(repo, anchor.wt, anchor.branch, anchor.remote, rel_root).allowed
+    results, lock, stop = {}, threading.Lock(), {"budget": False}
+    work = queue.Queue()
+
+    def record(qid, t):
+        with lock:
+            results[qid] = t
+
+    def llm_part(q):
+        rd = os.path.join(trials_root, "runs", q["id"])
+        os.makedirs(rd, exist_ok=True)
+        t = _trial(rd)
+        if t.get("status") == "complete":
+            return record(q["id"], dict(t, skipped=True))
+        t = dict(t, id=q["id"], engine_ref=q["engine"], steps=dict(t.get("steps") or {}), status="running")
+        try:
+            if "prepare" not in t["steps"]:
+                t["context"] = prepare(q, rd, root, max_engine_runs)
+                t["steps"]["prepare"] = _now()
+                _save(rd, t)
+            if "seed" not in t["steps"]:
+                if stop["budget"]:
+                    t["status"] = "budget_refused"
+                    _save(rd, t)
+                    return record(q["id"], t)
+                s = seed_step(q, rd, t["context"], seed_fn, ledger, task_cap_usd)
+                t["seed"] = s
+                if s["status"] != "ok":
+                    stop["budget"] = stop["budget"] or s["status"] == "budget_refused"
+                    t["status"] = s["status"]
+                    _save(rd, t)
+                    return record(q["id"], t)
+                t["steps"]["seed"] = _now()
+                _save(rd, t)
+            if "register" not in t["steps"]:
+                t["register"] = register_step(rd)
+                t["steps"]["register"] = _now()
+                _save(rd, t)
+            if "anchor" not in t["steps"]:
+                if anchor is not None:
+                    rels = [f"{rel_root}/runs/{q['id']}/{SEED}",
+                            f"{rel_root}/runs/{q['id']}/analysis/hypotheses_registry.jsonl"]
+                    t["anchor"] = anchor.publish(rels, q["id"])
+                    _wait_past(t["anchor"]["at"])
+                else:
+                    t["anchor"] = None
+                t["steps"]["anchor"] = _now()
+                _save(rd, t)
+            work.put((q, rd, t))
+        except Exception as e:  # noqa: BLE001 -- recorded on the question; the others carry on
+            t.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            _save(rd, t)
+            record(q["id"], t)
+
+    def engine_worker():
+        while True:
+            item = work.get()
+            if item is None:
+                return
+            q, rd, t = item
+            try:
+                if "engine" not in t["steps"]:
+                    if engine_probe:
+                        engine_probe("start")
+                    try:
+                        t["engine"] = engine_step(q, rd, max_engine_runs, engine_workers)
+                    finally:
+                        if engine_probe:
+                            engine_probe("end")
+                    ledger.compute(q["id"], t["engine"]["compute_usd"], t["engine"]["backend"])
+                    t["steps"]["engine"] = _now()
+                    _save(rd, t)
+                t["build"] = build_step(q, rd, anchor.ref if anchor is not None else None)
+                t["steps"]["build"] = _now()
+                pq = ledger.by_question().get(q["id"]) or {}
+                t.update(status="complete", spend_usd=round(pq.get("llm_usd", 0.0) + pq.get("compute_usd", 0.0), 6))
+            except Exception as e:  # noqa: BLE001
+                t.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            _save(rd, t)
+            record(q["id"], t)
+
+    ew = threading.Thread(target=engine_worker, daemon=True)
+    ew.start()
+    with ThreadPoolExecutor(max_workers=max(1, int(llm_concurrency))) as ex:
+        list(ex.map(llm_part, questions))
+    work.put(None)
+    ew.join()
+    return results
+
+
+# ---------------------------------------------------------------- scoring
+# The scoring's own review heuristics (not world-model rules; the verdicts are the build's): a band test is lenient
+# when its band spans at least LENIENT_WIDTH of relative reduction or its threshold share is at most LENIENT_SHARE;
+# a negligible claim when its equivalence bound is at least LENIENT_EQUIVALENCE. A literature citation is machine-
+# verifiable only with a year and a location naming a table, figure, page or section.
+SCORING = {"lenient_width": 0.6, "lenient_share": 0.6, "lenient_equivalence": 0.3}
+YEAR_RE = re.compile(r"\b(19|20)\d\d\b")
+LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix)", re.I)
+MODES = ("untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
+         "inert_feature", "high_confidence_refuted", "contradiction_without_open_question", "citation_not_verifiable")
+
+
+def failure_modes(hyps, seed, wm, ctx=None) -> dict:
+    """{mode: [hypothesis or belief ids]} for the checked hypotheses of one question (MODES; empty modes omitted)."""
+    by = {b["id"]: b for b in seed.get("beliefs") or []}
+    qs = {q.get("id") for q in (wm or {}).get("open_questions") or []}
+    feats = ((ctx or {}).get("sweep") or {}).get("features") or {}
+    out = {m: [] for m in MODES}
+    for h in hyps:
+        t, st, obs = h.get("test") or {}, h.get("status"), (h.get("result") or {}).get("observed") or {}
+        b = by.get(h.get("belief")) or {}
+        if st == "untestable":
+            out["untestable"].append(h["id"])
+        if (h.get("confrontation") or {}).get("post_hoc"):
+            out["post_hoc"].append(h["id"])
+        if isinstance(obs, dict) and obs.get("marginal_only"):
+            out["conditional_not_settled"].append(h["id"])
+        if st == "inconclusive" and isinstance(obs, dict) and ("usable points" in str(obs.get("reason") or "") or
+                                                               "usable points" in str(obs.get("why") or "")):
+            out["too_few_points"].append(h["id"])
+        k = t.get("kind")
+        lenient = (k == "effect_band" and (t["band"][1] - t["band"][0] >= SCORING["lenient_width"] or
+                                           t["min_share"] <= SCORING["lenient_share"])) or \
+            (k == "paired_sign" and t["min_share"] <= SCORING["lenient_share"]) or \
+            (k == "effect_direction" and t.get("direction") == "negligible" and
+             t.get("equivalence", 0) >= SCORING["lenient_equivalence"])
+        if lenient:
+            out["test_too_lenient"].append(h["id"])
+        mg = b.get("magnitude") or {}
+        if k == "effect_band" and mg and mg.get("scale") != "relative_reduction":
+            out["wrong_estimand"].append(h["id"])
+        named = [t.get("feature")] + list(t.get("where") or {}) if k != "plan_share" else []
+        if any((feats.get(n) or {}).get("read_by_engine") is False for n in named if n):
+            out["inert_feature"].append(h["id"])
+        if st == "refuted" and b.get("confidence") == "high":
+            out["high_confidence_refuted"].append(h["id"])
+        if st == "refuted" and f"Q.{h['id']}" not in qs:
+            out["contradiction_without_open_question"].append(h["id"])
+    for b in seed.get("beliefs") or []:
+        if b.get("source_type") == "literature" and not all(
+                YEAR_RE.search(str(e.get("citation") or "")) and LOC_RE.search(str(e.get("location") or ""))
+                for e in b.get("evidence") or []):
+            out["citation_not_verifiable"].append(b["id"])
+    return {m: v for m, v in out.items() if v}
+
+
+def _yaml(p):
+    import yaml
+    try:
+        return yaml.safe_load(open(p)) if os.path.isfile(p) else None
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def score_question(run_dir) -> dict:
+    t = _trial(run_dir)
+    out = {"status": t.get("status", "not_started"), "engine": t.get("engine_ref"),
+           "seed": {k: (t.get("seed") or {}).get(k) for k in ("sessions", "repairs", "usd", "status")}}
+    seed, hy, wm = (_yaml(os.path.join(run_dir, p)) for p in (SEED, "analysis/hypotheses.yaml",
+                                                              "analysis/world_model.yaml"))
+    if not (seed and hy and wm):
+        return out
+    hs = hy["hypotheses"]
+    st = {}
+    for h in hs:
+        st[h["status"]] = st.get(h["status"], 0) + 1
+    by = {b["id"]: b for b in seed["beliefs"]}
+    conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
+    for h in hs:
+        if (h.get("confrontation") or {}).get("post_hoc"):
+            continue
+        c = by[h["belief"]]["confidence"]
+        conf[c][h["status"] if h["status"] in ("supported", "refuted") else "other"] += 1
+    for c in conf.values():
+        n = c["supported"] + c["refuted"]
+        c["share_confirmed"] = round(c["supported"] / n, 3) if n else None
+    qs = {q.get("id"): q for q in wm.get("open_questions") or []}
+    contra = [{"hypothesis": h["id"], "belief": h["belief"], "claim": h.get("claim"),
+               "open_question": (qs.get(f"Q.{h['id']}") or {}).get("question")} for h in hs if h["status"] == "refuted"]
+    conflicts = [{"belief": b["id"], "with": [c.get("belief") for c in b.get("conflicts") or []]}
+                 for b in wm["beliefs"] if b.get("conflicts") and not str(b["id"]).startswith("sim.")]
+    wl = (wm.get("where_to_look") or [None])[0]
+    wb = {b["id"]: b for b in wm["beliefs"]}.get((wl or {}).get("belief")) or {}
+    out.update(hypotheses={"written": len(hs), "testable": sum(h["status"] != "untestable" for h in hs),
+                           "by_status": st, "post_hoc": sum(bool((h.get("confrontation") or {}).get("post_hoc"))
+                                                            for h in hs)},
+               confidence=conf, contradictions=contra, conflicts=conflicts,
+               where_to_look={"top": wl, "decision_relevant": bool(wb.get("decision_relevant"))},
+               failure_modes=failure_modes(hs, seed, wm, t.get("context")),
+               seed_refusals=(t.get("seed") or {}).get("refusals") or [],
+               track_record={k: (wm.get("track_record") or {}).get(k) for k in ("confirmed", "contradicted",
+                                                                                 "inconclusive", "untestable",
+                                                                                 "share_confirmed")})
+    return out
+
+
+def score(trials_root) -> dict:
+    """Per question and overall (module docstring); writes trials/summary.yaml and trials/summary.md."""
+    import yaml
+    runs = os.path.join(trials_root, "runs")
+    ids = sorted(x for x in os.listdir(runs) if os.path.isdir(os.path.join(runs, x))) if os.path.isdir(runs) else []
+    Q = {i: score_question(os.path.join(runs, i)) for i in ids}
+    spend = {}
+    if os.path.isfile(os.path.join(trials_root, "spend.jsonl")):
+        L = SpendLedger(os.path.join(trials_root, "spend.jsonl"), 1e12)      # read only: the cap is not used
+        spend = L.by_question()
+        for i, q in Q.items():
+            q["spend_usd"] = spend.get(i, {"llm_usd": 0.0, "compute_usd": 0.0})
+    tot = {"written": 0, "testable": 0, "post_hoc": 0, "by_status": {}}
+    conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
+    fm, wtl = {}, {"decision_relevant": 0, "questions": 0}
+    for i, q in Q.items():
+        h = q.get("hypotheses")
+        if not h:
+            continue
+        for k in ("written", "testable", "post_hoc"):
+            tot[k] += h[k]
+        for s, n in h["by_status"].items():
+            tot["by_status"][s] = tot["by_status"].get(s, 0) + n
+        for c, v in q["confidence"].items():
+            for k in ("supported", "refuted", "other"):
+                conf[c][k] += v[k]
+        for m, v in q["failure_modes"].items():
+            fm.setdefault(m, {"count": 0, "questions": []})
+            fm[m]["count"] += len(v)
+            fm[m]["questions"].append(i)
+        wtl["questions"] += q["where_to_look"]["top"] is not None
+        wtl["decision_relevant"] += q["where_to_look"]["decision_relevant"]
+    for c in conf.values():
+        n = c["supported"] + c["refuted"]
+        c["share_confirmed"] = round(c["supported"] / n, 3) if n else None
+    statuses = {}
+    for q in Q.values():
+        statuses[q["status"]] = statuses.get(q["status"], 0) + 1
+    S = {"schema": "trials.world_model/0", "producer": "scripts/world_model_trials.py", "written_at": _now(),
+         "scoring": dict(SCORING, note="review heuristics of this scoring, not world-model rules; verdicts are the "
+                                       "build's own"),
+         "overall": {"questions": statuses, "hypotheses": tot, "confidence": conf, "failure_modes": fm,
+                     "where_to_look": wtl,
+                     "spend_usd": {"llm": round(sum(v["llm_usd"] for v in spend.values()), 4),
+                                   "compute": round(sum(v["compute_usd"] for v in spend.values()), 4)}},
+         "questions": Q}
+    _sio().write_nofollow(trials_root, "summary.yaml", yaml.safe_dump(S, sort_keys=False, width=110).encode(),
+                          atomic=True)
+    _sio().write_nofollow(trials_root, "summary.md", summary_md(S).encode(), atomic=True)
+    return S
+
+
+def summary_md(S) -> str:
+    o = S["overall"]
+    L = ["# World-model trials: summary", "",
+         f"Questions by status: {', '.join(f'{k} {v}' for k, v in sorted(o['questions'].items()))}. "
+         f"Spend: LLM ${o['spend_usd']['llm']:.2f}, compute ${o['spend_usd']['compute']:.2f}.", "",
+         "Verdicts are the world model build's own (toolkit/analysis/world_model.py). Post hoc means not anchored "
+         "in remote git before the evidence existed; post-hoc results are not in the confirmation shares.", "",
+         "## Per question", "",
+         "| Question | Engine | Status | Written | Testable | Supported | Refuted | Inconclusive | Untestable | "
+         "Post hoc | Repairs | Spend (USD) |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for i, q in S["questions"].items():
+        h = q.get("hypotheses") or {}
+        b = h.get("by_status") or {}
+        sp = q.get("spend_usd") or {}
+        L.append(f"| {i} | {str(q.get('engine') or '').split(':')[-1]} | {q['status']} | {h.get('written', '')} | "
+                 f"{h.get('testable', '')} | {b.get('supported', 0) if h else ''} | {b.get('refuted', 0) if h else ''}"
+                 f" | {b.get('inconclusive', 0) if h else ''} | {b.get('untestable', 0) if h else ''} | "
+                 f"{h.get('post_hoc', '')} | {(q.get('seed') or {}).get('repairs') or 0} | "
+                 f"{sp.get('llm_usd', 0) + sp.get('compute_usd', 0):.2f} |")
+    L += ["", "## Confirmation by the seed's confidence (pre-registered only)", "",
+          "| Confidence | Supported | Refuted | Other | Share confirmed |", "|---|---|---|---|---|"]
+    for c, v in o["confidence"].items():
+        L.append(f"| {c} | {v['supported']} | {v['refuted']} | {v['other']} | "
+                 f"{'' if v['share_confirmed'] is None else v['share_confirmed']} |")
+    L += ["", "## Failure modes", "", "| Mode | Count | Questions |", "|---|---|---|"]
+    for m, v in sorted(o["failure_modes"].items(), key=lambda kv: -kv[1]["count"]):
+        L.append(f"| {m} | {v['count']} | {', '.join(v['questions'])} |")
+    w = o["where_to_look"]
+    L += ["", f"where_to_look's top item concerns a belief the seed marked decision-relevant in "
+              f"{w['decision_relevant']} of {w['questions']} questions.", "", "## Contradictions", ""]
+    for i, q in S["questions"].items():
+        for c in q.get("contradictions") or []:
+            L.append(f"- {i} {c['hypothesis']} ({c['claim']}): open question recorded: "
+                     f"{'yes' if c['open_question'] else 'no'}")
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- CLI
+def sdk_seed_fn():
+    """The real seed task: one bounded SDK session per call (agents/v2_sdk_tasks.py), capped at the reserved USD."""
+    from agents.v2_sdk_tasks import SdkTasks
+
+    def fn(run_dir, ctx, feedback, cap_usd):
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd)
+        t.set_allowance(cap_usd)
+        return t.seed_world_model(ctx, feedback)
+    return fn
+
+
+def check_templates(qs, out_root, max_engine_runs=50) -> dict:
+    """Each template as the run will use it (prepare, the engine step, world_model.load_sweep), with no LLM call and
+    no push: a question that fails here fails before any spend."""
+    from toolkit.analysis import world_model as W
+    out, stamp = {}, dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+    for q in qs:
+        rd = os.path.join(out_root, f"{q['id']}-{stamp}")          # a fresh directory per check: nothing is removed
+        try:
+            ctx = prepare(q, rd, REPO, max_engine_runs)
+            e = engine_step(q, rd, max_engine_runs)
+            sw, _ = W.load_sweep(rd, "current", q.get("shadow_price"), use_plan=False)
+            out[q["id"]] = {"ok": True, "jobs": e["jobs"], "wall_s": e["wall_s"], "features": list(ctx["sweep"][
+                "features"]), "packages": list(sw.packages)}
+        except Exception as e:  # noqa: BLE001
+            out[q["id"]] = {"ok": False, "error": f"{type(e).__name__}: {e}"[:400]}
+        print(json.dumps({q["id"]: out[q["id"]]}, default=str))
+    return out
+
+
+def main(argv=None) -> int:
+    import argparse
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--self-test"]:
+        return _self_test()
+    ap = argparse.ArgumentParser(prog="world_model_trials.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("run", "check-templates", "score"):
+        p = sub.add_parser(name)
+        p.add_argument("--trials-dir", default=os.path.join(REPO, "trials"))
+        if name != "score":
+            p.add_argument("--questions", default=QUESTIONS)
+            p.add_argument("--only", help="comma-separated question ids")
+            p.add_argument("--batch", help="only questions with this batch value")
+            p.add_argument("--limit", type=int)
+            p.add_argument("--max-engine-runs", type=int, default=50)
+    r = sub.choices["run"]
+    r.add_argument("--total-cap-usd", type=float, required=True, help="the cap on cumulative spend in the ledger")
+    r.add_argument("--task-cap-usd", type=float, default=2.0)
+    r.add_argument("--llm-concurrency", type=int, default=5)
+    r.add_argument("--push", action="store_true", help="anchor registrations on origin/wm-trials (else post hoc)")
+    a = ap.parse_args(argv)
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    if a.cmd == "score":
+        S = score(a.trials_dir)
+        print(json.dumps(S["overall"], indent=1, default=str))
+        return 0
+    qs = select(load_questions(a.questions), set(a.only.split(",")) if a.only else None, a.batch, a.limit)
+    if a.cmd == "check-templates":
+        res = check_templates(qs, os.path.join(a.trials_dir, "checks"), a.max_engine_runs)
+        return 0 if all(v["ok"] for v in res.values()) else 1
+    led = SpendLedger(os.path.join(a.trials_dir, "spend.jsonl"), a.total_cap_usd)
+    anchor = GitAnchor(REPO, os.path.join(a.trials_dir, ".wm-trials"),
+                       trials_rel=os.path.relpath(os.path.realpath(a.trials_dir), os.path.realpath(REPO))) \
+        if a.push else None
+    res = run_trials(qs, a.trials_dir, REPO, sdk_seed_fn(), led, anchor, a.task_cap_usd, a.llm_concurrency, 2,
+                     a.max_engine_runs)
+    for i, t in res.items():
+        print(json.dumps({"id": i, "status": t.get("status"), "spend_usd": t.get("spend_usd"),
+                          "error": t.get("error")}, default=str))
+    print(json.dumps({"committed_usd": round(led.committed(), 4), "total_cap_usd": led.cap}))
+    S = score(a.trials_dir)
+    print(json.dumps(S["overall"]["hypotheses"], default=str))
+    return 0 if all(t.get("status") == "complete" for t in res.values()) else 1
 
 
 # ---------------------------------------------------------------- self-test
@@ -266,7 +1110,8 @@ def _self_test() -> int:
             ok(sorted(tree) == ["trials/runs/toy0/analysis/hypotheses_registry.jsonl",
                                 "trials/runs/toy0/analysis/world_model_seed.yaml"],
                f"WT3b the wm-trials branch holds the ledger and the seed only, never run data: {tree}")
-            ok(_git("status", "--porcelain", cwd=repo) == "" and
+            untracked = [x[3:] for x in _git("status", "--porcelain", cwd=repo).splitlines()]
+            ok(untracked == ["data/"] and _git("status", "--porcelain", "--untracked-files=no", cwd=repo) == "" and
                _git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "main",
                "WT3c the main working tree is untouched (the wm-trials branch lives in its own worktree)")
             ctx = calls[0]["ctx"]
@@ -397,6 +1242,14 @@ def _self_test() -> int:
            f"WT8d the failure-mode taxonomy classifies planted outcomes: {fm}")
     tryit("WT8 scoring", wt8)
 
+    def wt9():
+        import pipeline as P
+        src = open(os.path.abspath(__file__)).read()
+        src = src[:src.index("# ---------------------------------------------------------------- self-test")]
+        ok(not P.domain_terms(src), f"WT9 the driver names no disease, place or intervention (pipeline.domain_terms, "
+                                    f"the repository's own check): {P.domain_terms(src)}")
+    tryit("WT9 disease-agnostic", wt9)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -404,11 +1257,5 @@ def _self_test() -> int:
     return 0
 
 
-def failure_modes(*a, **k):
-    raise NotImplementedError
-
-
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--self-test"]:
-        sys.exit(_self_test())
-    sys.exit(2)
+    sys.exit(main())
