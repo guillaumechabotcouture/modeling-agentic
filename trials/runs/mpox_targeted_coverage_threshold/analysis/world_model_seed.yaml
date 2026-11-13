@@ -1,0 +1,326 @@
+beliefs:
+- id: B1
+  mechanism: Higher coverage in the high-contact group lowers Reff in the group and shrinks the final size; the
+    reduction is steeper than linear near the herd-immunity threshold
+  about:
+    package: vax
+    feature: reach:vax (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5 (critical vaccination proportion 1 - 1/R0); page not checked
+  - citation: Endo A, Murayama H, Abbott S, et al. Heavy-tailed sexual contact networks and monkeypox epidemiology
+      in the global outbreak, 2022. Science 2022
+    location: Fig. 3 / main text on targeting the high-activity group; location approximate
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: At high reach (>= ~0.7) and two-dose effectiveness of roughly 66-86%, effective protection (~0.45-0.75
+    of susceptibles) exceeds the group's herd threshold for group R0 x s0 up to ~2-3, so most of the epidemic is
+    averted
+  about:
+    package: vax
+  direction: reduces
+  magnitude:
+    band:
+    - 0.75
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: reach:vax (calibration scale)
+    range:
+    - 0.7
+    - 0.8962
+  source_type: literature
+  evidence:
+  - citation: Deputy NP, Deckert J, Chard AN, et al. Vaccine Effectiveness of JYNNEOS against Mpox Disease in the
+      United States. N Engl J Med 2023
+    location: Table 2 (two-dose adjusted VE about 66%)
+  - citation: 'Dalton AF, Diallo AO, Chard AN, et al. Estimated Effectiveness of JYNNEOS Vaccine in Preventing Mpox:
+      A Multijurisdictional Case-Control Study - United States, August 19, 2022-March 31, 2023. MMWR Morb Mortal
+      Wkly Rep 2023'
+    location: Table 2 (two-dose VE about 86%)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: At low reach (0.2-0.35) effective protection (~0.13-0.3) stays below the herd threshold in most supercritical
+    cities, so the epidemic still runs and only a partial share is averted (overshoot makes it more than proportional
+    but far from elimination)
+  about:
+    package: vax
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.65
+    scale: relative_reduction
+  conditions:
+  - feature: reach:vax (calibration scale)
+    range:
+    - 0.2061
+    - 0.35
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, main text; worked numbers are mine (Reff 1.5-2.4 after 20-25% protection)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: In supercritical cities, more remaining susceptibility in the group (higher s0_high) raises Reff and
+    the herd threshold, so a given coverage averts a smaller share of the epidemic
+  about:
+    package: vax
+    feature: s0_high
+  direction: decreases
+  conditions:
+  - feature: s0_high
+    range:
+    - 0.5
+    - 0.8859
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'Where the group is well above threshold (high s0_high), infections averted per resident (~1e-3 to
+    1e-2: high_share 1.4-4% x attack rate x reduction) dwarf the shadow-price cost of the campaign (4e-5 x US$0.80
+    = 3.2e-5 infections per resident), so vaccinating beats none'
+  about:
+    pair:
+    - vax
+    - none
+    feature: s0_high
+  direction: increases
+  conditions:
+  - feature: s0_high
+    range:
+    - 0.6
+    - 0.8859
+  source_type: literature
+  evidence:
+  - citation: Endo A, Murayama H, Abbott S, et al. Heavy-tailed sexual contact networks and monkeypox epidemiology
+      in the global outbreak, 2022. Science 2022
+    location: main text on attack rates concentrated in the high-activity group; location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: Where past immunity has left the group sub-critical (R0 x s0_high < 1), seeded chains die out on their
+    own; the campaign averts only a few infections per resident, below its shadow-price cost, so the choice flips
+    to none at a low s0_high (located roughly at 1/R0 of the group, i.e. s0 ~0.35-0.6 for group R0 ~1.7-3)
+  about:
+    pair:
+    - vax
+    - none
+    feature: s0_high
+  direction: flips
+  conditions:
+  - feature: s0_high
+    range:
+    - 0.3101
+    - 0.6
+  source_type: literature
+  evidence:
+  - citation: Endo A, Murayama H, Abbott S, et al. Heavy-tailed sexual contact networks and monkeypox epidemiology
+      in the global outbreak, 2022. Science 2022
+    location: R0 estimates for the sexual network; values and location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: In a final-size-to-extinction run, the initial seed share (1e-6 to 8e-5) barely changes a supercritical
+    epidemic's final size, so the relative reduction does not depend on it
+  about:
+    package: vax
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size with vanishing initial infected fraction, main text
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: Relative reduction is set inside the group and does not depend on the group's size; group size (high_share)
+    instead scales the absolute infections averted per dollar, since cost is per city resident, so it ranks cities
+  about:
+    package: vax
+    feature: high_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Endo A, Murayama H, Abbott S, et al. Heavy-tailed sexual contact networks and monkeypox epidemiology
+      in the global outbreak, 2022. Science 2022
+    location: targeting argument, main text; location approximate
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is the group R0 (r0_target) in each city, and so where is its herd threshold 1 - 1/(R0 x s0_high)?
+    This locates both the coverage that stops transmission and the sub-critical cities where a campaign is wasted.
+  beliefs:
+  - B2
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Which two-dose efficacy does the engine use (trial/case-control VE ranges from ~66% to ~86%), and does
+    it protect only susceptibles reached or waste doses on the already immune?
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q3
+  question: Is the shadow price 4e-5 per USD in infections (as labelled) or in DALYs? In DALYs the bar is ~25x higher
+    in infection terms (about US$40 per infection averted) and vaccination could lose in many cities.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does the budget bind (US$15M buys ~18.75M residents)? If not, the rule is simply to vaccinate every
+    supercritical city.
+  beliefs:
+  - B5
+  - B8
+  decision_relevant: true
+- id: Q5
+  question: How much does mixing with the low-contact rest of the population add to group R0 and to infections outside
+    the group?
+  beliefs:
+  - B8
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Relative reduction from vax rises with reach in the group
+  test:
+    kind: effect_direction
+    package: vax
+    feature: reach:vax (calibration scale)
+    direction: increases
+- id: H2
+  belief: B2
+  claim: At reach >= 0.7, at least 70% of usable points have a relative reduction of 0.75-1.0; refuted if 30% or
+    fewer do
+  test:
+    kind: effect_band
+    package: vax
+    band:
+    - 0.75
+    - 1.0
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: At reach 0.2-0.35, at least 60% of usable points have a partial relative reduction of 0.1-0.65; refuted
+    if 40% or fewer do
+  test:
+    kind: effect_band
+    package: vax
+    band:
+    - 0.1
+    - 0.65
+    min_share: 0.6
+- id: H4
+  belief: B4
+  claim: Among supercritical cities (s0_high >= 0.5), relative reduction falls as s0_high rises
+  test:
+    kind: effect_direction
+    package: vax
+    feature: s0_high
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Where s0_high is 0.6-0.886, vax beats none on net benefit at the shadow price at >= 85% of usable points
+  test:
+    kind: paired_sign
+    a: vax
+    b: none
+    feature: s0_high
+    range:
+    - 0.6
+    - 0.8859
+    sign: positive
+    min_share: 0.85
+- id: H6
+  belief: B6
+  claim: The vax/none choice flips along s0_high inside 0.31-0.6 (none wins in sub-critical cities)
+  test:
+    kind: flip_in
+    a: vax
+    b: none
+    feature: s0_high
+    range:
+    - 0.3101
+    - 0.6
+- id: H7
+  belief: B7
+  claim: Relative reduction is insensitive to seed_share (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: vax
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.2
+- id: H8
+  belief: B8
+  claim: Relative reduction is insensitive to high_share (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: vax
+    feature: high_share
+    direction: negligible
+    equivalence: 0.2
