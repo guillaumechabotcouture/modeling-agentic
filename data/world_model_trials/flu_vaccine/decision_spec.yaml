@@ -1,0 +1,271 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): the population, numbers and files below are synthetic, generated
+  for this test; they do not describe a real place. A health ministry will receive 770,000 influenza vaccine doses
+  (11 blocks of 70,000) before next season for a population of 4.6 million in five age groups (0-4, 5-17, 18-49,
+  50-64, 65+). Allocate whole blocks to age groups, with at most 70% of any group vaccinated, to minimise expected
+  influenza hospitalisations next season. Assume next season''s transmissibility and pre-season susceptibility equal
+  last season''s, vaccination before the season with all-or-nothing protection against infection at the effectiveness
+  given, and an age-structured SIR epidemic with the contact matrix given (mean daily contacts of a person in the
+  row group with people in the column group). Input files: data/evals/flu_vaccine/population.csv, data/evals/flu_vaccine/contact_matrix.csv,
+  data/evals/flu_vaccine/serosurvey_last_season.csv (pre-season susceptible titres and paired seroconversion by
+  age group, no vaccination last season), data/evals/flu_vaccine/hospitalisations_last_season.csv, data/evals/flu_vaccine/vaccine_effectiveness.csv.
+  Report hospitalisations averted against no vaccination, with a 95% uncertainty interval, and state the decision
+  rule. Deliverables: allocation_optimized.csv in the run directory with columns age_group, doses (a multiple of
+  70,000) and hospitalisations_averted; and the uncertainty analysis must report the total as an output named hospitalisations_averted.'
+decision_maker: health ministry immunisation programme (synthetic evaluation question)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - 0-4
+    - 5-17
+    - 18-49
+    - 50-64
+    - 65+
+    structure: age_groups_contact_matrix
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 1.5
+        infectious_days: 3.0
+    components:
+      vax_children:
+        kind: campaign
+        targets:
+        - 0-4
+        - 5-17
+        reach: 0.7
+      vax_older:
+        kind: campaign
+        targets:
+        - 50-64
+        - 65+
+        reach: 0.5
+      vax_65plus:
+        kind: campaign
+        targets:
+        - 65+
+        reach: 0.7
+    outcomes:
+    - hosp
+    tol: 1.0e-10
+horizon:
+  start: 0
+  stop: 365
+decision_units:
+  csv: population.csv
+  id: unit
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    ratio:hosp:
+      column: ratio_hosp
+      split: ' '
+    contact:
+      value:
+      - - 1.793
+        - 1.26325
+        - 2.45519
+        - 0.56031
+        - 0.43293
+      - - 0.63163
+        - 7.335
+        - 3.05625
+        - 0.87107
+        - 0.35404
+      - - 0.45681
+        - 1.13717
+        - 4.564
+        - 1.19789
+        - 0.59609
+      - - 0.24906
+        - 0.77425
+        - 2.86155
+        - 1.793
+        - 0.88974
+      - - 0.23089
+        - 0.37759
+        - 1.70881
+        - 1.06765
+        - 1.304
+      source: data/evals/flu_vaccine/contact_matrix.csv x transmission_scale (see note)
+    seed:
+      value: 1.0e-06
+      source: seasonal introduction (assumption)
+    intro:
+      value: 5-17
+      source: school-age introduction (assumption)
+  note: 'contact is the given matrix times transmission_scale (fitted outside the harness by the template generator
+    to last season''s seroconversion through the final-size relation, q = 0.2); its uncertainty is not swept: a
+    declared limitation'
+  defaults_accepted:
+    always_immune: none declared
+    always_susceptible: none declared
+    reach:vax_older: the configured reach (doses / targeted people)
+    reach:vax_65plus: the configured reach (at most 70% of a group, question text)
+options:
+  populations:
+    total: pop
+    children: pop_children
+    older: pop_older
+    over65: pop_65p
+  components:
+    vax_children:
+      group: allocation
+      eligible: children
+    vax_older:
+      group: allocation
+      eligible: older
+    vax_65plus:
+      group: allocation
+      eligible: over65
+  packages:
+    generate: true
+  engine_map:
+    vax_children:
+      vax_children: 1
+    vax_older:
+      vax_older: 1
+    vax_65plus:
+      vax_65plus: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: vax_children_doses
+    component: vax_children
+    value: 0.7
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - doses
+    note: 'one unit of cost = one dose: reach x eligible people'
+  - id: vax_older_doses
+    component: vax_older
+    value: 0.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - doses
+    note: 'one unit of cost = one dose: reach x eligible people'
+  - id: vax_65plus_doses
+    component: vax_65plus
+    value: 0.7
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - doses
+    note: 'one unit of cost = one dose: reach x eligible people'
+objective:
+  outcome: hosp
+  sense: avert
+  horizon:
+  - 0
+  - 365
+  discounting: none
+constraints:
+  envelope_usd: 800000
+comparator:
+  package: none
+  text: no vaccination (as last season)
+outcomes_reported:
+- hosp
+- infections
+engine_parameters:
+  efficacy:vax_children:
+    value: 0.597
+    range:
+    - 0.497
+    - 0.697
+    dist: triangular
+    basis: setting_data
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
+    reason: all-or-nothing protection against infection at the given effectiveness
+  efficacy:vax_older:
+    value: 0.444
+    range:
+    - 0.344
+    - 0.544
+    dist: triangular
+    basis: setting_data
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
+    reason: all-or-nothing protection against infection at the given effectiveness
+  efficacy:vax_65plus:
+    value: 0.4
+    range:
+    - 0.3
+    - 0.5
+    dist: triangular
+    basis: setting_data
+    source: data/evals/flu_vaccine/vaccine_effectiveness.csv, population-weighted over the targeted groups; range
+      +/- 0.1 assumed
+    reason: all-or-nothing protection against infection at the given effectiveness
+calibration:
+  method: emulator_inversion
+  attribute: reach:vax_children
+  scale: linear
+  range:
+  - 0.4
+  - 0.7
+  target_column: transmission_scale
+  window:
+  - 0
+  - 365
+  metric: attack_rate
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: the swept attribute is the share of children the school-age programme reaches (achieved coverage, at most
+    70%); it is a scenario axis, not fitted to the target column
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: doses, not money
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 12
+    holdout_share: 0.0
+    seed: 5
+    features: []
+  stability:
+    holdout_group: unit
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: hospitalisations_averted
+  headline:
+    name: hospitalisations_averted
+    outcome: hosp

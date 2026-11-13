@@ -1,0 +1,217 @@
+schema_version: 1
+question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme
+  has US$1.2 million for a preventive vaccination campaign in 2026 across 10 districts with routine first-dose coverage
+  between 55% and 92% and no second dose. For each district choose one option: none; C_9to59m (children aged 9-59
+  months); D_9mto14y (children aged 9 months to 14 years). A campaign reaches 85% of the targeted children and protects
+  about 90% of the susceptible children it reaches (all-or-nothing). Cost: US$1.50 per targeted child plus US$18,000
+  per district campaign. Infants under 9 months are susceptible, adults immune; older children carry immunity gaps
+  where coverage has been low. Assume one importation per district seeds an outbreak in a homogeneously mixing population,
+  R0 between 10 and 16. Which age range should each district target to maximise measles infections averted, and
+  what decides it?'
+decision_maker: measles programme manager (synthetic trial question)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - u9m
+    - m9_59
+    - y5_14
+    - a15p
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    generation_interval:
+    - 0.1
+    - 0.55
+    - 0.3
+    - 0.05
+    transmission: q
+    components:
+      C_9to59m:
+        kind: campaign
+        targets:
+        - m9_59
+        reach: 0.85
+      D_9mto14y:
+        kind: campaign
+        targets:
+        - m9_59
+        - y5_14
+        reach: 0.85
+    tol: 1.0e-09
+horizon:
+  start: 0
+  stop: 3650
+decision_units:
+  csv: districts.csv
+  id: district
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    seed:
+      value: 1.0e-06
+      source: one importation per district (question text)
+    intro:
+      value: m9_59
+      source: importation into the youngest reachable band (assumption)
+  defaults_accepted:
+    always_immune: adults immune through s0 = 0 (question text)
+    always_susceptible: infants susceptible through s0 = 1 (question text)
+    reach:C_9to59m: the configured 85% reach (question text)
+    reach:D_9mto14y: the configured 85% reach (question text)
+options:
+  populations:
+    total: pop
+    children_9_59m: pop_9_59m
+    children_9m_14y: pop_9m_14y
+  components:
+    C_9to59m:
+      group: campaign
+      eligible: children_9_59m
+    D_9mto14y:
+      group: campaign
+      eligible: children_9m_14y
+  packages:
+    generate: true
+  engine_map:
+    C_9to59m:
+      C_9to59m: 1
+    D_9mto14y:
+      D_9mto14y: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: C_9to59m_child
+    component: C_9to59m
+    value: 1.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - vaccine
+    - delivery
+  - id: D_9mto14y_child
+    component: D_9mto14y
+    value: 1.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - vaccine
+    - delivery
+  - id: C_9to59m_district
+    component: C_9to59m
+    value: 18000
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_unit
+    includes:
+    - campaign_fixed
+  - id: D_9mto14y_district
+    component: D_9mto14y
+    value: 18000
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_unit
+    includes:
+    - campaign_fixed
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 3650
+  discounting: none
+constraints:
+  envelope_usd: 1200000
+comparator:
+  package: none
+  text: no campaign; routine first dose only
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:C_9to59m:
+    value: 0.9
+    range:
+    - 0.85
+    - 0.95
+    dist: triangular
+    basis: setting_data
+    source: 'question text: protects about 90% of the susceptible children reached'
+    reason: the stated protection; the range (assumed) lets the sweep test how much it matters
+  efficacy:D_9mto14y:
+    value: 0.9
+    range:
+    - 0.85
+    - 0.95
+    dist: triangular
+    basis: setting_data
+    source: 'question text: protects about 90% of the susceptible children reached'
+    reason: the stated protection; the range (assumed) lets the sweep test how much it matters
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 50.0
+  - 80.0
+  target_column: r0_target
+  window:
+  - 0
+  - 3650
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); R0 = q x contact_rate under
+    homogeneous mixing, so contact_rate over [50, 80] spans R0 10-16
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 16
+    holdout_share: 0.0
+    seed: 5
+    features:
+    - mcv1
+    - susc_9_59m
+    - susc_5_14y
+    - mean_susceptible
+  stability:
+    holdout_group: district
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: district
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections
