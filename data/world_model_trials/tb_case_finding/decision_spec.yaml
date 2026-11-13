@@ -1,14 +1,11 @@
-# World-model trial template (tb_case_finding): generated deterministically; see the questions file for its
-# inputs and derivation. Test input, not signed by the owner.
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme has
-  US$6 million for 2026-2028 case-finding packages in 12 districts. For each district choose one package: none;
-  CACF (community-wide active case finding: annual door-to-door screening with sputum Xpert for everyone who can
-  produce sputum, three rounds); HHC (enhanced household-contact investigation of every notified case); or CACF+HHC.
-  Costs: CACF US$4.00 per resident per round; HHC US$0.40 per resident per year. Input file: units.csv (population,
-  prevalence of bacteriologically confirmed pulmonary TB from a 2024 synthetic survey, HIV prevalence among adults).
-  Choose the packages that maximise the reduction in prevalent bacteriologically confirmed TB by the end of 2028
-  within the budget, report it with a 95% uncertainty interval, and state the decision rule.'
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme has US$12 million
+  for 2026-2028 case-finding packages in 24 districts. For each district choose one package: none; CACF (community-wide active
+  case finding: annual door-to-door screening with sputum Xpert for everyone who can produce sputum, three rounds); HHC (enhanced
+  household-contact investigation of every notified case); or CACF+HHC. Costs: CACF US$4.00 per resident per round; HHC US$0.40
+  per resident per year. Input file: units.csv (population, prevalence of bacteriologically confirmed pulmonary TB from a
+  2024 synthetic survey, HIV prevalence among adults). Choose the packages that maximise the reduction in prevalent bacteriologically
+  confirmed TB by the end of 2028 within the budget, report it with a 95% uncertainty interval, and state the decision rule.'
 decision_maker: programme manager (world-model trial; template, not owner-signed)
 decision_date: 2026
 engine:
@@ -34,8 +31,8 @@ engine:
           - 0.78
           dist: triangular
           measure: rate_ratio
-          source: 'ACT3: Marks et al. 2019, N Engl J Med 381:1347 (community-wide screening, Vietnam; prevalence
-            ratio 0.56, 0.40-0.78, after three annual rounds)'
+          source: 'ACT3: Marks et al. 2019, N Engl J Med 381:1347 (community-wide screening, Vietnam; prevalence ratio 0.56,
+            0.40-0.78, after three annual rounds)'
           verified: false
           note: a prevalence ratio applied to prevalence (the outcome is prevalence)
       hhc:
@@ -46,8 +43,7 @@ engine:
           - 1.04
           dist: triangular
           measure: rate_ratio
-          source: 'ZAMSTAR: Ayles et al. 2013, Lancet 382:1183 (household intervention; adjusted prevalence ratio
-            0.82, 0.64-1.04)'
+          source: 'ZAMSTAR: Ayles et al. 2013, Lancet 382:1183 (household intervention; adjusted prevalence ratio 0.82, 0.64-1.04)'
           verified: false
           note: a prevalence ratio applied to prevalence
     combination:
@@ -111,7 +107,7 @@ objective:
   - 2027.0
   discounting: none
 constraints:
-  envelope_usd: 6000000
+  envelope_usd: 12000000
 comparator:
   package: none
   text: no package in the decision window
@@ -127,8 +123,8 @@ calibration:
   window:
   - 0.0
   - 0.0
-  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
-    is an attribute the engine does not read (inert by construction)
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
 uncertainty:
   draws: 16
   seed: 3
@@ -146,12 +142,19 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 12
+    points: 100
     holdout_share: 0.0
     seed: 7
     features:
     - prev
     - hiv
+    independent_features:
+      features:
+      - prev
+      - hiv
+      basis: generate_units.py draws prev log-uniform and hiv uniform, independently of each other and of pop (24 synthetic
+        districts)
+      generator: generate_units.py
   stability:
     holdout_group: region
   sensitivity:

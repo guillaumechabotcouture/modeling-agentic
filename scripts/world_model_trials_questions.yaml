@@ -256,3 +256,650 @@ questions:
   rerun_reason: the tb_acf smoke (2026-11-13) let the seed read the spec's effect priors, so its band tests confirmed
     the engine's own inputs; rerun with the spec's values, the engine's effect values and priors and the input data
     values withheld from the seed task, and circular tests classified
+- id: malaria_alloc_r3
+  batch: 1r3
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
+    for this test; none describes a real place. A malaria programme must choose one intervention package for each
+    of 10 districts for 2026-2028, within a budget of US$17.0 million. Packages: none; ITN (one mass campaign of
+    insecticide-treated nets); IRS (annual indoor residual spraying); ITN+IRS; SMC (seasonal malaria chemoprevention,
+    only in districts marked SMC-eligible); ITN+SMC; ITN+IRS+SMC. The nets from the 2022 campaign have expired,
+    so the counterfactual for 2026-2028 is no ITN, IRS or SMC anywhere. Input files: data/evals/malaria_alloc/districts.csv
+    (population and SMC eligibility), data/evals/malaria_alloc/programme_history.csv (recorded clinical cases by
+    district and year, 2015-2024, under the package each district had that year; assume complete recording, stable
+    populations and no trend other than the packages), data/evals/malaria_alloc/unit_costs.csv (cost per person
+    covered over the whole plan). Because the setting is synthetic, estimate the effect of each package from the
+    programme history; published effect sizes may be used as priors only. Choose the allocation that maximises clinical
+    cases averted over 2026-2028 within the budget, report the total cases averted with a 95% uncertainty interval,
+    and state the decision rule. Deliverables: allocation_optimized.csv in the run directory with columns district,
+    package (exactly one of the package names above) and cases_averted; and the uncertainty analysis must report
+    the total as an output named total_cases_averted.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/malaria_alloc
+  shadow_price: 0.05
+  shadow_price_basis: about 1 / US$20 per clinical case averted (ITN alone is about US$12 per case in the sweep);
+    not a budget dual
+  inputs: 'derived from data/evals/malaria_alloc public inputs: population and SMC eligibility from districts.csv;
+    baseline = mean recorded cases per person in the district''s ''none'' years of programme_history.csv; unit costs
+    from unit_costs.csv; packages restricted to 5 of the question''s 7 (none, itn, irs, itn+irs, itn+smc) to keep
+    10 design points within 50 engine runs'
+  rerun_of: malaria_alloc
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: measles_campaign_r3
+  batch: 1r3
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
+    for this test; none describes a real place. A measles programme has US$850,000 for a catch-up vaccination campaign
+    in early 2026 across 12 districts. For each district choose one option: none; A_1to4 (all children aged 1-4
+    years); B_1to9 (all children aged 1-9 years). A campaign reaches 85% of targeted children and seroconverts 93%
+    of the susceptible children it reaches. Cost: US$1.20 per targeted child plus US$22,000 per district campaign;
+    each single-year birth cohort is 3.0% of a district''s population. Routine MCV1 seroconverts about 85% of the
+    children it reaches and MCV2 about 90% of those still susceptible. Assume everyone aged 15 years or older is
+    immune and children under 1 year are susceptible, and that in each district one measles importation in the coming
+    period starts an outbreak whose size follows the final-size relation of a homogeneous-mixing SIR model, with
+    R0 between 12 and 18 (uniform). Input files: data/evals/measles_campaign/districts.csv (2026 population), data/evals/measles_campaign/routine_coverage_admin.csv
+    (administrative MCV1 and MCV2 coverage by birth cohort), data/evals/measles_campaign/serosurvey_2025.csv (a
+    2025 serosurvey by age band; ages are as in 2025). Choose the options that maximise expected measles cases averted,
+    report the total with a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv
+    in the run directory with columns district, package (none, A_1to4 or B_1to9) and cases_averted; and the uncertainty
+    analysis must report the total as an output named total_cases_averted.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/measles_campaign
+  shadow_price: 0.02
+  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed willingness to pay)
+  inputs: 'derived from data/evals/measles_campaign public inputs: districts.csv populations; group sizes from the
+    stated 3% birth cohort; s0 = 1 - 2025 serosurvey seropositive share by band (under 1 = 1, 15+ = 0); transmission
+    swept through contact_rate (R0 = q x contact_rate, 12-18)'
+  rerun_of: measles_campaign
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: tb_acf_r3
+  batch: 1r3
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
+    for this test; none describes a real place. A TB programme has US$1.1 million for one round of active case finding
+    among high-risk adults in 10 districts in 2026. For each district choose one screening algorithm: none; SYM
+    (symptom screening, with Xpert MTB/RIF Ultra for people with presumptive TB); CXR (chest X-ray for everyone
+    screened, with Xpert if the X-ray is abnormal). A round reaches 70% of each district''s target population, and
+    costs are per person screened. Input files: data/evals/tb_acf/districts.csv (target population), data/evals/tb_acf/acf_records_2022_2025.csv
+    (people screened and bacteriologically confirmed cases detected, by district, year and algorithm; assume the
+    prevalence of undiagnosed TB in the target population was stable over 2022-2025 and is unchanged in 2026), data/evals/tb_acf/algorithm_costs.csv,
+    data/evals/tb_acf/national_reference_yields.csv. Choose the algorithms that maximise bacteriologically confirmed
+    TB cases detected within the budget, report the total with a 95% uncertainty interval, and state the decision
+    rule. Deliverables: allocation_optimized.csv in the run directory with columns district, package (none, SYM
+    or CXR) and cases_detected; and the uncertainty analysis must report the total as an output named total_cases_detected.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/tb_acf
+  shadow_price: 0.001
+  shadow_price_basis: about 1 / US$1,000 per additional case detected (SYM about US$930, CXR about US$1,400 per
+    case in the sweep)
+  inputs: 'derived from data/evals/tb_acf public inputs: target population from districts.csv; undiagnosed prevalence
+    = mean CXR yield per person screened / an assumed CXR algorithm sensitivity of 0.83; costs per person screened
+    from algorithm_costs.csv at 70% reach; outcome = prevalent cases left undetected'
+  rerun_of: tb_acf_r2
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: flu_vaccine_r3
+  batch: 1r3
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): the population, numbers and files below are synthetic,
+    generated for this test; they do not describe a real place. A health ministry will receive 770,000 influenza
+    vaccine doses (11 blocks of 70,000) before next season for a population of 4.6 million in five age groups (0-4,
+    5-17, 18-49, 50-64, 65+). Allocate whole blocks to age groups, with at most 70% of any group vaccinated, to
+    minimise expected influenza hospitalisations next season. Assume next season''s transmissibility and pre-season
+    susceptibility equal last season''s, vaccination before the season with all-or-nothing protection against infection
+    at the effectiveness given, and an age-structured SIR epidemic with the contact matrix given (mean daily contacts
+    of a person in the row group with people in the column group). Input files: data/evals/flu_vaccine/population.csv,
+    data/evals/flu_vaccine/contact_matrix.csv, data/evals/flu_vaccine/serosurvey_last_season.csv (pre-season susceptible
+    titres and paired seroconversion by age group, no vaccination last season), data/evals/flu_vaccine/hospitalisations_last_season.csv,
+    data/evals/flu_vaccine/vaccine_effectiveness.csv. Report hospitalisations averted against no vaccination, with
+    a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run directory
+    with columns age_group, doses (a multiple of 70,000) and hospitalisations_averted; and the uncertainty analysis
+    must report the total as an output named hospitalisations_averted.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/flu_vaccine
+  shadow_price: 0.001
+  shadow_price_basis: 'cost units are doses: one hospitalisation averted is worth 1,000 doses (assumed)'
+  inputs: 'derived from data/evals/flu_vaccine public inputs: population, susceptible-titre share as s0, hospitalisations
+    / (seroconverted share x population) as ratio:hosp, VE weighted by population over targeted groups; contact
+    matrix x 0.815 fitted outside the harness to last season''s seroconversion (transmission uncertainty not swept);
+    three targeting packages, not whole-block allocations'
+  rerun_of: flu_vaccine
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: dengue_outbreak_r3
+  batch: 1r3
+  eval_question: true
+  question: 'SYNTHETIC TEST QUESTION (evaluation suite): the city, numbers and files below are synthetic, generated
+    for this test; they do not describe a real place. In 2025 Synthetic City (population 1.5 million) had its first
+    DENV-2 outbreak in many years. Input files: data/evals/dengue_outbreak/city.csv, data/evals/dengue_outbreak/weekly_reported_cases_2025.csv,
+    data/evals/dengue_outbreak/generation_interval.csv (the distribution of the time between successive human infections,
+    in weeks). No serosurvey is available, and the fraction of infections that are reported is not known (published
+    ratios of reported cases to infections for dengue vary widely, roughly 1 in 3 to 1 in 30). The city must decide
+    whether to fund a pre-season DENV-2 control campaign for 2026. Using a simple SIR-type model of human infection
+    (vector dynamics absorbed into the transmission rate), estimate (1) the effective reproduction number of DENV-2
+    at the start of the 2026 season, assuming the same transmissibility as in 2025 and no births, deaths, waning
+    immunity or migration, and (2) the proportion of the city''s population infected with DENV-2 in 2025. Report
+    each with a 95% uncertainty interval, say whether a large DENV-2 outbreak is expected in 2026, and state what
+    the data do and do not determine. Deliverables: the uncertainty analysis must report outputs named reff_2026
+    and attack_rate_2025 (attack_rate_2025 as a proportion of the whole population).'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/dengue_outbreak
+  shadow_price: 0.05
+  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed); the question is mainly
+    an estimation; the campaign cost (US$1 per resident) is assumed
+  inputs: 'derived from data/evals/dengue_outbreak public inputs: city population, the generation interval; R0 fixed
+    at the engine default 2.0 and the 2026 susceptible share swept 0.3-1.0, so the R0 the question asks to estimate
+    is not swept'
+  rerun_of: dengue_outbreak
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: measles_age_targeting_r3
+  batch: 1r3
+  eval_question: false
+  question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme
+    has US$2.9 million for a preventive vaccination campaign in 2026 across 24 districts with no second dose. For
+    each district choose one option: none; C_9to59m (children aged 9-59 months); D_9mto14y (children aged 9 months
+    to 14 years). A campaign reaches 85% of the targeted children and protects about 90% of the susceptible children
+    it reaches (all-or-nothing). Cost: US$1.50 per targeted child plus US$18,000 per district campaign. Infants
+    under 9 months are susceptible, adults immune; the immunity gaps of younger and older children vary between
+    districts. Assume one importation per district seeds an outbreak in a homogeneously mixing population, R0 between
+    10 and 16. Which age range should each district target to maximise measles infections averted, and what decides
+    it?'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/measles_age_targeting
+  shadow_price: 0.02
+  shadow_price_basis: infections averted per US$ at US$50 per infection averted (assumed)
+  inputs: 'synthetic (seeded 20261113): 10 districts, MCV1 0.55-0.92, susceptible gaps derived from coverage'
+  rerun_of: measles_age_targeting
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: cholera_ocv_siting_r3
+  batch: 1r3
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national cholera
+    programme has US$5.0 million for preventive oral cholera vaccine (OCV) campaigns in 2026 across 24 districts.
+    For each district choose one option: none; OCV1 (a single-dose campaign); OCV2 (a two-dose campaign). A campaign
+    reaches 70% of the population. Cost: US$3.00 per dose delivered (vaccine and delivery). Input file: units.csv
+    (population, suspected cholera incidence per person-year over the last five years with no vaccination, share
+    with improved sanitation). Choose the options that maximise suspected cholera cases averted over 2026-2027 within
+    the budget, report the total with a 95% uncertainty interval, and state the decision rule for siting the campaigns.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/cholera_ocv_siting
+  shadow_price: 0.0004
+  shadow_price_basis: about 1 / US$2,500 per suspected case averted (OCV2 about US$2,600 per case in the sweep)
+  inputs: 'synthetic (seed 11): 12 districts, log-uniform incidence 0.0005-0.008 per person-year scaled by (1.4
+    - sanitation share); direct protection only, no herd effect'
+  rerun_of: cholera_ocv_siting
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: outbreak_growth_peak_r3
+  batch: 1r3
+  eval_question: false
+  question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the cities and numbers are synthetic. A respiratory
+    pathogen with a generation interval of about 5 days (weekly grid: 0.6, 0.35, 0.05 of transmission in weeks 1-3)
+    is spreading in 24 cities, each with its own number of infections seeded at the start of 2026 and its own share
+    already immune from an earlier wave. A national task force must decide, city by city, whether to fund a transmission-reducing
+    measure (masks, distancing and ventilation in schools and workplaces) from week 4 to week 16 of 2026, at about
+    US$3 per resident. The measure''s effect on transmission is uncertain (15-45%). For each city, estimate the
+    epidemic''s growth rate and peak week without the measure, the infections it averts over 2026, and which cities
+    should get it under a US$45 million budget; say what decides it.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/outbreak_growth_peak
+  shadow_price: 0.05
+  shadow_price_basis: infections averted per US$ at US$20 per infection averted (assumed)
+  inputs: 'synthetic (seeded 1113): 8 cities, population, seed share 10^-6.5 to 10^-4.5; the s0 sweep overrides
+    each city''s prior immunity'
+  rerun_of: outbreak_growth_peak
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: tb_case_finding_r3
+  batch: 1r3
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme
+    has US$12 million for 2026-2028 case-finding packages in 24 districts. For each district choose one package:
+    none; CACF (community-wide active case finding: annual door-to-door screening with sputum Xpert for everyone
+    who can produce sputum, three rounds); HHC (enhanced household-contact investigation of every notified case);
+    or CACF+HHC. Costs: CACF US$4.00 per resident per round; HHC US$0.40 per resident per year. Input file: units.csv
+    (population, prevalence of bacteriologically confirmed pulmonary TB from a 2024 synthetic survey, HIV prevalence
+    among adults). Choose the packages that maximise the reduction in prevalent bacteriologically confirmed TB by
+    the end of 2028 within the budget, report it with a 95% uncertainty interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/tb_case_finding
+  shadow_price: 0.0002
+  shadow_price_basis: about 1 / US$5,000 per prevalent case averted (HHC about US$2,000, CACF about US$8,600 in
+    the sweep)
+  inputs: 'synthetic (seed 23): 12 districts, log-uniform prevalence 0.0015-0.009, adult HIV prevalence 1-25% (a
+    feature the engine does not read)'
+  rerun_of: tb_case_finding
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: hiv_prep_targeting_r3
+  batch: 1r3
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district, population and number is synthetic. An
+    HIV programme has US$8 million for pre-exposure prophylaxis (PrEP) in 2026-2027 for 24 population groups (adolescent
+    girls and young women, men who have sex with men, and HIV-negative partners in serodiscordant couples, in each
+    of eight districts). For each group choose one option: none; ORAL (daily oral TDF/FTC PrEP); CAB (long-acting
+    injectable cabotegravir every two months). Costs per person-year on PrEP: ORAL US$120, CAB US$300; the group
+    sizes in units.csv are the people expected to start PrEP if offered. Input file: units.csv (group, district,
+    people expected to start, HIV incidence per person-year without PrEP, expected adherence score). Choose the
+    options that maximise HIV infections averted over 2026-2027 within the budget, report the total with a 95% uncertainty
+    interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/hiv_prep_targeting
+  shadow_price: 0.0001
+  shadow_price_basis: about 1 / US$10,000 per infection averted (oral about US$9,600, CAB about US$13,000 in the
+    sweep)
+  inputs: 'synthetic (seed 37): 4 districts x 3 groups; incidence log-uniform per group; adherence score 0.3-0.8
+    (a feature the engine does not read)'
+  rerun_of: hiv_prep_targeting
+  rerun_reason: 'round 2 rules (2026-11-13): designs of 60-100 points, independent features declared for synthetic
+    units tables, literature citations looked up, a tighter-band seed prompt, the seed''s inputs withheld and circular
+    tests classified'
+- id: rotavirus_intro_ranking
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A ministry of health
+    can introduce rotavirus vaccine (two-dose oral) in 2026 in some of 24 districts within US$2.0 million for 2026-2027.
+    For each district choose one option: none; ROUTINE (introduction into routine immunisation, about 70% of infants
+    fully vaccinated); ROUTINE_OUTREACH (introduction with outreach sessions, about 85%). Costs per child under
+    five per year: ROUTINE US$3.00, ROUTINE_OUTREACH US$4.50. Input file: units.csv (children under five, hospitalised
+    severe diarrhoea per child-year, share of severe diarrhoea due to rotavirus from sentinel surveillance, health-facility
+    access index). Rank the districts for introduction, choose the options that maximise severe diarrhoea hospitalisations
+    averted within the budget, report the total with a 95% uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/rotavirus_intro_ranking
+  shadow_price: 0.003
+  shadow_price_basis: about US$330 per hospitalisation averted (assumed willingness to pay, placed near the options'
+    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (ranking)
+  area: vaccines
+- id: hpv_dose_schedule
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national immunisation
+    programme will run an HPV vaccination campaign for girls aged 9-14 in 2026 across 24 districts with US$3.0 million.
+    For each district choose one option: none; ONE_DOSE (single-dose campaign, about 80% of girls reached); TWO_DOSE
+    (two doses six months apart, about 80% reached for the first dose and 65% completing both). Costs per girl in
+    the target population: ONE_DOSE US$6, TWO_DOSE US$11. Input file: units.csv (girls aged 9-14, incidence of persistent
+    HPV 16/18 infection per girl-year from a synthetic cohort, school enrolment share). Choose the options that
+    maximise persistent HPV 16/18 infections averted over 2026-2030 within the budget, report the total with a 95%
+    uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/hpv_dose_schedule
+  shadow_price: 0.02
+  shadow_price_basis: about US$50 per persistent infection averted (assumed willingness to pay, placed near the
+    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
+    dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (schedule choice)
+  area: vaccines
+- id: dengue_wolbachia_vs_spraying
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national vector-control
+    programme has US$40 million for 2026-2027 dengue control in 20 cities. For each city choose one option: none;
+    SPRAY (reactive and routine ultra-low-volume space spraying, US$2.50 per resident per year); WOLBACHIA (wMel
+    Wolbachia mosquito releases, US$12 per resident once, effective from deployment). Input file: units.csv (population,
+    reported dengue incidence per person-year 2021-2025, population density, Aedes house index). Choose the options
+    that maximise symptomatic dengue cases averted over 2026-2027 within the budget, report the total with a 95%
+    uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/dengue_wolbachia_vs_spraying
+  shadow_price: 0.0005
+  shadow_price_basis: about US$2,000 per dengue case averted (assumed willingness to pay, placed near the options'
+    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (intervention choice)
+  area: vector control
+- id: malaria_repellent_vs_itn_topup
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A malaria programme
+    has US$12 million for 2026-2027 in 24 districts that already have insecticide-treated nets (ITNs) in use. For
+    each district choose one package: none; SR (spatial repellent emanators in every household, replaced on schedule,
+    US$4.00 per person per year); TOPUP (an ITN top-up distribution raising net use by about 25 percentage points,
+    US$1.80 per person per year); SR+TOPUP. Input file: units.csv (population, clinical malaria incidence per person-year
+    under current nets, current net use, pyrethroid resistance index). Choose the packages that maximise clinical
+    cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval and state the
+    decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/malaria_repellent_vs_itn_topup
+  shadow_price: 0.04
+  shadow_price_basis: about US$25 per clinical case averted (assumed willingness to pay, placed near the options'
+    average cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (package choice)
+  area: vector control
+- id: lf_mda_ida_vs_da
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A lymphatic filariasis
+    elimination programme has US$6 million for mass drug administration (MDA) in 2026-2027 in 24 implementation
+    units. For each unit choose one regimen: none; DA (diethylcarbamazine plus albendazole, two annual rounds, US$0.80
+    per person per round); IDA (ivermectin, diethylcarbamazine and albendazole, two annual rounds, US$1.40 per person
+    per round). About 65% of the population swallows the drugs each round. Input file: units.csv (population, microfilaraemia
+    prevalence from the last survey, past MDA rounds, past coverage). Choose the regimens that maximise microfilaraemic
+    person-years averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval and
+    state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/lf_mda_ida_vs_da
+  shadow_price: 0.017
+  shadow_price_basis: about US$60 per microfilaraemic person-year averted (assumed willingness to pay, placed near
+    the options' average cost-effectiveness in the template check so the paired comparisons are informative; not
+    a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (regimen choice)
+  area: MDA / NTDs
+- id: trachoma_mda_frequency
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A trachoma programme
+    has US$1.5 million for azithromycin mass drug administration in 2026-2027 across 24 districts. For each district
+    choose one option: none; ANNUAL (one round a year, US$0.60 per person per round); BIANNUAL (two rounds a year,
+    US$0.60 per person per round). Input file: units.csv (population, prevalence of ocular Chlamydia trachomatis
+    infection in children, TF prevalence in children aged 1-9, household water access). Choose the options that
+    maximise ocular infection person-years averted over 2026-2027 within the budget, report the total with a 95%
+    uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/trachoma_mda_frequency
+  shadow_price: 0.2
+  shadow_price_basis: about US$5 per ocular infection person-year averted (assumed willingness to pay, placed near
+    the options' average cost-effectiveness in the template check so the paired comparisons are informative; not
+    a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (frequency choice)
+  area: MDA / NTDs
+- id: hcv_test_treat_targeting
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A hepatitis programme
+    has US$5 million for 2026-2027 hepatitis C test-and-treat in 24 population groups (people who inject drugs,
+    people in prison, people attending HIV clinics and the general population of high-prevalence districts). For
+    each group choose one option: none; LAB (antibody screening with laboratory RNA confirmation, then direct-acting
+    antivirals, US$30 per person screened); POC (point-of-care RNA testing with same-day treatment start, US$45
+    per person screened). Input file: units.csv (people in the group, prevalence of viraemic HCV, group code 0-3,
+    expected linkage to care). Choose the options that maximise viraemic person-years averted over 2026-2027 within
+    the budget, report the total with a 95% uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/hcv_test_treat_targeting
+  shadow_price: 0.001
+  shadow_price_basis: about US$1,000 per viraemic person-year averted (assumed willingness to pay, placed near the
+    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
+    dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: targeting
+  area: screening
+- id: nutrition_sqlns_vs_mnp
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A nutrition programme
+    has US$8 million for 2026-2027 preventive supplementation of children aged 6-23 months in 24 districts. For
+    each district choose one option: none; MNP (multiple micronutrient powders, US$6 per child per year); SQLNS
+    (small-quantity lipid-based nutrient supplements, US$40 per child per year). About 70% of children receive and
+    use the product. Input file: units.csv (children aged 6-23 months, wasting prevalence, stunting prevalence,
+    household food insecurity). Choose the options that maximise child-years of wasting averted over 2026-2027 within
+    the budget, report the total with a 95% uncertainty interval and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/nutrition_sqlns_vs_mnp
+  shadow_price: 0.0003
+  shadow_price_basis: about US$3,300 per wasted child-year averted (assumed willingness to pay, placed near the
+    options' average cost-effectiveness in the template check so the paired comparisons are informative; not a budget
+    dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: allocation (product choice)
+  area: nutrition
+- id: measles_reactive_campaign_timing
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Measles outbreaks
+    have just been detected in 20 districts at the start of 2026. Each district can run one reactive vaccination
+    campaign targeting everyone susceptible-eligible (about 80% reached), and the choice is its timing: none; EARLY
+    (campaign completed 14 days after detection, US$2.20 per resident because of emergency logistics); LATE (completed
+    42 days after detection, US$1.40 per resident). The budget is US$4 million. R0 is between 12 and 18. Input file:
+    units.csv (population, susceptible share at detection from a synthetic serosurvey, share of the population already
+    infected at detection). Choose the timing per district that maximises measles infections averted over the outbreak
+    within the budget, report the total with a 95% uncertainty interval, and state the rule (when does waiting for
+    a cheaper campaign cost more infections than it saves money?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/measles_reactive_campaign_timing
+  shadow_price: 0.048
+  shadow_price_basis: about US$21 per infection averted (assumed willingness to pay, placed near the options' average
+    cost-effectiveness in the template check so the paired comparisons are informative; not a budget dual)
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: timing
+  area: outbreak response
+- id: school_influenza_estimation
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Influenza-like illness
+    outbreaks occur in 20 closed boarding schools (600-2,400 pupils each) at the start of term in 2026. Using an
+    SIR-type model of a single well-mixed school population, estimate (1) the basic reproduction number R0 of the
+    outbreak strain in a school and (2) the share of pupils infected over the term, each with a 95% uncertainty
+    interval, and say how both depend on the pupils'' pre-term immunity and the number infected at the start. Also
+    say whether a pre-term vaccination day (about 50% of pupils vaccinated, US$12 per pupil, within a US$150,000
+    budget) is worth it in which schools. Input file: units.csv (pupils, share susceptible at the start of term
+    from a synthetic serosurvey, share already infected on day 0).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/school_influenza_estimation
+  shadow_price: null
+  shadow_price_basis: 'estimation question: the vaccination day is secondary; paired tests are not the point'
+  inputs: 'synthetic: units.csv from generate_units.py (seeded; each design feature drawn independently)'
+  decision_type: estimation
+  area: outbreak response
+- id: amr_crp_delayed_prescribing
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every clinic and number is synthetic. A primary-care network
+    has US$1.5 million for 2026 to cut inappropriate antibiotic prescribing for acute respiratory infections in
+    24 clinics. For each clinic choose one package: none; CRP (point-of-care C-reactive protein testing to guide
+    prescribing); DELAYED (delayed-prescribing strategy with patient information); or CRP+DELAYED. Costs per registered
+    patient per year: CRP US$1.80, DELAYED US$0.40. Input file: units.csv (registered patients, inappropriate antibiotic
+    prescriptions per patient-year in 2025, share of consultations for respiratory complaints). Choose the packages
+    that maximise inappropriate prescriptions averted in 2026 within the budget, report the total with a 95% uncertainty
+    interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/amr_crp_delayed_prescribing
+  shadow_price: 0.5
+  shadow_price_basis: about 1 / US$2 per inappropriate prescription averted (assumed willingness to pay)
+  inputs: 'synthetic: data/world_model_trials/amr_crp_delayed_prescribing/generate_units.py (seeded)'
+  decision_type: allocation
+  area: AMR stewardship
+- id: amr_hospital_stewardship
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every hospital and number is synthetic. A health ministry
+    has US$3 million for 2026 antibiotic stewardship in 20 hospitals. For each hospital choose one policy: none;
+    AUDIT (prospective audit and feedback by a stewardship team); RESTRICT (restrictive formulary with pre-authorisation
+    of broad-spectrum agents). Costs per admission: AUDIT US$6, RESTRICT US$4. Input file: units.csv (admissions
+    per year, hospital-onset Clostridioides difficile infections per admission in 2025, share of admissions to surgical
+    wards). Choose the policies that maximise C. difficile infections averted in 2026 within the budget, report
+    the total with a 95% uncertainty interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/amr_hospital_stewardship
+  shadow_price: 0.0002
+  shadow_price_basis: about 1 / US$5,000 per C. difficile infection averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/amr_hospital_stewardship/generate_units.py (seeded)'
+  decision_type: allocation
+  area: AMR stewardship
+- id: ntd_schisto_mda_strategy
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national NTD
+    programme has US$2 million for 2026 praziquantel mass drug administration in 20 districts. For each district
+    choose one strategy: none; SCHOOL (school-based treatment of school-age children, 75% coverage of them); COMMUNITY
+    (community-wide treatment of everyone aged 5 and over, 60% coverage). Costs per resident: SCHOOL US$0.25, COMMUNITY
+    US$0.80. Input file: units.csv (population, Schistosoma infection prevalence among school-age children and among
+    adults from a 2025 synthetic survey). Choose the strategies that maximise infections averted in 2026 within
+    the budget, report the total with a 95% uncertainty interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/ntd_schisto_mda_strategy
+  shadow_price: 0.2
+  shadow_price_basis: about 1 / US$5 per infection averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/ntd_schisto_mda_strategy/generate_units.py (seeded)'
+  decision_type: allocation
+  area: NTDs
+- id: ntd_vl_irs_vs_acd
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every block and number is synthetic. A visceral leishmaniasis
+    elimination programme has US$1.2 million for 2026 in 24 endemic blocks. For each block choose one package: none;
+    IRS (two rounds of indoor residual spraying of houses and cattle sheds); ACD (house-to-house active case detection
+    with rapid diagnostic tests every six months); or IRS+ACD. Costs per resident: IRS US$1.50, ACD US$0.60. Input
+    file: units.csv (population, visceral leishmaniasis cases per resident in 2025, share of houses with mud walls).
+    Choose the packages that maximise cases averted in 2026 within the budget, report the total with a 95% uncertainty
+    interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/ntd_vl_irs_vs_acd
+  shadow_price: 0.002
+  shadow_price_basis: about 1 / US$500 per VL case averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/ntd_vl_irs_vs_acd/generate_units.py (seeded)'
+  decision_type: allocation
+  area: NTDs
+- id: tb_tpt_3hp_vs_6h
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme
+    has US$2.5 million for 2026-2027 to offer TB preventive treatment to the household contacts of notified patients
+    in 20 districts. For each district choose one regimen: none; 6H (six months of daily isoniazid); 3HP (three
+    months of weekly rifapentine and isoniazid). Costs per contact offered treatment: 6H US$25, 3HP US$45 (drugs,
+    screening and follow-up). Input file: units.csv (household contacts expected in 2026, TB incidence among contacts
+    per person-year without preventive treatment, HIV prevalence among adult contacts). Choose the regimens that
+    maximise incident TB cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty
+    interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/tb_tpt_3hp_vs_6h
+  shadow_price: 0.001
+  shadow_price_basis: about 1 / US$1,000 per TB case averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/tb_tpt_3hp_vs_6h/generate_units.py (seeded)'
+  decision_type: allocation
+  area: screening / TB prevention
+- id: cervical_hpv_vs_via
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national cancer
+    control programme has US$4 million for one screening round in 2026 for women aged 30-49 in 20 districts. For
+    each district choose one approach: none; VIA (visual inspection with acetic acid, screen and treat); HPV (HPV-DNA
+    testing, screen and treat). Costs per woman in the target group: VIA US$4, HPV US$9. Input file: units.csv (women
+    aged 30-49, incidence of advanced cervical cancer per woman-year without screening, HIV prevalence among women).
+    Choose the approaches that maximise advanced cervical cancers averted over 2026-2033 within the budget, report
+    the total with a 95% uncertainty interval, and state the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/cervical_hpv_vs_via
+  shadow_price: 0.0001
+  shadow_price_basis: about 1 / US$10,000 per advanced cancer averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/cervical_hpv_vs_via/generate_units.py (seeded)'
+  decision_type: allocation
+  area: screening / cancer
+- id: typhoid_tcv_age_targeting
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. An immunisation
+    programme has US$3 million for a 2026 typhoid conjugate vaccine campaign in 20 districts. For each district
+    choose one option: none; U5 (children aged 9 months to 4 years); WIDE (children aged 9 months to 14 years).
+    The campaign reaches 80% of targeted children. Costs per resident (both targeted and not): U5 US$0.40, WIDE
+    US$1.10. Input file: units.csv (population, blood-culture-confirmed typhoid incidence per resident in children
+    under 5, in children 5-14 and in adults, from synthetic surveillance). Choose the options that maximise typhoid
+    cases averted over 2026-2028 within the budget, report the total with a 95% uncertainty interval, and state
+    the decision rule.'
+  engine: toolkit.engines.empirical.engine:PackageRateEngine
+  engine_mode: trial_priors
+  template: data/world_model_trials/typhoid_tcv_age_targeting
+  shadow_price: 0.002
+  shadow_price_basis: about 1 / US$500 per typhoid case averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/typhoid_tcv_age_targeting/generate_units.py (seeded)'
+  decision_type: targeting
+  area: vaccines
+- id: flu_school_closure_timing
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every town and number is synthetic. An influenza epidemic
+    is starting in 24 towns, each with its own number of infections at the start of 2026 and its own share still
+    susceptible (uncertain, 60-100%). An education ministry can close schools for eight weeks, starting either in
+    week 3 (EARLY) or in week 7 (LATE) of 2026, or not at all, town by town. Closure costs about US$4 per resident
+    whatever its start. Input file: units.csv (population, infections seeded at the start of 2026 as a share of
+    the population). Choose for each town whether and when to close, to maximise infections averted in 2026 under
+    a US$40 million budget, report the total with a 95% uncertainty interval, and say what decides the timing.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/flu_school_closure_timing
+  shadow_price: 0.25
+  shadow_price_basis: about 1 / US$4 per infection averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/flu_school_closure_timing/generate_units.py (seeded)'
+  decision_type: timing
+  area: outbreak response
+- id: ebola_ring_vaccination
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. An Ebola virus
+    disease outbreak is reported in 20 districts, each with its own number of infections when the response starts
+    in early 2026. Contact tracing and isolation are in place everywhere (the comparator). Ring vaccination of contacts
+    and contacts of contacts can be added from week 20 of 2026 (when vaccine supply arrives) at about US$2 per resident.
+    Input file: units.csv (population, infections at the start of the response as a share of the population, uncertain).
+    For each district estimate the final size of the 2026 outbreak with contact tracing only and the share of it
+    that ring vaccination averts, each with a 95% uncertainty interval, and say where ring vaccination should go
+    first under a US$10 million budget.'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/ebola_ring_vaccination
+  shadow_price: 0.5
+  shadow_price_basis: about 1 / US$2 per infection averted (assumed)
+  inputs: 'synthetic: data/world_model_trials/ebola_ring_vaccination/generate_units.py (seeded)'
+  decision_type: estimation
+  area: outbreak response
+- id: early_growth_doubling_time
+  batch: 2
+  eval_question: false
+  question: 'SYNTHETIC TEST QUESTION (world-model trial): every town and number is synthetic. A new respiratory
+    virus with a generation interval of about one week (weekly grid 0.5, 0.4, 0.1) has been seeded in 24 towns at
+    the start of 2026, each with its own number of infections; the share of residents still susceptible is uncertain
+    (50-100%). Estimate for each town the epidemic growth rate and doubling time in the first weeks, the peak week
+    and the 2026 attack rate, each with a 95% uncertainty interval, and the infections averted by a mild hygiene
+    campaign from week 6 (about US$0.50 per resident). Input file: units.csv (population, infections seeded as a
+    share of the population).'
+  engine: toolkit.engines.renewal.engine:RenewalEngine
+  engine_mode: null
+  template: data/world_model_trials/early_growth_doubling_time
+  shadow_price: null
+  shadow_price_basis: 'estimation question: no shadow price (paired tests untestable by design)'
+  inputs: 'synthetic: data/world_model_trials/early_growth_doubling_time/generate_units.py (seeded)'
+  decision_type: estimation
+  area: outbreak response

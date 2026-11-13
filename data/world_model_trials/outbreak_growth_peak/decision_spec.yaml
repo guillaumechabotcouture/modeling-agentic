@@ -1,12 +1,11 @@
 schema_version: 1
-question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the cities and numbers are synthetic. A respiratory pathogen
-  with a generation interval of about 5 days (weekly grid: 0.6, 0.35, 0.05 of transmission in weeks 1-3) is spreading
-  in 8 cities, each with its own number of infections seeded at the start of 2026 and its own share already immune
-  from an earlier wave. A national task force must decide, city by city, whether to fund a transmission-reducing
-  measure (masks, distancing and ventilation in schools and workplaces) from week 4 to week 16 of 2026, at about
-  US$3 per resident. The measure''s effect on transmission is uncertain (15-45%). For each city, estimate the epidemic''s
-  growth rate and peak week without the measure, the infections it averts over 2026, and which cities should get
-  it under a US$15 million budget; say what decides it.'
+question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the cities and numbers are synthetic. A respiratory pathogen with
+  a generation interval of about 5 days (weekly grid: 0.6, 0.35, 0.05 of transmission in weeks 1-3) is spreading in 24 cities,
+  each with its own number of infections seeded at the start of 2026 and its own share already immune from an earlier wave.
+  A national task force must decide, city by city, whether to fund a transmission-reducing measure (masks, distancing and
+  ventilation in schools and workplaces) from week 4 to week 16 of 2026, at about US$3 per resident. The measure''s effect
+  on transmission is uncertain (15-45%). For each city, estimate the epidemic''s growth rate and peak week without the measure,
+  the infections it averts over 2026, and which cities should get it under a US$45 million budget; say what decides it.'
 decision_maker: national outbreak task force (synthetic trial question)
 decision_date: 2026
 engine:
@@ -69,7 +68,7 @@ objective:
   - 2027.0
   discounting: none
 constraints:
-  envelope_usd: 15000000
+  envelope_usd: 45000000
 comparator:
   package: none
   text: no measure
@@ -99,17 +98,24 @@ calibration:
   metric: s_start
   target_uncertainty:
     region_sd_logit: 0.2
-  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share
-    (immunity from the earlier wave is uncertain) spans R_eff = 2 s0 from 1.1 to 2.0'
+  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share (immunity
+    from the earlier wave is uncertain) spans R_eff = 2 s0 from 1.1 to 2.0'
 analysis:
   evaluation: emulator
   emulator:
-    points: 24
+    points: 100
     holdout_share: 0.0
     seed: 5
     features:
     - seed_share
     - pop
+    independent_features:
+      features:
+      - seed_share
+      - pop
+      basis: generate_units.py draws pop log-uniform and seed_share log-uniform, independently of each other and of prior
+        immunity (24 synthetic cities)
+      generator: generate_units.py
   stability:
     holdout_group: city
   sensitivity:

@@ -398,7 +398,12 @@ def prepare(q, run_dir, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> d
             "primary_outcome": spec.outcomes()[0],
             "sweep": {"design_points": len(design["points"]), "engine_runs": len(jobs), "features": feats,
                       "independent_features": list(design.get("independent_features") or []),
-                      "shadow_price": q.get("shadow_price"), "optimised_plan": False,
+                      # the value is withheld: a template's shadow price may have been placed from a check sweep
+                      "shadow_price": "withheld: net benefit is compared at a declared shadow price (outcome per "
+                                      "USD) whose value is not shown" if q.get("shadow_price") is not None else None,
+                      "paired_tests": "testable" if q.get("shadow_price") is not None else
+                      "untestable: no shadow price is declared",
+                      "optimised_plan": False,
                       "min_points": W.SETTINGS["min_points"], "small_sample_below": W.SETTINGS["perm_n_max"]},
             "hypotheses": {"min": HYPOTHESES[0], "max": HYPOTHESES[1]}}
 

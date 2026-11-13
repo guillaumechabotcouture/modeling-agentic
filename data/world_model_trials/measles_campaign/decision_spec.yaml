@@ -1,19 +1,18 @@
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
-  for this test; none describes a real place. A measles programme has US$850,000 for a catch-up vaccination campaign
-  in early 2026 across 12 districts. For each district choose one option: none; A_1to4 (all children aged 1-4 years);
-  B_1to9 (all children aged 1-9 years). A campaign reaches 85% of targeted children and seroconverts 93% of the
-  susceptible children it reaches. Cost: US$1.20 per targeted child plus US$22,000 per district campaign; each single-year
-  birth cohort is 3.0% of a district''s population. Routine MCV1 seroconverts about 85% of the children it reaches
-  and MCV2 about 90% of those still susceptible. Assume everyone aged 15 years or older is immune and children under
-  1 year are susceptible, and that in each district one measles importation in the coming period starts an outbreak
-  whose size follows the final-size relation of a homogeneous-mixing SIR model, with R0 between 12 and 18 (uniform).
-  Input files: data/evals/measles_campaign/districts.csv (2026 population), data/evals/measles_campaign/routine_coverage_admin.csv
-  (administrative MCV1 and MCV2 coverage by birth cohort), data/evals/measles_campaign/serosurvey_2025.csv (a 2025
-  serosurvey by age band; ages are as in 2025). Choose the options that maximise expected measles cases averted,
-  report the total with a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv
-  in the run directory with columns district, package (none, A_1to4 or B_1to9) and cases_averted; and the uncertainty
-  analysis must report the total as an output named total_cases_averted.'
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated for this
+  test; none describes a real place. A measles programme has US$850,000 for a catch-up vaccination campaign in early 2026
+  across 12 districts. For each district choose one option: none; A_1to4 (all children aged 1-4 years); B_1to9 (all children
+  aged 1-9 years). A campaign reaches 85% of targeted children and seroconverts 93% of the susceptible children it reaches.
+  Cost: US$1.20 per targeted child plus US$22,000 per district campaign; each single-year birth cohort is 3.0% of a district''s
+  population. Routine MCV1 seroconverts about 85% of the children it reaches and MCV2 about 90% of those still susceptible.
+  Assume everyone aged 15 years or older is immune and children under 1 year are susceptible, and that in each district one
+  measles importation in the coming period starts an outbreak whose size follows the final-size relation of a homogeneous-mixing
+  SIR model, with R0 between 12 and 18 (uniform). Input files: data/evals/measles_campaign/districts.csv (2026 population),
+  data/evals/measles_campaign/routine_coverage_admin.csv (administrative MCV1 and MCV2 coverage by birth cohort), data/evals/measles_campaign/serosurvey_2025.csv
+  (a 2025 serosurvey by age band; ages are as in 2025). Choose the options that maximise expected measles cases averted, report
+  the total with a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run
+  directory with columns district, package (none, A_1to4 or B_1to9) and cases_averted; and the uncertainty analysis must report
+  the total as an output named total_cases_averted.'
 decision_maker: measles programme manager (synthetic evaluation question)
 decision_date: 2026
 engine:
@@ -168,8 +167,8 @@ calibration:
   metric: r0
   target_uncertainty:
     region_sd_logit: 0.05
-  note: transmission q stays at the engine default 0.2 (kind calibrated, not varied by the batch); with homogeneous
-    mixing R0 = q x contact_rate, so contact_rate over [60, 90] spans the question's R0 range 12-18
+  note: transmission q stays at the engine default 0.2 (kind calibrated, not varied by the batch); with homogeneous mixing
+    R0 = q x contact_rate, so contact_rate over [60, 90] spans the question's R0 range 12-18
 engine_parameters:
   efficacy:A_1to4:
     value: 0.93
@@ -205,7 +204,7 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 16
+    points: 64
     holdout_share: 0.0
     seed: 5
     features:

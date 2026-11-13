@@ -1,0 +1,180 @@
+# World-model trial template (rotavirus_intro_ranking, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A ministry of health
+  can introduce rotavirus vaccine (two-dose oral) in 2026 in some of 24 districts within US$2.0 million for 2026-2027.
+  For each district choose one option: none; ROUTINE (introduction into routine immunisation, about 70% of infants
+  fully vaccinated); ROUTINE_OUTREACH (introduction with outreach sessions, about 85%). Costs per child under five
+  per year: ROUTINE US$3.00, ROUTINE_OUTREACH US$4.50. Input file: units.csv (children under five, hospitalised
+  severe diarrhoea per child-year, share of severe diarrhoea due to rotavirus from sentinel surveillance, health-facility
+  access index). Rank the districts for introduction, choose the options that maximise severe diarrhoea hospitalisations
+  averted within the budget, report the total with a 95% uncertainty interval and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - routine
+    - outreach
+    outcome: severe_diarrhoea
+    mode: trial_priors
+    outcomes:
+      severe_diarrhoea:
+        baseline_source: synthetic hospital surveillance of severe diarrhoea in children under five, 2023-2025
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      routine:
+        severe_diarrhoea:
+          rr: 0.83
+          range:
+          - 0.75
+          - 0.9
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - coverage 0.7 x rotavirus share about 0.4 x efficacy against severe rotavirus gastroenteritis
+            0.61 (Madhi SA et al. Effect of human rotavirus vaccine on severe diarrhea in African infants. N Engl
+            J Med 2010;362:289-298)'
+          verified: false
+      outreach:
+        severe_diarrhoea:
+          rr: 0.79
+          range:
+          - 0.7
+          - 0.88
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: as routine with coverage 0.85 (Madhi SA et al. N Engl J Med 2010;362:289-298)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        severe_diarrhoea: inc
+options:
+  populations:
+    total: pop
+  components:
+    routine:
+      group: rota
+    outreach:
+      group: rota
+  packages:
+    none: []
+    routine:
+    - routine
+    outreach:
+    - outreach
+  engine_map:
+    routine:
+      routine: 1
+    outreach:
+      outreach: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: routine_cost
+    component: routine
+    value: 3.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - routine
+  - id: outreach_cost
+    component: outreach
+    value: 4.5
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - outreach
+objective:
+  outcome: severe_diarrhoea
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 2000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- severe_diarrhoea
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - rv_share
+    - access
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: severe_diarrhoea_averted
+  headline:
+    name: total_severe_diarrhoea_averted
+    outcome: severe_diarrhoea

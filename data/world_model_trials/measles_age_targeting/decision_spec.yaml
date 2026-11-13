@@ -1,13 +1,12 @@
 schema_version: 1
-question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme
-  has US$1.2 million for a preventive vaccination campaign in 2026 across 10 districts with routine first-dose coverage
-  between 55% and 92% and no second dose. For each district choose one option: none; C_9to59m (children aged 9-59
-  months); D_9mto14y (children aged 9 months to 14 years). A campaign reaches 85% of the targeted children and protects
-  about 90% of the susceptible children it reaches (all-or-nothing). Cost: US$1.50 per targeted child plus US$18,000
-  per district campaign. Infants under 9 months are susceptible, adults immune; older children carry immunity gaps
-  where coverage has been low. Assume one importation per district seeds an outbreak in a homogeneously mixing population,
-  R0 between 10 and 16. Which age range should each district target to maximise measles infections averted, and
-  what decides it?'
+question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme has
+  US$2.9 million for a preventive vaccination campaign in 2026 across 24 districts with no second dose. For each district
+  choose one option: none; C_9to59m (children aged 9-59 months); D_9mto14y (children aged 9 months to 14 years). A campaign
+  reaches 85% of the targeted children and protects about 90% of the susceptible children it reaches (all-or-nothing). Cost:
+  US$1.50 per targeted child plus US$18,000 per district campaign. Infants under 9 months are susceptible, adults immune;
+  the immunity gaps of younger and older children vary between districts. Assume one importation per district seeds an outbreak
+  in a homogeneously mixing population, R0 between 10 and 16. Which age range should each district target to maximise measles
+  infections averted, and what decides it?'
 decision_maker: measles programme manager (synthetic trial question)
 decision_date: 2026
 engine:
@@ -136,7 +135,7 @@ objective:
   - 3650
   discounting: none
 constraints:
-  envelope_usd: 1200000
+  envelope_usd: 2900000
 comparator:
   package: none
   text: no campaign; routine first dose only
@@ -175,8 +174,8 @@ calibration:
   metric: r0
   target_uncertainty:
     region_sd_logit: 0.05
-  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); R0 = q x contact_rate under
-    homogeneous mixing, so contact_rate over [50, 80] spans R0 10-16
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); R0 = q x contact_rate under homogeneous
+    mixing, so contact_rate over [50, 80] spans R0 10-16
 uncertainty:
   level: 0.95
   draws: 8
@@ -193,14 +192,19 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 16
+    points: 64
     holdout_share: 0.0
     seed: 5
     features:
-    - mcv1
     - susc_9_59m
     - susc_5_14y
-    - mean_susceptible
+    independent_features:
+      features:
+      - susc_9_59m
+      - susc_5_14y
+      basis: generate_units.py draws the two susceptible shares uniform, independently of each other and of the population;
+        mean_susceptible is derived and is not a design feature (24 synthetic districts)
+      generator: generate_units.py
   stability:
     holdout_group: district
   sensitivity:

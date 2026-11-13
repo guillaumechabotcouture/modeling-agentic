@@ -1,0 +1,185 @@
+# World-model trial template (amr_crp_delayed_prescribing, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every clinic and number is synthetic. A primary-care network
+  has US$1.5 million for 2026 to cut inappropriate antibiotic prescribing for acute respiratory infections in 24
+  clinics. For each clinic choose one package: none; CRP (point-of-care C-reactive protein testing to guide prescribing);
+  DELAYED (delayed-prescribing strategy with patient information); or CRP+DELAYED. Costs per registered patient
+  per year: CRP US$1.80, DELAYED US$0.40. Input file: units.csv (registered patients, inappropriate antibiotic prescriptions
+  per patient-year in 2025, share of consultations for respiratory complaints). Choose the packages that maximise
+  inappropriate prescriptions averted in 2026 within the budget, report the total with a 95% uncertainty interval,
+  and state the decision rule.'
+decision_maker: primary-care network manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - crp
+    - delayed
+    outcome: rx
+    mode: trial_priors
+    outcomes:
+      rx:
+        baseline_source: synthetic 2025 prescribing audit (inappropriate antibiotic prescriptions per patient-year)
+    baseline:
+      measured_under: no_components
+      source: 'usual care in 2025: no CRP testing and no delayed-prescribing strategy (synthetic)'
+    effects:
+      crp:
+        rx:
+          rr: 0.78
+          range:
+          - 0.66
+          - 0.92
+          dist: triangular
+          measure: risk_ratio
+          source: Aabenhus R et al. Biomarkers as point-of-care tests to guide prescription of antibiotics in patients
+            with acute respiratory infections in primary care. Cochrane Database Syst Rev 2014;(11):CD010130 (antibiotic
+            use RR 0.78, 0.66-0.92)
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.5
+            source: control arms prescribed antibiotics at roughly half of consultations (Aabenhus 2014)
+      delayed:
+        rx:
+          rr: 0.6
+          range:
+          - 0.4
+          - 0.85
+          dist: triangular
+          measure: risk_ratio
+          source: Spurling GKP et al. Delayed antibiotic prescriptions for respiratory infections. Cochrane Database
+            Syst Rev 2017;9:CD004417 (antibiotic use far lower with delayed than immediate prescribing; a ratio
+            against usual care is derived, wide)
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.5
+            source: usual-care prescribing at roughly half of respiratory consultations (assumed)
+    combination:
+      rule: multiplicative
+      source: independent action (no trial tested the two together)
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        rx: rx_rate
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    crp: {}
+    delayed: {}
+  packages:
+    generate: true
+  engine_map:
+    crp:
+      crp: 1
+    delayed:
+      delayed: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: crp_cost
+    component: crp
+    value: 1.8
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - crp_delivery
+  - id: delayed_cost
+    component: delayed
+    value: 0.4
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - delayed_delivery
+objective:
+  outcome: rx
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 1500000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- rx
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - rx_rate
+    - resp_share
+    - pop
+    independent_features:
+      features:
+      - rx_rate
+      - resp_share
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: rx_averted
+  headline:
+    name: total_rx_averted
+    outcome: rx

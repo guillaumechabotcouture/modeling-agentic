@@ -1,0 +1,183 @@
+# World-model trial template (malaria_repellent_vs_itn_topup, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A malaria programme
+  has US$12 million for 2026-2027 in 24 districts that already have insecticide-treated nets (ITNs) in use. For
+  each district choose one package: none; SR (spatial repellent emanators in every household, replaced on schedule,
+  US$4.00 per person per year); TOPUP (an ITN top-up distribution raising net use by about 25 percentage points,
+  US$1.80 per person per year); SR+TOPUP. Input file: units.csv (population, clinical malaria incidence per person-year
+  under current nets, current net use, pyrethroid resistance index). Choose the packages that maximise clinical
+  cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval and state the
+  decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - sr
+    - topup
+    outcome: clinical_cases
+    mode: trial_priors
+    outcomes:
+      clinical_cases:
+        baseline_source: synthetic health-facility incidence of clinical malaria with current net use
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      sr:
+        clinical_cases:
+          rr: 0.78
+          range:
+          - 0.6
+          - 0.95
+          dist: triangular
+          measure: rate_ratio
+          source: 'spatial repellent cluster-randomised trial, protective efficacy against first-time malaria infection
+            about 28% (Syafruddin D et al. Efficacy of a spatial repellent for control of malaria in Indonesia:
+            a cluster-randomized controlled trial. Am J Trop Med Hyg 2020;103:344-358)'
+          verified: false
+      topup:
+        clinical_cases:
+          rr: 0.86
+          range:
+          - 0.78
+          - 0.93
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: (1 - 0.75 x 0.45) / (1 - 0.5 x 0.45), nets against no nets rate ratio about 0.55 for
+            uncomplicated episodes (Pryce J, Richardson M, Lengeler C. Insecticide-treated nets for preventing malaria.
+            Cochrane Database Syst Rev 2018;11:CD000363)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        clinical_cases: inc
+options:
+  populations:
+    total: pop
+  components:
+    sr: {}
+    topup: {}
+  packages:
+    none: []
+    sr:
+    - sr
+    topup:
+    - topup
+    sr+topup:
+    - sr
+    - topup
+  engine_map:
+    sr:
+      sr: 1
+    topup:
+      topup: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: sr_cost
+    component: sr
+    value: 4.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - sr
+  - id: topup_cost
+    component: topup
+    value: 1.8
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - topup
+objective:
+  outcome: clinical_cases
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 12000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- clinical_cases
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - net_use
+    - resistance
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: clinical_cases_averted
+  headline:
+    name: total_clinical_cases_averted
+    outcome: clinical_cases

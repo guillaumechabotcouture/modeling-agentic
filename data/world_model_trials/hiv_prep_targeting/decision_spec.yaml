@@ -1,15 +1,12 @@
-# World-model trial template (hiv_prep_targeting): generated deterministically; see the questions file for its
-# inputs and derivation. Test input, not signed by the owner.
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (world-model trial): every district, population and number is synthetic. An HIV
-  programme has US$4 million for pre-exposure prophylaxis (PrEP) in 2026-2027 for 12 population groups (adolescent
-  girls and young women, men who have sex with men, and HIV-negative partners in serodiscordant couples, in each
-  of four districts). For each group choose one option: none; ORAL (daily oral TDF/FTC PrEP); CAB (long-acting injectable
-  cabotegravir every two months). Costs per person-year on PrEP: ORAL US$120, CAB US$300; the group sizes in units.csv
-  are the people expected to start PrEP if offered. Input file: units.csv (group, district, people expected to start,
-  HIV incidence per person-year without PrEP, expected adherence score). Choose the options that maximise HIV infections
-  averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval, and state the decision
-  rule.'
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district, population and number is synthetic. An HIV programme
+  has US$8 million for pre-exposure prophylaxis (PrEP) in 2026-2027 for 24 population groups (adolescent girls and young women,
+  men who have sex with men, and HIV-negative partners in serodiscordant couples, in each of eight districts). For each group
+  choose one option: none; ORAL (daily oral TDF/FTC PrEP); CAB (long-acting injectable cabotegravir every two months). Costs
+  per person-year on PrEP: ORAL US$120, CAB US$300; the group sizes in units.csv are the people expected to start PrEP if
+  offered. Input file: units.csv (group, district, people expected to start, HIV incidence per person-year without PrEP, expected
+  adherence score). Choose the options that maximise HIV infections averted over 2026-2027 within the budget, report the total
+  with a 95% uncertainty interval, and state the decision rule.'
 decision_maker: programme manager (world-model trial; template, not owner-signed)
 decision_date: 2026
 engine:
@@ -35,9 +32,9 @@ engine:
           - 0.95
           dist: triangular
           measure: hazard_ratio
-          source: 'oral TDF/FTC efficacy varies with adherence: Partners PrEP (Baeten et al. 2012, N Engl J Med
-            367:399; efficacy 75%), iPrEx (Grant et al. 2010, N Engl J Med 363:2587; 44%), FEM-PrEP (Van Damme et
-            al. 2012, N Engl J Med 367:411; no efficacy with low adherence)'
+          source: 'oral TDF/FTC efficacy varies with adherence: Partners PrEP (Baeten et al. 2012, N Engl J Med 367:399; efficacy
+            75%), iPrEx (Grant et al. 2010, N Engl J Med 363:2587; 44%), FEM-PrEP (Van Damme et al. 2012, N Engl J Med 367:411;
+            no efficacy with low adherence)'
           verified: false
       cab:
         relative_to: oral
@@ -48,8 +45,8 @@ engine:
           - 0.62
           dist: triangular
           measure: hazard_ratio
-          source: 'CAB-LA vs TDF/FTC: HPTN 083 (Landovitz et al. 2021, N Engl J Med 385:595; hazard ratio 0.34,
-            0.18-0.62) and HPTN 084 (Delany-Moretlwe et al. 2022, Lancet 399:1779; hazard ratio 0.11, 0.04-0.32)'
+          source: 'CAB-LA vs TDF/FTC: HPTN 083 (Landovitz et al. 2021, N Engl J Med 385:595; hazard ratio 0.34, 0.18-0.62)
+            and HPTN 084 (Delany-Moretlwe et al. 2022, Lancet 399:1779; hazard ratio 0.11, 0.04-0.32)'
           verified: false
     combination:
       rule: multiplicative
@@ -118,7 +115,7 @@ objective:
   - 2028.0
   discounting: none
 constraints:
-  envelope_usd: 4000000
+  envelope_usd: 8000000
 comparator:
   package: none
   text: no package in the decision window
@@ -134,8 +131,8 @@ calibration:
   window:
   - 0.0
   - 0.0
-  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
-    is an attribute the engine does not read (inert by construction)
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
 uncertainty:
   draws: 16
   seed: 3
@@ -153,13 +150,20 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 16
+    points: 100
     holdout_share: 0.0
     seed: 7
     features:
     - inc
     - adherence
     - group_code
+    independent_features:
+      features:
+      - adherence
+      basis: 'generate_units.py draws adherence uniform independently of every other column; inc is drawn within each group''s
+        range (depends on group_code), so neither inc nor group_code is declared independent (24 synthetic units: 8 districts
+        x 3 groups)'
+      generator: generate_units.py
   stability:
     holdout_group: region
   sensitivity:

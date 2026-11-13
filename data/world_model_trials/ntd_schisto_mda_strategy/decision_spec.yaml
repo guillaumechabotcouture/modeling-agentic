@@ -1,0 +1,225 @@
+# World-model trial template (ntd_schisto_mda_strategy, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national NTD programme
+  has US$2 million for 2026 praziquantel mass drug administration in 20 districts. For each district choose one
+  strategy: none; SCHOOL (school-based treatment of school-age children, 75% coverage of them); COMMUNITY (community-wide
+  treatment of everyone aged 5 and over, 60% coverage). Costs per resident: SCHOOL US$0.25, COMMUNITY US$0.80. Input
+  file: units.csv (population, Schistosoma infection prevalence among school-age children and among adults from
+  a 2025 synthetic survey). Choose the strategies that maximise infections averted in 2026 within the budget, report
+  the total with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: national NTD programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - school
+    - community
+    outcome: infections
+    mode: trial_priors
+    outcomes:
+      sac:
+        baseline_source: 'synthetic 2025 survey: infections in school-age children per resident'
+      adult:
+        baseline_source: 'synthetic 2025 survey: infections in adults per resident'
+    baseline:
+      measured_under: no_components
+      source: no MDA for two years before the decision (synthetic)
+    effects:
+      school:
+        sac:
+          rr: 0.43
+          range:
+          - 0.3
+          - 0.6
+          dist: triangular
+          measure: risk_ratio
+          source: 'derived: 1 - coverage 0.75 x cure rate (Zwang J, Olliaro PL. Clinical efficacy and tolerability
+            of praziquantel for intestinal and urinary schistosomiasis: a meta-analysis of comparative and non-comparative
+            clinical trials. PLoS Negl Trop Dis 2014;8:e3286 (cure rate about 76%))'
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.1
+            source: synthetic baseline prevalence, about 10%
+        adult:
+          rr: 1.0
+          range:
+          - 0.99
+          - 1.01
+          dist: uniform
+          measure: rate_ratio
+          source: school-based treatment does not treat adults (no transmission effect assumed within one year)
+          verified: false
+      community:
+        sac:
+          rr: 0.54
+          range:
+          - 0.4
+          - 0.7
+          dist: triangular
+          measure: risk_ratio
+          source: 'derived: 1 - coverage 0.60 x cure rate (Zwang J, Olliaro PL. Clinical efficacy and tolerability
+            of praziquantel for intestinal and urinary schistosomiasis: a meta-analysis of comparative and non-comparative
+            clinical trials. PLoS Negl Trop Dis 2014;8:e3286 (cure rate about 76%))'
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.1
+            source: synthetic baseline prevalence, about 10%
+        adult:
+          rr: 0.54
+          range:
+          - 0.4
+          - 0.7
+          dist: triangular
+          measure: risk_ratio
+          source: 'derived: 1 - coverage 0.60 x cure rate (Zwang J, Olliaro PL. Clinical efficacy and tolerability
+            of praziquantel for intestinal and urinary schistosomiasis: a meta-analysis of comparative and non-comparative
+            clinical trials. PLoS Negl Trop Dis 2014;8:e3286 (cure rate about 76%))'
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.1
+            source: synthetic baseline prevalence, about 10%
+    combination:
+      rule: multiplicative
+      source: 'alternatives: one strategy per district'
+    compose:
+      infections:
+        sac:
+          value: 1.0
+          source: infections counted alike in both age groups
+        adult:
+          value: 1.0
+          source: infections counted alike in both age groups
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        sac: prev_sac
+        adult: prev_adult
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    school:
+      group: strategy
+    community:
+      group: strategy
+  packages:
+    none: []
+    school:
+    - school
+    community:
+    - community
+  engine_map:
+    school:
+      school: 1
+    community:
+      community: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: school_cost
+    component: school
+    value: 0.25
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - school_delivery
+  - id: community_cost
+    component: community
+    value: 0.8
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - community_delivery
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 2000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- infections
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - prev_sac
+    - prev_adult
+    - pop
+    independent_features:
+      features:
+      - prev_sac
+      - prev_adult
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

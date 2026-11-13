@@ -1,0 +1,180 @@
+# World-model trial template (hpv_dose_schedule, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national immunisation
+  programme will run an HPV vaccination campaign for girls aged 9-14 in 2026 across 24 districts with US$3.0 million.
+  For each district choose one option: none; ONE_DOSE (single-dose campaign, about 80% of girls reached); TWO_DOSE
+  (two doses six months apart, about 80% reached for the first dose and 65% completing both). Costs per girl in
+  the target population: ONE_DOSE US$6, TWO_DOSE US$11. Input file: units.csv (girls aged 9-14, incidence of persistent
+  HPV 16/18 infection per girl-year from a synthetic cohort, school enrolment share). Choose the options that maximise
+  persistent HPV 16/18 infections averted over 2026-2030 within the budget, report the total with a 95% uncertainty
+  interval and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - one_dose
+    - two_dose
+    outcome: persistent_hpv
+    mode: trial_priors
+    outcomes:
+      persistent_hpv:
+        baseline_source: synthetic cohort incidence of persistent HPV 16/18 infection among unvaccinated girls
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      one_dose:
+        persistent_hpv:
+          rr: 0.24
+          range:
+          - 0.2
+          - 0.35
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - reach 0.8 x single-dose efficacy about 0.95 against persistent HPV 16/18 (Barnabas
+            RV et al. Efficacy of single-dose human papillomavirus vaccination among young African women. NEJM Evid
+            2022;1(5))'
+          verified: false
+      two_dose:
+        persistent_hpv:
+          rr: 0.3
+          range:
+          - 0.22
+          - 0.42
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - (0.65 completing x 0.97 + 0.15 one dose only x 0.95) (Barnabas RV et al. NEJM Evid
+            2022; two-dose efficacy taken as at least single-dose)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2031.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        persistent_hpv: inc
+options:
+  populations:
+    total: pop
+  components:
+    one_dose:
+      group: hpv
+    two_dose:
+      group: hpv
+  packages:
+    none: []
+    one_dose:
+    - one_dose
+    two_dose:
+    - two_dose
+  engine_map:
+    one_dose:
+      one_dose: 1
+    two_dose:
+      two_dose: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: one_dose_cost
+    component: one_dose
+    value: 6.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - one_dose
+  - id: two_dose_cost
+    component: two_dose
+    value: 11.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - two_dose
+objective:
+  outcome: persistent_hpv
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2031.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- persistent_hpv
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - school_enrol
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: persistent_hpv_averted
+  headline:
+    name: total_persistent_hpv_averted
+    outcome: persistent_hpv

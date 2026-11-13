@@ -1,13 +1,11 @@
-# World-model trial template (cholera_ocv_siting): generated deterministically; see the questions file for its
-# inputs and derivation. Test input, not signed by the owner.
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national cholera
-  programme has US$2.5 million for preventive oral cholera vaccine (OCV) campaigns in 2026 across 12 districts.
-  For each district choose one option: none; OCV1 (a single-dose campaign); OCV2 (a two-dose campaign). A campaign
-  reaches 70% of the population. Cost: US$3.00 per dose delivered (vaccine and delivery). Input file: units.csv
-  (population, suspected cholera incidence per person-year over the last five years with no vaccination, share with
-  improved sanitation). Choose the options that maximise suspected cholera cases averted over 2026-2027 within the
-  budget, report the total with a 95% uncertainty interval, and state the decision rule for siting the campaigns.'
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A national cholera programme
+  has US$5.0 million for preventive oral cholera vaccine (OCV) campaigns in 2026 across 24 districts. For each district choose
+  one option: none; OCV1 (a single-dose campaign); OCV2 (a two-dose campaign). A campaign reaches 70% of the population. Cost:
+  US$3.00 per dose delivered (vaccine and delivery). Input file: units.csv (population, suspected cholera incidence per person-year
+  over the last five years with no vaccination, share with improved sanitation). Choose the options that maximise suspected
+  cholera cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval, and state the
+  decision rule for siting the campaigns.'
 decision_maker: programme manager (world-model trial; template, not owner-signed)
 decision_date: 2026
 engine:
@@ -33,8 +31,8 @@ engine:
           - 0.92
           dist: triangular
           measure: rate_ratio
-          source: 'derived: 1 - reach 0.7 x single-dose efficacy 0.39 (0.11-0.60) over two years (Qadri et al. 2018,
-            Lancet Glob Health 6:e680; Qadri et al. 2016, Lancet 387:1362)'
+          source: 'derived: 1 - reach 0.7 x single-dose efficacy 0.39 (0.11-0.60) over two years (Qadri et al. 2018, Lancet
+            Glob Health 6:e680; Qadri et al. 2016, Lancet 387:1362)'
           verified: false
       ocv2:
         cases:
@@ -44,8 +42,8 @@ engine:
           - 0.71
           dist: triangular
           measure: rate_ratio
-          source: 'derived: 1 - reach 0.7 x two-dose efficacy 0.58 (0.42-0.69) (Bi et al. 2017, Lancet Infect Dis
-            17:1080, meta-analysis of killed whole-cell OCV)'
+          source: 'derived: 1 - reach 0.7 x two-dose efficacy 0.58 (0.42-0.69) (Bi et al. 2017, Lancet Infect Dis 17:1080,
+            meta-analysis of killed whole-cell OCV)'
           verified: false
     combination:
       rule: multiplicative
@@ -116,7 +114,7 @@ objective:
   - 2028.0
   discounting: none
 constraints:
-  envelope_usd: 2500000
+  envelope_usd: 5000000
 comparator:
   package: none
   text: no package in the decision window
@@ -132,8 +130,8 @@ calibration:
   window:
   - 0.0
   - 0.0
-  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
-    is an attribute the engine does not read (inert by construction)
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
 uncertainty:
   draws: 16
   seed: 3
@@ -151,13 +149,21 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 16
+    points: 100
     holdout_share: 0.0
     seed: 7
     features:
     - inc
     - wash
     - pop
+    independent_features:
+      features:
+      - inc
+      - wash
+      - pop
+      basis: generate_units.py draws pop and inc log-uniform and wash uniform, each from its own seeded stream position with
+        no dependence on any other column (24 synthetic districts)
+      generator: generate_units.py
   stability:
     holdout_group: region
   sensitivity:

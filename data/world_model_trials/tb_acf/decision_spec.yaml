@@ -1,18 +1,16 @@
-# World-model trial template (tb_acf): generated deterministically; see the questions file for its
-# inputs and derivation. Test input, not signed by the owner.
 schema_version: 1
-question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated
-  for this test; none describes a real place. A TB programme has US$1.1 million for one round of active case finding
-  among high-risk adults in 10 districts in 2026. For each district choose one screening algorithm: none; SYM (symptom
-  screening, with Xpert MTB/RIF Ultra for people with presumptive TB); CXR (chest X-ray for everyone screened, with
-  Xpert if the X-ray is abnormal). A round reaches 70% of each district''s target population, and costs are per
-  person screened. Input files: data/evals/tb_acf/districts.csv (target population), data/evals/tb_acf/acf_records_2022_2025.csv
-  (people screened and bacteriologically confirmed cases detected, by district, year and algorithm; assume the prevalence
-  of undiagnosed TB in the target population was stable over 2022-2025 and is unchanged in 2026), data/evals/tb_acf/algorithm_costs.csv,
-  data/evals/tb_acf/national_reference_yields.csv. Choose the algorithms that maximise bacteriologically confirmed
-  TB cases detected within the budget, report the total with a 95% uncertainty interval, and state the decision
-  rule. Deliverables: allocation_optimized.csv in the run directory with columns district, package (none, SYM or
-  CXR) and cases_detected; and the uncertainty analysis must report the total as an output named total_cases_detected.'
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated for this
+  test; none describes a real place. A TB programme has US$1.1 million for one round of active case finding among high-risk
+  adults in 10 districts in 2026. For each district choose one screening algorithm: none; SYM (symptom screening, with Xpert
+  MTB/RIF Ultra for people with presumptive TB); CXR (chest X-ray for everyone screened, with Xpert if the X-ray is abnormal).
+  A round reaches 70% of each district''s target population, and costs are per person screened. Input files: data/evals/tb_acf/districts.csv
+  (target population), data/evals/tb_acf/acf_records_2022_2025.csv (people screened and bacteriologically confirmed cases
+  detected, by district, year and algorithm; assume the prevalence of undiagnosed TB in the target population was stable over
+  2022-2025 and is unchanged in 2026), data/evals/tb_acf/algorithm_costs.csv, data/evals/tb_acf/national_reference_yields.csv.
+  Choose the algorithms that maximise bacteriologically confirmed TB cases detected within the budget, report the total with
+  a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run directory with
+  columns district, package (none, SYM or CXR) and cases_detected; and the uncertainty analysis must report the total as an
+  output named total_cases_detected.'
 decision_maker: programme manager (world-model trial; template, not owner-signed)
 decision_date: 2026
 engine:
@@ -25,8 +23,8 @@ engine:
     mode: trial_priors
     outcomes:
       undetected:
-        baseline_source: 'derived: prevalence of undiagnosed bacteriologically confirmed TB = mean CXR-round yield
-          per person screened in data/evals/tb_acf/acf_records_2022_2025.csv / CXR algorithm sensitivity 0.83'
+        baseline_source: 'derived: prevalence of undiagnosed bacteriologically confirmed TB = mean CXR-round yield per person
+          screened in data/evals/tb_acf/acf_records_2022_2025.csv / CXR algorithm sensitivity 0.83'
     baseline:
       measured_under: no_components
       source: no ACF round in 2026 before the decision
@@ -39,9 +37,9 @@ engine:
           - 0.79
           dist: triangular
           measure: rate_ratio
-          source: 'derived: share left undetected = 1 - reach 0.7 x algorithm sensitivity 0.44 (0.3-0.6): about
-            half of bacteriologically confirmed TB is symptom-negative (Frascella et al. 2021, Clin Infect Dis 73:e830)
-            and Xpert Ultra sensitivity about 0.88 (Dorman et al. 2018, Lancet Infect Dis 18:76)'
+          source: 'derived: share left undetected = 1 - reach 0.7 x algorithm sensitivity 0.44 (0.3-0.6): about half of bacteriologically
+            confirmed TB is symptom-negative (Frascella et al. 2021, Clin Infect Dis 73:e830) and Xpert Ultra sensitivity
+            about 0.88 (Dorman et al. 2018, Lancet Infect Dis 18:76)'
           verified: false
       cxr:
         undetected:
@@ -51,9 +49,8 @@ engine:
           - 0.51
           dist: triangular
           measure: rate_ratio
-          source: 'derived: 1 - reach 0.7 x algorithm sensitivity 0.83 (0.7-0.9): CXR any abnormality sensitivity
-            about 0.95 (WHO 2021 consolidated guidelines on TB, Module 2: screening) x Xpert Ultra about 0.88 (Dorman
-            et al. 2018)'
+          source: 'derived: 1 - reach 0.7 x algorithm sensitivity 0.83 (0.7-0.9): CXR any abnormality sensitivity about 0.95
+            (WHO 2021 consolidated guidelines on TB, Module 2: screening) x Xpert Ultra about 0.88 (Dorman et al. 2018)'
           verified: false
     combination:
       rule: multiplicative
@@ -140,8 +137,8 @@ calibration:
   window:
   - 0.0
   - 0.0
-  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
-    is an attribute the engine does not read (inert by construction)
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
 uncertainty:
   draws: 16
   seed: 3
@@ -159,7 +156,7 @@ uncertainty:
 analysis:
   evaluation: emulator
   emulator:
-    points: 16
+    points: 100
     holdout_share: 0.0
     seed: 7
     features:
