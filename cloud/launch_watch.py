@@ -99,6 +99,7 @@ import run_cluster as rc  # noqa: E402
 EXIT_DONE, EXIT_LAUNCH_FAILED, EXIT_NEVER_RAN, EXIT_CAP = 0, 1, 2, 3
 EXIT_UNCONFIRMED, EXIT_SHUTDOWN_UNCONFIRMED, EXIT_LIMIT, EXIT_REFUSED, EXIT_PRELIVE = 4, 5, 6, 7, 8
 SUBMITTED = (rc.EXIT_LAUNCHED, rc.EXIT_SUBMITTED_LOST, rc.EXIT_UNCONFIRMED, rc.EXIT_INCOMPLETE)   # 0, 3, 4, 5
+STATUS_S = 300      # the watch loop's status deadline: a spend reading at least every interval + this
 TIMEOUTS = {"status": 600, "collect": 1800, "relaunch": 1800}   # defaults; launch and collect get the Watch's
 _NET = re.compile(r"gaierror|nodename nor servname|name resolution|Name or service not known|getaddrinfo|"
                   r"Timed out trying to connect|tls://|\bSSL|\bTLS\b|ConnectTimeout|ReadTimeout|TimeoutError|"
@@ -277,12 +278,32 @@ def shell_runner(cfg_path, prefix=None):
                 out.append(f"\nTimeoutError: launch did not return within {timeout} s: terminated\n")
             t.join(timeout=10)
             return code, "".join(out)
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                               timeout=timeout or TIMEOUTS.get(tail[0], 1800))
-        except subprocess.TimeoutExpired as e:
-            return None, f"TimeoutError: {' '.join(tail)} did not return within {e.timeout} s"
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        # 2026-11-12: output to a file, not a pipe, in its own process group, killed whole past the deadline.
+        # subprocess.run(capture_output, timeout) killed the child, then waited for the pipes a grandchild still
+        # held: the watch hung for 80 min and the spend cap went unchecked.
+        import signal
+        import tempfile
+        limit = timeout or TIMEOUTS.get(tail[0], 1800)
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as f:   # a cut character is replaced
+            p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
+            try:
+                code = p.wait(timeout=limit)
+            except subprocess.TimeoutExpired:
+                code = None
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)      # the child and whatever it started
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    pass
+            f.flush()
+            f.seek(0)
+            out = f.read()
+        if code is None:
+            return None, out + f"\nTimeoutError: {' '.join(tail)} did not return within {limit} s: its process group killed\n"
+        return code, out
     return run
 
 
@@ -409,7 +430,9 @@ class Watch:
                 return self.at_cap(rec)
             if usd is None and getattr(self, "unreadable", 0) >= UNREADABLE_READINGS:
                 return self.at_cap(rec, unreadable=True)
-            code, out = self.call(["status"])
+            # One try per interval (2026-11-12): a retried status skipped the spend reading for up to an hour;
+            # the loop tries again after the next reading.
+            code, out = self.call(["status"], retries=1, timeout=STATUS_S)
             st = parse_status(out, self.cfg.labels) if code == 0 else None
             act = decide(st)
             self.log(f"status: {act} " + (json.dumps(st) if st else ""))
@@ -1031,6 +1054,49 @@ def _self_test() -> int:
         return code is None and "hello" in out and _t.time() - t0 < 20
     case("LW13b", "shell_runner: a launch past its deadline is terminated and reaped, its output kept", deadline_case)
 
+    # 2026-11-12 (canary): the watch logged nothing for 80 min after a spend reading while its `status` call hung;
+    # the cap went unenforced. subprocess.run(capture_output, timeout) kills the child on timeout but then waits for
+    # the pipes, which a surviving grandchild holds open. A call past its deadline now ends with its whole process
+    # group killed, within the deadline plus a small margin, its output so far kept.
+    def grandchild_case():
+        import threading
+        import time as _t
+        prog = ("import subprocess, sys, time; print('started', flush=True); "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); time.sleep(120)")
+        run = shell_runner("cfg.py", prefix=[sys.executable, "-c", prog])
+        box = {}
+        th = threading.Thread(target=lambda: box.update(r=run(["status"], None, timeout=2.0)), daemon=True)
+        t0 = _t.time()
+        th.start()
+        th.join(30)
+        code, out = box.get("r", ("hung", ""))
+        return code is None and "started" in out and "TimeoutError" in out and _t.time() - t0 < 20
+    case("LW13c", "shell_runner: a call past its deadline whose child left a grandchild holding its output returns "
+                  "within the deadline (the process group is killed)", grandchild_case)
+
+    def partial_utf8_case():      # gpt-6-astra review of #208: a cut multibyte sequence must not crash the watch
+        prog = "import sys, time; sys.stdout.buffer.write(b'ok \\xe2\\x82'); sys.stdout.flush(); time.sleep(60)"
+        run = shell_runner("cfg.py", prefix=[sys.executable, "-c", prog])
+        try:
+            code, out = run(["status"], None, timeout=2.0)
+        except UnicodeDecodeError:
+            return False
+        return code is None and out.startswith("ok ")
+    case("LW13e", "shell_runner: output cut inside a UTF-8 character is read with a replacement, not a crash",
+         partial_utf8_case)
+
+    # 2026-11-12: a status call that times out was retried up to `retries` times (each its own deadline) before the
+    # next spend reading, so a hung status could skip the cap for an hour. In the watch loop status is tried once per
+    # interval; the loop itself tries again next time, after a fresh spend reading.
+    def status_once_case():
+        api = _Rising()
+        r = scenario(0, record, lambda cfg: {"status": [(None, "TimeoutError: status did not return within 600 s")],
+                                             "collect": [(0, "A: still running")]}, cap_usd=650.0, api=api)
+        n_status = sum(1 for c in r[1] if c == ("run", "status"))
+        return r[0] == EXIT_CAP and n_status <= api.readings and api.readings >= 6
+    case("LW13d", "a status call that times out is not retried before the next spend reading: the cap is checked "
+                  "every interval", status_once_case)
+
     # P2-7: before an exit that leaves clusters up, every live cluster of the launch's names and its ownership
     case("LW14a", "exit 4: leftovers listed as recorded / journal / unknown; nothing extra stopped",
          lambda: (lambda r: r[0] == EXIT_UNCONFIRMED and stops(r[1]) == []
@@ -1244,6 +1310,19 @@ class _FakeApi:
 
     def usd_of(self, cid):                      # what the budget's meter reports for a cluster
         return 0.0
+
+
+class _Rising(_FakeApi):
+    """The run cluster (id 100) costs $100 more at each reading; `readings` counts them."""
+    def __init__(self):
+        super().__init__()
+        self.readings = 0
+
+    def usd_of(self, cid):
+        if cid != 100:
+            return 0.0
+        self.readings += 1
+        return 100.0 * self.readings
 
 
 class _Sticky(_FakeApi):
