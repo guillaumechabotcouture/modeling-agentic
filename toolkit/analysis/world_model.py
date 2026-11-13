@@ -1299,6 +1299,15 @@ def _cli(argv):
 EVIDENCE_TIME, REGISTERED = "2026-01-01T00:00:00+00:00", "2025-12-01T00:00:00+00:00"   # synthetic sweeps and seeds
 
 
+def _head(ledger, at):
+    """A recorded ledger head (what the harness writes into run_state.json history at a step's start)."""
+    return {"at": at, "lines": len(ledger), "head": ledger[-1]["line_sha"], "source": "test"}
+
+
+def _anch(ledger, at=None):
+    return {"lines": ledger, "anchors": [_head(ledger, at or REGISTERED)]}
+
+
 def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
     """A sweep with packages none, A (component a) and B (component b, same group): relative reductions rA, rB."""
     n = len(rA)
@@ -1447,7 +1456,7 @@ def _self_test() -> int:
         units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
         wm, hy = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
-                       registry=register(_seed(), [], at=REGISTERED))
+                       registry=_anch(register(_seed(), [], at=REGISTERED)))
         st = {h["id"]: h["status"] for h in hy["hypotheses"]}
         ok(st == {"H1": "supported", "H2": "refuted", "H3": "supported", "H4": "supported", "H5": "supported"},
            f"WM8 check() supports the true hypotheses and flags the false one (H2) as refuted: {st}")
@@ -1475,7 +1484,7 @@ def _self_test() -> int:
            "WM15 a plan hypothesis without a plan is untestable, never supported")
         sd = _seed()
         sd["beliefs"][3].update(decision_relevant=True, confidence="high")
-        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
+        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
         ok(any(x["belief"] == "B4" and x["kind"] == "contradiction" for x in where_to_look(wm2, top=0)),
            "WM33 where_to_look always lists a contradicted decision-relevant belief, even with no conditions or "
            "conflicts and top=0")
@@ -1669,7 +1678,7 @@ def _self_test() -> int:
         rng = np.random.default_rng(1)
         units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
-        reg = register(_seed(), [], at=REGISTERED)
+        reg = _anch(register(_seed(), [], at=REGISTERED))
         wm1, hy1 = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg)
         wm2, hy2 = build(wm1, sw, plan=plan, units=units, hypotheses=hy1["hypotheses"], plan_time=EVIDENCE_TIME,
                          registry=reg)
@@ -1691,18 +1700,19 @@ def _self_test() -> int:
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
         sd = _seed()
         sd["hypotheses"].append(dict(sd["hypotheses"][0], id="H1b"))
-        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
+        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
         ok(wa["track_record"]["confirmed"] == 4, f"WM39 an alias (identical test, same evidence) counts once: "
                                                  f"{wa['track_record']['confirmed']}")
         sd = _seed()
         sd["track_record"] = {"confirmed": 99, "contradicted": 0, "history": []}
-        wr, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
+        wr, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
         ok(wr["track_record"]["confirmed"] == 4 and wr["track_record"].get("reconciled"),
            f"WM40 seed counters are recomputed from the confrontations, not trusted: {wr['track_record']}")
         sd = _seed()
-        reg = register(dict(sd, hypotheses=[h for h in sd["hypotheses"] if h["id"] not in ("H1", "H4")]), [],
-                       at=REGISTERED)
-        reg = register(dict(sd, hypotheses=[sd["hypotheses"][0]]), reg, at="2026-02-01T00:00:00+00:00")
+        reg1 = register(dict(sd, hypotheses=[h for h in sd["hypotheses"] if h["id"] not in ("H1", "H4")]), [],
+                        at=REGISTERED)
+        reg2 = register(dict(sd, hypotheses=[sd["hypotheses"][0]]), reg1, at="2026-02-01T00:00:00+00:00")
+        reg = {"lines": reg2, "anchors": [_head(reg1, REGISTERED), _head(reg2, "2026-02-01T00:00:00+00:00")]}
         wp, hp = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg)
         tr = wp["track_record"]
         ok(tr["confirmed"] == 2 and (tr.get("post_hoc") or {}).get("confirmed") == 2 and
@@ -1927,7 +1937,7 @@ def _self_test() -> int:
            f"{wn['track_record']['confirmed']} counted")
         sd = _seed()
         sd["hypotheses"][0]["test"]["band"] = [0.7, 0.9]                  # registered: a band the sweep refutes
-        reg = register(sd, [], at=REGISTERED)
+        reg = _anch(register(sd, [], at=REGISTERED))
         wm0, hy0 = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=reg)
         ok(hy0["hypotheses"][0]["status"] == "refuted" and not hy0["hypotheses"][0]["confrontation"]["post_hoc"],
            "WM54 a hypothesis whose test is in the registration ledger before its evidence is pre-registered")
@@ -1937,7 +1947,7 @@ def _self_test() -> int:
         ok(h1["status"] == "supported" and h1["confrontation"]["post_hoc"] and wm1["track_record"]["confirmed"] == 3,
            f"WM54b an edit after registration is post hoc, whatever its registered_at: {h1['confrontation']} "
            f"{wm1['track_record']['confirmed']}")
-        late = register(_seed(), [], at="2026-02-01T00:00:00+00:00")
+        late = _anch(register(_seed(), [], at="2026-02-01T00:00:00+00:00"), "2026-02-01T00:00:00+00:00")
         _, hy2 = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=late)
         ok(all(h["confrontation"]["post_hoc"] for h in hy2["hypotheses"]),
            "WM54c a ledger entry dated after the evidence does not pre-register")
@@ -1986,7 +1996,7 @@ def _self_test() -> int:
         sd = _seed()
         sd["hypotheses"].append(dict(sd["hypotheses"][3], id="H4b", test=dict(sd["hypotheses"][3]["test"],
                                                                                 scope="conditional")))
-        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=register(sd, [], REGISTERED))
+        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
         ok(wa["track_record"]["confirmed"] == 4, f"WM56c an alias spelled with an explicit default counts once: "
                                                  f"{wa['track_record']['confirmed']}")
     tryit("WM56 canonical tests", wm56)
@@ -2031,6 +2041,169 @@ def _self_test() -> int:
         d2 = direction(x, x + 0.3 * np.random.default_rng(4).standard_normal(60))
         ok(d2.get("p_method") == "fisher", f"WM58b from {SETTINGS.get('perm_n_max')} points on, Fisher: {d2}")
     tryit("WM58 small samples", wm58)
+
+    def wm67():
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        kw = dict(plan=plan, units=units, plan_time=EVIDENCE_TIME)
+        sd = _seed()
+        sd["hypotheses"][0]["test"]["band"] = [0.7, 0.9]
+        reg = register(sd, [], at=REGISTERED)
+        forged = json.loads(json.dumps(reg))            # after seeing the result: a winning band, every hash recomputed
+        forged[0]["test"]["band"] = [0.2, 0.4]
+        prev = "0" * 64
+        for e in forged:
+            e["test_sha"], e["prev"] = _sha(e["test"]), prev
+            e["line_sha"] = _line_sha(e)
+            prev = e["line_sha"]
+        sd2 = _seed()
+        _, h0 = build(sd2, sw, registry=forged, **kw)
+        ok(h0["hypotheses"][0]["confrontation"]["post_hoc"], "WM67 a ledger with no recorded head pre-registers nothing "
+                                                             "(a self-attesting, rehashed rewrite counts post hoc)")
+        for lines, why in ((forged, "a rehashed rewrite"), (reg[:3], "a truncated ledger")):
+            try:
+                build(sd2, sw, registry={"lines": lines, "anchors": [_head(reg, REGISTERED)]}, **kw)
+                ok(False, f"WM67b {why} that does not extend the recorded head is refused")
+            except WorldModelError:
+                ok(True, f"WM67b {why} that does not extend the recorded head is refused")
+        later = register(dict(sd2, hypotheses=[dict(sd2["hypotheses"][0], id="H1x")]), reg, at=REGISTERED)
+        _, h1 = build(dict(sd2, hypotheses=[dict(sd2["hypotheses"][0], id="H1x")]), sw,
+                      registry={"lines": later, "anchors": [_head(reg, REGISTERED)]}, **kw)
+        ok(h1["hypotheses"][0]["confrontation"]["post_hoc"], "WM67c a line appended after the last recorded head, even "
+                                                             "dated early, is post hoc")
+    tryit("WM67 anchored ledger", wm67)
+
+    def wm68():
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            work, remote = os.path.join(d, "work"), os.path.join(d, "remote.git")
+            vcs = lambda c, *a: subprocess.run(["git", "-C", c, *a], capture_output=True, text=True)  # noqa: E731
+            subprocess.run(["git", "init", "-q", "--bare", remote], capture_output=True)
+            os.makedirs(work)
+            vcs(work, "init", "-q")
+            vcs(work, "config", "user.email", "t@t")
+            vcs(work, "config", "user.name", "t")
+            reg = register(_seed(), [], at=REGISTERED)
+            path = os.path.join(work, "hypotheses_registry.jsonl")
+            open(path, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in reg))
+            vcs(work, "add", ".")
+            vcs(work, "commit", "-qm", "register")
+            vcs(work, "remote", "add", "origin", remote)
+            vcs(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+            vcs(work, "fetch", "-q", "origin")
+            more = register(dict(_seed(), hypotheses=[dict(_seed()["hypotheses"][0], id="H9", test=dict(
+                _seed()["hypotheses"][0]["test"], min_share=0.9))]), reg, at=REGISTERED)
+            open(path, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in more))
+            vcs(work, "commit", "-qam", "local only")
+            an = git_anchors(path, "origin/main")
+            ok(len(an) == 1 and an[0]["lines"] == 5 and an[0]["source"].startswith("anchored in git (remote commit ")
+               and len(an[0]["commit"]) == 40, f"WM68 a ledger head in a commit on the fetched remote is an anchor; an "
+                                               f"unpushed commit is not: {an}")
+    tryit("WM68 git anchor", wm68)
+
+    def wm69():
+        import yaml
+        from toolkit.analysis.artifacts import sha256
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write("x: 1\n")
+            ident = {"name": "e"}
+            base = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident}}
+            pth = os.path.join(d, "analysis", "point.yaml")
+            yaml.safe_dump(dict(base, inputs={"missing.csv": None}), open(pth, "w"))
+            try:
+                point_doc(d, ident)
+                ok(False, "WM69 a missing input recorded with a null hash is refused")
+            except WorldModelError:
+                ok(True, "WM69 a missing input recorded with a null hash is refused")
+            yaml.safe_dump({"schema": "analysis.calibration/1", "data": {}},
+                           open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
+            yaml.safe_dump(dict(base, inputs={"analysis/calibration.yaml": sha256(os.path.join(
+                d, "analysis", "calibration.yaml"))}), open(pth, "w"))
+            try:
+                point_doc(d, ident)
+                ok(False, "WM69b a harness artifact (schema analysis.*) without inputs is refused, not a leaf")
+            except WorldModelError:
+                ok(True, "WM69b a harness artifact (schema analysis.*) without inputs is refused, not a leaf")
+    tryit("WM69 provenance leaves", wm69)
+
+    def wm70():
+        import yaml
+        ident = {"name": "e", "version": "1", "code_sha256": "c" * 64, "params_sha256": "p" * 64,
+                 "config_sha256": "k" * 64}
+        with tempfile.TemporaryDirectory() as d:
+            yaml.safe_dump({"engine_identity": ident}, open(os.path.join(d, "results.yaml"), "w"))
+            for k in ("name", "params_sha256", "config_sha256"):
+                try:
+                    benchmark_record(d, dict(ident, **{k: "x"}))
+                    ok(False, f"WM70 a recorded identity differing in {k} does not match the benchmark")
+                except WorldModelError:
+                    ok(True, f"WM70 a recorded identity differing in {k} does not match the benchmark")
+    tryit("WM70 full identity", wm70)
+
+    def wm71():
+        sd = _seed()
+        sd["hypotheses"][3]["test"]["equivalence"] = 0.2
+        try:
+            validate_seed(sd)
+            ok(False, "WM71 an equivalence bound on an increases/decreases claim is refused (it changes nothing)")
+        except WorldModelError:
+            ok(True, "WM71 an equivalence bound on an increases/decreases claim is refused (it changes nothing)")
+        sd = _seed()
+        sd["beliefs"][2]["conditions"] = [{"feature": "f1", "range": [0.0, 0.2]}, {"feature": "f1", "range": [0.8, 1.0]}]
+        try:
+            validate_seed(sd)
+            ok(False, "WM72 repeated conditions on one feature are intersected; an empty intersection is refused")
+        except WorldModelError:
+            ok(True, "WM72 repeated conditions on one feature are intersected; an empty intersection is refused")
+        b = {"conditions": [{"feature": "f1", "range": [0.0, 0.6]}, {"feature": "f1", "range": [0.4, 1.0]}]}
+        c = canonical_test({"kind": "effect_band", "package": "A", "band": [0.2, 0.4], "min_share": 0.8}, b)
+        ok(c["where"] == {"f1": [0.4, 0.6]}, f"WM72b two conditions on one feature apply as their intersection: {c}")
+        bn = {"conditions": [{"feature": "f1", "range": [0.0, 0.5]}]}
+        c2 = canonical_test({"kind": "plan_share", "package": "A", "where": {"region": "north"}, "min_share": 0.8}, bn)
+        ok(c2["where"]["region"] == "north", f"WM73 a categorical filter stays intact when conditions apply: {c2}")
+        units = {str(i): {"f1": 0.1 * i} for i in range(10)}
+        st, _ = _one(sw, {"kind": "plan_share", "package": "A", "where": {}, "min_share": 0.8},
+                     plan={u: "A" for u in units}, units=units)
+        ok(st == "supported", f"WM74 plan_share over every unit (where: {{}}) works after canonicalisation: {st}")
+    tryit("WM71-74 canonical tests and conditions", wm71)
+
+    def wm75():
+        import subprocess
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            paths = []
+            for k in range(4):
+                sd = _seed()
+                for h in sd["hypotheses"]:
+                    h["id"] += f"_{k}"
+                    if "min_share" in h["test"]:
+                        h["test"]["min_share"] = 0.81 + 0.01 * k
+                paths.append(os.path.join(d, f"seed{k}.yaml"))
+                yaml.safe_dump(sd, open(paths[-1], "w"))
+            procs = [subprocess.Popen([sys.executable, os.path.abspath(__file__), "register", q, d],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for q in paths]
+            codes = [q.wait() for q in procs]
+            lines = [json.loads(x) for x in open(os.path.join(d, LEDGER)) if x.strip()]
+            try:
+                verify_ledger(lines)
+                good = True
+            except WorldModelError:
+                good = False
+            ok(codes == [0] * 4 and good and len(lines) == 2 + 3 * 4, f"WM75 concurrent registrations hold one lock: "
+                                                                      f"the ledger verifies ({len(lines)} lines, "
+                                                                      f"exit codes {codes})")
+    tryit("WM75 registration lock", wm75)
+
+    def wm76():
+        x = np.arange(10.0)
+        cs = _sw({"x": x}, np.where(x >= 8, 0.5, 0.2), 0.35 + 0 * x)
+        fa = flip_along(cs, "A", "B", "x")
+        ok(0.03 <= (fa.get("p") or 0) <= 0.06 and fa.get("p_method") == "permutation",
+           f"WM76 a small-sample flip's p-value is a permutation p-value (exact 0.0444, not the logistic 0.0026): {fa}")
+    tryit("WM76 small-sample flips", wm76)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
