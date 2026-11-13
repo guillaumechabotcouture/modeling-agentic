@@ -1413,6 +1413,23 @@ def _anch(ledger, at=None):
     return {"lines": ledger, "anchors": [_head(ledger, at or REGISTERED)]}
 
 
+def _bind(d):
+    """A completed analysis manifest listing the run's point.yaml with the current batch (design, results)."""
+    import yaml
+    from toolkit.analysis.artifacts import sha256
+    b = os.path.join(d, "analysis", "batch")
+    os.makedirs(b, exist_ok=True)
+    for name in ("design.json", "results.jsonl"):
+        if not os.path.exists(os.path.join(b, name)):
+            open(os.path.join(b, name), "w").write("{}\n")
+    yaml.safe_dump({"written_at": EVIDENCE_TIME, "inputs": {
+        f"analysis/batch/{n}": sha256(os.path.join(b, n)) for n in ("design.json", "results.jsonl")}},
+        open(os.path.join(d, "analysis", "batch.yaml"), "w"))
+    json.dump({"complete": True, "status": "complete", "artifacts": {
+        rel: {"sha256": sha256(os.path.join(d, rel))} for rel in ("analysis/point.yaml", "analysis/batch.yaml")}},
+        open(os.path.join(d, "analysis", "manifest.json"), "w"))
+
+
 def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
     """A sweep with packages none, A (component a) and B (component b, same group): relative reductions rA, rB."""
     n = len(rA)
@@ -1950,6 +1967,7 @@ def _self_test() -> int:
                     "data": {"engine_identity": ident, "plan": {}}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(good, open(pth, "w"))
+            _bind(d)
             ok(point_doc(d, ident)["data"]["plan"] == {}, "WM49 a point plan bound to this run is read")
             for mut, why in ((lambda g: g.update(spec_sha256="0" * 64), "another spec"),
                              (lambda g: g["data"].update(engine_identity={"name": "e", "version": "2"}),
@@ -1959,6 +1977,7 @@ def _self_test() -> int:
                 bad = json.loads(json.dumps(good))
                 mut(bad)
                 yaml.safe_dump(bad, open(pth, "w"))
+                _bind(d)
                 try:
                     point_doc(d, ident)
                     ok(False, f"WM49b a stale point plan ({why}) is refused")
@@ -2126,6 +2145,7 @@ def _self_test() -> int:
                   "data": {"engine_identity": ident, "plan": {}}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(pt, open(pth, "w"))
+            _bind(d)
             ok(point_doc(d, ident) is not None, "WM57 a plan whose inputs verify all the way down is used")
             put("units.csv", "id,region\n1,south\n")
             try:
@@ -2135,6 +2155,7 @@ def _self_test() -> int:
                 ok(True, "WM57b a plan whose calibration's units table changed is refused (transitive inputs)")
             for inp, why in (({}, "an empty inputs mapping"), (None, "no inputs mapping")):
                 yaml.safe_dump(dict(pt, inputs=inp), open(pth, "w"))
+                _bind(d)
                 try:
                     point_doc(d, ident)
                     ok(False, f"WM57c a plan with {why} is refused")
@@ -2222,6 +2243,7 @@ def _self_test() -> int:
             base = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(dict(base, inputs={"missing.csv": None}), open(pth, "w"))
+            _bind(d)
             try:
                 point_doc(d, ident)
                 ok(False, "WM69 a missing input recorded with a null hash is refused")
@@ -2231,6 +2253,7 @@ def _self_test() -> int:
                            open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
             yaml.safe_dump(dict(base, inputs={"analysis/calibration.yaml": sha256(os.path.join(
                 d, "analysis", "calibration.yaml"))}), open(pth, "w"))
+            _bind(d)
             try:
                 point_doc(d, ident)
                 ok(False, "WM69b a harness artifact (schema analysis.*) without inputs is refused, not a leaf")
@@ -2315,6 +2338,109 @@ def _self_test() -> int:
         ok(0.03 <= (fa.get("p") or 0) <= 0.06 and fa.get("p_method") == "permutation",
            f"WM76 a small-sample flip's p-value is a permutation p-value (exact 0.0444, not the logistic 0.0026): {fa}")
     tryit("WM76 small-sample flips", wm76)
+
+    def wm77():
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            work, remote = os.path.join(d, "work"), os.path.join(d, "remote.git")
+            vcs = lambda c, *a: subprocess.run(["git", "-C", c, *a], capture_output=True, text=True)  # noqa: E731
+            subprocess.run(["git", "init", "-q", "--bare", remote], capture_output=True)
+            os.makedirs(work)
+            vcs(work, "init", "-q", "-b", "main")
+            vcs(work, "config", "user.email", "t@t")
+            vcs(work, "config", "user.name", "t")
+            reg = register(_seed(), [], at=REGISTERED)
+            path = os.path.join(work, "hypotheses_registry.jsonl")
+            open(path, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in reg))
+            vcs(work, "add", ".")
+            vcs(work, "commit", "-qm", "register")
+            vcs(work, "remote", "add", "origin", remote)
+            vcs(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+            vcs(work, "fetch", "-q", "origin")
+            sha = vcs(work, "rev-parse", "HEAD").stdout.strip()
+            for ref in ("HEAD", "main", sha):
+                try:
+                    git_anchors(path, ref)
+                    ok(False, f"WM77 --anchor-ref {ref[:12]} (not a remote-tracking ref) is refused")
+                except WorldModelError:
+                    ok(True, f"WM77 --anchor-ref {ref[:12]} (not a remote-tracking ref) is refused")
+            an = git_anchors(path, "origin/main")
+            ok(an and an[0]["source"].startswith("anchored in remote git (commit ") and
+               "the commit time is the committer's clock" in an[0]["source"],
+               f"WM77b a fetched remote-tracking ref anchors, labelled as remote git: {an[:1]}")
+    tryit("WM77 remote anchors only", wm77)
+
+    def wm78():
+        with tempfile.TemporaryDirectory() as d:
+            json.dump({"history": [{"registry_head": {"at": "2025-01-01T00:00:00+00:00", "lines": 1, "head": "0" * 64}}]},
+                      open(os.path.join(d, "run_state.json"), "w"))
+            ok(cli_anchors(d, os.path.join(d, LEDGER), None) == [],
+               "WM78 run_state.json heads are not anchors (v2 does not hash-protect run_state.json): none without a "
+               "remote ref")
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        wm, hy = build(_seed(), sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
+                       registry=_anch(register(_seed(), [], at=REGISTERED)))
+        st = {h["confrontation"].get("registration_status") for h in hy["hypotheses"]}
+        ok(st == {"remote-anchored"} and wm["track_record"].get("tamper_proof") is False and
+           "not tamper-proof" in wm["track_record"].get("note", ""),
+           f"WM79 the output says each registration is remote-anchored or post hoc and that the track record is not "
+           f"tamper-proof: {st} {wm['track_record'].get('note')}")
+    tryit("WM78-79 anchors and statements", wm78)
+
+    def wm80():
+        rng = np.random.default_rng(13)
+        feats = {f"n{k:03d}": rng.uniform(0, 1, 30) for k in range(100)}
+        null = _sw(feats, 0.3 + 0.02 * rng.standard_normal(30), 0.3 + 0.02 * rng.standard_normal(30))
+        mu = summarise(null)["multiplicity"]
+        ok(mu["tested"] == 300 and mu["discoveries"] == 0, f"WM80 every attempted test enters the false-discovery "
+                                                           f"family (failed fits with p = 1): {mu}")
+    tryit("WM80 multiplicity family", wm80)
+
+    def wm81():
+        x = np.arange(50.0)
+        cs = _sw({"x": x}, np.where(x >= 47, 0.5, 0.2), 0.35 + 0 * x)
+        fa = flip_along(cs, "A", "B", "x")
+        ok(5e-5 <= (fa.get("p") or 0) <= 3e-4 and fa.get("p_method") == "permutation",
+           f"WM81 with fewer than 10 winners a flip's p-value is a permutation p-value at any n (50 points, 3 winners: "
+           f"exact 1.02e-4, logistic 1.19e-5): {fa.get('p')} {fa.get('p_method')}")
+    tryit("WM81 sparse winners", wm81)
+
+    def wm82():
+        import yaml
+        from toolkit.analysis.artifacts import sha256
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            open(os.path.join(d, "decision_spec.yaml"), "w").write("x: 1\n")
+            open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
+            ident = {"name": "e"}
+            pt = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident},
+                  "inputs": {"units.csv": sha256(os.path.join(d, "units.csv"))}}
+            yaml.safe_dump(pt, open(os.path.join(d, "analysis", "point.yaml"), "w"))
+            try:
+                point_doc(d, ident)
+                ok(False, "WM82 a point plan the run's completed analysis manifest does not list is refused")
+            except WorldModelError:
+                ok(True, "WM82 a point plan the run's completed analysis manifest does not list is refused")
+            _bind(d)
+            ok(point_doc(d, ident) is not None, "WM82b a plan listed by the completed manifest with the current batch "
+                                                "is used")
+            open(os.path.join(d, "analysis", "batch", "results.jsonl"), "w").write("{\"i\": 1}\n")
+            try:
+                point_doc(d, ident)
+                ok(False, "WM82c a plan whose manifest names another batch (a rerun replaced the results) is refused")
+            except WorldModelError:
+                ok(True, "WM82c a plan whose manifest names another batch (a rerun replaced the results) is refused")
+            _bind(d)
+            m = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+            json.dump(dict(m, complete=False), open(os.path.join(d, "analysis", "manifest.json"), "w"))
+            try:
+                point_doc(d, ident)
+                ok(False, "WM82d a plan from an incomplete analysis is refused")
+            except WorldModelError:
+                ok(True, "WM82d a plan from an incomplete analysis is refused")
+    tryit("WM82 plan bound to the completed analysis", wm82)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
