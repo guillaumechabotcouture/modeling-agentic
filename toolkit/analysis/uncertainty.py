@@ -536,11 +536,83 @@ def _self_test() -> int:
             except ValueError:
                 ok(True, f"U12 {label} fails closed")
     _self_test_reserve(ok)
+    try:
+        _self_test_posterior(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"U13-U16 the net-effect posterior in the draws ({type(e).__name__}: {e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_posterior(ok):
+    """U13-U16: uncertainty.net_effect_posterior draws whole rows of the net-effect fit's verified joint sample."""
+    import tempfile
+    import types
+    from toolkit.engines.malaria.engine import MalariaEngine
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.spec import priors as PRI
+    e = MalariaEngine()
+    card = PRI.load_card(e)["priors"]
+
+    class Sp:
+        def __init__(s, raw, base):
+            s.raw, s.base = raw, base
+
+        def __getitem__(s, k):
+            return s.raw[k]
+
+        def resolve(s, p):
+            return p if os.path.isabs(p) else os.path.join(s.base, p)
+
+    def fake(d, post=None, sources=("engine_parameters",), cal=()):
+        u = dict({"sources": [{"kind": k} for k in sources]}, **({"net_effect_posterior": post} if post else {}))
+        A = types.SimpleNamespace(spec=Sp({"uncertainty": u, "calibration": {"method": "none", "parameters": list(cal)}},
+                                          d), eng=e, region=None, method="none", joint=None, lik=None, model=None,
+                                  ids=["u1"], anchor=None, fr={"cfp_kill": (0.3, 0.7, 0.485)},
+                                  pr={k: card[k] for k in ("net_kill_shift", "use_rate")},
+                                  theta0={"net_kill_shift": 0.0, "use_rate": 0.871, "cfp_kill": 0.485})
+        A.calibrate = lambda theta, shifts=None, ids=None: {"u1": (1.0, False)}
+        return A
+    x = np.random.default_rng(3).uniform(0, 1, 30)
+    rows = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.35 + 0.3 * v, 6)} for v in x]
+    box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8]}
+    with tempfile.TemporaryDirectory() as d:
+        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
+        # recorded before this change (branch f6-netfit-adopt): the first draw at seed 9 without the field
+        th0 = {"net_kill_shift": 0.11657722739764786, "use_rate": 0.87768660115964, "cfp_kill": 0.6480996815880338}
+        D0, D1 = Drawer(fake(d), 9), Drawer(fake(d, "net_effect_fit.yaml"), 9)
+        t0, t1 = [D0.draw()[0] for _ in range(60)], [D1.draw()[0] for _ in range(60)]
+        pairs = {(r["net_kill_shift"], r["cfp_kill"]) for r in rows}
+        c1 = np.corrcoef([t["net_kill_shift"] for t in t1], [t["cfp_kill"] for t in t1])[0, 1]
+        c0 = np.corrcoef([t["net_kill_shift"] for t in t0], [t["cfp_kill"] for t in t0])[0, 1]
+        ok(D0.ne is None and th0 == t0[0] and all((t["net_kill_shift"], t["cfp_kill"]) in pairs for t in t1)
+           and [t["use_rate"] for t in t0] == [t["use_rate"] for t in t1] and c1 > 0.999 and abs(c0) < 0.5,
+           f"U13 with uncertainty.net_effect_posterior each draw takes one whole row of the fit's joint sample (corr "
+           f"{c1:.3f}; independent draws {c0:.3f}); a parameter without a sample (use_rate) is drawn from its prior "
+           "exactly as without it, and without the field the draws are unchanged")
+        pv = D1.posterior_provenance()
+        ok(pv["sha256"] == NEF.load_posterior(os.path.join(d, "net_effect_fit.yaml"), e,
+                                              {"net_kill_shift": (-1, 1), "cfp_kill": (0, 1)})["sha256"]
+           and len(pv["rows"]) == 60 and pv["names"] == list(box) and posterior_input(fake(d).spec) is None,
+           "U14 the uncertainty report records the sample's sha256, names and the row of every draw")
+        i1 = posterior_input(fake(d, "net_effect_fit.yaml").spec)
+        NEF.placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)
+        i2 = posterior_input(fake(d, "net_effect_fit.yaml").spec)
+        ok(i1["sha256"] != i2["sha256"] and i1["path"] == os.path.join(d, "net_effect_fit.yaml"),
+           "U15 the manifest input (path, sha256) of the sample changes when the sample changes")
+        refused = []
+        for label, A in (("a missing file", fake(d, "absent.yaml")),
+                         ("a calibrated parameter", fake(d, "net_effect_fit.yaml", cal=("cfp_kill",))),
+                         ("a fitted parameter without the engine_parameters source", fake(d, "net_effect_fit.yaml",
+                                                                                         sources=("costs",)))):
+            try:
+                Drawer(A, 9)
+            except ValueError:
+                refused.append(label)
+        ok(len(refused) == 3, f"U16 the draws refuse the sample for {refused} (fail closed)")
 
 
 def _self_test_reserve(ok):

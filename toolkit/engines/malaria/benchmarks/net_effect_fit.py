@@ -563,6 +563,69 @@ def _self_test() -> int:
            f"F12 (review P2) the hull and the box-edge flags come from every accepted candidate, not the 50-point "
            f"subsample ({r2['hull']}, edges {r2['at_box_edge']})")
     case("F12", f12)
+
+    def f14():
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [547.5, 1277.5]}
+        u = np.random.default_rng(5).uniform(0, 1, 40)
+        rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
+                 "cfp_half": round(700 + 300 * x, 6)} for x in u]
+        rg = {"net_kill_shift": (pr.lo, pr.hi), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
+              "cfp_half": (547.5, 1277.5)}
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "net_effect_fit.yaml")
+            placeholder(good, e, rows, box)
+            P = load_posterior(good, e, rg)
+            ok(P["names"] == list(box) and P["rows"].shape == (40, 4) and len(P["sha256"]) == 64
+               and np.allclose(P["rows"][:, 0], [r["net_kill_shift"] for r in rows])
+               and np.allclose(P["rows"][:, 3], [r["cfp_half"] for r in rows]),
+               "F14 a verified fit output (run()'s own format, placeholder sample) loads as whole rows, one column per "
+               f"fitted parameter {P['names']}, with the sha256 of the bytes read")
+            got = {}
+
+            def refuse(label, path, ranges=rg):
+                try:
+                    load_posterior(path, e, ranges)
+                    got[label] = False
+                except PosteriorRefused:
+                    got[label] = True
+
+            def variant(label, mut):
+                doc = yaml.safe_load(open(good))
+                mut(doc)
+                p = os.path.join(d, label.replace(" ", "_") + ".yaml")
+                yaml.safe_dump(doc, open(p, "w"))
+                refuse(label, p)
+            refuse("missing file", os.path.join(d, "absent.yaml"))
+            for label, text in (("malformed YAML", "joint_region: [unclosed"), ("not a mapping", "- 1\n")):
+                open(os.path.join(d, "t.yaml"), "w").write(text)
+                refuse(label, os.path.join(d, "t.yaml"))
+            bad_gate = os.path.join(d, "gate.yaml")
+            placeholder(bad_gate, e, rows, box, gate_ok=False)
+            refuse("acceptance gate failed (finalize)", bad_gate)
+            variant("status edited to invalid", lambda x: x["joint_region"].update(sample_status="invalid"))
+            variant("acceptance reasons left", lambda x: x["joint_region"].update(acceptance=["out of band"]))
+            variant("a failed verified point", lambda x: x["joint_region"]["verified"].update(failed=[{"a": 1}]))
+            variant("a smoke", lambda x: x.update(smoke=True))
+            variant("another producer", lambda x: x.update(producer="someone"))
+            variant("other engine code", lambda x: x["engine_identity"].update(code_sha256="0" * 64))
+            variant("empty sample", lambda x: x["joint_region"].update(sample=[]))
+            variant("a row lacks a parameter", lambda x: x["joint_region"]["sample"][3].pop("cfp_half"))
+            variant("a non-finite value", lambda x: x["joint_region"]["sample"][3].update(cfp_kill=float("nan")))
+            variant("a non-numeric value", lambda x: x["joint_region"]["sample"][3].update(cfp_kill="high"))
+            variant("a column the fit did not fit", lambda x: x["plan"]["params"].pop("irs_kill"))
+            refuse("a parameter these draws do not vary", good, {k: v for k, v in rg.items() if k != "cfp_half"})
+            refuse("a value outside its priors.yaml range", good, dict(rg, net_kill_shift=(0.0, pr.hi)))
+            rows2 = [dict(r) for r in rows]
+            rows2[0]["cfp_half"] = 701.0
+            other = os.path.join(d, "other.yaml")
+            placeholder(other, e, rows2, box)
+            sha2 = load_posterior(other, e, rg)["sha256"]
+        ok(all(got.values()) and len(got) == 17 and sha2 != P["sha256"],
+           f"F15 the loader fails closed on every refusal case ({sorted(k for k, v in got.items() if not v) or 'all'} "
+           f"not refused of {len(got)}), and a changed sample has another sha256")
+    case("F14", f14)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
