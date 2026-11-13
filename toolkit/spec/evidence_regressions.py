@@ -49,27 +49,53 @@ def _spec(d, fn):
     _yaml(d, SPEC, fn)
 
 
+PATCH: dict = {}                    # the toy declaration a row patched, written into the archive's code too
+
+
 def _patch_decl(new):
     from toolkit.spec import toy_engines as T
     old = T.ToyDossierEngine.DECISION_INPUTS
     T.ToyDossierEngine.DECISION_INPUTS = new
+    PATCH["decl"] = new
 
     def undo():
         T.ToyDossierEngine.DECISION_INPUTS = old
+        PATCH.pop("decl", None)
     return undo
 
 
-def _tar(d, state):
+_CODE: dict = {}
+
+
+def code_files() -> dict:
+    """{path: bytes} of the code a launch archive ships (tracked toolkit/, agents/, scripts/, cloud/): the launch
+    check runs the archive's own code, so the table's archives carry it."""
+    if not _CODE:
+        import subprocess
+        names = subprocess.run(["git", "-C", ROOT, "ls-files", "toolkit", "agents", "scripts", "cloud"],
+                               capture_output=True, text=True, check=True).stdout.split()
+        for n in names:
+            p = os.path.join(ROOT, n)
+            if os.path.isfile(p):
+                _CODE[n] = open(p, "rb").read()
+    out = dict(_CODE)
+    if "decl" in PATCH:                 # the declaration change the row made, in the shipped code
+        out["toolkit/spec/toy_engines.py"] = out["toolkit/spec/toy_engines.py"] + (
+            f"\n\nToyDossierEngine.DECISION_INPUTS = {PATCH['decl']!r}\n").encode()
+    return out
+
+
+def _tar(d, state, signoff="owner"):
     bio = io.BytesIO()
     with tarfile.open(fileobj=bio, mode="w:gz") as t:
-        files = {"run_state.json": json.dumps({"state": state}).encode()}
+        files = {f"{R}/run_state.json": json.dumps({"state": state, "signoff": signoff}).encode(), **code_files()}
         for root, _, fs in os.walk(d):
             for f in fs:
                 rel = os.path.relpath(os.path.join(root, f), d)
                 if rel != "run_state.json":
-                    files[rel] = open(os.path.join(root, f), "rb").read()
-        for rel, data in files.items():
-            ti = tarfile.TarInfo(f"{R}/{rel}")
+                    files[f"{R}/{rel}"] = open(os.path.join(root, f), "rb").read()
+        for name, data in files.items():
+            ti = tarfile.TarInfo(name)
             ti.size = len(data)
             t.addfile(ti, io.BytesIO(data))
     return bio.getvalue()
@@ -102,9 +128,18 @@ def p_stage(d):
     return _refusal(lambda: SM.sign(d, "owner", "n"))
 
 
-def p_launch_sign(d):
+def _launch(d, state, signoff="owner"):
     import run_cluster as RC
-    return "; ".join(RC.stale_sheet_problems(_tar(d, "SIGN"), ("--resume", R)))
+    from toolkit.spec import toy_engines as T
+    old, RC.TEST_ENGINE_REFS = RC.TEST_ENGINE_REFS, T.REFS      # the toy engines, in the checker's process too
+    try:
+        return "; ".join(RC.stale_sheet_problems(_tar(d, state, signoff), ("--resume", R)))
+    finally:
+        RC.TEST_ENGINE_REFS = old
+
+
+def p_launch_sign(d):
+    return _launch(d, "SIGN")
 
 
 def p_status(d):
@@ -114,18 +149,87 @@ def p_status(d):
 
 
 def p_launch_past(d):
-    import run_cluster as RC
-    return "; ".join(RC.stale_sheet_problems(_tar(d, "ANALYZE"), ("--resume", R)))
+    return _launch(d, "ANALYZE")
 
 
-def p_resume(d):
+class _Reached(Exception):
+    """The path reached compute (a backend call, or the submission)."""
+
+
+def p_resume(d, signoff="owner"):
+    """The real entry point: Machine.run on a run resumed past ENGINE_CHOICE. Refused: it ends run_failed before any
+    backend call. Accepted: it reaches the backend (compute)."""
     from agents import stage_machine as SM
-    return "; ".join(SM.evidence_gate(d))
+
+    class Backend:
+        def __getattr__(self, name):
+            def call(*a, **k):
+                raise _Reached(name)
+            return call
+    st = SM.init_run(d, "toy question", 3, signoff, "v2", None, derived_inputs=False)
+    st.state = "CONFIGURE"
+    SM.save_state(d, st)
+    m = SM.Machine(d, None, None, backend=Backend(), log=lambda *a: None, cross_engine_check=False)
+    try:
+        status = m.run()
+    except _Reached:
+        return ""
+    why = (m.st.history[-1] or {}).get("why", "") if m.st.history else ""
+    return why or f"ended {status} without reaching compute"
+
+
+def p_relaunch(d):
+    """The real entry point: run_cluster.relaunch with its cloud calls stubbed. Refused: SystemExit before the first
+    upload; accepted: it reaches the upload (the submission)."""
+    import types
+    import contextlib
+    import run_cluster as RC
+    from toolkit.spec import toy_engines as T
+    cfg = types.SimpleNamespace(name="n", out_dir=os.path.join(d, ".out"), state_file=os.path.join(d, ".state.json"),
+                                storage_prefix="p", storage_account="a", flags=("--resume", R), tree=ROOT,
+                                question_file=os.path.join(d, ".q"))
+    json.dump({"l1": {"launch_id": "x", "worker": "w"}}, open(cfg.state_file, "w"))
+    open(cfg.question_file, "w").write("q")
+    code = _tar(d, "ANALYZE")
+
+    class Client:
+        def upload_file(self, *a, **k):
+            raise _Reached("upload_file")
+    saved = {k: getattr(RC, k) for k in ("_config_lock", "budget_guard", "attach", "_on_worker", "relaunch_refusal",
+                                         "code_tarball", "pipeline_preflight", "TEST_ENGINE_REFS")}
+    saved_rb, saved_rs = RC.ws.record_blob, sys.modules.get("results_store")
+    try:
+        RC._config_lock = lambda cfg: contextlib.nullcontext()
+        RC.budget_guard = lambda *a, **k: None
+        RC.attach = lambda name: types.SimpleNamespace(get_client=lambda: Client())
+        RC._on_worker = lambda *a, **k: {"state": "idle"}
+        RC.relaunch_refusal = lambda *a, **k: None
+        RC.code_tarball = lambda cfg: (code, "abc1234")
+        RC.pipeline_preflight = lambda cfg, code: "v2"
+        RC.TEST_ENGINE_REFS = T.REFS
+        RC.ws.record_blob = lambda *a, **k: "none"
+        sys.modules["results_store"] = types.SimpleNamespace(list_blobs=lambda *a, **k: [])
+        try:
+            RC.relaunch(cfg, "l1")
+            return "relaunch returned without reaching the submission"
+        except _Reached:
+            return ""
+        except SystemExit as e:
+            return str(e)
+    finally:
+        for k, v in saved.items():
+            setattr(RC, k, v)
+        RC.ws.record_blob = saved_rb
+        if saved_rs is None:
+            sys.modules.pop("results_store", None)
+        else:
+            sys.modules["results_store"] = saved_rs
 
 
 PRE_PATHS = {"signoff.sign": p_signoff, "decision_brief.sign": p_brief, "stage_machine.sign": p_stage,
              "launch at SIGN": p_launch_sign}
-POST_PATHS = {"signoff.status": p_status, "launch past SIGN": p_launch_past, "resume past ENGINE_CHOICE": p_resume}
+POST_PATHS = {"signoff.status": p_status, "launch past SIGN": p_launch_past, "relaunch": p_relaunch,
+              "Machine.run (resume past ENGINE_CHOICE)": p_resume}
 
 
 # ----------------------------------------------------------------------------------------------- rows
@@ -135,6 +239,31 @@ def _set(m, k, v):
 
 TOY_K = {"model_value": 0.8, "model_source": "card", "no_data": {"reason": "toy", "borrowing_rule": "the range"},
          "chosen": {"range": [0.7, 0.9], "rule": "the toy range"}, "decision_test": "prior_range_k"}
+
+
+def _with_group(extra_entry, binding=None):
+    """The toy declaration with the unit attribute `group` an input of a (the binding's default, a column or a value),
+    and the dossier's group entry."""
+    from toolkit.spec import toy_engines as T
+
+    def mutate(d):
+        decl = {c: dict(v) for c, v in T.ToyDossierEngine.DECISION_INPUTS.items()}
+        decl["a"] = dict(decl["a"], inputs=list(decl["a"]["inputs"]) + [
+            {"kind": "unit_attribute", "name": "group", "why": "the toy's group label"}])
+        if binding is not None:
+            _spec(d, lambda s: _set(s["decision_units"]["engine_attributes"], "group", binding))
+        else:
+            _spec(d, lambda s: s["decision_units"].setdefault("defaults_accepted", {}).__setitem__(
+                "group", "the toy has no groups"))
+        _entries(d, lambda e: _set(e, "unit_attribute:group", extra_entry))
+        return _patch_decl(decl)
+    return mutate
+
+
+def _group_entry(model, chosen):
+    return {"model_value": model, "model_source": "toy", "no_data": {"reason": "toy", "borrowing_rule": "the label"},
+            "chosen": {"value": chosen, "rule": "the label"}}
+
 
 # (id, what the reviewers found, mutate(d) -> undo or None, regenerate the sheet afterwards)
 PRE_ROWS = [
@@ -150,6 +279,8 @@ PRE_ROWS = [
     ("R1-stale-sheet", "the dossier changed after the sheet",
      lambda d: open(os.path.join(d, DOSSIER), "a").write("# edited\n"), False),
     ("R3-no-sheet", "no sheet showed the dossier", lambda d: os.remove(os.path.join(d, SHEET)), False),
+    ("R4-sheet-other-spec", "the sheet was generated for another spec (the dossier unchanged)",
+     lambda d: _spec(d, lambda s: _set(s, "question", "Another question?")), False),
     ("R1-malformed-decl", "a component declared {} (no inputs, no reason)",
      lambda d: _patch_decl({"a": {}, "b": {"inputs": [], "none_reason": "r"}}), True),
     ("R1-non-dict-input", "an input entry that is not a mapping",
@@ -157,29 +288,31 @@ PRE_ROWS = [
     ("R1-engine-map", "a used component with no engine mapping",
      lambda d: _spec(d, lambda s: s["options"]["engine_map"].pop("a")), True),
     ("R1-nested-blank", "a nested blank chosen value",
-     lambda d: _entries(d, lambda e: _set(e["unit_attribute:x"]["chosen"], "value", [None, " "])), True),
-    ("R1-test-other-quantity", "a range whose test varies another quantity",
+     lambda d: _entries(d, lambda e: _set(e["parameter:k"]["chosen"], "value", [None, " "])), True),
+    ("R1-test-other-quantity", "a fitted parameter's range citing a test of another quantity",
      lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"], "decision_test", "DT1")), True),
-    ("R1-test-narrow", "a range wider than its test's values",
+    ("R1-test-narrow", "a fitted parameter's range that is not its declared (fitted) range",
      lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"]["chosen"], "range", [0.2, 0.6])), True),
+    ("R4-generated-name", "prior_range_<p> cited where the runner generates fitted_range_<p>",
+     lambda d: _entries(d, lambda e: _set(e["parameter:eff_a"], "decision_test", "prior_range_eff_a")), True),
     ("R2-excluded-prior", "prior_range_<p> cited for a prior the draw plan excludes",
      lambda d: (_spec(d, lambda s: (s["uncertainty"].__setitem__("priors", {"k": {
          "dist": "uniform", "range": [0.7, 0.9], "source": "toy"}}), s["uncertainty"]["excluded"].append(
          {"parameter": "k", "reason": "held"}))), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
-    ("R2-explicit-value", "the chosen value is not the spec's engine_parameters value (0.1 vs 0.9)",
+    ("R2-explicit-value", "the chosen value is not the spec's engine_parameters value (0.8 vs 0.9)",
      lambda d: _spec(d, lambda s: _set(s, "engine_parameters", {"k": {
          "value": 0.9, "source": "toy", "reason": "toy", "basis": "setting_data"}})), True),
-    ("R3-default-value", "the chosen value is not the card default the engine runs (eff_a 0.1 vs 0.5)",
-     lambda d: _entries(d, lambda e: (_set(e["parameter:eff_a"], "model_value", 0.1),
-                                      _set(e["parameter:eff_a"], "chosen", {"value": 0.1, "rule": "r"}),
-                                      e["parameter:eff_a"].pop("decision_test"))), True),
-    ("R3-structured-literal", "a unit attribute bound to [0.8, 0.9] and a dossier saying [0.1, 0.2]",
-     lambda d: (_spec(d, lambda s: _set(s["decision_units"]["engine_attributes"], "x", {"value": [0.8, 0.9],
-                                                                                         "source": "toy"})),
-                _entries(d, lambda e: (_set(e["unit_attribute:x"], "model_value", [0.1, 0.2]),
-                                       _set(e["unit_attribute:x"], "chosen", {"value": [0.1, 0.2], "rule": "r"})))),
-     True),
-    ("R3-range-inside-draws", "the chosen range does not contain the draw support ([0.7, 0.9] vs [0.6, 1.0])",
+    ("R3-default-value", "the chosen value is not the default the engine runs (k 0.1 vs 0.8)",
+     lambda d: _entries(d, lambda e: (_set(e["parameter:k"], "model_value", 0.1),
+                                      _set(e["parameter:k"], "chosen", {"value": 0.1, "rule": "r"}))), True),
+    ("R4-default-attribute", "an attribute left at its card default (\"\") and a dossier saying \"g1\"",
+     _with_group(_group_entry("g1", "g1")), True),
+    ("R4-column-attribute", "an attribute bound to a column and a dossier that does not describe the column",
+     _with_group(_group_entry({"min": 0, "median": 0, "max": 0}, "g1"), {"column": "grp"}), True),
+    ("R3-structured-literal", "an attribute bound to a literal and a dossier giving another literal",
+     _with_group(_group_entry(["g1", "g2"], ["g1", "g2"]), {"value": ["g3", "g4"], "source": "toy"}), True),
+    ("R3-range-inside-draws", "a drawn parameter whose chosen range is not its declared range ([0.7, 0.9] vs "
+                              "[0.6, 1.0])",
      lambda d: (_spec(d, lambda s: _set(s, "engine_parameters", {"k": {
          "value": 0.8, "range": [0.6, 1.0], "dist": "uniform", "source": "toy", "reason": "toy",
          "basis": "setting_data"}})), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
@@ -208,6 +341,11 @@ POST_ROWS = [
          {"kind": "parameter", "name": "eff_a", "why": "w"}, {"kind": "unit_attribute", "name": "x", "why": "w"},
          {"kind": "parameter", "name": "base", "why": "w"}]},
          "b": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "k", "why": "w"}]}})),
+    ("R4-declaration-changed", "a declaration changed since signing (the same inputs, another content)",
+     lambda d: _patch_decl({"a": {"inactive": [0], "inputs": [
+         {"kind": "parameter", "name": "eff_a", "why": "another reason"},
+         {"kind": "unit_attribute", "name": "x", "why": "w"}]},
+         "b": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "k", "why": "w"}]}})),
 ]
 
 
@@ -216,15 +354,19 @@ WANT = {
     "R1-no-dossier": ["names no evidence dossier"], "R1-missing-file": ["does not exist"],
     "R1-uncovered": ["no entry for unit_attribute:x"], "R1-blank": ["entry unit_attribute:x is blank"],
     "R1-unparseable": ["does not parse"], "R1-stale-sheet": ["another evidence dossier"],
-    "R3-no-sheet": ["no sign-off sheet"], "R1-malformed-decl": ["malformed"], "R1-non-dict-input": ["malformed"],
+    "R3-no-sheet": ["no sign-off sheet"], "R4-sheet-other-spec": ["another spec", "another decision_spec"],
+    "R1-malformed-decl": ["malformed"], "R1-non-dict-input": ["malformed"],
     "R1-engine-map": ["no engine mapping"], "R1-nested-blank": ["chosen.value is blank"],
-    "R1-test-other-quantity": ["does not vary"], "R1-test-narrow": ["do not cover"],
-    "R2-excluded-prior": ["not drawn"], "R2-explicit-value": ["= 0.9"], "R3-default-value": ["= 0.5"],
-    "R3-structured-literal": ["[0.8, 0.9]"], "R3-range-inside-draws": ["draw support"],
+    "R1-test-other-quantity": ["the runner generates"], "R1-test-narrow": ["declared range"],
+    "R4-generated-name": ["fitted_range_eff_a"],
+    "R2-excluded-prior": ["not drawn"], "R2-explicit-value": ["= 0.9"], "R3-default-value": ["= 0.8"],
+    "R4-default-attribute": ["the value the run uses"], "R4-column-attribute": ["per-unit values"],
+    "R3-structured-literal": ["['g3', 'g4']"], "R3-range-inside-draws": ["declared range"],
     "R3-test-not-executable": ["does not execute"],
     "R1-dossier-edited": ["changed", "evidence dossier"], "R1-spec-edited": ["changed", "not the one signed"],
     "R1-legacy-record": ["unsigned_evidence"], "R3-empty-evidence": ["unsigned_evidence"],
     "R3-partial-evidence": ["unsigned_evidence"], "R3-declaration-grew": ["evidence_incomplete", "parameter:base"],
+    "R4-declaration-changed": ["declaration"],
 }
 
 
@@ -273,12 +415,19 @@ def run_table(ok) -> None:
             want_refused = rid != "control"
             ok(_right(rid, why),
                f"ET {rid} via {pname}: {'refused' if want_refused else 'accepted'} ({what}): {why[:160]!r}")
-    # relaunch submits paid work: it runs the same launch check as launch (the archive it would ship)
-    import inspect
-    import run_cluster as RC
-    src = inspect.getsource(RC.relaunch)
-    ok("stale_sheet_problems(" in src and src.index("stale_sheet_problems(") < src.index("upload_file("),
-       "ET relaunch runs the launch check (stale_sheet_problems) on the archive before it submits anything")
+    # signoff: none (nobody signs): the launch preflight and the runtime gate apply one rule, coverage without a
+    # record: a complete dossier passes both, an uncovered one is refused by both
+    for rid, mutate in (("control", lambda d: None),
+                        ("R4-signoff-none-uncovered", lambda d: _entries(d, lambda e: e.pop("unit_attribute:x")))):
+        for pname, path in (("launch past SIGN", lambda d: _launch(d, "ANALYZE", signoff="none")),
+                            ("Machine.run", lambda d: p_resume(d, signoff="none"))):
+            with tempfile.TemporaryDirectory() as d:
+                ED.toy_dossier_spec(d)
+                mutate(d)
+                SO.write_sheet(d)
+                why = path(d)
+            ok((not why) if rid == "control" else ("no entry for unit_attribute:x" in why),
+               f"ET signoff none, {rid} via {pname}: {'accepted' if rid == 'control' else 'refused'}: {why[:160]!r}")
 
 
 def _self_test() -> int:

@@ -740,17 +740,18 @@ def toy_entries() -> dict:
             "comparison": "the trial's 0.42 is below the card's 0.5, inside its fitted range [0.3, 0.7]",
             "chosen": {"range": [0.3, 0.7], "rule": "the card's fitted range, which the draws vary it over; it contains "
                                                     "the trial's 0.42"},
-            "decision_test": "DT_eff_a"},
+            "decision_test": "fitted_range_eff_a"},
         "parameter:k": {
             "model_value": 0.8, "model_source": "engine card default",
             "no_data": {"reason": "no field measurement of the toy slope",
                         "borrowing_rule": "the card's value, held fixed"},
             "chosen": {"value": 0.8, "rule": "the card's value"}},
         "unit_attribute:x": {
-            "model_value": "units.csv column cov (calibrated)", "model_source": "toy surface",
+            "model_value": "calibrated per unit", "model_source": "the spec's calibration (emulator inversion)",
             "no_data": {"reason": "no field measurement of the toy index",
                         "borrowing_rule": "the calibrated value per unit; the calibration's interval carries it"},
-            "chosen": {"value": "calibrated per unit", "rule": "no direct data: the calibration is the evidence"}},
+            "calibration_targets": "the units table's tgt column (the toy prevalence), window [1, 2]",
+            "chosen": {"range": [-2, 2], "rule": "the calibration's declared search range"}},
     }
 
 
@@ -772,6 +773,79 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     with open(p, "w") as f:
         yaml.safe_dump(raw, f, sort_keys=False)
     return p
+
+
+def _self_test_round4(ok, T) -> None:
+    """#218 review round 4: execution's own values, card tables by content, calibrated parameters, the signed
+    superset, no caches across calls."""
+    import tempfile
+    import yaml
+    mal = "toolkit.engines.malaria.engine:MalariaEngine"
+    try:
+        from toolkit.analysis import batch as BA
+        from toolkit.spec import schema
+        ex = _exec_context(mal, {}, {})
+        want = BA.fitted_ranges(schema.engine_class(mal)())["cfp_kill"][:2]
+        ok(tuple(ex["ranges"]["cfp_kill"]) == tuple(float(x) for x in want)
+           and abs(ex["values"]["cfp_kill"] - BA.fitted_ranges(schema.engine_class(mal)())["cfp_kill"][2]) < 1e-12,
+           f"ED-X1 a fitted parameter's value and range are execution's (fitted.yaml through batch.fitted_ranges), not "
+           f"the card file's: {ex['ranges'].get('cfp_kill')} vs {want}")
+        sha_t = card_table_sha256(mal, "hut_trial_coefficients")
+        r = {"kind": "card_table", "name": "hut_trial_coefficients", "engines": [(mal, {})], "used_by": ["n"]}
+        good = {"model_value": {"sha256": sha_t}, "model_source": "card", "chosen": {"value": {"sha256": sha_t},
+                                                                                     "rule": "the card's"},
+                "no_data": {"reason": "r", "borrowing_rule": "b"}}
+        bad = dict(good, model_value=0.123)
+        ok(not _value_problems("card_table:hut_trial_coefficients", good, r, good["chosen"], {}, None, {})
+           and any("sha256" in p for p in _value_problems("card_table:hut_trial_coefficients", bad, r,
+                                                          bad["chosen"], {}, None, {})),
+           "ED-X2 a card table entry names the table's content sha256, checked against the card; a scalar is refused")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"ED-X1/X2 execution values and card tables: {type(e).__name__}: {e}")
+    with tempfile.TemporaryDirectory() as d:
+        from toolkit.spec import signoff as SO
+        toy_dossier_spec(d)
+        SO.write_sheet(d)
+        SO.sign(d, "owner", note="n")
+        rec = json.load(open(os.path.join(d, "decision_spec.signoff.json")))
+        sup = dict(rec, evidence=dict(rec["evidence"], required=rec["evidence"]["required"] + ["parameter:other"]))
+        ok(state(d, record=sup)["status"] == "ok",
+           f"ED-X3 the chosen engine needs a subset of the inputs signed (a superset was signed): ok "
+           f"{state(d, record=sup)['problems'][:2]}")
+        before = state(d)["status"]
+        orig = T.ToyDossierEngine.parameters
+
+        def moved(self):
+            from toolkit.engines.contract import ParamSpec
+            return [ParamSpec("k", 0.9, "fixed", source="toy") if p.name == "k" else p for p in orig(self)]
+        T.ToyDossierEngine.parameters = moved
+        try:
+            after = state(d)
+        finally:
+            T.ToyDossierEngine.parameters = orig
+        ok(before == "ok" and after["status"] != "ok" and any("= 0.9" in p for p in after["problems"]),
+           f"ED-X4 nothing is cached across calls: an engine default changed after a check is seen by the next "
+           f"({before}, {after['problems'][:1]})")
+    comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": {
+        "groups": ["all"], "structure": "single_group", "mode": "to_extinction", "initialiser": "given", "dt": "day",
+        "generation_interval": [0.2, 0.3, 0.3, 0.2], "components": {"vax": {"kind": "campaign", "targets": ["all"],
+                                                                             "reach": 0.5}}}},
+        "options": {"components": {"c": {}}, "engine_map": {"c": {"vax": 1}}},
+        "calibration": {"method": "likelihood", "parameters": ["r0"],
+                        "priors": {"r0": {"dist": "uniform", "range": [1.0, 4.0], "source": "toy"}}},
+        "analysis": {"evaluation": "direct"}}
+    req, _ = required_inputs(comp)
+    point = {"model_value": 2.5, "model_source": "s", "no_data": {"reason": "r", "borrowing_rule": "b"},
+             "chosen": {"value": 2.5, "rule": "r"}}
+    prior = dict(point, chosen={"range": [1.0, 4.0], "rule": "the calibration prior"},
+                 calibration_targets="the attack-rate panel")
+    p1 = [p for p in check(comp, yaml.safe_dump({"inputs": {"parameter:r0": point}}).encode(), req)
+          if "parameter:r0" in p]
+    p2 = [p for p in check(comp, yaml.safe_dump({"inputs": {"parameter:r0": prior}}).encode(), req)
+          if "parameter:r0" in p]
+    ok(any("declared range" in p for p in p1) and not p2,
+       f"ED-X5 a calibrated parameter attests its declared prior range and its calibration targets, not a point value "
+       f"(which does not exist before the run): {p1[:2]} {p2[:2]}")
 
 
 def _self_test_round2(ok, T) -> None:
@@ -935,6 +1009,10 @@ def _self_test_round1(ok, T) -> None:
         ok(st["status"] == "refused" and any("does not exist" in p for p in st["problems"]),
            f"ED-B2 state() refuses a dossier that does not exist: {st['problems'][:2]}")
     _self_test_round2(ok, T)
+    try:
+        _self_test_round4(ok, T)
+    except NameError as e:          # before the round-4 functions exist (the tests-first commit)
+        ok(False, f"ED-X round 4: {e}")
     # ED-R9: a configured engine's inputs follow its configuration
     comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": {
         "groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "transmission": "q",
