@@ -1,0 +1,284 @@
+beliefs:
+- id: B1
+  mechanism: A single round of HPV-DNA screen-and-treat at age 30-49 reduces stage II+ (advanced) cervical cancer
+    over ~8 years by about half
+  about:
+    package: hpv
+  direction: reduces
+  magnitude:
+    band:
+    - 0.31
+    - 0.68
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Sankaranarayanan R, et al. HPV screening for cervical cancer in rural India. N Engl J Med 2009;360:1385-94
+    location: 'Table 3 / Abstract: advanced (stage II or higher) cancer HR 0.47 (95% CI 0.32-0.69), HPV arm vs control,
+      8-year follow-up'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: A single round of VIA screen-and-treat reduces advanced cervical cancer less than HPV testing, with
+    an uncertain and possibly small effect
+  about:
+    package: via
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.4
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Sankaranarayanan R, et al. Effect of visual screening on cervical cancer incidence and mortality
+      in Tamil Nadu, India: a cluster-randomised trial. Lancet 2007;370:398-406'
+    location: 'Abstract: incidence HR ~0.75, mortality HR ~0.65 (values recalled, not re-checked; advanced-stage
+      estimate not recalled)'
+  - citation: Sankaranarayanan R, et al. HPV screening for cervical cancer in rural India. N Engl J Med 2009;360:1385-94
+    location: 'Table 3: VIA arm advanced-cancer HR not significantly different from control (exact value uncertain)'
+  - citation: 'Shastri SS, et al. Effect of VIA screening by primary health workers: randomized controlled study
+      in Mumbai, India. J Natl Cancer Inst 2014;106:dju009'
+    location: 'Abstract: ~31% cervical cancer mortality reduction with repeated (4 rounds) VIA; more than one round,
+      so an upper reference'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 3
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: Under the engine's multiplicative rule the relative reduction of each option does not depend on the
+    district's baseline rate; only the absolute number averted scales with adv_rate
+  about:
+    package: hpv
+    feature: adv_rate
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Deeks JJ. Issues in the selection of a summary statistic for meta-analysis of clinical trials with
+      binary outcomes. Stat Med 2002;21:1575-1600
+    location: 'Results/Discussion: relative measures (RR, OR) vary less with baseline risk than risk differences'
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: HIV prevalence is not read by the engine, so it cannot change the relative reduction in the sweep;
+    in reality HIV raises baseline risk (captured only via adv_rate) and lowers VIA performance and post-treatment
+    durability
+  about:
+    package: via
+    feature: hiv
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Stelzle D, et al. Estimates of the global burden of cervical cancer associated with HIV. Lancet Glob
+      Health 2021;9:e161-e169
+    location: 'Abstract: women living with HIV ~6-fold higher cervical cancer risk (bears on baseline, not on the
+      relative effect)'
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: At the budget's shadow price HPV's extra US$5 per woman pays for itself only in high-burden districts,
+    where the absolute extra cancers averted (adv_rate x (RR_via - RR_hpv)) are largest
+  about:
+    pair:
+    - hpv
+    - via
+    feature: adv_rate
+  direction: increases
+  conditions:
+  - feature: adv_rate
+    range:
+    - 0.0004
+    - 0.000593
+  source_type: literature
+  evidence:
+  - citation: Sankaranarayanan R, et al. HPV screening for cervical cancer in rural India. N Engl J Med 2009;360:1385-94
+    location: 'Table 3: HPV vs VIA arm advanced-cancer contrast'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: In low-burden districts the cheaper VIA (or nothing) beats HPV at the shadow price; the HPV/VIA switch
+    lies inside the observed adv_rate range
+  about:
+    pair:
+    - via
+    - hpv
+    feature: adv_rate
+  direction: flips
+  conditions:
+  - feature: adv_rate
+    range:
+    - 0.0002
+    - 0.00045
+  source_type: literature
+  evidence:
+  - citation: Sankaranarayanan R, et al. HPV screening for cervical cancer in rural India. N Engl J Med 2009;360:1385-94
+    location: Table 3
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: Any screening beats none in the highest-burden districts at the binding shadow price, because the budget
+    (~US$4M) cannot cover all ~1.4M women even with VIA, so the marginal district is a mid- or low-burden one
+  about:
+    pair:
+    - via
+    - none
+    feature: adv_rate
+  direction: increases
+  conditions:
+  - feature: adv_rate
+    range:
+    - 0.00035
+    - 0.000593
+  source_type: literature
+  evidence:
+  - citation: 'Sankaranarayanan R, et al. Effect of visual screening on cervical cancer incidence and mortality
+      in Tamil Nadu, India: a cluster-randomised trial. Lancet 2007;370:398-406'
+    location: Abstract
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What advanced-cancer RR does the engine's VIA prior encode (Tamil Nadu-type ~0.75 or Osmanabad-type
+    near 1)? Its size decides whether VIA is ever chosen over HPV or none.
+  beliefs:
+  - B2
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Where does the shadow price sit, i.e. how many women the US$4M covers; this locates both the none/VIA
+    and VIA/HPV cut-offs on adv_rate.
+  beliefs:
+  - B5
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Are the costs per woman screened or per woman in the target group (coverage, treatment and follow-up
+    of positives, HPV positivity higher where HIV is high)? HIV-related positivity would raise HPV's real cost per
+    woman in high-HIV districts.
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Does the adv_rate baseline already include any existing opportunistic screening? If so the trial RRs
+    (vs no screening) would double count.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q5
+  question: Is an 8-year window enough for the single round's effect to be at its trial size (trial follow-up was
+    ~8 years), or is part of the benefit after 2033?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: HPV's relative reduction in advanced cancer lies within the Osmanabad trial's 95% interval at most design
+    points
+  test:
+    kind: effect_band
+    package: hpv
+    band:
+    - 0.31
+    - 0.68
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: VIA's relative reduction in advanced cancer lies between 5% and 40% at most design points
+  test:
+    kind: effect_band
+    package: via
+    band:
+    - 0.05
+    - 0.4
+    min_share: 0.75
+- id: H3
+  belief: B3
+  claim: HPV's relative reduction does not vary with the district baseline rate (multiplicative RR)
+  test:
+    kind: effect_direction
+    package: hpv
+    feature: adv_rate
+    direction: negligible
+    equivalence: 0.15
+- id: H4
+  belief: B4
+  claim: VIA's relative reduction does not vary with HIV prevalence in the sweep (engine does not read hiv)
+  test:
+    kind: effect_direction
+    package: via
+    feature: hiv
+    direction: negligible
+    equivalence: 0.15
+- id: H5
+  belief: B5
+  claim: In the highest-burden districts HPV has higher net benefit than VIA at the shadow price
+  test:
+    kind: paired_sign
+    a: hpv
+    b: via
+    feature: adv_rate
+    range:
+    - 0.0004
+    - 0.000593
+    sign: positive
+    min_share: 0.6
+- id: H6
+  belief: B6
+  claim: The VIA/HPV switch along adv_rate lies between 0.0002 and 0.00045 per woman-year
+  test:
+    kind: flip_in
+    a: via
+    b: hpv
+    feature: adv_rate
+    range:
+    - 0.0002
+    - 0.00045
+- id: H7
+  belief: B7
+  claim: In high-burden districts VIA has higher net benefit than no screening at the shadow price
+  test:
+    kind: paired_sign
+    a: via
+    b: none
+    feature: adv_rate
+    range:
+    - 0.00035
+    - 0.000593
+    sign: positive
+    min_share: 0.8
