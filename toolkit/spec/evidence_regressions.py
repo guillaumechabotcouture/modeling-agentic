@@ -424,7 +424,7 @@ POST_ROWS = [
 ]
 
 
-def _extensionless_units(d):
+def _fixture_extensionless_units(d):
     import shutil
     shutil.move(os.path.join(d, "units.csv"), os.path.join(d, "units"))
     _spec(d, lambda s: _set(s["decision_units"], "csv", "units"))
@@ -468,7 +468,7 @@ POST_SETUP_ROWS = [
     ("R6-allocation-produced", "the lifecycle: sign, the analysis writes its allocation (an output), then resume",
      _produce_allocation, None),
     ("R6-extensionless-units", "an extensionless units path (execution resolves it) edited after signing",
-     lambda d: _fixture_write(d, "units", "\n", "a"), _extensionless_units),
+     lambda d: _fixture_write(d, "units", "\n", "a"), _fixture_extensionless_units),
     ("R6-no-dossier-edited", "a run that needs no dossier, its units table edited after signing",
      lambda d: _fixture_write(d, "units.csv", "\n", "a"), _no_dossier_run),
 ]
