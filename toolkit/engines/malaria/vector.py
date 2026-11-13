@@ -330,6 +330,118 @@ def cycle(b, w0, y, w, z, tau1=0.69, tau2=2.31):
     return f, mu, W
 
 
+def _itn_effect_v016(net_type, x, age_d, P, complex_="gambiae", holes=True):
+    """Frozen copy of the v0.16 net code (Churcher constants only), the reference for V31: at their defaults the
+    v0.17 net-effect parameters must give these outputs bit for bit."""
+    C = CHURCHER
+
+    def new_net(x, pbo):
+        x = np.clip(np.asarray(x, float), 0.0, 1.0)
+        if pbo:
+            b1, b2, b3 = C["pbo"][complex_]
+            x = _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+        l = _expit(C["a1"] + C["a2"] * (x - C["tau"]))
+        m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
+        k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
+        j = np.clip(1 - l - k, 0.0, 1.0)
+        jp, kp, lp = m * j + (1 - m), m * k, m * l
+        s0 = np.clip(kp / C["k0"], 0.0, 1.0)
+        g = _expit(C["mu"] + C["rho"] * (l - C["tau"]))
+        gs = _expit(C["mu"] + C["rho"] * (1 - C["tau"]))
+        return (1 - s0) * jp / (jp + lp), (1 - s0) * lp / (jp + lp), LN2 / ((LN2 / g) / (LN2 / gs) * C["Hys"] * 365.0)
+
+    net_type, age_d = np.asarray(net_type), np.maximum(np.asarray(age_d, float), 0.0)
+    out = []
+    for pbo in (False, True):
+        r0, d0, gam = new_net(x, pbo)
+        dec = np.exp(-gam * age_d)
+        out.append(((r0 - C["rM"]) * dec + C["rM"], d0 * dec, dec))
+    (r_p, d_p, dec_p), (r_b, d_b, dec_b) = out
+    is_pbo = net_type == 1
+    r, d, dec = np.where(is_pbo, r_b, r_p), np.where(is_pbo, d_b, d_p), np.where(is_pbo, dec_b, dec_p)
+    s = np.clip(1 - r - d, 0.0, 1.0)
+    r, d, s = apply_holes(r, d, s, x, age_d, dec, holes and P.get("net_holes", 1.0) > 0)
+    c = P["cfp_kill"] * np.exp(-LN2 * age_d / P["cfp_half"])
+    dual = net_type == 2
+    r, s = np.where(dual, r * (1 - c), r), np.where(dual, s * (1 - c), s)
+    return r, 1 - r - s, s
+
+
+def _self_test_v017(ok, P) -> None:
+    """v0.17 (F6 net-effect ranges): the three net-effect parameters, their defaults and their meaning."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    nt = np.repeat(np.array([0, 1, 2]), 9)
+    ages = np.tile(np.array([0.0, 1.0, 30.0, 180.0, 365.0, 548.0, 730.0, 1100.0, 1500.0]), 3)
+    xs = (0.0, 0.088, 0.25, 0.5, 0.95, 1.0)
+
+    def v31():
+        same = True
+        for cx in ("gambiae", "funestus"):
+            for x in xs:
+                for holes in (True, False):
+                    ref = _itn_effect_v016(nt, x, ages, P, cx, holes)
+                    for Pd in (P, dict(P, **NET_DEFAULTS)):
+                        got = itn_effect(nt, x, ages, Pd, cx, holes)
+                        same &= all(np.array_equal(a, b) for a, b in zip(got, ref))
+        ok(same and NET_DEFAULTS == {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0},
+           "V31 at their defaults (kill shift 0, PBO gain scale 1, PBO advantage decay 0) the net outcomes equal the "
+           "frozen v0.16 code bit for bit (pyrethroid, PBO, dual-AI; 6 resistance levels, 2 complexes, 9 ages, holes on/off)")
+    case("V31", v31)
+
+    def v32():
+        r0, d0, s0, g0 = hut_new_net(0.25, False)
+        r1, d1, s1, g1 = hut_new_net(0.25, False, kill_shift=0.5)
+        r_ref, d_ref, s_ref, g_ref = hut_new_net(0.25 + 0.5 / CHURCHER["a2"], False)
+        ok(d1 > d0 and s1 < s0 and g1 < g0
+           and np.allclose([r1, d1, s1, g1], [r_ref, d_ref, s_ref, g_ref], rtol=1e-12, atol=0),
+           f"V32 a kill shift of +0.5 on Churcher's hut-mortality logit (alpha1) kills more ({float(d0):.3f} -> "
+           f"{float(d1):.3f}), lets fewer feed and decays slower, exactly as a net at bioassay mortality x + 0.5/alpha2")
+    case("V32", v32)
+
+    def v33():
+        Pz = dict(P, pbo_gain_scale=0.0)
+        a = itn_effect(np.ones(9, int), 0.088, ages[:9], Pz)
+        b = itn_effect(np.zeros(9, int), 0.088, ages[:9], Pz)
+        f1 = float(pbo_bioassay(0.088))
+        f2 = float(pbo_bioassay(0.088, gain_scale=2.0))
+        lg = lambda p: np.log(p / (1 - p))  # noqa: E731
+        ok(all(np.allclose(u, v, rtol=0, atol=1e-12) for u, v in zip(a, b))
+           and abs((lg(f2) - lg(0.088)) - 2 * (lg(f1) - lg(0.088))) < 1e-9,
+           f"V33 PBO gain scale: 0 makes a PBO net a pyrethroid net; 2 doubles the PBO gain in bioassay-mortality logit "
+           f"(x 0.088: f {f1:.3f} at scale 1, {f2:.3f} at scale 2)")
+    case("V33", v33)
+
+    def v34():
+        lam = 1.0
+        age = np.array([0.0, 365.0, 730.0])
+        p0 = itn_effect(np.ones(3, int), 0.088, age, P, holes=False)
+        q0 = itn_effect(np.zeros(3, int), 0.088, age, P, holes=False)
+        p1 = itn_effect(np.ones(3, int), 0.088, age, dict(P, pbo_adv_decay=lam), holes=False)
+        w = np.exp(-lam * age / 365.0)
+        ok(all(np.allclose(p1[i], q0[i] + w * (p0[i] - q0[i]), rtol=0, atol=1e-12) for i in range(3))
+           and np.array_equal(p1[1][:1], p0[1][:1]),
+           "V34 PBO advantage decay (per year): a new PBO net is unchanged; at age t its outcomes are a same-age "
+           "pyrethroid net's plus exp(-decay t) times the PBO net's advantage")
+    case("V34", v34)
+
+    def v35():
+        bad = []
+        for k, v in (("pbo_gain_scale", -0.1), ("pbo_adv_decay", -1.0), ("net_kill_shift", float("nan"))):
+            try:
+                net_check(dict(P, **{k: v}))
+                bad.append(k)
+            except ValueError:
+                pass
+        net_check(dict(P, **NET_DEFAULTS))
+        ok(not bad, f"V35 a negative PBO gain scale or decay, or a non-finite kill shift, fails closed (accepted: {bad})")
+    case("V35", v35)
+
+
 def _self_test() -> int:
     fails = []
 
@@ -456,6 +568,7 @@ def _self_test() -> int:
        f"V28 insecticide gone (x = 0.088, 2 years): holes add {sh2[0] - sn2[0]:.3f} to feeding, as Briet's near-untreated net")
     ok(resistance_of({"gambiae": 0.1, "default": 0.5}, "funestus") == 0.5 and resistance_of(0.3, "gambiae") == 0.3,
        "V16 resistance per species, with a default")
+    _self_test_v017(ok, P)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

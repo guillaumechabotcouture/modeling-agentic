@@ -3214,6 +3214,57 @@ def _self_test_v015(ok, e, unit) -> None:
     case("BR4", br4)
 
 
+def _self_test_v017(ok, e, unit) -> None:
+    """v0.17 (F6 net-effect ranges; ENGINE_NOTES.md, v0.17): the net-type relative effects are engine parameters whose
+    defaults reproduce v0.16 (vector.py V31 proves the net outcomes bit for bit)."""
+    def case(label, fn):
+        try:
+            fn()
+        except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
+            ok(False, f"{label} ({type(ex).__name__}: {ex})")
+
+    want = {"net_kill_shift": (0.0, "logit"), "pbo_gain_scale": (1.0, "multiplier"), "pbo_adv_decay": (0.0, "per year")}
+
+    def ne0():
+        sp = {p.name: p for p in e.parameters()}
+        got = {k: (sp[k].value, sp[k].units) for k in want if k in sp and sp[k].kind == "fixed"}
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 17) and got == want and not set(want) & POST_FORK
+           and V.NET_DEFAULTS == {k: v[0] for k, v in want.items()},
+           f"NE0 engine v0.17 has the net-effect parameters, kind fixed, at the v0.16-reproducing defaults ({got})")
+    case("NE0", ne0)
+
+    def ne1():
+        a = dict(unit.attributes, itn_hist_years=[2017.0])
+        P0 = resolve_params(e, {})
+        ok(all(e._burnin_key(P0, a) != e._burnin_key(dict(P0, **{k: v[0] + 0.25}), a) for k, v in want.items()),
+           "NE1 the net-effect parameters act on past campaigns before the fork, so they are in the burn-in key")
+    case("NE1", ne1)
+
+    def ne2():
+        from toolkit.spec import priors as PR
+        card = PR.load_card(e)
+        pr = card["priors"].get("net_kill_shift")
+        ok(not card["problems"] and pr is not None and (pr.lo, pr.hi) == (-0.618, 0.66) and "0.012" in pr.source
+           and all("trial fit" in card["fixed"].get(k, "") for k in ("pbo_gain_scale", "pbo_adv_decay"))
+           and "hut_trial_coefficients" not in card["not_exposed"],
+           "NE2 priors.yaml: the kill shift is drawn over Churcher 2016's 95% CrI of alpha1 (0.012-1.29, centred on the "
+           "engine's 0.63); the PBO gain scale and advantage decay are held until the trial fit sets their ranges "
+           f"(problems {card['problems'][:2]})")
+    case("NE2", ne2)
+
+    def ne3():
+        h = Horizon(2015.0, 2015.2, (2015.0, 2015.2), {})
+        bad = []
+        for k, v in (("pbo_gain_scale", -0.5), ("pbo_adv_decay", -0.1)):
+            try:
+                e.run({"n_agents": 200, "burnin_years": 0, k: v}, unit, Package("none", {}), h, 1)
+                bad.append(k)
+            except ValueError:
+                pass
+        ok(not bad, f"NE3 an out-of-domain net-effect parameter fails closed before the sim runs (accepted: {bad})")
+    case("NE3", ne3)
+
+
 def write_card(path: str) -> None:
     """Engine card (describe() plus every parameter with its kind, range and source) as YAML."""
     e = MalariaEngine()
