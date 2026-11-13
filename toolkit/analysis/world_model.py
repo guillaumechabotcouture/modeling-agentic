@@ -8,7 +8,7 @@ throughout: absence of evidence, weak evidence or too few usable points is `inco
     python3 toolkit/analysis/world_model.py register <seed.yaml> <run_dir>      # before the evidence exists
     python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml or a world_model.yaml> [--out DIR]
         [--hypotheses hypotheses.yaml] [--registry ledger.jsonl] [--engine-identity current|recorded]
-        [--shadow-price LAMBDA] [--without-plan]
+        [--shadow-price LAMBDA] [--without-plan] [--anchor-ref origin/<branch>]
     python3 toolkit/analysis/world_model.py --self-test
 
 Simulation beliefs are screened: every direction (package x feature) and flip (pair x feature) of the summary is one
@@ -25,9 +25,16 @@ sha256 of its evidence. A replay or an alias counts once and moves no confidence
 history, never taken from the seed (`reconciled` records a difference). Registration is a separate, append-only
 ledger (`register`, analysis/hypotheses_registry.jsonl): each line holds a canonical test, its sha256, the time it
 was registered, the previous line's sha256 and its own, and the chain is verified on every read (an edited, removed,
-reordered or backdated line is refused). A hypothesis is pre-registered only when its current canonical test sha256
-is in the ledger with a time before its evidence existed; an edit after registration, a test not in the ledger, or a
-`registered_at` written in the seed alone is `post_hoc`: reported separately and never in the share confirmed.
+reordered or backdated line is refused). The ledger cannot attest itself, so it needs an anchor outside it: a
+recorded head (its line count and last line sha256, with a time). In a run the harness records the head into
+run_state.json history at the start of each step (`registry_head`; run_state.json is a harness file protected by
+agents/integrity.py's hash record); offline, a head is the ledger as committed in a git commit that is an ancestor of
+the fetched remote ref (--anchor-ref, e.g. origin/v2), recorded as "anchored in git (remote commit <sha>)" with its
+residual trust (the commit time is the committer's clock). A ledger that does not extend every recorded head
+(rewritten or truncated) is refused. A hypothesis is pre-registered only when its current canonical test sha256 is in
+a ledger line covered by a head recorded before its evidence existed; an edit after registration, a test not in the
+ledger, a line after the last recorded head, or a `registered_at` written in the seed alone is `post_hoc`: reported
+separately and never in the share confirmed.
 A produced world model can seed the next build: its simulation beliefs are replaced (`version`,
 `superseded_simulation`), literature and data beliefs kept, and hypotheses reloaded with --hypotheses. Ids starting
 `sim.` are reserved for generated beliefs. Nothing is wired into the analysis or the stage machine. No LLM calls.
@@ -220,10 +227,17 @@ def _where_problem(where, sweep):
     return None
 
 
+def _pair(v):
+    return isinstance(v, (list, tuple)) and len(v) == 2 and all(_num(x) for x in v)
+
+
 def _intersect(region, f, r):
-    """region with feature f's range intersected with r (r added when f is not there)."""
-    out = {k: list(v) for k, v in region.items()}
-    out[f] = [max(out[f][0], r[0]), min(out[f][1], r[1])] if f in out and _band_ok(out[f]) else list(r)
+    """region with feature f's numeric range intersected with r (r added when f is not there; an empty intersection
+    stays empty, lo > hi). Categorical filters are kept as they are; a numeric range on one is refused."""
+    out = {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in region.items()}
+    if f in out and not _pair(out[f]):
+        raise WorldModelError(f"a numeric condition on {f!r}, which the test filters by category")
+    out[f] = [max(out[f][0], r[0]), min(out[f][1], r[1])] if f in out else list(r)
     return out
 
 
@@ -315,9 +329,14 @@ def validate_seed(seed) -> dict:
         mg = b.get("magnitude")
         if mg is not None and not (isinstance(mg, dict) and _band_ok(mg.get("band"))):
             errs.append(f"{w}: magnitude.band [lo, hi] of finite numbers (a band, not a point value)")
+        cc = {}
         for c in b.get("conditions") or []:
             if not (isinstance(c, dict) and c.get("feature") and _band_ok(c.get("range"))):
                 errs.append(f"{w}: each condition {{feature, range: [lo, hi]}} of finite numbers")
+            else:
+                cc = _intersect(cc, c["feature"], c["range"])
+        if any(r[0] > r[1] for r in cc.values()):
+            errs.append(f"{w}: its conditions on one feature do not intersect (an empty region)")
     for b in bs if isinstance(bs, list) else []:
         for c in (b.get("conflicts") or []) if isinstance(b, dict) else []:
             if not isinstance(c, dict) or c.get("belief") not in ids:
@@ -370,6 +389,9 @@ def validate_seed(seed) -> dict:
                 errs.append(f"{w}: direction increases, decreases or negligible")
             elif t["direction"] == "negligible" and not (_num(t.get("equivalence")) and 0 < t["equivalence"] < 1):
                 errs.append(f"{w}: a negligible claim needs an explicit equivalence bound on |rho| in (0, 1)")
+            elif t["direction"] != "negligible" and "equivalence" in t:
+                errs.append(f"{w}: an equivalence bound applies only to a negligible claim (it would change the "
+                            "test's identity, not its check)")
         if h.get("belief") in by and not errs:
             why = _related(t, by[h["belief"]])
             if why:
@@ -460,14 +482,25 @@ def flip_along(sw, a, b, f, mask=None):
         return dict(out, status="non_monotone", bin_shares=[_r(v) for v in sh])
     dev, t, b1 = _logistic(x, s)
     lo, hi = float(x.min()), float(x.max())
-    if not (dev >= SETTINGS["flip_deviance_min"] and math.isfinite(t) and lo <= t <= hi):
-        return dict(out, status="no_flip_detected", deviance_gain=_r(dev), p=_r(chi2.sf(max(dev, 0.0), 1)))
+    if len(x) < SETTINGS["perm_n_max"]:      # small samples: a permutation p-value of the winners' rank sum
+        from scipy.stats import rankdata
+        rk, k = rankdata(x), int(s.sum())
+        perm = np.argsort(np.random.default_rng(SETTINGS["perm_seed"]).random((SETTINGS["perm_resamples"], len(x))),
+                          axis=1)[:, :k]
+        mu = k * (len(x) + 1) / 2
+        pv = float((1 + np.sum(np.abs(rk[perm].sum(1) - mu) >= abs(rk[s == 1].sum() - mu) - 1e-9)) /
+                   (SETTINGS["perm_resamples"] + 1))
+        found, how = pv <= chi2.sf(SETTINGS["flip_deviance_min"], 1), "permutation"
+    else:
+        pv, found, how = float(chi2.sf(max(dev, 0.0), 1)), dev >= SETTINGS["flip_deviance_min"], "logistic"
+    if not (found and math.isfinite(t) and lo <= t <= hi):
+        return dict(out, status="no_flip_detected", deviance_gain=_r(dev), p=_r(pv), p_method=how)
     h = math.log(3) / abs(b1)
     below, above = x[x <= t], x[x >= t]
     rlo = min(t - h, float(below.max()) if len(below) else lo)      # widened to the nearest sampled points
     rhi = max(t + h, float(above.min()) if len(above) else hi)
     return dict(out, status="flip", at=_r(t), range=[_r(max(lo, rlo)), _r(min(hi, rhi))],
-                first_preferred_below=bool(b1 < 0), deviance_gain=_r(dev), p=_r(chi2.sf(dev, 1)))
+                first_preferred_below=bool(b1 < 0), deviance_gain=_r(dev), p=_r(pv), p_method=how)
 
 
 def flip(sw, a, b):
@@ -603,7 +636,7 @@ def _test(t, ctx):
         plan, units = ctx.get("plan"), ctx.get("units") or {}
         if not plan:
             return "untestable", {"reason": "no optimised plan (analysis/point.yaml)"}, None, []
-        got = {u: _match(row, t["where"]) for u, row in sorted(units.items())}
+        got = {u: _match(row, t.get("where") or {}) for u, row in sorted(units.items())}
         nocol, hit = [u for u, v in got.items() if v is None], [u for u, v in got.items() if v]
         absent = [u for u in hit if u not in plan]
         if nocol or absent or not hit:
@@ -675,7 +708,9 @@ def _scope(sw, t, st, obs, m):
 def _constrained(t, b):
     """The test as checked: its belief's conditions intersected into its `where` (a flip belief's condition on the
     test's own feature locates the flip, so it is not applied)."""
-    conds = {c["feature"]: c["range"] for c in (b or {}).get("conditions") or []}
+    conds = {}
+    for c in (b or {}).get("conditions") or []:          # repeated conditions on one feature intersect
+        conds = _intersect(conds, c["feature"], c["range"])
     if (b or {}).get("direction") == "flips":
         conds.pop(t.get("feature"), None)
     if not conds:
@@ -832,6 +867,59 @@ def verify_ledger(lines):
     return lines
 
 
+def anchor_cover(led, anchors):
+    """{ledger line index: (time, source)} of the earliest recorded head covering each line. A ledger that does not
+    extend a recorded head (its line at the head's count is not the head) was rewritten or truncated: refused."""
+    cov = {}
+    for a in sorted(anchors or [], key=lambda a: str(a.get("at"))):
+        n = a.get("lines")
+        if _when(a.get("at")) is None or not isinstance(n, int) or not 0 < n <= len(led) or \
+                led[n - 1]["line_sha"] != a.get("head"):
+            raise WorldModelError(f"the registration ledger does not extend the head recorded at {a.get('at')} "
+                                  f"({a.get('source')}): it was rewritten or truncated")
+        for i in range(n):
+            cov.setdefault(i, (a["at"], a.get("source")))
+    return cov
+
+
+def run_state_anchors(run_dir):
+    """The ledger heads the harness recorded into run_state.json history (`registry_head` at a step's start)."""
+    try:
+        st = json.load(open(os.path.join(run_dir, "run_state.json")))
+    except (OSError, ValueError):
+        return []
+    return [dict(h["registry_head"], source="run_state.json history (recorded by the harness at a step's start)")
+            for h in st.get("history") or [] if isinstance(h, dict) and isinstance(h.get("registry_head"), dict)]
+
+
+def git_anchors(path, ref):
+    """Recorded heads from git: each commit of the ledger file that is an ancestor of the fetched remote `ref`, with
+    the verified ledger it held and its commit time. Residual trust: the commit time is the committer's clock; the
+    remote shows the commit was pushed by the time it was fetched. Fetch before use; git unavailable: none."""
+    import subprocess
+    d, name = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
+    out = []
+    try:
+        run = lambda *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=120)  # noqa
+        log = run("log", "--format=%H %cI", ref, "--", name)
+        for row in (log.stdout.splitlines() if log.returncode == 0 else []):
+            c, at = row.split()
+            if run("merge-base", "--is-ancestor", c, ref).returncode != 0:
+                continue
+            show = run("show", f"{c}:./{name}")
+            try:
+                lines = verify_ledger([json.loads(x) for x in show.stdout.splitlines() if x.strip()])
+            except (WorldModelError, ValueError):
+                continue
+            if show.returncode == 0 and lines:
+                out.append({"at": at, "lines": len(lines), "head": lines[-1]["line_sha"], "commit": c,
+                            "source": f"anchored in git (remote commit {c}); residual trust: the commit time is the "
+                                      "committer's clock"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    return out
+
+
 def register(seed, ledger, at=None):
     """The ledger with every hypothesis of the seed whose canonical test is not yet in it appended, registered at
     `at` (default now; never before the ledger's last line). The ledger is verified first."""
@@ -896,22 +984,27 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
     hist = [e for e in (seed.get("track_record") or {}).get("history") or [] if isinstance(e, dict)]
     seen = {(e.get("test_sha"), e.get("evidence_sha")) for e in hist if e.get("test_sha")}
     plan_sha = _sha([plan, units]) if plan else None
-    led = verify_ledger(list(registry or []))
+    lines, anchors = (registry.get("lines"), registry.get("anchors")) if isinstance(registry, dict) else \
+        (registry, None)
+    led = verify_ledger(list(lines or []))
+    cover = anchor_cover(led, anchors)
     first = {}
-    for e in led:
-        first.setdefault(e["test_sha"], e)
+    for i, e in enumerate(led):
+        first.setdefault(e["test_sha"], (i, e))
     by = {b["id"]: b for b in beliefs}
     qs = list(seed.get("open_questions") or [])
     for h in checked:
         on_plan = h["test"]["kind"] == "plan_share"
         ev_sha, ev_time = (plan_sha, plan_time) if on_plan else (sw.evidence_sha, sw.evidence_time)
         key = (_sha(h["result"]["test_applied"]), ev_sha)
-        e, at = first.get(key[0]), _when(ev_time)
-        post = e is None or at is None or _when(e["registered_at"]) >= at
+        i, e = first.get(key[0], (None, None))
+        anchor, at = cover.get(i), _when(ev_time)
+        post = anchor is None or at is None or _when(anchor[0]) >= at
         again = key in seen
         seen.add(key)
         h["confrontation"] = {"test_sha": key[0], "evidence_sha": ev_sha, "evidence_time": ev_time,
-                              "post_hoc": post, "repeat": again, "registration": e["line_sha"] if e else None}
+                              "post_hoc": post, "repeat": again, "registration": e["line_sha"] if e else None,
+                              "anchor": {"at": anchor[0], "source": anchor[1]} if anchor else None}
         hist.append(dict({"hypothesis": h["id"], "belief": h["belief"], "status": h["status"]}, **h["confrontation"]))
         b = by[h["belief"]]
         if again:
@@ -932,7 +1025,8 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
             b.setdefault("confidence_seed", b["confidence"])
             b["confidence"] = CONFIDENCE[min(max(j, 0), 2)]
     tr = dict(_record(hist, seed.get("track_record")), provisional=PROVISIONAL,
-              registry={"lines": len(led), "head": led[-1]["line_sha"] if led else None})
+              registry={"lines": len(led), "head": led[-1]["line_sha"] if led else None,
+                        "anchors": [{k: a.get(k) for k in ("at", "lines", "source")} for a in anchors or []]})
     wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "version": seed.get("version", 0) + 1,
           "inputs": inputs or sw.artifacts, "superseded_simulation": seed.get("superseded_simulation") or [],
           "structure": {"comparator": sw.comparator, "packages": sorted(sw.packages),
@@ -1011,21 +1105,21 @@ def benchmark_record(bench_dir, ident):
     import glob
     import subprocess
     import yaml
-    want = (str(ident.get("version")), ident.get("code_sha256"))
-    same = lambda doc: isinstance(doc, dict) and (str((doc.get("engine_identity") or {}).get("version")),  # noqa
-                                                  (doc.get("engine_identity") or {}).get("code_sha256")) == want
+    keys = ("name", "version", "code_sha256", "params_sha256", "config_sha256")
+    want = tuple(str(ident.get(k)) for k in keys)
+    same = lambda doc: isinstance(doc, dict) and tuple(  # noqa: E731
+        str((doc.get("engine_identity") or {}).get(k)) for k in keys) == want
     files = [os.path.join(bench_dir, "results.yaml")] + sorted(glob.glob(os.path.join(bench_dir, "history", "*.yaml")))
     for f in files:
         try:
             if same(yaml.safe_load(open(f))):
-                return {"matched": "working tree", "file": os.path.relpath(f, bench_dir), "version": want[0],
-                        "code_sha256": want[1]}
+                return {"matched": "working tree", "file": os.path.relpath(f, bench_dir), **dict(zip(keys, want))}
         except (OSError, yaml.YAMLError):
             continue
     try:
         run = lambda *a: subprocess.run(["git", "-C", bench_dir, *a], capture_output=True, text=True,  # noqa
                                         timeout=120)
-        log = run("log", "--format=%H", "-S", str(want[1]), "--", "results.yaml")
+        log = run("log", "--format=%H", "-S", str(want[2]), "--", "results.yaml")
         for c in log.stdout.split() if log.returncode == 0 else []:
             if run("merge-base", "--is-ancestor", c, "HEAD").returncode != 0:
                 continue
@@ -1033,11 +1127,10 @@ def benchmark_record(bench_dir, ident):
                 show = run("show", f"{rev}:./results.yaml")
                 if show.returncode == 0 and same(yaml.safe_load(show.stdout)):
                     sha = run("rev-parse", rev).stdout.strip()
-                    return {"matched": "git history", "file": "results.yaml", "commit": sha, "version": want[0],
-                            "code_sha256": want[1]}
+                    return {"matched": "git history", "file": "results.yaml", "commit": sha, **dict(zip(keys, want))}
     except (OSError, subprocess.SubprocessError, yaml.YAMLError):
         pass
-    raise WorldModelError(f"recorded engine identity {want[0]} ({want[1]}) is not in the engine's benchmark history "
+    raise WorldModelError(f"recorded engine identity {dict(zip(keys, want))} is not in the engine's benchmark history "
                           f"({bench_dir}: results.yaml, history/*, or results.yaml in an ancestor commit)")
 
 
@@ -1099,16 +1192,18 @@ def _input_problems(run_dir, rel, doc, seen):
     bad = []
     for q_rel, h in sorted(inp.items()):
         q = os.path.normpath(os.path.join(run_dir, q_rel))
-        if sha256(q) != h:
-            bad.append(f"{rel} -> {q_rel}: {'changed' if os.path.exists(q) else 'missing'}")
+        got = sha256(q)
+        if not (isinstance(h, str) and len(h) == 64) or got is None or got != h:
+            bad.append(f"{rel} -> {q_rel}: " + ("no recorded sha256" if not (isinstance(h, str) and len(h) == 64)
+                                                else "missing or unreadable" if got is None else "changed"))
         elif q_rel.endswith((".yaml", ".yml")) and q not in seen:
             seen.add(q)
             try:
                 sub = yaml.safe_load(open(q))
             except (OSError, yaml.YAMLError):
                 sub = None
-            if isinstance(sub, dict) and "inputs" in sub:
-                bad += _input_problems(run_dir, q_rel, sub, seen)
+            if isinstance(sub, dict) and ("inputs" in sub or str(sub.get("schema") or "").startswith("analysis.")):
+                bad += _input_problems(run_dir, q_rel, sub, seen)      # a harness artifact must record its inputs
     return bad
 
 
@@ -1256,6 +1351,7 @@ def _cli(argv):
     b.add_argument("--hypotheses", help="a hypotheses.yaml to reload (with a world_model.yaml as --seed)")
     b.add_argument("--registry", help=f"the registration ledger (default: <run_dir>/{LEDGER} when present)")
     b.add_argument("--without-plan", action="store_true", help="build without analysis/point.yaml")
+    b.add_argument("--anchor-ref", help="a fetched remote ref (origin/<branch>) whose commits anchor the ledger")
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
@@ -1264,11 +1360,18 @@ def _cli(argv):
         return 0
     from toolkit.analysis.artifacts import _safe_io, sha256
     jsonl = lambda q: [json.loads(x) for x in open(q) if x.strip()] if q and os.path.isfile(q) else []  # noqa: E731
-    if a.cmd == "register":
-        old = jsonl(os.path.join(a.run_dir, LEDGER))
-        new = register(seed, old)[len(old):]
-        _safe_io().write_nofollow(a.run_dir, LEDGER, "".join(json.dumps(e, sort_keys=True) + "\n"
-                                                             for e in new).encode(), append=True)
+    if a.cmd == "register":              # one lock across reading the head, building the lines and appending
+        import fcntl
+        with _safe_io().open_append_nofollow(a.run_dir, LEDGER) as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                old = jsonl(os.path.join(a.run_dir, LEDGER))
+                new = register(seed, old)[len(old):]
+                f.write("".join(json.dumps(e, sort_keys=True) + "\n" for e in new))
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         print(f"registered {len(new)} test(s) in {a.run_dir}/{LEDGER} ({len(old) + len(new)} lines)")
         return 0
     sw, spec = load_sweep(a.run_dir, a.engine_identity, a.shadow_price, use_plan=not a.without_plan)
@@ -1282,7 +1385,9 @@ def _cli(argv):
     reg_path = a.registry or os.path.join(a.run_dir, LEDGER)
     if os.path.isfile(reg_path):
         inputs["registry"] = sha256(reg_path)
-    wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time, registry=jsonl(reg_path))
+    anchors = run_state_anchors(a.run_dir) + (git_anchors(reg_path, a.anchor_ref) if a.anchor_ref else [])
+    wm, hy = build(seed, sw, plan, units, inputs, hyps, plan_time,
+                   registry={"lines": jsonl(reg_path), "anchors": anchors})
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
     for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)
@@ -1484,7 +1589,8 @@ def _self_test() -> int:
            "WM15 a plan hypothesis without a plan is untestable, never supported")
         sd = _seed()
         sd["beliefs"][3].update(decision_relevant=True, confidence="high")
-        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
+        wm2, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
+                       registry=_anch(register(sd, [], REGISTERED)))
         ok(any(x["belief"] == "B4" and x["kind"] == "contradiction" for x in where_to_look(wm2, top=0)),
            "WM33 where_to_look always lists a contradicted decision-relevant belief, even with no conditions or "
            "conflicts and top=0")
@@ -1700,12 +1806,14 @@ def _self_test() -> int:
         plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
         sd = _seed()
         sd["hypotheses"].append(dict(sd["hypotheses"][0], id="H1b"))
-        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
+        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
+                       registry=_anch(register(sd, [], REGISTERED)))
         ok(wa["track_record"]["confirmed"] == 4, f"WM39 an alias (identical test, same evidence) counts once: "
                                                  f"{wa['track_record']['confirmed']}")
         sd = _seed()
         sd["track_record"] = {"confirmed": 99, "contradicted": 0, "history": []}
-        wr, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
+        wr, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
+                       registry=_anch(register(sd, [], REGISTERED)))
         ok(wr["track_record"]["confirmed"] == 4 and wr["track_record"].get("reconciled"),
            f"WM40 seed counters are recomputed from the confrontations, not trusted: {wr['track_record']}")
         sd = _seed()
@@ -1996,7 +2104,8 @@ def _self_test() -> int:
         sd = _seed()
         sd["hypotheses"].append(dict(sd["hypotheses"][3], id="H4b", test=dict(sd["hypotheses"][3]["test"],
                                                                                 scope="conditional")))
-        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME, registry=_anch(register(sd, [], REGISTERED)))
+        wa, _ = build(sd, sw, plan=plan, units=units, plan_time=EVIDENCE_TIME,
+                       registry=_anch(register(sd, [], REGISTERED)))
         ok(wa["track_record"]["confirmed"] == 4, f"WM56c an alias spelled with an explicit default counts once: "
                                                  f"{wa['track_record']['confirmed']}")
     tryit("WM56 canonical tests", wm56)
@@ -2059,7 +2168,8 @@ def _self_test() -> int:
             prev = e["line_sha"]
         sd2 = _seed()
         _, h0 = build(sd2, sw, registry=forged, **kw)
-        ok(h0["hypotheses"][0]["confrontation"]["post_hoc"], "WM67 a ledger with no recorded head pre-registers nothing "
+        ok(h0["hypotheses"][0]["confrontation"]["post_hoc"], "WM67 a ledger with no recorded head pre-registers "
+                                                             "nothing "
                                                              "(a self-attesting, rehashed rewrite counts post hoc)")
         for lines, why in ((forged, "a rehashed rewrite"), (reg[:3], "a truncated ledger")):
             try:
@@ -2151,7 +2261,8 @@ def _self_test() -> int:
         except WorldModelError:
             ok(True, "WM71 an equivalence bound on an increases/decreases claim is refused (it changes nothing)")
         sd = _seed()
-        sd["beliefs"][2]["conditions"] = [{"feature": "f1", "range": [0.0, 0.2]}, {"feature": "f1", "range": [0.8, 1.0]}]
+        sd["beliefs"][2]["conditions"] = [{"feature": "f1", "range": [0.0, 0.2]},
+                                          {"feature": "f1", "range": [0.8, 1.0]}]
         try:
             validate_seed(sd)
             ok(False, "WM72 repeated conditions on one feature are intersected; an empty intersection is refused")
