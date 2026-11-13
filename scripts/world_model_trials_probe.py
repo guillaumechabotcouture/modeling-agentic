@@ -24,14 +24,19 @@ def probe(template, pops, attrs) -> dict:
     from toolkit.engines.contract import Package, UnitSpec
     from toolkit.engines.horizon import make_horizon
     from toolkit.spec import schema
+    from toolkit.analysis import batch as B
+    from toolkit.spec import engine_parameters as PV
     s = schema.load(os.path.join(template, "decision_spec.yaml"))
     e, o = s.engine(), s.outcomes()[0]
     h = s["horizon"]
     hz = make_horizon(h["start"], h["stop"], list(s["objective"]["horizon"]))
-    out = {}
+    box = B.design_box(s, e)[0]                     # the design's parameters at their point values (priors' modes)
+    params = PV.params(s, {k: v[2] for k, v in box.items()})
+    out = {"params": params}
     for n in pops:
-        out[str(n)] = {name: e.run({}, UnitSpec("u", dict(attrs, N=float(n))), Package(name, s.engine_package(cs)),
-                                   hz, 1).per_capita[o]["all"] for name, cs in s.packages().items()}
+        out[str(n)] = {name: e.run(params, UnitSpec("u", dict(attrs, N=float(n))),
+                                   Package(name, s.engine_package(cs)), hz, 1).per_capita[o]["all"]
+                       for name, cs in s.packages().items()}
     return out
 
 
