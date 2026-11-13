@@ -1,0 +1,304 @@
+beliefs:
+- id: B1
+  mechanism: Emergency chlorination plus household water treatment, started in week 2, cuts waterborne transmission
+    during a piped-water outbreak; in a renewal model the cut in R_t is amplified nonlinearly into a larger cut
+    in the final size when it brings R_t near or below 1, and muted when R_t stays well above 1.
+  about:
+    package: fast
+  direction: reduces
+  magnitude:
+    band:
+    - 0.3
+    - 0.9
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Wolf J, et al. Effectiveness of interventions to improve drinking water, sanitation, and handwashing
+      with soap on risk of diarrhoeal disease in children in low-income and middle-income settings: a systematic
+      review and meta-analysis. Lancet 2022'
+    location: Results, water-treatment pooled estimates (table row not checked; location uncertain)
+  - citation: Clasen TF, et al. Interventions to improve water quality for preventing diarrhoea. Cochrane Database
+      of Systematic Reviews 2015
+    location: Summary of findings tables (point-of-use chlorination; exact table not checked)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 2006
+    location: final size relation, main result
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B2
+  mechanism: The later the start relative to the outbreak's progress, the more infections have already occurred
+    or are already committed; a week-7 start therefore achieves a smaller relative reduction where the outbreak
+    was further along at detection (higher seed_share).
+  about:
+    package: standard
+    feature: seed_share
+  direction: decreases
+  magnitude:
+    band:
+    - 0.1
+    - 0.6
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Fraser C, Riley S, Anderson RM, Ferguson NM. Factors that make an infectious disease outbreak controllable.
+      PNAS 2004
+    location: Discussion of control timing (page not checked)
+  - citation: Polonsky JA, et al. Descriptive epidemiology of typhoid fever during an epidemic in Harare, Zimbabwe,
+      2012. PLoS One 2014
+    location: epidemic curve figure (outbreak timescale of weeks to months; figure number not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The engine is a deterministic per-capita renewal model with seeding given as a share of the population,
+    so the relative reduction in a town does not depend on its population size; population only scales cost and
+    cases averted in proportion.
+  about:
+    package: fast
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 2006
+    location: final size relation depends on R0 and initial fractions, not on N
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: 'The value of starting five weeks earlier rises with how far the outbreak has progressed at detection
+    (seed_share): where seeding is light, few infections fall in weeks 2-7 and STANDARD gets most of FAST''s benefit
+    for half the price; where seeding is heavy, the delay lets a large share of the outbreak through and FAST wins
+    despite costing US$1.30 more per resident. The choice flips somewhere inside the seed_share range, roughly located
+    below.'
+  about:
+    pair:
+    - fast
+    - standard
+    feature: seed_share
+  direction: flips
+  conditions:
+  - feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.00025
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proceedings of the Royal Society B 2007
+    location: growth rate to R relation (equation numbers not checked)
+  - citation: Fraser C, Riley S, Anderson RM, Ferguson NM. Factors that make an infectious disease outbreak controllable.
+      PNAS 2004
+    location: Discussion of control timing (page not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Where most residents are still susceptible, R0 x s0 is above 1 and an unchecked outbreak infects a
+    large share of the town, so even the week-7 response averts far more than the ~0.0008 infections per resident
+    its price requires; where s0 is low the outbreak may be near-subcritical and no response can win.
+  about:
+    pair:
+    - standard
+    - none
+    feature: s0 (calibration scale)
+  direction: raises
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.75
+    - 0.99685840732418
+  source_type: literature
+  evidence:
+  - citation: 'Pitzer VE, et al. Predicting the impact of vaccination on the transmission dynamics of typhoid in
+      South Asia: a mathematical modeling study. PLoS Neglected Tropical Diseases 2014'
+    location: fitted transmission parameters table (R0 values and table number not checked)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology 2006
+    location: final size relation, main result
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: Higher susceptibility raises the effective reproduction number, so the outbreak grows faster (more
+    is missed by a week-7 start) and the intervention's multiplier is less able to push R_t below 1; the relative
+    reduction of STANDARD therefore falls as s0 rises.
+  about:
+    package: standard
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proceedings of the Royal Society B 2007
+    location: growth rate to R relation (equation numbers not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'The US$6 million budget probably cannot buy FAST in every town but can buy STANDARD in every town,
+    so the binding question is where to upgrade STANDARD to FAST: towns with the highest seed_share (and high susceptibility)
+    first, ranked per resident, not by town size.'
+  about:
+    pair:
+    - fast
+    - standard
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Hutubessy R, Chisholm D, Tan-Torres Edejer T. Generalized cost-effectiveness analysis for national-level
+      priority-setting in the health sector. Cost Effectiveness and Resource Allocation 2003
+    location: threshold convention used for the shadow price (whole paper)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is typhoid's R0 in a piped-water outbreak and the generation interval the engine uses? Together
+    with s0 they set whether outbreaks are supercritical and how fast they grow, hence what five weeks of delay
+    cost.
+  beliefs:
+  - B4
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: How large a cut in R_t does emergency chlorination plus household treatment achieve, and is it the same
+    for FAST and STANDARD (emergency supplies may achieve lower coverage or adherence)? Trials measure diarrhoea
+    in children, not typhoid transmission in outbreaks, so the effect carried into the engine is weakly anchored.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q3
+  question: Is seed_share (reported cases at detection) a fair measure of infections already present, given typhoid's
+    low clinical ascertainment? If infections are much more numerous than cases, every town is further along than
+    its seed_share suggests and FAST gains value everywhere.
+  beliefs:
+  - B4
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Is the shadow price (0.69 DALYs per case at US$1,000 per DALY) appropriate when the outcome is infections
+    rather than clinical cases? Counting infections at the per-case value favours the costlier FAST option.
+  beliefs:
+  - B4
+  - B5
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: FAST reduces 2026 infections by between 30% and 90% relative to no response at most design points.
+  test:
+    kind: effect_band
+    package: fast
+    band:
+    - 0.3
+    - 0.9
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: STANDARD's relative reduction falls as seed_share rises (later start relative to outbreak progress).
+  test:
+    kind: effect_direction
+    package: standard
+    feature: seed_share
+    direction: decreases
+    scope: conditional
+- id: H3
+  belief: B3
+  claim: FAST's relative reduction does not depend on town population (|rho| below 0.15).
+  test:
+    kind: effect_direction
+    package: fast
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+    scope: conditional
+- id: H4
+  belief: B4
+  claim: 'The FAST/STANDARD choice at the shadow price flips inside seed_share 3e-5 to 2.5e-4: STANDARD below, FAST
+    above.'
+  test:
+    kind: flip_in
+    a: fast
+    b: standard
+    feature: seed_share
+    range:
+    - 3.0e-05
+    - 0.00025
+- id: H5
+  belief: B4
+  claim: In the most advanced outbreaks (seed_share 2e-4 and above) FAST beats STANDARD on net benefit at the shadow
+    price at 70% or more of usable points.
+  test:
+    kind: paired_sign
+    a: fast
+    b: standard
+    feature: seed_share
+    range:
+    - 0.0002
+    - 0.0003904
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: Where s0 is 0.75 or more, STANDARD beats no response on net benefit at the shadow price at 75% or more
+    of usable points.
+  test:
+    kind: paired_sign
+    a: standard
+    b: none
+    feature: s0 (calibration scale)
+    range:
+    - 0.75
+    - 0.99685840732418
+    sign: positive
+    min_share: 0.75
+- id: H7
+  belief: B6
+  claim: STANDARD's relative reduction falls as s0 rises, after adjusting for the sampled STANDARD effect.
+  test:
+    kind: effect_direction
+    package: standard
+    feature: s0 (calibration scale)
+    direction: decreases
+    adjust_for:
+    - effect:standard
