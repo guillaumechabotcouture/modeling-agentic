@@ -1,0 +1,293 @@
+beliefs:
+- id: B1
+  mechanism: A children campaign (85% reach) removes most susceptibles in a never-vaccinated population; with homogeneous
+    mixing the residual Reff usually falls below 1, so CRS falls through the herd effect even though no woman is
+    vaccinated
+  about:
+    package: children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.7
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM (1983). Vaccination against rubella and measles: quantitative investigations
+      of different policies. Journal of Hygiene'
+    location: section on vaccination of children vs girls; location within paper not recalled exactly
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology
+    location: final size relation, main theorem
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 1
+    confidence_claimed: medium
+- id: B2
+  mechanism: A wide campaign protects women directly (about 0.85 reach x ~0.95 seroconversion, roughly 0.8 of women's
+    susceptibles) and adds the children's herd effect, so CRS reduction is near complete
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Rubella vaccines: WHO position paper (2011). Weekly Epidemiological Record'
+    location: section on vaccine immunogenicity (seroconversion >=95% after one dose); page not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 0
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The more susceptible women there are, the larger the residual Reff after a children-only campaign and
+    the larger the share of CRS that remains; the children option's relative reduction falls with s0_women
+  about:
+    package: children
+    feature: s0_women
+  direction: decreases
+  magnitude:
+    band:
+    - 0.1
+    - 0.4
+    scale: spearman_rho_abs
+  source_type: literature
+  evidence:
+  - citation: Metcalf CJE, Cohen C, Lessler J, McAnerney JM, Ntshoe GM, Puren A, Klepac P, Tatem A, Grenfell BT,
+      Bjornstad ON (2013). Implications of spatially heterogeneous vaccination coverage for the risk of congenital
+      rubella syndrome in South Africa. Journal of the Royal Society Interface
+    location: results on adult female susceptibility and CRS risk; figure not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: Higher child susceptibility raises the no-vaccination epidemic (and CRS baseline) much more than it
+    raises the residual after a children campaign, so the children option's relative reduction rises with s0_children
+  about:
+    package: children
+    feature: s0_children
+  direction: increases
+  magnitude:
+    band:
+    - 0.1
+    - 0.5
+    scale: spearman_rho_abs
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology
+    location: final size relation, main theorem
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Where children-only already brings Reff below 1, the extra CRS averted by wide is small while its cost
+    is roughly 1.3-1.6x higher; at a binding budget's shadow price children beats wide across the sampled s0_women
+    range (no flip inside 0.06-0.30 unless R0 and women's population share are both high)
+  about:
+    pair:
+    - children
+    - wide
+    feature: s0_women
+  direction: none
+  conditions:
+  - feature: s0_women
+    range:
+    - 0.0618
+    - 0.2972
+  source_type: literature
+  evidence:
+  - citation: Knox EG (1980). Strategy for rubella vaccination. International Journal of Epidemiology
+    location: comparison of selective (girls/women) vs universal childhood strategies; location not recalled
+  - citation: 'Anderson RM, May RM (1983). Vaccination against rubella and measles: quantitative investigations
+      of different policies. Journal of Hygiene'
+    location: location not recalled
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Where child susceptibility is high the unvaccinated district has Reff above 1 and a sizeable outbreak
+    among women; a children campaign then averts enough CRS to beat doing nothing at the shadow price. In low-susceptibility
+    districts baseline Reff may already be near or below 1 and none can win
+  about:
+    pair:
+    - children
+    - none
+    feature: s0_children
+  direction: none
+  conditions:
+  - feature: s0_children
+    range:
+    - 0.45
+    - 0.5908
+  source_type: literature
+  evidence:
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, Reef SE, Navar AM, Simons E, Yoshida LM, Brown DWJ, Jackson C, Strebel
+      PM, Dabbagh AJ (2016). Using seroprevalence and immunisation coverage data to estimate the global burden of
+      congenital rubella syndrome, 1996-2010: a systematic review. PLoS One'
+    location: CRS incidence vs seroprevalence among women; tables not recalled
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: Susceptibles outside children and women (s0_other) also feed residual transmission after a children
+    campaign, lowering the children option's relative reduction
+  about:
+    package: children
+    feature: s0_other
+  direction: decreases
+  magnitude:
+    band:
+    - 0.05
+    - 0.3
+    scale: spearman_rho_abs
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD (2006). Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology
+    location: final size relation, main theorem
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: Does the budget bind (can wide be afforded everywhere within US$12M)? If it does not, the shadow price
+    is 0 and wide weakly dominates children everywhere; the herd-effect question then matters only for cost, not
+    for the plan.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: What are the population shares of children and women per district? The residual Reff after a children
+    campaign scales with the women's and others' population shares, which decides whether the herd effect suffices.
+  beliefs:
+  - B1
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Are outcomes expected values including the probability that an importation fails to cause a major outbreak
+    (p_major), or conditional final sizes? This changes the baseline burden in districts with Reff near 1.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does the campaign waste doses on already-immune people (targets_susceptible not declared)? Cost per
+    susceptible protected is then 1.10 / s0, which favours children (higher s0) over women.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q5
+  question: Where in R0 4-7 (contact_rate calibration) does a children-only residual Reff cross 1 for the highest
+    s0_women districts?
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Children-only averts 70-100% of CRS at most points with baseline burden
+  test:
+    kind: effect_band
+    package: children
+    band:
+    - 0.7
+    - 1.0
+    min_share: 0.75
+- id: H2
+  belief: B2
+  claim: Wide averts 80-100% of CRS at most points with baseline burden
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: The children option's relative CRS reduction decreases as s0_women rises
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_women
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: The children option's relative CRS reduction increases with s0_children
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_children
+    direction: increases
+- id: H5
+  belief: B5
+  claim: At the budget's shadow price children beats wide at >=75% of points across the sampled s0_women range
+  test:
+    kind: paired_sign
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.0618
+    - 0.2972
+    sign: positive
+    min_share: 0.75
+- id: H6
+  belief: B6
+  claim: Where s0_children >= 0.45, children beats none at the shadow price at >=70% of points
+  test:
+    kind: paired_sign
+    a: children
+    b: none
+    feature: s0_children
+    range:
+    - 0.45
+    - 0.5908
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: The children option's relative CRS reduction decreases as s0_other rises
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_other
+    direction: decreases
