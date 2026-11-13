@@ -220,6 +220,39 @@ def _survey_changes(run_dir: str, data) -> list[dict]:
 
 
 def gate_findings(run_dir: str) -> list[dict]:
+    return departure_findings(run_dir) + _gate_findings(run_dir)
+
+
+def departure_findings(run_dir: str) -> list[dict]:
+    """#215 round 4: a signed engine departure whose decision test did not take effect in the run (not run, an
+    identity at the calibrated point, a targeted package skipped, no realised benefit change), or with no check
+    recorded, is a non-declarable finding that bears on the decision: only the owner can resolve it."""
+    import yaml
+    try:
+        spec = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError):
+        return []                     # the contract checks below report an unreadable spec
+    deps = [d for d in (spec.get("engine_departures") or []) if isinstance(d, dict)] if isinstance(spec, dict) else []
+    if not deps:
+        return []
+
+    def f(claim, key):
+        return dict(_f("departure_test_ineffective", claim, key), decision_bearing=True)
+    p = os.path.join(run_dir, "models", "decision_tests", "departure_checks.yaml")
+    try:
+        checks = (yaml.safe_load(open(p)) or {}).get("checks") or []
+    except (OSError, yaml.YAMLError, AttributeError):
+        return [f("the spec declares engine departures but the run recorded no check of their decision tests "
+                  "(models/decision_tests/departure_checks.yaml)", "departures")]
+    out = [f(f"engine departure {c.get('departure')}: {c.get('why')}", str(c.get("departure")))
+           for c in checks if isinstance(c, dict) and c.get("effective") is not True]
+    seen = {str(c.get("departure")) for c in checks if isinstance(c, dict)}
+    out += [f(f"engine departure {k}: no check of its decision test was recorded", k)
+            for k in (str(d.get("benchmark") or d.get("component")) for d in deps) if k not in seen]
+    return out
+
+
+def _gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
         return [] if not os.path.exists(os.path.join(run_dir, SPEC)) else [

@@ -189,7 +189,8 @@ def benchmark_gate(ref: str, card, config: dict, spec: dict, departures: str = "
     verified record of the configuration in use, never the card's copy of it."""
     from toolkit.engines import benchmark_coverage as BC
     raw, status = _departures(spec, departures)
-    return BC.assess(ref, config, raw, status, engine_name=card.name, card_benchmarks=card.benchmarks)
+    return BC.assess(ref, config, raw, status, engine_name=card.name, card_benchmarks=card.benchmarks,
+                     base=spec.get("_run_dir"))
 
 
 def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> list[dict]:
@@ -768,7 +769,7 @@ def _self_test_benchmark_gate(ok) -> None:
            "text": "Does the plan change?"}
     # review round 2: the departure's test must run on the run's path and change the departed effect (eff_a is a
     # fitted parameter, so an emulator input); DT1 names `a` only in with_any, so it does not count for T1
-    dta = {"id": "DTa", "type": "parameter_value", "parameter": "eff_a", "values": [0.4, 0.6], "text": "a's effect"}
+    dta = {"id": "DTa", "type": "parameter_value", "parameter": "eff_a", "values": [0.3, 0.7], "text": "a's effect"}
     dep = {"engine": "toy", "benchmark": "T1", "reason": "the trial measured a different product", "decision_test": "DTa"}
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "cov", "benchmarks"))
@@ -824,12 +825,12 @@ def _self_test_benchmark_gate(ok) -> None:
                f"G3c a departure whose decision test does not vary the related effect does not count ({r['why_not']})")
             r = eligible_engines(dict(spec_ab, engine_departures=[dict(dep, decision_test="DT1")]), entry,
                                  departures="proposed")[0]
-            ok(not r["eligible"] and any("with_any" in w for w in r["why_not"]),
+            ok(not r["eligible"] and any("interaction" in w and "does not count" in w for w in r["why_not"]),
                f"G3d an interaction test that names the departed component only in with_any does not count "
                f"({r['why_not'][-1:]})")
             r = eligible_engines(dict(spec_ab, engine_departures=[dict(dep, decision_test="DTI")]), entry,
                                  departures="proposed")[0]
-            ok(not r["eligible"] and any("arm" in w for w in r["why_not"]),
+            ok(not r["eligible"] and any("does not count" in w for w in r["why_not"]),
                f"G3e an interaction test whose benchmark has no arm ratios would not run, so it does not count "
                f"({r['why_not'][-1:]})")
             from toolkit.spec import preconditions as PC
@@ -959,7 +960,7 @@ def _self_test_benchmark_gate(ok) -> None:
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("component b" in w and "no benchmark" in w for w in r["why_not"]),
                f"G14 a used component no benchmark covers makes the engine ineligible ({r['why_not']})")
-            dtb = {"id": "DTb", "type": "parameter_value", "parameter": "eff_b", "values": [0.2, 0.4], "text": "b"}
+            dtb = {"id": "DTb", "type": "parameter_value", "parameter": "eff_b", "values": [0.1, 0.5], "text": "b"}
             cdep = {"engine": "toy", "component": "b", "reason": "no trial; its effect is tested", "decision_test": "DTb"}
             r = eligible_engines(dict(spec_ab, engine_departures=[cdep], analysis={"decision_tests": [dt1, dtb]}),
                                  entry, departures="proposed")[0]
@@ -1051,6 +1052,36 @@ def _self_test_benchmark_gate(ok) -> None:
             ok(any("T1" in x for x in e6) and any("T1" in x for x in e7),
                f"G27 engine auto: the resolved engine (engine_choice.json) and, while pending, every candidate is "
                f"checked ({e6[:1]}, {e7[:1]})")
+            # round 4: the spec-only signer runs the shared check for engine: auto too (every candidate)
+            try:
+                signoff.sign(run6, "owner")
+                ok(False, "G28 signing an engine: auto spec whose only candidate fails is refused")
+            except ValueError as ex:
+                ok("T1" in str(ex), f"G28 signing an engine: auto spec whose only candidate fails is refused "
+                                    f"({str(ex)[:90]})")
+            e8 = schema.validate(schema.load(p6), pending_ok=True)
+            ok(any("T1" in x for x in e8), f"G28b pending schema validation runs the shared check ({e8[:1]})")
+            # round 4: candidate assessment reads run-local inputs from the run directory, whatever the process cwd
+            write_results([dict(rows_in[0], status="in_band"), dict(rows_in[1], status="out_of_band"), rows_in[2]])
+            raw4b = dict(yaml.safe_load(open(p4)), _run_dir=run4)
+            r = eligible_engines(raw4b, [(TOY, None, None)])[0]
+            ok(r["eligible"], f"G29 the candidate check prunes packages with the run's own units table (base is the "
+                              f"run directory) ({r['why_not'][:1]})")
+            write_results(rows_in)
+            # round 4: a departure whose test did not take effect during the run is a non-declarable finding that
+            # bears on the decision (it goes to the owner; it blocks delivery)
+            from toolkit.analysis import contract as CT
+            dk = os.path.join(run, "models", "decision_tests")
+            os.makedirs(dk, exist_ok=True)
+            yaml.safe_dump({"checks": [{"departure": "T1", "test": "DTa", "effective": False,
+                                        "why": "every perturbation is an identity at the calibrated point"}]},
+                           open(os.path.join(dk, "departure_checks.yaml"), "w"))
+            fd = [f for f in CT.gate_findings(run) if f["kind"] == "departure_test_ineffective"]
+            ok(fd and fd[0]["scope_declarable"] is False and fd[0].get("decision_bearing") is True,
+               f"G30 an ineffective departure test is a non-declarable, decision-bearing finding ({fd[:1]})")
+            os.remove(os.path.join(dk, "departure_checks.yaml"))
+            fd = [f for f in CT.gate_findings(run) if f["kind"] == "departure_test_ineffective"]
+            ok(bool(fd), "G30b a signed departure with no departure check recorded is the same finding (fail closed)")
             # review: the configuration the run uses, and the named-engine sheet
             write_cov(cov)
             write_results(rows_in)

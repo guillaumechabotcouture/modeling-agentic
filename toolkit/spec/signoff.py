@@ -220,7 +220,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
-    if not errs and not sp.engine_pending:      # the preconditions with the signer (a departure needs the owner)
+    if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
         from toolkit.spec import preconditions as PC
         errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
                 for e in PC.problems(run_dir, data, by, spec=sp)]

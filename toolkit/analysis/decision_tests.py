@@ -86,6 +86,54 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
                                       atomic=True)
             rec["path"] = os.path.relpath(p, run_dir)
         out.append(rec)
+    from toolkit.analysis.artifacts import _safe_io
+    rel = f"{DIR}/{DEPARTURE_CHECKS}".replace(os.sep, "/")
+    if A.spec.raw.get("engine_departures"):
+        _safe_io().write_nofollow(run_dir, rel, yaml.safe_dump(plain({"producer": PRODUCER, "checks": check_departures(
+            A, out)}), sort_keys=False, width=120).encode(), atomic=True)
+    else:
+        _safe_io().remove_nofollow(run_dir, rel)
+    return out
+
+
+DEPARTURE_CHECKS = "departure_checks.yaml"
+
+
+def check_departures(A, recs) -> list[dict]:
+    """#215 round 4: during the run, each signed engine departure's decision test is checked against what actually
+    ran: run (not not_run), a non-identity perturbation at the calibrated point (plan_test with runtime_evidence), no
+    targeted package skipped for want of its subtraction package, and a realised change in the benefit of a
+    package holding a departed component. A failed check is a non-declarable finding for the owner
+    (toolkit/analysis/contract.py departure_test_ineffective)."""
+    from toolkit.engines import benchmark_coverage as BC
+    name = A.eng.describe().name
+    ref = f"{type(A.eng).__module__}:{type(A.eng).__name__}"
+    targets = BC.departure_targets(A.spec.raw, ref, A.spec.base)
+    tests = {str(t.get("id")): t for t in A.spec["analysis"].get("decision_tests") or []}
+    byid = {str(r.get("test_id")): r for r in recs}
+    out = []
+    for d in A.spec.raw.get("engine_departures") or []:
+        if not isinstance(d, dict) or d.get("engine") != name:
+            continue
+        key, tid = d.get("benchmark") or d.get("component"), str(d.get("decision_test"))
+        comps = set((targets.get(key) or {}).get("components") or [])
+        rec, dt = byid.get(tid), tests.get(tid)
+        why = None
+        if rec is None or dt is None or rec.get("status") != "run":
+            why = f"its decision test {tid} was not run ({(rec or {}).get('reason', 'no result')})"
+        else:
+            pl = plan_test(A.spec, dt, runtime_evidence(A))
+            live = [x for x in pl["perturbations"] if not x.get("identity")]
+            if pl["status"] != "runs" or not live:
+                why = (f"every perturbation of {tid} is an identity at the calibrated point" if pl["status"] == "runs"
+                       else f"{tid} would not run at the calibrated point: {pl['why']}")
+            elif set(rec.get("missing_subtraction") or []) & {k for k, cs in A.pk.items() if comps & cs}:
+                why = (f"{tid} skipped packages holding the departed components for want of their subtraction "
+                       f"package ({sorted(set(rec['missing_subtraction']))})")
+            elif not comps or max(float((rec.get("benefit_change") or {}).get(c) or 0.0) for c in comps) <= 0:
+                why = f"{tid} changed no benefit of a package holding {sorted(comps) or 'the departed component'}"
+        out.append({"departure": key, "test": tid, "components": sorted(comps), "effective": why is None,
+                    "why": why or f"{tid} ran and changed the benefit of packages holding {sorted(comps)}"})
     return out
 
 
@@ -399,7 +447,10 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         A.guard(f"decision test {dt['id']} at {v}", [plan, ch], events=evs.get(v, []))
         # F6 S1-5: what moves beside the share (regret, population, dollars by component, units by group)
         # (the point plan judged under the test's costs, feasibility and planning budget: Codex r1 P2-1)
+        bchg = {c: max((abs(float(ben[i][k]) - float(ben0[i][k])) for i in A.ids for k in A.pk if c in A.pk[k]),
+                       default=0.0) for c in (A.spec["options"].get("components") or {})}
         results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas),
+                        "benefit_change": bchg,
                         "objective": sol["objective"], "recommendation": A.mix_text(ch),
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
     worst = max(results, key=lambda r: r["share_units_changed"])
@@ -436,7 +487,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                          "not feasible under the test"),
            **agg, "share_threshold": thr, "regret_threshold": th["regret"], "dollars_threshold": th["dollars"],
            "recommendation": {"with": A.mix_text(plan), "without": worst["recommendation"]},
-           "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER}
+           "results": results, "rejected_values": rejected, "produced_by": "harness", "producer": PRODUCER,
+           # #215 round 4: the realised change in each component's benefit, and the packages a test had to skip
+           "benefit_change": {c: max(float(r["benefit_change"].get(c, 0.0)) for r in results)
+                              for c in (A.spec["options"].get("components") or {})},
+           "missing_subtraction": list(extra.get("_missing") or [])}
     if sv:
         rec["spec_value"] = sv
     if t == "cost_items":
@@ -469,7 +524,7 @@ def _interaction(A, dt, ben0, cost0, plan_, out0) -> dict:
     comp = set(dt["components"])
     cases, lowers, rejected = [], [], pl["rejected"]
     extra = {"_arm": arm, "_int": eng_int, "_src": f"verified benchmark results ({dt.get('benchmark')}), {info['src']}",
-             "_inputs": info["inputs"]}
+             "_inputs": info["inputs"], "_missing": list(info.get("missing_subtraction") or [])}
     o = A.primary
     for pt in pl["perturbations"]:
         v, g = pt["value"], pt["scale"]

@@ -53,7 +53,7 @@ ESTIMANDS = ("effect_vs_none", "effect_vs_component", "durability", "interaction
 ROLE_MEANING = {"held_out": "held-out validation; the result stands, no parameter is tuned toward it",
                 "fit": "a fit target the fitted engine misses (the fit failed)",
                 "unknown": "role not recorded"}
-DEPARTURE_FIELDS = ("engine", "benchmark", "component", "reason", "decision_test")
+DEPARTURE_FIELDS = ("engine", "benchmark", "component", "reason", "decision_test", "range_fraction")
 OVERRIDES: dict = {}          # self-tests only: engine ref -> coverage file
 
 
@@ -212,6 +212,9 @@ def departure_problems(raw: dict) -> list[str]:
         if str(d.get("decision_test")) not in tests:
             bad.append(f"engine_departures[{j}]: decision_test {d.get('decision_test')!r} must be an "
                        "analysis.decision_tests id (a departure names the decision test that varies the effect)")
+        rf = d.get("range_fraction")
+        if rf is not None and not (isinstance(rf, (int, float)) and 0 < rf <= 1):
+            bad.append(f"engine_departures[{j}]: range_fraction must be a number in (0, 1]")
         key = (d.get("engine"), d.get("benchmark") or d.get("component"))
         if key in seen:
             bad.append(f"engine_departures[{j}]: a second departure for {key[1]} of {key[0]}")
@@ -285,7 +288,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
         pending.append((c, kind + "; the engine is not eligible for it without an owner-signed departure naming a "
                         "decision test on its effect", effect_parameters(e, version),
                         {s for s, pairs in smap.items() if any(cc == c for cc, _ in pairs)},
-                        {"benchmark_status": "no benchmark", "role": "none", "components": [c]}))
+                        {"benchmark_status": "no benchmark", "role": "none", "components": [c]}, {}))
     drivers = _drivers(raw)
     relevant = {}
     for i, e in entries.items():
@@ -339,13 +342,16 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                                f"{st} (computed {r.get('computed')}, band {r.get('band')}): the engine is not eligible "
                                "for it without an owner-signed engine_departures entry",
                             effect_parameters(entries[i], version), {s for s, _c, _v in hits},
-                            {"benchmark_status": st, "role": role, "components": comps}))
+                            {"benchmark_status": st, "role": role, "components": comps},
+                            {"benchmark": i, "estimand": entries[i].get("estimand"),
+                             "pair": {c: {s for s, cc, _v in hits if cc == c} for c in (entries[i].get("covers") or {})}}))
     counts = departures_status in ("signed", "proposed")
-    for key, kind, params, comps, failing in pending:
+    for key, kind, params, comps, failing, ctx in pending:
         d = deps.get(key)
         if d is not None and counts:
             ok, why = (runs or (lambda *a: (False, "no decision-test check available")))(
-                d.get("decision_test"), {"parameters": params, "components": comps}, rows)
+                d.get("decision_test"), dict(ctx, parameters=params, components=comps,
+                                             range_fraction=d.get("range_fraction")), rows)
             if ok:
                 out["departures"].append(dict(d, status=departures_status, **failing))
                 continue
@@ -424,6 +430,32 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
         out["card_rows_disagree"] = sorted(str(c.get("id")) for c in card_benchmarks if isinstance(c, dict)
                                            and c.get("id") in rows and (c.get("status"), c.get("computed")) !=
                                            (rows[c["id"]].get("status"), rows[c["id"]].get("computed")))
+    return out
+
+
+def departure_targets(raw: dict, ref: str, base: str | None = None) -> dict:
+    """{departure key: {components, benchmark, estimand, pair}}: the spec components each departure's effect lives in
+    (a benchmark's covered pairs, or the engine component no benchmark covers), over the effective packages. Read by
+    the run's check of what each departure's test did (decision_tests.check_departures)."""
+    cov, _p = load(path_for(ref))
+    if not cov:
+        return {}
+    try:
+        from toolkit.spec import schema
+        raw = dict(raw, _packages=list(schema.Spec(raw, base or os.getcwd()).packages().values()))
+    except Exception:  # noqa: BLE001
+        pass
+    smap = _smap(raw, cov.get("absent_values") or {})
+    out = {}
+    for i, e in (cov.get("benchmarks") or {}).items():
+        h = _hits(e, smap, raw)
+        out[i] = {"components": {s for s, _c, _v in h}, "benchmark": i, "estimand": e.get("estimand"),
+                  "pair": {c: {s for s, cc, _v in h if cc == c} for c in (e.get("covers") or {})}}
+    for s_, pairs in smap.items():
+        for c, _v in pairs:
+            out.setdefault(c, {"components": set(), "benchmark": None, "estimand": None, "pair": {}})
+            if out[c]["benchmark"] is None:
+                out[c]["components"].add(s_)
     return out
 
 

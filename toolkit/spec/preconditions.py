@@ -74,10 +74,29 @@ def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=No
     return out
 
 
+def _declared_range(spec, eng, p):
+    """The parameter's declared range: its drawn prior's, else the engine's (lo, hi); None when it has none."""
+    try:
+        from toolkit.spec import priors as PRI
+        pr = PRI.drawn(spec).get(p)
+        if pr is not None:
+            return float(pr.lo), float(pr.hi)
+    except Exception:  # noqa: BLE001
+        pass
+    x = next((q for q in eng.parameters() if q.name == p), None)
+    if x is not None and x.lo is not None and x.hi is not None and x.hi > x.lo:
+        return float(x.lo), float(x.hi)
+    return None
+
+
 def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
-    """(True, "") when the test will run on this run's path and change the effect; else (False, why). The answer
-    is the decision-test runner's own plan (toolkit/analysis/decision_tests.py plan_test) with the evidence the run
-    will hold; no rule is restated here. `effect`: {parameters, components}."""
+    """(True, "") when the test is fit to carry a departure, judged on the spec's inputs before the run (the run then
+    checks what the test actually did: toolkit/analysis/decision_tests.py check_departures). The runner's own plan
+    (decision_tests.plan_test) must run it. A parameter test varies a parameter carrying the effect over its declared
+    range (at least two distinct values, spanning the range or `range_fraction` of it). An interaction test targets
+    the departed benchmark's own interaction: the test's benchmark is the departed one, and it rescales one of that
+    benchmark's component pair given the other. `effect`: {parameters, components, benchmark, estimand, pair,
+    range_fraction}."""
     raw = spec.raw
     t = next((x for x in (raw.get("analysis") or {}).get("decision_tests") or []
               if isinstance(x, dict) and str(x.get("id")) == str(test_id)), None)
@@ -85,13 +104,23 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
         return False, "is not an analysis.decision_tests id"
     comps = set(effect.get("components") or [])
     typ = t.get("type")
-    if typ == "parameter_value" and t.get("parameter") not in (effect.get("parameters") or []):
-        return False, (f"varies {t.get('parameter')!r}, not a parameter carrying this effect "
-                       f"({list(effect.get('parameters') or []) or 'the coverage file declares none'})")
-    if typ == "interaction_rescale" and not comps & set(t.get("components") or []):
-        return False, (f"does not rescale the effect: it names {sorted(comps)} only in with_any or not at all "
-                       "(the rescaled increment is that of `components`)")
-    if typ not in ("parameter_value", "interaction_rescale"):
+    if typ == "parameter_value":
+        p = t.get("parameter")
+        if p not in (effect.get("parameters") or []):
+            return False, (f"varies {p!r}, not a parameter carrying this effect "
+                           f"({list(effect.get('parameters') or []) or 'the coverage file declares none'})")
+    elif typ == "interaction_rescale":
+        if effect.get("estimand") != "interaction" or not effect.get("benchmark"):
+            return False, "an interaction test can carry only a departure from an interaction benchmark"
+        if str(t.get("benchmark")) != str(effect["benchmark"]):
+            return False, (f"tests benchmark {t.get('benchmark')!r}'s interaction, not the departed "
+                           f"{effect['benchmark']!r}")
+        pair = [set(v) for v in (effect.get("pair") or {}).values()]
+        tc, wa = set(t.get("components") or []), set(t.get("with_any") or [])
+        if len(pair) != 2 or not any(tc & x and tc <= x and wa & y for x, y in (pair, pair[::-1])):
+            return False, (f"does not rescale the departed benchmark's pair ({[sorted(x) for x in pair]}): it "
+                           f"rescales {sorted(tc)} given {sorted(wa)}")
+    else:
         return False, f"is a {typ} test, which does not vary a component's effect"
     from toolkit.analysis import decision_tests as DT
     try:
@@ -104,11 +133,23 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
         return False, f"cannot change the effect: no allowed package holds {sorted(comps)}"
     if pl["status"] != "runs":
         return False, f"would not run: {pl['why']}"
+    if typ == "parameter_value":
+        vals = sorted({float(x["value"]) for x in pl["perturbations"]})
+        rng = _declared_range(spec, ev["engine"], t["parameter"])
+        if rng is None:
+            return False, f"{t['parameter']} has no declared range (a prior or the engine's) to span"
+        frac = float(effect.get("range_fraction") or 1.0)
+        need = frac * (rng[1] - rng[0])
+        if len(vals) < 2 or vals[-1] - vals[0] < need * (1 - 1e-9):
+            return False, (f"its values {vals} do not span {frac:g} of {t['parameter']}'s declared range "
+                           f"{list(rng)} (at least two distinct values)")
+        return True, ""
     live = [x for x in pl["perturbations"] if not x.get("identity")]
     if not live:
-        return False, "changes nothing: every tested value leaves the effect where it is"
-    if typ == "interaction_rescale" and not any(comps & pks[k] for x in live for k in x["packages"]):
-        return False, "modifies no package that delivers the component"
+        return False, "changes nothing: every tested value leaves the interaction where it is (scale 1)"
+    pair = [set(v) for v in (effect.get("pair") or {}).values()]
+    if not any(pair[0] & pks[k] and pair[1] & pks[k] for x in live for k in x["packages"]):
+        return False, "modifies no package that holds the departed benchmark's pair"
     return True, ""
 
 
@@ -152,28 +193,34 @@ def _self_test() -> int:
         P = lambda par, vals: {"id": "X", "type": "parameter_value", "parameter": par, "values": vals,  # noqa: E731
                                "text": "t"}
         excl = {"components": {"a": {"group": "g"}, "b": {"group": "g"}, "c": {}}}
+        # round 4: before the run, inputs only. A parameter test spans the declared range (>= 2 distinct values);
+        # an interaction test targets the failing benchmark's own interaction (its benchmark and component pair)
+        IX = {"components": {"b"}, "benchmark": "T2", "estimand": "interaction", "pair": {"a": {"a"}, "b": {"b"}}}
+        PB = {"components": {"b"}, "parameters": ["eff_b"]}
         cases = [  # (name, test, effect, spec change, expected)
-            ("interaction reachable", I(v_ok), {"components": {"b"}}, {}, True),
-            ("interaction unreachable", I(v_bad), {"components": {"b"}}, {}, False),
-            ("interaction at the engine's own value (scale 1)", I(v_id), {"components": {"b"}}, {}, False),
-            ("departed component only in with_any", I(v_ok), {"components": {"a"}}, {}, False),
-            ("no package holds every rescaled component", I(v_ok, ("a", "b"), ("c",)), {"components": {"a"}},
-             {"options": excl}, False),
-            ("no subtraction package", I(v_ok), {"components": {"b"}},
-             {"options": {"packages": {"none": [], "ab": ["a", "b"]}}}, False),
-            ("spec engine values: arms at spec values missing", I(v_ok), {"components": {"b"}},
+            ("interaction reachable, the benchmark's own pair", I(v_ok), IX, {}, True),
+            ("interaction unreachable", I(v_bad), IX, {}, False),
+            ("interaction at the engine's own value (scale 1)", I(v_id), IX, {}, False),
+            ("the pair swapped (a rescaled given b)", I(v_ok, ("a",), ("b",)), dict(IX, components={"a"}), {}, True),
+            ("another interaction's context (b with c for an a x b benchmark)", I(v_ok, ("b",), ("c",)),
+             dict(IX, pair={"a": {"a"}, "b": {"b"}}), {"options": {"components": {"a": {}, "b": {}, "c": {}}}}, False),
+            ("interaction test of another benchmark", dict(I(v_ok), benchmark="T9"), IX, {}, False),
+            ("interaction test for a single-component benchmark", I(v_ok), {"components": {"b"}, "benchmark": "T1",
+                                                                          "estimand": "effect_vs_none"}, {}, False),
+            ("no package holds every rescaled component", I(v_ok, ("a", "b"), ("c",)), IX, {"options": excl}, False),
+            ("no subtraction package", I(v_ok), IX, {"options": {"packages": {"none": [], "ab": ["a", "b"]}}}, False),
+            ("spec engine values: arms at spec values missing", I(v_ok), IX,
              {"engine_parameters": {"k": {"value": 0.8, "source": "s", "reason": "r", "basis": "owner_judgement"}}},
              False),
-            ("parameter on an emulator input", P("eff_b", [0.2, 0.4]), {"components": {"b"}, "parameters": ["eff_b"]},
+            ("parameter spanning its declared range", P("eff_b", [0.1, 0.5]), PB, {}, True),
+            ("parameter, one value only", P("eff_b", [0.2]), PB, {}, False),
+            ("parameter, two values not spanning the range", P("eff_b", [0.2, 0.3]), PB, {}, False),
+            ("parameter spanning the stated fraction of its range", P("eff_b", [0.2, 0.3]), dict(PB, range_fraction=0.25),
              {}, True),
-            ("parameter at its point value only", P("eff_b", [0.3]), {"components": {"b"}, "parameters": ["eff_b"]},
-             {}, False),
             ("parameter not an emulator input", P("k", [0.5, 1.0]), {"components": {"b"}, "parameters": ["k"]}, {},
              False),
-            ("parameter not carrying the effect", P("eff_a", [0.4, 0.6]), {"components": {"b"}, "parameters": ["eff_b"]},
-             {}, False),
-            ("parameter on the direct path", P("k", [0.5, 1.0]), {"components": {"b"}, "parameters": ["k"]},
-             {"analysis": {"evaluation": "direct"}}, True),
+            ("parameter not carrying the effect", P("eff_a", [0.3, 0.7]), PB, {}, False),
+            ("parameter on the direct path", P("eff_b", [0.1, 0.5]), PB, {"analysis": {"evaluation": "direct"}}, True),
         ]
         for name, t, eff, chg, want in cases:
             raw = dict(base)
@@ -182,22 +229,50 @@ def _self_test() -> int:
             raw["analysis"] = dict(raw["analysis"], decision_tests=[t])
             sp = schema.Spec(raw, d)
             got, why = decision_test_runs(sp, "X", eff)
-            pre = DT.plan_test(sp, t, DT.prerun_evidence(sp))
-            ev = DT.prerun_evidence(sp)
-
-            class _M:       # what the analysis's model holds: its kind and design box (toolkit/analysis/model.py)
-                kind = ev["kind"]
-                param_names = list(ev["box"] or {})
-                input_names = ["z"] + param_names
-                dom_lo = [0.0] + [ev["box"][k][0] for k in param_names] if ev["box"] else [0.0]
-                dom_hi = [1.0] + [ev["box"][k][1] for k in param_names] if ev["box"] else [1.0]
-
-            class _A:
-                spec, model, theta0, pk, eng = sp, _M, ev["point"], ev["packages"], ev["engine"]
-            rt = DT.plan_test(sp, t, DT.runtime_evidence(_A))
-            agree = (pre["status"], [x.get("identity") for x in pre["perturbations"]]) == \
-                    (rt["status"], [x.get("identity") for x in rt["perturbations"]])
-            ok(got == want and agree, f"PC5 {name}: precondition {got} ({why[:90]}), planner {pre['status']}/{rt['status']}")
+            ok(got == want, f"PC5 {name}: {got} ({why[:100]})")
+        # during the run, outcomes: a real calibrated Analysis (direct model, joint calibration moves eff_a)
+        from toolkit.analysis import core as CORE, model as MOD
+        from toolkit.engines import benchmark_coverage as BC
+        raw = dict(base, analysis=dict(base["analysis"], evaluation="direct", decision_tests=[
+            P("eff_a", [0.4]), I(v_ok, ("a",), ("b",)), dict(I(v_ok), id="Y")]))
+        raw["analysis"]["decision_tests"][1]["id"] = "Z"
+        raw["engine_departures"] = [{"engine": "toy", "benchmark": "T1", "reason": "r", "decision_test": "X"},
+                                    {"engine": "toy", "benchmark": "T2", "reason": "r", "decision_test": "Z"}]
+        import yaml as _y
+        cpth = os.path.join(d, "cov.yaml")
+        _y.safe_dump({"engine": "toy", "absent_values": {"a": [0], "b": [0]}, "benchmarks": {
+            "T2": {"covers": {"a": [1], "b": [1]}, "match": "all", "estimand": "interaction"},
+            "T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none", "effect_parameters": ["eff_a"]}}},
+            open(cpth, "w"))
+        BC.OVERRIDES["toolkit.engines.contract:ToyEngine"] = cpth
+        try:
+            sp = schema.Spec(raw, d)
+            A = CORE.Analysis(sp, MOD.DirectModel(sp, log=lambda *a: None), log=lambda *a: None)
+            A.set_joint({"shared": ["eff_a"], "best": {"theta": {"eff_a": 0.4}, "z": {}},
+                         "region": {"ranges": {"eff_a": [0.3, 0.7]}},
+                         "sample": {"sample_id": "s", "names": ["eff_a"], "rows": [[0.4]]}})
+            recs = [{"test_id": "X", "status": "run", "benefit_change": {"a": 1.0}, "missing_subtraction": []},
+                    {"test_id": "Z", "status": "run", "benefit_change": {"a": 0.0, "b": 0.0}, "missing_subtraction": []}]
+            chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
+            ok(not chk["T1"]["effective"] and "identity" in chk["T1"]["why"],
+               f"PC6 runtime: joint calibration moved eff_a onto the test's only value, so the departure's test is an "
+               f"identity and the departure is ineffective ({chk['T1']['why'][:90]})")
+            ok(not chk["T2"]["effective"] and "no benefit" in chk["T2"]["why"],
+               f"PC7 runtime: an interaction test that changed no benefit of the departed components is ineffective "
+               f"({chk['T2']['why'][:90]})")
+            recs[1]["benefit_change"] = {"a": 0.2, "b": 0.2}
+            recs[1]["missing_subtraction"] = [k for k, cs in A.pk.items() if cs == {"a", "b"}]
+            chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
+            ok(not chk["T2"]["effective"] and "subtraction" in chk["T2"]["why"],
+               "PC8 runtime: a test that skipped a targeted package (missing subtraction package) is ineffective")
+            recs[1]["missing_subtraction"] = []
+            chk = {c["departure"]: c for c in DT.check_departures(A, recs[:1] + [dict(recs[1], status="not_run")])}
+            ok(not chk["T2"]["effective"] and "not run" in chk["T2"]["why"], "PC9 runtime: a not_run test is ineffective")
+            chk = {c["departure"]: c for c in DT.check_departures(A, recs)}
+            ok(chk["T2"]["effective"], f"PC10 runtime: a test that ran, at a non-identity scale, changing the departed "
+                                       f"benefit, is effective ({chk['T2']['why']})")
+        finally:
+            BC.OVERRIDES.pop("toolkit.engines.contract:ToyEngine", None)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

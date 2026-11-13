@@ -221,9 +221,11 @@ departure for the owner to sign, never a silent one:
 
 The decision test must run on this run's path and change the related effect
 (toolkit/spec/preconditions.py `decision_test_runs`): a parameter_value test on an effect parameter the coverage
-file names for it, with values that differ from the point value and, on the emulator path, on an emulator input
-(a fitted parameter, a drawn prior or a spec value); or an interaction_rescale test that names the component in
-`components` (not only `with_any`), whose benchmark has arm ratios in the verified record. Only components some
+file names for it, with at least two values spanning its declared range (or `range_fraction` of it, stated in the
+departure) and, on the emulator path, on an emulator input (a fitted parameter, a drawn prior or a spec value); or,
+for an interaction benchmark only, an interaction_rescale test on that benchmark that rescales one of its two
+components given the other. The run then checks what the test actually did; a departure whose test did not take
+effect is a finding only the owner can resolve. Only components some
 allowed package holds are checked. Only the owner's signature makes a departure
 count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
 limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
