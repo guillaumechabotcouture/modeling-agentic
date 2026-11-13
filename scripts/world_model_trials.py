@@ -1125,7 +1125,7 @@ def summary_md(S) -> str:
     L += ["", f"where_to_look's top item concerns a belief the seed marked decision-relevant in "
               f"{w['decision_relevant']} of {w['questions']} questions.", "", "## Contradictions", ""]
     for i, q in S["questions"].items():
-        for c in q.get("contradictions") or []:
+        for c in ([] if q.get("superseded_by") else q.get("contradictions") or []):      # current runs only
             L.append(f"- {i} {c['hypothesis']} ({c['claim']}): open question recorded: "
                      f"{'yes' if c['open_question'] else 'no'}")
     return "\n".join(L) + "\n"
