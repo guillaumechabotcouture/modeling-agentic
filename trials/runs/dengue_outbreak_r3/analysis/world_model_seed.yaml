@@ -1,0 +1,188 @@
+beliefs:
+- id: B1
+  mechanism: Under a closed SIR with transmissibility fixed by the observed 2025 growth rate, reff_2026 = R_e(1-z)
+    depends only on the identified R_e, not on the calibration scale s0; hence the relative effect of control on
+    2026 infections does not move with s0.
+  about:
+    package: control
+    feature: s0 (calibration scale)
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.7 (R = 1/M(-r))
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: reff_2026 is below 1 (roughly 0.15-0.7 for a plausible 2025 R_e of 1.3-3), so 2026 transmission is
+    sub-critical; infections come from seeded chains of size ~1/(1-R) and control (multiplier 1-effect on R_t) gives
+    a modest relative reduction of 2026 infections, 1-(1-R)/(1-R(1-effect)).
+  about:
+    package: control
+  direction: reduces
+  magnitude:
+    band:
+    - 0.05
+    - 0.5
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: A larger control effect (lower multiplier on R_t) gives a larger relative reduction of 2026 infections.
+  about:
+    package: control
+    feature: effect:control
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: renewal equation, Methods
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Because 2026 is sub-critical, infections averted per person by a campaign are small (of the order of
+    the seed size over the population), so at any material shadow price the campaign's cost outweighs its benefit
+    and no-action beats control across the s0 range.
+  about:
+    pair:
+    - none
+    - control
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.7
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: attack_rate_2025 = s0 * z rises in proportion to s0; with reported-to-infection ratios of 1:3 to 1:30
+    (Stanaway et al. 2016 on dengue under-reporting) the attack rate is weakly identified and only bounded by the
+    s0 range; it does not change the 2026 choice.
+  about:
+    feature: s0 (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Stanaway JD, Shepard DS, Undurraga EA, et al. The global burden of dengue: an analysis from the Global
+      Burden of Disease Study 2013. Lancet Infect Dis 2016'
+    location: expansion factors, Methods (location uncertain)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Did the 2025 outbreak end by susceptible depletion or by season end? If truncated by seasonality, reff_2026
+    could exceed 1 and the choice could flip toward control.
+  beliefs:
+  - B1
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: What is the reporting fraction (equivalently 2025 s0)? It sets attack_rate_2025 but, under the closed-SIR
+    assumptions, not reff_2026.
+  beliefs:
+  - B5
+  decision_relevant: false
+- id: Q3
+  question: How many infections seed the 2026 season (importations), and what does the campaign cost per person?
+    These set the absolute benefit against the shadow price.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Is there pre-existing cross-reactive or heterotypic immunity, or waning, that the closed-SIR assumptions
+    ignore?
+  beliefs:
+  - B1
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: The relative reduction from control does not vary with s0 (|Spearman rho| bound within 0.3).
+  test:
+    kind: effect_direction
+    package: control
+    feature: s0 (calibration scale)
+    direction: negligible
+    equivalence: 0.3
+- id: H2
+  belief: B2
+  claim: Control's relative reduction of 2026 infections lies in [0.05, 0.5] at >= 80% of points.
+  test:
+    kind: effect_band
+    package: control
+    band:
+    - 0.05
+    - 0.5
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: Control's relative reduction increases with effect:control.
+  test:
+    kind: effect_direction
+    package: control
+    feature: effect:control
+    direction: increases
+- id: H4
+  belief: B4
+  claim: No-action beats control on net benefit at the shadow price at >= 80% of points across the s0 range.
+  test:
+    kind: paired_sign
+    a: none
+    b: control
+    feature: s0 (calibration scale)
+    range:
+    - 0.3061709347181022
+    - 0.996152682043612
+    sign: positive
+    min_share: 0.8
+- id: H5
+  belief: B4
+  claim: No-action beats control in the high-s0 half too (s0 0.65-0.997), where a mis-specified model would most
+    likely show residual epidemic potential.
+  test:
+    kind: paired_sign
+    a: none
+    b: control
+    feature: s0 (calibration scale)
+    range:
+    - 0.65
+    - 0.996152682043612
+    sign: positive
+    min_share: 0.8
