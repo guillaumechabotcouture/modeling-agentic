@@ -3268,11 +3268,12 @@ def _self_test_v017(ok, e, unit) -> None:
         srcs = " ".join(f"{x.source} {x.note}" for x in (g, d) if x is not None)
         ok(not card["problems"] and pr is not None and (pr.lo, pr.hi) == (-0.618, 0.66) and "0.012" in pr.source
            and g is not None and (g.lo, g.hi, g.dist) == (0.316, 1.0, "uniform") and "Gleave" in g.source
-           and d is not None and (d.lo, d.hi, d.dist) == (0.0, 1.594, "uniform") and "Staedke" in d.source
+           and d is not None and (d.lo, d.hi, d.dist) == (0.0, 1.895, "uniform") and "Staedke" in d.source
            and not any(h in srcs for h in held)
            and "net_kill_shift" in card["not_exposed"].get("hut_trial_coefficients", ""),
            "NE2 priors.yaml: the kill shift is drawn over Churcher 2016's 95% CrI of alpha1; the PBO gain scale over "
-           "0.316-1.0 (Gleave 2021 hut mortality) and the PBO advantage decay over 0-1.594 per year (LLINEUP), with "
+           "0.316-1.0 (Gleave 2021 hut mortality) and the PBO advantage decay over 0-1.895 per year (LLINEUP less the "
+           "engine's own waning), with "
            f"no held-out trial in their justification (problems {card['problems'][:2]})")
     case("NE2", ne2)
 

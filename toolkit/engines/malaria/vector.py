@@ -528,10 +528,23 @@ def _self_test_v017(ok, P) -> None:
         # Staedke et al. 2020 Lancet 395:1292, Table 2 (p. 1299), as-treated PR 0.74 (0.62-0.87) at 6 months and 0.84
         # (0.72-0.98) at 18 months. Rule: log PR(t) fades as exp(-decay t); delta method, the two estimates taken as
         # independent (conservative), lower bound clipped at 0
-        pt, lo, hi = adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0)
-        ok(abs(pt - 0.546) < 0.002 and lo == 0.0 and abs(hi - 1.594) < 0.002,
-           f"V37 the PBO advantage decay range rule on LLINEUP's 6- and 18-month prevalence ratios: {pt:.3f} per year, "
-           f"95% range [{lo}, {hi:.3f}]")
+        pt, lo, hi = adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0, clip=False)
+        # review round 2: the parameter is decay ON TOP OF the engine's own waning of the PBO advantage, so the prior is
+        # the trial's total minus the engine's, at each resistance level of the high-resistance category (x 0-0.30)
+        xs = np.round(np.linspace(0.0, 0.30, 31), 3)
+        rr = pbo_adv_decay_extra((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 182.5, 547.5, xs)
+        applied = {}
+        for x in (0.10, 0.15, 0.25):                   # the application: the engine's total waning equals the trial's
+            lam = rr["by_x"][x]["extra"][0]
+            applied[x] = engine_adv_decay(x, 182.5, 547.5, dict(P, pbo_adv_decay=lam))
+        ok(abs(pt - 0.546) < 0.002 and abs(lo + 0.502) < 0.002 and abs(hi - 1.594) < 0.002
+           and abs(engine_adv_decay(0.15, 182.5, 547.5, P)) < 1e-3 and abs(engine_adv_decay(0.0, 182.5, 547.5, P) - 0.977) < 2e-3
+           and all(abs(v - pt) < 1e-9 for v in applied.values())
+           and rr["range"] == [0.0, round(float(rr["by_x"][0.3]["extra"][2]), 3)] and abs(rr["range"][1] - 1.895) < 2e-3,
+           f"V37 the PBO advantage decay prior is LLINEUP's total waning ({pt:.3f}/y, 95% {lo:.3f} to {hi:.3f}) minus the "
+           f"engine's own (feeding advantage, 6-18 months: 0.977/y at x 0, 0.000 at 0.15, -0.301 at 0.30); applied, the "
+           f"extra rate makes the engine's total equal the trial's ({ {k: round(v, 6) for k, v in applied.items()} }); "
+           f"range over x 0-0.30, clipped at 0: {rr['range']}")
     case("V37", v37)
 
 

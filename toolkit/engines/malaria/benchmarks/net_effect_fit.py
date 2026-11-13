@@ -364,14 +364,21 @@ def _self_test() -> int:
     def f4():
         q = plan(p)
         npt = 45 + 1 + 1 + 12
+        w = q["waves"]
+        naive = q["cpu_work_hours"] * VM_FACTOR[1] * USD_PER_VCPU_H[1]
+        q64 = plan(p, vcpus=64)
         ok(q["design_points"] == 46 and q["seeds"] == 8 and len(q["arms"]) == 8
            and q["settings"] == ["benin", "irs_added", "misungwi", "muleba"]
            and q["calibration_runs"] == 5 * 21 * 2 and q["arm_runs"] == npt * 8 * 8 + q["calibration_runs"]
            and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held
-           and q["usd"][1] <= CAP_USD,
-           f"F4 plan: 46 design points + the chosen value + 12 verified, x 8 arms x 8 seeds, plus a 5-point calibration "
-           f"grid in net_kill_shift; {q['arm_runs']} arm runs, {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]} "
-           f"(cap ${CAP_USD})")
+           and q["vcpus"] == VCPUS and w["calibration"] == 5 * -(-42 // VCPUS) and w["chosen"] == 4
+           and w["design"] == sum(-(-min(300, 1472 - i) // VCPUS) for i in range(0, 1472, 300))
+           and w["sample"] == sum(-(-min(300, 384 - i) // VCPUS) for i in range(0, 384, 300))
+           and q["usd"][1] > naive and q64["usd"][1] > q["usd"][1] and q["usd"][1] <= CAP_USD,
+           f"F4 (review P2) the price is allocated VM time: {q['vcpus']} vCPUs x the wall time of the calibration "
+           f"({w['calibration']}), design ({w['design']}), chosen-point ({w['chosen']}) and sample ({w['sample']}) "
+           f"waves plus start-up, {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]} (cap ${CAP_USD}); the "
+           f"CPU-work estimate would say ${naive:.1f}; 64 vCPUs ${q64['usd'][1]}")
     case("F4", f4)
     # F5: a narrow trade-off (a + b = 1 +- 0.05) is kept by the joint sample and lost by independent marginal draws
     names, box = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
@@ -390,7 +397,8 @@ def _self_test() -> int:
     def f6():
         for bad, kw, why in (("fitted.yaml", {"approved": "x", "smoke": False}, "writing fitted.yaml"),
                              ("x.yaml", {"approved": None, "smoke": False}, "a full fit without --approved"),
-                             ("x.yaml", {"approved": "x", "smoke": False, "cap_usd": 5.0}, "a plan above the cap")):
+                             ("x.yaml", {"approved": "x", "smoke": False, "cap_usd": 5.0}, "a plan above the cap"),
+                             ("x.yaml", {"approved": "x", "smoke": False, "vcpus": 64}, "64 vCPUs above the cap")):
             try:
                 run(p, base, 1, os.path.join(HERE, bad), **kw)
                 ok(False, f"F6 refused: {why}")
@@ -432,15 +440,39 @@ def _self_test() -> int:
 
     def f11():
         reg = {"sample": [{"a": 0.1}, {"a": 0.2}], "hull": {"a": [0.1, 0.2]}}
-        good, c0 = finalize(copy.deepcopy(reg), [{"point": {"a": 0.1}, "all_in_band": True}])
-        bad, c1 = finalize(copy.deepcopy(reg), [{"point": {"a": 0.1}, "all_in_band": True},
-                                                {"point": {"a": 0.2}, "all_in_band": False}])
-        ok(c0 == 0 and good["sample_status"] == "verified" and len(good["sample"]) == 2
-           and c1 != 0 and bad["sample_status"] == "invalid" and bad["sample"] == []
-           and len(bad["sample_unverified"]) == 2 and bad["verified"]["failed"] == [{"a": 0.2}],
-           "F11 (review P2) a verified point out of band invalidates the exported sample (kept apart as "
-           "sample_unverified, with the failing points) and the run returns non-zero")
+        cal = lambda **kw: {s: {"target": t, "achieved": kw.get(s, t)} for s, t in  # noqa: E731
+                            (("muleba", 0.55), ("misungwi", 0.458), ("benin", 2.06), ("irs_added", 0.40))}
+        pt = lambda a, ok_=True, **kw: {"point": {"a": a}, "all_in_band": ok_, "calibration_check": cal(**kw)}  # noqa
+        chosen_ok = {"all_in_band": True, "disproved_by_verification": [], "calibration_check": cal()}
+        runs = {
+            "good": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
+            "ratio": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, False)], chosen_ok), 2),
+            "misungwi 0.30 vs 0.458": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, misungwi=0.30)], chosen_ok), 2),
+            "muleba 0.15 vs 0.55": (finalize(copy.deepcopy(reg), [pt(0.1, muleba=0.15)], chosen_ok), 2),
+            "chosen disproved B10": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(
+                chosen_ok, all_in_band=False, disproved_by_verification=["B10"])), 2),
+            "chosen calibration": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(chosen_ok, calibration_check=cal(
+                benin=1.5))), 2),
+            "grid at its edge": (finalize(copy.deepcopy(reg), [pt(0.1)], chosen_ok, grid_edge=["misungwi"]), 2),
+        }
+        bad = {k: (r[1], r[0]["sample_status"]) for k, (r, want) in runs.items()
+               if r[1] != want or (want == 0) != (r[0]["sample_status"] == "verified")
+               or (want != 0 and (r[0]["sample"] or len(r[0]["sample_unverified"]) != 2))}
+        ok(not bad and runs["good"][0][0]["sample"] == reg["sample"],
+           f"F11 (review P2, rounds 1-2) the sample is verified only if every verified point and the chosen point keep "
+           f"the targets in band and their control arms within {CAL_TOL:.0%} of the calibration target, and no site's "
+           f"calibration grid is at its edge; otherwise it is invalidated and the run returns 2 ({sorted(runs)}; "
+           f"wrong: {bad})")
     case("F11", f11)
+
+    def f13():
+        cmd = launch_command(VCPUS)
+        ok(cmd[:3] == ["python3", "cloud/vm_job.py", "run"] and cmd[cmd.index("--cap-usd") + 1] == "25"
+           and "--approved" in cmd and str(VCPUS) in cmd and cmd[cmd.index("--") + 1:][:2] == [
+               "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
+           f"F13 the launch goes through cloud/vm_job.py run with --cap-usd 25, so the job's USD meter stops the VM at "
+           f"the cap: {' '.join(cmd)}")
+    case("F13", f13)
 
     def f12():
         n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
