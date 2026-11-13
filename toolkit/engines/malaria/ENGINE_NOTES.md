@@ -8,7 +8,7 @@ Engine `malaria-starsim` v0.15 (workstream A of architecture v2). Design note:
 `results_v0.3-r2.yaml`, `results_v0.3.yaml`, `results_v0.4.yaml`, `results_v0.8.yaml`, `results_v0.10.yaml`) beside them, by
 `benchmarks/render_notes.py`. Reproduce with `bash toolkit/engines/malaria/benchmarks/validate_once.sh` on a VM.
 
-**v0.17 adds the net-effect parameters at defaults that reproduce v0.16 (section below); its evidence re-stamp is pending.** The v0.15 and v0.16 refits ran: `results.yaml` and `fitted.yaml` hold v0.16's numbers. The tables block below has not been re-rendered since v0.14.
+**v0.17 adds the net-effect parameters at defaults that reproduce v0.16 (section below); the evidence is re-stamped after `restamp_proof.py` proved the outputs identical.** The v0.15 and v0.16 refits ran: `results.yaml` and `fitted.yaml` hold v0.16's numbers. The tables block below has not been re-rendered since v0.14.
 
 **v0.15 changes every output under nets or IRS. The numbers on this page are still v0.14's.** v0.15 corrects the biting rates of the feeding-cycle model (section below).
 - **Not refitted yet.** The fit and the benchmark pack have not run on v0.15. The tables block, `benchmarks/results.yaml`, `fitted.yaml`, `equilibration.yaml`, `guess_sensitivity.yaml` and the benchmark rows of `card.yaml` describe v0.14.
@@ -94,38 +94,65 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
-## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12; written before any fit)
+## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12 and 13; written before any fit)
 
-**What changed.** Up to v0.16 the inputs that decide between net types were module constants: the Churcher 2016 hut-trial coefficients (`vector.CHURCHER`, the PBO equation among them) and the way PBO's advantage decays. The uncertainty step never varied them, and the value-of-information estimate ignored them. v0.17 adds three engine parameters (kind `fixed`). At their defaults the engine gives v0.16's outputs exactly.
+**What changed.** Up to v0.16 the inputs that decide between net types were module constants: the Churcher 2016 hut-trial coefficients (`vector.CHURCHER`, the PBO equation among them) and the way PBO's advantage decays. The uncertainty step never varied them, and the value-of-information estimate ignored them. v0.17 adds three engine parameters (kind `fixed`). At their defaults the engine gives v0.16's outputs exactly. All three are drawn card priors (`priors.yaml`).
 
-| Parameter | Default | Units | What it does (vector.py) | Range now |
+| Parameter | Default | Units | What it does (vector.py) | Drawn range and source |
 |---|---|---|---|---|
-| `net_kill_shift` | 0 | logit | added to the hut-mortality intercept: logit l = 0.63 + shift + 4.00 (x − 0.5), for every net type. Deterrence, feeding, killing and insecticide decay all follow from l through Churcher's own equations | drawn: −0.618 to 0.66, Churcher 2016 Results, α1 = 0.634 (95% CrI 0.012–1.29), re-centred on Table 6's 0.63 |
-| `pbo_gain_scale` | 1 | multiplier | scales PBO's gain in bioassay-mortality logit: logit f_s = logit x + s (logit f − logit x), f from Equation 4. 0 = no PBO gain | held at 1: no published range, and no training target has a PBO net (see the proposal below) |
-| `pbo_adv_decay` | 0 | per year | a PBO net of age t gives a same-age pyrethroid net's outcomes plus exp(−decay × t) times the PBO net's advantage (repeat, kill and the insecticide content used by the holes model) | held at 0: no published range, and no training target has a PBO net (see the proposal below) |
+| `net_kill_shift` | 0 | logit | added to the hut-mortality intercept: logit l = 0.63 + shift + 4.00 (x − 0.5), for every net type. Deterrence, feeding, killing and insecticide decay all follow from l through Churcher's own equations | −0.618 to 0.66 (triangular). Churcher 2016, Results: α1 = 0.634 (95% CrI 0.012–1.29), re-centred on Table 6's 0.63 |
+| `pbo_gain_scale` | 1 | multiplier | scales PBO's gain in bioassay-mortality logit: logit f_s = logit x + s (logit f − logit x), with f from Equation 4. 0 = no PBO gain | 0.316 to 1.0 (uniform). Gleave et al. 2021 Cochrane review, hut-trial mortality; rule below |
+| `pbo_adv_decay` | 0 | per year | a PBO net of age t gives a same-age pyrethroid net's outcomes plus exp(−decay × t) times the PBO net's advantage (repeat, kill and the insecticide content used by the holes model) | 0 to 1.594 (uniform). LLINEUP, Staedke et al. 2020, Table 2; rule below |
 
-**Why these three, and not the 20 coefficients.** Each net type's effect runs through one quantity, the hut mortality l:
-- **Pyrethroid nets against no nets.** l comes from the bioassay mortality x through α1 and α2 (Equation 2). Entry (m), feeding (k), exit (j), the per-attempt outcomes (r0, d0, s0) and the wash decay γ are all functions of l (Equations 8, 11–19). A shift on α1 therefore moves every outcome the way the hut-trial data tie them together. Drawing δ1–δ3, θ1–θ2, μ and ρ independently would ignore their correlation in Churcher's joint fit. The paper reports a credible interval only for α1 and α2 (Results); the slope α2 sets how the effect changes with resistance, and stays fixed.
-- **PBO's gain over pyrethroid.** A PBO net is a pyrethroid net evaluated at f(x), Equation 4, instead of x. The gain is the distance from x to f(x), so one scale on that distance (in logit) covers "no gain" (0), Churcher's fit (1) and a larger gain.
-- **The durability of PBO's advantage.** In Churcher's model a PBO net decays more slowly than a pyrethroid net, because γ falls as l rises (ρ < 0). Nothing in it lets PBO leave the net faster than the pyrethroid, the mechanism this parameter adds. Its value is not chosen here, and is not chosen from the held-out PBO trials.
-- **Dual-AI nets.** Their gain is already `cfp_kill`, kind `fitted` with the range of its fit (B10, B11). Its decay `cfp_half` stays fixed. The fit below could add it as a fourth dimension, against the same training targets (an open question for the owner).
+**Why these three, and not the 20 coefficients.** Each net type's effect runs through one quantity, the hut mortality l.
+- **Pyrethroid nets against no nets.** l comes from the bioassay mortality x through α1 and α2 (Equation 2). Entry (m), feeding (k), exit (j), the per-attempt outcomes (r0, d0, s0) and the wash decay γ are all functions of l (Equations 8, 11–19). A shift on α1 moves every outcome the way the hut-trial data tie them together, whereas drawing δ1–δ3, θ1–θ2, μ and ρ independently would ignore their correlation in Churcher's joint fit. The paper reports a credible interval only for α1 and α2 (Results). The slope α2, which sets how the effect changes with resistance, stays fixed.
+- **PBO's gain over pyrethroid.** A PBO net is a pyrethroid net evaluated at f(x) (Equation 4) instead of x. The gain is the distance from x to f(x), so one scale on that distance (in logit) covers no gain (0), Churcher's fit (1) and a larger gain.
+- **The durability of PBO's advantage.** In Churcher's model a PBO net decays more slowly than a pyrethroid net, because γ falls as l rises (ρ < 0). Nothing in it lets PBO leave the net faster than the pyrethroid. This parameter adds that mechanism.
+- **Dual-AI nets.** Their gain is `cfp_kill` (kind `fitted`), and their decay is `cfp_half`. The fit below takes both.
+
+### PBO prior ranges, from trials that are not in the pack (owner, 13 Nov)
+
+Sources:
+- **Gleave et al. 2021**, Cochrane CD012776.pub3. I read the abstract on cochrane.org; the full text and the abstract PDF returned HTTP 403.
+- **Staedke et al. 2020**, Lancet 395:1292–1303 (LLINEUP). I read the open-access PDF: abstract p. 1292, Table 2 p. 1299, net chemistry p. 1298.
+
+The pack's PBO trials (B9, B9b, B9c) and their papers play no part in these ranges. Gleave 2021 also pools two cluster-randomised trials for prevalence. One of them is the pack's Muleba trial, so its prevalence result is not used: only the review's experimental-hut and village entomology is used. Each rule is coded in `vector.py` and checked by a self-test (V36, V37).
+
+**`pbo_gain_scale`: Gleave 2021, abstract.**
+- *Data.* Unwashed pyrethroid-PBO against standard nets, mosquito mortality:
+  - high resistance (below 30% mortality in discriminating-dose assays): RR 1.84 (95% CI 1.60–2.11); 14,620 mosquitoes, 5 trials, 9 comparisons; high certainty;
+  - moderate resistance (31–60%): RR 1.68 (1.33–2.11).
+- *Rule.* The estimand is the hut mortality of a new net, as in Churcher's Equation 2. For each CI bound, find the scale at which the PBO net's hut mortality over the pyrethroid net's equals that bound. Both mortalities are averaged over x uniform within the resistance category (`hut_mortality_ratio`, `pbo_gain_scale_for_hut_rr`).
+- *Result at high resistance.* The A. gambiae complex gives 0.511–0.912, and A. funestus 0.316–0.513. Their union is 0.316–0.912.
+- *Result at moderate resistance.* This category only gives a lower bound (0.341 and 0.400), because Equation 4's gain there cannot reach the CI's upper end at any scale.
+- **A finding for principle 4.** At scale 1 (Equation 4 as published) the rule gives a mortality ratio of 2.21 (A. gambiae) and 2.81 (A. funestus), against the pooled 1.84 (1.60–2.11). The hut trials say Equation 4 overstates PBO's killing gain at high resistance.
+- *Why the drawn range ends at 1.0, not the rule's 0.912.* A card prior must contain the engine's point value, and v0.17 keeps v0.16's outputs at the defaults. Moving the point value into the range changes every PBO output. It is a later engine version, with a refit and the held-out PBO benchmarks scored once afterwards.
+
+**`pbo_adv_decay`: LLINEUP, Table 2 (p. 1299).**
+- *Data.* As-treated prevalence ratio, children 2–10 years, PBO against non-PBO LLINs:
+  - 0.74 (0.62–0.87) at 6 months;
+  - 0.73 (0.63–0.85) at 12 months;
+  - 0.84 (0.72–0.98) at 18 months.
+- *Rule* (`adv_decay_from_prs`):
+  1. Assume log PR fades as exp(−decay × t) between 6 and 18 months.
+  2. Then decay = ln(ln 0.74 / ln 0.84) / 1 y = 0.546 per year.
+  3. The 95% range comes from the delta method, with each SE taken from its CI and the two estimates treated as independent. That is conservative, since they come from the same clusters.
+  4. The lower end is clipped at 0.
+- *Result.* 0 to 1.594 per year.
+- *Cross-check.* The intention-to-treat ratios (0.78, 0.80, 0.94; Table 2) give 1.39 per year, inside the range.
+- *Mechanism.* At 12 months, PBO in withdrawn nets was below the manufacturers' minimum target in 80% of PermaNet 3.0 and 90% of Olyset Plus (p. 1298).
+- *Assumption.* Mapping the fading of a prevalence ratio onto the fading of the per-attempt advantage assumes that transmission responds linearly and that attrition is equal in the two arms.
 
 **Defaults reproduce v0.16.**
-- *Net level.* Self-test V31 compares `itn_effect` at the defaults with a frozen copy of the v0.16 net code. Pyrethroid, PBO and dual-AI nets, six resistance levels, both species complexes, nine net ages, holes on and off: equal bit for bit.
-- *Engine level.* One `run_batch` was run under the v0.16 tree, v0.17, and v0.17 with the defaults set explicitly. Its unit had a past PBO campaign, Muleba-like resistance and IRS; its arms were none, pyrethroid, PBO, dual-AI and PBO + IRS (1,500 agents, seed 21). All three gave identical output digests. The case is in the PR description.
-- *Still to do.* The full proof, `benchmarks/restamp_proof.py prove` (24 cases), and the re-stamp of the evidence files have not run (see What follows). Until they run, the harness refuses the v0.16 evidence for v0.17: the code fingerprint and the parameter hash changed.
+- *Net level.* Self-test V31 compares `itn_effect` at the defaults with a frozen copy of the v0.16 net code. Pyrethroid, PBO and dual-AI nets, six resistance levels, both species complexes, nine net ages, holes on and off: all equal bit for bit.
+- *Engine level.* One `run_batch` with a past PBO campaign, Muleba-like resistance and IRS, run under the v0.16 tree and under v0.17, gave identical output digests (PR description).
+- *Evidence.* `benchmarks/restamp_proof.py prove` compares the two trees on the pack's settings and the evidence cases. `restamp` then carries the four evidence files to the v0.17 identity (`restamp_proof.yaml`).
 
-**What the uncertainty step does now.**
-- `net_kill_shift` is a card prior: every uncertainty draw varies it, unless a spec excludes it with a reason.
-- The two PBO parameters stay fixed, with that reason in `priors.yaml`. A run whose decision turns on PBO against pyrethroid nets must declare this as a departure from principle 6 until PBO trials can set their ranges (the proposal below).
+### B7 and B8 at v0.16: the brief's numbers, and what the engine does now
 
-### B7 and B8 at v0.16: what the brief's numbers were, and what the engine does now
-
-The card's benchmark rows still showed v0.14 (B7 0.50, B8 0.41, both too much effect): they were not rewritten after the v0.15 and v0.16 refits. v0.17 rewrites them. At v0.16 (`results.yaml`, 8 seeds):
-- **B7** (prevalence RR, 12 months): 0.759, seed range 0.72–0.79. That is **in band** (0.71–0.98).
-- **B8** (under-5 clinical incidence RR, 0–24 months): 0.665, seed range 0.63–0.72. That is **out of band on the other side**: too little effect against 0.48–0.64.
-
-The v0.15 correction of the biting rates (1/W-bar) removed most of the earlier overshoot.
+The card's benchmark rows still showed v0.14 (B7 0.50, B8 0.41, both too much effect); they were not rewritten after the v0.15 and v0.16 refits. v0.17 rewrites them. At v0.16 (`results.yaml`, 8 seeds):
+- **B7** (prevalence RR, 12 months): 0.759, seed range 0.72–0.79, **in band** (0.71–0.98).
+- **B8** (under-5 clinical incidence RR, 0–24 months): 0.665, seed range 0.63–0.72. This is **out of band on the other side**: too little effect against 0.48–0.64.
 
 **A local probe** (2 seeds; the Cochrane setting at its calibrated m0 13.47; v0.16 code). Each row changes one thing from the pack's setting:
 
@@ -137,89 +164,83 @@ The v0.15 correction of the biting rates (1/W-bar) removed most of the earlier o
 | lower transmission (m0 3, PfPR 6 m–14 y 0.26) | 0.589 | 0.574 | 0.97 |
 | Pryce 2018 pooled estimates | 0.83 | 0.55 | 0.66 |
 
-**What this shows.**
-- In the trials the nets cut clinical incidence far more than prevalence: 0.55 against 0.83, a ratio of 0.66. The engine's ratio is 0.84–0.97 in every configuration tried.
-- So no change to how nets are used brings both into band at once. Each change that brings B8 into band takes B7 to or below its floor.
-- A stronger net (a larger `net_kill_shift`) acts like more use, so it would trade one benchmark for the other. **No net parameter is fitted to B7/B8 (principle 4).**
+**What this shows, and only for these four configurations.**
+- None puts both B7 and B8 in band.
+- The two that bring B8 into band take B7 to or below its floor.
+- This does not show that no configuration can: for example, B7 0.73 with B8 0.62 would satisfy both bands at a ratio of 0.85.
+- Two seeds per row is a probe, not evidence.
 
-**Where the gap points.** The cause is in the benchmark setup and the human module, not the net inputs:
-- **The trials pooled differ.** B7 and B8 pool different trials: six prevalence trials and five incidence trials. They range from EIR 6 to 300–500, and several are Asian, low-transmission and all-age (v0.4 scope table). One simulated setting at PfPR 0.50 stands for all of them.
-- **The nets were maintained.** The trials of that era used conventionally treated nets, re-treated during follow-up, not campaign LLINs losing insecticide and holed over 1.6 years. The probe's "trial-maintained" row moves B8 into band.
-- **The age gradient is wrong.** The engine cuts all-age prevalence about as much as under-5 prevalence (seed 11: 0.759 against 0.779). Sochantha 2006 measured 0.91 against 0.63. Prevalence in older children and adults responds too strongly. The human module is the candidate (duration and detectability of infections at high immunity, as at v0.4).
+**No net parameter is fitted to B7/B8 (they are held out; principle 4).** The candidates are setup differences with their own evidence:
+- **The trials pooled differ.** B7 and B8 pool different trials: six prevalence trials and five incidence trials. They span EIR 6 to 300–500, and several are Asian, low-transmission and all-age (v0.4 scope table). One simulated setting at PfPR 0.50 stands for all of them.
+- **The nets were maintained.** The trials of that era used conventionally treated nets, re-treated during follow-up. They were not campaign LLINs losing insecticide and holed over 1.6 years. The probe's "trial-maintained" row is in that direction.
+- **Age gradient: not established.** Sochantha 2006 reports an adjusted all-age prevalence ratio of 0.91 (0.65–1.28) and an adjusted under-five *odds* ratio of 0.63 (0.26–1.53). Neither compares directly with the engine's prevalence ratios. Converted to odds at the engine's control prevalence (about 0.5), the engine's under-five RR of 0.779 is an OR of about 0.64, close to the trial's 0.63. The engine's all-age RR (0.76) lies inside the trial's interval for the all-age ratio. One trial's intervals do not establish an age-gradient error. The v0.4 reading of these numbers is withdrawn.
 
 **Proposed structural fix (not in this PR).**
-- Split `cochrane_itn` into one setting per identified trial: its transmission, its age band, its follow-up, and nets re-treated as the trial describes. Each of these comes from the trial reports, not from B7/B8. Pool the engine's per-trial ratios with the review's weights (Analysis 1.2 and 1.6). The full text is needed for those weights, which are not in the accessible text.
-- B7 and B8 stay held out. They are checked after the fix, as validation; nothing is chosen by whether they pass.
-- The human module's age gradient is a separate item.
+- Split `cochrane_itn` into one setting per identified trial, each from the trial reports: its transmission, age band and follow-up, and nets re-treated as the trial describes.
+- Pool the engine's per-trial ratios with the review's weights (Analysis 1.2 and 1.6). Those weights need the full text, which was not accessible.
+- B7 and B8 then stay held out and are checked afterwards, as validation.
 
-### B9b and B9c: two trials, opposite durability (both held out)
+### B9, B9b and B9c (held out)
 
-At v0.16 the engine sits between the two trials:
-- **Muleba** (Protopopoff 2018): B9 0.474 against 0.37 at 9 months, B9b 0.740 against 0.40 at 21 months. The engine's PBO advantage is smaller, and fades faster, than the trial's.
-- **Misungwi** (Mosha 2022): B9c 0.821 against 0.99 at 24 months. The engine keeps an advantage the trial did not see.
+At v0.16 the engine's PBO advantage is weaker than at Muleba (B9 0.474 against 0.37; B9b 0.740 against 0.40) and stronger than at Misungwi (B9c 0.821 against 0.99). All three are within their bands. They stay held out: no range in this section was chosen from them, and the PBO priors above come from trials that are not in the pack.
 
-Both are inside their wide bands. A setting difference the engine represents (resistance: 8.8% bioassay mortality in A. gambiae s.l. at Muleba, 25% at Misungwi; species: A. funestus at Misungwi) does not reconcile them. B9, B9b and B9c are held out in the pack, so the fit below does not use them. Values justified by them are also refused for a spec (`toolkit/spec/engine_parameters.py`, held-out check).
+One proposal remains, for the owner: making B9, B9b and B9c training targets, with a replacement held-out PBO validation set. B15 (the PBO × IRS interaction at Muleba) would then no longer be an independent check.
 
-**Proposal for the owner (not made here).** The PBO parameters can only get trial-based ranges if PBO trials train them. That would mean:
-1. B9, B9b and B9c become training targets.
-2. A replacement held-out PBO validation set is added first, from trials not in the training set, with published 95% intervals. Candidates to source: the LLINEUP cluster-randomised trial in Uganda (Staedke et al. 2020, Lancet), and the PBO-net trials pooled in the Cochrane review of PBO nets (Gleave et al. 2021). Neither has been read for this PR; no number is taken from them.
-3. B15 (PBO × IRS interaction, Muleba) cannot be the validation of a fit trained on Muleba's own PBO arm, so it would move to the training side or be dropped as a check.
-
-Under that proposal, Muleba's durability and Misungwi's would each define a region. If no value fits both, the range for a third setting (the decision's) is their union, not a compromise point. The script's joint-region step would then take one region per trial.
-
-### Trial-fitting design (`benchmarks/net_effect_fit.py`; not run)
+### Trial-fitting design (`benchmarks/net_effect_fit.py`; not run; the lead launches it after this PR is merged, hard cap $25)
 
 **Train and held out.**
 
 | | Benchmarks | How it is kept |
 |---|---|---|
-| **Train (fit targets)** | the pack's own `fit_joint.targets`: B10, B11 (dual-AI vs pyrethroid), B12, B12b, B12m (IRS added to pyrethroid nets) | read from pack.yaml, never typed in the script |
-| **Held out (untouched)** | B7, B8, B9, B9b, B9c, B13, B15, B16c, B17, B18, B19, B20 | the fit never scores one; its objective, range and joint sample use only the targets; `run` refuses any target list other than the pack's (self-test F1b: B9c or B7 as a target is refused); the output lists them under `held_out_untouched` |
+| **Train (fit targets)** | the pack's own `fit_joint.targets`: B10 and B11 (dual-AI vs pyrethroid); B12, B12b and B12m (IRS added to pyrethroid nets) | read from pack.yaml, never typed in the script |
+| **Held out (untouched)** | B7, B8, B9, B9b, B9c, B13, B15, B16c, B17, B18, B19, B20 | the fit never scores one; its objective, range and joint sample use only the targets; `run` refuses any other target list (F1b); the output lists them under `held_out_untouched` |
 
-**Parameters.**
-- A net-effect parameter joins the fit only if a training arm uses a net it acts on.
-- The training arms use pyrethroid and dual-AI nets (self-test F2). So `net_kill_shift` joins the two fitted parameters, `cfp_kill` and `irs_kill`, giving 3 dimensions.
-- `pbo_gain_scale` and `pbo_adv_decay` stay out. No training target can identify them, and fitting them against targets that never use a PBO net would only return the box.
+**Parameters.** A net-effect parameter joins the fit only if a training arm uses a net it acts on (F2). That gives four dimensions:
 
 | Parameter | Box | Basis of the box |
 |---|---|---|
-| `net_kill_shift` | −0.618 to 0.66 | the hut-trial CrI (its card prior). The field trials may narrow it, not leave it: a target out of band everywhere in the box is reported as infeasible (a principle-4 finding) |
+| `net_kill_shift` | −0.618 to 0.66 | its card prior, the hut-trial CrI. The field trials may narrow it, not leave it: a target out of band everywhere in the box is reported as infeasible (a principle-4 finding) |
 | `cfp_kill` | 0 to 0.8 | the pack's |
 | `irs_kill` | 0 to 0.95 | the pack's |
+| `cfp_half` | 547.5 to 1,277.5 days (1.5–3.5 years) | owner, 13 Nov. Attempt 8's range, a modeller reading of the dual-AI trials' durability: a design assumption, not a prior |
 
-**Method.** The pack's joint fit, rule `joint-v1` (`benchmark.fit_joint`), unchanged:
-1. calibrate each site at the box centre;
-2. run a Latin hypercube of 40 points plus the centre on the pack's 8 seeds;
-3. fit a quadratic surrogate of each target's log value (10 coefficients, leave-one-out error reported);
-4. choose the value that minimises (targets out of band, then the band-scaled squared log error);
-5. verify at the chosen value, with the sites re-calibrated there.
+`pbo_gain_scale` and `pbo_adv_decay` stay out: no training arm has a PBO net. They keep their card priors.
 
-The script then exports a **joint sample**: up to 2,000 parameter sets from the region where the surrogate puts every target in band, with their correlation matrix. It re-runs 20 of them on the engine and records how many keep every target in band. The trials can admit a narrow trade-off, for example chlorfenapyr kill against the pyrethroid kill or the IRS kill. Independent draws from the marginal ranges would break it: self-test F5 has a trade-off where 90% of independent draws fall outside the region the joint sample keeps. Using the sample in the uncertainty step (draws taken as joint rows, not per-parameter priors) is a harness change for the adoption PR.
+**Calibration at every point (review P2).**
+- `net_kill_shift` changes the pyrethroid-only arm each site is calibrated to. A fixed calibration would let a point match the trial ratios while missing the control-arm burden.
+- The sites' calibration arms (pyrethroid nets, no IRS) depend on no other fitted parameter (F9). So the sites are calibrated on a grid of 5 values of `net_kill_shift`.
+- Each parameter point, whether design, chosen or sample, takes its m0 by log-linear interpolation at its own value.
+- Results are cached under the calibration they ran with (F10). The design points, the verification at the chosen value and the verified sample points therefore all share one calibration rule.
+- Each verified point also records its control arms' baseline against the target it is calibrated to.
+
+**Method.** The pack's joint fit, rule `joint-v1` (`benchmark.fit_joint`, unchanged), on that runner:
+1. Run a Latin hypercube of 45 points plus the centre on the pack's 8 seeds.
+2. Fit a quadratic surrogate of each target's log value: 15 coefficients, with the leave-one-out error reported.
+3. Choose the value that minimises the number of targets out of band, then the band-scaled squared log error.
+4. Verify at the chosen value.
+
+**Joint sample.**
+- The output is up to 2,000 parameter sets from the region where the surrogate puts every target in band, with their correlation matrix. The hull and the box-edge flags are computed from every accepted candidate, before subsampling (F12).
+- 12 of them are re-run on the engine. If any one is out of band, the sample is marked invalid: it moves to `sample_unverified` with the failing points, and the run exits 2 (F11).
+- Why a joint sample: independent draws from the marginal ranges break a narrow trade-off. Self-test F5 shows one where 90% of independent draws fall outside it.
 
 **Run count.**
-- Design, chosen value and verified sample: (41 + 1 + 20) points × 8 arms × 8 seeds = 3,968 arm runs, in 62 × 4 × 8 = 1,984 burn-in groups.
-- Calibration: 84 runs.
-- Total: 4,052 arm runs.
-- `net_kill_shift` acts on past campaigns before the fork, so the parameter points cannot share a burn-in.
+- Points: 46 design, 1 chosen value and 12 verified, so 59 points × 8 arms × 8 seeds = 3,776 arm runs, in 1,888 burn-in groups.
+- Calibration grid: 5 × 21 grid values × 2 seeds = 210 runs.
+- Total: 3,986 arm runs.
 
-**Cost.** Measured on the laptop (v0.16, 5000 agents): a 50-year burn-in with one arm takes 77 s of CPU, and with four arms 99.5 s. That is about 70 s per burn-in group and 7.4 s per extra arm.
-- Laptop: 48.5 CPU-hours.
-- VM: about 97–146 vCPU-hours, assuming a VM vCPU is 2–3 times slower than a laptop core.
-- Price: **about $11–22**, at $0.109 per vCPU-hour (billed, P6 records) up to $0.152 (the `vm_prices.yaml` bound).
-- The upper end is above $20, so the owner approves before the lead launches it. `run` refuses without `--approved`.
-- Cost option: an engine fork at the first past net campaign would let points share the 50-year burn-in, about 70% of each group's time.
+**Cost.** Laptop basis, measured on v0.16 with 5000 agents: about 70 s per burn-in group and 7.4 s per extra arm.
+- Laptop: 49 CPU-hours.
+- VM: 98–147 vCPU-hours, assuming a VM vCPU is 2–3 times slower than a laptop core.
+- Price: **$10.7–22.3**, at $0.109 per vCPU-hour (the P6 billing) up to $0.152 (the `vm_prices.yaml` bound). That is under the owner's $25 cap.
+- `run` refuses a plan whose upper estimate exceeds the cap (F6), as well as a run without `--approved`.
 
 **Output.** `benchmarks/net_effect_fit.yaml`, never `fitted.yaml` or `results.yaml`. Adopting it is a later engine version:
-1. `net_kill_shift` becomes kind `fitted`, with the joint sample as its uncertainty;
-2. the pack's `fit_joint` takes the design's parameters;
+1. The fitted parameters take the joint sample as their uncertainty. Draws as joint rows are a harness change.
+2. The pack's `fit_joint` takes the design's parameters.
 3. `validate_once.sh` recomputes the evidence, and the held-out benchmarks are scored once, as validation.
 
-**Smoke.** `run --smoke --out <scratch>` (1 seed, 3 design points, 600 agents, 2-year burn-in) ran locally end to end (PR description). Its numbers are not evidence.
-
-**What follows.**
-1. `restamp_proof.py prove`, then `restamp`, for v0.16 → v0.17. The lead runs it, on the VM or locally (24 cases, two trees, about 1.5 laptop CPU-hours).
-2. The owner decides on the fit's spend, and on the PBO training proposal.
-3. The structural B7/B8 setting fix.
+**Smoke.** `run --smoke --out <scratch>` ran locally end to end: 1 seed, 3 design points, 600 agents, 2-year burn-in, 2 calibration grid points. Its numbers are not evidence.
 
 ## v0.16 scope: BR3 at dual-AI nets and 70% use is reported, not judged (owner, 2026-11-10)
 

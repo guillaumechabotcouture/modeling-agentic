@@ -253,6 +253,42 @@ def pbo_bioassay(x, complex_: str = "gambiae", gain_scale: float = 1.0):
     return _expit(lx + float(gain_scale) * (_logit(f) - lx))
 
 
+def hut_mortality_ratio(gain_scale: float, x_lo: float, x_hi: float, complex_: str = "gambiae", n: int = 301) -> float:
+    """v0.17 prior rule for pbo_gain_scale: the PBO net's hut mortality over the pyrethroid net's (Churcher Equation 2
+    at Equation 4's f_s and at x), each averaged over bioassay mortality x uniform on [x_lo, x_hi] (a resistance
+    category of a pooled hut-trial estimate)."""
+    C = CHURCHER
+    x = np.linspace(x_lo, x_hi, n)
+    lm = lambda z: _expit(C["a1"] + C["a2"] * (z - C["tau"]))  # noqa: E731
+    return float(np.mean(lm(pbo_bioassay(x, complex_, gain_scale))) / np.mean(lm(x)))
+
+
+def pbo_gain_scale_for_hut_rr(rr: float, x_lo: float, x_hi: float, complex_: str = "gambiae",
+                              s_max: float = 20.0) -> float | None:
+    """The scale whose category-mean hut mortality ratio equals `rr` (bisection; the ratio rises with the scale over
+    the categories used), or None when no scale in [0, s_max] reaches it."""
+    f = lambda s: hut_mortality_ratio(s, x_lo, x_hi, complex_) - rr  # noqa: E731
+    lo, hi = 0.0, s_max
+    if f(lo) > 0 or f(hi) < 0:
+        return None
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if f(mid) < 0 else (lo, mid)
+    return 0.5 * (lo + hi)
+
+
+def adv_decay_from_prs(early, late, dt_years: float) -> tuple:
+    """v0.17 prior rule for pbo_adv_decay from two prevalence ratios (point, lo95, hi95) of one trial, dt_years apart:
+    log PR(t) fades as exp(-decay t), so decay = ln(log PR_early / log PR_late) / dt; its 95% range by the delta method
+    with each SE from its CI and the two estimates taken as independent (conservative: they share clusters), the lower
+    end clipped at 0 (no faster-than-Churcher fading below zero). Returns (point, lo, hi)."""
+    se = lambda t: (np.log(t[2]) - np.log(t[1])) / (2 * 1.959964)  # noqa: E731
+    a, b = -np.log(early[0]), -np.log(late[0])
+    pt = float(np.log(a / b) / dt_years)
+    s = float(np.sqrt((se(early) / a) ** 2 + (se(late) / b) ** 2) / dt_years)
+    return pt, max(0.0, pt - 1.959964 * s), pt + 1.959964 * s
+
+
 def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0):
     """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day). v0.17: kill_shift is added to
     the hut-mortality intercept alpha1 (Equation 2), so killing, deterrence, feeding and the insecticide decay all

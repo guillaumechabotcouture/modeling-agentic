@@ -190,11 +190,11 @@ _PARAMS = [
      "uses Table 6's 0.63", "matched"),
     ("pbo_gain_scale", 1.0, "fixed", "multiplier", None, None, "scale on PBO's gain in bioassay-mortality logit, "
      "logit f_s = logit x + s (logit f - logit x), f from " + V.CHURCHER_SOURCE + ", Equation 4; 1 = Equation 4, "
-     "0 = no PBO gain; no published range: held until a PBO trial is a training target of the trial fit (the pack's "
-     "PBO trials are held out)", "unverified"),
+     "0 = no PBO gain; drawn over the card prior from Gleave et al. 2021 Cochrane CD012776.pub3 hut-trial mortality "
+     "(priors.yaml)", "unverified"),
     ("pbo_adv_decay", 0.0, "fixed", "per year", None, None, "decay rate of a PBO net's advantage over a same-age "
-     "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; no published range: held "
-     "until a PBO trial is a training target of the trial fit (the pack's PBO trials are held out)", "unverified"),
+     "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; drawn over the card prior "
+     "from Staedke et al. 2020 Lancet (LLINEUP) Table 2 (priors.yaml)", "unverified"),
     ("irs_kill", 0.5, "fitted", "probability", 0.0, 0.95, "fitted: B12, B12b, B12m", "unverified"),
     ("irs_rep", 0.10, "fixed", "probability", None, None, A8, "unverified"),
     ("irs_half", 0.4 * 365., "fixed", "days", None, None, A8 + " (decay of the generic short-lived product only)", "unverified"),

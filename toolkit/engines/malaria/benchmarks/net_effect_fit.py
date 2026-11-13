@@ -12,16 +12,19 @@ B12, B12b, B12m); every other benchmark is held out and stays untouched: the fit
 its ranges use only the targets, and the script refuses a target list that differs from the pack's (a held-out
 benchmark used to choose a value would no longer test the engine; toolkit/spec/engine_parameters.py refuses such
 values). The parameters fitted are those the training arms can identify: a net-effect parameter joins only when a
-training arm uses a net it acts on, so net_kill_shift (every net type) joins cfp_kill and irs_kill, while
-pbo_gain_scale and pbo_adv_decay stay out (no training arm has a PBO net; the PBO trials B9, B9b, B9c are held out).
+training arm uses a net it acts on, so net_kill_shift (every net type) joins cfp_kill, irs_kill and cfp_half (owner,
+13 Nov), while pbo_gain_scale and pbo_adv_decay stay out (no training arm has a PBO net; the PBO trials B9, B9b, B9c
+are held out; their ranges are card priors from trials outside the pack).
 
-`run` is the pack's joint fit (benchmark.fit_joint, rule joint-v1). Besides joint-v1's value and marginal range it
-exports a JOINT sample of trial-compatible parameter sets (the surrogate's all-in-band region, subsampled), with
-`verify` of them re-run on the engine, because the trials can admit a narrow trade-off (for example chlorfenapyr
-kill against the pyrethroid kill) that independent draws from marginal ranges would break. It writes
-net_effect_fit.yaml beside this file, never fitted.yaml or results.yaml: adopting the result is a later engine
-version. The full run is launched by the lead session after the owner approves the spend; `--smoke` checks the
-script end to end with a few short runs and writes only to the scratch file it is given.
+`run` is the pack's joint fit (benchmark.fit_joint, rule joint-v1) on a RecalRunner: net_kill_shift moves the sites'
+pyrethroid-only calibration arms, so every parameter point is calibrated to the site's control-arm baseline, by
+log-linear interpolation of m0 on a grid in net_kill_shift (the only fitted parameter those arms depend on). Results
+are cached under their calibration. Besides joint-v1's value and marginal range it exports a JOINT sample of
+trial-compatible parameter sets (the surrogate's all-in-band region; hull and edge flags from every accepted
+candidate), with `verify` of them re-run on the engine at their own calibration, each with its control-arm check:
+one out of band invalidates the sample and the run exits 2. It writes net_effect_fit.yaml beside this file, never
+fitted.yaml or results.yaml. A full run needs --approved and a plan under the $25 cap; the lead launches it after
+this PR is merged. `--smoke` checks the script end to end with a few short runs and writes only to its scratch file.
 """
 from __future__ import annotations
 
@@ -50,9 +53,15 @@ PROTECTED = ("fitted.yaml", "results.yaml")
 NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
               "pbo_gain_scale": ({"pbo"}, [0.0, 2.0]),
               "pbo_adv_decay": ({"pbo"}, [0.0, 1.5])}
-DESIGN = {"n": 40, "seed": 17}     # 10 quadratic coefficients in 3 dimensions; 4 points per coefficient
-VERIFY = 20                        # joint-sample points re-run on the engine at the chosen value's calibration
+# owner, 13 Nov: cfp_half joins the fit. Box 1.5-3.5 years (547.5-1277.5 days): attempt 8's range, a modeller reading
+# of the dual-AI trials' durability (priors.yaml: no published half-life), a design assumption, not a prior
+FIT_EXTRA = {"cfp_half": [547.5, 1277.5]}
+CAL_PARAM = "net_kill_shift"       # the only fitted parameter the sites' calibration arms depend on (F9)
+CAL_N = 5                          # calibration grid points in net_kill_shift across its box
+DESIGN = {"n": 45, "seed": 17}     # 15 quadratic coefficients in 4 dimensions; 3 points per coefficient
+VERIFY = 12                        # joint-sample points re-run on the engine, each at its own calibration
 SAMPLE = 2000                      # joint-sample points exported (surrogate all-in-band region)
+CAP_USD = 25.0                     # owner, 13 Nov: hard cap for the fit; `run` refuses a plan above it
 # Cost basis (measured 2026-11-12 on the laptop, arm64, one process, OMP_NUM_THREADS=2, v0.16 tree, 5000 agents,
 # Muleba setting): a 50-year burn-in with the history to the fork and one arm 77 s CPU, with four arms 99.5 s, so
 # about 70 s per (parameter point, setting, seed) group and 7.4 s per extra arm. VM_FACTOR 2-3: a VM vCPU against one
@@ -61,6 +70,7 @@ SAMPLE = 2000                      # joint-sample points exported (surrogate all
 GROUP_S, ARM_S = 70.0, 7.4
 VM_FACTOR = (2.0, 3.0)
 USD_PER_VCPU_H = (1.0 * 0.061 + 0.048, 1.5 * 0.061 + 0.048 * 1.25)
+ACTS = {"irs": {"irs_kill"}, "dual": {"cfp_kill", "cfp_half"}}      # fitted parameters by package element
 
 
 def split(pack: dict) -> tuple[list, list]:
@@ -76,13 +86,14 @@ def train_nets(pack: dict, train: list) -> set:
 
 
 def build_pack(base: dict, smoke: bool = False) -> dict:
-    """The pack with its own targets and a joint fit over its fitted parameters plus every net-effect parameter that a
-    training arm identifies. Benchmarks, settings and targets are the pack's (smoke: one seed, small runs)."""
+    """The pack with its own targets and a joint fit over its fitted parameters, cfp_half, and every net-effect
+    parameter that a training arm identifies. Benchmarks, settings and targets are the pack's (smoke: small runs)."""
     p = copy.deepcopy(base)
     train, _ = split(base)
     nets = train_nets(base, train)
-    params = {k: list(v) for k, v in base["fit_joint"]["params"].items()}
-    params = dict({k: list(b) for k, (acts, b) in NET_PARAMS.items() if acts & nets}, **params)
+    params = {k: list(b) for k, (acts, b) in NET_PARAMS.items() if acts & nets}
+    params.update({k: list(v) for k, v in base["fit_joint"]["params"].items()})
+    params.update({k: list(v) for k, v in FIT_EXTRA.items()})
     p["fit_joint"] = {"rule": "joint-v1", "params": params, "targets": train, "design": dict(DESIGN)}
     if smoke:
         p["seeds"] = p["seeds"][:1]
@@ -101,22 +112,106 @@ def check(pack: dict, base: dict) -> list[str]:
     return bad + ([f"targets {t} differ from the pack's fit targets {train}"] if sorted(t) != sorted(train) else [])
 
 
-def plan(pack: dict, verify: int = VERIFY) -> dict:
+def _fit_settings(pack: dict) -> list:
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    arms = {a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])}
+    return sorted({pack["arms"][a]["setting"] for a in arms})
+
+
+def calibration_params(pack: dict) -> set:
+    """The fitted parameters that the calibration arms of the fit's sites depend on (from their packages)."""
+    out = set()
+    for s in _fit_settings(pack):
+        pk = (pack["settings"][s].get("calibrate") or {}).get("arm_package") or {}
+        net = pk.get("net")
+        out |= {k for k, (acts, _) in NET_PARAMS.items() if net in acts}
+        out |= ACTS["dual"] if net == "dual" else set()
+        out |= ACTS["irs"] if pk.get("irs") else set()
+    return out & set(pack["fit_joint"]["params"])
+
+
+def interp_calibration(grid, values, v: float) -> float:
+    """Log-linear interpolation of a calibrated attribute (m0) on the calibration grid of CAL_PARAM."""
+    return float(np.exp(np.interp(float(v), np.asarray(grid, float), np.log(np.asarray(values, float)))))
+
+
+class RecalRunner(BM.Runner):
+    """benchmark.Runner with the sites calibrated at every parameter point (review P2). Each site's calibration arm
+    depends only on CAL_PARAM, so the sites are calibrated once on a grid of CAL_PARAM and each point's m0 is the
+    log-linear interpolation at its value. Results are cached under the calibration they were run with."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.cal_grid = None          # {"values": [...], "m0": {setting: [...]}, "rows": {setting: calibrated row}}
+
+    def calibrate_grid(self, settings, centre: dict, n: int):
+        lo, hi = self._p["fit_joint"]["params"][CAL_PARAM]
+        vals = [float(x) for x in np.linspace(lo, hi, n)]
+        m0, rows = {s: [] for s in settings}, {s: [] for s in settings}
+        for v in vals:
+            self.calibrated = {}
+            BM.Runner.calibrate_settings(self, dict(centre, **{CAL_PARAM: v}), settings)
+            for s in settings:
+                m0[s].append(self.calibrated[s]["value"])
+                rows[s].append(self.calibrated[s])
+        self.cal_grid = {"values": vals, "m0": m0, "rows": rows}
+
+    def set_calibration(self, values: dict):
+        for s, v in values.items():
+            row = dict(self.calibrated.get(s) or {"attribute": self._p["settings"][s]["calibrate"]["attribute"]})
+            self.calibrated[s] = dict(row, value=float(v))
+
+    def calibrate_settings(self, fitted: dict, names=None):
+        if self.cal_grid is None:
+            return BM.Runner.calibrate_settings(self, fitted, names)
+        g = self.cal_grid
+        v = float(dict(self._fitted, **fitted).get(CAL_PARAM, 0.0))
+        self.set_calibration({s: interp_calibration(g["values"], g["m0"][s], v) for s in g["m0"]})
+
+    def _calkey(self):
+        return tuple(sorted((s, round(float(c["value"]), 9)) for s, c in self.calibrated.items()))
+
+    def prefetch(self, arms, fitted_list):
+        jobs, need = [], []
+        for f in fitted_list:
+            if self.cal_grid is not None:
+                self.calibrate_settings(f)
+            key = (tuple(sorted(f.items())), self._calkey())
+            for a in arms:
+                if (a, key) in self.cache or (a, key) in need:
+                    continue
+                jobs += self._arm_jobs(a, f)
+                need.append((a, key))
+        if jobs:
+            res = self._map(jobs)
+            self.nsims += len(jobs)
+            k = len(self.seeds)
+            for i, ak in enumerate(need):
+                self.cache[ak] = res[i * k:(i + 1) * k]
+
+    def arm_results(self, arms, fitted: dict):
+        self.prefetch(arms, [fitted])
+        key = (tuple(sorted(fitted.items())), self._calkey())
+        return {a: self.cache[(a, key)] for a in arms}
+
+
+def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N) -> dict:
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
-    settings = sorted({pack["arms"][a]["setting"] for a in arms})
+    settings = _fit_settings(pack)
     npts, ns = int(fj["design"]["n"]) + 1, len(pack["seeds"])
     grid = sum(len(pack["settings"][s]["calibrate"]["grid"]) for s in settings if pack["settings"][s].get("calibrate"))
-    cal = 2 * grid * min(2, ns)                     # at the box centre and at the chosen value; each its own burn-in
+    cal = cal_n * grid * min(2, ns)                 # the calibration grid in CAL_PARAM; each run its own burn-in
     pts = npts + 1 + verify                         # design, the chosen value, the verified joint-sample points
     groups, sims = pts * len(settings) * ns, pts * len(arms) * ns
     cpu_h = (groups * GROUP_S + sims * ARM_S + cal * (GROUP_S + ARM_S)) / 3600
     vcpu = [cpu_h * f for f in VM_FACTOR]
     _, held = split(pack)
     return {"params": fj["params"], "targets_train": fj["targets"], "held_out_untouched": held,
-            "not_fitted": sorted(set(NET_PARAMS) - set(fj["params"])), "arms": arms, "settings": settings,
-            "design_points": npts, "verified_sample_points": verify, "seeds": ns, "arm_runs": sims + cal,
-            "burn_in_groups": groups + cal, "laptop_cpu_hours": round(cpu_h, 1),
+            "not_fitted": sorted(set(NET_PARAMS) - set(fj["params"])), "calibration_depends_on": sorted(
+                calibration_params(pack)), "arms": arms, "settings": settings,
+            "design_points": npts, "verified_sample_points": verify, "seeds": ns, "calibration_runs": cal,
+            "arm_runs": sims + cal, "burn_in_groups": groups + cal, "laptop_cpu_hours": round(cpu_h, 1),
             "vm_vcpu_hours": [round(v, 1) for v in vcpu],
             "usd": [round(vcpu[0] * USD_PER_VCPU_H[0], 1), round(vcpu[1] * USD_PER_VCPU_H[1], 1)]}
 
@@ -130,7 +225,8 @@ def target_bands(pack: dict) -> dict:
 def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarray, seed: int,
                  n_sample: int = SAMPLE) -> dict:
     """Each target's quadratic surrogate (as joint-v1) on dense candidates; the region where every target is in band:
-    its share of the box, its marginal hull, and a joint sample of its points (parameter sets, not marginals)."""
+    its share of the box, its marginal hull and box-edge flags (from every accepted candidate), and a joint sample of
+    its points (parameter sets, not marginals)."""
     cand = BM._candidates(X.shape[1], seed)
     Fc = BM._quad_features(cand)
     m = np.ones(len(cand), bool)
@@ -139,22 +235,37 @@ def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarr
         v = np.exp(Fc @ coef)
         m &= (v >= bands[t][0]) & (v <= bands[t][1])
     to = lambda c: {k: round(float(box[i, 0] + c[i] * (box[i, 1] - box[i, 0])), 6) for i, k in enumerate(names)}  # noqa
-    idx = np.flatnonzero(m)
-    if len(idx) > n_sample:
-        idx = np.sort(np.random.default_rng(seed).choice(idx, n_sample, replace=False))
-    pts = [to(cand[i]) for i in idx]
-    hull = ({k: [min(p[k] for p in pts), max(p[k] for p in pts)] for k in names} if pts else None)
+    acc = cand[m]
+    hull = ({k: [round(float(box[i, 0] + acc[:, i].min() * (box[i, 1] - box[i, 0])), 6),
+                 round(float(box[i, 0] + acc[:, i].max() * (box[i, 1] - box[i, 0])), 6)] for i, k in enumerate(names)}
+            if len(acc) else None)
     edge = sorted(k for i, k in enumerate(names) if hull and (
         hull[k][1] >= box[i, 1] - 1e-3 * (box[i, 1] - box[i, 0])
         or (box[i, 0] != 0.0 and hull[k][0] <= box[i, 0] + 1e-3 * (box[i, 1] - box[i, 0]))))
-    corr = (np.corrcoef(np.array([[p[k] for k in names] for p in pts]).T).round(3).tolist()
-            if len(pts) > 2 else None)
-    return {"share_of_box": round(float(m.mean()), 4), "hull": hull, "at_box_edge": edge,
-            "correlation": {"names": names, "matrix": corr}, "sample": pts}
+    corr = np.corrcoef(acc.T).round(3).tolist() if len(acc) > 2 else None
+    idx = np.flatnonzero(m)
+    if len(idx) > n_sample:
+        idx = np.sort(np.random.default_rng(seed).choice(idx, n_sample, replace=False))
+    return {"share_of_box": round(float(m.mean()), 4), "n_accepted": int(m.sum()), "hull": hull, "at_box_edge": edge,
+            "correlation": {"names": names, "matrix": corr}, "sample": [to(cand[i]) for i in idx]}
+
+
+def finalize(reg: dict, checked: list) -> tuple[dict, int]:
+    """Attach the verification; a verified point out of band invalidates the sample (review P2): it is moved to
+    `sample_unverified`, `sample` is emptied, and the code is 2. Every verified point in band: `verified`, code 0."""
+    failed = [c["point"] for c in checked if not c["all_in_band"]]
+    reg["verified"] = {"n": len(checked), "all_in_band": len(checked) - len(failed), "failed": failed,
+                       "points": checked}
+    if failed or not checked:
+        reg["sample_status"] = "invalid" if failed else "unverified"
+        reg["sample_unverified"], reg["sample"] = reg.get("sample") or [], []
+        return reg, 2
+    reg["sample_status"] = "verified"
+    return reg, 0
 
 
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
-        verify: int = VERIFY) -> int:
+        verify: int = VERIFY, cap_usd: float = CAP_USD) -> int:
     if os.path.basename(out_path) in PROTECTED:
         raise ValueError(f"net_effect_fit writes its own file, never {PROTECTED}")
     bad = check(pack, base)
@@ -162,39 +273,53 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError("net_effect_fit: " + "; ".join(bad))
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
+    cal_n = 2 if smoke else CAL_N
+    q = plan(pack, verify, cal_n)
+    if not smoke and q["usd"][1] > cap_usd:
+        raise ValueError(f"the plan's upper cost ${q['usd'][1]} is above the cap ${cap_usd}")
+    if calibration_params(pack) != {CAL_PARAM}:
+        raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
-    runner = BM.Runner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
+    runner = RecalRunner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
     t0 = time.time()
-    fit = BM.fit_joint(pack, eng, runner)
     names = list(pack["fit_joint"]["params"])
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
+    centre = {k: float(box[i].mean()) for i, k in enumerate(names)}
+    runner.calibrate_grid(_fit_settings(pack), centre, cal_n)
+    fit = BM.fit_joint(pack, eng, runner)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
     reg = joint_region(X, fit["design"]["computed"], target_bands(pack), names, box,
                        int(pack["fit_joint"]["design"]["seed"]))
-    # re-run `verify` of the joint-sample points (settings stay calibrated at the chosen value): the surrogate's
-    # region is a claim until the engine agrees at points other than the chosen one
+    # re-run `verify` joint-sample points, each at its own interpolated calibration, as the design points were
     byid = {b["id"]: b for b in pack["benchmarks"]}
     rng = np.random.default_rng(int(pack["fit_joint"]["design"]["seed"]) + 1)
     pick = sorted(rng.choice(len(reg["sample"]), min(verify, len(reg["sample"])), replace=False).tolist()) \
         if reg["sample"] else []
-    arms = sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])})
-    runner.prefetch(arms, [reg["sample"][i] for i in pick])
+    runner.prefetch(sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])}),
+                    [reg["sample"][i] for i in pick])
+    # each site's control arm at the interpolated calibration, against the baseline it is calibrated to
+    ctrl = {s: next(a for a, c in pack["arms"].items() if c["setting"] == s and (c.get("package") or {}) ==
+                    (pack["settings"][s]["calibrate"].get("arm_package") or {})) for s in _fit_settings(pack)}
     checked = []
     for i in pick:
         rows = {t: runner.evaluate(byid[t], reg["sample"][i]) for t in pack["fit_joint"]["targets"]}
+        res = runner.arm_results(sorted(ctrl.values()), reg["sample"][i])
+        cal = {s: {"target": pack["settings"][s]["calibrate"]["target"], "achieved": round(float(np.mean(
+            [BM.get(r, pack["settings"][s]["calibrate"]["value_path"]) for r in res[a]])), 4)} for s, a in ctrl.items()}
         checked.append({"point": reg["sample"][i], "all_in_band": all(r["in_band"] for r in rows.values()),
-                        "computed": {t: round(r["computed"], 4) for t, r in rows.items()}})
-    reg["verified"] = {"n": len(checked), "all_in_band": sum(c["all_in_band"] for c in checked), "points": checked}
+                        "computed": {t: round(r["computed"], 4) for t, r in rows.items()}, "calibration_check": cal})
+    reg, code = finalize(reg, checked)
     doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters on the pack's training targets "
                                "(ENGINE_NOTES.md, v0.17); not adopted",
-                    "smoke": smoke, "approved": approved, "plan": plan(pack, verify), "n_sims": runner.nsims,
+                    "smoke": smoke, "approved": approved, "cap_usd": cap_usd, "plan": q, "n_sims": runner.nsims,
                     "wall_s": round(time.time() - t0, 1), "fitted_at": time.strftime("%F %T"),
+                    "calibration_grid": {CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"]},
                     "joint_region": reg, **fit}, eng)
     yaml.safe_dump(doc, open(out_path, "w"), sort_keys=False)
-    print(f"wrote {out_path} ({runner.nsims} sims); joint sample {len(reg['sample'])} points, verified "
+    print(f"wrote {out_path} ({runner.nsims} sims); joint sample {reg['sample_status']}: verified "
           f"{reg['verified']['all_in_band']}/{reg['verified']['n']} all in band")
-    return 0
+    return code
 
 
 def _self_test() -> int:

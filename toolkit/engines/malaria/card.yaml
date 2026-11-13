@@ -718,10 +718,9 @@ parameters:
   units: multiplier
   lo: null
   hi: null
-  source: 'scale on PBO''s gain in bioassay-mortality logit, logit f_s = logit x + s (logit f - logit x), f from
-    Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277), Equation 4; 1 = Equation 4, 0 = no PBO
-    gain; no published range: held until a PBO trial is a training target of the trial fit (the pack''s PBO trials
-    are held out)'
+  source: scale on PBO's gain in bioassay-mortality logit, logit f_s = logit x + s (logit f - logit x), f from Churcher
+    et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277), Equation 4; 1 = Equation 4, 0 = no PBO gain; drawn
+    over the card prior from Gleave et al. 2021 Cochrane CD012776.pub3 hut-trial mortality (priors.yaml)
   verified: unverified
 - name: pbo_adv_decay
   value: 0.0
@@ -729,9 +728,8 @@ parameters:
   units: per year
   lo: null
   hi: null
-  source: 'decay rate of a PBO net''s advantage over a same-age pyrethroid net (PBO lost from the net; Churcher
-    2016 has no such term); 0 = v0.16; no published range: held until a PBO trial is a training target of the trial
-    fit (the pack''s PBO trials are held out)'
+  source: decay rate of a PBO net's advantage over a same-age pyrethroid net (PBO lost from the net; Churcher 2016
+    has no such term); 0 = v0.16; drawn over the card prior from Staedke et al. 2020 Lancet (LLINEUP) Table 2 (priors.yaml)
   verified: unverified
 - name: irs_kill
   value: 0.45125
