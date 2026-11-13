@@ -76,6 +76,10 @@ Rules:
   measured effect on the headline is understood.
 - Stay inside the budget: a loop that cannot finish is worse than a shorter one.
 """
+# The owner's decision design principles (2026-11-12): the planner judges and plans by them too (one file, the
+# source of truth for every v2 task's prompt; agents/v2_sdk_tasks.py PRINCIPLES_FILE).
+FIX_PLANNER_PROMPT += "\n" + open(os.path.join(REPO, ".claude", "orchestration",
+                                                 "decision_design_principles.md")).read().strip() + "\n"
 
 
 # ------------------------------------------------------------------ packet and plan
