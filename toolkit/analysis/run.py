@@ -1742,8 +1742,15 @@ def _self_test_anchor_e2e(ok, d, q):
           for k, v in ((0, 2000.0), (1, 1500.0), (2, 1000.0))],
         "ND,*,,dalys,count,,1,10000,5000,20000,estimated,synthetic ND,ratio,,,REF-ND,,anchor,,"]) + "\n")
     try:
-        _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2],
-                                                               window_metrics={"cases": "prev", "dalys": "prev"}))
+        def mut(r):         # review r1 P1-2, P2-3: a burden-driven cost output, the external estimates' uncertainty
+            r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev", "dalys": "prev"},
+                                             cost_scaling={"q": "cases"})
+            r["analysis"]["cost_outputs"] = {"q": {"cost_driver": "a_doses"}}
+            r["options"]["cost_items"].append({"id": "ca_q", "component": "a", "value": 1.0, "price_year": "2024",
+                                               "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                               "includes": ["per_case"]})
+            r["uncertainty"]["sources"].append({"kind": "burden_anchor"})
+        _resign(d, mut)
         R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
         ba = yaml.safe_load(open(os.path.join(d, "analysis", "burden_anchor.yaml")))["data"]
     except Exception as e:  # noqa: BLE001
@@ -1782,6 +1789,38 @@ def _self_test_anchor_e2e(ok, d, q):
     res = open(os.path.join(d, "results.md")).read()
     ok(not [x for x in fs if x["kind"].startswith("burden_anchor")] and "anchored to external estimates" in res
        and "[CLAIM:" not in res, f"BA6 the gate accepts the anchor artifact and results.md reports it: {fs}")
+    # review r1 P1-2: the cost matrix reads the scaled cost output (item ca_q, 1 $ per q, on packages with a)
+    cst, raw_c = anchored[2], _c
+    ok(all(tol(cst[i][k] - raw_c[i][k], (raw_out[i]["cost"][k]["q"] * (f[i][0] - 1.0)) if "a" in A.pk[k] else 0.0)
+           for i in A.ids for k in A.pk) and ba.get("cost_scaling") == {"q": "cases"},
+       "BA8 (review r1 P1-2) a cost output in cost_scaling enters the real cost matrix at its outcome's factor")
+    # review r1 P1-1, P2-3: in a draw the level is the draw's external value, against that draw's own model value
+    from toolkit.analysis import uncertainty as U
+    D = U.Drawer(A, 7)
+    D.prepare(2)
+    th, zs, noise, mult, smp = D.draw()
+    D2 = U.Drawer(A, 7)
+    D2.prepare(2)
+    smp2 = D2.draw()[4]
+    o_d = A.evaluate(th, zs, noise=noise, cost_mult=mult, sampled=smp)[0]
+    ud = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    lvl = sum(o_d[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == "r0")
+    ok("anchor:N0" in smp and smp["anchor:N0"] != 2000.0 and smp == smp2 and tol(lvl, smp["anchor:N0"])
+       and "burden_anchor" in ud.get("covers", []) and {"kind": "burden_anchor", "status": "drawn"} in [
+           {k: x.get(k) for k in ("kind", "status")} for x in ud["draw_plan"]["sources"]],
+       f"BA9 (review r1 P2-3) a draw samples each anchor's external value from its own seeded stream; the draw's "
+       f"window burden is that value ({lvl:.6g} vs {smp.get('anchor:N0')}); the interval covers burden_anchor")
+    # review r1 P2-9: a rebuild restores the anchor, so its benefits are the published ones
+    from toolkit.analysis import figure_data as FD
+    try:
+        Ar, plan_r, _o, ben_r, *_ = FD.rebuild(d, log=q)
+        pu = R["point"]["per_unit"]
+        ok(Ar.anchor is not None and plan_r == R["point"]["plan"]
+           and all(tol(ben_r[i][plan_r[i]], pu[i]["benefit"]) for i in A.ids),
+           "BA14 (review r1 P2-9) figure_data.rebuild() restores the anchor from analysis/burden_anchor.yaml: its "
+           "benefits equal the published ones")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA14 (review r1 P2-9) rebuild() of an anchored run: {type(e).__name__}: {e}")
 
 
 def _self_test_floors_e2e(ok, d, q):

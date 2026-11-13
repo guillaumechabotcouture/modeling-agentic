@@ -148,16 +148,16 @@ class Analysis:
         return self.lik
 
     # ------------------------------------------------------------ outcomes, benefits, costs
-    def evaluate(self, theta, zs, ids=None, noise=None, cost_mult=None):
+    def evaluate(self, theta, zs, ids=None, noise=None, cost_mult=None, sampled=None):
         """(outcomes, benefit, cost) for the units. benefit[u][p] = (comparator - package) x discount factor
         on the primary outcome; cost from toolkit/alloc (per-outcome items from the model's cost outputs),
         with optional per-cost-item multipliers."""
         ids = ids or self.ids
         out = self.model.predict(zs, theta, ids, noise=noise)
         self.last_events = list(getattr(self.model, "last_events", []) or [])
-        if self.anchor is not None:      # F6 S2-5d: in a draw (noise given) each anchor's factor is drawn too
+        if self.anchor is not None:      # F6 S2-5d: external level / this evaluation's own model value
             from toolkit.analysis import burden as BU
-            BU.apply_anchor(self.anchor, out, ids, noise)
+            BU.apply_anchor(self.anchor, out, ids, param=lambda x: BU.param_at(self, theta, x), sampled=sampled)
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]

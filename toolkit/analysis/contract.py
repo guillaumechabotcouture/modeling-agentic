@@ -175,7 +175,7 @@ def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]
         out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
                       "independent of the calibration inputs", "burden"))
     return (out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
-            + BV.anchor_findings(raw, anchor, None if bad else refs))       # F6 S2-5d
+            + BV.anchor_findings(raw, anchor, None if bad else refs, sp))       # F6 S2-5d
 
 
 def _boundary(run_dir: str, data, point) -> list[dict]:
