@@ -1,0 +1,196 @@
+# World model v0 (seed), written before any simulation. Built from the question, the engine card and the
+# literature; no spec values, engine effect values or data values were read.
+#
+# Decision: for each of 10 districts choose none, C_9to59m or D_9mto14y for a 2026 preventive campaign, under a
+# US$1.2M budget; comparator is no campaign (no funded plan exists, so "none" is the reprogramming baseline).
+# Benefit per cost = baseline burden (expected final size of one importation) x relative reduction of the option,
+# set against cost (US$1.50 per targeted child + US$18,000 fixed; the fixed cost is the same for C and D and cancels
+# in the C vs D choice, but not in the choice of whether to campaign at all).
+#
+# Working arithmetic (rough, for orientation only):
+#   effective protection per targeted susceptible ~ reach 0.85 x protection 0.9 ~ 0.75.
+#   Population shares (young-population pyramid): 0-8 m ~3%, 9-59 m ~12%, 5-14 y ~25-28%.
+#   With mean susceptible 7-12% and R0 10-16, pre-campaign Reff = R0 x s is roughly 0.7-2: the districts sit around
+#   the epidemic threshold, so the decision is a threshold problem, not a proportional one.
+#   C removes ~3/4 of 9-59 m susceptibles; D also removes ~3/4 of 5-14 y susceptibles. Infants <9 m are untouched
+#   by both. Under homogeneous mixing only the count of remaining susceptibles matters, not their age.
+#   Once post-campaign Reff < 1 the expected final size collapses to a minor outbreak (~1/(1-Reff) cases), so the
+#   extra susceptibles D removes buy almost nothing there, while D costs ~US$0.4 more per head of population.
+#   At the run's shadow price (0.02 infections per US$) that is ~0.008 infections per person; D beats C only where
+#   C leaves Reff above ~1 and D brings it down (gain of order 0.01-0.05 infections per person).
+
+beliefs:
+  - id: B1
+    mechanism: >-
+      Under-five campaign removes about three quarters of the 9-59 month susceptibles, which in most districts are
+      the largest pool of susceptibles; with mean susceptibility 7-12% and R0 10-16 this pushes post-campaign Reff
+      near or below 1, so the expected final size of one importation falls steeply (threshold effect).
+    about: {package: C_9to59m}
+    direction: reduces
+    magnitude: {band: [0.6, 1.0], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press, 1991", location: "Ch. 5 (vaccination and herd immunity threshold 1 - 1/R0); exact page not checked"}
+      - {citation: "Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious disease. Bulletin of Mathematical Biology, 2006", location: "final size relation, main theorem; page not checked"}
+      - {citation: "Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infectious Diseases, 2017", location: "Results / summary of R0 estimates (12-18 commonly cited, wide range); table not checked"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B2
+    mechanism: >-
+      Wide-age campaign removes the same 9-59 month susceptibles plus about three quarters of the 5-14 year
+      immunity gap, so its relative reduction is at least that of C and usually pushes Reff clearly below 1.
+    about: {package: D_9mto14y}
+    direction: reduces
+    magnitude: {band: [0.8, 1.0], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press, 1991", location: "Ch. 5; page not checked"}
+      - {citation: "WHO. Measles vaccines: WHO position paper - April 2017. Weekly Epidemiological Record 92(17), 2017", location: "section on supplementary immunization activities and target age ranges; page not checked"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B3
+    mechanism: >-
+      The relative reduction of a fixed-age campaign shrinks as transmission intensity rises (higher mean
+      susceptibility or higher contact rate / R0): the same removal leaves a higher post-campaign Reff, and the
+      final size is far more sensitive above threshold than below it.
+    about: {package: C_9to59m, feature: mean_susceptible}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious disease. Bulletin of Mathematical Biology, 2006", location: "final size relation; page not checked"}
+      - {citation: "Ferrari MJ et al. The dynamics of measles in sub-Saharan Africa. Nature, 2008", location: "discussion of susceptible accumulation and outbreak size; figure not checked"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B4
+    mechanism: >-
+      Where the 5-14 year immunity gap is small (typically higher routine coverage districts), C already brings Reff
+      below 1, D adds little averted burden, and D's higher cost per head makes C the better option at the shadow
+      price.
+    about: {pair: [C_9to59m, D_9mto14y], feature: susc_5_14y}
+    direction: none
+    conditions: [{feature: susc_5_14y, range: [0.0375, 0.07]}]
+    source_type: literature
+    evidence:
+      - {citation: "Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press, 1991", location: "Ch. 5; page not checked"}
+    confidence: medium
+    decision_relevant: true
+
+  - id: B5
+    mechanism: >-
+      The C vs D choice flips along the older-child immunity gap: where 5-14 year susceptibility is large (low
+      historical coverage, no second dose) C leaves Reff above 1, and D's extra removal of older susceptibles averts
+      a major outbreak that outweighs its extra cost; the flip location also moves with R0 (contact rate).
+    about: {pair: [D_9mto14y, C_9to59m], feature: susc_5_14y}
+    direction: flips
+    conditions: [{feature: susc_5_14y, range: [0.08, 0.13]}]
+    source_type: literature
+    evidence:
+      - {citation: "Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review of published literature. Journal of Infectious Diseases, 2011", location: "Results on single-dose effectiveness at 9 months (~84%) leaving residual susceptibility in vaccinated cohorts; table not checked"}
+      - {citation: "WHO. Measles vaccines: WHO position paper - April 2017. Weekly Epidemiological Record 92(17), 2017", location: "SIA target age ranges chosen from the age profile of susceptibles; page not checked"}
+    confidence: low
+    decision_relevant: true
+
+  - id: B6
+    mechanism: >-
+      Higher contact rate (higher R0 on the calibration scale) lowers C's relative reduction, for the same
+      threshold reason as B3.
+    about: {package: C_9to59m, feature: "contact_rate (calibration scale)"}
+    direction: decreases
+    source_type: literature
+    evidence:
+      - {citation: "Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infectious Diseases, 2017", location: "summary of R0 range; table not checked"}
+    confidence: medium
+    decision_relevant: false
+
+  - id: B7
+    mechanism: >-
+      Infants under 9 months are not reachable by either option and are a floor of susceptibles shared by both;
+      under homogeneous mixing they matter only through their share of total susceptibles, and they weaken the
+      threshold effect in districts with high birth rates.
+    about: {component: C_9to59m}
+    direction: none
+    source_type: literature
+    evidence:
+      - {citation: "WHO. Measles vaccines: WHO position paper - April 2017. Weekly Epidemiological Record 92(17), 2017", location: "MCV1 at 9 months in high-transmission settings; page not checked"}
+    confidence: low
+    decision_relevant: false
+
+open_questions:
+  - id: Q1
+    question: >-
+      Where does the post-C Reff sit relative to 1 in each district across R0 10-16? This is what decides C vs D;
+      it depends on the joint distribution of susc_9_59m, susc_5_14y, the under-9-month share and the contact rate.
+    beliefs: [B1, B4, B5]
+    decision_relevant: true
+  - id: Q2
+    question: >-
+      Is the assumption of homogeneous mixing right? With age-assortative contacts (school-age children mixing
+      mostly with each other), the 5-14 year gap would matter more than its share of susceptibles, favouring D.
+    beliefs: [B5]
+    decision_relevant: true
+  - id: Q3
+    question: >-
+      Does the campaign protect "about 90% of the susceptible children it reaches" independently of prior vaccination
+      status, or are reached children correlated with those already vaccinated (missed-community effect)? Correlated
+      reach would lower both options' effect and raise the value of D in low-coverage districts.
+    beliefs: [B1, B2]
+    decision_relevant: true
+  - id: Q4
+    question: >-
+      Does the US$1.2M budget bind if every district gets D? If it does not bind the shadow price is moot and D would
+      be chosen wherever it averts any more infections; the stated shadow price (0.02 infections per US$) decides
+      the paired tests.
+    beliefs: [B4, B5]
+    decision_relevant: true
+  - id: Q5
+    question: >-
+      Where pre-campaign Reff is already below 1 (low R0 and low susceptibility), the expected burden is a minor
+      outbreak, and even C may not pay its US$18,000 fixed cost; is "none" then the best option in some districts?
+    beliefs: [B1, B3]
+    decision_relevant: true
+
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: >-
+      C_9to59m reduces expected infections by 60-100% relative to no campaign at most points; refuted if fewer than
+      25% of usable points fall in that band.
+    test: {kind: effect_band, package: C_9to59m, band: [0.6, 1.0], min_share: 0.75}
+  - id: H2
+    belief: B2
+    claim: >-
+      D_9mto14y reduces expected infections by 80-100% at most points; refuted if fewer than 25% of usable points
+      fall in that band.
+    test: {kind: effect_band, package: D_9mto14y, band: [0.8, 1.0], min_share: 0.75}
+  - id: H3
+    belief: B3
+    claim: >-
+      C's relative reduction falls as district mean susceptibility rises (threshold effect); refuted if the Spearman
+      interval lies above 0.
+    test: {kind: effect_direction, package: C_9to59m, feature: mean_susceptible, direction: decreases}
+  - id: H4
+    belief: B6
+    claim: >-
+      C's relative reduction falls as the contact rate (R0) rises; refuted if the Spearman interval lies above 0.
+    test: {kind: effect_direction, package: C_9to59m, feature: "contact_rate (calibration scale)", direction: decreases}
+  - id: H5
+    belief: B4
+    claim: >-
+      Where the 5-14 year susceptible share is below 7%, C has the higher net benefit than D at the shadow price at
+      70% or more of usable points; refuted if D wins at 70% or more.
+    test: {kind: paired_sign, a: C_9to59m, b: D_9mto14y, feature: susc_5_14y, range: [0.0375, 0.07], sign: positive, min_share: 0.7}
+  - id: H6
+    belief: B5
+    claim: >-
+      Where the 5-14 year susceptible share is above 11%, D has the higher net benefit than C at the shadow price at
+      60% or more of usable points; refuted if C wins at 60% or more.
+    test: {kind: paired_sign, a: D_9mto14y, b: C_9to59m, feature: susc_5_14y, range: [0.11, 0.1476], sign: positive, min_share: 0.6}
+  - id: H7
+    belief: B5
+    claim: >-
+      The C to D transition along the 5-14 year susceptible share lies within 8-13%; refuted if the located
+      transition is wholly outside that range.
+    test: {kind: flip_in, a: D_9mto14y, b: C_9to59m, feature: susc_5_14y, range: [0.08, 0.13]}
