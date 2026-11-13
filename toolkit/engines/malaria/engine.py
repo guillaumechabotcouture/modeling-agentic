@@ -124,6 +124,13 @@ v0.16 (owner, 2026-11-10): outputs byte-identical to v0.15 (benchmarks/restamp_p
 judges, the lifetime human bites per mosquito under dual-AI nets at 70% use: after the v0.15 refit (cfp_kill 0.485)
 the published model's approximation gives 1.206 times the exact per-attempt chain there, above BR3's 20%, so dual-AI's
 effect at high use is somewhat understated (ENGINE_NOTES.md, v0.16). The other cases stay judged at 20%.
+
+v0.17 (F6 net-effect ranges): the net-type relative effects become engine parameters (vector.NET_DEFAULTS):
+net_kill_shift on Churcher's hut-mortality intercept (every net type), pbo_gain_scale on PBO's bioassay gain and
+pbo_adv_decay, the fading of a PBO net's advantage over a pyrethroid net. Their defaults give the v0.16 net outcomes
+bit for bit (vector.py V31); the identity fields of the evidence change, so the evidence is re-stamped after
+benchmarks/restamp_proof.py proves the outputs identical. Self-tests V31-V35 (vector.py) and NE0-NE3 (selftest_late.py).
+The trial fit that sets their ranges is designed in ENGINE_NOTES.md, v0.17, and benchmarks/net_effect_fit.py.
 """
 from __future__ import annotations
 
@@ -152,7 +159,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.16"
+VERSION = "0.17"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -177,6 +184,16 @@ BV = "Bertozzi-Villa et al. 2021 Nat Commun 10.1038/s41467-021-23707-7 (PMC81960
 _PARAMS = [
     ("cfp_kill", 0.36, "fitted", "probability", 0.0, 0.85, "fitted: B10, B11", "unverified"),
     ("cfp_half", 2.5 * 365., "fixed", "days", None, None, A8, "unverified"),
+    # v0.17 (ENGINE_NOTES.md, v0.17): the net-type relative effects; the defaults reproduce v0.16 (vector.py V31)
+    ("net_kill_shift", 0.0, "fixed", "logit", None, None, "shift on the hut-mortality intercept alpha1 of " +
+     V.CHURCHER_SOURCE + ", Equation 2, for every net type; Results: alpha1 = 0.634 (95% CrI 0.012-1.29); the engine "
+     "uses Table 6's 0.63", "matched"),
+    ("pbo_gain_scale", 1.0, "fixed", "multiplier", None, None, "scale on PBO's gain in bioassay-mortality logit, "
+     "logit f_s = logit x + s (logit f - logit x), f from " + V.CHURCHER_SOURCE + ", Equation 4; 1 = Equation 4, "
+     "0 = no PBO gain; range to be set by the trial fit (B9, B9b, B9c)", "unverified"),
+    ("pbo_adv_decay", 0.0, "fixed", "per year", None, None, "decay rate of a PBO net's advantage over a same-age "
+     "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; range to be set by the "
+     "trial fit (B9 at 9 m, B9b at 21 m, B9c at 24 m)", "unverified"),
     ("irs_kill", 0.5, "fitted", "probability", 0.0, 0.95, "fitted: B12, B12b, B12m", "unverified"),
     ("irs_rep", 0.10, "fixed", "probability", None, None, A8, "unverified"),
     ("irs_half", 0.4 * 365., "fixed", "days", None, None, A8 + " (decay of the generic short-lived product only)", "unverified"),
@@ -827,6 +844,7 @@ class MalariaEngine:
                              f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
                              "so the population would not grow: shorten the burn-in or move the horizon")
         M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
+        V.net_check(P)                               # v0.17: and the net-effect parameters
         M.cm_check(P)                                # v0.12: and the case-management options
         n = int(P["n_agents"])
         n0 = n if B == 0 else max(int(round(n * np.exp(-POP_GROWTH * B))), 50)
@@ -3246,7 +3264,7 @@ def _self_test_v017(ok, e, unit) -> None:
         pr = card["priors"].get("net_kill_shift")
         ok(not card["problems"] and pr is not None and (pr.lo, pr.hi) == (-0.618, 0.66) and "0.012" in pr.source
            and all("trial fit" in card["fixed"].get(k, "") for k in ("pbo_gain_scale", "pbo_adv_decay"))
-           and "hut_trial_coefficients" not in card["not_exposed"],
+           and "net_kill_shift" in card["not_exposed"].get("hut_trial_coefficients", ""),
            "NE2 priors.yaml: the kill shift is drawn over Churcher 2016's 95% CrI of alpha1 (0.012-1.29, centred on the "
            "engine's 0.63); the PBO gain scale and advantage decay are held until the trial fit sets their ranges "
            f"(problems {card['problems'][:2]})")

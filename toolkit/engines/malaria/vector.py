@@ -35,6 +35,12 @@ pyrethroid bioassay mortality x (1 = susceptible), tau = 0.5:
                         with j' = m j + 1 - m, l' = m l
   decay                 logit(gamma_wash) = -2.36 - 3.05 (l - tau);  H_y = H_w / H_w(l=1) x 2.64 y
                         r(t) = (r0 - r_M) exp(-gamma t) + r_M, r_M = 0.24;  d(t) = d0 exp(-gamma t)
+v0.17 net-effect parameters (NET_DEFAULTS; the defaults reproduce the lines above bit for bit, self-test V31):
+  net_kill_shift  delta:  logit(l) = 0.63 + delta + 4.00 (x - tau), every net type (Results: alpha1 0.634, 95% CrI
+                  0.012-1.29); m, k, j, the per-attempt outcomes and gamma_wash then follow from l as above
+  pbo_gain_scale  s:      logit(f_s) = logit(x) + s (logit(f) - logit(x)); s = 1 is Equation 4, s = 0 no PBO gain
+  pbo_adv_decay   lambda: a PBO net of age t gives r_p(t) + exp(-lambda t)(r_b(t) - r_p(t)) (and d, insecticide
+                  content alike), r_p a pyrethroid net of the same age; lambda = 0 keeps Churcher's PBO net
 Note: Table 6 gives the funestus PBO row as two coefficients (2.53, 0.89); the linear form
 used for it is our reading of the table (flagged unverified in the engine card).
 
@@ -96,6 +102,11 @@ CHURCHER = dict(tau=0.5, a1=0.63, a2=4.00, d1=0.071, d2=1.26, d3=1.52, th1=0.02,
                 mu=-2.36, rho=-3.05, k0=0.70, Hys=2.64, rM=0.24,
                 pbo={"gambiae": (3.41, 5.88, 0.78), "funestus": (2.53, 0.89, 0.0)})
 CHURCHER_SOURCE = "Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5025277)"
+# v0.17 (ENGINE_NOTES.md, v0.17): the net-type relative effects as engine parameters. Defaults reproduce v0.16:
+#   net_kill_shift  added to alpha1 (hut-mortality logit, Equation 2) for every net type
+#   pbo_gain_scale  multiplies PBO's gain in bioassay-mortality logit (Equation 4)
+#   pbo_adv_decay   per year: a PBO net's outcomes move toward a same-age pyrethroid net's, weight exp(-decay t)
+NET_DEFAULTS = {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0}
 
 # Briet et al. 2020 Malar J, Additional file 2 Table S9 (PermaNet 2.0): (b0, b1 holes, b2 insecticide, b3 interaction).
 BRIET = {
@@ -218,21 +229,39 @@ def resistance_of(resistance, species: str) -> float:
     return float(resistance)
 
 
-def pbo_bioassay(x, complex_: str = "gambiae"):
-    """Churcher 2016 Equation 4 (MathML in PMC5025277): logit(f) = b1 + b2 (x - tau) / (1 + b3 (x - tau))."""
+def net_check(P) -> None:
+    """v0.17: the net-effect parameters' domain (fail closed): a finite kill shift, a PBO gain scale and a PBO
+    advantage decay that are finite and >= 0."""
+    v = {k: P.get(k, d) for k, d in NET_DEFAULTS.items()}
+    if not all(isinstance(x, (int, float)) and np.isfinite(x) for x in v.values()):
+        raise ValueError(f"net-effect parameters must be finite numbers: {v}")
+    if v["pbo_gain_scale"] < 0 or v["pbo_adv_decay"] < 0:
+        raise ValueError(f"pbo_gain_scale and pbo_adv_decay must be >= 0: {v}")
+
+
+def pbo_bioassay(x, complex_: str = "gambiae", gain_scale: float = 1.0):
+    """Churcher 2016 Equation 4 (MathML in PMC5025277): logit(f) = b1 + b2 (x - tau) / (1 + b3 (x - tau)).
+    v0.17: gain_scale s scales PBO's gain in bioassay-mortality logit, logit f_s = logit x + s (logit f - logit x)
+    (s = 1: Equation 4 exactly, the same code path; s = 0: no PBO gain)."""
     C = CHURCHER
     b1, b2, b3 = C["pbo"][complex_]
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
-    return _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+    f = _expit(b1 + b2 * (x - C["tau"]) / (1 + b3 * (x - C["tau"])))
+    if gain_scale == 1.0:
+        return f
+    lx = _logit(x)
+    return _expit(lx + float(gain_scale) * (_logit(f) - lx))
 
 
-def hut_new_net(x, pbo: bool, complex_: str = "gambiae"):
-    """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day)."""
+def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0):
+    """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day). v0.17: kill_shift is added to
+    the hut-mortality intercept alpha1 (Equation 2), so killing, deterrence, feeding and the insecticide decay all
+    follow Churcher's own relationships from the shifted hut mortality; pbo_gain_scale as in pbo_bioassay."""
     C = CHURCHER
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
     if pbo:
-        x = pbo_bioassay(x, complex_)
-    l = _expit(C["a1"] + C["a2"] * (x - C["tau"]))
+        x = pbo_bioassay(x, complex_, pbo_gain_scale)
+    l = _expit(C["a1"] + kill_shift + C["a2"] * (x - C["tau"]))
     m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
     k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
     j = np.clip(1 - l - k, 0.0, 1.0)
@@ -252,14 +281,20 @@ def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae", holes: bool = T
     holes=False)."""
     net_type = np.asarray(net_type)
     age_d = np.maximum(np.asarray(age_d, float), 0.0)
+    shift, scale, lam = (float(P.get(k, d)) for k, d in NET_DEFAULTS.items())
     out = []
     for pbo in (False, True):
-        r0, d0, _, gam = hut_new_net(x, pbo, complex_)
+        r0, d0, _, gam = hut_new_net(x, pbo, complex_, shift, scale)
         dec = np.exp(-gam * age_d)
         r = (r0 - CHURCHER["rM"]) * dec + CHURCHER["rM"]
         d = d0 * dec
         out.append((r, d, dec))
     (r_p, d_p, dec_p), (r_b, d_b, dec_b) = out
+    if lam > 0:
+        # v0.17: the PBO net's advantage over a same-age pyrethroid net fades at pbo_adv_decay per year (PBO lost from
+        # the net); decay 0 is v0.16's code path
+        w = np.exp(-lam * age_d / 365.0)
+        r_b, d_b, dec_b = r_p + w * (r_b - r_p), d_p + w * (d_b - d_p), dec_p + w * (dec_b - dec_p)
     is_pbo = net_type == 1
     r = np.where(is_pbo, r_b, r_p)
     d = np.where(is_pbo, d_b, d_p)

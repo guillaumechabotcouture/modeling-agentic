@@ -1,6 +1,6 @@
 # Engine-card priors of the malaria engine (toolkit/spec/priors.py). Card metadata only: this file is not
-# engine code (the code fingerprint covers *.py), and the parameter values, kinds and ranges in engine.py
-# are unchanged, so the benchmark pack needs no re-stamp. Every `fixed` engine parameter is listed below as
+# engine code (the code fingerprint covers *.py), so editing it alone needs no benchmark re-stamp. (v0.17 added three
+# engine parameters in engine code; their entries below came with that change.) Every `fixed` engine parameter is listed below as
 # a prior, as fixed with the reason, or as a setting. Sources: the engine's parameter table, ENGINE_NOTES.md
 # and the attempt 8 parameter registry (citations.md C25, C48, C49, C50; registry_build.py).
 # Triangular priors take the engine's point value as their mode.
@@ -75,6 +75,20 @@ priors:
       Results: a liver-stage protection half-life of 24-30 days behaves like SP+AQ"
     verified: matched
     note: "two model fits to the same trial (Zongo 2015, clinical malaria); the point value is the upper end"
+  # v0.17 (ENGINE_NOTES.md, v0.17): the kill shift's range is Churcher 2016's posterior for alpha1, re-centred on the
+  # engine's Table 6 value 0.63 (0.012 - 0.63 = -0.618; 1.29 - 0.63 = 0.66). It replaces nothing: until v0.17 the
+  # coefficient was a module constant and never drawn. The trial fit (ENGINE_NOTES.md, v0.17) is to replace this
+  # hut-trial range with the range the randomised trials allow.
+  net_kill_shift:
+    dist: triangular
+    range: [-0.618, 0.66]
+    source: "Churcher et al. 2016 eLife 10.7554/eLife.16090 (PMC5025277), Results (standard LLIN hut mortality vs
+      discriminating-dose bioassay mortality, Equation 2): alpha1 = 0.634 (95% CrI 0.012-1.29), alpha2 = 3.99
+      (3.171-5.12); Table 6 gives alpha1 0.63"
+    verified: matched
+    note: "a 95% credible interval of the hut-trial meta-analysis fit, for the intercept only; alpha2 (the resistance
+      slope) stays at 4.00. It shifts every net type alike, so it moves pyrethroid nets against no nets far more than
+      one net type against another"
   dw_moderate:
     dist: triangular
     range: [0.032, 0.074]
@@ -101,6 +115,11 @@ fixed:
     identifiability and fits only the curve's end point (tau ~ Unif(5.5, 20.7) y); the paper gives no range for k.
     Briet et al. 2012 Malar J 11:20 (PMC3273435) used k = 18 for the same function. The median retention, which the
     paper estimates, carries the uncertainty (net_retention_half)"
+  pbo_gain_scale: "v0.17: no published range; held at 1 (Churcher 2016 Equation 4) until the trial fit (B9, B9b, B9c;
+    ENGINE_NOTES.md, v0.17) sets it. A run whose decision turns on PBO vs pyrethroid nets declares this departure"
+  pbo_adv_decay: "v0.17: no published range; held at 0 (no fading beyond Churcher's decay) until the trial fit (B9 at
+    9 m, B9b at 21 m, B9c at 24 m; ENGINE_NOTES.md, v0.17) sets it. B9b and B9c disagree on durability, so the fit
+    reports each trial's region and their union"
   cfp_half: "attempt 8's range (1.5-3.5 y, registry cfp_half_life_years) is a modeller reading of Mosha 2022/2024
     durability, not a published half-life estimate"
   irs_rep: "no published range on the card or in the attempt 8 registry"
@@ -133,8 +152,9 @@ fixed:
 settings: [n_agents, net_holes, burnin_years, init_eir_per_m0]   # v0.5: numerical settings of the start
   # (burn-in length and its starting guess; benchmarks/equilibration.yaml shows the results do not depend on them)
 not_exposed:
-  hut_trial_coefficients: "Churcher et al. 2016 Table 6 coefficients are module constants (vector.CHURCHER), not engine
-    parameters; drawing them needs an engine change (code fingerprint, benchmark re-stamp)"
+  hut_trial_coefficients: "Churcher et al. 2016 Table 6 coefficients are module constants (vector.CHURCHER). v0.17
+    exposes three summaries of them as engine parameters (net_kill_shift, pbo_gain_scale, pbo_adv_decay) instead of
+    drawing the 20 coefficients one by one, which would ignore their correlation in the paper's joint fit"
   smc_clearance: "v0.11: every child reached is cleared of blood-stage infection at dosing (model.SMCDelivery), as in
     Burgert 2022's model; no source in hand gives a lower probability, so it is not a parameter"
   species_bionomics: "Q0, phi_I, phi_B, mu0 per species are module constants (vector.SPECIES), not engine parameters"
