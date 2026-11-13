@@ -17,9 +17,14 @@ What the Nigeria F-series runs and the 12 Nov canary showed:
   surveys 3%), northern pyrethroid resistance (model bioassay mortality about 0.73, field about 0.13),
   2023 net prices, and absolute burden from the engine. We found them after paid runs, through
   critics and manual checks. No step required them to be checked first.
-- **The engine failed its most basic trial benchmark and was still used.** Pyrethroid nets against
-  no nets: prevalence ratio 0.50 against the Cochrane estimate 0.83 (B7), incidence 0.41 against
-  0.55 (B8).
+- **The engine fails a basic trial benchmark and was still eligible.** Pyrethroid nets against no
+  nets, clinical incidence (B8): engine 0.665 against a band of 0.48–0.64 from the Cochrane review,
+  too little effect, while prevalence (B7, 0.759) is in band (engine v0.16 record,
+  `toolkit/engines/malaria/benchmarks/results.yaml`). The trials cut incidence far more than
+  prevalence; the engine does not reproduce that ratio. (Correction, 13 Nov 2026: this paragraph
+  first quoted B7 0.50 and B8 0.41, read from benchmark rows in the malaria card that had not been
+  regenerated since v0.14. A card's benchmark rows can go stale; eligibility must read the record
+  bound to the engine identity, never the card's copy.)
 - **The "large" simulation is many independent single-node simulations.** The malaria engine models
   each unit as one node with a fixed importation rate; there is no coupling between units. The
   emulator design copies one real unit's features per point (`toolkit/analysis/batch.py`
@@ -230,10 +235,11 @@ P6 (the full preview) becomes steps 2 and 3. Order:
 2. The evidence dossier for F6: species and resistance (done, local), burden, prices, trial
    effects, SMC and case-management inputs. The owner signs it with the amended spec, and step 0
    is re-run on the signed inputs as the reference.
-3. Step 1: the net-effect ranges fitted to the pack's training targets; B7 and B8 (held out)
-   then checked as validation. If they still fail, the cause is investigated as a mechanism or
-   setup error with its own evidence, or the owner signs a departure (PR `f6-net-effect-ranges`;
-   spend of $20 or more goes to the owner first).
+3. Step 1: the net-effect ranges fitted to the pack's training targets (PR #213); B8 (held out,
+   out of band) then checked as validation, with B7 and the PBO trials. If B8 still fails, the
+   cause is investigated as a mechanism or setup error with its own evidence (PR #213 found it
+   likely structural: one simulated setting for trials from very different settings, and the age
+   gradient), or the owner signs a departure. Spend of $20 or more goes to the owner first.
 4. Steps 2 and 3 on the cloud, with the feature-box design once built; until then, the current
    design with the widened ranges.
 
