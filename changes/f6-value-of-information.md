@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "VOI α-γ"
+---
+
+## Changelog
+
+**Value of information from the uncertainty draws (owner, 2026-11-12).** The analysis step now says which uncertain input is worth better data, from the draws it already evaluates (no new engine runs). A read-only `on_solve` hook in `UQ.run` hands each draw's sampled inputs, benefit and cost tables and re-optimised plan to `toolkit/analysis/value_of_information.py`, which writes `analysis/value_of_information.yaml` (new artifact kind). Candidates: the headline plan, the declared plan variants, the plan maximising the expected objective (one solve on the mean tables) and each draw's optimum. A candidate over the allocatable budget in a draw is infeasible there and may be chosen now only within the spec's affordability share (0 without a rule); ineligible plans are listed, never counted. EVPI is paired by draw (standard error and bootstrap interval); EVPPI per drawn input and per group (calibration shifts, cost multipliers, spec `analysis.value_of_information.groups`) by the regression method of Strong, Oakley & Brennan 2014, with a natural cubic spline chosen by GCV, a bootstrap interval and a permutation noise floor. Below 30 draws the step does not run; below 500 it is labelled indicative (thresholds.yaml `value_of_information`, proposals for the owner). Inputs not drawn are listed with why. Claims, a results.md section and a contract check (`analysis_contract_value_of_information`, fail closed); on by default, `enabled: false` turns it off with the uncertainty outputs unchanged. Self-tests VI1-13, VG1-7 and VR1-6, written first, failed before the change (the module was a stub; VR1-3 and VR5 failed end to end).
