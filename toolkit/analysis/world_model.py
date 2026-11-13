@@ -615,7 +615,7 @@ def _cli(argv):
         validate_seed(seed)
         print(f"OK: {len(seed['beliefs'])} beliefs, {len(seed.get('hypotheses') or [])} hypotheses")
         return 0
-    from toolkit.analysis.artifacts import sha256
+    from toolkit.analysis.artifacts import _safe_io, sha256
     sw, spec = load_sweep(a.run_dir)
     plan, units = load_plan(a.run_dir, spec, sw)
     inputs = dict({k: v for k, v in sw.artifacts.items() if k != "results"}, seed=sha256(a.seed))
@@ -624,9 +624,9 @@ def _cli(argv):
     wm, hy = build(seed, sw, plan, units, inputs)
     out = a.out or os.path.join(a.run_dir, "analysis")
     os.makedirs(out, exist_ok=True)
-    for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):
-        with open(os.path.join(out, name), "w") as f:
-            yaml.safe_dump(json.loads(json.dumps(doc)), f, sort_keys=False, width=110)
+    for name, doc in (("world_model.yaml", wm), ("hypotheses.yaml", hy)):      # no-follow, atomic (lib.safe_io)
+        _safe_io().write_nofollow(out, name, yaml.safe_dump(json.loads(json.dumps(doc)), sort_keys=False,
+                                                           width=110).encode(), atomic=True)
     st = {}
     for h in hy["hypotheses"]:
         st[h["status"]] = st.get(h["status"], 0) + 1
