@@ -139,7 +139,36 @@ def independent_features(spec) -> tuple[list, dict]:
                          "(the synthetic table's generator)")
     with open(path, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()
-    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha}
+    # A generator that draws columns independently can still realize a correlated table on a few units (a world-model
+    # trial's 24 units gave rank correlation 0.82 between two separately drawn columns): the declaration holds only
+    # when the realized table's declared features are also uncorrelated (|Spearman| <= INDEPENDENCE_RHO_MAX pairwise).
+    rho = realized_rank_correlations(spec, list(dec["features"]))
+    big = {k: v for k, v in rho.items() if abs(v) > INDEPENDENCE_RHO_MAX}
+    if big:
+        raise ValueError(f"analysis.emulator.independent_features: the realized units table correlates declared features "
+                         f"{ {k: round(v, 3) for k, v in big.items()} } (|Spearman| > {INDEPENDENCE_RHO_MAX}): draw a "
+                         "table whose declared columns are uncorrelated, or do not declare them independent")
+    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha,
+                                   "realized_max_abs_spearman": max((abs(v) for v in rho.values()), default=0.0)}
+
+
+INDEPENDENCE_RHO_MAX = 0.3
+
+
+def realized_rank_correlations(spec, features) -> dict:
+    """{"a|b": Spearman rho} between each pair of declared features over the units table (as features.vector reads
+    them)."""
+    from scipy.stats import spearmanr
+    from toolkit.analysis import features as FT
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    rows = [FT.vector(spec, u) for u in spec.units()]
+    col = {f: [r[names.index(f)] for r in rows] for f in features}
+    out = {}
+    for i, a in enumerate(features):
+        for b in features[i + 1:]:
+            if len(set(col[a])) > 1 and len(set(col[b])) > 1:
+                out[f"{a}|{b}"] = float(spearmanr(col[a], col[b])[0])
+    return out
 
 
 def design(spec) -> tuple[dict, list[dict]]:
