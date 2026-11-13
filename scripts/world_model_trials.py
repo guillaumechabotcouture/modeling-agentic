@@ -2846,6 +2846,18 @@ def _self_test() -> int:
                 ok(True, "WT25c a carry_from question without a belief table is refused")
     tryit("WT25 learning chain", wt25)
 
+    def wt25d():
+        # chain step 2's first VM job failed: engine_only prepared the question with its carry_from, and the VM holds
+        # no earlier belief table. The engine step needs the design only.
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            _toy_template(os.path.join(repo, "data", "tpl", "toy0"))
+            q = {"id": "toyc", "question": "Which package per unit?", "engine": toy_ref, "template": "data/tpl/toy0",
+                 "inputs": "synthetic", "carry_from": ["not_on_this_machine"]}
+            out = engine_only([q], os.path.join(d, "vm"), root=repo)
+            ok(out["toyc"]["ok"], f"WT25d the VM's engine step ignores carry_from (it needs the design only): {out}")
+    tryit("WT25d engine-only with carry_from", wt25d)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
