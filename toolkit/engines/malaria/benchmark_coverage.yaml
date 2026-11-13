@@ -1,0 +1,51 @@
+# Which package components each benchmark of the malaria-starsim pack covers (owner decision 2026-11-12;
+# toolkit/engines/benchmark_coverage.py). Read from each benchmark's metric, source and arms (benchmarks/pack.yaml).
+# A covering benchmark that is not in_band in the verified record makes the engine ineligible for a spec using the
+# component, unless the signed spec declares a departure for it.
+engine: malaria-starsim
+absent_values: {net: [none], smc: [0], irs: [0], cm: [0]}
+components_without_benchmark:
+  cm: >-
+    no benchmark in the pack compares case management with its absence or another level (no arm sets cm); its
+    effect is not judged against a trial
+benchmarks:
+  B7:
+    covers: {net: [pyr, pbo, dual]}
+    estimand: effect_vs_none
+    note: >-
+      Pyrethroid nets vs no nets, prevalence (Pryce 2018 Cochrane). PBO and dual-AI nets are benchmarked only
+      against pyrethroid nets (B9-B11), so their effect against no nets carries this one.
+  B8:
+    covers: {net: [pyr, pbo, dual]}
+    estimand: effect_vs_none
+    note: Nets vs no nets, clinical incidence under 5 (Pryce 2018); carried by PBO and dual-AI nets as for B7.
+  B9: {covers: {net: [pbo]}, estimand: effect_vs_component, versus: {net: pyr},
+       note: "PBO vs pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
+  B9b: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
+        note: "PBO vs pyrethroid nets at 21 months (Protopopoff 2018)"}
+  B9c: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
+        note: "PBO vs pyrethroid nets at 24 months (Mosha 2022, Misungwi)"}
+  B10: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},
+        note: "Dual-AI vs pyrethroid nets, prevalence at 24 months (Mosha 2022)"}
+  B11: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},
+        note: "Dual-AI vs pyrethroid nets, incidence 0-24 months (Accrombessi 2023)"}
+  B12: {covers: {irs: [1]}, estimand: effect_vs_none,
+        note: "Non-pyrethroid IRS added to pyrethroid nets vs nets alone, prevalence (Pryce 2022 Cochrane)"}
+  B12b: {covers: {irs: [1]}, estimand: effect_vs_none,
+         note: "Non-pyrethroid IRS added to nets, incidence (Pryce 2022)"}
+  B12m: {covers: {irs: [1]}, estimand: effect_vs_none,
+         note: "Pirimiphos-methyl IRS added to pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
+  B13: {covers: {smc: [1]}, estimand: effect_vs_none,
+        note: "SMC vs none, in-season clinical incidence 3-59 months (Thwing 2024)"}
+  B15: {covers: {net: [pbo], irs: [1]}, match: all, estimand: interaction,
+        note: "PBO net x IRS interaction, 2x2 factorial (Protopopoff 2018)"}
+  B16c:
+    covers: {}
+    covers_none_because: >-
+      EIR-prevalence relation (Beier 1999): the engine's baseline transmission, not a component's effect; the
+      decision's baseline burden comes from external estimates (decision design principle 3)
+  B17: {covers: {smc: [1]}, estimand: cost_per_outcome, note: "SMC cost per DALY averted (Gilmartin 2021)"}
+  B18: {covers: {net: [pyr]}, estimand: cost_per_outcome, note: "Pyrethroid nets cost per DALY averted (Conteh 2021)"}
+  B19: {covers: {irs: [1]}, estimand: cost_per_outcome, note: "IRS cost per DALY averted (Conteh 2021)"}
+  B20: {covers: {net: [dual]}, estimand: cost_per_outcome, versus: {net: pyr},
+        note: "Dual-AI vs pyrethroid nets, incremental cost per DALY averted (Mosha 2022)"}

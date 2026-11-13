@@ -165,12 +165,52 @@ def candidate_entries(spec: dict, engines=None) -> list:
     return entries
 
 
-def eligible_engines(spec: dict, engines=None) -> list[dict]:
-    """[{ref, name, version, eligible, why_not, card}] for every registered engine (or every signed candidate)."""
+def _departures_status(spec: dict, departures: str) -> tuple[list, str]:
+    """(the departures that may count, their status). "proposed": the pre-sign check, the spec's own. Otherwise only
+    those of the run's spec as the owner signed it (signoff status "signed": the file is the signed bytes)."""
+    if departures == "proposed":
+        return list(spec.get("engine_departures") or []), "proposed"
+    rd = spec.get("_run_dir")
+    try:
+        import yaml
+        from toolkit.spec import signoff
+        if rd and signoff.status(rd) == "signed":
+            return list((yaml.safe_load(open(os.path.join(rd, SPEC_FILE))) or {}).get("engine_departures") or []), "signed"
+    except Exception:  # noqa: BLE001 -- unreadable sign-off: no departure counts (fail closed)
+        pass
+    return list(spec.get("engine_departures") or []), "unsigned"
+
+
+def benchmark_gate(ref: str, card, config: dict, needs: dict, spec: dict, departures: str = "signed",
+                   coverage_path: str | None = None) -> dict:
+    """Owner decision 2026-11-12: the benchmark precondition (toolkit/engines/benchmark_coverage.py). The record is the
+    engine's verified benchmark results for the version in use, never the card's copy of them."""
+    from toolkit.engines import benchmark_coverage as BC
+
+    def record():
+        try:
+            from toolkit.engines import benchmark as B
+            from toolkit.spec import schema
+            doc, why = B.verified_results(schema.engine_class(ref)(**(config or {})))
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            return [], f"{type(e).__name__}: {e}"
+        if why:
+            return [], why
+        if str((doc.get("engine_identity") or {}).get("version")) != str(card.version):
+            return [], f"the record is for engine version {doc['engine_identity'].get('version')}, the card is {card.version}"
+        return doc["benchmarks"], None
+    cov, probs = BC.load(coverage_path or BC.path_for(ref))
+    deps, status = _departures_status(spec, departures)
+    return BC.gate(cov, probs, card, needs.get("components") or {}, record, deps, status)
+
+
+def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> list[dict]:
+    """[{ref, name, version, eligible, why_not, card}] for every registered engine (or every signed candidate).
+    `departures`: "signed" (the engine choice) or "proposed" (the pre-sign check)."""
     needs = engine_needs(spec)
     rows = []
     for entry in candidate_entries(spec, engines):
-        ref, card_path, cfg_fn = (tuple(entry) + (None, None))[:3]
+        ref, card_path, cfg_fn, cov_path = (tuple(entry) + (None, None, None))[:4]
         try:
             config = cfg_fn(spec) if cfg_fn else {}
             card = _card(ref, card_path, config)
@@ -178,8 +218,12 @@ def eligible_engines(spec: dict, engines=None) -> list[dict]:
             rows.append({"ref": ref, "eligible": False, "why_not": [f"card unreadable: {type(e).__name__}: {e}"]})
             continue
         why = card_fits(card, needs)
+        bg = benchmark_gate(ref, card, config, needs, spec, departures, cov_path) if not why else {}
+        why += bg.get("why_not") or []
         rows.append({"ref": ref, "config": config, "name": card.name, "version": card.version, "eligible": not why,
-                     "why_not": why, "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or [])})
+                     "why_not": why, "mechanisms": list(card.mechanisms)[:8], "benchmarks": len(card.benchmarks or []),
+                     "departures": bg.get("departures") or [], "benchmark_record": bg.get("record"),
+                     "components_without_benchmark": bg.get("uncovered") or {}})
     return rows
 
 
@@ -295,7 +339,8 @@ def merged_spec(run_dir: str) -> dict:
 def engine_choice_record(ref: str, why: str, candidates: list, cross_check=None, config=None) -> dict:
     """engine_choice.json, the format agreed with workstream B: the harness writes it; a spec
     with `engine: auto` takes its engine from it."""
-    rec = {"engine": {"ref": ref, "config": config or {}}, "why": why, "candidates": candidates}
+    rec = {"engine": {"ref": ref, "config": config or {}}, "why": why, "candidates": candidates,
+           "engine_departures": next((r.get("departures") or [] for r in candidates or [] if r.get("ref") == ref), [])}
     if cross_check is not None:
         rec["cross_check"] = cross_check
     return rec
@@ -499,11 +544,11 @@ class _ToolkitApi:
             if derived is not None:
                 s.derived = derived
             if not s.engine_pending:
-                return list(schema.validate(s))
+                return list(schema.validate(s)) + self._named_gate(s)
             bad = list(schema.validate(s, pending_ok=True))
             # The candidates are checked even when an engine-independent section fails, so one try of the draft
             # task hears every problem (MAX_SPEC_TRIES is small).
-            rows = self.candidate_rows(s)
+            rows = self.candidate_rows(s, departures="proposed")
             self.candidates = rows
             if any(r.get("eligible") for r in rows):
                 return bad
@@ -517,7 +562,22 @@ class _ToolkitApi:
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
 
-    def candidate_rows(self, s, engines=None) -> list[dict]:
+    def _named_gate(self, s) -> list[str]:
+        """A spec that names its engine: the benchmark precondition for that engine before sign-off (its proposed
+        departures count; the engine choice after sign-off counts only signed ones)."""
+        e = s.raw.get("engine")
+        ref, cfg = (e.get("ref"), e.get("config") or {}) if isinstance(e, dict) else (e, {})
+        entry = next((x for x in ENGINES if x[0] == ref), (ref, None, None))
+        try:
+            config = entry[2](dict(s.raw, _run_dir=s.base)) if entry[2] else cfg
+            card = _card(ref, entry[1], config)
+        except Exception:  # noqa: BLE001 -- schema.validate reports an engine that does not load
+            return []
+        needs = (getattr(self.api, "engine_needs", None) or engine_needs)(s.raw)
+        bg = benchmark_gate(ref, card, config, needs, dict(s.raw, _run_dir=s.base), "proposed")
+        return [f"engine {ref}: {w}" for w in bg["why_not"]]
+
+    def candidate_rows(self, s, engines=None, departures: str = "signed") -> list[dict]:
         """eligible_engines on the card, then the spec's full validation with each card-eligible candidate."""
         import yaml
         from toolkit.spec import schema
@@ -526,7 +586,7 @@ class _ToolkitApi:
             signed = (yaml.safe_load(open(s.path)) or {}).get("engine", signed) if s.path else signed
         except (OSError, yaml.YAMLError):
             pass
-        rows = self._card_rows(dict(s.raw, engine=signed, _run_dir=s.base), engines)
+        rows = self._card_rows(dict(s.raw, engine=signed, _run_dir=s.base), engines, departures)
         for r in rows:
             if r.get("eligible"):
                 probs = schema.validate(schema.with_engine(s, r["ref"], r.get("config")))
@@ -565,12 +625,12 @@ class _ToolkitApi:
         except Exception as e:  # noqa: BLE001
             return [f"spec validation failed: {type(e).__name__}: {e}"]
 
-    def _card_rows(self, spec, engines=None):
+    def _card_rows(self, spec, engines=None, departures: str = "signed"):
         """The filter in B's vocabulary when B exposes engine_needs(spec); otherwise ours."""
         en = getattr(self.api, "engine_needs", None)
         if en is not None:
             spec = dict(spec, engine_needs=en(spec))
-        return eligible_engines(spec, engines)
+        return eligible_engines(spec, engines, departures)
 
     def eligible_engines(self, spec, engines=None):
         """The card filter, then (for a spec read by choice_spec, which knows its run directory) the full checks per

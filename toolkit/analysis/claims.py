@@ -377,6 +377,8 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -
             L.append(f"| {p} | {_fmt(v['estimate'])} | {_fmt(v['se'])} | {v['status']} |")
         L.append("")
     L += attribute_simplifications(A)
+    from toolkit.engines import benchmark_coverage as BC
+    L += BC.results_lines(A.spec.raw)                  # the signed engine departures, as declared limitations
     if emu_acc and not emu_acc.get("direct"):
         acc = {k: v for k, v in emu_acc.items() if k != "boundary_ranking"}
         L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in acc.items())}.", ""]

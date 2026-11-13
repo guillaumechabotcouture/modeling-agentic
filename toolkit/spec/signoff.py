@@ -393,6 +393,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
+    from toolkit.engines import benchmark_coverage as BC
+    out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

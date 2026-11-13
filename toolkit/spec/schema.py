@@ -561,6 +561,8 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
         spec.derived = derived
     try:
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
+        from toolkit.engines import benchmark_coverage as BC      # owner decision 2026-11-12: signed departures
+        pres = pres + BC.departure_problems(spec.raw)
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
