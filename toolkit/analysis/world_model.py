@@ -1472,7 +1472,7 @@ def _anch(ledger, at=None):
     return {"lines": ledger, "anchors": [_head(ledger, at or REGISTERED)]}
 
 
-def _bind(d):
+def _fixture_bind(d):
     """A completed analysis manifest listing the run's point.yaml with the current batch (design, results)."""
     import yaml
     from toolkit.analysis.artifacts import sha256
@@ -2028,7 +2028,7 @@ def _self_test() -> int:
                     "data": {"engine_identity": ident, "plan": {}}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(good, open(pth, "w"))
-            _bind(d)
+            _fixture_bind(d)
             ok(point_doc(d, ident)["data"]["plan"] == {}, "WM49 a point plan bound to this run is read")
             for mut, why in ((lambda g: g.update(spec_sha256="0" * 64), "another spec"),
                              (lambda g: g["data"].update(engine_identity={"name": "e", "version": "2"}),
@@ -2038,7 +2038,7 @@ def _self_test() -> int:
                 bad = json.loads(json.dumps(good))
                 mut(bad)
                 yaml.safe_dump(bad, open(pth, "w"))
-                _bind(d)
+                _fixture_bind(d)
                 try:
                     point_doc(d, ident)
                     ok(False, f"WM49b a stale point plan ({why}) is refused")
@@ -2206,7 +2206,7 @@ def _self_test() -> int:
                   "data": {"engine_identity": ident, "plan": {}}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(pt, open(pth, "w"))
-            _bind(d)
+            _fixture_bind(d)
             ok(point_doc(d, ident) is not None, "WM57 a plan whose inputs verify all the way down is used")
             put("units.csv", "id,region\n1,south\n")
             try:
@@ -2216,7 +2216,7 @@ def _self_test() -> int:
                 ok(True, "WM57b a plan whose calibration's units table changed is refused (transitive inputs)")
             for inp, why in (({}, "an empty inputs mapping"), (None, "no inputs mapping")):
                 yaml.safe_dump(dict(pt, inputs=inp), open(pth, "w"))
-                _bind(d)
+                _fixture_bind(d)
                 try:
                     point_doc(d, ident)
                     ok(False, f"WM57c a plan with {why} is refused")
@@ -2304,7 +2304,7 @@ def _self_test() -> int:
             base = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident}}
             pth = os.path.join(d, "analysis", "point.yaml")
             yaml.safe_dump(dict(base, inputs={"missing.csv": None}), open(pth, "w"))
-            _bind(d)
+            _fixture_bind(d)
             try:
                 point_doc(d, ident)
                 ok(False, "WM69 a missing input recorded with a null hash is refused")
@@ -2314,7 +2314,7 @@ def _self_test() -> int:
                            open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
             yaml.safe_dump(dict(base, inputs={"analysis/calibration.yaml": sha256(os.path.join(
                 d, "analysis", "calibration.yaml"))}), open(pth, "w"))
-            _bind(d)
+            _fixture_bind(d)
             try:
                 point_doc(d, ident)
                 ok(False, "WM69b a harness artifact (schema analysis.*) without inputs is refused, not a leaf")
@@ -2485,7 +2485,7 @@ def _self_test() -> int:
                 ok(False, "WM82 a point plan the run's completed analysis manifest does not list is refused")
             except WorldModelError:
                 ok(True, "WM82 a point plan the run's completed analysis manifest does not list is refused")
-            _bind(d)
+            _fixture_bind(d)
             ok(point_doc(d, ident) is not None, "WM82b a plan listed by the completed manifest with the current batch "
                                                 "is used")
             open(os.path.join(d, "analysis", "batch", "results.jsonl"), "w").write("{\"i\": 1}\n")
@@ -2494,7 +2494,7 @@ def _self_test() -> int:
                 ok(False, "WM82c a plan whose manifest names another batch (a rerun replaced the results) is refused")
             except WorldModelError:
                 ok(True, "WM82c a plan whose manifest names another batch (a rerun replaced the results) is refused")
-            _bind(d)
+            _fixture_bind(d)
             m = json.load(open(os.path.join(d, "analysis", "manifest.json")))
             json.dump(dict(m, complete=False), open(os.path.join(d, "analysis", "manifest.json"), "w"))
             try:
@@ -2515,13 +2515,13 @@ def _self_test() -> int:
             pt = {"spec_sha256": sha256(os.path.join(d, "decision_spec.yaml")), "data": {"engine_identity": ident},
                   "inputs": {"units.csv": sha256(os.path.join(d, "units.csv"))}}
             yaml.safe_dump(pt, open(os.path.join(d, "analysis", "point.yaml"), "w"))
-            _bind(d)
+            _fixture_bind(d)
             st = os.path.join(d, "analysis_settings.yaml")
             ok(point_doc(d, ident) is not None, "WM83 no settings recorded and none present: the plan is used")
             for step, why in ((lambda: open(st, "w").write("uncertainty: {draws: 8}\n"), "added"),
-                              (lambda: (_bind(d), open(st, "w").write("uncertainty: {draws: 9}\n")),
+                              (lambda: (_fixture_bind(d), open(st, "w").write("uncertainty: {draws: 9}\n")),
                                "changed"),
-                              (lambda: (open(st, "w").write("uncertainty: {draws: 8}\n"), _bind(d),
+                              (lambda: (open(st, "w").write("uncertainty: {draws: 8}\n"), _fixture_bind(d),
                                         os.remove(st)), "removed")):
                 step()
                 try:
@@ -2536,13 +2536,13 @@ def _self_test() -> int:
             pt2 = dict(pt, engine={"name": "e"}, inputs={"analysis/calibration.yaml": sha256(os.path.join(
                 d, "analysis", "calibration.yaml"))})
             yaml.safe_dump(pt2, open(os.path.join(d, "analysis", "point.yaml"), "w"))
-            _bind(d)
+            _fixture_bind(d)
             for c, why in ((cal, "another spec"), (dict(cal, spec_sha256=pt["spec_sha256"], engine={"name": "f"}),
                                                    "another engine")):
                 yaml.safe_dump(c, open(os.path.join(d, "analysis", "calibration.yaml"), "w"))
                 yaml.safe_dump(dict(pt2, inputs={"analysis/calibration.yaml": sha256(os.path.join(
                     d, "analysis", "calibration.yaml"))}), open(os.path.join(d, "analysis", "point.yaml"), "w"))
-                _bind(d)
+                _fixture_bind(d)
                 try:
                     point_doc(d, ident)
                     ok(False, f"WM87 a descendant artifact computed under {why} is refused in the provenance walk")
