@@ -1,0 +1,311 @@
+beliefs:
+- id: B1
+  mechanism: ENTRY removes roughly 0.9 x one-dose efficacy of the 5-9 susceptibles; with homogeneous mixing the
+    final-size relation turns that into a direct plus indirect reduction. Under-5 and adult susceptibles stay, so
+    in most districts Reff remains above 1 and the reduction is partial, largest where the residual Reff nears 1.
+  about:
+    package: entry
+  direction: reduces
+  magnitude:
+    band:
+    - 0.1
+    - 0.65
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Marin M, Marti M, Kambhampati A, Jeram SM, Seward JF. Global Varicella Vaccine Effectiveness: A Meta-analysis.
+      Pediatrics 2016;137(3):e20153741'
+    location: 'Abstract/Results: one-dose VE about 81% against all varicella, about 98% against moderate/severe'
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: final-size relation and herd immunity threshold, chapters on vaccination (exact page not recalled)
+  - citation: units.csv
+    location: columns s_5_9, s_u5, s_10_14 (susceptible shares), pop
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: SCHOOL adds the 10-14 susceptibles to ENTRY's, so its reduction exceeds ENTRY's at every point; where
+    the residual Reff after ENTRY is close to 1 the extra removal can stop transmission and the reduction becomes
+    large.
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.2
+    - 0.9
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Marin M, Marti M, Kambhampati A, Jeram SM, Seward JF. Global Varicella Vaccine Effectiveness: A Meta-analysis.
+      Pediatrics 2016;137(3):e20153741'
+    location: 'Abstract/Results: one-dose VE about 81%'
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927;115:700-721
+    location: final-size equation
+  - citation: units.csv
+    location: columns s_10_14, s_5_9, s_u5
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: The under-5 susceptible pool is not targeted by either option and dominates the residual Reff under
+    homogeneous mixing; the larger it is, the further above 1 Reff stays after vaccination and the smaller the relative
+    (especially indirect) reduction from SCHOOL.
+  about:
+    package: school
+    feature: s_u5
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Diekmann O, Heesterbeek JAP, Metz JAJ. On the definition and the computation of the basic reproduction
+      ratio R0 in models for infectious diseases in heterogeneous populations. J Math Biol 1990;28:365-382
+    location: next-generation matrix; with proportionate mixing R equals R0 times the susceptible share
+  - citation: units.csv
+    location: column s_u5
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: A higher contact rate (higher R0, 8-12) pushes Reff after ENTRY further above 1, so the final size
+    among the remaining susceptibles approaches 1 and ENTRY's relative reduction shrinks toward its direct share.
+  about:
+    package: entry
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Table 4.1 lists R0 for chickenpox of roughly 7-12 (location recalled, not checked)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'ENTRY protects only susceptibles reached (doses to immune children are wasted), so its effect scales
+    with the 5-9 susceptible share: districts with high s_5_9 gain most from ENTRY.'
+  about:
+    package: entry
+    feature: s_5_9
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: units.csv
+    location: column s_5_9 (range of the input across districts)
+  - citation: Nardone A, de Ory F, Carton M, et al. The comparative sero-epidemiology of varicella zoster virus
+      in 11 countries in the European region. Vaccine 2007;25:7866-7872
+    location: age-specific seroprevalence curves (figure; exact number not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B6
+  mechanism: 'Saturation vs need: at the declared shadow price (3e-6 outcome per USD) the extra US$0.80 per resident
+    of SCHOOL is worth very little against the extra infections it averts (10-14 susceptibles removed plus indirect
+    effect), so SCHOOL beats ENTRY on net benefit across the s_10_14 range; the margin is smallest where s_10_14
+    is low (saturation) and largest where ENTRY leaves Reff just above 1. Under the binding US$4M budget the ranking
+    per dollar may differ (ENTRY cheaper per susceptible protected), which this shadow price does not test.'
+  about:
+    pair:
+    - school
+    - entry
+    feature: s_10_14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: critical vaccination coverage 1 - 1/R0 (chapter on vaccination; page not recalled)
+  - citation: units.csv
+    location: columns s_10_14, pop
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 1
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Run to extinction, the final size of a supercritical epidemic barely depends on the size of a small
+    seed (1e-6 to 8e-5 of the population); seed matters only near Reff = 1.
+  about:
+    package: school
+    feature: seed_share
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927;115:700-721
+    location: final-size equation in the limit of a small initial infected fraction
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: 'ENTRY beats doing nothing on net benefit almost everywhere at the declared shadow price: it averts
+    a few percent of the population''s infections for US$0.90 per resident.'
+  about:
+    pair:
+    - entry
+    - none
+    feature: s_5_9
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Marin M, Marti M, Kambhampati A, Jeram SM, Seward JF. Global Varicella Vaccine Effectiveness: A Meta-analysis.
+      Pediatrics 2016;137(3):e20153741'
+    location: 'Abstract/Results: one-dose VE'
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+open_questions:
+- id: Q1
+  question: What are the age shares of the population (under 5, 5-9, 10-14, adults) and the adult susceptible floor
+    in each district? They set the size of each option's removable pool relative to the untargeted pool and hence
+    whether any district can be pushed below Reff = 1.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: The homogeneous-mixing assumption ignores school-age assortative mixing (Mossong et al. PLoS Med 2008).
+    With assortative mixing, school-age vaccination would have a larger indirect effect than estimated here; how
+    much would that move SCHOOL vs ENTRY?
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: With a binding US$4M budget (likely less than ENTRY in every district), does the budget's own shadow
+    price favour ENTRY widely over SCHOOL in fewer districts? The declared lambda (3e-6) does not answer this, and
+    no optimised plan will exist in this sweep.
+  beliefs:
+  - B6
+  - B8
+  decision_relevant: true
+- id: Q4
+  question: What one-dose efficacy does the engine use against infection (not disease)? Breakthrough mild varicella
+    is common after one dose; protection against any infection may be lower than the ~81% against all varicella.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: 'ENTRY reduces season infections by 10-65% at most points: partial, because the under-5 pool keeps Reff
+    above 1.'
+  test:
+    kind: effect_band
+    package: entry
+    band:
+    - 0.1
+    - 0.65
+    min_share: 0.75
+- id: H2
+  belief: B2
+  claim: SCHOOL reduces season infections by 20-90% at most points, more than ENTRY.
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.2
+    - 0.9
+    min_share: 0.75
+- id: H3
+  belief: B3
+  claim: SCHOOL's relative reduction falls as the unvaccinated under-5 susceptible share rises.
+  test:
+    kind: effect_direction
+    package: school
+    feature: s_u5
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: ENTRY's relative reduction falls as the contact rate (R0) rises.
+  test:
+    kind: effect_direction
+    package: entry
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: ENTRY's relative reduction rises with the 5-9 susceptible share.
+  test:
+    kind: effect_direction
+    package: entry
+    feature: s_5_9
+    direction: increases
+- id: H6
+  belief: B6
+  claim: At the declared shadow price SCHOOL beats ENTRY on net benefit at 80% or more of points across the s_10_14
+    range.
+  test:
+    kind: paired_sign
+    a: school
+    b: entry
+    feature: s_10_14
+    range:
+    - 0.082
+    - 0.3457
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: The seed share has a negligible effect on SCHOOL's relative reduction (|rho| bound within 0.2).
+  test:
+    kind: effect_direction
+    package: school
+    feature: seed_share
+    direction: negligible
+    equivalence: 0.2
+- id: H8
+  belief: B8
+  claim: ENTRY beats no vaccination on net benefit at 90% or more of points across the s_5_9 range.
+  test:
+    kind: paired_sign
+    a: entry
+    b: none
+    feature: s_5_9
+    range:
+    - 0.1655
+    - 0.5826
+    sign: positive
+    min_share: 0.9
