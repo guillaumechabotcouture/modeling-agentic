@@ -1,0 +1,269 @@
+beliefs:
+- id: B1
+  mechanism: 'CXR-first screening (any abnormality, then Xpert Ultra) detects most prevalent bacteriologically confirmed
+    TB among those screened: CXR any-abnormality sensitivity is high (~0.9-0.98) and Ultra sensitivity ~0.85-0.9,
+    less losses to sputum non-submission. With 70% reach, the relative reduction in undetected prevalent TB in the
+    district is roughly 0.7 x 0.6-0.85.'
+  about:
+    package: cxr
+  direction: reduces
+  magnitude:
+    band:
+    - 0.38
+    - 0.62
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'WHO consolidated guidelines on tuberculosis. Module 2: screening - systematic screening for tuberculosis
+      disease. World Health Organization, 2021'
+    location: screening tool accuracy summary (CXR any abnormality); exact table number uncertain
+  - citation: Zifodya JS et al. Xpert Ultra versus Xpert MTB/RIF for pulmonary tuberculosis and rifampicin resistance
+      in adults with presumptive pulmonary tuberculosis. Cochrane Database Syst Rev, 2021
+    location: Summary of findings table 1
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B2
+  mechanism: Symptom-first screening misses subclinical TB, which is about half of prevalent bacteriologically confirmed
+    TB in prevalence surveys; symptom sensitivity ~0.4-0.7 depending on the definition, then Ultra and sputum losses.
+    With 70% reach the relative reduction is roughly 0.7 x 0.25-0.5.
+  about:
+    package: sym
+  direction: reduces
+  magnitude:
+    band:
+    - 0.15
+    - 0.35
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Frascella B et al. Subclinical tuberculosis disease - a review and analysis of prevalence surveys
+      to inform definitions, burden, associations, and screening methodology. Clinical Infectious Diseases, 2021
+    location: Results, pooled proportion subclinical; table number uncertain
+  - citation: 'van''t Hoog AH et al. Screening strategies for tuberculosis prevalence surveys: the value of chest
+      radiography and symptoms. PLoS One, 2012'
+    location: Table 2 (sensitivity of symptom vs CXR screening); location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B3
+  mechanism: Per person screened, CXR detects roughly 1.5-3x as many prevalent cases as SYM, so its relative reduction
+    exceeds SYM's in essentially every draw of shared uncertainty.
+  about:
+    pair:
+    - cxr
+    - sym
+  direction: increases
+  magnitude:
+    band:
+    - 1.5
+    - 3.0
+    scale: ratio
+  source_type: literature
+  evidence:
+  - citation: 'van''t Hoog AH et al. Screening strategies for tuberculosis prevalence surveys: the value of chest
+      radiography and symptoms. PLoS One, 2012'
+    location: Table 2; location uncertain
+  - citation: Frascella B et al. Subclinical tuberculosis disease - a review and analysis of prevalence surveys
+      to inform definitions, burden, associations, and screening methodology. Clinical Infectious Diseases, 2021
+    location: Discussion on screening methodology
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B4
+  mechanism: The relative reduction of each algorithm does not depend on the district's prevalence or population
+    (the engine applies a multiplicative RR; screening sensitivity is a property of the tool, not of burden). Absolute
+    yield scales with prevalence x population, so burden ranks districts.
+  about:
+    package: cxr
+    feature: prev_undiag
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Burke RM et al. Community-based active case-finding interventions for tuberculosis: a systematic
+      review. Lancet Public Health, 2021'
+    location: Results; yield varies with underlying prevalence; location uncertain
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Same structural point for SYM: its relative reduction is independent of district population size.'
+  about:
+    package: sym
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'WHO consolidated guidelines on tuberculosis. Module 2: screening - systematic screening for tuberculosis
+      disease. World Health Organization, 2021'
+    location: screening tool accuracy summary; table number uncertain
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 0
+    not_found: 1
+    lookup_failed: 0
+- id: B6
+  mechanism: CXR costs several times more per person screened than SYM (X-ray plus reading vs a questionnaire; Xpert
+    cost spread over fewer presumptives in SYM). Under a binding budget the extra cases CXR buys over SYM scale
+    with prevalence while the extra cost does not, so the choice flips from SYM to CXR as prevalence rises; in the
+    lowest-prevalence districts even SYM may fall below the shadow price. The flip location depends on the price
+    ratio and shadow price, both withheld; roughly mid-range.
+  about:
+    pair:
+    - cxr
+    - sym
+    feature: prev_undiag
+  direction: flips
+  conditions:
+  - feature: prev_undiag
+    range:
+    - 0.004
+    - 0.01
+  source_type: literature
+  evidence:
+  - citation: 'Burke RM et al. Community-based active case-finding interventions for tuberculosis: a systematic
+      review. Lancet Public Health, 2021'
+    location: Discussion of yield and cost per case; location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'In the highest-prevalence districts CXR beats doing nothing at the budget''s shadow price: their cases
+    detected per dollar exceed the marginal (budget-setting) yield per dollar.'
+  about:
+    pair:
+    - cxr
+    - none
+    feature: prev_undiag
+  direction: increases
+  conditions:
+  - feature: prev_undiag
+    range:
+    - 0.009
+    - 0.011928
+  source_type: literature
+  evidence:
+  - citation: 'Burke RM et al. Community-based active case-finding interventions for tuberculosis: a systematic
+      review. Lancet Public Health, 2021'
+    location: location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: Per-person cost ratio CXR/SYM in algorithm_costs.csv, and whether CXR cost includes Xpert for CXR-abnormal
+    people; this sets the SYM/CXR flip prevalence.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Does the historical ACF yield (records 2022-2025) per algorithm, divided by prevalence, agree with the
+    trial-based sensitivity bands, or do district yields imply different detection fractions (e.g. low sputum submission)?
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q3
+  question: Does district prevalence estimated from ACF records (yield / detection fraction) agree with prev_undiag
+    in units.csv and the national reference yields, after accounting for who was screened in past rounds?
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q4
+  question: Is the budget sufficient for CXR in all districts? If so the choice is trivially all-CXR and the flip
+    does not bind.
+  beliefs:
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CXR's relative reduction in undetected TB lies in 0.38-0.62 at most design points.
+  test:
+    kind: effect_band
+    package: cxr
+    band:
+    - 0.38
+    - 0.62
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: SYM's relative reduction in undetected TB lies in 0.15-0.35 at most design points.
+  test:
+    kind: effect_band
+    package: sym
+    band:
+    - 0.15
+    - 0.35
+    min_share: 0.7
+- id: H3
+  belief: B4
+  claim: CXR's relative reduction does not vary with district prevalence (|rho| < 0.2).
+  test:
+    kind: effect_direction
+    package: cxr
+    feature: prev_undiag
+    direction: negligible
+    equivalence: 0.2
+- id: H4
+  belief: B5
+  claim: SYM's relative reduction does not vary with district population (|rho| < 0.2).
+  test:
+    kind: effect_direction
+    package: sym
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H5
+  belief: B6
+  claim: The SYM-to-CXR transition along prevalence lies within 0.004-0.010.
+  test:
+    kind: flip_in
+    a: cxr
+    b: sym
+    feature: prev_undiag
+    range:
+    - 0.004
+    - 0.01
+- id: H6
+  belief: B7
+  claim: In the highest-prevalence districts (prev_undiag >= 0.009) CXR beats none at the shadow price in at least
+    80% of points.
+  test:
+    kind: paired_sign
+    a: cxr
+    b: none
+    feature: prev_undiag
+    range:
+    - 0.009
+    - 0.011928
+    sign: positive
+    min_share: 0.8
