@@ -117,15 +117,21 @@ def _check_prior(name, d, ps: ParamSpec, where) -> tuple[Prior | None, list[str]
 def load_card(engine) -> dict:
     """{priors, fixed, settings, not_exposed, path, problems} from the engine's priors.yaml (empty when there is none)."""
     out = {"priors": {}, "fixed": {}, "settings": [], "not_exposed": {}, "path": None, "problems": []}
-    p = priors_path(engine)
-    if not p or not os.path.exists(p):
-        return out
-    out["path"] = p
-    try:
-        doc = yaml.safe_load(open(p)) or {}
-    except (OSError, yaml.YAMLError) as e:
-        out["problems"].append(f"engine priors {p}: unreadable ({e})")
-        return out
+    # an engine whose priors are its spec configuration (engine.config, signed with the spec) gives them itself,
+    # in the same format, through priors_doc() (the package-rate engine's trial_priors mode)
+    doc = engine.priors_doc() if callable(getattr(engine, "priors_doc", None)) else None
+    if doc is not None:
+        out["path"] = "engine.config"
+    else:
+        p = priors_path(engine)
+        if not p or not os.path.exists(p):
+            return out
+        out["path"] = p
+        try:
+            doc = yaml.safe_load(open(p)) or {}
+        except (OSError, yaml.YAMLError) as e:
+            out["problems"].append(f"engine priors {p}: unreadable ({e})")
+            return out
     specs = {q.name: q for q in engine.parameters()}
     for name, d in (doc.get("priors") or {}).items():
         ps = specs.get(name)
@@ -305,7 +311,9 @@ def plan(spec) -> dict:
     cal = spec.raw["calibration"]
     moves = ([cal.get("attribute")] if cal.get("method") not in (None, "none") else []) + list(cal.get("parameters") or [])
     sources = []
-    for k, what in list(UNCERTAINTY_KINDS.items()) + [("priors", PRIORS_WHAT)]:
+    from toolkit.spec.schema import CONDITIONAL_KINDS
+    for k, what in list(UNCERTAINTY_KINDS.items()) + [("priors", PRIORS_WHAT)] + [
+            (c, w) for c, w in CONDITIONAL_KINDS.items() if c in inc or c in kex]:
         if k == "priors":
             declared = set(card["priors"]) | set(sp)
             st = "drawn" if dr else "excluded" if (k in kex or declared) else "none_declared"

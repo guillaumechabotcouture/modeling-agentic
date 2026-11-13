@@ -165,7 +165,10 @@ UNCERTAINTY_KINDS = {
 OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-card priors.yaml or uncertainty.priors), "
                             "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
-                     "emulator": "emulator error"}
+                     "emulator": "emulator error", "burden_anchor": "external burden estimates"}
+# F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
+CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
+                                      "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
@@ -1267,8 +1270,12 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
     exc = {x.get("kind"): x.get("reason") for x in u.get("excluded") or [] if isinstance(x, dict) and "parameter" not in x}
     for k in inc + list(exc):
-        if k not in UNCERTAINTY_KINDS and k not in OPTIONAL_KINDS:
-            bad.append(f"uncertainty: unknown source kind {k!r} (known: {', '.join(list(UNCERTAINTY_KINDS) + list(OPTIONAL_KINDS))})")
+        if k not in UNCERTAINTY_KINDS and k not in OPTIONAL_KINDS and k not in CONDITIONAL_KINDS:
+            bad.append(f"uncertainty: unknown source kind {k!r} (known: "
+                       f"{', '.join(list(UNCERTAINTY_KINDS) + list(OPTIONAL_KINDS) + list(CONDITIONAL_KINDS))})")
+    if "burden_anchor" in inc and not ((s.raw.get("validation") or {}).get("burden") if isinstance(
+            s.raw.get("validation"), dict) else None):
+        bad.append("uncertainty: source burden_anchor needs validation.burden anchor rows")
     for x in u.get("excluded") or []:
         if isinstance(x, dict) and "parameter" in x and "kind" in x:
             bad.append("uncertainty.excluded: an entry names a kind or a parameter, not both")
