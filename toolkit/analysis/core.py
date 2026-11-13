@@ -148,16 +148,28 @@ class Analysis:
         return self.lik
 
     # ------------------------------------------------------------ outcomes, benefits, costs
-    def evaluate(self, theta, zs, ids=None, noise=None, cost_mult=None, sampled=None):
+    def evaluate(self, theta, zs, ids=None, noise=None, cost_mult=None, sampled=None, anchor_factors=None):
         """(outcomes, benefit, cost) for the units. benefit[u][p] = (comparator - package) x discount factor
         on the primary outcome; cost from toolkit/alloc (per-outcome items from the model's cost outputs),
         with optional per-cost-item multipliers."""
         ids = ids or self.ids
+        if self.anchor is not None and anchor_factors is None and len(ids) < len(self.ids):
+            # F6 S2-5d review r2: a partial evaluation (a stability fold) covers whole anchor groups, so the merged
+            # result keeps each group's anchored total; the returned tables hold every unit evaluated
+            need, grow = set(ids), True
+            while grow:
+                grow = False
+                for r in self.anchor["rows"].values():
+                    if need & set(r["members"]) and not set(r["members"]) <= need:
+                        need |= set(r["members"])
+                        grow = True
+            ids = [i for i in self.ids if i in need]
         out = self.model.predict(zs, theta, ids, noise=noise)
         self.last_events = list(getattr(self.model, "last_events", []) or [])
         if self.anchor is not None:      # F6 S2-5d: external level / this evaluation's own model value
             from toolkit.analysis import burden as BU
-            BU.apply_anchor(self.anchor, out, ids, param=lambda x: BU.param_at(self, theta, x), sampled=sampled)
+            BU.apply_anchor(self.anchor, out, ids, param=lambda x: BU.param_at(self, theta, x), sampled=sampled,
+                            factors=anchor_factors)
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]

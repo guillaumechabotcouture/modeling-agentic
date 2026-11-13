@@ -1821,6 +1821,64 @@ def _self_test_anchor_e2e(ok, d, q):
            "benefits equal the published ones")
     except Exception as e:  # noqa: BLE001
         ok(False, f"BA14 (review r1 P2-9) rebuild() of an anchored run: {type(e).__name__}: {e}")
+    _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol)
+
+
+def _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol):
+    """F6 S2-5d review round 2: the boundary check, stability folds, and the anchors' ranges in sensitivity and the
+    decision tests."""
+    import toolkit.analysis.model as Mm
+    import toolkit.engines.contract as Ct
+    from toolkit.analysis import boundary as BD, decision_tests as DT
+    out0, ben0, cost0 = anchored
+    raw = A.model.predict(z0, A.theta0, A.ids)            # the emulator's own (un-anchored) outputs
+    plan = R["point"]["plan"]
+    cands = [{"unit": i, "chosen": plan[i], "runner_up": next(k for k in A.pk if k != plan[i])} for i in A.ids[:4]]
+
+    class _DM:          # an engine that returns exactly what the emulator predicts
+        def __init__(self, spec, log=None):
+            self.packages = None
+
+        def predict(self, zs, theta, ids):
+            return {i: raw[i] for i in ids}
+    saved = Mm.DirectModel, Ct.Outcomes
+    Mm.DirectModel, Ct.Outcomes = _DM, (lambda **kw: None)
+    try:
+        ben_e, cost_e = BD.engine_tables(A, cands, z0, out0, {f"boundary:{c['unit']}|{k}": {}
+                                                              for c in cands for k in A.pk})
+        err = None
+    except Exception as e:  # noqa: BLE001
+        err = e
+    finally:
+        Mm.DirectModel, Ct.Outcomes = saved
+    ok(err is None and all(tol(ben_e[c["unit"]][k], ben0[c["unit"]][k]) and tol(cost_e[c["unit"]][k], cost0[c["unit"]][k])
+                           for c in cands for k in (c["chosen"], c["runner_up"])),
+       f"BA17 (review r2 P1) identical engine and emulator outputs, non-unit anchors, fixed and burden-driven costs: the "
+       f"boundary check's engine side equals the emulator side ({err!r})")
+    # review r2 P2: a fold evaluation keeps each anchor group's anchored total
+    hid = [i for i in A.ids if A.by_id[i]["grp"] == "g0"]
+    zh = dict(z0, **{i: z0[i] + 0.3 for i in hid})
+    oh, bh, ch = A.evaluate(A.theta0, zh, hid)
+    merged = {**out0, **oh}
+    ok(all(tol(sum(merged[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == g), v)
+           for g, v in (("r0", 2000.0), ("r1", 1500.0), ("r2", 1000.0))) and set(bh) >= set(hid) and set(ch) == set(bh),
+       f"BA18 (review r2 P2) a fold that re-evaluates some units returns every member of their anchor groups, so the "
+       f"merged anchored totals stay external ({len(bh)} units for {len(hid)} held out)")
+    # review r2 P2: each anchor's published interval is a sensitivity row and an automatic range test
+    sens = R["sensitivity"]
+    srow = {r["name"]: r for r in sens["rows"]}
+    tests = {t["test_id"]: t for t in R["decision_tests"]}
+    ok({"burden_anchor_N0", "burden_anchor_ND"} <= set(srow) and srow["burden_anchor_N0"]["kind"] == "burden_anchor"
+       and tests.get("anchor_range_N0", {}).get("status") == "run" and tests["anchor_range_N0"].get("automatic"),
+       f"BA19 (review r2 P2) each anchor's interval enters the tornado and an automatic range test: "
+       f"{sorted(srow)[:6]}, {sorted(tests)[:8]}")
+    dt = next(t for t in DT.prior_range_tests(A) if t["id"] == "anchor_range_N0")
+    rec = DT.run_one(A, dict(dt, values=[A.anchor["rows"]["N0"]["value"] * 0.06, A.anchor["rows"]["N0"]["value"] * 15]),
+                     z0, ben0, cost0, plan, R["uncertainty"], out0)
+    ok(rec.get("status") == "run" and rec.get("decision_changes") is True,
+       f"BA19 (review r2 P2) an anchor that moves the recommendation is found by its range test "
+       f"({rec.get('share_units_changed')}, {rec.get('triggered_by')})")
+
 
 
 def _self_test_floors_e2e(ok, d, q):
