@@ -1,0 +1,291 @@
+beliefs:
+- id: B1
+  mechanism: 'Threshold nonlinearity: with R0 10-16 and mean susceptibility ~6-13%, baseline Reff is near or above
+    1; D removes ~77% of all child susceptibles above 9 months and pushes Reff below 1 almost everywhere, so its
+    relative reduction in infections is close to complete wherever the baseline is supercritical.'
+  about:
+    package: D_9mto14y
+  direction: reduces
+  magnitude:
+    band:
+    - 0.85
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5 (herd immunity threshold 1 - 1/R0); location approximate
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation; page not recalled
+  - citation: 'Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infect
+      Dis 2017'
+    location: abstract (R0 range)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: C leaves the whole 5-14y immunity gap unreached, so its residual Reff, and the outbreak it fails to
+    prevent, grow with susc_5_14y; C's relative reduction falls as susc_5_14y rises.
+  about:
+    package: C_9to59m
+    feature: susc_5_14y
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; location approximate
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B3
+  mechanism: Higher transmission (contact_rate, i.e. R0) raises C's residual Reff above 1 more often while the baseline
+    final size saturates, so C's relative reduction decreases with contact_rate.
+  about:
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation; page not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: C removes ~77% of the 9-59m gap, which is the larger gap; a larger susc_9_59m raises the baseline more
+    than C's residual, so C's relative reduction increases with susc_9_59m.
+  about:
+    package: C_9to59m
+    feature: susc_9_59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; location approximate
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Where the 5-14y gap is large, C leaves Reff above 1 and a major outbreak follows; D prevents thousands
+    more infections than C at an extra cost worth only tens of infections at the shadow price, so D wins.
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+  direction: flips
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.08
+    - 0.17
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: Where the 5-14y gap is small, C alone pushes Reff below 1; the residual is a stuttering chain from
+    one importation (mean size ~1/(1-R), tens of infections), so D's extra infections averted are worth less than
+    its extra cost (~US$1.50 per child aged 5-14) and C wins on net benefit.
+  about:
+    pair:
+    - C_9to59m
+    - D_9mto14y
+  direction: increases
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.0179
+    - 0.07
+  source_type: literature
+  evidence:
+  - citation: Blumberg S, Lloyd-Smith JO. Inference of R0 and transmission heterogeneity from the size distribution
+      of stuttering chains. PLoS Comput Biol 2013
+    location: mean chain size 1/(1-R); section not recalled
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Vaccine efficacy per child reached (all-or-nothing) scales the susceptibles removed; C's relative reduction
+    increases with efficacy:C_9to59m, most where its residual Reff is near 1. Field effectiveness of one dose at
+    9+ months is roughly 85-95%.
+  about:
+    package: C_9to59m
+    feature: efficacy:C_9to59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: abstract (median one-dose VE at >=9 months)
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: What share of each district's population is aged 9-59 months, 5-14 years and under 9 months? The flip
+    location on susc_5_14y scales with these shares, and I assumed them.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Which contact_rate values map to R0 10 versus 16? At R0 10 C may suffice nearly everywhere; at 16 D
+    may be needed in most districts.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: 'Carried from chain1: does the relative effect fall with seed size because a subcritical residual scales
+    with the seed while a supercritical baseline does not? Here the seed is one importation per district; districts
+    with smaller populations have a larger seed share.'
+  beliefs:
+  - B6
+  decision_relevant: false
+- id: Q4
+  question: Are some districts subcritical at baseline (low gaps, low R0)? There both options avert few infections
+    and 'none' may win at the shadow price.
+  beliefs:
+  - B1
+  decision_relevant: true
+- id: Q5
+  question: Does the US$2.9M budget bind? If D everywhere is unaffordable, D goes first to districts where C leaves
+    Reff furthest above 1.
+  beliefs:
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: D_9mto14y averts 85-100% of infections at 70% or more of usable points (it pushes Reff below 1 where the
+    baseline is supercritical)
+  p: 0.55
+  test:
+    kind: effect_band
+    package: D_9mto14y
+    band:
+    - 0.85
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: C_9to59m's relative reduction decreases with susc_5_14y (Spearman interval below 0)
+  p: 0.8
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_5_14y
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: C_9to59m's relative reduction decreases with contact_rate (Spearman interval below 0)
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: contact_rate (calibration scale)
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: C_9to59m's relative reduction increases with susc_9_59m (Spearman interval above 0)
+  p: 0.5
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_9_59m
+    direction: increases
+- id: H5
+  belief: B5
+  claim: Where susc_5_14y is 0.12-0.1861, D_9mto14y has the higher net benefit than C_9to59m at 70% or more of usable
+    points
+  p: 0.6
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.12
+    - 0.1861
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: The C/D choice flips along susc_5_14y between 0.08 and 0.17
+  p: 0.4
+  test:
+    kind: flip_in
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.08
+    - 0.17
+- id: H7
+  belief: B6
+  claim: Where susc_5_14y is 0.0179-0.07, C_9to59m has the higher net benefit than D_9mto14y at 60% or more of usable
+    points
+  p: 0.55
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.0179
+    - 0.07
+    sign: positive
+    min_share: 0.6
+- id: H8
+  belief: B7
+  claim: C_9to59m's relative reduction increases with efficacy:C_9to59m (Spearman interval above 0)
+  p: 0.55
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: efficacy:C_9to59m
+    direction: increases
