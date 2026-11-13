@@ -13,9 +13,12 @@ where it overspends): a lower bound on the value of deciding now, labelled so.
 Perfect information: in each draw the best plan feasible there (its own optimum within the budget, solved at the full
 budget when the draws were re-optimised within a reserve). Costs are then known, so no overspend is needed; with an
 allowance, perfect information may overspend in as many draws as the plan chosen now may (floor(share x draws)), where
-the best candidate ignoring the budget gains most. So EVPI >= 0 and is never inflated by overspending.
+the draw's plan solved without the budget (or the best candidate) gains most. So EVPI >= 0 and is never inflated by
+overspending.
 Candidates: the headline plan, every declared plan variant, the plan decided now, each draw's optimum, and the plan
-decided within the budget on each quantile bin of each valued input and group (duplicates merged). A candidate that
+decided within the budget on each bin of each valued input and group, built on one half of the draws and valued,
+for that input only, on the other half (cross-fitting, so its fit to the input reaches neither the draws it is valued
+on nor the noise floor). A candidate that
 breaks the signed feasibility or on which a model correction bears in any draw is reported with its regret, never
 chosen or counted. No eligible candidate: status no_eligible_plan.
 
@@ -24,12 +27,15 @@ chosen or counted. No eligible candidate: status no_eligible_plan.
   EVPPI = mean_d max_p g_p(phi_d) - value of deciding now for an input (or a group) phi, g_p the regression of
           NB(p, .) on phi (Strong, Oakley & Brennan 2014, Med Decis Making 34:311-326), p over the candidates eligible
           within phi_d's quantile bin under the same affordability rule: feasibility after learning is conditional on
-          what is learned, judged within bins (a lower bound for inputs that move costs). The paper's GAM is replaced
+          what is learned, judged within bins (one bin per value when an input has at most `bins` values; a lower
+          bound for inputs that move costs). With an allowance, the chosen per-draw policy must itself keep the
+          share; otherwise eligibility falls back to within the budget in every draw of a bin (a lower bound,
+          recorded as `policy_rule`). The paper's GAM is replaced
           by an unpenalised natural cubic regression spline (additive over a group, binned on its first principal
           component), knots chosen by GCV. An additive group has no interaction terms (the paper's Gaussian process is
           not implemented). EVPPI is over the candidate set, never below 0 (ignoring what is learned is always open).
 Small draw counts bias regression EVPPI upward. Each EVPPI carries a permutation noise floor: the same full procedure
-(GCV, bins) on the input shuffled against the net benefits, at `noise_quantile`. No interval is published (a
+(GCV, bins, cross-fitting) on the input shuffled within each half against the net benefits, at `noise_quantile`. No interval is published (a
 percentile bootstrap around a maximisation does not cover near ties). A value is `supported` only when it clears its
 noise floor and does not exceed EVPI (`exceeds_evpi`); only supported values are claimed. Below `min_draws` nothing
 is computed and the artifact records too_few_draws; below `informative_draws` the status is `indicative`
@@ -159,6 +165,9 @@ def _bins(Xm, G):
     values always share a bin, so a discrete input gets one bin per value when it has at most G values."""
     Z = (Xm - Xm.mean(0)) / np.where(Xm.std(0) > 0, Xm.std(0), 1.0)
     u = Z[:, 0] if Z.shape[1] == 1 else Z @ np.linalg.svd(Z, full_matrices=False)[2][0]
+    vals = np.unique(u)
+    if len(vals) <= int(G):          # at most G distinct values: one bin per value (round 2: quantiles merge them)
+        return np.searchsorted(vals, u)
     edges = np.unique(np.quantile(u, np.linspace(0, 1, int(G) + 1)[1:-1]))
     return np.searchsorted(edges, u, side="left")
 
@@ -171,12 +180,16 @@ INTERVAL_NOTE = ("No interval is published: a percentile bootstrap around a maxi
 
 # --------------------------------------------------------------------------- the analysis
 def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, thr=None, seed=0, ids=None,
-            excluded=None, exact_id=None) -> dict:
+            excluded=None, exact_id=None, nb_free=None, cond=None, halves=None) -> dict:
     """EVPI and EVPPI from per-draw net benefits `nb` (draws x candidates), each draw's own optimum within the budget
     `nb_opt`, the over-budget mask `over` (draws x candidates) and the drawn inputs {name: values per draw}.
     `excluded` {candidate id: why}: candidates that break the signed feasibility or carry model corrections, reported
     (with their regret) and never chosen or counted. `exact_id`: the candidate solved as the best plan within the
-    budget in every draw (with no overspend allowed, deciding now is then exact). Bad input fails closed."""
+    budget in every draw (with no overspend allowed, deciding now is then exact). `nb_free`: each draw's best plan
+    solved without the budget (the plans perfect information may overspend with). `cond` {input: [(candidate, half)]}:
+    plans decided within that input's bins on one half of the draws (`halves`, 0/1 per draw); each is valued only for
+    that input and only on the other half (cross-fitting), so its fit to the input never reaches the draws it is
+    valued on, nor the noise floor. Bad input fails closed."""
     th = dict(thresholds(), **(thr or {}))
     nb, nb_opt, over = np.asarray(nb, float), np.asarray(nb_opt, float), np.asarray(over, bool)
     if nb.ndim != 2 or nb.shape[0] < 2 or nb.shape[1] < 1 or nb_opt.shape != (nb.shape[0],) or over.shape != nb.shape:
@@ -225,7 +238,10 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
     star = np.maximum(nb_opt, np.where(feas, nb, -np.inf).max(1))
     k = int(math.floor(s * n + 1e-9))
     if k:
-        gain = np.maximum(np.where(okc[None, :], nb, -np.inf).max(1) - star, 0.0)
+        free = np.where(okc[None, :], nb, -np.inf).max(1)
+        if nb_free is not None:
+            free = np.maximum(free, np.asarray(nb_free, float))
+        gain = np.maximum(free - star, 0.0)
         star = star + np.where(np.isin(np.arange(n), np.argsort(-gain, kind="stable")[:k]), gain, 0.0)
     v_pi = float(star.mean())
     evpi = max(v_pi - v_now, 0.0)
@@ -237,26 +253,64 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
                "deciding now, so EVPI may be overstated)",
                expected_value_decide_now=v_now, expected_value_perfect_information=v_now + evpi,
                evpi={"value": evpi, "pct": pct(evpi), "se_paired": float((star - nb[:, j]).std(ddof=1) / math.sqrt(n))})
-    Y = (nb - nb[:, [j]])[:, okc]           # incremental net benefit over the plan chosen now; excluded never counted
-    F = feas[:, okc]
-    md = max(2, int(th["max_df_share"] * n))
+    D = nb - nb[:, [j]]                     # incremental net benefit over the plan chosen now
+    cmap = {str(k): [(int(c), int(h)) for c, h in v] for k, v in (cond or {}).items()}
+    is_cond = np.zeros(P, bool)
+    for v_ in cmap.values():
+        for c, _ in v_:
+            is_cond[c] = True
+    gen = np.flatnonzero(okc & ~is_cond)    # excluded never counted; conditional plans only for their own input
+    hv = np.zeros(n, int) if halves is None else np.asarray(halves, int)
     G = max(1, min(int(th["bins"]), n // int(th["min_bin_draws"])))
     tol = float(th["exceeds_evpi_tol"]) * evpi + 1e-9 * max(1.0, abs(v_now))
     rng = np.random.default_rng(int(seed))
 
-    def value(Xm):
-        """EVPPI with the full procedure: GCV on the data, then, per quantile bin, the best plan eligible within the
-        bin under the affordability rule (feasibility after learning is conditional on what is learned)."""
-        Q, df, kn = _fit(Xm, Y, md, max_knots=int(th["max_knots"]))
-        if Q is None:
-            return None, None, None
-        Gh = Q @ (Q.T @ Y)
-        b, v = _bins(Xm, G), np.zeros(n)
-        for g in np.unique(b):
-            m = b == g
-            e = (~F[m]).mean(0) <= s + 1e-12
-            v[m] = Gh[m][:, e].max(1) if e.any() else 0.0
-        return max(float(v.mean()), 0.0), df, kn       # ignoring what is learned is always open: never below 0
+    def fitted(Xm, cols, rows):
+        Yc = D[np.ix_(rows, cols)]
+        Q, df, kn = _fit(Xm[rows], Yc, max(2, int(th["max_df_share"] * len(rows))), max_knots=int(th["max_knots"]))
+        return (None, None, None) if Q is None else (Q @ (Q.T @ Yc), df, kn)
+
+    def value(Xm, conds, strict=False):
+        """EVPPI with the full procedure: GCV on the data; per bin, the best plan eligible within the bin under the
+        affordability rule (feasibility after learning is conditional on what is learned); conditional plans fitted
+        and valued on the half they were not built on. The chosen per-draw policy must itself keep the affordability
+        share; when it does not, eligibility within bins falls back to within the budget in every draw (strict)."""
+        Gg, df, kn = fitted(Xm, gen, np.arange(n))
+        if Gg is None:
+            return None, None, None, None, None
+        b, lim = _bins(Xm, G), (0.0 if strict else s)
+        best, pick = np.full(n, -np.inf), np.full(n, -1)
+
+        def take(rows, cols, Gh):
+            for g in np.unique(b[rows]):
+                m = b[rows] == g
+                rr = rows[m]
+                e = (~feas[np.ix_(rr, cols)]).mean(0) <= lim + 1e-12
+                if e.any():
+                    vals = Gh[m][:, e]
+                    up = vals.max(1) > best[rr]
+                    best[rr[up]], pick[rr[up]] = vals.max(1)[up], cols[e][vals.argmax(1)[up]]
+        take(np.arange(n), gen, Gg)
+        for h in np.unique(hv):
+            rows = np.flatnonzero(hv == h)
+            cc = np.array([c for c, bh in conds if bh != h and okc[c]], int)
+            if len(cc) and len(rows) >= 4:
+                Gc = fitted(Xm, cc, rows)[0]
+                if Gc is not None:
+                    take(rows, cc, Gc)
+        miss = pick < 0                      # no eligible plan in the bin: keep the plan chosen now
+        best[miss], pick[miss] = 0.0, j
+        share = float(over[np.arange(n), pick].mean())
+        if s > 0 and not strict and share > s + 1e-12:
+            return value(Xm, conds, strict=True)
+        return max(float(best.mean()), 0.0), df, kn, share, strict      # ignoring what is learned is always open
+
+    def shuffled():
+        idx = np.arange(n)                   # within each half, so conditional plans stay independent of their half
+        for h in np.unique(hv):
+            r = np.flatnonzero(hv == h)
+            idx[r] = r[rng.permutation(len(r))]
+        return idx
 
     todo = [(k_, "input", [k_]) for k_ in sorted(X)] + [(str(g), "group", [str(m) for m in mem])
                                                         for g, mem in (groups or {}).items()]
@@ -268,17 +322,21 @@ def analyse(nb, nb_opt, over, inputs, groups=None, max_share=0.0, level=0.95, th
                                       knots=None, noise_floor=0.0, noise_mean=0.0, above_noise_floor=False,
                                       exceeds_evpi=False, supported=False))
             continue
-        v, df, kn = value(Xm)
+        conds = cmap.get(name, [])
+        v, df, kn, psh, strict = value(Xm, conds)
         if v is None:
             out["inputs"].append(dict(rec, status="too_many_inputs", evppi=None, supported=False,
                                       reason=f"a linear fit on {len(mem)} inputs needs more than {md} degrees of "
                                              f"freedom at {n} draws"))
             continue
-        perm = np.array([value(Xm[rng.permutation(n)])[0] for _ in range(int(th["permutations"]))])
+        perm = np.array([value(Xm[shuffled()], conds)[0] for _ in range(int(th["permutations"]))])
         fl = float(np.quantile(perm, float(th["noise_quantile"])))
         above, exceeds = bool(v > fl), bool(v > evpi + tol)
         out["inputs"].append(dict(rec, status="computed", evppi=v, pct=pct(v), share_of_evpi=v / evpi if evpi > 0 else None,
                                   df=int(df), knots=int(kn), noise_floor=fl, noise_mean=float(perm.mean()),
+                                  conditional_plans=len(conds), policy_share_over_budget=psh,
+                                  policy_rule="within the budget in every draw of a bin" if strict
+                                  else "the affordability share within each bin",
                                   above_noise_floor=above, exceeds_evpi=exceeds,
                                   supported=bool(above and not exceeds and evpi > tol)))
     out["inputs"].sort(key=lambda r: (-(r["evppi"] if r.get("evppi") is not None else -1.0), r["input"]))
@@ -382,20 +440,30 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
             skipped.append({"group": g, "members": list(mem), "reason": f"not drawn inputs: {miss}"})
         else:
             groups[g] = list(mem)
-    # conditional candidates: the plan decided within the budget on each quantile bin of each valued input and group
-    G = max(1, min(int(th["bins"]), n // int(th["min_bin_draws"])))
+    # conditional candidates: the plan decided within the budget on each bin of each valued input and group, built on
+    # one half of the draws and valued on the other (cross-fitting: round 2 P1, a plan fitted to the input's own
+    # draws made an irrelevant input look valuable, and the permutation floor could not see it)
+    hv = np.zeros(n, int)
+    hv[np.random.default_rng([int(seed), 7]).permutation(n)[: n // 2]] = 1
+    G = max(1, min(int(th["bins"]), (n // 2) // int(th["min_bin_draws"])))
+    cond = {}
     for name, mem in [(k, [k]) for k in inputs] + list(groups.items()):
         Xm = np.column_stack([inputs[m] for m in mem])
         if np.all(Xm.std(0) == 0) or G < 2:
             continue
-        b = _bins(Xm, G)
-        for g in np.unique(b):
-            if notes["solves"] >= int(th["max_conditional_solves"]):
-                notes["truncated"] = True
-                break
-            c = robust(b == g)
-            if c is not None:
-                add(f"given:{name}:{g}", [at[c[i]] for i in ids_u], True)
+        for h in (0, 1):
+            R = np.flatnonzero(hv == h)
+            b = _bins(Xm[R], G)
+            for g in np.unique(b):
+                if notes["solves"] >= int(th["max_conditional_solves"]):
+                    notes["truncated"] = True
+                    break
+                m = np.zeros(n, bool)
+                m[R[b == g]] = True
+                c = robust(m)
+                if c is not None:
+                    add(f"given:{name}:h{h}:{g}", [at[c[i]] for i in ids_u], False)
+                    cond.setdefault(name, []).append((len(cand) - 1, h))
     pos = {c[0]: j for j, c in enumerate(cand)}
     ar = np.arange(len(ids_u))
     nb = np.column_stack([Bn[:, ar, ix].sum(1) for _, ix in cand])
@@ -429,14 +497,26 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
             except AnalysisBlocked as e:
                 excluded[cid] = f"model corrections bear on it at {e.where}"
                 break
+    nb_free = None
+    if s > 0:          # perfect information may overspend: each draw's best plan without the budget (round 2 P2)
+        nb_free = np.full(n, -np.inf)
+        for d, r in enumerate(rows):
+            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=float(Cs[d].max(1).sum()) + 1.0)
+            try:
+                A.guard(f"uncertainty draw {d}", [sol["choice"]], r["events"])
+                nb_free[d] = float(sol["objective"])
+            except AnalysisBlocked:
+                notes.setdefault("unbudgeted_left_out", []).append(d)
     res = analyse(nb, pi, cost > B * (1 + 1e-9), inputs, groups, s, level, thr=th, seed=seed,
-                  ids=[c[0] for c in cand], excluded=excluded, exact_id="robust" if rb is not None else None)
+                  ids=[c[0] for c in cand], excluded=excluded, exact_id="robust" if rb is not None else None,
+                  nb_free=nb_free, cond=cond, halves=hv)
     res.update(outcome=A.primary, discount_factor=float(A.dfac), budget_allocatable=B, groups=groups,
                groups_not_computed=skipped, not_drawn=not_drawn(report, A), solves=notes,
                consistency={"objective_max_abs_gap": gap},
                evppi_over=(f"the candidate set ({len(cand)} plans, including the plan decided within the budget on "
-                           f"each of {G} quantile bins of each input and group); feasibility after learning is judged "
-                           f"within those bins, so for inputs that move costs it is a lower bound"),
+                           f"each of {G} bins of each input and group in one half of the draws, valued on the other "
+                           f"half); feasibility after learning is judged within bins, so for inputs that move costs "
+                           f"it is a lower bound"),
                method={"estimator": "regression EVPPI (nonparametric, per candidate plan)", "citation": CITATION,
                        "smoother": "natural cubic regression spline, additive over a group, knots by GCV (repeated in "
                                    "every permutation)",
@@ -498,8 +578,20 @@ def contract_findings(raw: dict, unc, voi) -> list[str]:
                    f"deciding now ({vp} - {v0})")
     if ev["value"] < -at or ev["se_paired"] < 0:
         bad.append("value_of_information: a negative EVPI or standard error")
-    if cl.get(voi.get("decide_now"), {}).get("eligible") is not True or n_el != cd.get("eligible"):
-        bad.append(f"value_of_information: the plan chosen now {voi.get('decide_now')!r} is not an eligible candidate")
+    sh = voi.get("max_share_over_budget", 0.0)
+    for x in cd["list"]:
+        want = (num(x.get("draws_over_budget")) and "excluded" not in x and num(sh)
+                and x["draws_over_budget"] / draws <= sh + 1e-12)
+        if x.get("eligible") is not bool(want) or not num(x.get("expected_value")):
+            bad.append(f"value_of_information: candidate {x.get('id')!r}: eligibility or value disagrees with its "
+                       f"budget count and exclusion")
+    ch = cl.get(voi.get("decide_now")) or {}
+    best = max((x["expected_value"] for x in cd["list"] if x.get("eligible") is True
+                and num(x.get("expected_value"))), default=None)
+    if (ch.get("eligible") is not True or n_el != cd.get("eligible") or not num(ch.get("expected_value"))
+            or abs(ch["expected_value"] - v0) > at or best is None or abs(best - v0) > at):
+        bad.append(f"value_of_information: the plan chosen now {voi.get('decide_now')!r} is not the best eligible "
+                   f"candidate at the value recorded ({v0})")
     tol = float(th["exceeds_evpi_tol"]) * max(ev["value"], 0.0) + at
     need = ("evppi", "noise_floor", "noise_mean", "df", "above_noise_floor", "exceeds_evpi", "supported")
     for r in voi["inputs"]:
@@ -605,14 +697,18 @@ def _valid_doc(n=64):
 class _FakeA:
     """The parts of core.Analysis that run() reads: one solve on toolkit/alloc, the model-correction guard."""
 
-    def __init__(self, pk, budget, raw=None):
+    def __init__(self, pk, budget, raw=None, units=("u",)):
         from toolkit.alloc import optimize as aopt
-        self.aopt, self.ids, self.pk, self.budget, self.plan_budget = aopt, ["u"], {k: () for k in pk}, budget, None
-        self.feas = {"feasible": {"u": {k: True for k in pk}}, "caps": []}
+        self.aopt, self.ids, self.pk, self.budget, self.plan_budget = aopt, list(units), {k: () for k in pk}, budget, None
+        self.feas = {"feasible": {u: {k: True for k in pk} for u in units}, "caps": []}
         self.spec = type("S", (), {"raw": raw or {}})()
         self.primary, self.dfac, self.method, self.joint = "y", 1.0, "none", None
 
     def solve(self, ben, cost, budget=None, feas=None):
+        f = feas or self.feas
+        if not any(v for t in cost.values() for v in t.values()) and not f.get("links"):   # free plans: the argmax
+            ch = {u: max(ben[u], key=lambda k: (ben[u][k], -list(self.pk).index(k))) for u in ben}
+            return {"choice": ch, "objective": sum(ben[u][ch[u]] for u in ben), "status": "optimal"}
         r = self.aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp")
         if r["status"] != "optimal":
             raise RuntimeError(f"optimizer status {r['status']}")
@@ -625,16 +721,18 @@ class _FakeA:
             raise AnalysisBlocked(where, hits)
 
 
-def _fake_run(pk, ben, cost, budget, plan, sampled, events=None, thr=None, raw=None):
-    """VOI.run on draws given as per-draw {package: benefit} and {package: cost} for the one unit."""
-    A = _FakeA(pk, budget, raw)
+def _fake_run(pk, ben, cost, budget, plan, sampled, events=None, thr=None, raw=None, seed=0):
+    """VOI.run on draws given as per-draw {package: benefit} and {package: cost} for one unit, or {unit: {...}}."""
+    multi = isinstance(next(iter(ben[0].values())), dict)
+    A = _FakeA(pk, budget, raw, units=list(ben[0]) if multi else ("u",))
     col = Collector(A)
     for d, (b, c) in enumerate(zip(ben, cost)):
-        bt, ct = {"u": dict(b)}, {"u": dict(c)}
+        bt, ct = (dict(b), dict(c)) if multi else ({"u": dict(b)}, {"u": dict(c)})
         ev = (events or {}).get(d, [])
         sol = A.solve(bt, ct)
         col.add(d, sampled[d], bt, ct, sol, ev)
-    return run(A, col, {"u": plan}, None, {}, thr=dict(thresholds(), min_draws=4, **(thr or {})))
+    return run(A, col, plan if isinstance(plan, dict) else {"u": plan}, None, {}, seed=seed,
+               thr=dict(thresholds(), min_draws=4, **(thr or {})))
 
 
 def _self_test() -> int:
@@ -865,12 +963,94 @@ def _self_test() -> int:
         # (10, 0, 0), (10, 0, 0); phi tells the first two from the last two. C is optimal only given the first
         # pair: EVPPI(phi) = 0.5 once plans optimal within each value of phi are candidates.
         st = [(10, 0, 6), (0, 10, 6), (10, 0, 0), (10, 0, 0)]
-        ben = [{"A": float(st[d % 4][0]), "B": float(st[d % 4][1]), "C": float(st[d % 4][2])} for d in range(40)]
-        cost = [{"A": 0.0, "B": 0.0, "C": 0.0} for _ in range(40)]
-        r = _fake_run(["A", "B", "C"], ben, cost, 1.0, "A", [{"phi": float(d % 4 >= 2)} for d in range(40)])
+        ben = [{"A": float(st[d % 4][0]), "B": float(st[d % 4][1]), "C": float(st[d % 4][2])} for d in range(400)]
+        cost = [{"A": 0.0, "B": 0.0, "C": 0.0} for _ in range(400)]
+        r = _fake_run(["A", "B", "C"], ben, cost, 1.0, "A", [{"phi": float(d % 4 >= 2)} for d in range(400)],
+                      thr={"permutations": 20})
         e = {x["input"]: x for x in r["inputs"]}.get("phi") or {}
-        ok(abs((e.get("evppi") or 0) - 0.5) < 1e-6 and "candidate set" in str(r.get("evppi_over")),
+        ok(abs((e.get("evppi") or 0) - 0.5) < 0.05 and "candidate set" in str(r.get("evppi_over")),
            f"D10 conditional candidates: EVPPI(phi) = 0.5 over the candidate set ({e.get('evppi')}, {r.get('evppi_over')})")
+
+    def e1():
+        # E1 (round 2, P1; both reviewers' null, scaled down): units whose two options are worth independent noise in
+        # every draw, and an input unrelated to all of it. Plans decided within the input's bins are candidates;
+        # built on one half of the draws and valued on the other (cross-fitting), the input is supported in about
+        # the nominal 5% of replicates, not in nearly all of them.
+        hits, ev = 0, []
+        for k in range(30):
+            rng = np.random.default_rng(500 + k)
+            n, units = 128, [f"u{i}" for i in range(80)]
+            ben = [{u: {"a": float(rng.normal()), "b": float(rng.normal())} for u in units} for _ in range(n)]
+            cost = [{u: {"a": 0.0, "b": 0.0} for u in units} for _ in range(n)]
+            r = _fake_run(["a", "b"], ben, cost, 1.0, {u: "a" for u in units},
+                          [{"z": float(rng.normal())} for _ in range(n)], thr={"permutations": 40}, seed=k)
+            e = {x["input"]: x for x in r["inputs"]}["z"]
+            hits += bool(e["supported"])
+            ev.append(round(e["evppi"] - e["noise_floor"], 3))
+        ok(hits <= 4, f"E1 an irrelevant input with input-dependent candidates is supported in {hits} of 30 replicates "
+                      f"(at most 4; EVPPI minus floor, first five: {ev[:5]})")
+
+    def e2():
+        # E2 (round 2, P2): budget 1, treatment costs 2 in every draw and is worth 10 in ten of 40 draws; 25% of draws
+        # may overspend. Deciding now: nothing (0). Perfect information treats in those ten draws: EVPI 2.5, though
+        # no budget-constrained solve ever proposes treatment.
+        ben = [{"none": 0.0, "t": 10.0 if d < 10 else 0.0} for d in range(40)]
+        cost = [{"none": 0.0, "t": 2.0} for _ in range(40)]
+        r = _fake_run(["none", "t"], ben, cost, 1.0, "none", [{"x": float(d)} for d in range(40)],
+                      raw={"uncertainty": {"affordability": {"max_share_over_budget": 0.25}}}, thr={"permutations": 10})
+        ok(abs((r.get("evpi") or {}).get("value", -1) - 2.5) < 1e-9,
+           f"E2 perfect information may overspend with the plan solved without the budget: EVPI 2.5 ({r.get('evpi')})")
+
+    def e3():
+        # E3 (round 2, P2): 800 draws, one bin, at most 20% of draws over budget. A is worth 1 - phi and overspends in
+        # 20% of draws, all with phi < 0.5; B is worth phi and overspends in 20%, all with phi > 0.5. Choosing A below
+        # 0.5 and B above overspends in 40% of draws: the chosen policy, not each plan, must keep the share.
+        n = 800
+        phi = (np.arange(n) + 0.5) / n
+        over = np.zeros((n, 3), bool)
+        over[: n // 5, 1], over[n - n // 5:, 2] = True, True
+        nb = np.column_stack([np.zeros(n), 1 - phi, phi])
+        r = analyse(nb, np.maximum(nb[:, 0], np.where(over, -np.inf, nb).max(1)), over, {"phi": phi},
+                    max_share=0.2, thr=dict(thresholds(), min_draws=4, bins=1, permutations=10), ids=["r", "a", "b"])
+        e = r["inputs"][0]
+        ok(e.get("policy_share_over_budget") is not None and e["policy_share_over_budget"] <= 0.2 + 1e-12
+           and e["evppi"] < 0.25 - 0.01,
+           f"E3 the policy chosen after learning keeps the affordability share ({e.get('policy_share_over_budget')}, "
+           f"EVPPI {e.get('evppi')})")
+
+    def e4():
+        # E4 (round 2, P2): treatment costs 0.5 in 25 of 500 draws and 1.5 in the rest (budget 1, benefit 10): learning
+        # the cost is perfect information, so EVPPI = EVPI = 0.5; each distinct value needs its own bin.
+        n = 500
+        c = np.where(np.arange(n) < 25, 0.5, 1.5)
+        nb = np.column_stack([np.zeros(n), np.full(n, 10.0)])
+        r = analyse(nb, np.where(c < 1, 10.0, 0.0), np.column_stack([np.zeros(n, bool), c > 1]), {"cost:t": c},
+                    thr=dict(thresholds(), min_draws=4, permutations=10), ids=["none", "treat"])
+        e = r["inputs"][0]
+        ok(abs(r["evpi"]["value"] - 0.5) < 1e-9 and abs(e["evppi"] - 0.5) < 1e-6,
+           f"E4 a discrete input with no more values than bins is binned by value: EVPPI {e['evppi']} = EVPI "
+           f"{r['evpi']['value']}")
+
+    def e5():
+        # E5 (round 2, P2 gate): eligibility recomputed from the counts and exclusions; the value of deciding now is
+        # the chosen candidate's and the best eligible one
+        import copy
+        doc = _valid_doc()
+        raw, unc, nd = {}, {"draws": 64}, doc["decide_now"]
+
+        def chosen(d, **kw):
+            return dict(d, candidates=dict(d["candidates"], list=[dict(x, **kw) if x["id"] == nd else x
+                                                                   for x in d["candidates"]["list"]]))
+        muts = [("the chosen plan over budget in every draw", lambda d: chosen(d, draws_over_budget=64)),
+                ("the chosen plan excluded", lambda d: chosen(d, excluded="model corrections bear on it")),
+                ("both values shifted", lambda d: dict(d, expected_value_decide_now=d["expected_value_decide_now"] + 1000,
+                                                       expected_value_perfect_information=d[
+                                                           "expected_value_perfect_information"] + 1000)),
+                ("the baseline lowered and EVPI raised to match", lambda d: dict(
+                    d, expected_value_decide_now=d["expected_value_decide_now"] - 100,
+                    evpi=dict(d["evpi"], value=d["evpi"]["value"] + 100)))]
+        for label, m in muts:
+            ok(bool(contract_findings(raw, unc, m(copy.deepcopy(doc)))), f"E5 {label} is a finding (fail closed)")
 
     def gate():
         doc = _valid_doc()
@@ -910,7 +1090,8 @@ def _self_test() -> int:
     for label, fn in (("VI1-5 toy", toy), ("VI6-7 paired", paired), ("VI8-10 budget", budget),
                       ("VI11-13 floors", floors), ("D1", d1), ("D2", d2), ("D3", d3), ("D4", d4),
                       ("D5", d5), ("D6", d6), ("D7", d7),
-                      ("D8", d8), ("D9", d9), ("D10", d10), ("VG gate", gate)):
+                      ("D8", d8), ("D9", d9), ("D10", d10), ("E1", e1), ("E2", e2), ("E3", e3), ("E4", e4),
+                      ("E5", e5), ("VG gate", gate)):
         run_case(label, fn)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
