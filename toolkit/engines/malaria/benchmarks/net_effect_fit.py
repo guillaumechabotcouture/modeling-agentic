@@ -84,6 +84,12 @@ def plan(pack: dict) -> dict:
             "usd": [round(vcpu[0] * USD_PER_VCPU_H[0], 1), round(vcpu[1] * USD_PER_VCPU_H[1], 1)]}
 
 
+def target_bands(pack: dict) -> dict:
+    """{target: band} of the fit's targets (a benchmark outside the fit, such as a curve rule, may have no band)."""
+    t = set(pack["fit_joint"]["targets"])
+    return {b["id"]: b["band"] for b in pack["benchmarks"] if b["id"] in t}
+
+
 def regions(X: np.ndarray, Y: dict, bands: dict, groups: dict, names: list, box: np.ndarray, seed: int) -> dict:
     """Each target's quadratic surrogate (as joint-v1) on dense candidates; the hull of the region where the common
     targets and one group's targets are in band, for each group, for all at once, and for their union."""
@@ -133,7 +139,7 @@ def run(pack: dict, workers: int, out_path: str, approved: str | None, smoke: bo
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
-    bands = {b["id"]: b["band"] for b in pack["benchmarks"]}
+    bands = target_bands(pack)
     reg = regions(X, fit["design"]["computed"], bands, GROUPS, names, box, int(pack["fit_joint"]["design"]["seed"]))
     doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters (ENGINE_NOTES.md, v0.17); not adopted",
                     "smoke": smoke, "approved": approved, "plan": plan(pack), "n_sims": runner.nsims,
@@ -189,6 +195,9 @@ def _self_test() -> int:
             ok(False, f"F6 refused: {bad} {kw}")
         except ValueError:
             ok(True, f"F6 refused before any run: {'writing ' + bad if bad != 'x.yaml' else 'a full fit without --approved'}")
+    tb = target_bands(p)
+    ok(set(tb) == set(TARGETS) and all(len(v) == 2 for v in tb.values()),
+       "F8 the region step reads the bands of the fit's targets only (B16c has none; the smoke's first failure)")
     s = build_pack(base, smoke=True)
     ok(s["seeds"] == base["seeds"][:1] and s["fit_joint"]["design"]["n"] == 3
        and all(v["params"]["n_agents"] == 600 for v in s["settings"].values()),
