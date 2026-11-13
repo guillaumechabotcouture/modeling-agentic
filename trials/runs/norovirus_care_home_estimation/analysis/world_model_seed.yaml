@@ -1,0 +1,265 @@
+beliefs:
+- id: B1
+  mechanism: Final size is set by the effective reproduction number at detection (R0 x s0) through the final-size
+    relation z = s0 (1 - exp(-R0 z)) plus the seeded share; norovirus R0 in semi-closed settings is roughly 2 to
+    4, so with s0 near 1 most of the home is infected without control, and as s0 falls towards 0.4 R0 x s0 approaches
+    1 and the attack rate collapses towards the seeded share.
+  about:
+    package: none
+    feature: s0 (calibration scale)
+  direction: increases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.40528937261551623
+    - 0.9967022988945246
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation, Section 2 (location approximate)
+  - citation: Heijne JCH, Teunis P, Morroy G, et al. Enhanced hygiene measures and norovirus transmission during
+      an outbreak. Emerg Infect Dis 2009
+    location: Results, estimated reproduction numbers (exact table not recalled)
+  - citation: Steele MK, Wikswo ME, Hall AJ, et al. Characterizing norovirus transmission from outbreak data, United
+      States. Emerg Infect Dis 2020
+    location: Results, R0 estimates by setting (values not recalled precisely)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Home size has no effect on attack rate, peak week or the control''s relative reduction: the engine
+    is deterministic and closed, so outcomes scale with N once the seed is expressed as a share. Only integer rounding
+    of the seed count in the smallest homes (around 40 residents) could break this, and only slightly.'
+  about:
+    package: control
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS ONE
+      2007
+    location: renewal equation formulation, Methods
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods, renewal equation
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B3
+  mechanism: 'Control reduces infections by a moderate-to-large relative amount: when started on day 3 after detection
+    (roughly one norovirus generation, mean around 3 days), most of the outbreak is still ahead, so a hygiene /
+    cohorting bundle that cuts transmission substantially, pushing (1 - effect) R0 s0 near or below 1, averts a
+    large share of remaining infections. Evidence on bundle efficacy is observational (outbreak reports, no randomised
+    trials), so the size of the transmission cut is uncertain.'
+  about:
+    package: control
+  direction: reduces
+  magnitude:
+    band:
+    - 0.2
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Harris JP, Lopman BA, O''Brien SJ. Infection control measures for norovirus: a systematic review
+      of outbreaks in semi-enclosed settings. J Hosp Infect 2010'
+    location: 'Results / discussion: evidence largely observational (no numeric effect recalled)'
+  - citation: Heijne JCH, Teunis P, Morroy G, et al. Enhanced hygiene measures and norovirus transmission during
+      an outbreak. Emerg Infect Dis 2009
+    location: Results, reproduction number before and after measures (values not recalled precisely)
+  - citation: Vanderpas J, Louis J, Reynders M, Mascart G, Vandenberg O. Mathematical model for the control of nosocomial
+      norovirus. J Hosp Infect 2009
+    location: Results, effect of control measures on R (location approximate)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 2
+    confidence_claimed: low
+- id: B4
+  mechanism: A larger infected share at detection leaves less of the outbreak ahead on day 3 (more infections already
+    incurred or incubating, earlier peak), so the control's relative reduction decreases as seed_share rises from
+    about 0.5% to 5%.
+  about:
+    package: control
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS ONE
+      2007
+    location: renewal dynamics, Methods (mechanistic reasoning, not an empirical estimate)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Over the upper part of the susceptible-share range (s0 from about 0.6 upward), a higher s0 means faster
+    growth and a higher effective R that a fixed multiplicative cut cannot push below 1, so the control's relative
+    reduction decreases with s0. At the lowest s0 values (R0 s0 near 1) the outcome is dominated by the seeded infections
+    the control cannot avert, so the relation may be non-monotone over the full range; the turning point is located
+    only roughly (s0 around 0.4 to 0.6).
+  about:
+    package: control
+    feature: s0 (calibration scale)
+  direction: decreases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.6
+    - 0.9967022988945246
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final-size relation (mechanistic reasoning)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: The control's relative reduction increases monotonically with the bundle's effect on transmission (the
+    multiplier 1 - effect on R_t from day 3); a check that the engine wires the effect through.
+  about:
+    package: control
+    feature: effect:control
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: Methods, R_t as multiplier on the renewal equation
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: 'Peak timing: with a mean generation interval of about 3 days and R0 s0 of about 2 to 3, the uncontrolled
+    peak falls about 1 to 2 weeks after detection; it comes earlier with higher s0 and higher seed_share, and is
+    independent of home size. Low s0 (R0 s0 near 1) gives a flat, late or absent peak.'
+  about:
+    package: none
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Heijne JCH, Teunis P, Morroy G, et al. Enhanced hygiene measures and norovirus transmission during
+      an outbreak. Emerg Infect Dis 2009
+    location: serial interval estimate, Results (value recalled only roughly, about 3 to 4 days)
+  - citation: Lopman BA, Reacher MH, Vipond IB, et al. Clinical manifestation of norovirus gastroenteritis in health
+      care settings. Clin Infect Dis 2004
+    location: outbreak duration and attack rates (location not recalled)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What R0 does the spec declare for norovirus in care homes, and is s0 low enough in some homes that R0
+    x s0 < 1 (no outbreak beyond the seed)?
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: How large is the bundle's transmission cut, and is there any trial-grade evidence for it? Outbreak-report
+    estimates are observational and likely confounded by the outbreak's natural decline.
+  beliefs:
+  - B3
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Does the outcome 'infections' include the seeded infections and those before day 3? If so the relative
+    reduction is capped below 1 and is smaller at low s0 and high seed_share.
+  beliefs:
+  - B3
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Does the engine round seed counts to integers, which would make small homes differ slightly from large
+    ones?
+  beliefs:
+  - B2
+  decision_relevant: false
+- id: Q5
+  question: What is the generation interval declared (mean and length), which sets how much of the outbreak is still
+    ahead on day 3?
+  beliefs:
+  - B3
+  - B4
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B3
+  claim: The control bundle reduces infections by 20% to 70% relative to no control at most design points.
+  test:
+    kind: effect_band
+    package: control
+    band:
+    - 0.2
+    - 0.7
+    min_share: 0.6
+- id: H2
+  belief: B4
+  claim: The control's relative reduction decreases as the infected share at detection rises; refuted if it increases.
+  test:
+    kind: effect_direction
+    package: control
+    feature: seed_share
+    direction: decreases
+- id: H3
+  belief: B2
+  claim: Home size has no material association with the control's relative reduction (|rho| bound within 0.3).
+  test:
+    kind: effect_direction
+    package: control
+    feature: pop
+    direction: negligible
+    equivalence: 0.3
+- id: H4
+  belief: B5
+  claim: For s0 of 0.6 and above, the control's relative reduction decreases as the susceptible share rises.
+  test:
+    kind: effect_direction
+    package: control
+    feature: s0 (calibration scale)
+    direction: decreases
+- id: H5
+  belief: B6
+  claim: The control's relative reduction increases with its transmission effect parameter.
+  test:
+    kind: effect_direction
+    package: control
+    feature: effect:control
+    direction: increases
