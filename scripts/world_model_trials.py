@@ -511,7 +511,39 @@ def engine_read_columns(spec) -> set:
     return out
 
 
-def classify_tests(run_dir, seed, lam=None) -> dict:
+ENGINE_READS = "engine_reads.yaml"     # in a template: {features_read_via: {feature: bound attribute or column}}
+
+
+def engine_unread_features(spec_dir, reads_dir=None) -> set:
+    """Declared design features the engine never reads, from the inputs only: a feature on a units-table column
+    bound to no engine attribute (decision_units.engine_attributes), unless the template declares that it reaches
+    the engine through a derived bound attribute (engine_reads.yaml features_read_via, e.g. a susceptibility gap
+    folded into the bound s0 groups), and a calibration axis the engine card does not list. A features_read_via
+    target that is neither an engine attribute nor a bound column is refused (TrialError)."""
+    import yaml
+    from toolkit.analysis import features as FT
+    from toolkit.spec import schema
+    spec = schema.load(os.path.join(spec_dir, "decision_spec.yaml"))
+    read = engine_read_columns(spec)
+    attrs = set(spec["decision_units"].get("engine_attributes") or {})
+    attr = spec["calibration"].get("attribute")
+    via = {}
+    for d in (spec_dir, reads_dir):
+        if d and os.path.isfile(os.path.join(d, ENGINE_READS)):
+            via = (yaml.safe_load(open(os.path.join(d, ENGINE_READS))) or {}).get("features_read_via") or {}
+            break
+    bad = {f: t for f, t in via.items() if t not in read | attrs | ({attr} if attr else set())}
+    if bad:
+        raise TrialError(f"{ENGINE_READS}: features_read_via targets {bad} are neither engine attributes nor bound "
+                         f"columns ({sorted(read | attrs)})")
+    unread = {FT.name(f) for f in FT.declared(spec.raw) if isinstance(f, str) and f not in read and f not in via}
+    card_attrs = set(spec.engine().describe().to_dict().get("unit_attributes") or {})
+    if attr and attr not in card_attrs:
+        unread.add(f"{attr} (calibration scale)")
+    return unread
+
+
+def classify_tests(run_dir, seed, lam=None, template_dir=None) -> dict:
     """{hypothesis id: {class, why}} from the spec's inputs and the engine's own sweep (world_model.load_sweep,
     canonical_test and the sweep's reduction, as the build reads them). Classes, applied in world_model build
     (--set-aside): reported, counted apart, never a confirmation, never moving confidence.
@@ -526,13 +558,7 @@ def classify_tests(run_dir, seed, lam=None) -> dict:
     import numpy as np
     from toolkit.analysis import world_model as W
     sw, spec = W.load_sweep(run_dir, "current", lam, use_plan=False)
-    read = engine_read_columns(spec)
-    attr = spec["calibration"].get("attribute")
-    card_attrs = set(spec.engine().describe().to_dict().get("unit_attributes") or {})
-    from toolkit.analysis import features as FT
-    unread = {FT.name(f) for f in FT.declared(spec.raw) if isinstance(f, str) and f not in read}
-    if attr and attr not in card_attrs:
-        unread.add(f"{attr} (calibration scale)")
+    unread = engine_unread_features(run_dir, template_dir)
     by = {b["id"]: b for b in seed.get("beliefs") or []}
     out = {}
     for h in seed.get("hypotheses") or []:
@@ -964,7 +990,8 @@ def build_step(q, run_dir, anchor_ref=None) -> dict:
     import yaml
     from toolkit.analysis import world_model as W
     seed = yaml.safe_load(open(os.path.join(run_dir, SEED)))
-    aside = classify_tests(run_dir, seed, q.get("shadow_price"))
+    aside = classify_tests(run_dir, seed, q.get("shadow_price"),
+                           os.path.join(q.get("_root") or REPO, q["template"]) if q.get("template") else None)
     circ = {k: v["why"] for k, v in aside.items() if v["class"] == "circular"}
     _sio().write_nofollow(run_dir, "analysis/circular.json", json.dumps(circ, indent=1, sort_keys=True).encode(),
                           atomic=True)
@@ -998,7 +1025,7 @@ def _wait_past(at):
 def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anchor=None, task_cap_usd=2.0,
                llm_concurrency=5, engine_workers=2, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, engines=CHEAP_ENGINES,
                engine_probe=None,
-               root=None, citation_lookup=None) -> dict:
+               root=None, citation_lookup=None, engine="local") -> dict:
     """Every question through prepare, seed, register, anchor, engine and build (module docstring). Returns {id:
     trial record}; each record is also trials/runs/<id>/trial.json."""
     import queue
@@ -1066,6 +1093,10 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
                     t["anchor"] = None
                 t["steps"]["anchor"] = _now()
                 _save(rd, t)
+            if engine == "remote":           # owner, 2026-11-13: no engine compute here; a VM job runs it
+                t["status"] = "awaiting_engine"
+                _save(rd, t)
+                return record(q["id"], t)
             work.put((q, rd, t))
         except Exception as e:  # noqa: BLE001 -- recorded on the question; the others carry on
             t.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
@@ -1355,6 +1386,84 @@ def sdk_seed_fn():
     return fn
 
 
+# ---------------------------------------------------------------- the engine step in a VM job (owner, 2026-11-13)
+BATCH_FILES = ("results.jsonl", "first_seen.jsonl", "points.jsonl")     # what an imported batch brings
+
+
+def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> dict:
+    """The VM job's step: for each question, prepare its run directory from the template exactly as the laptop did
+    (the same commit's code and template give the same design), run the engine step (engine_step: the batch, then
+    record_first_seen on the VM, when the batch first appears) and keep analysis/batch/ under out_root/runs/<id>/.
+    No seed, no registration, no build: the laptop holds those."""
+    out = {}
+    for q in qs:
+        rd = os.path.join(out_root, "runs", q["id"])
+        try:
+            prepare(dict(q, shadow_price=None), rd, root, max_engine_runs)
+            e = engine_step(q, rd, max_engine_runs)
+            out[q["id"]] = dict(e, ok=True)
+        except Exception as ex:  # noqa: BLE001 -- recorded per question; the others run
+            out[q["id"]] = {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:400]}
+        os.makedirs(out_root, exist_ok=True)
+        _sio().write_nofollow(out_root, "engine_only.json", json.dumps(out, indent=1, default=str).encode(),
+                              atomic=True)
+        print(json.dumps({q["id"]: out[q["id"]]}, default=str), flush=True)
+    return out
+
+
+def import_engine(trials_root, src_root, qs, usd_total, source, ledger, repo=REPO, anchor_ref=None) -> dict:
+    """The laptop's step after a VM job: for each question awaiting its engine, the job's batch (BATCH_FILES under
+    src_root/runs/<id>/analysis/batch/) is copied into the local run directory when the job's design.json is the
+    local one byte for byte (refused otherwise), the job's real USD is charged to the spend ledger in equal shares,
+    and the question is built (build_step) and completed. The build then checks the rows' bindings (job sha256 and
+    engine identity) and dates the evidence by the VM's first-seen record, after the anchor commit."""
+    from toolkit.analysis.artifacts import sha256
+    todo = [q for q in qs if _trial(os.path.join(trials_root, "runs", q["id"])).get("status") == "awaiting_engine"]
+    share = float(usd_total) / len(todo) if todo else 0.0
+    out = {}
+    for q in todo:
+        rd = os.path.join(trials_root, "runs", q["id"])
+        t = _trial(rd)
+        src = os.path.join(src_root, "runs", q["id"], "analysis", "batch")
+        try:
+            a, b = sha256(os.path.join(src, "design.json")), sha256(os.path.join(rd, "analysis", "batch",
+                                                                                 "design.json"))
+            if a is None or a != b:
+                raise TrialError(f"{q['id']}: the job's design.json ({a}) is not the design the question was prepared "
+                                 f"and seeded with ({b})")
+            for name in BATCH_FILES:
+                if os.path.isfile(os.path.join(src, name)):
+                    data, _ = _sio().read_nofollow(src, name)
+                    _sio().write_nofollow(rd, f"analysis/batch/{name}", data, atomic=True)
+            ledger.compute(q["id"], share, source)
+            t["engine"] = {"backend": source, "imported_from": os.path.abspath(src_root), "compute_usd": share}
+            t["steps"]["engine"] = _now()
+            t["build"] = build_step(dict(q, shadow_price=(t.get("shadow_price") or {}).get("value")), rd,
+                                    anchor_ref if t.get("anchor") else None)
+            t["steps"]["build"] = _now()
+            pq = ledger.by_question().get(q["id"]) or {}
+            t.update(status="complete", spend_usd=round(pq.get("llm_usd", 0.0) + pq.get("compute_usd", 0.0), 6))
+        except Exception as ex:  # noqa: BLE001
+            t.update(status="failed", error=f"{type(ex).__name__}: {ex}"[:500])
+        _save(rd, t)
+        out[q["id"]] = {k: t.get(k) for k in ("status", "error", "spend_usd")}
+    return out
+
+
+def vm_commands(qs, per_job=5, cap_usd=3.0, prefix="wmt-b3-", store="outputs/wmt-b3") -> list[dict]:
+    """The cloud/vm_job.py commands that run the engine step of `qs`, `per_job` questions per job (one VM start-up
+    shared), each under a USD cap and a cluster name with the budget scope's prefix. Printed for the launch, never run
+    here."""
+    out = []
+    for k in range(0, len(qs), per_job):
+        ids = [q["id"] for q in qs[k:k + per_job]]
+        name, job = f"{prefix}{k // per_job + 1}", f"eng{k // per_job + 1}"
+        cmd = (f"python cloud/vm_job.py run {name} {job} --tree . --store {store}/{name} --cap-usd {cap_usd} -- "
+               f"python3 scripts/world_model_trials.py engine-only --only {','.join(ids)} --out '$JOB_OUT'")
+        out.append({"name": name, "job_id": job, "ids": ids, "cap_usd": cap_usd, "command": cmd})
+    return out
+
+
 def check_templates(qs, out_root, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> dict:
     """Each template as the run will use it (prepare, the engine step, world_model.load_sweep), with no LLM call and
     no push: a question that fails here fails before any spend."""
@@ -1410,7 +1519,7 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser(prog="world_model_trials.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "check-templates", "rebuild", "score"):
+    for name in ("run", "check-templates", "rebuild", "score", "engine-only", "import-engine", "vm-commands"):
         p = sub.add_parser(name)
         p.add_argument("--trials-dir", default=os.path.join(REPO, "trials"))
         if name != "score":
@@ -1426,6 +1535,19 @@ def main(argv=None) -> int:
     r.add_argument("--task-cap-usd", type=float, default=2.0)
     r.add_argument("--llm-concurrency", type=int, default=5)
     r.add_argument("--push", action="store_true", help="anchor registrations on origin/wm-trials (else post hoc)")
+    r.add_argument("--engine", choices=("remote", "local"), default="remote",
+                   help="remote (default; owner, 2026-11-13): stop at awaiting_engine for a VM job; local runs it here")
+    sub.choices["engine-only"].add_argument("--out", required=True, help="the VM job's output directory ($JOB_OUT)")
+    ie = sub.choices["import-engine"]
+    ie.add_argument("--from", dest="src", required=True, help="the job's collected output directory")
+    ie.add_argument("--usd", type=float, required=True, help="the job's real USD (vm_job's measured spend)")
+    ie.add_argument("--source", required=True, help="the job: coiled:<name>/<job_id>")
+    ie.add_argument("--total-cap-usd", type=float, required=True)
+    vc = sub.choices["vm-commands"]
+    vc.add_argument("--per-job", type=int, default=5)
+    vc.add_argument("--cap-usd", type=float, required=True)
+    vc.add_argument("--prefix", default="wmt-b3-")
+    vc.add_argument("--store", default="outputs/wmt-b3")
     a = ap.parse_args(argv)
     os.environ.setdefault("OMP_NUM_THREADS", "2")
     if a.cmd == "score":
@@ -1439,6 +1561,21 @@ def main(argv=None) -> int:
             print(json.dumps({i: r}, default=str))
         score(a.trials_dir)
         return 0 if all(r["status"] != "failed" for r in res.values()) else 1
+    if a.cmd == "engine-only":
+        res = engine_only(qs, os.path.expandvars(a.out), REPO, a.max_engine_runs)
+        return 0 if all(v["ok"] for v in res.values()) else 1
+    if a.cmd == "vm-commands":
+        for c in vm_commands(qs, a.per_job, a.cap_usd, a.prefix, a.store):
+            print(c["command"])
+        return 0
+    if a.cmd == "import-engine":
+        res = import_engine(a.trials_dir, a.src, qs, a.usd, a.source,
+                            SpendLedger(os.path.join(a.trials_dir, "spend.jsonl"), a.total_cap_usd), REPO,
+                            f"refs/remotes/{REMOTE}/{BRANCH}")
+        for i, r in res.items():
+            print(json.dumps({i: r}, default=str))
+        score(a.trials_dir)
+        return 0 if all(r["status"] == "complete" for r in res.values()) else 1
     if a.cmd == "check-templates":
         res = check_templates(qs, os.path.join(a.trials_dir, "checks"), a.max_engine_runs)
         return 0 if all(v["ok"] for v in res.values()) else 1
@@ -1447,14 +1584,14 @@ def main(argv=None) -> int:
                        trials_rel=os.path.relpath(os.path.realpath(a.trials_dir), os.path.realpath(REPO))) \
         if a.push else None
     res = run_trials(qs, a.trials_dir, REPO, sdk_seed_fn(), led, anchor, a.task_cap_usd, a.llm_concurrency, 2,
-                     a.max_engine_runs)
+                     a.max_engine_runs, engine=a.engine)
     for i, t in res.items():
         print(json.dumps({"id": i, "status": t.get("status"), "spend_usd": t.get("spend_usd"),
                           "error": t.get("error")}, default=str))
     print(json.dumps({"committed_usd": round(led.committed(), 4), "total_cap_usd": led.cap}))
     S = score(a.trials_dir)
     print(json.dumps(S["overall"]["hypotheses"], default=str))
-    return 0 if all(t.get("status") == "complete" for t in res.values()) else 1
+    return 0 if all(t.get("status") in ("complete", "awaiting_engine") for t in res.values()) else 1
 
 
 # ---------------------------------------------------------------- self-test

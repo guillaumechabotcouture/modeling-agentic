@@ -1,0 +1,168 @@
+threshold:
+  usd_per_daly: 1000.0
+  source: 'WHO-CHOICE convention: an intervention averting a DALY for less than 1 x GDP per capita is very cost-effective
+    (Hutubessy R, Chisholm D, Tan-Torres Edejer T. Generalized cost-effectiveness analysis for national-level priority-setting
+    in the health sector. Cost Eff Resour Alloc 2003;1:8), applied to one declared synthetic setting with GDP per
+    capita US$1,000 for every trial question. Woods et al. (Value Health 2016) and Ochalek et al. (BMJ Glob Health
+    2018) argue that thresholds based on health opportunity costs in low- and middle-income countries are lower,
+    so this threshold favours the costlier option.'
+outcome_types:
+  malaria_clinical_case:
+    dalys: 0.19
+    source: 'World Malaria Report 2023: 249 million cases and 608,000 deaths in 2022, so deaths per case 0.0024,
+      about 76% under five: YLL 0.0024 x (0.76 x 86 + 0.24 x 55) = 0.19; YLD 0.051 (infectious disease, acute episode,
+      moderate; Salomon et al. Lancet Glob Health 2015) x 3/365 = 0.0004'
+  measles_infection:
+    dalys: 0.86
+    source: 'uncertain: case fatality 1% assumed, within the community-based range reviewed by Wolfson et al. (Int
+      J Epidemiol 2009); child deaths, YLL 0.01 x 86 = 0.86; YLD 0.051 x 10/365 = 0.0014 (Salomon et al. 2015);
+      measles infections are almost all clinical cases'
+  influenza_hospitalisation:
+    dalys: 0.8
+    source: 'uncertain: in-hospital case fatality 4% assumed, deaths at a mean remaining life expectancy of about
+      20 years: YLL 0.04 x 20 = 0.80; YLD 0.133 (infectious disease, acute episode, severe; Salomon et al. 2015)
+      x 7/365 = 0.003'
+  influenza_infection:
+    dalys: 0.006
+    source: 'Iuliano et al. (Lancet 2018): 291,000-646,000 seasonal influenza respiratory deaths a year, against
+      about 1 billion infections a year (WHO estimate): deaths per infection about 0.00047, mostly aged 65 or over
+      (YLL about 12): 0.0056; YLD: half symptomatic x 0.051 x 5/365 = 0.0004. Used for a respiratory pathogen of
+      seasonal-influenza severity where the question gives no severity'
+  dengue_infection:
+    dalys: 0.003
+    source: 'Stanaway et al. (Lancet Infect Dis 2016; GBD 2013): 1.14 million dengue DALYs a year; Bhatt et al.
+      (Nature 2013): about 390 million infections a year: 1.14 / 390 = 0.003 per infection (apparent and inapparent)'
+  dengue_case:
+    dalys: 0.02
+    source: 'Stanaway et al. (Lancet Infect Dis 2016; GBD 2013): 1.14 million DALYs over 58.4 million symptomatic
+      cases a year: 0.0195 per symptomatic case'
+  tb_prevalent_case_year:
+    dalys: 3.5
+    source: 'one prevalent bacteriologically confirmed TB case left untreated for a year: YLD 0.333 (tuberculosis,
+      without HIV; Salomon et al. 2015) x 1 = 0.33; death hazard from Tiemersma et al. (PLoS One 2011) 10-year case
+      fatality without treatment of about 70% (smear-positive) and 20% (smear-negative): annual hazard 0.12 and
+      0.022, mix 60/40 = 0.08 a year, x YLL 40 = 3.2'
+  tb_incident_case:
+    dalys: 5.1
+    source: 'WHO Global Tuberculosis Report 2023: 10.6 million cases and 1.3 million deaths in 2022, deaths per
+      case 0.12 x YLL 40 = 4.9; YLD 0.333 x 0.6 years (until cure) = 0.2'
+  hiv_infection:
+    dalys: 10.0
+    source: 'uncertain: lifetime DALYs of one new infection in a setting with partial ART access, assumed 10 (published
+      estimates range roughly 5 to 25 depending on ART access, age at infection and discounting): years lived with
+      HIV on ART at 0.078 (AIDS with antiretroviral treatment; Salomon et al. 2015) for about 30 years = 2.3, plus
+      about 8 years of life lost'
+  cholera_case:
+    dalys: 1.5
+    source: 'Ali et al. (PLoS Negl Trop Dis 2015): 2.86 million cases and 95,000 deaths a year in endemic countries,
+      case fatality 0.033 x YLL 45 = 1.5; YLD 0.247 (diarrhoea, severe; Salomon et al. 2015) x 4/365 = 0.003'
+  severe_diarrhoea_hospitalisation_child:
+    dalys: 0.87
+    source: 'uncertain: in-hospital case fatality of severe diarrhoea in children under five assumed 1%: YLL 0.01
+      x 86 = 0.86; YLD 0.247 (diarrhoea, severe; Salomon et al. 2015) x 5/365 = 0.003'
+  hpv_persistent_infection:
+    dalys: 0.46
+    source: 'uncertain: share of persistent HPV 16/18 infections progressing to invasive cervical cancer assumed
+      2%, x 23 DALYs per cervical cancer case (row cervical_advanced_cancer)'
+  cervical_advanced_cancer:
+    dalys: 23.0
+    source: 'uncertain: case fatality of advanced cervical cancer in low-resource settings assumed 65% (five-year
+      survival about 35%), deaths around age 50 (YLL 35): 22.8; YLD 0.288 (cancer, diagnosis and primary therapy;
+      Salomon et al. 2015) x 1 year + 0.540 (terminal phase) x 0.1 = 0.34'
+  lf_mf_person_year:
+    dalys: 0.027
+    source: 'uncertain: lymphatic filariasis DALYs (about 1.4 million a year, GBD 2017) over about 51 million infected
+      people (WHO Weekly Epidemiological Record 2019): 0.027 per infected person-year; microfilaraemia itself carries
+      almost no disability, the DALYs come from lymphoedema and hydrocele'
+  trachoma_ocular_infection_year:
+    dalys: 0.002
+    source: 'uncertain (assumption): ocular chlamydial infection carries no disability weight of its own; its burden
+      is trichiasis and blindness (0.187; Salomon et al. 2015) decades later in a small share of repeatedly infected
+      people; 0.002 DALYs per infection person-year assumed as an order of magnitude'
+  hcv_viraemic_person_year:
+    dalys: 0.11
+    source: 'WHO Global progress report on HIV, viral hepatitis and STIs 2021: 58 million people with chronic hepatitis
+      C and about 290,000 deaths in 2019: YLL 290,000 x 20 = 5.8 million, plus about 0.5 million YLD from cirrhosis
+      and liver cancer (assumed), / 58 million = 0.11 per viraemic person-year'
+  wasted_child_year:
+    dalys: 2.0
+    source: 'uncertain: Olofin et al. (PLoS One 2013) pooled hazard ratio of death about 3.4 for moderate wasting;
+      at a mortality of about 1.5% a year in children aged 6-23 months, excess deaths 0.036 a year x YLL 86 = 3.1,
+      reduced to 2.0 for residual confounding (assumption); YLD of wasting ignored'
+  cdi_case:
+    dalys: 0.78
+    source: 'Lessa et al. (N Engl J Med 2015): 453,000 Clostridioides difficile infections and 29,300 deaths in
+      the United States in 2011, deaths per case 0.065 x YLL 12 (mostly older adults) = 0.78; YLD 0.247 x 10/365
+      = 0.007'
+  schisto_infection_year:
+    dalys: 0.01
+    source: 'uncertain: schistosomiasis DALYs (about 1.9 million a year, GBD 2016) over about 190 million infected
+      people (WHO): 0.01 per infected person-year'
+  vl_case:
+    dalys: 3.0
+    source: 'uncertain: visceral leishmaniasis is fatal in over 95% of cases without treatment (WHO fact sheet);
+      with a treatment programme case fatality assumed 5%, young deaths (YLL 60): 3.0; YLD 0.133 x 0.25 years =
+      0.03'
+  typhoid_case:
+    dalys: 0.69
+    source: 'Stanaway et al. (Lancet Infect Dis 2019; GBD 2017): typhoid and paratyphoid fevers 14.3 million cases
+      and 9.8 million DALYs in 2017: 0.69 per case'
+  ebola_infection:
+    dalys: 20.0
+    source: 'WHO situation reports on the 2014-2016 West Africa outbreak: about 28,600 cases and 11,300 deaths,
+      case fatality 0.40 x YLL 50 = 20; YLD 0.133 x 30/365 = 0.01'
+  diphtheria_infection:
+    dalys: 2.1
+    source: 'arithmetic: about half of infections clinical x case-fatality about 7% among clinical cases (Truelove
+      SA et al. Clin Infect Dis 2020;71:89-97 report pooled case fatality of this order among unvaccinated cases)
+      x 60 years of life lost per death = 2.1; disability while ill negligible beside it'
+  rubella_crs_case:
+    dalys: 32.0
+    source: 'arithmetic: about 30% die in infancy x about 65 years of life lost, plus about 70% surviving with lifelong
+      hearing, visual or intellectual impairment at a disability weight about 0.3 (Salomon JA et al. Disability
+      weights for the Global Burden of Disease 2013 study. Lancet Glob Health 2015;3:e712-e723) for about 60 years:
+      0.3 x 65 + 0.7 x 0.3 x 60 = about 32'
+  mumps_infection:
+    dalys: 0.0015
+    source: 'arithmetic: about 70% symptomatic x disability weight 0.051 for a moderate infectious disease episode
+      (Salomon JA et al. Lancet Glob Health 2015;3:e712-e723) x about 14 days (0.038 years) = 0.0014, plus rare
+      orchitis and meningitis: about 0.0015'
+  pertussis_infant_hospitalisation:
+    dalys: 0.7
+    source: 'arithmetic: case fatality about 1% among hospitalised infants x about 70 years of life lost = 0.7,
+      plus disability weight 0.133 for a severe episode (Salomon JA et al. Lancet Glob Health 2015;3:e712-e723)
+      x 3 weeks = 0.008'
+  yellow_fever_infection:
+    dalys: 2.8
+    source: 'arithmetic: about 15% of infections severe x about 47% case fatality among severe cases (Johansson
+      MA, Vasconcelos PFC, Staples JE. The whole iceberg: estimating the incidence of yellow fever virus infection
+      from the number of severe cases. Trans R Soc Trop Med Hyg 2014;108:482-487) x 40 years of life lost = 2.8'
+  child_death_u5:
+    dalys: 87.0
+    source: 'years of life lost per death at about age 1 against the GBD reference life table (life expectancy at
+      birth about 88 years: GBD 2019 Demographics Collaborators. Global age-sex-specific fertility, mortality, healthy
+      life expectancy (HALE), and population estimates in 204 countries and territories, 1950-2019. Lancet 2020;396:1160-1203)'
+  meningococcal_case:
+    dalys: 7.8
+    source: 'case fatality about 10% (WHO meningitis fact sheet) x about 55 years of life lost at a median age near
+      10 = 5.5, plus disabling sequelae in about 15% of survivors (Edmond K et al. Global and regional risk of disabling
+      sequelae from bacterial meningitis: a systematic review and meta-analysis. Lancet Infect Dis 2010;10:317-28)
+      x disability weight about 0.3 (Salomon JA et al. Disability weights for the Global Burden of Disease 2013
+      study. Lancet Glob Health 2015;3:e712-23) x 50 years = 2.25; undiscounted'
+  hepatitis_a_symptomatic_case:
+    dalys: 0.09
+    source: 'acute hepatitis as an infectious disease, acute episode, severe (DW 0.133, Salomon 2015) x 4 weeks
+      = 0.010, plus fulminant hepatitis fatality about 0.2% of symptomatic adult cases (Lemon SM. Type A viral hepatitis:
+      new developments in an old disease. N Engl J Med 1985;313:1059-67) x 40 years = 0.08; undiscounted'
+  chikungunya_infection:
+    dalys: 0.014
+    source: 'about 75% of infections symptomatic x (acute illness DW 0.051 x 10 days = 0.0014, plus chronic arthralgia
+      in about 30% of cases x DW 0.117 (musculoskeletal, mild; Salomon 2015) x 6 months = 0.0176; chronic share
+      from Rodriguez-Morales AJ et al. Prevalence of post-chikungunya infection chronic inflammatory arthritis:
+      a systematic review and meta-analysis. Arthritis Care Res 2016;68:1849-58) = 0.014; undiscounted'
+  low_birthweight_birth:
+    dalys: 2.0
+    source: 'excess neonatal mortality of low birthweight births about 3 percentage points against normal birthweight
+      in low-income settings x about 65 years of life lost = 2.0 (order of magnitude; Lawn JE et al. Every Newborn:
+      progress, priorities, and potential beyond survival. Lancet 2014;384:189-205); later-life morbidity not counted;
+      undiscounted'

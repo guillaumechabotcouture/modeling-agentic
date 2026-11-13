@@ -1,0 +1,182 @@
+# World-model trial template (ebola_tracing_threshold, batch 3): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. An Ebola-like outbreak
+  is under way in 24 districts at the start of 2026 (basic reproduction number about 2 without control; the share
+  of residents still susceptible is uncertain, 60-100%). Each district can run contact tracing and isolation at
+  one of two intensities from week 2: TRACE50 (about half of contacts traced, US$1.50 per resident) or TRACE80 (about
+  four in five contacts traced, US$4 per resident), or keep only passive case isolation. The budget is US$25 million.
+  Input file: units.csv (population, infections at the start as a share of the population). Choose the intensity
+  per district that maximises infections averted in 2026 within the budget, report the total with a 95% uncertainty
+  interval, and state the rule (at what coverage does the effective reproduction number fall below one, and where
+  does the extra cost of TRACE80 buy control?).'
+decision_maker: national outbreak response coordinator (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.renewal.engine:RenewalEngine
+  config:
+    dt: week
+    generation_interval:
+    - 0.1
+    - 0.3
+    - 0.3
+    - 0.2
+    - 0.1
+    transmissibility: constant
+    components:
+      trace50:
+        start: 2026.03833
+        stop: 2027.0
+      trace80:
+        start: 2026.03833
+        stop: 2027.0
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+    seed:
+      column: seed_share
+options:
+  populations:
+    total: pop
+  components:
+    trace50:
+      group: intensity
+    trace80:
+      group: intensity
+  packages:
+    none: []
+    trace50:
+    - trace50
+    trace80:
+    - trace80
+  engine_map:
+    trace50:
+      trace50: 1
+    trace80:
+      trace80: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: trace50_cost
+    component: trace50
+    value: 1.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - trace50
+  - id: trace80_cost
+    component: trace80
+    value: 4.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - trace80
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 25000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- infections
+engine_parameters:
+  effect:trace50:
+    value: 0.2
+    range:
+    - 0.1
+    - 0.3
+    dist: uniform
+    basis: literature
+    source: Fraser C, Riley S, Anderson RM, Ferguson NM. Factors that make an infectious disease outbreak controllable.
+      Proc Natl Acad Sci USA 2004;101:6146-51 (the share of transmission prevented by tracing and isolation scales
+      with the share of contacts traced and the share of transmission before symptoms; ranges here derived, wide)
+    reason: share of transmission prevented
+  effect:trace80:
+    value: 0.38
+    range:
+    - 0.25
+    - 0.5
+    dist: uniform
+    basis: literature
+    source: Fraser C, Riley S, Anderson RM, Ferguson NM. Factors that make an infectious disease outbreak controllable.
+      Proc Natl Acad Sci USA 2004;101:6146-51 (the share of transmission prevented by tracing and isolation scales
+      with the share of contacts traced and the share of transmission before symptoms; ranges here derived, wide)
+    reason: share of transmission prevented
+calibration:
+  method: emulator_inversion
+  attribute: s0
+  scale: linear
+  range:
+  - 0.6
+  - 1.0
+  target_column: s0_survey
+  window:
+  - 2026.0
+  - 2026.1
+  metric: s_start
+  target_uncertainty:
+    region_sd_logit: 0.2
+  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share
+    spans R_eff = 2 s0 from 1.2 to 2.0'
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: id
+    package: package
+    value: infections_averted
+  headline:
+    name: infections_averted
+    outcome: infections
