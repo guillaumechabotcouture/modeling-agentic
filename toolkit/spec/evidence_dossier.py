@@ -359,11 +359,11 @@ def _calibrated_by_run(r: dict, run: dict) -> str | None:
     m = cal.get("method")
     if m in (None, "none"):
         return None
-    if r["kind"] == "parameter" and r["name"] in (cal.get("parameters") or []):
-        return m
     if r["kind"] == "unit_attribute" and cal.get("attribute") == r["name"]:
-        return m
-    return None
+        return m                    # every method fits the calibration attribute per unit
+    if r["kind"] == "parameter" and m in ("likelihood", "posterior") and r["name"] in (cal.get("parameters") or []):
+        return m                    # Likelihood (and the posterior built on it) fits calibration.parameters
+    return None                     # emulator_inversion fits the attribute only
 
 
 # ----------------------------------------------------------------------------------- advice (shown, never refused)
@@ -620,24 +620,72 @@ def _engine_files(ref: str, cfg: dict) -> set:
     return {p for p in out if isinstance(p, str) and os.path.isfile(p)}
 
 
+def _execution_input_paths(run: dict, run_dir: str | None) -> list:
+    """The data files execution reads for this spec, from its own resolvers (Spec.resolve semantics: extensionless,
+    absolute and parent-relative paths included; outputs are never named here): the units table and every
+    calibration target table (toolkit/analysis/burden.py calibration_inputs), the joint calibration's tables
+    (joint_calibration.inputs), the burden reference file (burden.csv_path) and an estimates spec's generation
+    interval table. A resolver that cannot read its section is skipped only when the section is absent."""
+    from toolkit.spec import schema
+    s = schema.Spec(run, run_dir or os.getcwd(), os.path.join(run_dir, "decision_spec.yaml") if run_dir else None)
+    out = []
+    try:
+        from toolkit.analysis import burden as BV
+        out += [x["path"] for x in BV.calibration_inputs(s)]
+        if BV.section(s.raw) and BV.config(s).get("csv"):
+            out.append(BV.csv_path(s))
+    except (KeyError, TypeError, AttributeError):
+        pass
+    try:
+        from toolkit.analysis import joint_calibration as JC
+        out += list(JC.inputs(s))
+    except (KeyError, TypeError, AttributeError):
+        pass
+    gi = ((run.get("dynamics") or {}).get("generation_interval") or {}) if isinstance(run.get("dynamics"), dict) else {}
+    if isinstance(gi, dict) and isinstance(gi.get("csv"), str):
+        out.append(s.resolve(gi["csv"]))
+    return sorted({p for p in out if isinstance(p, str) and p})
+
+
 def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: list) -> dict:
-    """{"run:<path>" | "tree:<path>": sha256} of every file the run reads for this spec: the spec; every path the spec
-    names that resolves to a file in the run (its units table, calibration targets and data, reference files); the
-    evidence dossier; the derivation record and the outputs it lists; and each engine's files from the code tree (its
-    priors, fitted values, benchmark results and pack, attribute binding, card and declarations). Bound at signing
-    and recorded on the sheet: any change after signing makes the run stale."""
+    """{"run:<path>" | "abs:<path>" | "tree:<path>": sha256} of every file the run reads for this spec: the spec; the
+    data files execution resolves as inputs (_execution_input_paths); the evidence dossier; the derivation record and
+    the outputs it lists; and each engine's files from the code tree (priors, fitted values, benchmark results and
+    pack, attribute binding, card, declarations). Recorded and checked for every signed run, whether or not it needs a
+    dossier; any change after signing makes it stale. An absent file is recorded as "absent"."""
     out = {"run:decision_spec.yaml": sha(spec)}
-    for leaf in _string_leaves(run):
-        s_ = leaf.strip()
-        if not s_ or len(s_) > 300 or os.path.isabs(s_) or ".." in s_.replace("\\", "/").split("/") \
-                or "\n" in s_ or "." not in os.path.basename(s_):
-            continue
+
+    def put(path):
+        rd = os.path.realpath(run_dir) if run_dir else None
+        rp = os.path.realpath(path) if os.path.isabs(path) or run_dir is None else os.path.realpath(path)
+        if rd and (rp == rd or rp.startswith(rd + os.sep)):
+            rel = os.path.relpath(rp, rd)
+            try:
+                b = read(rel)
+            except ValueError:
+                b = None
+            out[f"run:{rel}"] = sha(b) if b is not None else "absent"
+        elif rd is None and not os.path.isabs(path):
+            try:
+                b = read(path)
+            except ValueError:
+                b = None
+            out[f"run:{os.path.normpath(path)}"] = sha(b) if b is not None else "absent"
+        else:
+            try:
+                with open(rp, "rb") as f:
+                    out[f"abs:{rp}"] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                out[f"abs:{rp}"] = "absent"
+    for pth in _execution_input_paths(run, run_dir):
+        put(pth)
+    rel = dossier_reference(run)
+    if rel:
         try:
-            b = read(s_)
+            b = read(rel)
         except ValueError:
             b = None
-        if b is not None:
-            out[f"run:{s_}"] = sha(b)
+        out[f"run:{rel}"] = sha(b) if b is not None else "absent"
     try:
         rec = read("data/derivations_record.json")
     except ValueError:
@@ -654,7 +702,7 @@ def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: li
                     b = read(str(o))
                 except ValueError:
                     b = None
-                out[f"run:{o}"] = sha(b)
+                out[f"run:{o}"] = sha(b) if b is not None else "absent"
     root = os.path.realpath(ROOT)
     for ref, cfg in engines:
         try:
@@ -662,12 +710,26 @@ def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: li
         except Exception as e:  # noqa: BLE001
             out[f"tree:<{ref}>"] = f"unreadable: {type(e).__name__}"
             continue
-        for p in sorted(files):
-            rp = os.path.realpath(p)
+        for p_ in sorted(files):
+            rp = os.path.realpath(p_)
             key = "tree:" + (os.path.relpath(rp, root) if rp.startswith(root + os.sep) else rp)
             with open(rp, "rb") as f:
                 out[key] = hashlib.sha256(f.read()).hexdigest()
     return dict(sorted(out.items()))
+
+
+def _closure_changes(signed: dict, current: dict) -> list:
+    """The closure members that changed since signing. Run data must match exactly (a member added, removed or
+    changed). Engine files follow the subset rule of the required inputs: after ENGINE_CHOICE the files of an engine
+    not chosen are not 'deleted'; a current engine file must be one signed, unchanged."""
+    out = []
+    for k in sorted(set(signed) | set(current)):
+        if k.startswith("tree:"):
+            if k in current and signed.get(k) != current[k]:
+                out.append(k)
+        elif signed.get(k) != current.get(k):
+            out.append(k)
+    return out
 
 
 def closure_digest(closure: dict) -> str:
@@ -824,7 +886,11 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
     except Exception as e:  # noqa: BLE001
         engines, coverage = [], coverage + [f"the engines that may run cannot be resolved ({type(e).__name__}: {e})"]
     decls = {ref: declaration_sha256(ref) for ref, _ in engines}
-    closure = input_closure(run, spec, read, run_dir, engines) if needed else {}
+    # The run's data inputs are bound for every run, whether it needs a dossier or not. The engine's files (priors,
+    # fitted values, benchmarks, card, declarations) are bound when the evidence is attested against them (needed); a
+    # run that attests none keeps the analysis's own provenance check of those files (benchmark_sources: refit
+    # required) as their guard.
+    closure = input_closure(run, spec, read, run_dir, engines if needed else [])
     binding = {"files": {rel: sha(data) if data is not None else None} if rel else {},
                "record": {"required": sorted(req), "dossier": rel,
                           "sha256": sha(data) if rel and data is not None else None, "declarations": decls,
@@ -891,7 +957,7 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
                         coverage.append(f"the decision-input declaration of {ref} changed since signing (its content "
                                         "sha256 differs): re-sign the spec with the dossier checked against it")
                 signed_cl = ev.get("closure") if isinstance(ev.get("closure"), dict) else {}
-                diff = sorted(k for k in set(signed_cl) | set(closure) if signed_cl.get(k) != closure.get(k))
+                diff = _closure_changes(signed_cl, closure)
                 if diff:
                     changed.append("the run's inputs changed since signing (input closure): " + ", ".join(diff[:8])
                                    + (f" and {len(diff) - 8} more" if len(diff) > 8 else ""))

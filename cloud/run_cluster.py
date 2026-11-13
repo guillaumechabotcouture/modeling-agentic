@@ -4738,7 +4738,10 @@ def _self_test_sheet(ok) -> None:
     def rec_for(sp, ev=None):
         return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
                            "evidence": ev or {"required": [], "dossier": None, "sha256": None,
-                                                 "declarations": {}, "closure": {}}}).encode()
+                                                 "declarations": {}, "closure": dict(sorted({   # its input closure
+                                                     "run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                                                     "run:data/derivations_record.json":
+                                                         hashlib.sha256(rec).hexdigest()}.items()))}}).encode()
     signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
                                           f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
