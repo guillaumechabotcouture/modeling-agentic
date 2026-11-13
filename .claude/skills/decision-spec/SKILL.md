@@ -219,8 +219,12 @@ departure for the owner to sign, never a silent one:
          decision_test: <an analysis.decision_tests id that varies that effect>}
       - {engine: <card name>, component: <engine component>, reason: "...", decision_test: <id>}
 
-The decision test must vary the related effect: a parameter_value test on an effect parameter the coverage file
-names for it, or an interaction_rescale test naming the component. Only the owner's signature makes a departure
+The decision test must run on this run's path and change the related effect
+(toolkit/spec/preconditions.py `decision_test_runs`): a parameter_value test on an effect parameter the coverage
+file names for it, with values that differ from the point value and, on the emulator path, on an emulator input
+(a fitted parameter, a drawn prior or a spec value); or an interaction_rescale test that names the component in
+`components` (not only `with_any`), whose benchmark has arm ratios in the verified record. Only components some
+allowed package holds are checked. Only the owner's signature makes a departure
 count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
 limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
 fit target out of band means the engine's fit failed; it gates the same way.

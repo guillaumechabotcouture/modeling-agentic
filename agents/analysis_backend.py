@@ -755,8 +755,8 @@ def _self_test_benchmark_gate(ok) -> None:
     from toolkit.spec import schema, signoff
     TOY = "toolkit.engines.contract:ToyEngine"
     cov = {"engine": "toy", "absent_values": {"a": [0], "b": [0]},
-           "benchmarks": {"T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none"},
-                          "T2": {"covers": {"b": [1]}, "estimand": "effect_vs_none"},
+           "benchmarks": {"T1": {"covers": {"a": [1]}, "estimand": "effect_vs_none", "effect_parameters": ["eff_a"]},
+                          "T2": {"covers": {"b": [1]}, "estimand": "effect_vs_none", "effect_parameters": ["eff_b"]},
                           "T3": {"covers": {}, "covers_none_because": "the baseline burden, not a component"}}}
     rows_in = [{"id": "T1", "metric": "a vs none", "role": "held_out", "status": "out_of_band", "computed": 0.3,
                 "band": [0.5, 0.7]},
@@ -766,19 +766,38 @@ def _self_test_benchmark_gate(ok) -> None:
                 "band": [1, 2]}]
     dt1 = {"id": "DT1", "type": "interaction_rescale", "components": ["b"], "with_any": ["a"], "values": [1.0, 3.0],
            "text": "Does the plan change?"}
-    dep = {"engine": "toy", "benchmark": "T1", "reason": "the trial measured a different product", "decision_test": "DT1"}
+    # review round 2: the departure's test must run on the run's path and change the departed effect (eff_a is a
+    # fitted parameter, so an emulator input); DT1 names `a` only in with_any, so it does not count for T1
+    dta = {"id": "DTa", "type": "parameter_value", "parameter": "eff_a", "values": [0.4, 0.6], "text": "a's effect"}
+    dep = {"engine": "toy", "benchmark": "T1", "reason": "the trial measured a different product", "decision_test": "DTa"}
     with tempfile.TemporaryDirectory() as d:
-        cp, rp = os.path.join(d, "benchmark_coverage.yaml"), os.path.join(d, "results.yaml")
-        yaml.safe_dump(cov, open(cp, "w"))
+        os.makedirs(os.path.join(d, "cov", "benchmarks"))
+        cp, rp = os.path.join(d, "cov", "benchmark_coverage.yaml"), os.path.join(d, "results.yaml")
+        pp = os.path.join(d, "cov", "benchmarks", "pack.yaml")
+        from toolkit.engines.benchmark_sources import band_digest
+
+        def write_cov(c, band=(0.5, 0.7)):
+            """the coverage file and the pack it was written for (same ids; one declaration per benchmark)"""
+            yaml.safe_dump(c, open(cp, "w"))
+            yaml.safe_dump({"engine": TOY, "benchmarks": [{"id": i, "metric": i, "band": list(band), "estimand":
+                                                           {"type": "ratio", "num": "x", "den": "y"}}
+                                                          for i in c["benchmarks"]]}, open(pp, "w"))
+        write_cov(cov)
         BCmod.OVERRIDES[TOY] = cp
         try:
             def write_results(rows, **change):
+                pk = yaml.safe_load(open(pp))
+                decl = {b["id"]: b for b in pk["benchmarks"]}
+                rows = [dict(r, band_sha256=band_digest(decl[r["id"]], pk)) if r["id"] in decl else r for r in rows]
                 doc = B.stamp({"benchmarks": rows}, ToyEngine(results_path=rp))
                 doc["engine_identity"].update(change)
                 yaml.safe_dump(doc, open(rp, "w"))
             write_results(rows_in)
             entry = [(TOY, None, lambda s: {"results_path": rp})]
-            spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}}, "analysis": {"decision_tests": [dt1]}}
+            dti = {"id": "DTI", "type": "interaction_rescale", "components": ["a"], "with_any": ["b"],
+                   "benchmark": "T2", "values": [1.0, 2.0], "text": "interaction"}
+            spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}},
+                       "analysis": {"decision_tests": [dt1, dta, dti]}}
             spec_b = dict(spec_ab, options={"engine_map": {"b": {"b": 1}}})
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("T1" in w and "out_of_band" in w and "held-out validation" in w
@@ -798,9 +817,27 @@ def _self_test_benchmark_gate(ok) -> None:
                f"({r.get('departures')})")
             other = {"id": "DT2", "type": "parameter_value", "parameter": "k", "values": [0.5, 1.0], "text": "k"}
             r = eligible_engines(dict(spec_ab, engine_departures=[dict(dep, decision_test="DT2")],
-                                      analysis={"decision_tests": [dt1, other]}), entry, departures="proposed")[0]
-            ok(not r["eligible"] and any("does not vary this effect" in w for w in r["why_not"]),
+                                      analysis={"decision_tests": [dt1, dta, other]}), entry, departures="proposed")[0]
+            ok(not r["eligible"] and any("does not count" in w for w in r["why_not"]),
                f"G3c a departure whose decision test does not vary the related effect does not count ({r['why_not']})")
+            r = eligible_engines(dict(spec_ab, engine_departures=[dict(dep, decision_test="DT1")]), entry,
+                                 departures="proposed")[0]
+            ok(not r["eligible"] and any("with_any" in w for w in r["why_not"]),
+               f"G3d an interaction test that names the departed component only in with_any does not count "
+               f"({r['why_not'][-1:]})")
+            r = eligible_engines(dict(spec_ab, engine_departures=[dict(dep, decision_test="DTI")]), entry,
+                                 departures="proposed")[0]
+            ok(not r["eligible"] and any("arm" in w for w in r["why_not"]),
+               f"G3e an interaction test whose benchmark has no arm ratios would not run, so it does not count "
+               f"({r['why_not'][-1:]})")
+            from toolkit.spec import preconditions as PC
+            sp_em = schema.Spec(dict(spec_ab, engine={"ref": TOY, "config": {"results_path": rp}},
+                                     analysis=dict(spec_ab["analysis"], evaluation="emulator",
+                                                   decision_tests=[dta, other])), d)
+            ok(PC.decision_test_runs(sp_em, "DTa", {"parameters": ["eff_a"], "components": {"a"}})[0]
+               and not PC.decision_test_runs(sp_em, "DT2", {"parameters": ["k"], "components": {"a"}})[0],
+               "G3f on the emulator path a parameter test runs only on an emulator input (a fitted or drawn parameter, "
+               "or a spec value the design spans); k is neither")
             run = os.path.join(d, "run")
             os.makedirs(run)
             p = schema.toy_spec(run, bench=rp)
@@ -814,6 +851,7 @@ def _self_test_benchmark_gate(ok) -> None:
             except ValueError as ex:
                 ok("T1" in str(ex), f"G16b signing it is refused ({str(ex)[:120]})")
             raw["engine_departures"] = [dep]
+            raw["analysis"]["decision_tests"].append(dta)
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             e = schema.validate(schema.load(p), pending_ok=True)
             ok(e == [], f"G4 the spec with a proposed departure validates before sign-off ({e[:2]})")
@@ -832,7 +870,7 @@ def _self_test_benchmark_gate(ok) -> None:
             ok(rec.get("engine_departures") == r["departures"] and rec["engine_departures"][0]["role"] == "held_out",
                "G5b the departure is recorded in engine_choice.json with the benchmark's role")
             sh = signoff.sheet(run, candidates=[r])
-            ok("## Engine departures from benchmark evidence" in sh and "T1" in sh and "DT1" in sh
+            ok("## Engine departures from benchmark evidence" in sh and "T1" in sh and "DTa" in sh
                and "the result stands" in sh and "the trial measured a different product" in sh,
                "G5c the sign-off sheet lists the departure with its reason, decision test and role")
             so = os.path.join(run, signoff.SPEC_SIGNOFF)
@@ -877,22 +915,23 @@ def _self_test_benchmark_gate(ok) -> None:
             ok(not r["eligible"] and any("twice" in w for w in r["why_not"]),
                f"G11b a record listing a benchmark twice is refused ({r['why_not'][:1]})")
             write_results([dict(rows_in[0], status="in_band"), rows_in[1], rows_in[2]])
-            yaml.safe_dump(dict(cov, benchmarks={"T1": cov["benchmarks"]["T1"]}), open(cp, "w"))
+            write_cov(dict(cov, benchmarks={"T1": cov["benchmarks"]["T1"]}))
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("component b" in w for w in r["why_not"]),
                f"G11 a component the coverage does not cover, and record ids it does not map, are refused ({r['why_not']})")
-            yaml.safe_dump(dict(cov, engine="malaria-starsim"), open(cp, "w"))
+            write_cov(dict(cov, engine="malaria-starsim"))
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("is for engine" in w for w in r["why_not"]),
                "G11c a coverage file for another engine is refused")
             os.remove(cp)
             r = eligible_engines(spec_ab, entry)[0]
+            write_cov(cov)
             ok(not r["eligible"] and any("benchmark_coverage.yaml" in w for w in r["why_not"]),
                "G12 an engine with benchmarks and no coverage file is not eligible (the card's copy is not consulted)")
             # owner decision 1: cost-per-outcome benchmarks gate only through the engine's own cost outputs
             cov2 = dict(cov, benchmarks=dict(cov["benchmarks"], T4={"covers": {"a": [1]}, "estimand": "cost_per_outcome",
                                                                       "cost_drivers": ["a_doses"]}))
-            yaml.safe_dump(cov2, open(cp, "w"))
+            write_cov(cov2)
             r4 = {"id": "T4", "metric": "a $ per outcome", "role": "held_out", "status": "band_mis_based"}
             write_results([dict(rows_in[0], status="in_band"), rows_in[1], rows_in[2], r4])
             r = eligible_engines(spec_ab, entry)[0]
@@ -911,26 +950,69 @@ def _self_test_benchmark_gate(ok) -> None:
                f"({r['why_not'][:1]})")
             # owner decision 2: a used component no benchmark covers blocks unless a departure names a decision test
             cov3 = dict(cov2, benchmarks={k: v for k, v in cov2["benchmarks"].items() if k != "T2"},
-                        components_without_benchmark={"b": {"reason": "no trial in the pack", "effect_parameters": ["k"]}})
-            yaml.safe_dump(cov3, open(cp, "w"))
+                        components_without_benchmark={"b": {"reason": "no trial in the pack",
+                                                            "effect_parameters": ["eff_b"]}})
+            write_cov(cov3)
             write_results([dict(rows_in[0], status="in_band"), rows_in[2], dict(r4, status="in_band")])
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("component b" in w and "no benchmark" in w for w in r["why_not"]),
                f"G14 a used component no benchmark covers makes the engine ineligible ({r['why_not']})")
-            cdep = {"engine": "toy", "component": "b", "reason": "no trial; its effect is tested", "decision_test": "DT2"}
-            r = eligible_engines(dict(spec_ab, engine_departures=[cdep], analysis={"decision_tests": [dt1, other]}),
+            dtb = {"id": "DTb", "type": "parameter_value", "parameter": "eff_b", "values": [0.2, 0.4], "text": "b"}
+            cdep = {"engine": "toy", "component": "b", "reason": "no trial; its effect is tested", "decision_test": "DTb"}
+            r = eligible_engines(dict(spec_ab, engine_departures=[cdep], analysis={"decision_tests": [dt1, dtb]}),
                                  entry, departures="proposed")[0]
             ok(r["eligible"] and r["departures"][0].get("component") == "b",
                f"G14b a departure naming a decision test on the component's effect parameter makes it eligible "
                f"({r['departures']})")
-            yaml.safe_dump(dict(cov3, components_without_benchmark={}, effects_from_spec={"*": "spec inputs"}),
-                           open(cp, "w"))
+            write_cov(dict(cov3, components_without_benchmark={}, effects_from_spec={"*": "spec inputs"}))
             r = eligible_engines(spec_ab, entry)[0]
             ok(r["eligible"] and r["components_without_benchmark"] == {"b": "spec inputs"},
                f"G15 an engine whose component effects are spec inputs (effects_from_spec) lists them, not gating "
                f"({r['why_not']})")
+            # review round 2: cost drivers charged by another component, packages, declarations, effect parameters
+            write_cov(cov2)
+            write_results([dict(rows_in[0], status="in_band"), rows_in[1], rows_in[2], r4])
+            spray = dict(spec_ab, options={"engine_map": {"a": {"a": 1}, "b": {"b": 1}, "spraying": {}},
+                                           "cost_items": [{"id": "cs", "component": "spraying", "basis": "per_outcome",
+                                                           "outcome": "doses"}]},
+                         analysis={"decision_tests": [dta], "cost_outputs": {"doses": {"cost_driver": "a_doses"}}})
+            r = eligible_engines(spray, entry)[0]
+            ok(not r["eligible"] and any("T4" in w for w in r["why_not"]),
+               f"G20 a cost benchmark gates when its engine cost driver is charged through any component's item "
+               f"({r['why_not'][:1]})")
+            write_cov(cov)
+            write_results(rows_in)
+            only_b = dict(spec_ab, options={"engine_map": {"a": {"a": 1}, "b": {"b": 1}},
+                                            "packages": {"none": [], "b_only": ["b"]}})
+            r = eligible_engines(only_b, entry)[0]
+            ok(r["eligible"], f"G21 a component in no allowed package is not checked ({r['why_not']})")
+            write_cov(cov, band=(0.4, 0.7))          # the pack the coverage was written for now declares another band
+            r = eligible_engines(spec_ab, entry)[0]
+            ok(not r["eligible"] and any("declaration" in w for w in r["why_not"]),
+               f"G19 a record row scored against another declaration of the same id is refused ({r['why_not'][:1]})")
+            write_cov(dict(cov, benchmarks=dict(cov["benchmarks"], T1=dict(cov["benchmarks"]["T1"],
+                                                                         effect_parameters=["no_such"]))))
+            write_results(rows_in)
+            r = eligible_engines(spec_ab, entry)[0]
+            ok(not r["eligible"] and any("no_such" in w for w in r["why_not"]),
+               f"G23 a declared effect parameter the engine does not have is refused ({r['why_not'][:1]})")
+            write_cov(cov)
+            write_results(rows_in)
+            run3 = os.path.join(d, "run3")
+            os.makedirs(run3)
+            schema.toy_spec(run3, bench=rp)
+            from toolkit.spec import geometry as GEO
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(run3, signoff.DB.CRITERIA), "w"))
+            yaml.safe_dump(signoff.DB.example_brief(), open(os.path.join(run3, signoff.DB.BRIEF), "w"))
+            GEO.toy_write_sheet(run3)
+            try:
+                signoff.DB.sign(run3, "owner", accept_proposed=True)
+                ok(False, "G22 the brief's signing path refuses an engine that fails the benchmark precondition")
+            except ValueError as ex:
+                ok("T1" in str(ex), f"G22 the brief's signing path refuses an engine that fails the benchmark "
+                                    f"precondition ({str(ex)[:90]})")
             # review: the configuration the run uses, and the named-engine sheet
-            yaml.safe_dump(cov, open(cp, "w"))
+            write_cov(cov)
             write_results(rows_in)
             named = dict(spec_ab, engine={"ref": TOY, "config": {"results_path": rp}})
             r = eligible_engines(named, [(TOY, None, None)])[0]
@@ -944,6 +1026,7 @@ def _self_test_benchmark_gate(ok) -> None:
                 p2 = schema.toy_spec(run2, bench=rp)
                 raw2 = yaml.safe_load(open(p2))
                 raw2["engine_departures"] = [dep]
+                raw2["analysis"]["decision_tests"].append(dta)
                 yaml.safe_dump(raw2, open(p2, "w"), sort_keys=False)
                 probs = api.pre_sign_problems(run2)
                 cands = getattr(api, "candidates", [])

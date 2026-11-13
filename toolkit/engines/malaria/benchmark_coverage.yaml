@@ -16,14 +16,14 @@ benchmarks:
   B7:
     covers: {net: [pyr, pbo, dual]}
     estimand: effect_vs_none
-    effect_parameters: [net_kill_shift]
+    effect_parameters: [use_rate, {name: net_kill_shift, from_version: "0.17"}]   # net_kill_shift: PR #213
     note: >-
       Pyrethroid nets vs no nets, prevalence (Pryce 2018 Cochrane). PBO and dual-AI nets are benchmarked only
       against pyrethroid nets (B9-B11), so their effect against no nets carries this one.
   B8:
     covers: {net: [pyr, pbo, dual]}
     estimand: effect_vs_none
-    effect_parameters: [net_kill_shift]
+    effect_parameters: [use_rate, {name: net_kill_shift, from_version: "0.17"}]   # net_kill_shift: PR #213
     note: Nets vs no nets, clinical incidence under 5 (Pryce 2018); carried by PBO and dual-AI nets as for B7.
   B9: {covers: {net: [pbo]}, estimand: effect_vs_component, versus: {net: pyr},
        note: "PBO vs pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}

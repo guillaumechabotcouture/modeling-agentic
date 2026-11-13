@@ -841,6 +841,10 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
+    from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
+    pre = PC.problems(run_dir, data, by)
+    if pre:
+        raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
     # toolkit/spec/signoff.py sign and scripts/decision_brief.py sign)
     from toolkit.spec import engine_parameters as PV

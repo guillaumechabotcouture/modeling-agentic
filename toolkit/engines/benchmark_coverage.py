@@ -65,14 +65,6 @@ def path_for(ref: str) -> str:
     return os.path.join(ROOT, *mod.split(".")[:-1], FILE)
 
 
-def _pack_ids(ref: str) -> list | None:
-    p = os.path.join(os.path.dirname(path_for(ref)) if ref in OVERRIDES else
-                     os.path.join(ROOT, *str(ref).split(":", 1)[0].split(".")[:-1]), "benchmarks", "pack.yaml")
-    if not os.path.exists(p):
-        return None
-    return [b.get("id") for b in (yaml.safe_load(open(p)) or {}).get("benchmarks") or [] if isinstance(b, dict)]
-
-
 def load(path: str) -> tuple[dict | None, list[str]]:
     """(coverage, problems); (None, []) when the file does not exist."""
     if not os.path.exists(path):
@@ -119,29 +111,31 @@ def problems(doc) -> list[str]:
 
 
 # ------------------------------------------------------------------ what the spec uses
-def _smap(raw: dict, absent: dict) -> dict:
-    """spec component -> {(engine component, value)} it delivers (absent values dropped)."""
-    em = (raw.get("options") or {}).get("engine_map") or {}
-    return {s: {(c, v) for c, v in (m or {}).items() if v not in (absent.get(c) or [])} for s, m in em.items()}
-
-
 def _packages(raw: dict) -> list:
+    """The packages the spec allows (explicit, or generated with at most one component per group)."""
     from toolkit.alloc import costs
     o = raw.get("options") or {}
     comps = o.get("components") or {s: {} for s in (o.get("engine_map") or {})}
-    return list(costs.packages(dict(o, components=comps)).values())
+    return [set(p) for p in costs.packages(dict(o, components=comps,
+                                                packages=o.get("packages") or {"generate": True})).values()]
 
 
-def _drivers(raw: dict) -> dict:
-    """spec component -> engine cost drivers its per_outcome cost items charge through analysis.cost_outputs."""
+def _smap(raw: dict, absent: dict) -> dict:
+    """spec component -> {(engine component, value)} it delivers (absent values dropped), for the spec components
+    some allowed package holds (review round 2: a component in no package is never delivered)."""
+    em = (raw.get("options") or {}).get("engine_map") or {}
+    inpk = set().union(*_packages(raw)) if em else set()
+    return {s: {(c, v) for c, v in (m or {}).items() if v not in (absent.get(c) or [])}
+            for s, m in em.items() if s in inpk}
+
+
+def _drivers(raw: dict) -> set:
+    """Engine cost drivers the spec charges anywhere (per_outcome cost items through analysis.cost_outputs, whichever
+    component owns the item: review round 2)."""
     outs = (raw.get("analysis") or {}).get("cost_outputs") or {}
-    d: dict = {}
-    for it in (raw.get("options") or {}).get("cost_items") or []:
-        if isinstance(it, dict) and it.get("basis") == "per_outcome":
-            drv = (outs.get(it.get("outcome")) or {}).get("cost_driver")
-            if drv:
-                d.setdefault(it.get("component"), set()).add(drv)
-    return d
+    return {(outs.get(it.get("outcome")) or {}).get("cost_driver")
+            for it in (raw.get("options") or {}).get("cost_items") or []
+            if isinstance(it, dict) and it.get("basis") == "per_outcome"} - {None}
 
 
 def _hits(entry: dict, smap: dict, raw: dict) -> list:
@@ -153,6 +147,32 @@ def _hits(entry: dict, smap: dict, raw: dict) -> list:
         ok = any(need <= {c for s, c, _v in hits if s in pk} for pk in _packages(raw))
         return hits if ok else []
     return hits
+
+
+def _vt(v) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (0,)
+
+
+def effect_parameters(entry: dict, version: str) -> list:
+    """The entry's effect parameters for an engine version: a name, or {name, from_version} (a parameter added in a
+    later engine version counts only from it)."""
+    out = []
+    for p in (entry or {}).get("effect_parameters") or []:
+        if isinstance(p, dict):
+            if _vt(version) >= _vt(p.get("from_version", "0")):
+                out.append(p.get("name"))
+        else:
+            out.append(p)
+    return out
+
+
+def _param_problems(cov: dict, version: str, names: set) -> list:
+    ents = list(cov["benchmarks"].items()) + list((cov.get("components_without_benchmark") or {}).items())
+    return [f"{FILE}: {k}: effect parameter {p!r} is not a parameter of engine version {version}"
+            for k, e in ents for p in effect_parameters(e, version) if p not in names]
 
 
 # ------------------------------------------------------------------ departures
@@ -184,18 +204,6 @@ def departure_problems(raw: dict) -> list[str]:
     return bad
 
 
-def _varies(d: dict, raw: dict, params: list, spec_comps: set) -> bool:
-    t = next((x for x in (raw.get("analysis") or {}).get("decision_tests") or []
-              if isinstance(x, dict) and str(x.get("id")) == str(d.get("decision_test"))), None)
-    if not t:
-        return False
-    if t.get("type") == "parameter_value":
-        return t.get("parameter") in (params or [])
-    if t.get("type") == "interaction_rescale":
-        return bool(spec_comps & set(list(t.get("components") or []) + list(t.get("with_any") or [])))
-    return False
-
-
 def signature(run_dir: str | None, by: str | None = None) -> str:
     """"signed" when the run's spec is signed by the owner and unchanged, "proposed" when it has no sign-off yet
     (or `by` is the owner about to sign), else "unsigned" (a lead's signature, or a spec changed since)."""
@@ -216,14 +224,16 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
 
 
 # ------------------------------------------------------------------ the check
-def gate(cov, cov_problems, engine_name, raw, record, departures, departures_status, pack_ids=None,
-         has_benchmarks: bool = False) -> dict:
-    """Benchmark precondition for one engine. `record()` returns (rows, problem) for the configuration in use and is
-    called only when a benchmark applies. Returns {why_not, departures, blocking, reported, uncovered, record}."""
+def gate(cov, cov_problems, engine_name, raw, record, departures, departures_status, pack=None,
+         has_benchmarks: bool = False, runs=None, version: str = "0", param_names=None) -> dict:
+    """Benchmark precondition for one engine. `record()` returns (rows, problem) for the configuration in use;
+    `pack` is the pack the coverage file was written for; `runs(test_id, effect, rows)` -> (ok, why) says whether a
+    departure's decision test runs and changes the effect (toolkit/spec/preconditions.decision_test_runs).
+    Returns {why_not, departures, blocking, reported, uncovered, record}."""
     out = {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
            "card_rows_disagree": []}
     if cov is None:
-        if pack_ids is not None or has_benchmarks:
+        if pack is not None or has_benchmarks:
             out["why_not"].append(f"the engine has a benchmark pack but no {FILE} saying which components it covers")
         return out
     if cov_problems:
@@ -233,30 +243,21 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
         out["why_not"].append(f"{FILE} is for engine {cov['engine']!r}, not {engine_name!r}")
         return out
     entries = cov["benchmarks"]
-    if pack_ids is not None and sorted(map(str, pack_ids)) != sorted(map(str, entries)):
-        out["why_not"].append(f"{FILE} does not map exactly the pack's benchmarks "
-                              f"(missing {sorted(set(pack_ids) - set(entries))}, extra {sorted(set(entries) - set(pack_ids))})")
+    decl = {b.get("id"): b for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)}
+    if pack is not None and sorted(map(str, decl)) != sorted(map(str, entries)):
+        out["why_not"].append(f"{FILE} does not map exactly the pack's benchmarks (missing "
+                              f"{sorted(set(decl) - set(entries))}, extra {sorted(set(entries) - set(decl))})")
         return out
+    if param_names is not None:
+        pp = _param_problems(cov, version, set(param_names))
+        if pp:
+            out["why_not"] += pp
+            return out
     smap = _smap(raw, cov.get("absent_values") or {})
     used = {(c, v) for pairs in smap.values() for c, v in pairs}
     deps = {(d.get("benchmark") or d.get("component")): d for d in departures or []
             if isinstance(d, dict) and d.get("engine") == engine_name}
-    counts = departures_status in ("signed", "proposed")
-
-    def depart(key, kind, params, comps, failing):
-        """True when a counting departure covers it; else a why_not line (with the departure's problem)."""
-        d = deps.get(key)
-        if d is not None and counts and _varies(d, raw, params, comps):
-            out["departures"].append(dict(d, status=departures_status, **failing))
-            return True
-        why = "" if d is None else (
-            f"; its departure does not count: the spec is not signed by the owner (or changed since)" if not counts
-            else f"; its departure's decision test {d.get('decision_test')!r} does not vary this effect "
-                 f"(a parameter_value test on {params or 'no declared effect parameter'}, or an interaction_rescale "
-                 f"test naming {sorted(comps)})")
-        out["why_not"].append(kind + why)
-        return False
-
+    pending = []          # (key, why_not text, effect parameters, spec components, failing record)
     covered = {(c, v) for e in entries.values() for c, vals in (e.get("covers") or {}).items() for v in vals}
     nob, efs = cov.get("components_without_benchmark") or {}, cov.get("effects_from_spec") or {}
     for c in sorted({c for c, v in used - covered}):
@@ -264,61 +265,92 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
             out["uncovered"][c] = efs.get(c, efs.get("*"))
             continue
         e = nob.get(c)
-        comps = {s for s, pairs in smap.items() if any(cc == c for cc, _ in pairs)}
         kind = (f"component {c}: no benchmark covers its effect ({e['reason']})" if e else
                 f"component {c}: {FILE} names no benchmark for it")
-        depart(c, kind + "; the engine is not eligible for it without an owner-signed departure naming a decision "
-               "test on its effect", (e or {}).get("effect_parameters"), comps,
-               {"benchmark_status": "no benchmark", "role": "none", "components": [c]})
+        pending.append((c, kind + "; the engine is not eligible for it without an owner-signed departure naming a "
+                        "decision test on its effect", effect_parameters(e, version),
+                        {s for s, pairs in smap.items() if any(cc == c for cc, _ in pairs)},
+                        {"benchmark_status": "no benchmark", "role": "none", "components": [c]}))
     drivers = _drivers(raw)
     relevant = {}
     for i, e in entries.items():
         h = _hits(e, smap, raw)
         if not h:
             continue
-        if e.get("estimand") == "cost_per_outcome" and not any(drivers.get(s, set()) & set(e.get("cost_drivers"))
-                                                               for s, _c, _v in h):
+        if e.get("estimand") == "cost_per_outcome" and not drivers & set(e.get("cost_drivers")):
             out["reported"].append({"id": i, "why": "the spec prices the component itself, not through this "
                                                      "engine cost output"})
             continue
         relevant[i] = h
-    if not relevant and not out["reported"]:
-        return out
-    rows, why = record()
-    out["record"] = why or "verified"
-    if why:
-        out["why_not"].append(f"benchmark record refused ({why}): the benchmarks covering "
-                              f"{', '.join(sorted(relevant) or [r['id'] for r in out['reported']])} cannot be read "
-                              "for this engine configuration")
-        return out
-    ids = [r.get("id") for r in rows]
-    if len(ids) != len(set(ids)):
-        out["why_not"].append(f"the benchmark record lists an id twice ({sorted({i for i in ids if ids.count(i) > 1})})")
-        return out
-    if set(ids) != set(entries):
-        out["why_not"].append(f"the benchmark record's ids differ from {FILE} (record only "
-                              f"{sorted(set(ids) - set(entries))}, coverage only {sorted(set(entries) - set(ids))})")
-        return out
-    byid = {r["id"]: r for r in rows}
-    for rp in out["reported"]:
-        rp.update(status=byid[rp["id"]].get("status"), role=byid[rp["id"]].get("role", "unknown"))
-    for i, hits in sorted(relevant.items()):
-        r = byid[i]
-        st, role = r.get("status", "missing"), r.get("role", "unknown")
-        if st == "in_band":
-            continue
-        comps = sorted({f"{c}={v}" for _s, c, v in hits})
-        kind = (f"benchmark {i} ({r.get('metric', '')}; role {role}: {ROLE_MEANING.get(role, ROLE_MEANING['unknown'])}) "
-                f"covers {', '.join(comps)} and is {st} (computed {r.get('computed')}, band {r.get('band')}): the "
-                "engine is not eligible for it without an owner-signed engine_departures entry")
-        if not depart(i, kind, entries[i].get("effect_parameters"), {s for s, _c, _v in hits},
-                      {"benchmark_status": st, "role": role, "components": comps}):
-            out["blocking"].append({"id": i, "role": role, "status": st})
+    rows = None
+    if relevant or out["reported"] or pending:
+        rows, why = record()
+        out["record"] = why or "verified"
+        if why and (relevant or out["reported"]):
+            out["why_not"].append(f"benchmark record refused ({why}): the benchmarks covering "
+                                  f"{', '.join(sorted(relevant) or [r['id'] for r in out['reported']])} cannot be "
+                                  "read for this engine configuration")
+            return out
+        rows = None if why else rows
+    if rows is not None:
+        ids = [r.get("id") for r in rows]
+        bad = []
+        if len(ids) != len(set(ids)):
+            bad.append(f"the benchmark record lists an id twice ({sorted({i for i in ids if ids.count(i) > 1})})")
+        elif set(ids) != set(entries):
+            bad.append(f"the benchmark record's ids differ from {FILE} (record only "
+                       f"{sorted(set(ids) - set(entries))}, coverage only {sorted(set(entries) - set(ids))})")
+        elif pack is not None:          # review round 2: bind the coverage to the declarations actually verified
+            from toolkit.engines.benchmark_sources import band_digest
+            off = sorted(r["id"] for r in rows if r.get("band_sha256") != band_digest(decl[r["id"]], pack))
+            if off:
+                bad.append(f"the benchmark record scored {off} against another declaration than the pack {FILE} "
+                           "was written for (same id, different band, arms or setting)")
+        if bad:                         # fail closed; the uncovered components below are still named
+            out["why_not"] += bad
+            rows, relevant = None, {}
+    if rows is not None:
+        byid = {r["id"]: r for r in rows}
+        for rp in out["reported"]:
+            rp.update(status=byid[rp["id"]].get("status"), role=byid[rp["id"]].get("role", "unknown"))
+        for i, hits in sorted(relevant.items()):
+            r = byid[i]
+            st, role = r.get("status", "missing"), r.get("role", "unknown")
+            if st == "in_band":
+                continue
+            comps = sorted({f"{c}={v}" for _s, c, v in hits})
+            pending.append((i, f"benchmark {i} ({r.get('metric', '')}; role {role}: "
+                               f"{ROLE_MEANING.get(role, ROLE_MEANING['unknown'])}) covers {', '.join(comps)} and is "
+                               f"{st} (computed {r.get('computed')}, band {r.get('band')}): the engine is not eligible "
+                               "for it without an owner-signed engine_departures entry",
+                            effect_parameters(entries[i], version), {s for s, _c, _v in hits},
+                            {"benchmark_status": st, "role": role, "components": comps}))
+    counts = departures_status in ("signed", "proposed")
+    for key, kind, params, comps, failing in pending:
+        d = deps.get(key)
+        if d is not None and counts:
+            ok, why = (runs or (lambda *a: (False, "no decision-test check available")))(
+                d.get("decision_test"), {"parameters": params, "components": comps}, rows)
+            if ok:
+                out["departures"].append(dict(d, status=departures_status, **failing))
+                continue
+            kind += f"; its departure does not count: decision test {d.get('decision_test')!r} {why}"
+        elif d is not None:
+            kind += "; its departure does not count: the spec is not signed by the owner (or changed since)"
+        out["why_not"].append(kind)
+        if failing["role"] != "none":
+            out["blocking"].append({"id": key, "role": failing["role"], "status": failing["benchmark_status"]})
     return out
 
 
+def _pack(ref: str) -> dict | None:
+    """The benchmark pack the coverage file was written for (beside it)."""
+    p = os.path.join(os.path.dirname(path_for(ref)), "benchmarks", "pack.yaml")
+    return (yaml.safe_load(open(p)) or {}) if os.path.exists(p) else None
+
+
 def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_name: str | None = None,
-           card_benchmarks=None) -> dict:
+           card_benchmarks=None, base: str | None = None) -> dict:
     """The check for one engine reference and configuration (the one the run uses)."""
     from toolkit.engines import benchmark_sources as BS
     cov, probs = load(path_for(ref))
@@ -334,21 +366,30 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
         return cache["e"]
 
     def record():
-        try:
-            from toolkit.engines import benchmark as B
-            doc, why = B.verified_results(engine())
-        except Exception as e:  # noqa: BLE001 -- fail closed
-            return [], f"{type(e).__name__}: {e}"
-        return (doc["benchmarks"], None) if not why else ([], why)
+        if "r" not in cache:
+            try:
+                from toolkit.engines import benchmark as B
+                doc, why = B.verified_results(engine())
+                cache["r"] = (doc["benchmarks"], None) if not why else ([], why)
+            except Exception as e:  # noqa: BLE001 -- fail closed
+                cache["r"] = ([], f"{type(e).__name__}: {e}")
+        return cache["r"]
     try:
-        name = engine_name or engine().describe().name
+        card = engine().describe()
+        name, version = engine_name or card.name, card.version
+        pnames = [p.name for p in engine().parameters()]
     except Exception as e:  # noqa: BLE001
         return {"why_not": [f"the engine cannot describe itself: {type(e).__name__}: {e}"], "departures": [],
                 "blocking": [], "reported": [], "uncovered": {}, "record": None, "card_rows_disagree": []}
-    deps = list(raw.get("engine_departures") or [])
+
+    def runs(test_id, effect, rows):
+        from toolkit.spec import preconditions as PC, schema
+        sp = schema.Spec(dict(raw, engine={"ref": ref, "config": config or {}}), base or os.getcwd())
+        return PC.decision_test_runs(sp, test_id, dict(effect, rows=rows))
     rp = (config or {}).get("results_path")
-    out = gate(cov, probs, name, raw, record, deps, departures_status, _pack_ids(ref),
-               has_benchmarks=bool(rp and os.path.exists(str(rp))))
+    out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
+               _pack(ref), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
+               param_names=pnames)
     if card_benchmarks and out["record"] == "verified":
         rows = {r.get("id"): r for r in record()[0]}
         out["card_rows_disagree"] = sorted(str(c.get("id")) for c in card_benchmarks if isinstance(c, dict)
@@ -364,7 +405,7 @@ def spec_problems(s, by: str | None = None) -> list[str]:
     if not isinstance(ref, str) or ":" not in ref:
         return []
     raw = dict(s.raw, options=s.raw.get("options") or {})
-    out = assess(ref, cfg, raw, signature(getattr(s, "base", None), by))
+    out = assess(ref, cfg, raw, signature(getattr(s, "base", None), by), base=getattr(s, "base", None))
     return [f"engine benchmarks: {w}" for w in out["why_not"]]
 
 
@@ -474,15 +515,15 @@ def _self_test() -> int:
        "BC6 it applies when a package can hold both")
     ok(gate(cov, [], "e", excl, rec, [], "unsigned")["why_not"] == [],
        "BC6c it does not apply when no package holds both (mutually exclusive alternatives)")
-    ok(gate(None, [], "e", both, rec, [], "unsigned", pack_ids=None)["why_not"] == [] and
-       gate(None, [], "e", both, rec, [], "unsigned", pack_ids=["I"])["why_not"] != [],
+    ok(gate(None, [], "e", both, rec, [], "unsigned", pack=None)["why_not"] == [] and
+       gate(None, [], "e", both, rec, [], "unsigned", pack={"benchmarks": [{"id": "I"}]})["why_not"] != [],
        "BC7 no coverage file: refused when the engine has a benchmark pack, whatever the card copies")
     ok("not 'f'" in " ".join(gate(cov, [], "f", both, rec, [], "unsigned")["why_not"]),
        "BC7b a coverage file for another engine is refused")
     dup = lambda: (rows + [{"id": "I", "status": "in_band"}], None)  # noqa: E731
     ok(any("twice" in w for w in gate(cov, [], "e", both, dup, [], "unsigned")["why_not"]),
        "BC7c a record listing a benchmark id twice is refused (a passing row cannot hide a failing one)")
-    ok(any("pack" in w for w in gate(cov, [], "e", both, rec, [], "unsigned", pack_ids=["I", "P"])["why_not"]),
+    ok(any("pack" in w for w in gate(cov, [], "e", both, rec, [], "unsigned", pack={"benchmarks": [{"id": "I"}, {"id": "P"}]})["why_not"]),
        "BC7d coverage ids must equal the pack's")
     dep = {"engine": "e", "benchmark": "I", "reason": "why", "decision_test": "DT"}
     md = "\n".join(results_lines({"engine_departures": [dep]}))
@@ -493,6 +534,15 @@ def _self_test() -> int:
        and any("unknown field" in p for p in departure_problems({"engine_departures": [
            dict(dep, no_decision_test_because="none")], "analysis": {"decision_tests": [{"id": "DT"}]}})),
        "BC9 a departure must name an existing decision test; no reason-for-none escape")
+    # review round 2: every declared effect parameter exists in the engine version its record is for
+    from toolkit.engines.malaria.engine import MalariaEngine
+    me = MalariaEngine()
+    mdoc, _ = load(os.path.join(eng, "malaria", FILE))
+    bad = _param_problems(mdoc, me.describe().version, {x.name for x in me.parameters()})
+    ok(not bad and "use_rate" in effect_parameters(mdoc["benchmarks"]["B8"], me.describe().version)
+       and "net_kill_shift" not in effect_parameters(mdoc["benchmarks"]["B8"], "0.16")
+       and "net_kill_shift" in effect_parameters(mdoc["benchmarks"]["B8"], "0.17"),
+       f"BC10 the malaria coverage's effect parameters exist in the engine; net_kill_shift counts from v0.17 ({bad})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

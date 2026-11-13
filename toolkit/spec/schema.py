@@ -571,9 +571,10 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
                         "cannot be checked)"] + pres
             return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
-        # owner decision 2026-11-12: the benchmark precondition at the execution boundary (the analysis validates here)
+        # the signed spec's preconditions at the execution boundary (the analysis validates here; #215, #218)
+        from toolkit.spec import preconditions as PC
         return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else []) \
-            + BC.spec_problems(spec)
+            + PC.problems(spec.base, None, None, spec=spec)
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
 
