@@ -350,7 +350,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     fcol = V.Draws(A, V.solved_plans(A, ben0, cost0)) if V.config(spec.raw).get("variants") else None
     hooks = [h.add for h in (bcol, fcol) if h is not None]
     from toolkit.analysis import value_of_information as VOI
-    vcol = VOI.Collector(A) if VOI.expected(spec.raw, UQ._n_seed(A, draws)[0]) else None   # F6: the draws' tables
+    nd_ = UQ._n_seed(A, draws)[0]
+    vcol = VOI.Collector(A) if VOI.expected(spec.raw) and nd_ >= VOI.thresholds()["min_draws"] else None
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
                on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None,
                on_solve=vcol.add if vcol is not None else None)
@@ -358,9 +359,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
     voi = None
-    if vcol is not None:        # F6: which drawn input is worth better data, from the same draws
+    if VOI.expected(spec.raw):        # F6: which drawn input is worth better data, from the same draws
         voi = VOI.run(A, vcol, plan, dict(fcol.plans) if fcol is not None else None, u["report"],
-                      level=u["data"]["interval"].get("level", 0.95), seed=u["data"]["seed"])
+                      level=u["data"]["interval"].get("level", 0.95), seed=u["data"]["seed"]) if vcol is not None \
+            else VOI.too_few(nd_, u["report"], A)
         arts["value_of_information"] = S.write("value_of_information", voi, VOI.PRODUCER, [arts["uncertainty"]])
         log(f"value of information: {voi['status']}, EVPI {(voi['evpi'] or {}).get('value')}")
     bvd = None
@@ -1076,7 +1078,7 @@ def _self_test_voi(ok, q):
         r["analysis"]["plan_variants"] = {"variants": [{"id": "given", "type": "fixed_plan", "column": "given",
                                                         "text": "the plan as funded"}]}
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
-        _given_column(d, lambda i: "a")
+        _given_column(d, lambda i: "b" if i % 2 == 0 else "a")      # b is not eligible in even units
         signoff.sign(d, "lead", note="self-test")
         try:
             R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
@@ -1086,10 +1088,14 @@ def _self_test_voi(ok, q):
         art = os.path.join(d, "analysis", "value_of_information.yaml")
         doc = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
         ids = {c["id"] for c in (doc.get("candidates") or {}).get("list") or []}
-        ok(doc.get("status") == "indicative" and doc.get("draws") == 32 and {"point", "variant:given", "expected_value"} <= ids
-           and (doc.get("evpi") or {}).get("value", -1) >= 0,
-           f"VR1 the run writes value_of_information.yaml: indicative at 32 draws, the point plan and the declared "
-           f"variant among the candidates ({doc.get('status')}, {sorted(ids)[:4]})")
+        gv = {c["id"]: c for c in (doc.get("candidates") or {}).get("list") or []}.get("variant:given") or {}
+        ok(doc.get("status") == "indicative" and doc.get("draws") == 32 and {"point", "variant:given", "robust"} <= ids
+           and (doc.get("evpi") or {}).get("value", -1) >= 0 and doc.get("decide_now") != "variant:given"
+           and gv.get("eligible") is False and "not feasible" in str(gv.get("excluded")) and gv.get("regret") is not None,
+           f"VR1 the run writes value_of_information.yaml: indicative at 32 draws; the point plan, the plan decided "
+           f"under the affordability rule and the declared variant among the candidates; the variant breaks the "
+           f"signed eligibility, so it is reported with its regret, never chosen ({doc.get('status')}, "
+           f"{doc.get('decide_now')}, {gv})")
         names = {x["input"] for x in doc.get("inputs") or []}
         nd = {x.get("input") for x in doc.get("not_drawn") or []}
         ok({"shift:r0", "shift:r1", "shift:r2", "calibration shifts"} <= names and {"synergy", "costs"} <= nd,
@@ -1097,7 +1103,9 @@ def _self_test_voi(ok, q):
            f"({sorted(names)}, {sorted(nd)})")
         cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
         txt = open(os.path.join(d, "results.md")).read()
-        ok({"voi.evpi", "voi.evpi_pct", "voi.status", "voi.top0.evppi"} <= cs and "## Value of information" in txt
+        sup = sum(bool(x.get("supported")) for x in doc.get("inputs") or [])
+        ok({"voi.evpi", "voi.status"} <= cs and "## Value of information" in txt
+           and len([x for x in cs if x.startswith("voi.top") and x.endswith(".evppi")]) == min(sup, 5)
            and "[CLAIM:" not in txt, f"VR3 claims and a results.md section ({sorted(x for x in cs if 'voi' in x)})")
         ok(contract.gate_findings(d) == [], f"VR4 the contract checks pass: {contract.gate_findings(d)}")
         mp = os.path.join(d, "analysis", "manifest.json")
@@ -1124,6 +1132,13 @@ def _self_test_voi(ok, q):
                   "checks pass": contract.gate_findings(d) == []}
         ok(all(checks.values()), f"VR6 switched off: no artifact, the uncertainty data and report identical, checks "
                                  f"pass ({[k for k, v in checks.items() if not v]})")
+        _resign(d, lambda x: x["analysis"].pop("value_of_information"))
+        run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+        few = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
+        ok(few.get("status") == "too_few_draws" and few.get("draws") == 8 and few.get("evpi") is None
+           and contract.gate_findings(d) == [],
+           f"VR7 below the minimum draws the artifact records too_few_draws and the count, not silence "
+           f"({few.get('status')}, {few.get('draws')}, {contract.gate_findings(d)})")
 
 
 def _given_column(d, pkg):

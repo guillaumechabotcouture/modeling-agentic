@@ -604,6 +604,9 @@ def _self_test() -> int:
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
                "claims": {"n_claims": 0, "unresolved": []}}
+        # F6: on by default; below the minimum draws it records too_few_draws
+        pay["value_of_information"] = {"status": "too_few_draws", "draws": pay["uncertainty"].get("draws"),
+                                       "evpi": None, "inputs": [], "not_drawn": []}
         for k, v in pay.items():
             if k != drop_kind:
                 S.write(k, v, f"toolkit/analysis/{k}.py", ["units.csv"] if k == "calibration" else [])
