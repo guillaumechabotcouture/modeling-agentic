@@ -100,7 +100,7 @@ def preconditions_state(run_dir: str, rec: dict | None = None) -> tuple:
     "preconditions_failed"."""
     from toolkit.spec import preconditions as PC
     cap: dict = {}
-    bad = PC.problems(run_dir, None, None, mode="status", only=("evidence_dossier",), record=rec, capture=cap)
+    bad = PC.problems(run_dir, None, None, mode="status", record=rec, capture=cap)    # every check: preconditions
     if not bad:
         return "ok", []
     ev = cap.get("evidence_status")

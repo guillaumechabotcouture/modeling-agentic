@@ -873,7 +873,7 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
         from toolkit.spec import preconditions as PC
         # signoff none (nobody signs): coverage without a record, the rule the launch preflight applies too
         return PC.problems(run_dir, None, None, mode="unsigned" if signoff == "none" else "resume",
-                           only=("evidence_dossier",), engine=engine)
+                           engine=engine)          # every check: the benchmark verdict too
     except Exception as e:  # noqa: BLE001
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 

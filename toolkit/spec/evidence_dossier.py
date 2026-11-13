@@ -1155,6 +1155,36 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     return p
 
 
+def _self_test_derived(ok) -> None:
+    """F6 amendment draft: a run whose data are derived (data/derivations.yaml) names its dossier; the dossier is an
+    owner-signed input, not derived data, so the derivation requirement does not apply to it, and the signed
+    closure binds it instead."""
+    import tempfile
+    import yaml
+    from toolkit.spec import schema, signoff as SO
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.derived_toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["evidence"] = {"dossier": DOSSIER_FILE}
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        yaml.safe_dump({"inputs": {}}, open(os.path.join(d, DOSSIER_FILE), "w"))
+        errs = schema.validate(schema.load(p), pending_ok=True)
+        ok(not [e for e in errs if "data_ref_not_derived" in e or DOSSIER_FILE in e],
+           f"ED-D1 a derived-data run that names its evidence dossier validates (the dossier is not derived data): "
+           f"{errs[:2]}")
+        try:
+            SO.write_sheet(d)
+            SO.sign(d, "owner", note="n")
+            signed = SO.status(d)
+        except ValueError as e:
+            signed = f"refused: {e}"
+        with open(os.path.join(d, DOSSIER_FILE), "a") as f:
+            f.write("# edited after signing\n")
+        ok(signed == "signed" and SO.status(d) != "signed",
+           f"ED-D2 ... signs, and editing its dossier after signing makes it stale (the closure binds the dossier): "
+           f"{signed} -> {SO.status(d)}")
+
+
 def _self_test_round6(ok, T) -> None:
     """#218 final review: indirect trial effects; the closure's subset rule after ENGINE_CHOICE."""
     from toolkit.engines.empirical.engine import toy_trial_config
@@ -1617,6 +1647,7 @@ def _self_test() -> int:
         _self_test_round6(ok, T)
     except NameError as e:
         ok(False, f"ED-Z final round: {e}")
+    _self_test_derived(ok)
     try:                            # last: it imports the malaria engine (ED-R6 checks it is not imported before)
         _self_test_round4(ok, T)
     except NameError as e:          # before the round-4 functions exist (the tests-first commit)

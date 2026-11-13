@@ -97,7 +97,27 @@ def code_files() -> dict:
         extra += f"\nToyDossierEngine.{name} = {value!r}\n"
     if extra:
         out["toolkit/spec/toy_engines.py"] = out["toolkit/spec/toy_engines.py"] + extra.encode()
+    for path, text in sorted((PATCH.get("append") or {}).items()):       # other shipped-code changes a row made
+        out[path] = out[path] + text.encode()
     return out
+
+
+BENCH_FAIL = "engine benchmarks: toy benchmark verdict changed after signing (row R8)"
+
+
+def _benchmark_fails(d):
+    """#215's benchmark check fails after signing (an engine restamp or a coverage change would): in-process, and in
+    the shipped preconditions.py the launch checks."""
+    from toolkit.spec import preconditions as PC
+    old = PC.CHECKS["benchmark_eligibility"]
+    PC.CHECKS["benchmark_eligibility"] = lambda run_dir, spec, signer: [BENCH_FAIL]
+    PATCH.setdefault("append", {})["toolkit/spec/preconditions.py"] = (
+        f"\n\nCHECKS['benchmark_eligibility'] = lambda run_dir, spec, signer: [{BENCH_FAIL!r}]\n")
+
+    def undo():
+        PC.CHECKS["benchmark_eligibility"] = old
+        PATCH.get("append", {}).pop("toolkit/spec/preconditions.py", None)
+    return undo
 
 
 def _patch_attr(name, value):
@@ -396,6 +416,8 @@ POST_ROWS = [
          {"kind": "parameter", "name": "eff_a", "why": "another reason"},
          {"kind": "unit_attribute", "name": "x", "why": "w"}]},
          "b": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "k", "why": "w"}]}})),
+    ("R8-benchmark-failed", "the benchmark check (#215) fails after signing: status, launch, relaunch and resume run it",
+     _benchmark_fails),
     ("R5-declaration-shrank", "every declared input removed since signing (none_reason everywhere)",
      lambda d: _patch_decl({"a": {"inputs": [], "none_reason": "none now"},
                             "b": {"inputs": [], "none_reason": "none now"}})),
@@ -479,7 +501,7 @@ WANT = {
     "R5-declaration-shrank": ["declaration", "evidence_incomplete", "changed"],
     "R6-extensionless-units": ["changed", "units"], "R6-no-dossier-edited": ["changed", "units.csv"],
     "R6-emulator-parameters": ["needs its decision_test"],
-    "R7-resolver-error": ["resolver"], "R7-engine-file-deleted": ["changed", "toy_priors.yaml"],
+    "R7-resolver-error": ["resolver"], "R8-benchmark-failed": ["engine benchmarks", "preconditions_failed"], "R7-engine-file-deleted": ["changed", "toy_priors.yaml"],
 }
 
 
