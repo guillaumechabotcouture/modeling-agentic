@@ -834,15 +834,20 @@ def _cli(argv):
 
 
 # ---------------------------------------------------------------- self-test
+EVIDENCE_TIME, REGISTERED = "2026-01-01T00:00:00+00:00", "2025-12-01T00:00:00+00:00"   # synthetic sweeps and seeds
+
+
 def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
     """A sweep with packages none, A (component a) and B (component b, same group): relative reductions rA, rB."""
     n = len(rA)
     one = np.ones(n)
     bu = one if burden is None else np.asarray(burden, float)
-    return Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
-                 {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
-                 {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
-                 groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"}, lam=lam)
+    sw = Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
+               {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
+               {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
+               groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"}, lam=lam)
+    sw.evidence_time = EVIDENCE_TIME    # tests-first shim: the current Sweep takes no evidence time (ι passes it)
+    return sw
 
 
 def _planted(seed=3, n=200):
@@ -871,16 +876,16 @@ def _seed():
         {"id": "B4", "mechanism": "A beats B on net benefit where f1 is high", "about": {"pair": ["A", "B"]},
          "direction": "none", "source_type": "literature", "evidence": lit, "confidence": "medium"}],
         "hypotheses": [
-            {"id": "H1", "belief": "B1", "claim": "A's effect is in [0.2, 0.4] at 80% of points",
+            {"id": "H1", "registered_at": REGISTERED, "belief": "B1", "claim": "A's effect is in [0.2, 0.4] at 80% of points",
              "test": {"kind": "effect_band", "package": "A", "band": [0.2, 0.4], "min_share": 0.8}},
-            {"id": "H2", "belief": "B4", "claim": "A beats B wherever f1 is above 0.7",
+            {"id": "H2", "registered_at": REGISTERED, "belief": "B4", "claim": "A beats B wherever f1 is above 0.7",
              "test": {"kind": "paired_sign", "a": "A", "b": "B", "feature": "f1", "range": [0.7, 1.0],
                       "sign": "positive", "min_share": 0.8}},
-            {"id": "H3", "belief": "B3", "claim": "the A/B choice flips for f1 in [0.3, 0.7]",
+            {"id": "H3", "registered_at": REGISTERED, "belief": "B3", "claim": "the A/B choice flips for f1 in [0.3, 0.7]",
              "test": {"kind": "flip_in", "a": "A", "b": "B", "feature": "f1", "range": [0.3, 0.7]}},
-            {"id": "H4", "belief": "B2", "claim": "B's effect increases with f1",
+            {"id": "H4", "registered_at": REGISTERED, "belief": "B2", "claim": "B's effect increases with f1",
              "test": {"kind": "effect_direction", "package": "B", "feature": "f1", "direction": "increases"}},
-            {"id": "H5", "belief": "B3", "claim": "most low-f1 units get A",
+            {"id": "H5", "registered_at": REGISTERED, "belief": "B3", "claim": "most low-f1 units get A",
              "test": {"kind": "plan_share", "component": "A", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
 
 
@@ -1162,6 +1167,121 @@ def _self_test() -> int:
                        "min_share": 0.8})
         ok(st2 == "untestable", f"WM34b without a shadow price a paired test is untestable: {st2}")
     tryit("WM34 net benefit", wm34)
+
+    def wm35():
+        rng = np.random.default_rng(11)
+        n = 200
+        feats = {f"n{k:03d}": rng.uniform(0, 1, n) for k in range(300)}
+        null = _sw(feats, 0.3 + 0.02 * rng.standard_normal(n), 0.3 + 0.02 * rng.standard_normal(n))
+        s = summarise(null)
+        dirs = [(p, f) for p, e in s["effects"].items() for f, v in e["direction"].items()
+                if v["direction"] in ("increases", "decreases")]
+        fl, mu = s["flips"]["A~B"]["along"], s.get("multiplicity") or {}
+        ok(not dirs and not fl and mu.get("tested", 0) >= 600, "WM35 a null sweep with 300 irrelevant features gives "
+           f"no direction and no flip after FDR control: {len(dirs)} directions, {len(fl)} flips, {mu}")
+        wm, _ = build({"beliefs": _seed()["beliefs"][:1]}, sw)
+        sims = [b for b in wm["beliefs"] if b["id"].startswith("sim.")]
+        ok(sims and all(b.get("screened") is True and b.get("scope") == "marginal" for b in sims),
+           f"WM35b simulation beliefs come only from screened results and say they are marginal: {sims[:1]}")
+    tryit("WM35 multiplicity", wm35)
+
+    def wm36():
+        rng = np.random.default_rng(12)
+        x = rng.uniform(0, 1, 400)
+        z = x + 0.05 * rng.standard_normal(400)
+        cs = _sw({"x": x, "z": z}, 0.3 + 0 * x, 0.5 + 0.1 * x - 0.3 * z)
+        dx = summarise(cs)["effects"]["B"]["direction"]["x"]
+        ok(dx.get("scope") == "marginal" and "z" in (dx.get("correlated_with") or []),
+           f"WM36 the summary labels a direction a marginal association and names correlated design features: {dx}")
+        st, res = _one(cs, {"kind": "effect_direction", "package": "B", "feature": "x", "direction": "increases"})
+        ok(st == "inconclusive" and "z" in json.dumps(res["observed"]), "WM36b a marginal association never refutes a "
+           f"conditional claim on a feature correlated with another (true: increases with x at fixed z): {st} "
+           f"{res['observed']}")
+    tryit("WM36 marginal vs conditional", wm36)
+
+    def wm37():
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        wm1, hy1 = build(_seed(), sw, plan=plan, units=units)
+        wm2, hy2 = build(wm1, sw, plan=plan, units=units, hypotheses=hy1["hypotheses"])
+        ids = [b["id"] for b in wm2["beliefs"]]
+        ok(len(ids) == len(set(ids)) and wm2.get("version") == 2 and wm2.get("superseded_simulation"),
+           f"WM37 rebuilding from a produced world model replaces its simulation beliefs (versioned): {ids}")
+        conf = lambda w: {b["id"]: b["confidence"] for b in w["beliefs"] if not b["id"].startswith("sim.")}  # noqa
+        ok(wm2["track_record"]["confirmed"] == wm1["track_record"]["confirmed"] and conf(wm2) == conf(wm1) and
+           all(h["confrontation"]["repeat"] for h in hy2["hypotheses"]),
+           f"WM38 replaying the same evidence counts once and moves no confidence: {wm2['track_record']}")
+        wm3, _ = build(wm2, sw, plan=plan, units=units, hypotheses=hy2["hypotheses"])
+        ok(len({b["id"] for b in wm3["beliefs"]}) == len(wm3["beliefs"]), "WM37b the output validates on reuse")
+    tryit("WM37-38 reuse and replay", wm37)
+
+    def wm39():
+        rng = np.random.default_rng(1)
+        units = {str(i): {"f1": float(x), "f2": 0.5} for i, x in enumerate(rng.uniform(0, 1, 40))}
+        plan = {u: ("A" if r["f1"] < 0.5 else "B") for u, r in units.items()}
+        sd = _seed()
+        sd["hypotheses"].append(dict(sd["hypotheses"][0], id="H1b"))
+        wa, _ = build(sd, sw, plan=plan, units=units)
+        ok(wa["track_record"]["confirmed"] == 4, f"WM39 an alias (identical test, same evidence) counts once: "
+                                                 f"{wa['track_record']['confirmed']}")
+        sd = _seed()
+        sd["track_record"] = {"confirmed": 99, "contradicted": 0, "history": []}
+        wr, _ = build(sd, sw, plan=plan, units=units)
+        ok(wr["track_record"]["confirmed"] == 4 and wr["track_record"].get("reconciled"),
+           f"WM40 seed counters are recomputed from the confrontations, not trusted: {wr['track_record']}")
+        sd = _seed()
+        sd["hypotheses"][0]["registered_at"] = "2026-02-01T00:00:00+00:00"
+        sd["hypotheses"][3].pop("registered_at")
+        wp, hp = build(sd, sw, plan=plan, units=units)
+        tr = wp["track_record"]
+        ok(tr["confirmed"] == 2 and (tr.get("post_hoc") or {}).get("confirmed") == 2 and
+           [h["confrontation"]["post_hoc"] for h in hp["hypotheses"]] == [True, False, False, True, False],
+           f"WM41 a hypothesis registered after its evidence, or with no registration time, is post hoc: reported "
+           f"separately, never in the share confirmed: {tr}")
+        b1 = next(b for b in wp["beliefs"] if b["id"] == "B1")
+        ok(b1["confidence"] == "medium", f"WM41b a post-hoc confirmation does not raise confidence: {b1['confidence']}")
+        sd = _seed()
+        sd["beliefs"][0]["id"] = "sim.effect.A"
+        sd["hypotheses"][0]["belief"] = "sim.effect.A"
+        try:
+            validate_seed(sd)
+            ok(False, "WM42 a hand-written belief may not use the reserved sim. prefix")
+        except WorldModelError:
+            ok(True, "WM42 a hand-written belief may not use the reserved sim. prefix")
+    tryit("WM39-42 track record and pre-registration", wm39)
+
+    def wm43():
+        import subprocess
+        import yaml
+        ident = {"version": "0.11", "code_sha256": "c" * 64}
+        with tempfile.TemporaryDirectory() as d:
+            put = lambda i: yaml.safe_dump({"engine_identity": i}, open(os.path.join(d, "results.yaml"), "w"))  # noqa
+            vcs = lambda *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)  # noqa: E731
+            vcs("init", "-q")
+            vcs("config", "user.email", "t@t")
+            vcs("config", "user.name", "t")
+            put(ident)
+            ok(benchmark_record(d, ident)["matched"] == "working tree", "WM43 an identity in the benchmark file")
+            vcs("add", "results.yaml")
+            vcs("commit", "-qm", "v0.11")
+            put({"version": "0.12", "code_sha256": "d" * 64})
+            vcs("commit", "-qam", "v0.12")
+            r = benchmark_record(d, ident)
+            ok(r["matched"] == "git history" and len(r.get("commit", "")) == 40, f"WM43b an identity found only in "
+                                                                                 f"an ancestor commit: {r}")
+            vcs("checkout", "-q", "-b", "side")
+            put({"version": "0.13", "code_sha256": "e" * 64})
+            vcs("commit", "-qam", "side")
+            vcs("checkout", "-q", "-")
+            for i, why in (({"version": "0.13", "code_sha256": "e" * 64}, "only on a branch that is not an ancestor"),
+                           ({"version": "0.9", "code_sha256": "f" * 64}, "nowhere")):
+                try:
+                    benchmark_record(d, i)
+                    ok(False, f"WM43c a recorded identity {why} is refused")
+                except WorldModelError:
+                    ok(True, f"WM43c a recorded identity {why} is refused")
+    tryit("WM43 recorded engine identity", wm43)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
