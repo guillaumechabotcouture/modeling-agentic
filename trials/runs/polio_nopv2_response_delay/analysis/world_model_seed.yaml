@@ -1,0 +1,280 @@
+beliefs:
+- id: B1
+  mechanism: 'A FAST campaign (two nOPV2 rounds from week 4) brings R_t below 1 in most settings and therefore averts
+    most 2026 type 2 infections: very few infections occur in the first 4 weeks when the seed is 1e-6 to 1e-4 of
+    the population. The share averted is lower where R0 x s0 is so high that (1 - effect) x R0 x s0 stays above
+    1, or where the engine''s intervention period ends well before the end of 2026 and transmission resumes.'
+  about:
+    package: fast
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: "S\xE1ez-Llorens X et al. Safety and immunogenicity of two novel type 2 oral poliovirus vaccine candidates\
+      \ compared with a monovalent type 2 oral poliovirus vaccine in children and infants: two clinical trials.\
+      \ Lancet 2021"
+    location: Results (type 2 seroconversion after one and two doses); exact table not verified
+  - citation: 'Cooper LV et al. Risk factors for the spread of vaccine-derived type 2 polioviruses after global
+      withdrawal of trivalent oral poliovirus vaccine and the effects of outbreak responses with monovalent vaccine:
+      a retrospective analysis of surveillance data for 51 countries in Africa. Lancet Infect Dis 2022'
+    location: Results, effect of mOPV2 response campaigns on subsequent detection; table not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B2
+  mechanism: 'The relative reduction from a STANDARD (week-12) campaign falls as seed_share rises: a larger seed
+    means the outbreak is further along by week 12, so more of the year''s infections occur before the campaign
+    can act. The effect is strongest where R0 x s0 is high (fast growth).'
+  about:
+    package: standard
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Fine PE, Carneiro IA. Transmissibility and persistence of oral polio vaccine viruses: implications
+      for the global poliomyelitis eradication initiative. Am J Epidemiol 1999'
+    location: estimates of R0 and serial interval for poliovirus; table not verified
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: renewal equation, Methods
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: With a per-capita seed and frequency-dependent transmission in a closed deterministic population, the
+    attack rate and the relative reduction from either campaign do not depend on district population; pop scales
+    burden and cost proportionally and only matters for how the budget is packed.
+  about:
+    package: fast
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc Lond
+      A 1927
+    location: final-size relation (depends on R0 and initial susceptible share, not on N)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 2 (frequency-dependent transmission); chapter location approximate
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: 'FAST beats STANDARD on net benefit at the declared shadow price where the seed is large: the infections
+    occurring between week 4 and week 12 (plus the extra depletion they cause) exceed the US$0.50 per resident price
+    difference valued at the shadow price (about 5e-6 infections per person), which holds whenever an outbreak grows
+    appreciably before week 12.'
+  about:
+    pair:
+    - fast
+    - standard
+  direction: increases
+  conditions:
+  - feature: seed_share
+    range:
+    - 3.0e-05
+    - 9.577e-05
+  source_type: literature
+  evidence:
+  - citation: 'Cooper LV et al. Risk factors for the spread of vaccine-derived type 2 polioviruses after global
+      withdrawal of trivalent oral poliovirus vaccine and the effects of outbreak responses with monovalent vaccine:
+      a retrospective analysis of surveillance data for 51 countries in Africa. Lancet Infect Dis 2022'
+    location: Results on timeliness/effect of outbreak response; table not verified
+  - citation: Blake IM et al. Type 2 poliovirus detection after global withdrawal of trivalent oral vaccine. N Engl
+      J Med 2018
+    location: Results, risk of further detections by response timing; location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: 'The relative reduction from a STANDARD campaign falls as the susceptible share s0 rises: higher R0
+    x s0 means faster growth, so more of the outbreak occurs before week 12, and a fixed (1 - effect) multiplier
+    is less likely to bring R_t below 1. Below the epidemic threshold (R0 x s0 < 1) burden is tiny and the relative
+    reduction is set by how much of a short, decaying chain remains at week 12.'
+  about:
+    package: standard
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: threshold and growth-rate relations; chapter location approximate
+  - citation: 'Fine PE, Carneiro IA. Transmissibility and persistence of oral polio vaccine viruses: implications
+      for the global poliomyelitis eradication initiative. Am J Epidemiol 1999'
+    location: R0 estimates; table not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'The FAST vs STANDARD choice flips along s0: where s0 is low enough that the outbreak barely grows
+    (R0 x s0 near or below 1), both options avert almost the same, tiny number of infections and the cheaper STANDARD
+    wins on net benefit; above the threshold FAST wins. The threshold location depends on the engine''s R0, which
+    is withheld; for an R0 of about 2 to 2.5 it lies in the lower part of the sampled s0 range. Location very uncertain.'
+  about:
+    pair:
+    - fast
+    - standard
+  direction: flips
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.4037627246230841
+    - 0.6
+  source_type: literature
+  evidence:
+  - citation: 'Fine PE, Carneiro IA. Transmissibility and persistence of oral polio vaccine viruses: implications
+      for the global poliomyelitis eradication initiative. Am J Epidemiol 1999'
+    location: R0 estimates; table not verified
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: Does the engine's campaign effect last to the end of 2026 or only over a declared period after which
+    R_t returns to R0 x S_t? A multiplier on R_t removes no susceptibles, so a short period would only delay the
+    outbreak and relative reductions (and the value of FAST) would be much smaller than B1 assumes.
+  beliefs:
+  - B1
+  - B2
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: What is the engine's R0 and generation interval for cVDPV2? Together with s0 they set the growth per
+    week and hence how much of the outbreak the 8-week delay forfeits, and where the epidemic threshold lies in
+    s0.
+  beliefs:
+  - B2
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Do the effect priors differ between FAST and STANDARD (same vaccine, two rounds each), or only the start
+    week? If effect:standard is drawn independently of effect:fast, some draws may make STANDARD stronger for reasons
+    unrelated to timing.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: The declared shadow price (1e-5 outcome per USD, i.e. about US$100,000 per infection averted) is far
+    below the value implied by the basis text's own arithmetic (0.01 DALY x US$1,000 per DALY, about US$10 per infection).
+    Under a binding US$15M budget the real dual could be much larger, which would favour STANDARD (more districts
+    covered per dollar) where the delay costs little. Which value does the optimiser's budget dual take?
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: true
+- id: Q5
+  question: How uncertain is the type 2 susceptible share by district (s0), and is it correlated with seed_share
+    in the data? High-s0, high-seed districts are where FAST pays; if they coincide the delay cost is concentrated
+    there.
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: FAST averts at least 60% of 2026 type 2 infections relative to no campaign in at least 60% of usable points.
+    Refuted if 40% or more of points fall outside [0.6, 1.0] (for example because the effect period ends early).
+  test:
+    kind: effect_band
+    package: fast
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: STANDARD's relative reduction decreases with seed_share (Spearman interval below 0). Refuted if it increases;
+    inconclusive if the interval crosses 0.
+  test:
+    kind: effect_direction
+    package: standard
+    feature: seed_share
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: 'FAST''s relative reduction does not depend on district population: the rank correlation''s 95% interval
+    lies within +/-0.1. Refuted if it lies outside.'
+  test:
+    kind: effect_direction
+    package: fast
+    feature: pop
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: In districts with seed_share of 3e-5 or more, FAST beats STANDARD on net benefit at the shadow price in
+    at least 80% of usable points. Refuted if STANDARD wins in at least 80%.
+  test:
+    kind: paired_sign
+    a: fast
+    b: standard
+    feature: seed_share
+    range:
+    - 3.0e-05
+    - 9.577e-05
+    sign: positive
+    min_share: 0.8
+- id: H5
+  belief: B5
+  claim: STANDARD's relative reduction decreases with s0, adjusted for the two campaign-effect draws. Refuted if
+    it increases.
+  test:
+    kind: effect_direction
+    package: standard
+    feature: s0 (calibration scale)
+    direction: decreases
+    adjust_for:
+    - effect:standard
+    - effect:fast
+- id: H6
+  belief: B6
+  claim: The FAST/STANDARD transition along s0 lies in the lower part of the sampled range, s0 0.40 to 0.60 (STANDARD
+    below it, FAST above). Refuted if the located transition lies entirely above 0.60; inconclusive if FAST wins
+    everywhere (one-sided).
+  test:
+    kind: flip_in
+    a: fast
+    b: standard
+    feature: s0 (calibration scale)
+    range:
+    - 0.4037627246230841
+    - 0.6
+    scope: marginal
