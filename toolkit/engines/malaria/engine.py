@@ -130,7 +130,7 @@ net_kill_shift on Churcher's hut-mortality intercept (every net type), pbo_gain_
 pbo_adv_decay, the fading of a PBO net's advantage over a pyrethroid net. Their defaults give the v0.16 net outcomes
 bit for bit (vector.py V31); the identity fields of the evidence change, so the evidence is re-stamped after
 benchmarks/restamp_proof.py proves the outputs identical. Self-tests V31-V35 (vector.py) and NE0-NE3 (selftest_late.py).
-The trial fit that sets their ranges is designed in ENGINE_NOTES.md, v0.17, and benchmarks/net_effect_fit.py.
+The trial fit (training targets only) is designed in ENGINE_NOTES.md, v0.17, and benchmarks/net_effect_fit.py.
 """
 from __future__ import annotations
 
@@ -190,10 +190,11 @@ _PARAMS = [
      "uses Table 6's 0.63", "matched"),
     ("pbo_gain_scale", 1.0, "fixed", "multiplier", None, None, "scale on PBO's gain in bioassay-mortality logit, "
      "logit f_s = logit x + s (logit f - logit x), f from " + V.CHURCHER_SOURCE + ", Equation 4; 1 = Equation 4, "
-     "0 = no PBO gain; range to be set by the trial fit (B9, B9b, B9c)", "unverified"),
+     "0 = no PBO gain; no published range: held until a PBO trial is a training target of the trial fit (the pack's "
+     "PBO trials are held out)", "unverified"),
     ("pbo_adv_decay", 0.0, "fixed", "per year", None, None, "decay rate of a PBO net's advantage over a same-age "
-     "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; range to be set by the "
-     "trial fit (B9 at 9 m, B9b at 21 m, B9c at 24 m)", "unverified"),
+     "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; no published range: held "
+     "until a PBO trial is a training target of the trial fit (the pack's PBO trials are held out)", "unverified"),
     ("irs_kill", 0.5, "fitted", "probability", 0.0, 0.95, "fitted: B12, B12b, B12m", "unverified"),
     ("irs_rep", 0.10, "fixed", "probability", None, None, A8, "unverified"),
     ("irs_half", 0.4 * 365., "fixed", "days", None, None, A8 + " (decay of the generic short-lived product only)", "unverified"),

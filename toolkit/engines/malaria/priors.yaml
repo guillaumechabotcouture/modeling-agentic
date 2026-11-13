@@ -115,11 +115,11 @@ fixed:
     identifiability and fits only the curve's end point (tau ~ Unif(5.5, 20.7) y); the paper gives no range for k.
     Briet et al. 2012 Malar J 11:20 (PMC3273435) used k = 18 for the same function. The median retention, which the
     paper estimates, carries the uncertainty (net_retention_half)"
-  pbo_gain_scale: "v0.17: no published range; held at 1 (Churcher 2016 Equation 4) until the trial fit (B9, B9b, B9c;
-    ENGINE_NOTES.md, v0.17) sets it. A run whose decision turns on PBO vs pyrethroid nets declares this departure"
-  pbo_adv_decay: "v0.17: no published range; held at 0 (no fading beyond Churcher's decay) until the trial fit (B9 at
-    9 m, B9b at 21 m, B9c at 24 m; ENGINE_NOTES.md, v0.17) sets it. B9b and B9c disagree on durability, so the fit
-    reports each trial's region and their union"
+  pbo_gain_scale: "v0.17: no published range; held at 1 (Churcher 2016 Equation 4). The trial fit (ENGINE_NOTES.md,
+    v0.17) uses only the pack's training targets, none of which has a PBO net, so it cannot set this range until the
+    owner makes a PBO trial a training target. A run whose decision turns on PBO vs pyrethroid nets declares this"
+  pbo_adv_decay: "v0.17: no published range; held at 0 (no fading beyond Churcher's decay). As pbo_gain_scale: the
+    trial fit cannot set it until a PBO trial is a training target (owner decision; ENGINE_NOTES.md, v0.17)"
   cfp_half: "attempt 8's range (1.5-3.5 y, registry cfp_half_life_years) is a modeller reading of Mosha 2022/2024
     durability, not a published half-life estimate"
   irs_rep: "no published range on the card or in the attempt 8 registry"

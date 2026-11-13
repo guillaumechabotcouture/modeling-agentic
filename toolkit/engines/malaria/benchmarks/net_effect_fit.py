@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Trial fit of the v0.17 net-effect parameters (design: ENGINE_NOTES.md, v0.17). Not yet run.
+"""Trial fit of the v0.17 net-effect parameters on the pack's training targets (design: ENGINE_NOTES.md, v0.17).
+Not yet run.
 
-    python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py plan [--with-b7b8]       # design, run count, cost
+    python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py plan                 # design, run count, cost
     python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py run --approved "<owner approval>" --workers W
     python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py run --smoke --out <scratch file> --workers 2
     python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py --self-test
 
-`run` is the pack's joint fit (benchmark.fit_joint, rule joint-v1) over five parameters: the three net-effect
-parameters and the two already fitted (cfp_kill, irs_kill), against the net and IRS trials. It writes
-net_effect_fit.yaml beside this file, never fitted.yaml: adopting the result (the parameters' kind becomes `fitted`,
-fitted.yaml and results.yaml are recomputed) is a separate engine version. The full run costs more than $20 and is
-launched by the lead session after the owner approves; `--smoke` is a few short runs that check the script end to
-end. Beyond joint-v1's own range (the region where every target is in band), the output gives each PBO trial's own
-region and their union: B9/B9b (Muleba, durable PBO advantage) and B9c (Misungwi, none at 24 months) may not be
-compatible, and a range for another setting must then cover both, not average them.
+Train and held out. The targets are exactly the pack's own fit targets (`fit_joint.targets` in pack.yaml: B10, B11,
+B12, B12b, B12m); every other benchmark is held out and stays untouched: the fit never scores one, its objective and
+its ranges use only the targets, and the script refuses a target list that differs from the pack's (a held-out
+benchmark used to choose a value would no longer test the engine; toolkit/spec/engine_parameters.py refuses such
+values). The parameters fitted are those the training arms can identify: a net-effect parameter joins only when a
+training arm uses a net it acts on, so net_kill_shift (every net type) joins cfp_kill and irs_kill, while
+pbo_gain_scale and pbo_adv_decay stay out (no training arm has a PBO net; the PBO trials B9, B9b, B9c are held out).
+
+`run` is the pack's joint fit (benchmark.fit_joint, rule joint-v1). Besides joint-v1's value and marginal range it
+exports a JOINT sample of trial-compatible parameter sets (the surrogate's all-in-band region, subsampled), with
+`verify` of them re-run on the engine, because the trials can admit a narrow trade-off (for example chlorfenapyr
+kill against the pyrethroid kill) that independent draws from marginal ranges would break. It writes
+net_effect_fit.yaml beside this file, never fitted.yaml or results.yaml: adopting the result is a later engine
+version. The full run is launched by the lead session after the owner approves the spend; `--smoke` checks the
+script end to end with a few short runs and writes only to the scratch file it is given.
 """
 from __future__ import annotations
 
@@ -35,20 +43,19 @@ from toolkit.engines import benchmark as BM  # noqa: E402
 PACK = os.path.join(HERE, "pack.yaml")
 OUT = os.path.join(HERE, "net_effect_fit.yaml")
 PROTECTED = ("fitted.yaml", "results.yaml")
-# Box of the design. net_kill_shift: Churcher 2016's 95% CrI of alpha1 (0.012-1.29) re-centred on 0.63, the card
-# prior: the field trials can narrow the hut-trial range, not leave it (a target out of band everywhere in it is
-# reported as infeasible, a principle-4 finding, not a reason to widen). pbo_gain_scale [0, 2] and pbo_adv_decay
-# [0, 1.5] per year (half-life >= 0.46 y) are design assumptions with no source; a range at a box edge is reported.
-# cfp_kill and irs_kill keep the pack's boxes.
-BOX = {"net_kill_shift": [-0.618, 0.66], "pbo_gain_scale": [0.0, 2.0], "pbo_adv_decay": [0.0, 1.5],
-       "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95]}
-TARGETS = ["B9", "B9b", "B9c", "B10", "B11", "B12", "B12b", "B12m"]
-B7B8 = ["B7", "B8"]        # only after the Cochrane setting represents its trials (ENGINE_NOTES.md, v0.17)
-GROUPS = {"muleba_pbo": ["B9", "B9b"], "misungwi_pbo": ["B9c"]}
-DESIGN = {"n": 80, "seed": 17}        # 21 quadratic coefficients in 5 dimensions; about 4 points per coefficient
+# The net-effect parameters, the net types each acts on, and their design box. net_kill_shift: Churcher 2016's 95%
+# CrI of alpha1 (0.012-1.29) re-centred on 0.63 (the card prior): the field trials may narrow the hut-trial range, not
+# leave it (a target out of band everywhere in it is reported infeasible, a principle-4 finding, not a reason to
+# widen). The PBO boxes are design assumptions with no source, used only once a PBO trial is a training target.
+NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
+              "pbo_gain_scale": ({"pbo"}, [0.0, 2.0]),
+              "pbo_adv_decay": ({"pbo"}, [0.0, 1.5])}
+DESIGN = {"n": 40, "seed": 17}     # 10 quadratic coefficients in 3 dimensions; 4 points per coefficient
+VERIFY = 20                        # joint-sample points re-run on the engine at the chosen value's calibration
+SAMPLE = 2000                      # joint-sample points exported (surrogate all-in-band region)
 # Cost basis (measured 2026-11-12 on the laptop, arm64, one process, OMP_NUM_THREADS=2, v0.16 tree, 5000 agents,
 # Muleba setting): a 50-year burn-in with the history to the fork and one arm 77 s CPU, with four arms 99.5 s, so
-# about 70 s per (design point, setting, seed) group and 7.4 s per extra arm. VM_FACTOR 2-3: a VM vCPU against one
+# about 70 s per (parameter point, setting, seed) group and 7.4 s per extra arm. VM_FACTOR 2-3: a VM vCPU against one
 # laptop core (an assumption). USD per vCPU-hour: 1 Coiled credit x $0.061 + $0.048 Azure Dv5 list price (P6
 # cluster records, cloud/vm_prices.yaml); bound: 1.5 credits and 1.25 margin as in vm_prices.yaml.
 GROUP_S, ARM_S = 70.0, 7.4
@@ -56,10 +63,27 @@ VM_FACTOR = (2.0, 3.0)
 USD_PER_VCPU_H = (1.0 * 0.061 + 0.048, 1.5 * 0.061 + 0.048 * 1.25)
 
 
-def build_pack(base: dict, with_b7b8: bool = False, smoke: bool = False) -> dict:
+def split(pack: dict) -> tuple[list, list]:
+    """(training targets, held-out ids): the pack's own fit targets and every other benchmark."""
+    train = list((pack.get("fit_joint") or {}).get("targets") or [])
+    return train, [b["id"] for b in pack["benchmarks"] if b["id"] not in train]
+
+
+def train_nets(pack: dict, train: list) -> set:
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    arms = {a for t in train for a in BM._arms_of(byid[t]["estimand"])}
+    return {str((pack["arms"][a].get("package") or {}).get("net")) for a in arms} - {"None"}
+
+
+def build_pack(base: dict, smoke: bool = False) -> dict:
+    """The pack with its own targets and a joint fit over its fitted parameters plus every net-effect parameter that a
+    training arm identifies. Benchmarks, settings and targets are the pack's (smoke: one seed, small runs)."""
     p = copy.deepcopy(base)
-    p["fit_joint"] = {"rule": "joint-v1", "params": {k: list(v) for k, v in BOX.items()},
-                      "targets": (B7B8 if with_b7b8 else []) + list(TARGETS), "design": dict(DESIGN)}
+    train, _ = split(base)
+    nets = train_nets(base, train)
+    params = {k: list(v) for k, v in base["fit_joint"]["params"].items()}
+    params = dict({k: list(b) for k, (acts, b) in NET_PARAMS.items() if acts & nets}, **params)
+    p["fit_joint"] = {"rule": "joint-v1", "params": params, "targets": train, "design": dict(DESIGN)}
     if smoke:
         p["seeds"] = p["seeds"][:1]
         p["fit_joint"]["design"] = {"n": 3, "seed": DESIGN["seed"]}
@@ -68,67 +92,74 @@ def build_pack(base: dict, with_b7b8: bool = False, smoke: bool = False) -> dict
     return p
 
 
-def plan(pack: dict) -> dict:
+def check(pack: dict, base: dict) -> list[str]:
+    """Why `pack` may not be fitted: a target that is not one of the base pack's fit targets (held out)."""
+    train, held = split(base)
+    t = list(pack["fit_joint"]["targets"])
+    bad = [f"{x} is held out in pack.yaml (not one of its fit targets {train}): it may not be a target" for x in t
+           if x in held]
+    return bad + ([f"targets {t} differ from the pack's fit targets {train}"] if sorted(t) != sorted(train) else [])
+
+
+def plan(pack: dict, verify: int = VERIFY) -> dict:
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = sorted({pack["arms"][a]["setting"] for a in arms})
     npts, ns = int(fj["design"]["n"]) + 1, len(pack["seeds"])
     grid = sum(len(pack["settings"][s]["calibrate"]["grid"]) for s in settings if pack["settings"][s].get("calibrate"))
-    cal = 2 * grid * min(2, ns)                         # at the box centre and at the chosen value; each its own burn-in
-    groups, sims = (npts + 1) * len(settings) * ns, (npts + 1) * len(arms) * ns   # design points + verification
+    cal = 2 * grid * min(2, ns)                     # at the box centre and at the chosen value; each its own burn-in
+    pts = npts + 1 + verify                         # design, the chosen value, the verified joint-sample points
+    groups, sims = pts * len(settings) * ns, pts * len(arms) * ns
     cpu_h = (groups * GROUP_S + sims * ARM_S + cal * (GROUP_S + ARM_S)) / 3600
     vcpu = [cpu_h * f for f in VM_FACTOR]
-    return {"params": fj["params"], "targets": fj["targets"], "arms": arms, "settings": settings,
-            "design_points": npts, "seeds": ns, "arm_runs": sims + cal, "burn_in_groups": groups + cal,
-            "laptop_cpu_hours": round(cpu_h, 1), "vm_vcpu_hours": [round(v, 1) for v in vcpu],
+    _, held = split(pack)
+    return {"params": fj["params"], "targets_train": fj["targets"], "held_out_untouched": held,
+            "not_fitted": sorted(set(NET_PARAMS) - set(fj["params"])), "arms": arms, "settings": settings,
+            "design_points": npts, "verified_sample_points": verify, "seeds": ns, "arm_runs": sims + cal,
+            "burn_in_groups": groups + cal, "laptop_cpu_hours": round(cpu_h, 1),
+            "vm_vcpu_hours": [round(v, 1) for v in vcpu],
             "usd": [round(vcpu[0] * USD_PER_VCPU_H[0], 1), round(vcpu[1] * USD_PER_VCPU_H[1], 1)]}
 
 
 def target_bands(pack: dict) -> dict:
-    """{target: band} of the fit's targets (a benchmark outside the fit, such as a curve rule, may have no band)."""
+    """{target: band} of the fit's targets (a held-out benchmark, such as a curve rule, may have no band)."""
     t = set(pack["fit_joint"]["targets"])
     return {b["id"]: b["band"] for b in pack["benchmarks"] if b["id"] in t}
 
 
-def regions(X: np.ndarray, Y: dict, bands: dict, groups: dict, names: list, box: np.ndarray, seed: int) -> dict:
-    """Each target's quadratic surrogate (as joint-v1) on dense candidates; the hull of the region where the common
-    targets and one group's targets are in band, for each group, for all at once, and for their union."""
+def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarray, seed: int,
+                 n_sample: int = SAMPLE) -> dict:
+    """Each target's quadratic surrogate (as joint-v1) on dense candidates; the region where every target is in band:
+    its share of the box, its marginal hull, and a joint sample of its points (parameter sets, not marginals)."""
     cand = BM._candidates(X.shape[1], seed)
     Fc = BM._quad_features(cand)
-    inb = {}
+    m = np.ones(len(cand), bool)
     for t, y in Y.items():
         coef, _ = BM._quad_fit(X, np.log(np.maximum(np.asarray(y, float), 1e-12)))
         v = np.exp(Fc @ coef)
-        inb[t] = (v >= bands[t][0]) & (v <= bands[t][1])
-    grouped = {t for g in groups.values() for t in g}
-    common = np.logical_and.reduce([inb[t] for t in Y if t not in grouped] or [np.ones(len(cand), bool)])
-    masks = {g: common & np.logical_and.reduce([inb[t] for t in ts]) for g, ts in groups.items()}
-    masks["all"] = np.logical_and.reduce([masks[g] for g in groups])
-    masks["union"] = np.logical_or.reduce([masks[g] for g in groups])
-
-    def hull(m):
-        if not m.any():
-            return None
-        return {k: [round(float(box[i, 0] + cand[m, i].min() * (box[i, 1] - box[i, 0])), 4),
-                    round(float(box[i, 0] + cand[m, i].max() * (box[i, 1] - box[i, 0])), 4)] for i, k in enumerate(names)}
-    out = {g: {"share_of_box": round(float(m.mean()), 4), "hull": hull(m)} for g, m in masks.items()}
-    out["groups_compatible"] = bool(masks["all"].any())
-    # a hull on an edge the design chose (not a natural bound: 0 for the scale, the decay and the kills) is reported
-    edge = set()
-    for g in ("union", "all"):
-        for i, k in enumerate(names):
-            if out[g]["hull"]:
-                lo, hi = out[g]["hull"][k]
-                tol = 1e-3 * (box[i, 1] - box[i, 0])
-                if hi >= box[i, 1] - tol or (box[i, 0] != 0.0 and lo <= box[i, 0] + tol):
-                    edge.add(k)
-    out["at_box_edge"] = sorted(edge)
-    return out
+        m &= (v >= bands[t][0]) & (v <= bands[t][1])
+    to = lambda c: {k: round(float(box[i, 0] + c[i] * (box[i, 1] - box[i, 0])), 6) for i, k in enumerate(names)}  # noqa
+    idx = np.flatnonzero(m)
+    if len(idx) > n_sample:
+        idx = np.sort(np.random.default_rng(seed).choice(idx, n_sample, replace=False))
+    pts = [to(cand[i]) for i in idx]
+    hull = ({k: [min(p[k] for p in pts), max(p[k] for p in pts)] for k in names} if pts else None)
+    edge = sorted(k for i, k in enumerate(names) if hull and (
+        hull[k][1] >= box[i, 1] - 1e-3 * (box[i, 1] - box[i, 0])
+        or (box[i, 0] != 0.0 and hull[k][0] <= box[i, 0] + 1e-3 * (box[i, 1] - box[i, 0]))))
+    corr = (np.corrcoef(np.array([[p[k] for k in names] for p in pts]).T).round(3).tolist()
+            if len(pts) > 2 else None)
+    return {"share_of_box": round(float(m.mean()), 4), "hull": hull, "at_box_edge": edge,
+            "correlation": {"names": names, "matrix": corr}, "sample": pts}
 
 
-def run(pack: dict, workers: int, out_path: str, approved: str | None, smoke: bool) -> int:
+def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
+        verify: int = VERIFY) -> int:
     if os.path.basename(out_path) in PROTECTED:
         raise ValueError(f"net_effect_fit writes its own file, never {PROTECTED}")
+    bad = check(pack, base)
+    if bad:
+        raise ValueError("net_effect_fit: " + "; ".join(bad))
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
     eng = BM.load_engine(pack["engine"], None)
@@ -139,14 +170,30 @@ def run(pack: dict, workers: int, out_path: str, approved: str | None, smoke: bo
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
-    bands = target_bands(pack)
-    reg = regions(X, fit["design"]["computed"], bands, GROUPS, names, box, int(pack["fit_joint"]["design"]["seed"]))
-    doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters (ENGINE_NOTES.md, v0.17); not adopted",
-                    "smoke": smoke, "approved": approved, "plan": plan(pack), "n_sims": runner.nsims,
+    reg = joint_region(X, fit["design"]["computed"], target_bands(pack), names, box,
+                       int(pack["fit_joint"]["design"]["seed"]))
+    # re-run `verify` of the joint-sample points (settings stay calibrated at the chosen value): the surrogate's
+    # region is a claim until the engine agrees at points other than the chosen one
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    rng = np.random.default_rng(int(pack["fit_joint"]["design"]["seed"]) + 1)
+    pick = sorted(rng.choice(len(reg["sample"]), min(verify, len(reg["sample"])), replace=False).tolist()) \
+        if reg["sample"] else []
+    arms = sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])})
+    runner.prefetch(arms, [reg["sample"][i] for i in pick])
+    checked = []
+    for i in pick:
+        rows = {t: runner.evaluate(byid[t], reg["sample"][i]) for t in pack["fit_joint"]["targets"]}
+        checked.append({"point": reg["sample"][i], "all_in_band": all(r["in_band"] for r in rows.values()),
+                        "computed": {t: round(r["computed"], 4) for t, r in rows.items()}})
+    reg["verified"] = {"n": len(checked), "all_in_band": sum(c["all_in_band"] for c in checked), "points": checked}
+    doc = BM.stamp({"purpose": "trial fit of the v0.17 net-effect parameters on the pack's training targets "
+                               "(ENGINE_NOTES.md, v0.17); not adopted",
+                    "smoke": smoke, "approved": approved, "plan": plan(pack, verify), "n_sims": runner.nsims,
                     "wall_s": round(time.time() - t0, 1), "fitted_at": time.strftime("%F %T"),
-                    "trial_regions": reg, **fit}, eng)
+                    "joint_region": reg, **fit}, eng)
     yaml.safe_dump(doc, open(out_path, "w"), sort_keys=False)
-    print(f"wrote {out_path} ({runner.nsims} sims); groups compatible: {reg['groups_compatible']}")
+    print(f"wrote {out_path} ({runner.nsims} sims); joint sample {len(reg['sample'])} points, verified "
+          f"{reg['verified']['all_in_band']}/{reg['verified']['n']} all in band")
     return 0
 
 
@@ -160,48 +207,60 @@ def _self_test() -> int:
 
     base = yaml.safe_load(open(PACK))
     p = build_pack(base)
+    train, held = split(base)
     byid = {b["id"]: b for b in p["benchmarks"]}
     arms_ok = all(a in p["arms"] for t in p["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"]))
-    ok(set(p["fit_joint"]["targets"]) == set(TARGETS) and arms_ok and not set(B7B8) & set(p["fit_joint"]["targets"])
-       and base.get("fit_joint", {}).get("params") != p["fit_joint"]["params"],
-       "F1 the design targets the net and IRS trials (B7/B8 held out), every target's arms exist, the pack is not changed")
+    ok(p["fit_joint"]["targets"] == train == base["fit_joint"]["targets"] and arms_ok and not check(p, base)
+       and {"B7", "B8", "B9", "B9b", "B9c", "B15"} <= set(held) and not set(held) & set(train),
+       f"F1 the targets are the pack's own fit targets {train}; B7, B8, B9, B9b, B9c, B15 and the rest are held out")
+    for t in ("B9c", "B7"):
+        q = copy.deepcopy(p)
+        q["fit_joint"]["targets"].append(t)
+        ok(any(f"{t} is held out" in x for x in check(q, base)), f"F1b a held-out benchmark ({t}) as a target is refused")
+    ok(list(p["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill"]
+       and "pbo" not in train_nets(base, train),
+       "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets) with cfp_kill and irs_kill; the "
+       "PBO parameters stay out: no training arm has a PBO net")
     from toolkit.engines.malaria.engine import MalariaEngine
     from toolkit.spec import priors as PR
     e = MalariaEngine()
     sp = {q.name: q.value for q in e.parameters()}
     pr = PR.load_card(e)["priors"]["net_kill_shift"]
-    ok(all(BOX[k][0] <= sp[k] <= BOX[k][1] for k in BOX) and [pr.lo, pr.hi] == BOX["net_kill_shift"],
-       "F2 the box holds every current value; the kill shift's box is its card prior (Churcher 2016 alpha1 CrI)")
+    bx = p["fit_joint"]["params"]
+    ok(all(bx[k][0] <= sp[k] <= bx[k][1] for k in bx) and [pr.lo, pr.hi] == bx["net_kill_shift"],
+       "F3 the box holds every current value; the kill shift's box is its card prior (Churcher 2016 alpha1 CrI)")
     q = plan(p)
-    ok(q["design_points"] == 81 and q["seeds"] == 8 and len(q["arms"]) == 10 and q["settings"] ==
-       ["benin", "irs_added", "misungwi", "muleba"] and q["arm_runs"] == 82 * 10 * 8 + 2 * 21 * 2 and q["usd"][0] > 0,
-       f"F3 plan: 81 design points x 10 arms x 8 seeds, 4 settings; {q['arm_runs']} arm runs, "
-       f"{q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]}")
-    q2 = plan(build_pack(base, with_b7b8=True))
-    ok("cochrane_itn" in q2["settings"] and q2["usd"][1] > q["usd"][1], "F4 with B7/B8 the Cochrane setting joins and costs more")
-    # F5: two trials that cannot both be in band: target A in band only for theta < 0.4, B (Misungwi) only above 0.6
-    names, box = ["pbo_adv_decay"], np.array([[0.0, 1.5]])
-    X = np.linspace(0, 1, 21)[:, None]
-    Y = {"B9": np.exp(X[:, 0]), "B9c": np.exp(-X[:, 0]), "B10": np.full(21, 1.0)}
-    bands = {"B9": [0.5, np.exp(0.4)], "B9c": [0.1, np.exp(-0.6)], "B10": [0.5, 2.0]}
-    r = regions(X, Y, bands, {"muleba_pbo": ["B9"], "misungwi_pbo": ["B9c"]}, names, box, 1)
-    hu, hm, hs = r["union"]["hull"]["pbo_adv_decay"], r["muleba_pbo"]["hull"], r["misungwi_pbo"]["hull"]
-    ok(not r["groups_compatible"] and r["all"]["hull"] is None and hm["pbo_adv_decay"][1] < 0.61
-       and hs["pbo_adv_decay"][0] > 0.89 and hu[0] < 0.01 and hu[1] > 1.49,
-       f"F5 incompatible trials: no common region; each trial's region is reported and the range is their union {hu}")
+    ok(q["design_points"] == 41 and q["seeds"] == 8 and len(q["arms"]) == 8 and q["settings"] ==
+       ["benin", "irs_added", "misungwi", "muleba"] and q["arm_runs"] == (41 + 1 + 20) * 8 * 8 + 2 * 21 * 2
+       and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held,
+       f"F4 plan: 41 design points + 1 + 20 verified x 8 arms x 8 seeds; {q['arm_runs']} arm runs, "
+       f"{q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]}; held out listed")
+    # F5: a narrow trade-off (a + b = 1 +- 0.05) is kept by the joint sample and lost by independent marginal draws
+    names, box = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
+    g = np.linspace(0, 1, 7)
+    X = np.array([[u, v] for u in g for v in g])
+    Y = {"T": np.exp(X[:, 0] + X[:, 1])}
+    r = joint_region(X, Y, {"T": [np.exp(0.95), np.exp(1.05)]}, names, box, 3)
+    S = np.array([[s["a"], s["b"]] for s in r["sample"]])
+    rng = np.random.default_rng(0)
+    ind = np.column_stack([rng.uniform(*r["hull"]["a"], 2000), rng.uniform(*r["hull"]["b"], 2000)])
+    ok(len(S) > 50 and np.all(np.abs(S.sum(1) - 1) <= 0.051) and r["correlation"]["matrix"][0][1] < -0.9
+       and np.mean(np.abs(ind.sum(1) - 1) <= 0.05) < 0.2,
+       f"F5 the joint sample keeps a narrow trade-off (corr {r['correlation']['matrix'][0][1]}); independent draws "
+       f"from the marginal hulls fall outside it {1 - np.mean(np.abs(ind.sum(1) - 1) <= 0.05):.0%} of the time")
     for bad, kw in (("fitted.yaml", {"approved": "x", "smoke": False}), ("x.yaml", {"approved": None, "smoke": False})):
         try:
-            run(p, 1, os.path.join(HERE, bad), **kw)
+            run(p, base, 1, os.path.join(HERE, bad), **kw)
             ok(False, f"F6 refused: {bad} {kw}")
         except ValueError:
             ok(True, f"F6 refused before any run: {'writing ' + bad if bad != 'x.yaml' else 'a full fit without --approved'}")
-    tb = target_bands(p)
-    ok(set(tb) == set(TARGETS) and all(len(v) == 2 for v in tb.values()),
-       "F8 the region step reads the bands of the fit's targets only (B16c has none; the smoke's first failure)")
     s = build_pack(base, smoke=True)
     ok(s["seeds"] == base["seeds"][:1] and s["fit_joint"]["design"]["n"] == 3
-       and all(v["params"]["n_agents"] == 600 for v in s["settings"].values()),
-       "F7 --smoke: one seed, 3 design points, 600 agents, 2-year burn-in")
+       and all(v["params"]["n_agents"] == 600 for v in s["settings"].values()) and not check(s, base),
+       "F7 --smoke: one seed, 3 design points, 600 agents, 2-year burn-in, the same targets")
+    tb = target_bands(p)
+    ok(set(tb) == set(train) and all(len(v) == 2 for v in tb.values()),
+       "F8 the region step reads the bands of the fit's targets only (B16c has none; the first smoke's failure)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -214,20 +273,21 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["plan", "run"])
-    ap.add_argument("--with-b7b8", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--approved", default=None)
+    ap.add_argument("--verify", type=int, default=VERIFY)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
-    pack = build_pack(yaml.safe_load(open(PACK)), a.with_b7b8, a.smoke)
+    base = yaml.safe_load(open(PACK))
+    pack = build_pack(base, a.smoke)
     if a.action == "plan":
-        print(yaml.safe_dump(plan(pack), sort_keys=False))
+        print(yaml.safe_dump(plan(pack, a.verify), sort_keys=False))
         return 0
     if a.smoke and not a.out:
         print("--smoke needs --out (a scratch file): a smoke is not evidence")
         return 2
-    return run(pack, a.workers, a.out or OUT, a.approved, a.smoke)
+    return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify)
 
 
 if __name__ == "__main__":
