@@ -1,0 +1,121 @@
+# World model v0 (seed), written before any simulation.
+# Decision: one ACF algorithm per district (none / sym / cxr) for 10 districts in 2026 under a
+# US$1.1M envelope; comparator: none (no ACF round); outcome: bacteriologically confirmed TB
+# left undetected (cases detected = burden averted); no discounting, one-year window.
+# Working arithmetic (from decision_spec.yaml cost_items and units.csv, not from any run):
+#   cost per target person = 0.7 reach x price: sym 0.7 x 2.8, cxr 0.7 x 7.6 (US$ per person screened).
+#   sym in every district already costs more than the envelope, so the budget binds whatever is chosen.
+#   relative reduction = 0.7 reach x algorithm sensitivity, independent of prevalence (multiplicative engine).
+#   So the choice is set by (a) relative burden (prev_undiag ranks districts, ~4.8-fold spread) and
+#   (b) sensitivity-per-dollar of sym vs cxr; cxr's extra yield per extra dollar is about half of sym's
+#   yield per dollar, so cxr only pays where prevalence is roughly twice that of the marginal sym district.
+beliefs:
+  - id: B1
+    mechanism: "CXR-first screening (any abnormality, then Xpert Ultra) detects most prevalent bacteriologically confirmed TB among those reached; with 70% reach the share of the district's undetected burden removed is about 0.7 x 0.7-0.9"
+    about: {package: cxr}
+    direction: reduces
+    magnitude: {band: [0.48, 0.64], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "World Health Organization 2021, WHO consolidated guidelines on tuberculosis, Module 2: Screening - systematic screening for tuberculosis disease", location: "CXR (any abnormality) accuracy evidence summary; exact page not verified"}
+      - {citation: "Dorman SE et al. 2018, Lancet Infect Dis 18(1):76-84, Xpert MTB/RIF Ultra diagnostic accuracy", location: "Results / abstract (pooled sensitivity vs culture); table number not verified"}
+    # Engine prior for comparison (not literature): decision_spec.yaml engine.config.effects.cxr.undetected
+    # (rr 0.42, range 0.37-0.51, derived, verified: false).
+    confidence: medium
+    decision_relevant: true
+  - id: B2
+    mechanism: "Symptom screening misses symptom-negative (subclinical) TB, about half of prevalent bacteriologically confirmed TB in prevalence surveys, so its relative reduction is roughly half of CXR's: 0.7 reach x 0.3-0.6"
+    about: {package: sym}
+    direction: reduces
+    magnitude: {band: [0.20, 0.43], scale: relative_reduction}
+    source_type: literature
+    evidence:
+      - {citation: "Frascella B et al. 2021, Clin Infect Dis 73(3):e830-e841, Subclinical tuberculosis disease: a review and analysis of prevalence surveys", location: "Results, pooled proportion of bacteriologically confirmed TB without reported symptoms; table number not verified"}
+      - {citation: "Dorman SE et al. 2018, Lancet Infect Dis 18(1):76-84", location: "Results / abstract; table number not verified"}
+    # Engine prior for comparison (not literature): decision_spec.yaml engine.config.effects.sym.undetected
+    # (rr 0.69, range 0.58-0.79, derived, verified: false).
+    confidence: medium
+    decision_relevant: true
+  - id: B3
+    mechanism: "Per dollar, sym detects more cases than cxr in every district: cost ratio 7.6/2.8 = 2.7 exceeds the sensitivity ratio (about 1.9 at central values), so cases per US$ sym/cxr is about 0.9-2.3, centre ~1.45; under a binding budget and the harness shadow price, sym beats cxr except possibly in the highest-prevalence district with a large sensitivity gap"
+    about: {pair: [sym, cxr]}
+    direction: increases
+    magnitude: {band: [1.1, 2.0], scale: ratio_of_cases_detected_per_usd_sym_over_cxr}
+    conditions: [{feature: prev_undiag, range: [0.00247, 0.011928]}]
+    source_type: data
+    evidence:
+      - {dossier_entry: "decision_spec.yaml options.cost_items sym_screen 2.8 and cxr_screen 7.6 US$ per person, share 0.7 (from data/evals/tb_acf/algorithm_costs.csv)"}
+      - {dossier_entry: "decision_spec.yaml engine.config.effects (sym and cxr rate ratios)"}
+    confidence: medium
+    decision_relevant: true
+  - id: B4
+    mechanism: "Whether a district is screened at all (sym vs none) at a fixed shadow price flips with prevalence: net benefit of sym is prev x r_sym - lambda x 1.96; at lambda 0.001 cases/US$ the breakeven prevalence is 0.00196 / r_sym, about 0.005-0.009"
+    about: {pair: [sym, none]}
+    direction: flips
+    conditions: [{feature: prev_undiag, range: [0.0045, 0.0095]}]
+    source_type: data
+    evidence:
+      - {dossier_entry: "units.csv column prev_undiag (derived from data/evals/tb_acf/acf_records_2022_2025.csv CXR yields / 0.83)"}
+      - {dossier_entry: "decision_spec.yaml options.cost_items sym_screen"}
+    confidence: medium
+    decision_relevant: true
+  - id: B5
+    mechanism: "Relative reduction does not depend on prevalence or population: the engine is multiplicative per person, so baseline burden ranks districts and relative effect/price rank algorithms"
+    about: {package: cxr, feature: prev_undiag}
+    direction: negligible
+    source_type: data
+    evidence:
+      - {dossier_entry: "_task_input.json engine.mechanisms (rate = baseline x M(package) / M(baseline coverage)); note 'no transmission dynamics'"}
+    confidence: high
+    decision_relevant: false
+  - id: B6
+    mechanism: "The baseline (prev_undiag) is itself inferred from CXR-round yields divided by an assumed CXR algorithm sensitivity of 0.83, so baseline and cxr effect share one uncertain number: if CXR sensitivity is lower, true prevalence is higher in every district, which scales all benefits up proportionally and lowers the breakeven but leaves the district ranking unchanged"
+    about: {feature: prev_undiag}
+    direction: increases
+    source_type: data
+    evidence:
+      - {dossier_entry: "_task_input.json engine.notes baseline undetected (mean CXR-round yield / 0.83 from data/evals/tb_acf/acf_records_2022_2025.csv)"}
+    confidence: medium
+    decision_relevant: true
+open_questions:
+  - id: Q1
+    question: "Does the measured SYM-round yield per person screened in acf_records_2022_2025.csv, relative to CXR-round yield in the same districts, support a SYM sensitivity of 0.3-0.6 (ratio to CXR ~0.36-0.86)? Measured relative yield is direct field evidence on the sym/cxr ratio the choice turns on and should be preferred to the literature-derived prior if comparable (same districts, stable prevalence)."
+    beliefs: [B2, B3]
+    decision_relevant: true
+  - id: Q2
+    question: "The harness shadow price is 0.001 cases per US$ (US$1000 per case); my rough greedy estimate of the budget dual is lower, ~0.0006-0.0008. At the true dual, sym is worth it at lower prevalence and cxr upgrades become more attractive; paired verdicts at 0.001 may not match the budget-constrained plan."
+    beliefs: [B3, B4]
+    decision_relevant: true
+  - id: Q3
+    question: "Do national_reference_yields.csv yields agree with the district records-derived prevalence (same estimand: confirmed cases per person screened by algorithm)? A conflict would change the baseline ranking or level."
+    beliefs: [B6]
+    decision_relevant: true
+  - id: Q4
+    question: "At what CXR price would cxr match sym per dollar (about 2.8 x r_cxr / r_sym, ~US$5.3 at central values)? No price test is in the sweep, so this bracket is not computed and must be reported as not computed."
+    beliefs: [B3]
+    decision_relevant: true
+hypotheses:
+  - id: H1
+    belief: B1
+    claim: "cxr removes 48-64% of the undetected burden at nearly all usable points"
+    test: {kind: effect_band, package: cxr, band: [0.48, 0.64], min_share: 0.8}
+  - id: H2
+    belief: B2
+    claim: "sym removes 20-43% of the undetected burden at nearly all usable points"
+    test: {kind: effect_band, package: sym, band: [0.20, 0.43], min_share: 0.8}
+  - id: H3
+    belief: B2
+    claim: "sym's relative reduction falls as its log rate ratio rises toward 0"
+    test: {kind: effect_direction, package: sym, feature: "lrr:sym:undetected", direction: decreases}
+  - id: H4
+    belief: B3
+    claim: "at the harness shadow price sym has higher net benefit than cxr across the prevalence range in at least 80% of usable points"
+    test: {kind: paired_sign, a: sym, b: cxr, feature: prev_undiag, range: [0.00247, 0.011928], sign: positive, min_share: 0.8}
+  - id: H5
+    belief: B4
+    claim: "the sym/none transition along prevalence lies within 0.0045-0.0095"
+    test: {kind: flip_in, a: sym, b: none, feature: prev_undiag, range: [0.0045, 0.0095]}
+  - id: H6
+    belief: B4
+    claim: "in the higher-prevalence districts (prev_undiag >= 0.0067) sym beats none at the shadow price in at least 75% of usable points"
+    test: {kind: paired_sign, a: sym, b: none, feature: prev_undiag, range: [0.0067, 0.011928], sign: positive, min_share: 0.75}
