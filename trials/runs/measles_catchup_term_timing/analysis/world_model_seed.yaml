@@ -1,0 +1,272 @@
+beliefs:
+- id: B1
+  mechanism: Removing ~90% of school-age susceptibles before seeding pushes Reff near or below 1 in most districts;
+    near threshold the final size falls much faster than the susceptible share, so SCHOOL averts most infections
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.5
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 (final size relation); Chapter 5 (critical vaccination proportion)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology, 2006
+    location: final size equation, section 2
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. Journal of Infectious Diseases, 2011'
+    location: Results (median effectiveness by age of vaccination); location from memory, unsure
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: COMMUNITY acts 70 days after seeding; infections before then are not averted, so its relative reduction
+    falls as the seeded share rises (more early infections, earlier peak)
+  about:
+    package: community
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. American Journal of Epidemiology, 2014'
+    location: Table 2 (measles serial interval about 11-12 days)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 6 (epidemic growth and timing)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Under homogeneous mixing the option removing more susceptibles earlier wins; SCHOOL wins where the
+    under-five gap is small because COMMUNITY then removes fewer susceptibles and also acts late; COMMUNITY can
+    win only where the gap is concentrated in ages 1-4
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_1_4
+  direction: flips
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: 'Chapter 5 (homogeneous mixing: herd immunity depends on the susceptible fraction, not its age)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: The SCHOOL-to-COMMUNITY switch along gap_1_4 lies in the upper-middle of the sampled range (roughly
+    0.13-0.26), shifted upward from the pure susceptible-count tie (~0.15) by COMMUNITY's 70-day delay; its location
+    also depends on gap_5_9, gap_10_14 and seed_share, so it is blurred
+  about:
+    pair:
+    - community
+    - school
+    feature: gap_1_4
+  direction: flips
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.13
+    - 0.26
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; tie point is my own arithmetic, not from the text
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'SCHOOL''s relative reduction rises with the school-age gap (gap_10_14): the larger the share of all
+    susceptibles that sits in ages 10-14, the larger the share SCHOOL removes and the further it pushes Reff below
+    threshold'
+  about:
+    package: school
+    feature: gap_10_14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 (final size relation)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: District population size does not change per-capita relative reductions in a deterministic closed-population
+    model with per-capita seeding
+  about:
+    package: school
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bulletin of Mathematical Biology, 2006
+    location: final size depends on R0 and initial susceptible fraction, not population size
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B7
+  mechanism: COMMUNITY's relative reduction rises with the under-five gap (gap_1_4), the age band only it reaches
+  about:
+    package: community
+    feature: gap_1_4
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 4 (final size relation)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: How does the engine deliver COMMUNITY 70 days after seeding, when its card says interventions act before
+    the epidemic? If it is applied at day 0, its timing penalty vanishes and COMMUNITY wins more often than B3/B4
+    expect
+  beliefs:
+  - B2
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q2
+  question: What are the age-band population shares and infant share per district (s0_groups)? They set the susceptible
+    counts each option can reach and so locate the flip
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Where does Reff without intervention sit relative to 1 across districts? Districts below threshold have
+    no major epidemic, and there the cheaper SCHOOL or no action wins on cost alone
+  beliefs:
+  - B1
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: Do the efficacy priors differ between the two delivery modes (seroconversion of a second dose at ages
+    1-9 versus 5-14)? A sizeable difference would move the flip
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q5
+  question: Does the US$5M budget bind? SCHOOL everywhere costs ~0.8 x total population; if that exceeds the budget,
+    districts must be ranked by infections averted per dollar (relative burden times reduction)
+  beliefs:
+  - B1
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: SCHOOL averts 50-100% of infections relative to no action in at least 70% of usable points
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.5
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: COMMUNITY's relative reduction decreases as seed_share rises; refuted if it increases or shows no reliable
+    trend
+  test:
+    kind: effect_direction
+    package: community
+    feature: seed_share
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: Where the under-five gap is small (gap_1_4 0.051-0.12), SCHOOL beats COMMUNITY on net benefit in at least
+    75% of usable points
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.051
+    - 0.12
+    sign: positive
+    min_share: 0.75
+- id: H4
+  belief: B4
+  claim: The COMMUNITY/SCHOOL transition along gap_1_4 lies within 0.13-0.26
+  test:
+    kind: flip_in
+    a: community
+    b: school
+    feature: gap_1_4
+    range:
+    - 0.13
+    - 0.26
+- id: H5
+  belief: B5
+  claim: SCHOOL's relative reduction increases with gap_10_14
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_10_14
+    direction: increases
+- id: H6
+  belief: B6
+  claim: SCHOOL's relative reduction is unrelated to district population (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: school
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H7
+  belief: B7
+  claim: COMMUNITY's relative reduction increases with gap_1_4
+  test:
+    kind: effect_direction
+    package: community
+    feature: gap_1_4
+    direction: increases
