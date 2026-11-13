@@ -1005,6 +1005,35 @@ def _self_test() -> int:
             ok(status(d) == "signed", f"ED12b ... one whose options need none stays signed: {status(d)}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"ED10-ED12 every signing path: {type(e).__name__}: {e}")
+    # ED13-ED14 (#218 review round 2): the brief's signer checks the dossier against the sheet and never trusts a
+    # binding it is handed
+    try:
+        def brief_refusal(d, **kw):
+            try:
+                DB.sign(d, "owner", note="n", **kw)
+                return ""
+            except ValueError as e:
+                return str(e)
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after the sheet\n")
+            why = brief_refusal(d)
+            ok("stale" in why and "evidence dossier" in why and status(d) != "signed",
+               f"ED13 the brief's sign-off refuses a dossier changed after the sheet was generated: {why}")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            ED.toy_dossier_spec(d, dossier=False)
+            brief(d)
+            empty = {"files": {}, "record": {"required": [], "dossier": None, "sha256": None}}
+            w1 = brief_refusal(d, evidence=empty)
+            ED.toy_dossier_spec(other)
+            foreign = ED.bind(other, open(os.path.join(other, SPEC), "rb").read())
+            w2 = brief_refusal(d, evidence=foreign)
+            ok("evidence dossier" in w1 and w2 and status(d) != "signed",
+               f"ED14 a caller's binding is never trusted: an empty one and one made for another spec are refused "
+               f"({w1[:120]} | {w2[:120]})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"ED13-ED14 the brief's signer: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

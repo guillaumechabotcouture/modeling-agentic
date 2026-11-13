@@ -274,6 +274,19 @@ def _self_test() -> int:
            f"DI9 every card parameter and unit attribute is a declared input or excluded with a reason: {cov}")
     except NameError as e:
         ok(False, f"DI6-DI9: {e}")
+    # DI10 (#218 review round 2): inputs every arm uses to compute the decision's outcome, by outcome
+    try:
+        oi = {"*": [{"kind": "unit_attribute", "name": "ft", "why": "w"},
+                    {"kind": "unit_attribute", "name": "ratio:{outcome}", "why": "w", "if_on_card": True}],
+              "dalys": [{"kind": "parameter", "name": "dw", "why": "w"}]}
+        got = [i["name"] for i in outcome_inputs(oi, ["dalys"])]
+        ok(got == ["ft", "ratio:dalys", "dw"] and [i["name"] for i in outcome_inputs(oi, ["cases"])] == ["ft", "ratio:cases"]
+           and outcome_problems(oi) == [] and outcome_problems({"dalys": ["dw"]})
+           and coverage_problems({}, {}, {"parameter": ["dw"], "unit_attribute": ["ft"]}, oi) == [],
+           f"DI10 outcome inputs: every outcome's plus the outcome's own, {{outcome}} substituted; malformed ones are "
+           f"problems; they count for completeness: {got}")
+    except NameError as e:
+        ok(False, f"DI10: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

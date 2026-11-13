@@ -499,6 +499,82 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     return p
 
 
+def _self_test_round2(ok, T) -> None:
+    """#218 review round 2: the draw plan, the executable value, outcome-conversion inputs."""
+    import copy
+    import tempfile
+    import yaml
+    kdecl = {"a": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "k", "why": "the toy transmission slope"}]},
+             "b": {"inputs": [], "none_reason": "toy"}}
+    kentry = {"model_value": 0.8, "model_source": "engine card",
+              "no_data": {"reason": "toy", "borrowing_rule": "the toy range"},
+              "chosen": {"range": [0.7, 0.9], "rule": "the toy range"}, "decision_test": "prior_range_k"}
+
+    def verdict(raw, entry, d):
+        full = T.ToyDossierEngine.DECISION_INPUTS
+        T.ToyDossierEngine.DECISION_INPUTS = kdecl
+        try:
+            req, probs = required_inputs(raw, d)
+            return probs + check(raw, yaml.safe_dump({"inputs": {"parameter:k": entry}}).encode(), req)
+        finally:
+            T.ToyDossierEngine.DECISION_INPUTS = full
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_dossier_spec(d)))
+        drawn = copy.deepcopy(raw)
+        drawn["uncertainty"]["priors"] = {"k": {"dist": "uniform", "range": [0.6, 1.0], "source": "toy"}}
+        excl = copy.deepcopy(drawn)
+        excl["uncertainty"]["excluded"].append({"parameter": "k", "reason": "held fixed"})
+        sval = copy.deepcopy(raw)
+        sval["engine_parameters"] = {"k": {"value": 0.8, "range": [0.6, 1.0], "dist": "uniform", "source": "toy",
+                                           "reason": "toy", "basis": "setting_data"}}
+        ok(verdict(drawn, kentry, d) == [] and any("prior_range_k" in p for p in verdict(excl, kentry, d))
+           and verdict(sval, kentry, d) == [],
+           f"ED-T2 prior_range_<p> holds only when the draw plan draws p: a drawn prior passes, one excluded by "
+           f"uncertainty.excluded is refused, a range on its engine_parameters value passes "
+           f"({verdict(drawn, kentry, d)}, {verdict(excl, kentry, d)}, {verdict(sval, kentry, d)})")
+        fixed = copy.deepcopy(raw)
+        fixed["engine_parameters"] = {"k": {"value": 0.9, "source": "toy", "reason": "toy", "basis": "setting_data"}}
+        e1 = dict(kentry, model_value=0.1, chosen={"value": 0.1, "rule": "r"})
+        e1.pop("decision_test")
+        e2 = dict(e1, model_value=0.9, chosen={"value": 0.9, "rule": "r"})
+        ok(any("0.9" in p for p in verdict(fixed, e1, d)) and verdict(fixed, e2, d) == [],
+           f"ED-V1 the chosen and model values reconcile with the value the spec runs (engine_parameters 0.9 vs 0.1 "
+           f"refused; 0.9 passes): {verdict(fixed, e1, d)} {verdict(fixed, e2, d)}")
+        ua = copy.deepcopy(raw)
+        ua["decision_units"]["engine_attributes"] = {"x": {"value": 0.5, "source": "toy"}}
+        e3 = copy.deepcopy(toy_entries())
+        e3["unit_attribute:x"]["model_value"] = 0.2
+        e3["unit_attribute:x"]["chosen"] = {"value": 0.2, "rule": "r"}
+        req, _ = required_inputs(ua, d)
+        got = check(ua, yaml.safe_dump({"inputs": e3}).encode(), req)
+        ok(any("0.5" in p and "unit_attribute:x" in p for p in got),
+           f"ED-V2 ... and a unit attribute bound to a value: {got}")
+    # ED-R11: compartmental outcome ratios when the configured outcome uses them
+    base_cfg = {"groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "outcomes": ["deaths"],
+                "components": {"camp": {"kind": "campaign", "targets": ["g1"], "reach": 0.8}}}
+    for cfg, want in ((base_cfg, {"unit_attribute:ratio:deaths"}),
+                      (dict(base_cfg, per_group_parameters=["ratio:deaths"]),
+                       {"parameter:ratio:deaths:g1", "parameter:ratio:deaths:g2"})):
+        comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": cfg},
+                "objective": {"outcome": "deaths"},
+                "options": {"components": {"c": {}}, "engine_map": {"c": {"camp": 1}}}}
+        req, probs = required_inputs(comp)
+        ok(want <= set(req) and probs == [], f"ED-R11 compartmental outcome deaths needs its ratio inputs {sorted(want)}: "
+                                             f"{sorted(req)} {probs}")
+    # ED-R12: malaria outcome-conversion inputs follow the primary outcome, whatever the components
+    mal = {"engine": {"ref": "toolkit.engines.malaria.engine:MalariaEngine"}, "objective": {"outcome": "dalys"},
+           "options": {"components": {"n": {}}, "engine_map": {"n": {"net": "pbo"}}}}
+    req, probs = required_inputs(mal)
+    mal["objective"]["outcome"] = "cases"
+    req2, _ = required_inputs(mal)
+    conv = {"unit_attribute:cm_ft", "parameter:severe_access_add", "parameter:cfr_severe_treated",
+            "parameter:cfr_severe_untreated", "parameter:dw_moderate", "parameter:dw_severe", "parameter:le_u5"}
+    ok(conv <= set(req) and "unit_attribute:cm_ft" in req2 and "parameter:cfr_severe_treated" not in req2
+       and probs == [],
+       f"ED-R12 a net-only DALY decision needs treatment, severe-care, fatality and DALY inputs; a case decision needs "
+       f"treatment only: {sorted(conv - set(req))} {sorted(set(req2) & conv)}")
+
+
 def _self_test_round1(ok, T) -> None:
     """#218 review round 1: each reproduction is a case."""
     import copy
@@ -585,6 +661,7 @@ def _self_test_round1(ok, T) -> None:
             ok(False, "ED-B2 bind refuses a spec it cannot bind")
         except ValueError as e:
             ok("does not exist" in str(e), f"ED-B2 bind refuses a spec it cannot bind: {e}")
+    _self_test_round2(ok, T)
     # ED-R9: a configured engine's inputs follow its configuration
     comp = {"engine": {"ref": "toolkit.engines.compartmental.engine:CompartmentalEngine", "config": {
         "groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "transmission": "q",
