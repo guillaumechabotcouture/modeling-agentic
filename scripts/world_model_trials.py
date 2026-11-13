@@ -2526,6 +2526,27 @@ def _self_test() -> int:
            "confidence")
     tryit("WT22 summary wording", wt22)
 
+    # Owner, 2026-11-13: one guard replaces circular / prior echo / engine-blind / leaked price / threshold arithmetic;
+    # the belief table rescoring reads the runs' stored artifacts only.
+    def wt23():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            seed = yaml.safe_load(open(os.path.join(rd, SEED)))
+            g = guard_reasons(rd, seed, 0.1)
+            # toy packages a and b reduce by exactly their declared effects: H1, H2, H5 bands (circular), H3 (an effect
+            # against its own parameter) and H4 (a vs b at the declared costs and lambda: arithmetic on inputs)
+            ok(set(g) == {"H1", "H2", "H3", "H4", "H5"} and g["H4"]["class"] == "input_determined",
+               f"WT23 the guard sets aside every claim the declared inputs decide, including a paired comparison of "
+               f"input-determined packages at the declared prices and lambda: { {k: v['class'] for k, v in g.items()} }")
+            out = belief_rescore(troot, [{"id": "toy0", "batch": "3"}], fit_batches=("3",))
+            t = yaml.safe_load(open(os.path.join(rd, "analysis", "belief_table.yaml")))
+            ok(all(r.get("guard") for r in t["rows"]) and out["overall"]["scores"] == {}
+               and os.path.isfile(os.path.join(troot, "belief_summary.md")),
+               f"WT23b the rescoring writes the belief table and summary; guarded claims are not scored: "
+               f"{[r.get('guard') for r in t['rows']]}")
+    tryit("WT23 guard and belief table", wt23)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
