@@ -1057,6 +1057,26 @@ def toy_dossier_spec(d: str, entries: dict | None = None, ref: str = TOY, dossie
     return p
 
 
+def _self_test_round6(ok, T) -> None:
+    """#218 final review: indirect trial effects; the closure's subset rule after ENGINE_CHOICE."""
+    from toolkit.engines.empirical.engine import toy_trial_config
+    cfg = toy_trial_config()
+    only_c = {"engine": {"ref": "toolkit.engines.empirical.engine:PackageRateEngine", "config": cfg},
+              "options": {"components": {"c": {}}, "engine_map": {"c": {"c": 1}}}}
+    req, probs = required_inputs(only_c)
+    ok({"parameter:lrr:a:cases", "parameter:lrr:c:cases", "parameter:lint:a+b:cases"} <= set(req) and probs == [],
+       f"ED-Z1 a trial effect reached indirectly (c relative to a; baseline coverage and interactions over every "
+       f"component) is required even when only c is an option: {sorted(req)[:8]}")
+    signed = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a", "tree:eng_b/card.yaml": "b"}
+    chosen = {"run:decision_spec.yaml": "s", "run:units.csv": "u", "tree:eng_a/card.yaml": "a"}
+    ok(_closure_changes(signed, chosen) == [] and _closure_changes(signed, dict(chosen, **{"run:units.csv": "x"}))
+       == ["run:units.csv"] and _closure_changes(signed, {k: v for k, v in chosen.items() if k != "run:units.csv"})
+       == ["run:units.csv"] and _closure_changes(signed, dict(chosen, **{"tree:eng_c/card.yaml": "c"}))
+       == ["tree:eng_c/card.yaml"],
+       "ED-Z2 after ENGINE_CHOICE the files of an engine not chosen are not 'deleted' (the subset rule); a run input "
+       "changed or missing, or an engine file not signed, is a change")
+
+
 def _self_test_round5(ok, T) -> None:
     """#218 review round 5: trial-prior inputs by mode; the input closure bound at signing."""
     import tempfile
@@ -1461,6 +1481,10 @@ def _self_test() -> int:
         _self_test_round5(ok, T)
     except NameError as e:
         ok(False, f"ED-Y round 5: {e}")
+    try:
+        _self_test_round6(ok, T)
+    except NameError as e:
+        ok(False, f"ED-Z final round: {e}")
     try:                            # last: it imports the malaria engine (ED-R6 checks it is not imported before)
         _self_test_round4(ok, T)
     except NameError as e:          # before the round-4 functions exist (the tests-first commit)

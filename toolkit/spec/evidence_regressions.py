@@ -311,6 +311,11 @@ PRE_ROWS = [
      lambda d: (_spec(d, lambda s: (s["uncertainty"].__setitem__("priors", {"k": {
          "dist": "uniform", "range": [0.7, 0.9], "source": "toy"}}), s["uncertainty"]["excluded"].append(
          {"parameter": "k", "reason": "held"}))), _entries(d, lambda e: _set(e, "parameter:k", dict(TOY_K)))), True),
+    ("R6-emulator-parameters", "calibration.parameters under emulator_inversion (which fits only the attribute) "
+                               "used to exempt a range from its decision test",
+     lambda d: (_spec(d, lambda s: _set(s["calibration"], "parameters", ["k"])),
+                _entries(d, lambda e: _set(e, "parameter:k", {k: v for k, v in TOY_K.items() if k != "decision_test"}))),
+     True),
     ("R3-test-not-executable", "a parameter_value test the emulator path cannot run (k neither drawn nor set)",
      lambda d: (_spec(d, lambda s: s["analysis"]["decision_tests"].append({
          "id": "DT_k", "type": "parameter_value", "parameter": "k", "values": [0.7, 0.9],
@@ -375,6 +380,35 @@ POST_ROWS = [
 ]
 
 
+def _extensionless_units(d):
+    import shutil
+    shutil.move(os.path.join(d, "units.csv"), os.path.join(d, "units"))
+    _spec(d, lambda s: _set(s["decision_units"], "csv", "units"))
+
+
+def _no_dossier_run(d):
+    from toolkit.spec import evidence_dossier as ED
+    ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
+    _fixture_remove(d, DOSSIER) if os.path.exists(os.path.join(d, DOSSIER)) else None
+
+
+def _produce_allocation(d):
+    import yaml
+    out = (yaml.safe_load(open(os.path.join(d, SPEC)))["deliverable"] or {}).get("allocation_file")
+    _fixture_write(d, out, "unit,package,dalys_averted\n0,a,1.0\n")
+
+
+# post-sign rows with a setup before signing (review r6): (id, what, mutate, setup)
+POST_SETUP_ROWS = [
+    ("R6-allocation-produced", "the lifecycle: sign, the analysis writes its allocation (an output), then resume",
+     _produce_allocation, None),
+    ("R6-extensionless-units", "an extensionless units path (execution resolves it) edited after signing",
+     lambda d: _fixture_write(d, "units", "\n", "a"), _extensionless_units),
+    ("R6-no-dossier-edited", "a run that needs no dossier, its units table edited after signing",
+     lambda d: _fixture_write(d, "units.csv", "\n", "a"), _no_dossier_run),
+]
+ACCEPTED_ROWS = ("R6-allocation-produced",)
+
 # Why each row must be refused (any of these, case-insensitive), so a refusal for some other reason does not count.
 WANT = {
     "R1-no-dossier": ["names no evidence dossier"], "R1-missing-file": ["does not exist"],
@@ -394,6 +428,8 @@ WANT = {
     "R3-partial-evidence": ["unsigned_evidence"], "R3-declaration-grew": ["evidence_incomplete", "parameter:base"],
     "R4-declaration-changed": ["declaration", "evidence_incomplete", "changed"],
     "R5-declaration-shrank": ["declaration", "evidence_incomplete", "changed"],
+    "R6-extensionless-units": ["changed", "units"], "R6-no-dossier-edited": ["changed", "units.csv"],
+    "R6-emulator-parameters": ["needs its decision_test"],
 }
 
 
@@ -443,10 +479,14 @@ def _self_test_table(ok) -> None:
             ok(not why and key in top,
                f"ET {rid} via {pname}: signs, and the sheet lists {key} as differing ({what}): "
                f"{why[:120]!r} | {top[:160]!r}")
-    for rid, what, mutate in POST_ROWS:
+    for row in POST_ROWS + POST_SETUP_ROWS:
+        rid, what, mutate = row[:3]
+        setup = row[3] if len(row) > 3 else None
         for pname, path in POST_PATHS.items():
             with tempfile.TemporaryDirectory() as d:
                 ED.toy_dossier_spec(d)
+                if setup:
+                    setup(d)
                 SO.write_sheet(d)
                 SO.sign(d, "owner", note="n")
                 undo = mutate(d)
@@ -455,9 +495,9 @@ def _self_test_table(ok) -> None:
                 finally:
                     if callable(undo):
                         undo()
-            want_refused = rid != "control"
-            ok(_right(rid, why),
-               f"ET {rid} via {pname}: {'refused' if want_refused else 'accepted'} ({what}): {why[:160]!r}")
+            accept = rid == "control" or rid in ACCEPTED_ROWS
+            ok((not why) if accept else _right(rid, why),
+               f"ET {rid} via {pname}: {'accepted' if accept else 'refused'} ({what}): {why[:160]!r}")
     # signoff: none (nobody signs): the launch preflight and the runtime gate apply one rule, coverage without a
     # record: a complete dossier passes both, an uncovered one is refused by both
     for rid, mutate in (("control", lambda d: None),
