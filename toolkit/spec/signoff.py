@@ -94,6 +94,26 @@ def burden_changed(run_dir: str, rec: dict) -> list[str]:
     return [] if signed is not None and signed == now else [rel]
 
 
+def dossier_changed(run_dir: str, rec: dict) -> list[str]:
+    """F6 evidence dossier: the dossier the spec names, when its bytes are not the ones the sign-off recorded (none
+    recorded, absent or unreadable: changed, fail closed)."""
+    import yaml
+    from toolkit.spec import evidence_dossier as ED
+    try:
+        doc = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 -- unreadable: changed
+        return [SPEC]
+    rel = ED.dossier_reference(doc)
+    if rel is None:
+        return []
+    try:
+        now = ED.read_dossier(run_dir, rel)
+    except ValueError:
+        return [rel]
+    signed = (rec.get("sha256") or {}).get(rel)
+    return [] if now is not None and signed == ED.sha(now) else [rel]
+
+
 def status(run_dir: str) -> str:
     path = os.path.join(run_dir, SPEC)
     rec = _spec_record(run_dir)
@@ -101,7 +121,7 @@ def status(run_dir: str) -> str:
         return "changed" if rec is not None else "absent"
     if rec is not None:
         return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) and not derived_changed(run_dir, rec) \
-            and not burden_changed(run_dir, rec) else "changed"
+            and not burden_changed(run_dir, rec) and not dossier_changed(run_dir, rec) else "changed"
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
@@ -183,6 +203,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if brel and bdata is None:
         raise ValueError(f"{brel} (the validation.burden reference file) does not exist")
     bsha = hashlib.sha256(bdata).hexdigest() if bdata is not None else None
+    from toolkit.spec import evidence_dossier as ED
+    erel = ED.dossier_reference(doc0)  # F6 evidence dossier: read once, then checked, shown and bound from these bytes
+    edata = ED.read_dossier(run_dir, erel) if erel else None
     if expect_sha256 is not None and sha != expect_sha256:
         raise ValueError(f"{SPEC} changed since it was shown (sha256 {sha[:12]}, shown {str(expect_sha256)[:12]}): "
                          "read it again before signing")
@@ -204,12 +227,14 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         # it was generated from; it is refused, never skipped
         raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
                          "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
-    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
+    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {}),
+             **({erel: ED.sha(edata) if edata is not None else None} if erel else {})}
     if sheet_bytes is not None and (
             src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
-            or (brel is not None and src.get("burden_references_sha256") != bsha)):
-        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is stale): the sheet is "
-                         "regenerated before the owner signs; read the new one")
+            or (brel is not None and src.get("burden_references_sha256") != bsha)
+            or (erel is not None and src.get("evidence_dossier_sha256") != ED.sha(edata))):
+        raise ValueError(f"{SHEET} was generated from another spec, derivation record, reference file or evidence "
+                         "dossier (it is stale): the sheet is regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -223,6 +248,10 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
+    bad = ED.refusals(doc0 if isinstance(doc0, dict) else {}, run_dir, edata)
+    if bad:                             # F6: a precondition, whoever signs; no flag or note overrides it
+        raise ValueError("spec not signable (evidence dossier): " + "; ".join(bad[:12])
+                         + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
@@ -316,10 +345,18 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         bsha = (hashlib.sha256(bbytes).hexdigest() if bbytes is not None else "none") if brel else "none"
     except ValueError:
         bbytes, bsha = None, "unreadable"
+    from toolkit.spec import evidence_dossier as ED
+    erel = ED.dossier_reference(spec_doc)
+    try:                                # F6 evidence dossier: one read, shown and hashed
+        ebytes = ED.read_dossier(run_dir, erel) if erel else None
+        esha = ED.sha(ebytes)
+    except ValueError:
+        ebytes, esha = None, "unreadable"
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes)
+                 burden_bytes=bbytes, dossier_bytes=ebytes)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
+                      "evidence_dossier_sha256": esha,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
@@ -329,7 +366,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
-          burden_bytes: bytes | None = None) -> str:
+          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -393,6 +430,13 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
+    from toolkit.spec import evidence_dossier as ED
+    if dossier_bytes is None and ED.dossier_reference(raw):
+        try:
+            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
+        except ValueError:
+            dossier_bytes = None
+    out += ED.sheet_lines(raw, run_dir, dossier_bytes)  # F6: each decision input, model vs field, the chosen range
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:

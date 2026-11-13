@@ -17,7 +17,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from toolkit.engines.contract import EngineCard, ParamSpec, ToyEngine, resolve_params  # noqa: E402
+from toolkit.engines.contract import ParamSpec, ToyEngine, resolve_params  # noqa: E402
 from toolkit.engines.empirical.engine import PackageRateEngine  # noqa: E402
 from toolkit.engines.hooks import ToyScheduleEngine  # noqa: E402
 
@@ -99,12 +99,10 @@ class ToySpecRateEngine(PackageRateEngine):
 class ToyDossierEngine(ToyEngine):
     """The toy engine whose component `a` declares decision inputs (the fitted effect eff_a and the unit attribute x;
     none when a = 0), and `b` none, with its reason: the evidence dossier's self-tests (toolkit/spec/evidence_dossier.py,
-    toolkit/spec/signoff.py)."""
+    toolkit/spec/signoff.py), as a class attribute (toolkit/engines/decision_inputs.py)."""
 
-    def describe(self) -> EngineCard:
-        c = super().describe()
-        return EngineCard(**dict(c.to_dict(), decision_inputs={
-            "a": {"inactive": [0], "inputs": [
-                {"kind": "parameter", "name": "eff_a", "why": "the relative reduction component a gives"},
-                {"kind": "unit_attribute", "name": "x", "why": "the transmission index the reduction acts on"}]},
-            "b": {"inputs": [], "none_reason": "toy: the effect of b is not checked against field data"}}))
+    DECISION_INPUTS = {
+        "a": {"inactive": [0], "inputs": [
+            {"kind": "parameter", "name": "eff_a", "why": "the relative reduction component a gives"},
+            {"kind": "unit_attribute", "name": "x", "why": "the transmission index the reduction acts on"}]},
+        "b": {"inputs": [], "none_reason": "toy: the effect of b is not checked against field data"}}

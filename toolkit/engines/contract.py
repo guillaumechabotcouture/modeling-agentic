@@ -305,40 +305,6 @@ def _self_test() -> int:
                     for p in super().parameters()]
     ok(engine_identity(Refit()) != engine_identity(e) and engine_identity(ToyEngine()) == engine_identity(e),
        "C9 a changed fitted parameter value changes the engine identity (Codex r2 P1-6)")
-    # C10-C13 (F6 evidence dossier): decision inputs declared per component, fail closed on what cannot be mapped
-    try:
-        decl = {"a": {"inactive": [0], "inputs": [{"kind": "parameter", "name": "eff_a", "why": "its effect"},
-                                                  {"kind": "unit_attribute", "name": "x", "why": "transmission"}],
-                      "by_value": {"1": [{"kind": "card_table", "name": "benchmarks", "why": "trial table"}]}},
-                "b": {"inputs": [], "none_reason": "toy: closed form"}}
-        kw = {"components": {"a": [0, 1], "b": [0, 1]}, "unit_attributes": {"x": ""}, "parameters": ["eff_a"],
-              "tables": ["benchmarks"]}
-        bad = decision_input_problems({"a": {"inputs": [{"kind": "parameter", "name": "nope", "why": "w"},
-                                                        {"kind": "colour", "name": "x", "why": "w"}]},
-                                       "zz": {"inputs": [], "none_reason": "r"}}, **kw)
-        ok(decision_input_problems(decl, **kw) == []
-           and any("nope" in s for s in bad) and any("colour" in s for s in bad) and any("zz" in s for s in bad)
-           and any("b" in s and "not declared" in s for s in bad),
-           f"C10 a declaration names card components, attributes and parameters; an unknown one, an unknown kind and "
-           f"an undeclared card component are problems: {bad}")
-        ok(any("none_reason" in s for s in decision_input_problems({"a": {"inputs": []}, "b": decl["b"]}, **kw)),
-           "C11 a component with no inputs must say why (none_reason): it is never blank")
-        ins = component_inputs(decl, "a", 1)
-        ok([i["name"] for i in ins] == ["eff_a", "x", "benchmarks"] and component_inputs(decl, "a", 0) == []
-           and component_inputs(decl, "b", 1) == [] and component_inputs(decl, "c", 1) is None
-           and component_inputs(None, "a", 1) is None
-           and [i["name"] for i in component_inputs({"*": {"inputs": [{"kind": "parameter", "name": "e:{component}",
-                                                                       "why": "w"}]}}, "q", 1)] == ["e:q"],
-           "C12 component_inputs: the inputs and the value's extra inputs; none for an inactive value; None (cannot "
-           "map, fail closed) for an undeclared component or engine; `*` covers configured component names")
-        try:
-            merge_decision_inputs({"a": decl["a"]}, {"a": decl["a"]})
-            ok(False, "C13 two declarations of one component are refused")
-        except ValueError:
-            ok(merge_decision_inputs({"a": decl["a"]}, {"b": decl["b"]}) == decl,
-               "C13 two declarations of one component are refused; disjoint ones merge")
-    except NameError as ex:
-        ok(False, f"C10-C13 decision inputs: {ex}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
