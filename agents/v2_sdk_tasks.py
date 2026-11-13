@@ -172,8 +172,14 @@ Write """ + SEED_FILE + """ in the world model's format, documented below by too
   expect the sweep to show and what would refute it. Choose each threshold from the belief, never to make the
   test easy to pass. Give every band as tight as the cited evidence supports: a band wider than the plausible
   range makes its test lenient (it passes whatever the simulation shows), and a lenient test tests nothing.
-  Every literature citation is looked up after you finish (title, first author and year); one that is not found
-  lowers its belief's confidence to low, so cite the paper's title, first author and year exactly. The harness registers the
+  Every literature citation is looked up after you finish (title, first author and year), so cite the paper's
+  title, first author and year exactly.
+- p: every hypothesis also states p, your probability between 0.02 and 0.98 that its claim holds in this sweep.
+  Be calibrated: of claims you give p 0.7, about 7 in 10 should hold. Each outcome is scored against its p.
+- When {out_in} carries prior_world_model (earlier questions' belief tables: beliefs with their updated p and
+  history, the claims refuted with what was observed, and open questions), start from it. Carry forward what held,
+  revise what was refuted (never repeat a refuted claim unless this question's setting differs, and then say how),
+  and turn its open questions into claims this sweep can test. The harness registers the
   hypotheses before the sweep runs (you do not write registered_at).
 
 """ + doc[a:b].strip() + """

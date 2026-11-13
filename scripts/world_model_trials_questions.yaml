@@ -1494,3 +1494,232 @@ questions:
   area: outbreak response / vector control
   mechanism: 'final-size nonlinearity: the attack rate is near zero below s0 = 1/R0 = 0.5 and rises steeply above
     it; a time-limited control matters most just above the threshold'
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A second-dose measles
+    catch-up is planned in 24 districts, where an importation is expected early in the school year. Each district
+    can run it as SCHOOL (in schools during the first school term, before the importation: day 0, reaching 90% of
+    children aged 5-14, US$0.80 per resident) or COMMUNITY (a house-to-house campaign in the long holiday, 70 days
+    after the importation, reaching 75% of children aged 1-9, US$1.20 per resident), or not at all. R0 is between
+    12 and 18 with homogeneous mixing; everyone aged 15 or older is immune and infants under one are susceptible.
+    The budget is US$5 million. Input file: units.csv (population; susceptible shares of children aged 1-4, 5-9
+    and 10-14 from a synthetic serosurvey; the expected importation as a share of the population). Choose the option
+    per district that maximises measles infections averted, report the total with a 95% uncertainty interval, and
+    state when reaching school-age children early beats reaching the youngest late.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_catchup_term_timing
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_catchup_term_timing (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: timing and targeting
+  area: measles/rubella
+  chain_step: 1
+  chain_source: measles_catchup_term_timing
+  id: chain1_measles_catchup_term_timing
+  batch: chain
+  carry_from: []
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A second-dose measles
+    catch-up is planned in 24 districts, where an importation is expected early in the school year. Each district
+    can run it as SCHOOL (in schools during the first school term, before the importation: day 0, reaching 90% of
+    children aged 5-14, US$0.80 per resident) or COMMUNITY (a house-to-house campaign in the long holiday, 70 days
+    after the importation, reaching 75% of children aged 1-9, US$1.20 per resident), or not at all. R0 is between
+    12 and 18 with homogeneous mixing; everyone aged 15 or older is immune and infants under one are susceptible.
+    The budget is US$5 million. Input file: units.csv (population; susceptible shares of children aged 1-4, 5-9
+    and 10-14 from a synthetic serosurvey; the expected importation as a share of the population). Choose the option
+    per district that maximises measles infections averted, report the total with a 95% uncertainty interval, and
+    state when reaching school-age children early beats reaching the youngest late.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_catchup_term_timing
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_catchup_term_timing (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: timing and targeting
+  area: measles/rubella
+  chain_step: 1
+  chain_source: measles_catchup_term_timing
+  id: ctrl1_measles_catchup_term_timing
+  batch: control
+- question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme
+    has US$2.9 million for a preventive vaccination campaign in 2026 across 24 districts with no second dose. For
+    each district choose one option: none; C_9to59m (children aged 9-59 months); D_9mto14y (children aged 9 months
+    to 14 years). A campaign reaches 85% of the targeted children and protects about 90% of the susceptible children
+    it reaches (all-or-nothing). Cost: US$1.50 per targeted child plus US$18,000 per district campaign. Infants
+    under 9 months are susceptible, adults immune; the immunity gaps of younger and older children vary between
+    districts. Assume one importation per district seeds an outbreak in a homogeneously mixing population, R0 between
+    10 and 16. Which age range should each district target to maximise measles infections averted, and what decides
+    it?'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_age_targeting
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_age_targeting (realized max |Spearman| <= 0.2 among declared
+    independent features)'
+  decision_type: null
+  area: measles/rubella
+  chain_step: 2
+  chain_source: measles_age_targeting
+  id: chain2_measles_age_targeting
+  batch: chain
+  carry_from:
+  - chain1_measles_catchup_term_timing
+- question: 'SYNTHETIC TRIAL QUESTION (world-model trials): the districts and numbers are synthetic. A measles programme
+    has US$2.9 million for a preventive vaccination campaign in 2026 across 24 districts with no second dose. For
+    each district choose one option: none; C_9to59m (children aged 9-59 months); D_9mto14y (children aged 9 months
+    to 14 years). A campaign reaches 85% of the targeted children and protects about 90% of the susceptible children
+    it reaches (all-or-nothing). Cost: US$1.50 per targeted child plus US$18,000 per district campaign. Infants
+    under 9 months are susceptible, adults immune; the immunity gaps of younger and older children vary between
+    districts. Assume one importation per district seeds an outbreak in a homogeneously mixing population, R0 between
+    10 and 16. Which age range should each district target to maximise measles infections averted, and what decides
+    it?'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_age_targeting
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_age_targeting (realized max |Spearman| <= 0.2 among declared
+    independent features)'
+  decision_type: null
+  area: measles/rubella
+  chain_step: 2
+  chain_source: measles_age_targeting
+  id: ctrl2_measles_age_targeting
+  batch: control
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Measles outbreaks
+    have just been detected in 20 districts at the start of 2026. Each district can run one reactive vaccination
+    campaign targeting everyone susceptible-eligible (about 80% reached), and the choice is its timing: none; EARLY
+    (campaign completed 14 days after detection, US$2.20 per resident because of emergency logistics); LATE (completed
+    42 days after detection, US$1.40 per resident). The budget is US$4 million. R0 is between 12 and 18. Input file:
+    units.csv (population, susceptible share at detection from a synthetic serosurvey, share of the population already
+    infected at detection). Choose the timing per district that maximises measles infections averted over the outbreak
+    within the budget, report the total with a 95% uncertainty interval, and state the rule (when does waiting for
+    a cheaper campaign cost more infections than it saves money?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_reactive_campaign_timing
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_reactive_campaign_timing (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: timing
+  area: measles/rubella
+  chain_step: 3
+  chain_source: measles_reactive_campaign_timing
+  id: chain3_measles_reactive_campaign_timing
+  batch: chain
+  carry_from:
+  - chain1_measles_catchup_term_timing
+  - chain2_measles_age_targeting
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Measles outbreaks
+    have just been detected in 20 districts at the start of 2026. Each district can run one reactive vaccination
+    campaign targeting everyone susceptible-eligible (about 80% reached), and the choice is its timing: none; EARLY
+    (campaign completed 14 days after detection, US$2.20 per resident because of emergency logistics); LATE (completed
+    42 days after detection, US$1.40 per resident). The budget is US$4 million. R0 is between 12 and 18. Input file:
+    units.csv (population, susceptible share at detection from a synthetic serosurvey, share of the population already
+    infected at detection). Choose the timing per district that maximises measles infections averted over the outbreak
+    within the budget, report the total with a 95% uncertainty interval, and state the rule (when does waiting for
+    a cheaper campaign cost more infections than it saves money?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_reactive_campaign_timing
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_reactive_campaign_timing (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: timing
+  area: measles/rubella
+  chain_step: 3
+  chain_source: measles_reactive_campaign_timing
+  id: ctrl3_measles_reactive_campaign_timing
+  batch: control
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Susceptible children
+    have accumulated unevenly across 24 districts since the last measles campaign; one importation in 2026 will
+    start an outbreak in each district (R0 12-18, homogeneous mixing; everyone aged 15 or older immune; infants
+    under one susceptible). For each district choose one option: none; ROUTINE (a strengthening drive before any
+    outbreak, day 0, that vaccinates 60% of children under five, US$0.50 per resident); RESPONSE (an outbreak-response
+    campaign completed 42 days after the importation, reaching 85% of children aged 1-9, US$1.30 per resident).
+    The budget is US$5 million. Input file: units.csv (population; the susceptible share of children aged 1-4, 5-9
+    and 10-14 from a synthetic serosurvey). Choose the options that maximise measles infections averted within the
+    budget, report the total with a 95% uncertainty interval, and state the rule (when is the immunity gap too large
+    for prevention in the youngest alone?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_routine_vs_response
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_routine_vs_response (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: allocation
+  area: measles/rubella
+  chain_step: 4
+  chain_source: measles_routine_vs_response
+  id: chain4_measles_routine_vs_response
+  batch: chain
+  carry_from:
+  - chain1_measles_catchup_term_timing
+  - chain2_measles_age_targeting
+  - chain3_measles_reactive_campaign_timing
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Susceptible children
+    have accumulated unevenly across 24 districts since the last measles campaign; one importation in 2026 will
+    start an outbreak in each district (R0 12-18, homogeneous mixing; everyone aged 15 or older immune; infants
+    under one susceptible). For each district choose one option: none; ROUTINE (a strengthening drive before any
+    outbreak, day 0, that vaccinates 60% of children under five, US$0.50 per resident); RESPONSE (an outbreak-response
+    campaign completed 42 days after the importation, reaching 85% of children aged 1-9, US$1.30 per resident).
+    The budget is US$5 million. Input file: units.csv (population; the susceptible share of children aged 1-4, 5-9
+    and 10-14 from a synthetic serosurvey). Choose the options that maximise measles infections averted within the
+    budget, report the total with a 95% uncertainty interval, and state the rule (when is the immunity gap too large
+    for prevention in the youngest alone?).'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_measles_routine_vs_response
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for measles_routine_vs_response (realized max |Spearman| <= 0.2 among
+    declared independent features)'
+  decision_type: allocation
+  area: measles/rubella
+  chain_step: 4
+  chain_source: measles_routine_vs_response
+  id: ctrl4_measles_routine_vs_response
+  batch: control
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A rubella vaccination
+    campaign is planned in 2026 in 24 districts that have never vaccinated against rubella; an importation is expected
+    in each. For each district choose one option: none; CHILDREN (all children aged 1-14 years, about 85% reached,
+    US$1.10 per child); WIDE (children and women aged 15-39, about 85% reached, US$1.10 per person targeted). The
+    budget is US$12 million. R0 is between 4 and 7 with homogeneous mixing between children, women 15-39 and everyone
+    else. Input file: units.csv (population and susceptible share of each of the three groups). Choose the options
+    that maximise cases of congenital rubella syndrome averted over the outbreak, report the total with a 95% uncertainty
+    interval, and state when vaccinating children alone protects pregnant women enough (through the herd effect)
+    and when women must be vaccinated directly.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_rubella_crs_campaign_age
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for rubella_crs_campaign_age (realized max |Spearman| <= 0.2 among declared
+    independent features)'
+  decision_type: targeting (age)
+  area: measles/rubella
+  chain_step: 5
+  chain_source: rubella_crs_campaign_age
+  id: chain5_rubella_crs_campaign_age
+  batch: chain
+  carry_from:
+  - chain1_measles_catchup_term_timing
+  - chain2_measles_age_targeting
+  - chain3_measles_reactive_campaign_timing
+  - chain4_measles_routine_vs_response
+- question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A rubella vaccination
+    campaign is planned in 2026 in 24 districts that have never vaccinated against rubella; an importation is expected
+    in each. For each district choose one option: none; CHILDREN (all children aged 1-14 years, about 85% reached,
+    US$1.10 per child); WIDE (children and women aged 15-39, about 85% reached, US$1.10 per person targeted). The
+    budget is US$12 million. R0 is between 4 and 7 with homogeneous mixing between children, women 15-39 and everyone
+    else. Input file: units.csv (population and susceptible share of each of the three groups). Choose the options
+    that maximise cases of congenital rubella syndrome averted over the outbreak, report the total with a 95% uncertainty
+    interval, and state when vaccinating children alone protects pregnant women enough (through the herd effect)
+    and when women must be vaccinated directly.'
+  engine: toolkit.engines.compartmental.engine:CompartmentalEngine
+  engine_mode: null
+  template: data/world_model_trials/chain_rubella_crs_campaign_age
+  eval_question: false
+  inputs: 'synthetic: a fresh units table for rubella_crs_campaign_age (realized max |Spearman| <= 0.2 among declared
+    independent features)'
+  decision_type: targeting (age)
+  area: measles/rubella
+  chain_step: 5
+  chain_source: rubella_crs_campaign_age
+  id: ctrl5_rubella_crs_campaign_age
+  batch: control
