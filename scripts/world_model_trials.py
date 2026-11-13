@@ -1254,6 +1254,90 @@ def _self_test() -> int:
                                     f"the repository's own check): {P.domain_terms(src)}")
     tryit("WT9 disease-agnostic", wt9)
 
+    # Owner, 2026-11-13 (after the tb_acf smoke): the world model is built from literature and reasoning, then
+    # confronted with the simulation, never with its own inputs.
+    def wt10():
+        import csv
+        from agents.v2_sdk_tasks import _seed_read_denied
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            ctx = calls[0]["ctx"]
+            rd = os.path.join(troot, "runs", "toy0")
+            par = {n: f for n, f in ctx["sweep"]["features"].items() if f["kind"] == "parameter"}
+            ok(par and all("range" not in f for f in par.values()) and "notes" not in ctx["engine"]
+               and not any(re.search(r"\d", m) for m in ctx["engine"].get("mechanisms") or []),
+               f"WT10 the seed context withholds the engine's effect and prior values: no parameter range "
+               f"({par}), no card notes, mechanisms in words")
+            vals = set()
+            for row in csv.DictReader(open(os.path.join(rd, "units.csv"))):
+                vals |= {v for k, v in row.items() if k not in ("id",) and re.search(r"\d\.\d", v or "")}
+            blob = json.dumps(ctx)
+            leaked = sorted(v for v in vals if v in blob)
+            ok(not leaked and ctx.get("datasets") and all("columns" in x and "rows" not in x for x in ctx["datasets"]),
+               f"WT10b no input data value is in the seed context (datasets by file and column only): leaked "
+               f"{leaked[:5]}, datasets {ctx.get('datasets')}")
+            got = {p: _seed_read_denied("Read", {"file_path": p}, rd) for p in
+                   ("decision_spec.yaml", "units.csv", "_task_input.json", "world_model_seed.yaml",
+                    os.path.join(REPO, "data", "world_model_trials", "tb_acf", "decision_spec.yaml"),
+                    os.path.join(REPO, "toolkit", "analysis", "world_model.py"))}
+            want = {"decision_spec.yaml": True, "units.csv": True, "_task_input.json": False,
+                    "world_model_seed.yaml": False,
+                    os.path.join(REPO, "data", "world_model_trials", "tb_acf", "decision_spec.yaml"): True,
+                    os.path.join(REPO, "toolkit", "analysis", "world_model.py"): False}
+            ok({k: bool(v) for k, v in got.items()} == want,
+               f"WT10c the seed task can read only its input and its own seed in the run, and no template or input "
+               f"data in the repository: {got}")
+    tryit("WT10 inputs withheld", wt10)
+
+    def wt11():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            hy = yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))
+            wm = yaml.safe_load(open(os.path.join(rd, "analysis", "world_model.yaml")))
+            circ = {h["id"] for h in hy["hypotheses"] if (h.get("confrontation") or {}).get("circular")}
+            # the toy engine's package a reduces by exactly eff_a and b by eff_b (spec inputs): H1, H2, H5 are bands on
+            # a declared effect whose range lies inside the band; H3 tests a's effect against its own parameter
+            ok(circ == {"H1", "H2", "H3", "H5"},
+               f"WT11 circular tests are classified from the spec's inputs and the engine's own sweep: {sorted(circ)}")
+            sup = [h["id"] for h in hy["hypotheses"] if h["status"] == "supported" and h["id"] not in circ]
+            tr = wm["track_record"]
+            ok(tr["confirmed"] == len(sup) and tr.get("circular", {}).get("confirmed", 0) >= 1,
+               f"WT11b circular verdicts are reported apart and never counted as confirmations: confirmed "
+               f"{tr['confirmed']} (non-circular supported {sup}), circular {tr.get('circular')}")
+            b2 = [b for b in wm["beliefs"] if b["id"] == "B2"][0]
+            ok(b2["confidence"] == "low" and "confidence_seed" not in b2 and not b2.get("confirmed_by"),
+               f"WT11c a circular confirmation does not move confidence: B2 {b2['confidence']}, "
+               f"{b2.get('confirmed_by')}")
+            S = score(troot)
+            q = S["questions"]["toy0"]
+            ok(q["hypotheses"]["circular"] == 4 and sorted(q["failure_modes"].get("circular") or []) == sorted(circ)
+               and S["overall"]["hypotheses"]["circular"] == 4,
+               f"WT11d the summary counts circular tests ({q['hypotheses']}) and lists them as a failure mode")
+            ok(all(v["supported"] + v["refuted"] <= len(sup) for v in q["confidence"].values()),
+               f"WT11e the confirmation-by-confidence table leaves circular verdicts out: {q['confidence']}")
+    tryit("WT11 circular", wt11)
+
+    def wt12():
+        def seeds(cite):
+            def f(q, k):
+                sd = _toy_seed()
+                sd["beliefs"].append({"id": "B5", "mechanism": "the units differ in size", "about": {"feature": "pop"},
+                                      "direction": "none", "source_type": "data", "confidence": "medium",
+                                      "evidence": [{"dossier_entry": cite if k == 1 else "units.csv column pop"}]})
+                return sd
+            return f
+        for cite, why in (("_task_input.json engine.notes", "the task's own input file"),
+                          ("analysis/batch/design.json", "a harness artifact"),
+                          ("my reading of the question", "no dataset of the run")):
+            with tempfile.TemporaryDirectory() as d:
+                repo, troot, res, calls, L, _ = e2e(d, seeds(cite))
+                fb = calls[1]["feedback"] if len(calls) > 1 else []
+                ok(len(calls) == 2 and any("B5" in x for x in fb or []) and res["toy0"]["status"] == "complete",
+                   f"WT12 a data belief citing {why} is refused and repaired (then a dataset of the run is accepted): "
+                   f"{fb}")
+    tryit("WT12 data evidence", wt12)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
