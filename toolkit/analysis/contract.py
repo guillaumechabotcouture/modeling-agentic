@@ -242,26 +242,39 @@ def departure_findings(run_dir: str) -> list[dict]:
         return dict(_f("departure_test_ineffective", claim, key), decision_bearing=True)
     e = spec.get("engine")
     ref = e.get("ref") if isinstance(e, dict) else e
+    cfg = (e.get("config") if isinstance(e, dict) else None) or {}
     if not (isinstance(ref, str) and ":" in ref):
         try:
-            ref = ((json.load(open(os.path.join(run_dir, ENGINE_CHOICE))) or {}).get("engine") or {}).get("ref")
+            ch = (json.load(open(os.path.join(run_dir, ENGINE_CHOICE))) or {}).get("engine") or {}
+            ref, cfg = ch.get("ref"), ch.get("config") or {}
         except (OSError, ValueError, AttributeError):
             ref = None
-    from toolkit.engines import benchmark_coverage as BC
-    try:
-        name = (BC.load(BC.path_for(ref))[0] or {}).get("engine")
-    except Exception:  # noqa: BLE001
-        name = None
-    if not name:
-        return [f("the spec declares engine departures but the engine the run used, or its coverage file, cannot be "
-                  "identified", "departures")]
-    mine = [d for d in deps if d.get("engine") == name]
-    if not mine:
-        return []
     try:
         man = json.load(open(os.path.join(run_dir, MANIFEST)))
     except (OSError, ValueError):
         man = {}
+    # r5: the scope is the engine the run used (the manifest's engine identity; before the analysis, the engine the
+    # spec resolves to), never the coverage file's own name
+    name = ((man or {}).get("engine") or {}).get("name") if isinstance(man, dict) else None
+    if not name:
+        try:
+            from toolkit.spec import schema
+            name = schema.engine_class(ref)(**cfg).describe().name
+        except Exception:  # noqa: BLE001
+            name = None
+    if not name:
+        return [f("the spec declares engine departures but the engine the run used cannot be identified", "departures")]
+    mine = [d for d in deps if d.get("engine") == name]
+    if not mine:
+        return []
+    from toolkit.engines import benchmark_coverage as BC
+    try:
+        cov = BC.load(BC.path_for(ref))[0]
+    except Exception:  # noqa: BLE001
+        cov = None
+    if not cov or cov.get("engine") != name:
+        return [f(f"the run's engine {name!r} has departures but no coverage file of its own "
+                  f"({'none' if not cov else 'the file names ' + repr(cov.get('engine'))})", "departures")]
     records = {}
     for rel, ent in ((man or {}).get("deliverables") or {}).items():
         p = os.path.join(run_dir, rel)
@@ -274,7 +287,7 @@ def departure_findings(run_dir: str) -> list[dict]:
                 records[str(doc.get("test_id"))] = doc
     from toolkit.analysis import decision_tests as DT
     try:
-        raw = dict(spec, engine={"ref": ref, "config": (e.get("config") if isinstance(e, dict) else None) or {}})
+        raw = dict(spec, engine={"ref": ref, "config": cfg})
         targets = BC.departure_targets(raw, ref, run_dir)
     except Exception as ex:  # noqa: BLE001
         return [f(f"the departed components cannot be resolved: {type(ex).__name__}: {ex}", "departures")]

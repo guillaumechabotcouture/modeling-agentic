@@ -1104,6 +1104,23 @@ def _self_test_benchmark_gate(ok) -> None:
             fd = [f for f in CT.departure_findings(run)]
             ok(fd == [], f"G30d departures for an engine the run did not use are out of the check's scope ({fd[:1]})")
             yaml.safe_dump(raw_o, open(os.path.join(run, "decision_spec.yaml"), "w"), sort_keys=False)
+            # r5: the scope is the run's own engine (the manifest's engine identity), never the coverage file's name
+            mp_ = os.path.join(run, "analysis", "manifest.json")
+            man_ = json.load(open(mp_))
+            yaml.safe_dump(dict(good, perturbation_identity=[True, True]), open(rp_, "w"))     # an ineffective test
+            man_["deliverables"]["models/decision_tests/DTa.yaml"]["sha256"] = _sha(rp_)
+            json.dump(dict(man_, engine={"name": "package-rate", "version": "1"}), open(mp_, "w"))
+            fd = [f for f in CT.departure_findings(run)]
+            ok(fd == [], f"G30e a run of another engine (one without a coverage file) is not blocked by departures "
+                         f"for this engine ({fd[:1]})")
+            yaml.safe_dump(dict(good, perturbation_identity=[True, True]), open(rp_, "w"))
+            man_["deliverables"]["models/decision_tests/DTa.yaml"]["sha256"] = _sha(rp_)
+            json.dump(dict(man_, engine={"name": "toy", "version": "1"}), open(mp_, "w"))
+            write_cov(dict(cov, engine="renamed"))
+            fd = [f for f in CT.departure_findings(run)]
+            ok(fd and all(f["kind"] == "departure_test_ineffective" for f in fd),
+               f"G30f renaming the coverage file's engine does not take the run's departures out of scope ({fd[:1]})")
+            write_cov(cov)
             # review: the configuration the run uses, and the named-engine sheet
             write_cov(cov)
             write_results(rows_in)
