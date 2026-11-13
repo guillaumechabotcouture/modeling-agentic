@@ -8,6 +8,12 @@ none). Callers: toolkit/spec/signoff.py sign, scripts/decision_brief.py sign, ag
 signer), and toolkit/spec/schema.py validate, which the analysis calls before a run (signer None: the run's
 recorded sign-off decides). A check is registered by name in CHECKS: fn(run_dir, spec, signer) -> [str].
 
+The evidence dossier (#218) registers a check that also takes the call's context (CONTEXT_CHECKS): `mode` (sign: a
+signer, before the record exists; status, launch, resume: a signed run, its record compared; unsigned: a run
+nobody signs) and read / engine / record / capture. It runs only when a mode is given; its callers pass
+`only=("evidence_dossier",)` so the benchmark check is not run twice on a signing path that already ran it.
+`spec_bytes` None reads the run's decision_spec.yaml.
+
 `decision_test_runs(spec, test_id, effect)` -> (ok, why): will this decision test execute on this run's path and
 change this effect? `effect`: {parameters: engine parameters that carry the effect, components: spec components
 that deliver it, rows: the engine's verified benchmark rows (for interaction tests)}. Nothing here names a disease.
@@ -46,12 +52,34 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
 
 
 CHECKS = {"benchmark_eligibility": _benchmark_eligibility}
+CONTEXT_CHECKS: set = set()          # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, mode=, ...)
 
 
-def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=None) -> list:
+def register(name: str, fn, context: bool = False) -> None:
+    CHECKS[name] = fn
+    if context:
+        CONTEXT_CHECKS.add(name)
+
+
+def _load_builtin() -> None:
+    from toolkit.spec import evidence_dossier as ED
+    ED._register()
+
+
+def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=None, mode: str | None = None,
+             only=None, **ctx) -> list:
     """Every registered check's problems. `spec`: an already loaded schema.Spec; else the spec the run will use is
-    loaded from `spec_bytes` as the run's decision_spec.yaml (settings merged, engine_choice.json resolved)."""
+    loaded from `spec_bytes` as the run's decision_spec.yaml (settings merged, engine_choice.json resolved), or read
+    from the run dir when `spec_bytes` is None. `only`: the names of the checks to run. `mode` and `ctx` reach the
+    context checks (CONTEXT_CHECKS)."""
     from toolkit.spec import schema
+    _load_builtin()
+    if spec_bytes is None and spec is None and run_dir:
+        try:
+            with open(os.path.join(run_dir, "decision_spec.yaml"), "rb") as f:
+                spec_bytes = f.read()
+        except OSError:
+            spec_bytes = None
     if spec is None:
         import yaml
         try:
@@ -67,11 +95,47 @@ def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=No
             spec = schema.Spec(raw, run_dir)
     out = []
     for name, fn in CHECKS.items():
+        if only is not None and name not in only:
+            continue
         try:
-            out += list(fn(run_dir, spec, signer) or [])
+            if name in CONTEXT_CHECKS:
+                out += list(fn(run_dir, spec, signer, spec_bytes=spec_bytes, mode=mode, **ctx) or [])
+            else:
+                out += list(fn(run_dir, spec, signer) or [])
         except Exception as e:  # noqa: BLE001 -- a check that cannot run is a problem (fail closed)
             out.append(f"precondition {name} could not be checked: {type(e).__name__}: {e}")
     return out
+
+
+def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | None = None) -> tuple:
+    """(ok, why, values) for the evidence dossier (#218): whether `test_id` executes on this run's path and varies the
+    dossier input `effect` ("parameter:<name>"), and the values it sets, so the dossier's chosen range can be checked
+    against them. A generated prior_range_/fitted_range_<p> test exists only for a parameter the draws vary (`drawn`).
+    A declared parameter_value test varies its own parameter; on the emulator path only a drawn parameter or one the
+    spec sets (engine_parameters) is an emulator input. (decision_test_runs above answers a different question: may a
+    test carry a benchmark departure.)"""
+    kind, _, name = str(effect).partition(":")
+    if kind != "parameter":
+        return False, f"cannot vary a {kind}: no decision test type does", []
+    drawn = drawn or {}
+    if test_id in (f"prior_range_{name}", f"fitted_range_{name}"):
+        if name not in drawn:
+            return False, (f"is generated only for a parameter the draw plan draws, and {name} is not drawn (no prior, "
+                           "or excluded by uncertainty.excluded)"), []
+        return True, "", list(drawn[name])
+    an = spec.get("analysis") if isinstance(spec, dict) and isinstance(spec.get("analysis"), dict) else {}
+    tests = {str(t.get("id")): t for t in (an.get("decision_tests") or []) if isinstance(t, dict)}
+    t = tests.get(str(test_id))
+    if t is None:
+        return False, "is not an analysis.decision_tests id", []
+    if t.get("type") != "parameter_value" or t.get("parameter") != name:
+        return False, (f"does not vary parameter {name} (a parameter_value test of {name}, or prior_range_{name} for a "
+                       "drawn prior, does)"), []
+    eps = spec.get("engine_parameters") if isinstance(spec.get("engine_parameters"), dict) else {}
+    if an.get("evaluation") == "emulator" and name not in drawn and name not in eps:
+        return False, (f"does not execute on the emulator path: {name} is neither drawn nor set by engine_parameters, "
+                       "so it is not an emulator input"), list(t.get("values") or [])
+    return True, "", list(t.get("values") or [])
 
 
 def _declared_range(spec, eng, p):
@@ -195,6 +259,24 @@ def _self_test() -> int:
             CHECKS.pop("boom", None)
         ok(problems(d, b"[: bad", None) and "cannot be loaded" in problems(d, b"[: bad", None)[0],
            "PC4 unparsable bytes are a problem")
+        seen = {}
+        register("ctx", lambda r, sp, by, **k: seen.update(k) or ["ctx"], context=True)
+        try:
+            got = problems(d, None, None, mode="status", only=("ctx",), record={"r": 1})
+            ok(got == ["ctx"] and seen.get("mode") == "status" and seen.get("record") == {"r": 1}
+               and seen.get("spec_bytes") == open(p, "rb").read(),
+               f"PC4b a context check gets the mode, the context and the run's spec bytes; only= selects it: {got}")
+        finally:
+            CHECKS.pop("ctx", None)
+            CONTEXT_CHECKS.discard("ctx")
+    sp_ = {"analysis": {"evaluation": "emulator", "decision_tests": [
+        {"id": "P", "type": "parameter_value", "parameter": "p", "values": [1, 2]}]}}
+    ok(chosen_range_test_runs(sp_, "P", "parameter:p", {"p": (0, 3)})[0]
+       and not chosen_range_test_runs(sp_, "P", "parameter:p")[0]
+       and chosen_range_test_runs(dict(sp_, engine_parameters={"p": {"value": 1}}), "P", "parameter:p")[0]
+       and not chosen_range_test_runs(sp_, "prior_range_p", "parameter:p", {})[0],
+       "PC11 the dossier's range test: a parameter_value test runs on the emulator path only for a drawn or spec-set "
+       "parameter; a generated test only for a drawn one")
     # review round 3 regression table: each reproduction through the precondition and through the runner's planner
     # with the evidence an analysis holds (decision_tests.runtime_evidence), which must agree
     from toolkit.analysis import decision_tests as DT

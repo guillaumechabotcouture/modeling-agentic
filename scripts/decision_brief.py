@@ -442,10 +442,12 @@ def _capture(run_dir: str, names) -> dict:
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
          accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
-         expect_geometry: str | None = None) -> dict:
+         expect_geometry: str | None = None, evidence: dict | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
-    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record."""
+    `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record;
+    `evidence`: the binding the caller made (toolkit/spec/evidence_dossier.py bind); never trusted: this entry point
+    recomputes it from the captured spec and the dossier and refuses one that differs."""
     import hashlib
     from lib.safe_io import write_nofollow, LinkRefused
     captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
@@ -480,6 +482,13 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         pre = PC.problems(run_dir, captured[DECISION_SPEC], by)
         if pre:
             raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
+        # F6 (#218): every registered precondition, recomputed from the files (toolkit/spec/preconditions.py), whoever
+        # signs; a binding the caller hands in is never trusted: it must be the one recomputed here
+        mine = SO.sign_preconditions(run_dir, captured[DECISION_SPEC])
+        if evidence is not None and evidence != mine:
+            raise ValueError("the evidence binding supplied is not the one this spec and its dossier give: read the "
+                             "dossier and the sheet again before signing")
+        evidence = mine
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
@@ -495,7 +504,8 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {**shas, **(extra_sha or {})},
+        "sha256": {**shas, **(extra_sha or {}), **((evidence or {}).get("files") or {})},
+        **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }

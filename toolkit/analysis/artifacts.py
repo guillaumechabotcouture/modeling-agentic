@@ -128,10 +128,11 @@ class Store:
         doc = {"schema": f"analysis.{kind}/1", "produced_by": PRODUCED_BY, "producer": producer,
                "spec_sha256": self.spec_sha, "spec_signed": self.spec_signed, "engine": self.engine_info,
                "engine_choice_sha256": self.engine_choice_sha,
-               # an input is a path (hashed now) or (path, sha256) of the bytes a step already read and used
-               "inputs": {self.rel(p) if os.path.isabs(p) else p: (h if h is not None else
-                                                                  sha256(p if os.path.isabs(p) else self.path(p)))
-                          for p, h in ((x if isinstance(x, tuple) else (x, None)) for x in inputs)},
+               # an input given as (path, sha256): bytes already read and used (the signed net-effect posterior, a
+               # unit_attribute test's set_from table); never re-read here
+               "inputs": {**{self.rel(p) if os.path.isabs(p) else p: sha256(p if os.path.isabs(p) else self.path(p))
+                             for p in inputs if not isinstance(p, tuple)},
+                          **{self.rel(p[0]): p[1] for p in inputs if isinstance(p, tuple)}},
                "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
                "data": plain(data)}
         data = yaml.safe_dump(doc, sort_keys=False, width=120).encode("utf-8")
