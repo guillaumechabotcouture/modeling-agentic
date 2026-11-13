@@ -635,19 +635,27 @@ def _cli(argv):
 
 
 # ---------------------------------------------------------------- self-test
+def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
+    """A sweep with packages none, A (component a) and B (component b, same group): relative reductions rA, rB."""
+    n = len(rA)
+    one = np.ones(n)
+    bu = one if burden is None else np.asarray(burden, float)
+    sw = Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
+               {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
+               {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
+               groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"})
+    sw.lam = lam        # tests-first shim: the current Sweep has no shadow price (ζ passes it to the constructor)
+    return sw
+
+
 def _planted(seed=3, n=200):
     """A planted-truth sweep: A's relative effect is constant (0.30); B's rises with f1 (0.6 x f1); f2 is irrelevant;
-    equal costs, so A beats B on benefit per cost exactly where f1 < 0.5."""
+    equal costs, so A has the higher net benefit exactly where f1 < 0.5."""
     rng = np.random.default_rng(seed)
     f1, f2 = rng.uniform(0, 1, n), rng.uniform(0, 1, n)
     burden = 1.0 + 0.1 * rng.standard_normal(n)
-    rA = 0.30 + 0.02 * rng.standard_normal(n)
-    rB = 0.60 * f1 + 0.03 * rng.standard_normal(n)
-    one = np.ones(n)
-    return Sweep({"f1": f1, "f2": f2}, {"none": [], "A": ["a"], "B": ["b"]}, "none", burden,
-                 {"none": burden, "A": burden * (1 - rA), "B": burden * (1 - rB)},
-                 {"none": 0 * one, "A": one, "B": one}, groups={"a": "g", "b": "g"}, points=list(range(n)),
-                 kinds={"f1": "unit", "f2": "unit"}, artifacts={"results": "synthetic"})
+    return _sw({"f1": f1, "f2": f2}, 0.30 + 0.02 * rng.standard_normal(n), 0.60 * f1 + 0.03 * rng.standard_normal(n),
+               burden=burden)
 
 
 def _seed():
@@ -662,19 +670,28 @@ def _seed():
         {"id": "B3", "mechanism": "A is preferred over B where f1 is low", "about": {"pair": ["A", "B"]},
          "direction": "flips", "conditions": [{"feature": "f1", "range": [0.3, 0.7]}],
          "source_type": "data", "evidence": [{"dossier_entry": "D-1"}], "confidence": "low",
-         "decision_relevant": True}],
+         "decision_relevant": True},
+        {"id": "B4", "mechanism": "A beats B on net benefit where f1 is high", "about": {"pair": ["A", "B"]},
+         "direction": "none", "source_type": "literature", "evidence": lit, "confidence": "medium"}],
         "hypotheses": [
-            {"id": "H1", "belief": "B1", "claim": "A's effect is in [0.2, 0.4]",
-             "test": {"kind": "effect_band", "package": "A", "band": [0.2, 0.4]}},
-            {"id": "H2", "belief": "B3", "claim": "A beats B wherever f1 is above 0.7",
+            {"id": "H1", "belief": "B1", "claim": "A's effect is in [0.2, 0.4] at 80% of points",
+             "test": {"kind": "effect_band", "package": "A", "band": [0.2, 0.4], "min_share": 0.8}},
+            {"id": "H2", "belief": "B4", "claim": "A beats B wherever f1 is above 0.7",
              "test": {"kind": "paired_sign", "a": "A", "b": "B", "feature": "f1", "range": [0.7, 1.0],
-                      "sign": "positive"}},
+                      "sign": "positive", "min_share": 0.8}},
             {"id": "H3", "belief": "B3", "claim": "the A/B choice flips for f1 in [0.3, 0.7]",
              "test": {"kind": "flip_in", "a": "A", "b": "B", "feature": "f1", "range": [0.3, 0.7]}},
             {"id": "H4", "belief": "B2", "claim": "B's effect increases with f1",
              "test": {"kind": "effect_direction", "package": "B", "feature": "f1", "direction": "increases"}},
             {"id": "H5", "belief": "B3", "claim": "most low-f1 units get A",
-             "test": {"kind": "plan_share", "component": "a", "where": {"f1": [0.0, 0.5]}, "min_share": 0.8}}]}
+             "test": {"kind": "plan_share", "component": "a", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
+
+
+def _one(sw, t, plan=None, units=None):
+    """The status and result of one test, through check()."""
+    ctx = {"sweep": sw, "plan": plan, "units": units, "summary": summarise(sw)}     # tests-first shim (ζ drops it)
+    h = check([{"id": "H", "belief": "B", "claim": "c", "test": t}], ctx)[0]
+    return h["status"], h["result"]
 
 
 def _self_test() -> int:
@@ -698,10 +715,11 @@ def _self_test() -> int:
     def wm1():
         s = summarise(sw)
         eb = s["effects"]["B"]["direction"]
-        ok(eb["f1"]["direction"] == "increases" and eb["f2"]["direction"] == "none",
-           f"WM1 the summariser recovers B's direction along f1 and none along the irrelevant f2: {eb}")
+        ok(eb["f1"]["direction"] == "increases" and eb["f2"]["direction"] == "inconclusive",
+           f"WM1 the summariser recovers B's direction along f1, and no direction (inconclusive) along f2: {eb}")
         ea = s["effects"]["A"]
-        ok(ea["band"][0] <= 0.30 <= ea["band"][1] and all(v["direction"] == "none" for v in ea["direction"].values()),
+        ok(ea["band"][0] <= 0.30 <= ea["band"][1] and all(v["direction"] == "inconclusive" for v in
+                                                          ea["direction"].values()),
            f"WM2 A's effect band contains the true 0.30 and A has no direction along any feature: {ea}")
         fl = s["flips"]["A~B"]
         ok(fl["along"] and fl["along"][0]["feature"] == "f1" and fl["along"][0]["range"][0] <= 0.5
@@ -716,7 +734,8 @@ def _self_test() -> int:
         for mut, why in ((lambda b: b.pop("evidence"), "no evidence"),
                          (lambda b: b["evidence"][0].pop("location"), "literature without table or page"),
                          (lambda b: b.update(source_type="hunch"), "unknown source type"),
-                         (lambda b: b.update(confidence="certain"), "unknown confidence")):
+                         (lambda b: b.update(confidence="certain"), "unknown confidence"),
+                         (lambda b: b["magnitude"].update(band=[float("nan"), 0.4]), "a NaN band")):
             sd = _seed()
             mut(sd["beliefs"][0])
             try:
@@ -727,7 +746,14 @@ def _self_test() -> int:
         for mut, why in ((lambda h: h.pop("test"), "no refutation test"),
                          (lambda h: h["test"].update(kind="vibes"), "an unknown test kind"),
                          (lambda h: h["test"].pop("band"), "a test missing a field"),
-                         (lambda h: h.update(belief="B9"), "an unknown belief")):
+                         (lambda h: h.update(belief="B9"), "an unknown belief"),
+                         (lambda h: h["test"].pop("min_share"), "no declared pass threshold"),
+                         (lambda h: h["test"].update(min_share=-1), "min_share -1"),
+                         (lambda h: h["test"].update(min_share=2), "min_share 2"),
+                         (lambda h: h["test"].update(min_share=float("nan")), "min_share NaN"),
+                         (lambda h: h["test"].update(package="B"), "a test on another package than its belief's"),
+                         (lambda h: h["test"].update(kind="effect_direction", feature="f1", direction="negligible"),
+                          "a negligible claim without an equivalence bound")):
             sd = _seed()
             mut(sd["hypotheses"][0])
             try:
@@ -735,8 +761,20 @@ def _self_test() -> int:
                 ok(False, f"WM7 validation refuses a hypothesis with {why}")
             except WorldModelError:
                 ok(True, f"WM7 validation refuses a hypothesis with {why}")
+        sd = _seed()
+        sd["hypotheses"][2]["test"]["range"] = [0.8, 0.9]
+        try:
+            validate_seed(sd)
+            ok(False, "WM7 validation refuses a test whose region lies outside its belief's conditions")
+        except WorldModelError:
+            ok(True, "WM7 validation refuses a test whose region lies outside its belief's conditions")
         validate_seed(_seed())
         ok(True, "WM6b a seed whose beliefs all have evidence and whose hypotheses all have tests is accepted")
+        try:
+            _sw({"f": [0.0, 1.0]}, [0.1, float("nan")], [0.1, 0.2])
+            ok(False, "WM7b a sweep with a NaN outcome is refused")
+        except WorldModelError:
+            ok(True, "WM7b a sweep with a NaN outcome is refused")
     tryit("WM6-7 validation", wm6)
 
     def wm8():
@@ -754,21 +792,26 @@ def _self_test() -> int:
         ok(any(c["belief"].startswith("sim.") for c in b2.get("conflicts", [])) and b2["confidence"] == "low",
            f"WM10 the literature band for B (0.7-0.9) and the simulated band are kept side by side as a conflict, "
            f"and the confirmation of its direction does not raise its confidence: {b2}")
-        q = next(o for o in wm["open_questions"] if "H2" in o["question"])
-        ok(q["decision_relevant"], f"WM11 a contradiction becomes a decision-relevant open question: {q}")
-        hy2 = copy.deepcopy(hy)
-        ok(all(h["result"].get("artifact") for h in hy2["hypotheses"]), "WM12 every result names its artifact")
+        q = next((o for o in wm["open_questions"] if "H2" in o["question"]), {})
+        ok(q.get("beliefs") == ["B4"], f"WM11 a contradiction becomes an open question on its belief: {q}")
+        ok(all(h["result"].get("artifact") for h in copy.deepcopy(hy)["hypotheses"]), "WM12 every result names "
+                                                                                         "its artifact")
         look = where_to_look(wm)
         ok(look and look[0]["belief"] in ("B2", "B3"), "WM13 where_to_look ranks the low-confidence, decision-relevant,"
-           f" contradicted or conflicting belief first: {look[:2]}")
+           f" conflicting belief first: {look[:2]}")
         reg = next((x for x in look if x["kind"] == "simulation" and "f1" in (x.get("region") or {})), None)
         ok(reg is not None and reg["region"]["f1"][0] <= 0.5 <= reg["region"]["f1"][1],
            f"WM14 where_to_look proposes simulation points over the flip range, which contains the true 0.5: {reg}")
-        h5 = copy.deepcopy(_seed())
-        wm_np, hy_np = build(h5, sw, plan=None, units=None)
+        _, hy_np = build(copy.deepcopy(_seed()), sw, plan=None, units=None)
         ok(next(h for h in hy_np["hypotheses"] if h["id"] == "H5")["status"] == "untestable",
            "WM15 a plan hypothesis without a plan is untestable, never supported")
-    tryit("WM8-15 build, check, where_to_look", wm8)
+        sd = _seed()
+        sd["beliefs"][3].update(decision_relevant=True, confidence="high")
+        wm2, _ = build(sd, sw, plan=plan, units=units)
+        ok(any(x["belief"] == "B4" and x["kind"] == "contradiction" for x in where_to_look(wm2, top=0)),
+           "WM33 where_to_look always lists a contradicted decision-relevant belief, even with no conditions or "
+           "conflicts and top=0")
+    tryit("WM8-15, 33 build, check, where_to_look", wm8)
 
     def wm16():
         with tempfile.TemporaryDirectory() as d:
@@ -780,6 +823,146 @@ def _self_test() -> int:
             except WorldModelError as e:
                 ok("results" in str(e) or "decision_spec" in str(e), f"WM16 a run without results fails closed: {e}")
     tryit("WM16 load", wm16)
+
+    def wm17():
+        from toolkit.analysis import batch as B
+        jobs = [{"id": f"{i}|A", "point": i, "package": "A", "params": {"p": i}, "seed": i} for i in range(3)]
+        ident = {"name": "e", "version": "1"}
+        good = [{"id": j["id"], "result": {"result": {"v": 1}, "provenance": {"job_sha": B.job_sha(j),
+                                                                              "engine": ident}}} for j in jobs]
+        ok(set(bind_rows(good, jobs, ident)) == {j["id"] for j in jobs}, "WM17 rows bound to their jobs are kept")
+        for bad, why in (([dict(r, result={"result": {"v": 1}}) for r in good], "rows without provenance"),
+                         ([dict(good[0], id=jobs[1]["id"]), good[1], good[2]], "a row whose inputs differ from its job"),
+                         (good, "rows from another engine identity"), (good[:2], "a missing row")):
+            try:
+                bind_rows(bad, jobs, ident if why != "rows from another engine identity" else {"name": "e2"})
+                ok(False, f"WM17 {why} are refused")
+            except WorldModelError:
+                ok(True, f"WM17 {why} are refused")
+    tryit("WM17 provenance binding", wm17)
+
+    def wm18():
+        x = np.linspace(0, 1, 100)
+        d1, d2 = direction(x, np.full(100, 0.3)), direction(np.full(20, 1.0), np.full(20, 2.0))
+        ok(d1["direction"] == "inconclusive" and d2["direction"] == "inconclusive",
+           f"WM18 tie-aware ranks: an exactly constant effect, or two constant inputs, have no direction: {d1}, {d2}")
+        d3 = direction(np.arange(5.0), np.arange(5.0))
+        ok(d3["direction"] == "inconclusive", f"WM19 five points are too few for any direction: {d3}")
+        d4 = direction(np.array([0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0] * 3, float), np.arange(36.0))
+        ok(d4["direction"] == "inconclusive", f"WM19b a two-valued (categorical) feature has no direction: {d4}")
+        rng = np.random.default_rng(0)
+        xs = rng.uniform(0, 1, 400)
+        s_neg, _ = _one(_sw({"x": xs}, 0.3 + 0 * xs, 0.3 + 0.01 * rng.standard_normal(400)),
+                        {"kind": "effect_direction", "package": "B", "feature": "x", "direction": "negligible",
+                         "equivalence": 0.2})
+        ok(s_neg == "supported", f"WM19c 'negligible' is supported only with its explicit equivalence bound: {s_neg}")
+    tryit("WM18-19 direction", wm18)
+
+    def wm20():
+        x = np.linspace(0, 1, 200)
+        same = _sw({"x": x}, 0.3 + 0 * x, 0.3 + 0 * x)
+        st, res = _one(same, {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0, 1],
+                              "sign": "negative", "min_share": 0.8})
+        ok(st == "inconclusive" and res["observed"]["share_tie"] == 1.0,
+           f"WM20 identical options are ties, never a win for the second option: {st} {res['observed']}")
+        tie_above = _sw({"x": x}, np.where(x < 0.5, 0.5, 0.3), 0.3 + 0 * x)
+        fl = summarise(tie_above)["flips"]["A~B"]
+        ok(not fl["along"], f"WM20b A winning below 0.5 and tying above is not a flip (B never wins): {fl}")
+    tryit("WM20 ties", wm20)
+
+    def wm21():
+        x = np.linspace(0, 1, 200)
+        bu = np.where(np.arange(200) == 7, 1.0, 0.0)
+        st, res = _one(_sw({"x": x}, 0.3 + 0 * x, 0.3 + 0 * x, burden=bu),
+                       {"kind": "effect_band", "package": "A", "band": [0.2, 0.4], "min_share": 0.8})
+        ok(st == "inconclusive" and res["points"] == [7] and res["observed"]["excluded_no_baseline"] == 199,
+           f"WM21 the minimum sample counts usable points; exclusions are reported and only used ids listed: {st} "
+           f"{res['observed']} {res['points']}")
+        st0, _ = _one(_sw({"x": x}, 0 * x, 0 * x, burden=0 * x),
+                      {"kind": "effect_band", "package": "A", "band": [0.9, 1.0], "min_share": 0.8})
+        ok(st0 == "inconclusive", f"WM21b zero-baseline points are not 100% reductions: {st0}")
+    tryit("WM21 usable sample", wm21)
+
+    def wm22():
+        rng = np.random.default_rng(5)
+        x, z = rng.uniform(0, 1, 400), (rng.uniform(0, 1, 400) < 0.5).astype(float)
+        thr = np.where(z == 0, 0.2, 0.8)
+        cs = _sw({"x": x, "z": z}, np.where(x < thr, 0.5, 0.2), 0.35 + 0 * x)
+        t = {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "where": {"z": [0, 0]}}
+        s1, r1 = _one(cs, dict(t, range=[0.05, 0.35]))
+        s2, _ = _one(cs, dict(t, range=[0.45, 0.55]))
+        ok(s1 == "supported" and s2 == "refuted", f"WM22 a conditional flip test refits on its `where` points "
+                                                  f"(true threshold 0.2 at z=0): {s1} {r1['observed']}, {s2}")
+        x2 = np.linspace(0, 1, 1000)
+        sh = _sw({"x": x2}, np.where(x2 < 0.5, 0.5, 0.2), 0.35 + 0 * x2)
+        s3, r3 = _one(sh, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [0.47, 0.49]})
+        ok(s3 != "supported", f"WM23 overlap with the located range is not confirmation (true 0.5, claim "
+                              f"[0.47, 0.49]): {s3} {r3['observed']}")
+        xg = np.concatenate([np.linspace(0, 0.1, 500), np.linspace(0.9, 1, 500)])
+        gap = _sw({"x": xg}, np.where(xg < 0.2, 0.5, 0.2), 0.35 + 0 * xg)
+        fg = flip_along(gap, "A", "B", "x")
+        s4, _ = _one(gap, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [0.4, 0.6]})
+        ok(fg["status"] == "flip" and fg["range"][0] <= 0.2 <= fg["range"][1] and s4 == "inconclusive",
+           f"WM24 the located range spans the unsampled gap, so it contains the true 0.2: {fg.get('range')} {s4}")
+        nm = _sw({"x": x2}, np.where((x2 > 0.45) & (x2 < 0.55), 0.5, 0.2), 0.35 + 0 * x2)
+        s5, r5 = _one(nm, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x", "range": [0.0, 1.0]})
+        ok(s5 == "inconclusive", f"WM25 a non-monotone or rare regime is inconclusive, never refuted: {s5} "
+                                 f"{r5['observed']['status']}")
+        alias = _sw({f"x{k}": x2 for k in range(1, 5)}, np.where(x2 < 0.5, 0.5, 0.2), 0.35 + 0 * x2)
+        s6, _ = _one(alias, {"kind": "flip_in", "a": "A", "b": "B", "feature": "x4", "range": [0.3, 0.7]})
+        ok(s6 == "supported", f"WM26 a test evaluates its own feature, whatever the summary displays: {s6}")
+        s7, r7 = _one(sh, {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0.0, 0.4],
+                           "where": {"x": [0.3, 1.0]}, "sign": "positive", "min_share": 0.9})
+        ok(s7 == "supported" and r7["observed"]["n"] == 100, f"WM27 `where` intersects the test's range, never "
+                                                             f"replaces it: {s7} {r7['observed']}")
+    tryit("WM22-27 flips", wm22)
+
+    def wm28():
+        r = np.array([0.0] * 49 + [0.3] * 2 + [1.0] * 49)
+        st, res = _one(_sw({"x": np.linspace(0, 1, 100)}, r, r), {"kind": "effect_band", "package": "A",
+                                                                  "band": [0.2, 0.4], "min_share": 0.8})
+        ok(st == "refuted" and res["observed"]["coverage"] == 0.02, f"WM28 effect_band tests coverage of the band, "
+                                                                    f"not the median: {st} {res['observed']}")
+    tryit("WM28 effect band", wm28)
+
+    def wm29():
+        units = {str(i): {"region": "north" if i < 100 else "south"} for i in range(110)}
+        t = {"kind": "plan_share", "component": "a", "where": {"region": ["north"]}, "min_share": 0.8}
+        s1, _ = _one(sw, t, plan={"0": "A"}, units=units)
+        units["105"] = {}
+        s2, _ = _one(sw, t, plan={u: "A" for u in units}, units=units)
+        ok(s1 == "untestable" and s2 == "untestable", f"WM29 matching units missing from the plan, or a unit missing "
+                                                      f"the filter column, make plan_share untestable: {s1} {s2}")
+    tryit("WM29 plan share", wm29)
+
+    def wm32():
+        x = np.random.default_rng(2).uniform(0, 1, 400)
+        cs = _sw({"x": x}, 0.3 + 0 * x, 0.6 * x)
+        sd = {"beliefs": [{"id": "C1", "mechanism": "B is strong at high x", "about": {"package": "B"},
+                           "direction": "reduces", "magnitude": {"band": [0.55, 0.62], "scale": "relative_reduction"},
+                           "conditions": [{"feature": "x", "range": [0.95, 1.0]}], "source_type": "literature",
+                           "evidence": [{"citation": "T", "location": "p. 3"}], "confidence": "low"},
+                          {"id": "C2", "mechanism": "B halves the risk ratio", "about": {"package": "B"},
+                           "direction": "reduces", "magnitude": {"band": [0.9, 1.0], "scale": "odds_ratio"},
+                           "source_type": "literature", "evidence": [{"citation": "T", "location": "p. 3"}],
+                           "confidence": "low"}]}
+        wm, _ = build(sd, cs)
+        ok(not any(b.get("conflicts") for b in wm["beliefs"] if b["id"] in ("C1", "C2")),
+           "WM32 conflicts compare matching conditions and scales only (a conditional band, an odds-ratio band)")
+    tryit("WM32 conflicts", wm32)
+
+    def wm34():
+        x = np.linspace(0, 1, 100)
+        cs = _sw({"x": x}, 0.2 + 0 * x, 0.3 + 0 * x, cA=1.0, cB=2.0, lam=0.05)
+        st, res = _one(cs, {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0, 1],
+                            "sign": "positive", "min_share": 0.8})
+        ok(st == "refuted", f"WM34 options are compared on net benefit at the shadow price (A has the higher benefit "
+                            f"per cost, B the higher net benefit): {st} {res['observed']}")
+        st2, _ = _one(_sw({"x": x}, 0.2 + 0 * x, 0.3 + 0 * x, lam=None),
+                      {"kind": "paired_sign", "a": "A", "b": "B", "feature": "x", "range": [0, 1], "sign": "positive",
+                       "min_share": 0.8})
+        ok(st2 == "untestable", f"WM34b without a shadow price a paired test is untestable: {st2}")
+    tryit("WM34 net benefit", wm34)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
