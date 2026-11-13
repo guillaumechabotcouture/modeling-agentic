@@ -1,0 +1,289 @@
+version: 0
+beliefs:
+- id: B1
+  mechanism: Early growth rate r solves the Euler-Lotka relation 1 = R0*s0 * sum_k w_k exp(-r k) on the weekly generation
+    grid (0.5, 0.4, 0.1; mean ~1.6 weeks); doubling time is ln2 / r. r rises with s0 and is independent of population
+    size and of seed size. For R0*s0 around 1.5-2.5 this gives r of roughly 0.25-0.6 per week (doubling roughly
+    1.2-3 weeks); it tends to zero (doubling time unbounded) as R0*s0 approaches 1.
+  about:
+    feature: s0 (calibration scale)
+  direction: increases
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.5044078105129302
+    - 0.9972519157454371
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proc R Soc B 2007
+    location: Eq. 2.7 and Section 2 (moment-generating-function relation); exact page not checked
+  - citation: Fraser C. Estimating individual and household reproduction numbers in an emerging epidemic. PLoS ONE
+      2007
+    location: Methods, renewal equation; location not verified
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: Mild hygiene (hand hygiene / respiratory etiquette promotion) reduces respiratory infection transmission
+    by a modest fraction; community trials and meta-analyses report roughly 15-20% fewer respiratory illnesses with
+    intensive hand-hygiene programmes, so a 'mild' campaign plausibly cuts R_t by about 5-15%. Translated through
+    the final-size relation for R0*s0 of roughly 1.3-2.5, the 2026 infections averted are roughly 3-35% of the no-campaign
+    infections.
+  about:
+    package: hygiene
+  direction: reduces
+  magnitude:
+    band:
+    - 0.03
+    - 0.35
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Aiello AE, Coulborn RM, Perez V, Larson EL. Effect of hand hygiene on infectious disease risk in
+      the community setting: a meta-analysis. Am J Public Health 2008'
+    location: 'Abstract / Results: ~21% reduction in respiratory illness with hand-hygiene interventions'
+  - citation: Jefferson T, Dooley L, Ferroni E, et al. Physical interventions to interrupt or reduce the spread
+      of respiratory viruses. Cochrane Database Syst Rev 2023
+    location: Summary of findings, hand hygiene vs control (ARI RR about 0.84); value from memory, not re-checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'The relative reduction in infections increases monotonically with the hygiene multiplier''s effect:
+    a larger cut in R_t lowers the final size more (and steeply so when it brings R_t close to 1).'
+  about:
+    package: hygiene
+    feature: effect:hygiene
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an infectious disease. Bull Math Biol 2006
+    location: final size relation z = 1 - exp(-R0 z); general form, page not checked
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Final-size elasticity: the same proportional cut in R_t averts a larger share of infections when the
+    effective reproduction number R0*s0 is close to 1 (low susceptibility) and a smaller share when it is high (s0
+    near 1), because the final size saturates at high R. So the hygiene relative reduction decreases as s0 rises.
+    Where R0*s0 falls below 1 there is no epidemic and the point has no baseline burden (excluded).'
+  about:
+    package: hygiene
+    feature: s0 (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an infectious disease. Bull Math Biol 2006
+    location: final size relation; page not checked
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Chapter 6 (final size); chapter location from memory
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: At high susceptibility (s0 above about 0.85) the epidemic is fast and the final size is saturated,
+    so a mild campaign averts only a small share of infections, roughly 2-20%.
+  about:
+    package: hygiene
+  direction: reduces
+  magnitude:
+    band:
+    - 0.02
+    - 0.2
+    scale: relative_reduction
+  conditions:
+  - feature: s0 (calibration scale)
+    range:
+    - 0.85
+    - 0.9972519157454371
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an infectious disease. Bull Math Biol 2006
+    location: final size relation; page not checked
+  - citation: 'Aiello AE, Coulborn RM, Perez V, Larson EL. Effect of hand hygiene on infectious disease risk in
+      the community setting: a meta-analysis. Am J Public Health 2008'
+    location: Abstract / Results
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: 'Scale invariance: in a deterministic closed-population renewal model with seeding given as a share
+    of the population, every outcome expressed per person (growth rate, peak week, attack rate, relative reduction)
+    is independent of town population.'
+  about:
+    package: hygiene
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Cori A, Ferguson NM, Fraser C, Cauchemez S. A new framework and software to estimate time-varying
+      reproduction numbers during epidemics. Am J Epidemiol 2013
+    location: renewal equation formulation (Methods); no population-size term
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B7
+  mechanism: 'Timing: a larger seed share brings the epidemic forward (peak earlier by about ln(seed ratio)/r weeks,
+    up to several weeks across the 50-fold seed range), so more of it happens before week 6 and, if the epidemic
+    is slow, more of it completes within 2026. Both shrink the share a week-6 campaign averts; when the epidemic
+    is still growing at year end, a campaign that delays it averts a larger in-year share. Expected effect: the
+    relative reduction decreases weakly with seed share; small, because pre-week-6 infections are a tiny share for
+    any plausible r.'
+  about:
+    package: hygiene
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Handel A, Longini IM, Antia R. What is the best control strategy for multiple infectious disease outbreaks?
+      Proc R Soc B 2007
+    location: timing of control relative to epidemic peak; section not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B8
+  mechanism: 'Peak week and 2026 attack rate: attack rate follows the final-size relation in s0 (rises with s0,
+    near zero as R0*s0 approaches 1, at most s0); peak week comes earlier with higher s0 and higher seed share.
+    Slow epidemics (R0*s0 near 1) may not peak within 2026, so the in-year attack rate is below the final size there.'
+  about:
+    feature: s0 (calibration scale)
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Kermack WO, McKendrick AG. A contribution to the mathematical theory of epidemics. Proc R Soc A 1927
+    location: final size result; page not checked
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What is R0 (withheld)? It sets R0*s0, hence whether low-s0 towns have any epidemic and how elastic the
+    final size is to hygiene; the B2/B5 bands are wide mainly because of it.
+  beliefs:
+  - B1
+  - B2
+  - B4
+  - B5
+  - B8
+  decision_relevant: true
+- id: Q2
+  question: How large is the hygiene multiplier's effect on R_t, and does the campaign run to the end of 2026 or
+    stop? A temporary campaign mainly delays rather than averts infections.
+  beliefs:
+  - B2
+  - B3
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Do the slowest epidemics (low s0) peak after 2026, so the in-year attack rate and averted infections
+    depend on seed size more than the final-size argument suggests?
+  beliefs:
+  - B7
+  - B8
+  decision_relevant: true
+- id: Q4
+  question: Is a mild hygiene campaign's community effect on transmission comparable to the household/school trial
+    effects on illness that anchor B2 (different outcome, setting and adherence)?
+  beliefs:
+  - B2
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B2
+  claim: Across the sweep, hygiene averts 3-35% of 2026 infections relative to none in at least 70% of usable points;
+    refuted if 30% or fewer fall in that band.
+  test:
+    kind: effect_band
+    package: hygiene
+    band:
+    - 0.03
+    - 0.35
+    min_share: 0.7
+- id: H2
+  belief: B3
+  claim: The relative reduction from hygiene increases with the hygiene effect parameter (Spearman 95% interval
+    above 0); refuted if it is below 0.
+  test:
+    kind: effect_direction
+    package: hygiene
+    feature: effect:hygiene
+    direction: increases
+- id: H3
+  belief: B4
+  claim: The relative reduction from hygiene decreases as susceptibility s0 rises (final-size saturation); refuted
+    if the rank correlation is significantly positive.
+  test:
+    kind: effect_direction
+    package: hygiene
+    feature: s0 (calibration scale)
+    direction: decreases
+    adjust_for:
+    - effect:hygiene
+- id: H4
+  belief: B5
+  claim: Where s0 is at least 0.85, hygiene averts 2-20% of infections in at least 70% of usable points; refuted
+    if 30% or fewer fall in that band.
+  test:
+    kind: effect_band
+    package: hygiene
+    band:
+    - 0.02
+    - 0.2
+    min_share: 0.7
+    where:
+      s0 (calibration scale):
+      - 0.85
+      - 0.9972519157454371
+- id: H5
+  belief: B6
+  claim: Town population has no association with the hygiene relative reduction (|rho| 95% bound inside 0.15); refuted
+    if the interval lies outside +/-0.15.
+  test:
+    kind: effect_direction
+    package: hygiene
+    feature: pop
+    direction: negligible
+    equivalence: 0.15
+- id: H6
+  belief: B7
+  claim: The hygiene relative reduction decreases with seed share (earlier epidemics, more completed before and
+    within the campaign window); refuted if significantly positive.
+  test:
+    kind: effect_direction
+    package: hygiene
+    feature: seed_share
+    direction: decreases
