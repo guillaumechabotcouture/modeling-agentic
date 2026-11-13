@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """The world model (docs/design/v2-progressive-steps.md §4, v0): the modeller's working understanding of how the
 decision works, as beliefs that papers, data and simulations confront. It is meant to be mostly right, not precise:
-its numbers are bands and rough locations, never decision numbers (those come from the analysis' claims).
+its numbers are bands and rough locations, never decision numbers (those come from the analysis' claims). The rule
+throughout: absence of evidence, weak evidence or too few usable points is `inconclusive`, never `supported`.
 
     python3 toolkit/analysis/world_model.py validate <seed.yaml>
     python3 toolkit/analysis/world_model.py build <run_dir> --seed <seed.yaml> [--out DIR]
+        [--engine-identity current|recorded] [--shadow-price LAMBDA]
     python3 toolkit/analysis/world_model.py --self-test
 
-A person or a bounded reasoning task (a later PR) writes the seed; this module validates it, summarises a run's
-engine sweep coarsely, checks each hypothesis mechanically and says where to look next. No LLM calls.
+NOT YET FOR USE IN A RUN: the simulation-derived beliefs this version writes are marginal associations, unscreened
+for multiple testing across package x feature x pair (`screened: false`). They must not seed or update a world model
+until the follow-up (multiplicity control, marginal labels, track-record identity, pre-registration) lands. Nothing
+is wired into the analysis or the stage machine. No LLM calls.
 
 Seed (YAML), and the beliefs of analysis/world_model.yaml:
 
     beliefs:
       - id: B1
         mechanism: "PBO restores net killing where pyrethroid resistance is high"
-        about: {package: net_pbo, feature: resistance}       # or {pair: [a, b]}: what the belief is about
-        direction: reduces | increases | decreases | none | flips | raises
+        about: {package: net_pbo, feature: resistance}       # or {pair: [a, b]}, or {component: c}
+        direction: reduces | raises | increases | decreases | negligible | flips | none
         magnitude: {band: [lo, hi], scale: relative_reduction}   # optional: a band, never a point value
         conditions: [{feature: resistance, range: [lo, hi]}]     # optional: where it holds or where it flips
         source_type: literature | data | simulation
@@ -24,22 +28,33 @@ Seed (YAML), and the beliefs of analysis/world_model.yaml:
           - {citation: "...", location: "Table 2"}       # simulation: artifact + point ids
         confidence: low | medium | high
         decision_relevant: true   # optional
-        conflicts: [{belief: B7, note: "..."}]   # conflicting evidence, side by side, never averaged
     hypotheses:                   # analysis/hypotheses.yaml: testable expectations with a refutation test
-      - id: H1
-        belief: B1
-        claim: "..."
-        test: {kind: effect_band, package: P, band: [lo, hi], where: {feature: [lo, hi]}}
-              # effect_direction {package, feature, direction: increases|decreases|none}
-              # paired_sign {a, b, feature, range, sign: positive|negative}  (sign of a's minus b's benefit per cost)
-              # flip_in {a, b, feature, range}                   (the a/b choice flips inside range)
-              # plan_share {component, where, min_share}         (share of matching units whose plan has it)
-        status: open | supported | refuted | untestable          (written by check())
+      - {id: H1, belief: B1, claim: "...", test: {kind: ..., ...}}
     open_questions: [{id, question, beliefs: [...], decision_relevant}]
-    track_record: {confirmed, contradicted, open, untestable, history: [{hypothesis, belief, status}]}
 
-Fail closed: a belief without evidence (or literature without its table or page), a hypothesis without a
-refutation test, an unknown test kind, a missing run artifact or result row. Names come from the spec.
+Tests (each declares its pass threshold; a test must concern its belief's package, pair, feature and conditions):
+    effect_band {package, band, min_share, where?}  share of usable points whose relative reduction is in the band:
+        supported at >= min_share, refuted at <= 1 - min_share; points with no baseline burden are excluded
+    effect_direction {package, feature, direction: increases|decreases|negligible, equivalence?, where?}
+        tie-aware Spearman rho with its 95% interval: increases / decreases when the interval excludes 0;
+        negligible only when it lies inside +/- equivalence (required for that claim); else inconclusive
+    paired_sign {a, b, feature, range, sign: positive|negative, min_share, where?}  net benefit of a minus b at the
+        budget's shadow price; supported when the claimed option wins at >= min_share of usable points, refuted
+        when the other one does; ties are indifferent, counted separately
+    flip_in {a, b, feature, range, where?}  the a/b transition along the feature, refitted on the `where` points:
+        supported when its whole located range lies inside `range`, refuted when disjoint, else inconclusive; a
+        one-sided, rare or non-monotone regime is inconclusive, never refuted
+    plan_share {component, where, min_share}  share of matching units whose point plan contains it; a matching unit
+        missing from the plan, or a unit missing a filter column, makes it untestable
+Statuses: open (not yet checked), supported, refuted, inconclusive, untestable.
+
+The comparison measure is net benefit per person at the budget's shadow price, dfac x (burden - outcome) - lambda x
+(cost - comparator cost): ranking by benefit per cost misranks options of different cost under a budget. lambda is
+`--shadow-price`, else the cost-effectiveness of the marginal funded package of the point plan (the least
+benefit / cost among units given a package, analysis/point.yaml), else none (paired tests untestable).
+
+Fail closed: a belief without evidence, a hypothesis without a refutation test or threshold, a non-finite value,
+a missing artifact, a result row not bound to its job (job_sha) and the expected engine identity.
 """
 from __future__ import annotations
 
@@ -58,17 +73,18 @@ PRODUCER = "toolkit/analysis/world_model.py"
 SCHEMA, HSCHEMA = "analysis.world_model/0", "analysis.hypotheses/0"
 SOURCE_TYPES = ("literature", "data", "simulation")
 CONFIDENCE = ("low", "medium", "high")
-DIRECTIONS = ("reduces", "increases", "decreases", "none", "flips", "raises")
-STATUSES = ("open", "supported", "refuted", "untestable")
-TESTS = {"effect_band": ("package", "band"), "effect_direction": ("package", "feature", "direction"),
-         "paired_sign": ("a", "b", "feature", "range", "sign"), "flip_in": ("a", "b", "feature", "range"),
+DIRECTIONS = ("reduces", "raises", "increases", "decreases", "negligible", "flips", "none")
+STATUSES = ("open", "supported", "refuted", "inconclusive", "untestable")
+TESTS = {"effect_band": ("package", "band", "min_share"), "effect_direction": ("package", "feature", "direction"),
+         "paired_sign": ("a", "b", "feature", "range", "sign", "min_share"), "flip_in": ("a", "b", "feature", "range"),
          "plan_share": ("component", "where", "min_share")}
-# The coarse summary's settings (recorded in the output): effect bands are the 10th-90th percentiles over the sweep;
-# a direction needs |Spearman rho| above max(0.1, 3/sqrt(n-1)); a flip needs both options preferred at >= 5% of points
-# and a one-feature logistic fit of the sign gaining >= 6.63 in deviance (chi-square 1 df, p 0.01); its range is where
-# the fitted share is 25-75%, at least span/sqrt(n) on each side (the sweep's resolution); at most 3 features per pair.
-SETTINGS = {"band_quantiles": [0.1, 0.9], "rho_min": 0.1, "rho_z": 3.0, "flip_min_share": 0.05,
-            "flip_deviance_min": 6.63, "flips_max": 3, "sign_share": 0.8, "min_points": 5, "digits": 3}
+# Settings (recorded in the output): bands are 10th-90th percentiles; a direction needs its 95% interval to exclude 0
+# and |rho| >= 0.1, on at least 10 usable points with 3 or more distinct feature values; a flip needs each option to
+# win at >= 5% of the non-tied points, no reversal of more than 0.25 in the winning share across 5 quantile bins,
+# and a one-feature logistic fit gaining >= 6.63 in deviance (chi-square 1 df, p 0.01). Its range is the fit's 25-75%
+# transition widened to the nearest sampled points on either side. At most 3 features are displayed per pair.
+SETTINGS = {"band_quantiles": [0.1, 0.9], "z": 1.96, "rho_min": 0.1, "min_points": 10, "flip_min_share": 0.05,
+            "flip_deviance_min": 6.63, "bins": 5, "reversal": 0.25, "flips_max": 3, "tie_rtol": 1e-9, "digits": 3}
 
 
 class WorldModelError(ValueError):
@@ -76,12 +92,12 @@ class WorldModelError(ValueError):
 
 
 class Sweep:
-    """Per-capita sweep tables at the design points: features {name: n values}, packages {name: [components]},
-    the comparator, its burden (primary outcome per person), y {package: outcome per person}, cost {package: $ per
-    person}, component groups, point ids and the artifacts they came from."""
+    """Per-person sweep tables at the design points: features {name: n values}, packages {name: [components]}, the
+    comparator, its burden (primary outcome per person), y {package: outcome per person}, cost {package: $ per
+    person}, the shadow price `lam` (outcome per $) and its source, and the artifacts they came from."""
 
     def __init__(self, features, packages, comparator, burden, y, cost, groups=None, points=None, kinds=None,
-                 artifacts=None):
+                 artifacts=None, lam=None, lam_source=None, dfac=1.0):
         self.features = {k: np.asarray(v, float) for k, v in features.items()}
         self.packages, self.comparator = {k: sorted(v) for k, v in packages.items()}, comparator
         self.burden = np.asarray(burden, float)
@@ -89,26 +105,46 @@ class Sweep:
         self.cost = {k: np.asarray(v, float) for k, v in cost.items()}
         self.groups, self.kinds, self.artifacts = groups or {}, kinds or {}, artifacts or {}
         self.points = list(points if points is not None else range(len(self.burden)))
+        self.lam, self.lam_source, self.dfac = lam, lam_source, float(dfac)
         for k in packages:
             if k not in self.y or k not in self.cost:
                 raise WorldModelError(f"sweep: package {k!r} has no outcome or cost")
+        bad = [n for n, v in [("burden", self.burden)] + [(f"feature {k}", v) for k, v in self.features.items()] +
+               [(f"outcome {k}", v) for k, v in self.y.items()] + [(f"cost {k}", v) for k, v in self.cost.items()]
+               if len(v) != len(self.points) or not np.all(np.isfinite(v))]
+        if bad or (lam is not None and not (isinstance(lam, (int, float)) and math.isfinite(lam) and lam >= 0)):
+            raise WorldModelError(f"sweep: non-finite or misaligned values in {bad[:4]} or shadow price {lam!r}")
 
     def reduction(self, p):
-        return 1 - self.y[p] / np.maximum(self.burden, 1e-12)
+        """Relative reduction against the comparator; undefined (nan) where the baseline burden is not positive."""
+        ok = self.burden > 0
+        return np.where(ok, 1 - self.y[p] / np.where(ok, self.burden, 1.0), np.nan)
 
-    def per_cost(self, p):
-        """Benefit per cost: burden x relative reduction / incremental cost, per person (nan where it costs nothing)."""
-        c = self.cost[p] - self.cost[self.comparator]
-        return np.where(c > 0, (self.burden - self.y[p]) / np.where(c > 0, c, 1.0), np.nan)
+    def net(self, p):
+        if self.lam is None:
+            raise WorldModelError("no shadow price: pass --shadow-price or give the run an analysis/point.yaml")
+        return self.dfac * (self.burden - self.y[p]) - self.lam * (self.cost[p] - self.cost[self.comparator])
+
+    def diff(self, a, b):
+        """(net benefit of a minus b, tie tolerance)."""
+        na, nb = self.net(a), self.net(b)
+        return na - nb, SETTINGS["tie_rtol"] * max(1.0, float(np.max(np.abs(np.concatenate([na, nb])))))
 
 
 def _r(x):
     return None if x is None or not math.isfinite(float(x)) else float(f"{float(x):.{SETTINGS['digits']}g}")
 
 
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _band_ok(b):
-    return (isinstance(b, (list, tuple)) and len(b) == 2 and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                                                                 for v in b) and b[0] <= b[1])
+    return isinstance(b, (list, tuple)) and len(b) == 2 and all(_num(v) for v in b) and b[0] <= b[1]
+
+
+def _disjoint(a, b):
+    return a[1] < b[0] or b[1] < a[0]
 
 
 # ---------------------------------------------------------------- seed validation
@@ -127,22 +163,43 @@ def _evidence_problem(st, ev):
     return None
 
 
+def _related(t, b):
+    """Why a test does not bear on its belief (None when it does): same package or pair, the belief's feature, and
+    no region disjoint from the belief's conditions. Only a related test may move the belief's confidence."""
+    ab, k = b.get("about") or {}, t["kind"]
+    if k.startswith("effect_") and t.get("package") != ab.get("package"):
+        return f"tests package {t.get('package')!r}, the belief is about {ab}"
+    if k == "effect_direction" and ab.get("feature") and t.get("feature") != ab["feature"]:
+        return f"tests feature {t.get('feature')!r}, the belief is about {ab['feature']!r}"
+    if k in ("paired_sign", "flip_in") and sorted([t.get("a"), t.get("b")]) != sorted(ab.get("pair") or []):
+        return f"tests the pair {[t.get('a'), t.get('b')]}, the belief is about {ab}"
+    named = {ab.get("package"), ab.get("component"), *(ab.get("pair") or [])}
+    if k == "plan_share" and t.get("component") not in named:
+        return f"tests component {t.get('component')!r}, the belief is about {ab}"
+    reg = dict(t.get("where") or {}, **({t["feature"]: t["range"]} if t.get("range") and t.get("feature") else {}))
+    for c in b.get("conditions") or []:
+        r = reg.get(c.get("feature"))
+        if _band_ok(r) and _band_ok(c.get("range")) and _disjoint(r, c["range"]):
+            return f"its region {c['feature']} {r} lies outside the belief's condition {c['range']}"
+    return None
+
+
 def validate_seed(seed) -> dict:
     if not isinstance(seed, dict):
         raise WorldModelError("world-model seed: a mapping {beliefs, hypotheses, open_questions}")
-    errs, ids, hids = [], set(), set()
+    errs, ids, hids, by = [], set(), set(), {}
     bs, hs = seed.get("beliefs"), seed.get("hypotheses") or []
     if not isinstance(bs, list) or not bs:
         errs.append("beliefs: a non-empty list")
     for k, b in enumerate(bs if isinstance(bs, list) else []):
-        w = f"beliefs[{k}]"
         if not isinstance(b, dict):
-            errs.append(f"{w}: a mapping")
+            errs.append(f"beliefs[{k}]: a mapping")
             continue
         bid = b.get("id")
         if not bid or bid in ids:
-            errs.append(f"{w}: a unique id")
+            errs.append(f"beliefs[{k}]: a unique id")
         ids.add(bid)
+        by[bid] = b
         w = f"belief {bid}"
         if not str(b.get("mechanism") or "").strip():
             errs.append(f"{w}: mechanism (what causes what)")
@@ -158,10 +215,10 @@ def validate_seed(seed) -> dict:
             errs.append(f"{w}: confidence one of {CONFIDENCE}")
         mg = b.get("magnitude")
         if mg is not None and not (isinstance(mg, dict) and _band_ok(mg.get("band"))):
-            errs.append(f"{w}: magnitude.band [lo, hi] (a band, not a point value)")
+            errs.append(f"{w}: magnitude.band [lo, hi] of finite numbers (a band, not a point value)")
         for c in b.get("conditions") or []:
             if not (isinstance(c, dict) and c.get("feature") and _band_ok(c.get("range"))):
-                errs.append(f"{w}: each condition {{feature, range: [lo, hi]}}")
+                errs.append(f"{w}: each condition {{feature, range: [lo, hi]}} of finite numbers")
     for b in bs if isinstance(bs, list) else []:
         for c in (b.get("conflicts") or []) if isinstance(b, dict) else []:
             if not isinstance(c, dict) or c.get("belief") not in ids:
@@ -187,40 +244,58 @@ def validate_seed(seed) -> dict:
             continue
         miss = [f for f in TESTS[t["kind"]] if t.get(f) in (None, "", [])]
         if miss:
-            errs.append(f"{w}: test {t['kind']} needs {miss}")
+            errs.append(f"{w}: test {t['kind']} needs {miss} (every test declares its pass threshold)")
+            continue
         for f in ("band", "range"):
             if f in t and not _band_ok(t[f]):
-                errs.append(f"{w}: test {f} [lo, hi]")
+                errs.append(f"{w}: test {f} [lo, hi] of finite numbers")
+        for f, v in (t.get("where") or {}).items() if isinstance(t.get("where"), dict) else []:
+            if isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v) \
+                    and not _band_ok(v):
+                errs.append(f"{w}: where.{f} [lo, hi] of finite numbers")
+        lo_share = 0.0 if t["kind"] == "plan_share" else 0.5
+        if "min_share" in TESTS[t["kind"]] and not (_num(t["min_share"]) and lo_share < t["min_share"] <= 1):
+            errs.append(f"{w}: min_share a number in ({lo_share}, 1]")
         if t["kind"] == "paired_sign" and t.get("sign") not in ("positive", "negative"):
             errs.append(f"{w}: sign positive or negative")
-        if t["kind"] == "effect_direction" and t.get("direction") not in ("increases", "decreases", "none"):
-            errs.append(f"{w}: direction increases, decreases or none")
+        if t["kind"] == "effect_direction":
+            if t.get("direction") not in ("increases", "decreases", "negligible"):
+                errs.append(f"{w}: direction increases, decreases or negligible")
+            elif t["direction"] == "negligible" and not (_num(t.get("equivalence")) and 0 < t["equivalence"] < 1):
+                errs.append(f"{w}: a negligible claim needs an explicit equivalence bound on |rho| in (0, 1)")
         if t["kind"] == "plan_share" and not isinstance(t.get("where"), dict):
             errs.append(f"{w}: where {{feature or column: [lo, hi] or [values]}}")
+        if h.get("belief") in by and not errs:
+            why = _related(t, by[h["belief"]])
+            if why:
+                errs.append(f"{w}: does not bear on belief {h['belief']}: {why}")
     if errs:
         raise WorldModelError("world-model seed refused: " + "; ".join(errs))
     return seed
 
 
 # ---------------------------------------------------------------- coarse summary of a sweep
-def _rho(x, y):
+def direction(x, y, equivalence=None):
+    """Tie-aware Spearman association of y with x: increases, decreases, negligible (only with an equivalence bound
+    the interval lies inside) or inconclusive (too few points, a constant or categorical input, or no clear sign)."""
+    from scipy.stats import rankdata
     m = np.isfinite(x) & np.isfinite(y)
-    if m.sum() < SETTINGS["min_points"]:
-        return float("nan"), int(m.sum())
-    rx, ry = np.argsort(np.argsort(x[m])), np.argsort(np.argsort(y[m]))
-    if rx.std() == 0 or ry.std() == 0:
-        return 0.0, int(m.sum())
-    return float(np.corrcoef(rx, ry)[0, 1]), int(m.sum())
-
-
-def _direction(x, y):
-    rho, n = _rho(x, y)
-    sig = math.isfinite(rho) and abs(rho) > max(SETTINGS["rho_min"], SETTINGS["rho_z"] / math.sqrt(max(n - 1, 1)))
-    return {"direction": ("increases" if rho > 0 else "decreases") if sig else "none", "rho": _r(rho)}
+    n = int(m.sum())
+    x, y = x[m], y[m]
+    if n < SETTINGS["min_points"] or len(np.unique(x)) < 3 or np.ptp(y) == 0:
+        return {"direction": "inconclusive", "n": n,
+                "why": f"{n} usable points" if n < SETTINGS["min_points"] else "constant or categorical: undefined"}
+    rho = float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
+    zr, se = math.atanh(max(min(rho, 1 - 1e-12), -1 + 1e-12)), 1 / math.sqrt(n - 3)
+    lo, hi = math.tanh(zr - SETTINGS["z"] * se), math.tanh(zr + SETTINGS["z"] * se)
+    rmin = SETTINGS["rho_min"]
+    d = "increases" if lo > 0 and rho >= rmin else "decreases" if hi < 0 and rho <= -rmin \
+        else "negligible" if equivalence is not None and -equivalence <= lo and hi <= equivalence else "inconclusive"
+    return {"direction": d, "rho": _r(rho), "ci": [_r(lo), _r(hi)], "n": n}
 
 
 def _logistic(x, s, lam=1e-2):
-    """One-feature logistic fit of a 0/1 sign (Newton, a small ridge on the slope so separation stays finite):
+    """One-feature logistic fit of a 0/1 outcome (Newton, a small ridge on the slope so separation stays finite):
     (deviance gain over a constant, midpoint, slope per feature unit)."""
     mu, sd = float(x.mean()), float(x.std()) or 1.0
     X = np.column_stack([np.ones_like(x), (x - mu) / sd])
@@ -237,33 +312,55 @@ def _logistic(x, s, lam=1e-2):
     p0 = float(s.mean())
     ll = np.sum(s * np.log(p) + (1 - s) * np.log(1 - p))
     ll0 = len(s) * (p0 * math.log(p0) + (1 - p0) * math.log(1 - p0))
-    b1 = w[1] / sd
-    return 2 * (ll - ll0), (mu - w[0] * sd / w[1]) if w[1] != 0 else float("nan"), b1
+    return 2 * (ll - ll0), (mu - w[0] * sd / w[1]) if w[1] != 0 else float("nan"), w[1] / sd
+
+
+def flip_along(sw, a, b, f, mask=None):
+    """Roughly where the choice between a and b flips along feature f, on the points in `mask` (a one-feature,
+    marginal fit). status: flip, or why there is none to report (insufficient, one_sided, undefined, non_monotone,
+    no_flip_detected); points: the ids used."""
+    d, tol = sw.diff(a, b)
+    m = np.ones(len(d), bool) if mask is None else mask
+    win, lose = m & (d > tol), m & (d < -tol)
+    keep = win | lose
+    x, s = sw.features[f][keep], win[keep].astype(float)
+    out = {"feature": f, "n": int(keep.sum()), "ties": int((m & ~keep).sum()), "points": [p for p, k in
+                                                                                        zip(sw.points, keep) if k]}
+    if keep.sum() < SETTINGS["min_points"]:
+        return dict(out, status="insufficient")
+    if min(s.mean(), 1 - s.mean()) < SETTINGS["flip_min_share"]:
+        return dict(out, status="one_sided", share_a=_r(s.mean()))
+    if len(np.unique(x)) < 3:
+        return dict(out, status="undefined")
+    edges = np.quantile(x, np.linspace(0, 1, SETTINGS["bins"] + 1))
+    idx = np.clip(np.searchsorted(edges, x, side="right") - 1, 0, SETTINGS["bins"] - 1)
+    sh = np.array([s[idx == k].mean() for k in range(SETTINGS["bins"]) if (idx == k).any()])
+    st = np.diff(sh)
+    if (st > SETTINGS["reversal"]).any() and (st < -SETTINGS["reversal"]).any():
+        return dict(out, status="non_monotone", bin_shares=[_r(v) for v in sh])
+    dev, t, b1 = _logistic(x, s)
+    lo, hi = float(x.min()), float(x.max())
+    if not (dev >= SETTINGS["flip_deviance_min"] and math.isfinite(t) and lo <= t <= hi):
+        return dict(out, status="no_flip_detected", deviance_gain=_r(dev))
+    h = math.log(3) / abs(b1)
+    below, above = x[x <= t], x[x >= t]
+    rlo = min(t - h, float(below.max()) if len(below) else lo)      # widened to the nearest sampled points
+    rhi = max(t + h, float(above.min()) if len(above) else hi)
+    return dict(out, status="flip", at=_r(t), range=[_r(max(lo, rlo)), _r(min(hi, rhi))],
+                first_preferred_below=bool(b1 < 0), deviance_gain=_r(dev))
 
 
 def flip(sw, a, b):
-    """Roughly where the choice between a and b flips: the sign of a's minus b's benefit per cost at each point, and
-    for each feature a one-feature fit of that sign (marginal: design features may be correlated)."""
-    d = sw.per_cost(a) - sw.per_cost(b)
-    m = np.isfinite(d)
-    s = (d[m] > 0).astype(float)
-    out = {"a": a, "b": b, "measure": "benefit_per_cost", "n": int(m.sum()),
-           "share_first_preferred": _r(s.mean()) if m.any() else None, "along": []}
-    if m.sum() < SETTINGS["min_points"] or min(s.mean(), 1 - s.mean()) < SETTINGS["flip_min_share"]:
-        return out
-    for f, x in sw.features.items():
-        x = x[m]
-        if x.std() == 0:
-            continue
-        dev, t, b1 = _logistic(x, s)
-        lo, hi = float(x.min()), float(x.max())
-        if not (dev >= SETTINGS["flip_deviance_min"] and math.isfinite(t) and lo <= t <= hi):
-            continue
-        h = max(math.log(3) / abs(b1), (hi - lo) / math.sqrt(len(x)))
-        out["along"].append({"feature": f, "at": _r(t), "range": [_r(max(lo, t - h)), _r(min(hi, t + h))],
-                             "first_preferred_below": bool(b1 < 0), "deviance_gain": _r(dev)})
-    out["along"] = sorted(out["along"], key=lambda r: (-r["deviance_gain"], r["feature"]))[:SETTINGS["flips_max"]]
-    return out
+    """The a/b comparison along every feature; `along` displays at most flips_max located flips."""
+    if sw.lam is None:
+        return {"a": a, "b": b, "status": "no_shadow_price", "along": []}
+    d, tol = sw.diff(a, b)
+    fl = [flip_along(sw, a, b, f) for f in sorted(sw.features)]
+    along = sorted([{k: v for k, v in x.items() if k != "points"} for x in fl if x["status"] == "flip"],
+                   key=lambda r: (-r["deviance_gain"], r["feature"]))
+    return {"a": a, "b": b, "measure": "net_benefit", "n": len(d), "share_a": _r(np.mean(d > tol)),
+            "share_b": _r(np.mean(d < -tol)), "share_tie": _r(np.mean(np.abs(d) <= tol)),
+            "along": along[:SETTINGS["flips_max"]], "located": len(along)}
 
 
 def default_pairs(sw):
@@ -275,36 +372,43 @@ def default_pairs(sw):
 
 
 def summarise(sw, pairs=None, packages=None):
-    """Direction of each package's relative effect along each feature, its rough size band, and roughly where each
+    """Each package's relative-effect band and its marginal direction along each feature, and roughly where each
     competing pair's choice flips."""
-    pairs = sorted(set(map(tuple, pairs or [])) | set(default_pairs(sw)))
-    pk = sorted({k for k, v in sw.packages.items() if len(v) == 1} | set(packages or []) |
-                {x for p in pairs for x in p} - {sw.comparator})
+    pairs = sorted({tuple(sorted(p)) for p in (pairs or [])} | set(default_pairs(sw)))
+    pk = sorted(({k for k, v in sw.packages.items() if len(v) == 1} | set(packages or []) |
+                 {x for p in pairs for x in p}) - {sw.comparator})
     qlo, qhi = SETTINGS["band_quantiles"]
     eff = {}
     for p in pk:
         r = sw.reduction(p)
-        eff[p] = {"median": _r(np.median(r)), "band": [_r(np.quantile(r, qlo)), _r(np.quantile(r, qhi))],
-                  "direction": {f: _direction(x, r) for f, x in sorted(sw.features.items())}}
+        u = r[np.isfinite(r)]
+        eff[p] = {"n": int(len(u)), "excluded_no_baseline": int(len(r) - len(u)),
+                  "median": _r(np.median(u)) if len(u) else None,
+                  "band": [_r(np.quantile(u, qlo)), _r(np.quantile(u, qhi))] if len(u) else None,
+                  "direction": {f: direction(x, r) for f, x in sorted(sw.features.items())}}
     return {"comparator": sw.comparator, "n_points": len(sw.points), "settings": dict(SETTINGS),
+            "shadow_price": {"value": sw.lam, "source": sw.lam_source}, "screened": False,
             "effects": eff, "flips": {f"{a}~{b}": flip(sw, a, b) for a, b in pairs},
             "domain": {f: [_r(x.min()), _r(x.max())] for f, x in sorted(sw.features.items())}}
 
 
 # ---------------------------------------------------------------- check(): mechanical refutation tests
-def _region(sw, where):
+def _region(sw, *wheres):
+    """Points inside every numeric [lo, hi] of every mapping given (ranges on one feature intersect)."""
     m = np.ones(len(sw.points), bool)
-    for f, (lo, hi) in (where or {}).items():
-        if f not in sw.features:
-            raise WorldModelError(f"test region: unknown feature {f!r} (sweep features: {sorted(sw.features)})")
-        m &= (sw.features[f] >= lo) & (sw.features[f] <= hi)
+    for wh in wheres:
+        for f, v in (wh or {}).items():
+            if f not in sw.features:
+                raise WorldModelError(f"test region: unknown feature {f!r} (sweep features: {sorted(sw.features)})")
+            m &= (sw.features[f] >= v[0]) & (sw.features[f] <= v[1])
     return m
 
 
 def _match(row, where):
+    """True or False; None when the row lacks a filter column (the test is then untestable)."""
     for f, v in where.items():
         x = row.get(f)
-        if x is None:
+        if x is None or (isinstance(x, float) and not math.isfinite(x)):
             return None
         if _band_ok(v) and not isinstance(x, str):
             if not (v[0] <= float(x) <= v[1]):
@@ -314,56 +418,73 @@ def _match(row, where):
     return True
 
 
+def _ids(sw, m):
+    return [p for p, k in zip(sw.points, m) if k]
+
+
 def _test(t, ctx):
-    """(status, observed, artifact, point ids) for one refutation test."""
-    sw, summ, k = ctx["sweep"], ctx["summary"], t["kind"]
+    """(status, observed, artifact, ids of the points or units used) for one refutation test."""
+    sw, k = ctx["sweep"], t["kind"]
     art = sw.artifacts.get("results", "analysis/batch/results.jsonl")
     for p in [t.get(x) for x in ("package", "a", "b") if t.get(x)]:
         if p not in sw.packages:
             raise WorldModelError(f"test {k}: unknown package {p!r}")
     if k == "plan_share":
-        plan, units = ctx.get("plan"), ctx.get("units")
+        plan, units = ctx.get("plan"), ctx.get("units") or {}
         if not plan:
             return "untestable", {"reason": "no optimised plan (analysis/point.yaml)"}, None, []
-        hit = [u for u, row in sorted(units.items()) if _match(row, t["where"]) and u in plan]
-        if not hit:
-            return "untestable", {"reason": f"no unit matches {t['where']}"}, "analysis/point.yaml", []
+        got = {u: _match(row, t["where"]) for u, row in sorted(units.items())}
+        nocol, hit = [u for u, v in got.items() if v is None], [u for u, v in got.items() if v]
+        absent = [u for u in hit if u not in plan]
+        if nocol or absent or not hit:
+            return "untestable", {"reason": f"{len(nocol)} units lack a filter column, {len(absent)} matching units "
+                                            f"are missing from the plan, {len(hit)} match"}, "analysis/point.yaml", []
         c = t["component"]
         share = sum(c in sw.packages.get(plan[u], []) or plan[u] == c for u in hit) / len(hit)
-        st = "supported" if share >= float(t["min_share"]) else "refuted"
-        return st, {"share": _r(share), "units": len(hit)}, "analysis/point.yaml", []
-    m = _region(sw, t.get("where") or ({t["feature"]: t["range"]} if k in ("paired_sign", "flip_in") else {}))
-    ids = [p for p, x in zip(sw.points, m) if x]
-    if m.sum() < SETTINGS["min_points"]:
-        return "untestable", {"reason": f"{int(m.sum())} sweep points in the region"}, art, ids
-    if k == "effect_band":
-        med = float(np.median(sw.reduction(t["package"])[m]))
-        return ("supported" if t["band"][0] <= med <= t["band"][1] else "refuted"), {"median": _r(med)}, art, ids
-    if k == "effect_direction":
-        r = _direction(sw.features[t["feature"]][m], sw.reduction(t["package"])[m])
-        if r["direction"] == t["direction"]:
-            return "supported", r, art, ids
-        return ("open" if r["direction"] == "none" else "refuted"), r, art, ids
-    d = (sw.per_cost(t["a"]) - sw.per_cost(t["b"]))[m]
-    d = d[np.isfinite(d)]
-    share = float((d > 0).mean()) if len(d) else float("nan")
+        cut = float(t["min_share"])
+        st = "supported" if share >= cut else "refuted" if share <= 1 - cut else "inconclusive"
+        return st, {"share": _r(share), "units": len(hit)}, "analysis/point.yaml", hit
+    if k in ("paired_sign", "flip_in") and sw.lam is None:
+        return "untestable", {"reason": "no shadow price for the net-benefit comparison"}, art, []
+    if k == "flip_in":
+        fa = flip_along(sw, t["a"], t["b"], t["feature"], _region(sw, t.get("where")))
+        obs = {x: fa.get(x) for x in ("status", "range", "at", "n", "ties", "bin_shares", "share_a") if x in fa}
+        if fa["status"] != "flip":
+            return "inconclusive", obs, art, fa["points"]
+        r, c = fa["range"], t["range"]
+        st = "supported" if c[0] <= r[0] and r[1] <= c[1] else "refuted" if _disjoint(r, c) else "inconclusive"
+        return st, obs, art, fa["points"]
+    m = _region(sw, t.get("where"), {t["feature"]: t["range"]} if k == "paired_sign" else None)
     if k == "paired_sign":
-        want = share if t["sign"] == "positive" else 1 - share
-        cut = SETTINGS["sign_share"]
-        st = "supported" if want >= cut else "refuted" if want <= 1 - cut else "open"
-        return st, {"share_first_preferred": _r(share)}, art, ids
-    fl = summ["flips"].get(f"{t['a']}~{t['b']}") or flip(sw, t["a"], t["b"])
-    al = next((x for x in fl["along"] if x["feature"] == t["feature"]), None)
-    if al is not None:
-        inside = al["range"][0] <= t["range"][1] and al["range"][1] >= t["range"][0]
-        return ("supported" if inside else "refuted"), {"flip_range": al["range"]}, art, ids
-    one_sided = max(share, 1 - share) >= SETTINGS["sign_share"]
-    return ("refuted" if one_sided else "open"), {"share_first_preferred": _r(share), "flip": None}, art, ids
+        d, tol = sw.diff(t["a"], t["b"])
+        d = d[m]
+        n = len(d)
+        if n < SETTINGS["min_points"]:
+            return "inconclusive", {"reason": f"{n} usable points", "n": n}, art, _ids(sw, m)
+        sa, sb = float(np.mean(d > tol)), float(np.mean(d < -tol))
+        mine, other = (sa, sb) if t["sign"] == "positive" else (sb, sa)
+        cut = float(t["min_share"])
+        st = "supported" if mine >= cut else "refuted" if other >= cut else "inconclusive"
+        return st, {"share_a": _r(sa), "share_b": _r(sb), "share_tie": _r(1 - sa - sb), "n": n}, art, _ids(sw, m)
+    r = sw.reduction(t["package"])
+    use = m & np.isfinite(r)
+    obs = {"n": int(use.sum()), "excluded_no_baseline": int((m & ~np.isfinite(r)).sum())}
+    if k == "effect_band":
+        if use.sum() < SETTINGS["min_points"]:
+            return "inconclusive", obs, art, _ids(sw, use)
+        cov = float(np.mean((r[use] >= t["band"][0]) & (r[use] <= t["band"][1])))
+        cut = float(t["min_share"])
+        st = "supported" if cov >= cut else "refuted" if cov <= 1 - cut else "inconclusive"
+        return st, dict(obs, coverage=_r(cov), median=_r(np.median(r[use]))), art, _ids(sw, use)
+    res = direction(sw.features[t["feature"]][use], r[use], t.get("equivalence"))
+    got, want = res["direction"], t["direction"]
+    st = "supported" if got == want else "inconclusive" if got == "inconclusive" else "refuted"
+    return st, dict(obs, **res), art, _ids(sw, use)
 
 
 def check(hyps, ctx):
     """Evaluate each hypothesis' refutation test against the run's artifacts; returns the hypotheses with status and
-    result (observed value, artifact, point ids)."""
+    result (observed value, artifact, ids of the points or units used)."""
     out = []
     for h in hyps:
         st, obs, art, ids = _test(h["test"], ctx)
@@ -377,10 +498,12 @@ def _sim_beliefs(sw, summ):
     ev = [{"artifact": sw.artifacts.get("results", "analysis/batch/results.jsonl"), "points": list(sw.points)}]
     out = []
     for p, e in summ["effects"].items():
-        along = {f: v["direction"] for f, v in e["direction"].items() if v["direction"] != "none"}
-        out.append({"id": f"sim.effect.{p}", "about": {"package": p},
-                    "mechanism": f"{p} changes the primary outcome against {sw.comparator}; relative reduction "
-                                 f"{e['band'][0]} to {e['band'][1]} across the sweep" +
+        if e["band"] is None:
+            continue
+        along = {f: v["direction"] for f, v in e["direction"].items() if v["direction"] in ("increases", "decreases")}
+        out.append({"id": f"sim.effect.{p}", "about": {"package": p}, "screened": False,
+                    "mechanism": f"marginal association in the sweep: {p} against {sw.comparator}, relative reduction "
+                                 f"{e['band'][0]} to {e['band'][1]}" +
                                  (f", {', '.join(f'{v} with {f}' for f, v in along.items())}" if along else ""),
                     "direction": "reduces" if (e["median"] or 0) >= 0 else "raises", "along": along,
                     "magnitude": {"band": e["band"], "scale": "relative_reduction"}, "source_type": "simulation",
@@ -389,7 +512,8 @@ def _sim_beliefs(sw, summ):
         if fl["along"]:
             top = fl["along"][0]
             out.append({"id": f"sim.flip.{key}", "about": {"pair": [fl["a"], fl["b"]]}, "direction": "flips",
-                        "mechanism": f"{fl['a']} is preferred over {fl['b']} on benefit per cost "
+                        "screened": False,
+                        "mechanism": f"marginal association in the sweep: {fl['a']} has the higher net benefit "
                                      f"{'below' if top['first_preferred_below'] else 'above'} roughly "
                                      f"{top['feature']} {top['range'][0]} to {top['range'][1]}",
                         "conditions": [{"feature": x["feature"], "range": x["range"]} for x in fl["along"]],
@@ -398,32 +522,34 @@ def _sim_beliefs(sw, summ):
     return out
 
 
-def _disjoint(a, b):
-    return a[1] < b[0] or b[1] < a[0]
-
-
-def _conflicts(beliefs):
-    """Seed beliefs against simulation beliefs on the same package or pair: disjoint bands, opposite directions, or
-    disjoint flip ranges along one feature are recorded on both, side by side."""
-    key_of = lambda ab: json.dumps({"package": ab["package"]} if "package" in ab else  # noqa: E731
-                                   {"pair": sorted(ab.get("pair") or [])}, sort_keys=True)
-    sims = {key_of(b["about"]): b for b in beliefs if b["id"].startswith("sim.")}
+def _conflicts(beliefs, sw):
+    """Seed beliefs against the simulation on the same estimand: a relative-reduction band against the sweep's band
+    over the belief's own conditions, a direction against the sweep's only for an unconditional belief, a flip
+    location against the located range on the same feature. Recorded on both, side by side."""
+    key = lambda ab: json.dumps({"package": ab["package"]} if "package" in ab else  # noqa: E731
+                                {"pair": sorted(ab.get("pair") or [])}, sort_keys=True)
+    sims = {key(b["about"]): b for b in beliefs if b["id"].startswith("sim.")}
     for b in [x for x in beliefs if not x["id"].startswith("sim.")]:
-        ab = b["about"]
-        s = sims.get(key_of(ab))
+        ab, s = b["about"], sims.get(key(b["about"]))
         if s is None:
             continue
-        why = []
-        bb, sb = (b.get("magnitude") or {}).get("band"), (s.get("magnitude") or {}).get("band")
-        if bb and sb and _disjoint(bb, sb):
-            why.append(f"magnitude band {bb} against simulated {sb}")
+        why, conds = [], {c["feature"]: c["range"] for c in b.get("conditions") or []}
+        mg = b.get("magnitude") or {}
+        if mg.get("band") and mg.get("scale") == "relative_reduction" and "package" in ab \
+                and set(conds) <= set(sw.features):
+            r = sw.reduction(ab["package"])[_region(sw, conds)]
+            r = r[np.isfinite(r)]
+            if len(r) >= SETTINGS["min_points"]:
+                sb = [_r(np.quantile(r, q)) for q in SETTINGS["band_quantiles"]]
+                if _disjoint(mg["band"], sb):
+                    why.append(f"magnitude band {mg['band']} against simulated {sb} over {conds or 'the sweep'}")
         sd = (s.get("along") or {}).get(ab.get("feature"))
-        if b["direction"] in ("increases", "decreases") and sd and sd != b["direction"]:
+        if not conds and b["direction"] in ("increases", "decreases") and sd and sd != b["direction"]:
             why.append(f"{b['direction']} with {ab['feature']} against simulated {sd}")
         sc = {c["feature"]: c["range"] for c in s.get("conditions") or []}
-        for c in b.get("conditions") or []:
-            if c["feature"] in sc and _disjoint(c["range"], sc[c["feature"]]):
-                why.append(f"{c['feature']} range {c['range']} against simulated {sc[c['feature']]}")
+        if b["direction"] == "flips":
+            why += [f"{f} range {r} against simulated {sc[f]}" for f, r in conds.items()
+                    if f in sc and _disjoint(r, sc[f])]
         for x, y in ((b, s), (s, b)):
             if why:
                 x.setdefault("conflicts", []).append({"belief": y["id"], "note": "; ".join(why) +
@@ -437,12 +563,15 @@ def build(seed, sw, plan=None, units=None, inputs=None):
     seed = copy.deepcopy(validate_seed(seed))
     hyps = seed.get("hypotheses") or []
     pairs = [(h["test"]["a"], h["test"]["b"]) for h in hyps if h["test"]["kind"] in ("paired_sign", "flip_in")]
-    summ = summarise(sw, pairs, [h["test"]["package"] for h in hyps if h["test"].get("package")])
+    pk = [h["test"]["package"] for h in hyps if h["test"].get("package")] + \
+        [b["about"]["package"] for b in seed["beliefs"] if b["about"].get("package") in sw.packages]
+    summ = summarise(sw, pairs, pk)
     beliefs = seed["beliefs"] + _sim_beliefs(sw, summ)
-    _conflicts(beliefs)
-    checked = check(hyps, {"sweep": sw, "summary": summ, "plan": plan, "units": units or {}})
-    tr = copy.deepcopy(seed.get("track_record") or {"confirmed": 0, "contradicted": 0, "open": 0, "untestable": 0,
-                                                    "history": []})
+    _conflicts(beliefs, sw)
+    checked = check(hyps, {"sweep": sw, "plan": plan, "units": units or {}})
+    tr = copy.deepcopy(seed.get("track_record") or {"history": []})
+    for s_ in STATUSES:
+        tr.setdefault({"supported": "confirmed", "refuted": "contradicted"}.get(s_, s_), 0)
     by = {b["id"]: b for b in beliefs}
     qs = list(seed.get("open_questions") or [])
     for h in checked:
@@ -467,10 +596,12 @@ def build(seed, sw, plan=None, units=None, inputs=None):
     n = tr["confirmed"] + tr["contradicted"]
     tr["share_confirmed"] = _r(tr["confirmed"] / n) if n else None
     wm = {"schema": SCHEMA, "producer": PRODUCER, "produced_by": "harness", "inputs": inputs or sw.artifacts,
-          "structure": {"comparator": sw.comparator, "terms": "benefit per person = baseline burden x relative "
-                        "reduction of a package against the comparator; benefit per cost = burden x reduction / "
-                        "incremental cost per person", "packages": sorted(sw.packages)},
-          "note": "a working understanding, meant to be mostly right; its bands are never decision numbers",
+          "structure": {"comparator": sw.comparator, "packages": sorted(sw.packages),
+                        "terms": "net benefit per person = discount x baseline burden x relative reduction - shadow "
+                                 "price x incremental cost per person"},
+          "note": "a working understanding, meant to be mostly right; its bands are never decision numbers. "
+                  "Simulation beliefs are marginal associations unscreened for multiple testing (screened: false): "
+                  "not for seeding or updating a world model yet",
           "beliefs": beliefs, "open_questions": qs, "track_record": tr, "simulation_summary": summ}
     wm["where_to_look"] = where_to_look(wm)
     return wm, {"schema": HSCHEMA, "producer": PRODUCER, "produced_by": "harness", "hypotheses": checked}
@@ -480,10 +611,10 @@ WEAK = {"low": 1.0, "medium": 0.5, "high": 0.2}
 
 
 def where_to_look(wm, top=10):
-    """Beliefs that matter to the decision and are weakly held, conflicting or contradicted, each with the
-    simulation region or evidence that would most change it, and why."""
+    """Every contradicted decision-relevant belief, then the decision-relevant beliefs that are weakly held or in
+    conflict, each with the simulation region or evidence that would most change it, and why."""
     flips = {tuple(sorted((f["a"], f["b"]))): f for f in wm["simulation_summary"]["flips"].values()}
-    out = []
+    must, out = [], []
     for b in wm["beliefs"]:
         rel = bool(b.get("decision_relevant")) or "pair" in b["about"]
         weak = WEAK[b["confidence"]] + (1.0 if b.get("conflicts") else 0) + (1.0 if b.get("contradicted_by") else 0)
@@ -492,28 +623,90 @@ def where_to_look(wm, top=10):
         fl = flips.get(tuple(sorted(pair))) if pair else None
         region = {x["feature"]: x["range"] for x in (fl or {}).get("along", [])[:1]} or \
             {c["feature"]: c["range"] for c in b.get("conditions") or []}
+        if b.get("contradicted_by") and rel:
+            must.append({"belief": b["id"], "score": score, "kind": "contradiction", "region": region or None,
+                         "reason": f"{b['mechanism']}: contradicted by {b['contradicted_by']}; find the cause (a "
+                                   "missing mechanism, or a wrong source or simulation) before relying on it"})
         if region:
             out.append({"belief": b["id"], "score": score, "kind": "simulation", "region": region,
                         "reason": f"{b['mechanism']}: located only roughly; sweep points across {region} decide on "
-                                  "which side units fall" + (" and test the contradiction" if b.get("contradicted_by")
-                                                             else "")})
+                                  "which side units fall"})
         if b.get("conflicts") or (b["source_type"] != "simulation" and b["confidence"] == "low"):
             what = "; ".join(c["note"] for c in b.get("conflicts") or []) or f"{b['source_type']} evidence is weak"
             out.append({"belief": b["id"], "score": score, "kind": "evidence",
                         "reason": f"{b['mechanism']}: {what}; look for a trial, survey or engine benchmark on "
                                   f"{b['about']} that would settle it"})
-    return sorted(out, key=lambda r: (-(r["score"] or 0), r["belief"], r["kind"]))[:top]
+    order = lambda r: (-(r["score"] or 0), r["belief"], r["kind"])  # noqa: E731
+    return sorted(must, key=order) + sorted(out, key=order)[:top]
 
 
 # ---------------------------------------------------------------- reading a run (offline)
-def load_sweep(run_dir):
-    """The per-capita sweep tables of a run's engine batch, from analysis/batch/design.json, results.jsonl and the
-    signed spec (packages, populations, cost items). Fails closed on a missing file, a missing result row, a package
-    list that differs from the spec's, or rows from more than one engine identity."""
+def bind_rows(rows, jobs, ident):
+    """{job id: result} for compute rows bound to their jobs: each row's provenance must carry its job's input hash
+    (batch.job_sha) and the expected engine identity. Any other row fails closed (batch.verify_rows' checks, with the
+    identity given, so an offline retro-check can bind to the run's recorded identity)."""
+    from toolkit.analysis import batch as B
+    want = {j["id"]: B.job_sha(j) for j in jobs}
+    res, bad = {}, []
+    for r in rows:
+        jid, body = r.get("id"), r.get("result")
+        pv = body.get("provenance") if isinstance(body, dict) else None
+        if not isinstance(pv, dict):
+            bad.append(f"{jid}: no provenance")
+        elif pv.get("job_sha") != want.get(jid):
+            bad.append(f"{jid}: inputs differ from the design's job")
+        elif pv.get("engine") != ident:
+            bad.append(f"{jid}: computed by another engine identity or code")
+        else:
+            res[jid] = body["result"]
+    miss = sorted(set(want) - set(res) - {b.split(":")[0] for b in bad})
+    if bad or miss:
+        raise WorldModelError(f"result rows not bound to the design's jobs: {len(bad)} refused (e.g. {bad[:3]}), "
+                              f"{len(miss)} missing (e.g. {miss[:3]})")
+    return res
+
+
+def _jobs(spec, design):
+    """The jobs of a stored design (its own points, parameters and seeds), as batch.design() builds them."""
+    from toolkit.analysis import batch as B
+    by_id, pk, attr = {str(u[spec.uid]): u for u in spec.units()}, spec.packages(), spec["calibration"].get("attribute")
+    jobs = []
+    for p in design["points"]:
+        u = by_id.get(str(p["unit_id"]))
+        if u is None:
+            raise WorldModelError(f"design point {p['point']}: unit {p['unit_id']} is not in the spec's units")
+        a = spec.unit_attributes(u)
+        if attr:
+            a[attr] = B.calibrated_value(spec, p["z"])
+        jobs += [dict({"point": p["point"], "package": n, "components": spec.engine_package(cs), "unit": a,
+                       "params": p["theta"], "seed": p["seed"], "engine": spec["engine"], "horizon": design["horizon"],
+                       "windows": B.windows(spec)}, id=f"{p['point']}|{n}") for n, cs in pk.items()]
+    return jobs
+
+
+def shadow_price(run_dir):
+    """(lambda, source): the cost-effectiveness of the marginal funded package of the point plan, or (None, why)."""
+    from toolkit.analysis.artifacts import read
+    if not os.path.isfile(os.path.join(run_dir, "analysis", "point.yaml")):
+        return None, "no analysis/point.yaml"
+    pu = (read(run_dir, "analysis/point.yaml")["data"].get("per_unit") or {}).values()
+    r = [float(v["benefit"]) / float(v["cost"]) for v in pu if _num(v.get("cost")) and v["cost"] > 0
+         and _num(v.get("benefit"))]
+    return (min(r), "analysis/point.yaml: least benefit / cost among units given a package (the marginal funded "
+                    "package)") if r else (None, "point.yaml has no funded unit")
+
+
+def load_sweep(run_dir, identity="current", lam=None):
+    """The per-person sweep tables of a run's engine batch (analysis/batch/design.json and results.jsonl, rows bound
+    to the stored design's jobs) and the signed spec (packages, populations, cost items). `identity`: the engine
+    identity the rows must carry: `current` (the spec's engine as now) or `recorded` (analysis/point.yaml's
+    engine_identity, for an offline retro-check of an older engine; recorded in the output)."""
     from toolkit.alloc import costs as acosts
     from toolkit.analysis import features as FT
-    from toolkit.analysis.artifacts import sha256
+    from toolkit.analysis.artifacts import read, sha256
+    from toolkit.analysis.core import discount_factor
     from toolkit.analysis.model import _driver, _group
+    from toolkit.engines.contract import engine_identity
     from toolkit.spec import schema
     need = {"spec": "decision_spec.yaml", "design": "analysis/batch/design.json",
             "results": "analysis/batch/results.jsonl"}
@@ -523,41 +716,42 @@ def load_sweep(run_dir):
     spec = schema.load(os.path.join(run_dir, need["spec"]))
     design = json.load(open(os.path.join(run_dir, need["design"])))
     names, pk = design.get("packages"), spec.packages()
-    if names != list(pk):
-        raise WorldModelError(f"design packages {names} differ from the spec's {list(pk)}")
-    rows, idents = {}, set()
+    if names != list(pk) or not design.get("points"):
+        raise WorldModelError(f"design packages {names} differ from the spec's {list(pk)}, or no design points")
+    if identity == "recorded":
+        try:
+            ident = read(run_dir, "analysis/point.yaml")["data"]["engine_identity"]
+        except (OSError, KeyError, TypeError) as e:
+            raise WorldModelError(f"--engine-identity recorded needs analysis/point.yaml engine_identity ({e})")
+    elif identity == "current":
+        ident = engine_identity(spec.engine())
+    else:
+        raise WorldModelError(f"engine identity {identity!r}: current or recorded")
+    jobs = _jobs(spec, design)
+    rows = []
     with open(os.path.join(run_dir, need["results"])) as f:
         for line in f:
             r = json.loads(line) if line.strip() else {}
-            if r.get("ok") and isinstance(r.get("i"), int):
-                rows[r["i"]] = r["result"]["result"]
-                idents.add(json.dumps((r["result"].get("provenance") or {}).get("engine"), sort_keys=True))
-    P, pts = len(names), design["points"]
-    gaps = [f"{p['point']}|{k}" for n, p in enumerate(pts) for j, k in enumerate(names) if n * P + j not in rows]
-    if gaps or not pts:
-        raise WorldModelError(f"{len(gaps)} engine results missing (e.g. {gaps[:3]}) or no design points")
-    if len(idents) != 1:
-        raise WorldModelError(f"result rows come from {len(idents)} engine identities: one sweep needs one engine")
-    by_id = {str(u[spec.uid]): u for u in spec.units()}
+            if r.get("ok") and isinstance(r.get("i"), int) and r["i"] < len(jobs):
+                rows.append(dict(r, id=jobs[r["i"]]["id"]))
+    res = bind_rows(rows, jobs, ident)
     pops, o = spec["decision_units"]["populations"], spec.outcomes()[0]
     co = (spec["analysis"].get("cost_outputs") or {})
     alloc, attr = spec.alloc_spec(), spec["calibration"].get("attribute")
+    by_id = {str(u[spec.uid]): u for u in spec.units()}
     feats = [FT.name(x) for x in FT.declared(spec.raw)]
     pnames = list(design.get("fitted_names") or []) + list(design.get("prior_names") or []) + \
         list(design.get("spec_value_names") or [])
     F = {n_: [] for n_ in ([f"{attr} (calibration scale)"] if attr else []) + feats + pnames}
-    y, cost = {k: [] for k in names}, {k: [] for k in names}
-    burden = []
-    for n, p in enumerate(pts):
-        u = by_id.get(str(p["unit_id"]))
-        if u is None:
-            raise WorldModelError(f"design point {p['point']}: unit {p['unit_id']} is not in the spec's units")
+    y, cost, burden = {k: [] for k in names}, {k: [] for k in names}, []
+    for p in design["points"]:
+        u = by_id[str(p["unit_id"])]
         tot = sum(float(u[pm["column"]]) for pm in pops.values())
-        res = {k: rows[n * P + j] for j, k in enumerate(names)}
+        rk = {k: res[f"{p['point']}|{k}"] for k in names}
         for k in names:
-            y[k].append(sum(_group(res[k], o, pm) * float(u[pm["column"]]) for pm in pops.values()) / tot)
+            y[k].append(sum(_group(rk[k], o, pm) * float(u[pm["column"]]) for pm in pops.values()) / tot)
         cm = acosts.cost_matrix(alloc, [u], outcome=lambda _u, k: {
-            nm: _driver(res[k], m["cost_driver"], f"design point {p['point']}, {k}") * tot for nm, m in co.items()})
+            nm: _driver(rk[k], m["cost_driver"], f"design point {p['point']}, {k}") * tot for nm, m in co.items()})
         for k in names:
             cost[k].append(cm[str(u[spec.uid])][k]["total"] / tot)
         burden.append(y[spec.comparator][-1])
@@ -567,14 +761,17 @@ def load_sweep(run_dir):
     groups = {c: (d or {}).get("group") for c, d in spec["options"]["components"].items() if (d or {}).get("group")}
     kinds = {n_: "parameter" if n_ in pnames else "unit" for n_ in F}
     arts = {rel: sha256(os.path.join(run_dir, rel)) for rel in need.values()}
-    sw = Sweep(F, pk, spec.comparator, burden, y, cost, groups, [p["point"] for p in pts], kinds,
-               dict(arts, results=need["results"]))
+    lam_v, lam_s = (float(lam), "--shadow-price") if lam is not None else shadow_price(run_dir)
+    arts.update(results=need["results"], engine_identity_mode=identity)
+    sw = Sweep(F, pk, spec.comparator, burden, y, cost, groups, [p["point"] for p in design["points"]], kinds,
+               arts, lam_v, lam_s, discount_factor(spec))
     return sw, spec
 
 
 def load_plan(run_dir, spec, sw):
     """(plan, units) from analysis/point.yaml and the spec's units (columns, features, calibrated value), or
-    (None, None) when the run has no optimised plan."""
+    (None, None) when the run has no optimised plan. A plan missing units is kept as it is: a plan_share test over
+    a missing unit is untestable."""
     from toolkit.analysis import features as FT
     from toolkit.analysis.artifacts import read
     if not os.path.isfile(os.path.join(run_dir, "analysis", "point.yaml")):
@@ -609,6 +806,8 @@ def _cli(argv):
     b.add_argument("run_dir")
     b.add_argument("--seed", required=True)
     b.add_argument("--out")
+    b.add_argument("--engine-identity", default="current", choices=("current", "recorded"))
+    b.add_argument("--shadow-price", type=float)
     a = ap.parse_args(argv)
     seed = yaml.safe_load(open(a.seed))
     if a.cmd == "validate":
@@ -616,7 +815,7 @@ def _cli(argv):
         print(f"OK: {len(seed['beliefs'])} beliefs, {len(seed.get('hypotheses') or [])} hypotheses")
         return 0
     from toolkit.analysis.artifacts import _safe_io, sha256
-    sw, spec = load_sweep(a.run_dir)
+    sw, spec = load_sweep(a.run_dir, a.engine_identity, a.shadow_price)
     plan, units = load_plan(a.run_dir, spec, sw)
     inputs = dict({k: v for k, v in sw.artifacts.items() if k != "results"}, seed=sha256(a.seed))
     if plan is not None:
@@ -640,12 +839,10 @@ def _sw(feats, rA, rB, cA=None, cB=None, burden=None, lam=0.1):
     n = len(rA)
     one = np.ones(n)
     bu = one if burden is None else np.asarray(burden, float)
-    sw = Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
-               {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
-               {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
-               groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"})
-    sw.lam = lam        # tests-first shim: the current Sweep has no shadow price (ζ passes it to the constructor)
-    return sw
+    return Sweep(feats, {"none": [], "A": ["a"], "B": ["b"]}, "none", bu,
+                 {"none": bu, "A": bu * (1 - np.asarray(rA)), "B": bu * (1 - np.asarray(rB))},
+                 {"none": 0 * one, "A": one if cA is None else cA * one, "B": one if cB is None else cB * one},
+                 groups={"a": "g", "b": "g"}, points=list(range(n)), artifacts={"results": "synthetic"}, lam=lam)
 
 
 def _planted(seed=3, n=200):
@@ -684,13 +881,12 @@ def _seed():
             {"id": "H4", "belief": "B2", "claim": "B's effect increases with f1",
              "test": {"kind": "effect_direction", "package": "B", "feature": "f1", "direction": "increases"}},
             {"id": "H5", "belief": "B3", "claim": "most low-f1 units get A",
-             "test": {"kind": "plan_share", "component": "a", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
+             "test": {"kind": "plan_share", "component": "A", "where": {"f1": [0.3, 0.5]}, "min_share": 0.8}}]}
 
 
 def _one(sw, t, plan=None, units=None):
     """The status and result of one test, through check()."""
-    ctx = {"sweep": sw, "plan": plan, "units": units, "summary": summarise(sw)}     # tests-first shim (ζ drops it)
-    h = check([{"id": "H", "belief": "B", "claim": "c", "test": t}], ctx)[0]
+    h = check([{"id": "H", "belief": "B", "claim": "c", "test": t}], {"sweep": sw, "plan": plan, "units": units})[0]
     return h["status"], h["result"]
 
 
@@ -797,8 +993,10 @@ def _self_test() -> int:
         ok(all(h["result"].get("artifact") for h in copy.deepcopy(hy)["hypotheses"]), "WM12 every result names "
                                                                                          "its artifact")
         look = where_to_look(wm)
-        ok(look and look[0]["belief"] in ("B2", "B3"), "WM13 where_to_look ranks the low-confidence, decision-relevant,"
-           f" conflicting belief first: {look[:2]}")
+        rest = [x for x in look if x["kind"] != "contradiction"]
+        ok(look[0]["kind"] == "contradiction" and look[0]["belief"] == "B4" and rest[0]["belief"] in ("B2", "B3"),
+           "WM13 where_to_look lists the contradicted belief first, then ranks the low-confidence, decision-relevant, "
+           f"conflicting belief: {look[:2]}")
         reg = next((x for x in look if x["kind"] == "simulation" and "f1" in (x.get("region") or {})), None)
         ok(reg is not None and reg["region"]["f1"][0] <= 0.5 <= reg["region"]["f1"][1],
            f"WM14 where_to_look proposes simulation points over the flip range, which contains the true 0.5: {reg}")
@@ -832,7 +1030,8 @@ def _self_test() -> int:
                                                                               "engine": ident}}} for j in jobs]
         ok(set(bind_rows(good, jobs, ident)) == {j["id"] for j in jobs}, "WM17 rows bound to their jobs are kept")
         for bad, why in (([dict(r, result={"result": {"v": 1}}) for r in good], "rows without provenance"),
-                         ([dict(good[0], id=jobs[1]["id"]), good[1], good[2]], "a row whose inputs differ from its job"),
+                         ([dict(good[0], id=jobs[1]["id"]), good[1], good[2]],
+                          "a row whose inputs differ from its job"),
                          (good, "rows from another engine identity"), (good[:2], "a missing row")):
             try:
                 bind_rows(bad, jobs, ident if why != "rows from another engine identity" else {"name": "e2"})
