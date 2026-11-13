@@ -57,12 +57,24 @@ DEPARTURE_FIELDS = ("engine", "benchmark", "component", "reason", "decision_test
 OVERRIDES: dict = {}          # self-tests only: engine ref -> coverage file
 
 
+def canonical(ref: str) -> tuple[str, str]:
+    """(module:Class where the class is defined, its directory): an alias import resolves to the same class, so it
+    reads the same coverage file and pack (#215 review round 3)."""
+    import inspect
+    from toolkit.spec import schema
+    cls = schema.engine_class(ref)
+    return f"{cls.__module__}:{cls.__name__}", os.path.dirname(os.path.abspath(inspect.getfile(cls)))
+
+
 def path_for(ref: str) -> str:
-    """The coverage file beside an in-repository engine module, located without importing it."""
+    """The coverage file beside the module that defines the engine class (OVERRIDES: self-tests)."""
     if ref in OVERRIDES:
         return OVERRIDES[ref]
-    mod = str(ref).split(":", 1)[0]
-    return os.path.join(ROOT, *mod.split(".")[:-1], FILE)
+    try:
+        c, d = canonical(ref)
+    except Exception:  # noqa: BLE001 -- a reference that does not resolve: its own path (then no file: refused)
+        return os.path.join(ROOT, *str(ref).split(":", 1)[0].split(".")[:-1], FILE)
+    return OVERRIDES.get(c) or os.path.join(d, FILE)
 
 
 def load(path: str) -> tuple[dict | None, list[str]]:
@@ -112,7 +124,10 @@ def problems(doc) -> list[str]:
 
 # ------------------------------------------------------------------ what the spec uses
 def _packages(raw: dict) -> list:
-    """The packages the spec allows (explicit, or generated with at most one component per group)."""
+    """The packages the spec allows: the effective set (schema.Spec.packages(), after envelope pruning) when the
+    caller gives it (raw["_packages"]), else explicit or generated with at most one component per group."""
+    if raw.get("_packages") is not None:
+        return [set(p) for p in raw["_packages"]]
     from toolkit.alloc import costs
     o = raw.get("options") or {}
     comps = o.get("components") or {s: {} for s in (o.get("engine_map") or {})}
@@ -353,8 +368,12 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
            card_benchmarks=None, base: str | None = None) -> dict:
     """The check for one engine reference and configuration (the one the run uses)."""
     from toolkit.engines import benchmark_sources as BS
+    try:
+        cref = canonical(ref)[0]
+    except Exception:  # noqa: BLE001
+        cref = ref
     cov, probs = load(path_for(ref))
-    if cov is None and ref in BS.TOY_ENGINE_REFS and ref not in OVERRIDES:
+    if cov is None and cref in BS.TOY_ENGINE_REFS and cref not in OVERRIDES and ref not in OVERRIDES:
         return {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": "toy",
                 "card_rows_disagree": []}
     cache = {}
@@ -384,9 +403,19 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
 
     def runs(test_id, effect, rows):
         from toolkit.spec import preconditions as PC, schema
-        sp = schema.Spec(dict(raw, engine={"ref": ref, "config": config or {}}), base or os.getcwd())
+        sp = schema.Spec({k: v for k, v in raw.items() if k != "_packages"} | {"engine": {"ref": ref, "config":
+                                                                                         config or {}}},
+                         base or os.getcwd())
         return PC.decision_test_runs(sp, test_id, dict(effect, rows=rows))
-    rp = (config or {}).get("results_path")
+    rp = getattr(engine(), "results_path", None)        # the engine's effective results file, its default included
+    try:          # the effective packages the run will allocate over (after envelope pruning)
+        from toolkit.spec import schema
+        if "packages" not in (raw.get("options") or {}):
+            raise KeyError("no packages declared")      # a bare filter spec: every combination (_packages)
+        raw = dict(raw, _packages=list(schema.Spec(dict(raw, engine={"ref": ref, "config": config or {}}),
+                                                   base or os.getcwd()).packages().values()))
+    except Exception:  # noqa: BLE001 -- a spec without the sections pruning needs: the declared packages
+        pass
     out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
                _pack(ref), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
                param_names=pnames)

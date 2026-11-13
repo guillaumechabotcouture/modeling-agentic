@@ -796,9 +796,11 @@ def _self_test_benchmark_gate(ok) -> None:
             entry = [(TOY, None, lambda s: {"results_path": rp})]
             dti = {"id": "DTI", "type": "interaction_rescale", "components": ["a"], "with_any": ["b"],
                    "benchmark": "T2", "values": [1.0, 2.0], "text": "interaction"}
-            spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}},
-                       "analysis": {"decision_tests": [dt1, dta, dti]}}
-            spec_b = dict(spec_ab, options={"engine_map": {"b": {"b": 1}}})
+            gen = {"packages": {"generate": True}}
+            spec_ab = {"options": {"engine_map": {"a": {"a": 1}, "b": {"b": 1}}, "components": {"a": {}, "b": {}}, **gen},
+                       "uncertainty": {},
+                       "analysis": {"decision_tests": [dt1, dta, dti]}}     # the planner reads the draws' priors
+            spec_b = dict(spec_ab, options={"engine_map": {"b": {"b": 1}}, "components": {"b": {}}, **gen})
             r = eligible_engines(spec_ab, entry)[0]
             ok(not r["eligible"] and any("T1" in w and "out_of_band" in w and "held-out validation" in w
                                          for w in r["why_not"])
@@ -972,7 +974,8 @@ def _self_test_benchmark_gate(ok) -> None:
             # review round 2: cost drivers charged by another component, packages, declarations, effect parameters
             write_cov(cov2)
             write_results([dict(rows_in[0], status="in_band"), rows_in[1], rows_in[2], r4])
-            spray = dict(spec_ab, options={"engine_map": {"a": {"a": 1}, "b": {"b": 1}, "spraying": {}},
+            spray = dict(spec_ab, options={"engine_map": {"a": {"a": 1}, "b": {"b": 1}, "spraying": {}}, **gen,
+                                           "components": {"a": {}, "b": {}, "spraying": {}},
                                            "cost_items": [{"id": "cs", "component": "spraying", "basis": "per_outcome",
                                                            "outcome": "doses"}]},
                          analysis={"decision_tests": [dta], "cost_outputs": {"doses": {"cost_driver": "a_doses"}}})
@@ -1011,6 +1014,43 @@ def _self_test_benchmark_gate(ok) -> None:
             except ValueError as ex:
                 ok("T1" in str(ex), f"G22 the brief's signing path refuses an engine that fails the benchmark "
                                     f"precondition ({str(ex)[:90]})")
+            # review round 3: effective packages, departure shape on every signing path, engine auto candidates
+            from toolkit.spec import preconditions as PC
+            write_cov(cov)
+            write_results([dict(rows_in[0], status="in_band"), dict(rows_in[1], status="out_of_band"), rows_in[2]])
+            run4 = os.path.join(d, "run4")
+            os.makedirs(run4)
+            p4 = schema.toy_spec(run4, bench=rp)
+            raw4 = yaml.safe_load(open(p4))
+            e4 = PC.problems(run4, open(p4, "rb").read(), "owner")
+            ok(any("T2" in x for x in e4), f"G25a the toy spec using b fails on T2 ({e4[:1]})")
+            raw4["options"]["packages"] = {"generate": True, "within_envelope": True}
+            raw4["options"]["cost_items"][1]["value"] = 1.0e9           # b costs more than the envelope everywhere
+            yaml.safe_dump(raw4, open(p4, "w"), sort_keys=False)
+            pk4 = schema.load(p4).packages()
+            e4 = PC.problems(run4, open(p4, "rb").read(), "owner")
+            ok(not any("b" in c for c in pk4.values()) and not any("T2" in x for x in e4),
+               f"G25 a component envelope pruning removes from every package is not checked ({sorted(pk4)}, {e4[:1]})")
+            write_results(rows_in)
+            raw5 = yaml.safe_load(open(p))
+            raw5["engine_departures"] = [{k: v for k, v in dep.items() if k != "reason"}]
+            b5 = yaml.safe_dump(raw5, sort_keys=False).encode()
+            e5 = PC.problems(run, b5, "owner")
+            ok(any("engine_departures" in x and "reason" in x for x in e5),
+               f"G26 the shared signing check validates the departures' shape ({e5[:1]})")
+            run6 = os.path.join(d, "run6")
+            os.makedirs(run6)
+            p6 = schema.toy_spec(run6, bench=rp)
+            raw6 = yaml.safe_load(open(p6))
+            raw6["engine"] = {"auto": True, "candidates": [TOY]}
+            yaml.safe_dump(raw6, open(p6, "w"), sort_keys=False)
+            json.dump({"engine": {"ref": TOY, "config": {"results_path": rp}}}, open(os.path.join(run6, "engine_choice.json"), "w"))
+            e6 = PC.problems(run6, open(p6, "rb").read(), "owner")
+            os.remove(os.path.join(run6, "engine_choice.json"))
+            e7 = PC.problems(run6, open(p6, "rb").read(), "owner")
+            ok(any("T1" in x for x in e6) and any("T1" in x for x in e7),
+               f"G27 engine auto: the resolved engine (engine_choice.json) and, while pending, every candidate is "
+               f"checked ({e6[:1]}, {e7[:1]})")
             # review: the configuration the run uses, and the named-engine sheet
             write_cov(cov)
             write_results(rows_in)
@@ -1037,6 +1077,16 @@ def _self_test_benchmark_gate(ok) -> None:
                    f"components ({probs[:1]}, {[c.get('departures') for c in cands]})")
         finally:
             BCmod.OVERRIDES.pop(TOY, None)
+    # review round 3: an alias import of an engine behaves exactly like its canonical reference
+    em = {"pyr": {"net": "pyr"}, "cm": {"cm": 1}}
+    f6 = {"options": {"engine_map": em, "components": {"pyr": {}, "cm": {}}, "packages": {"generate": True}}}
+    canon = "toolkit.engines.malaria.engine:MalariaEngine"
+    rc = eligible_engines(f6, [(canon, None, None)])[0]
+    ra = eligible_engines(f6, [("toolkit.engines.malaria:MalariaEngine", None, None)])[0]
+    strip = lambda r: sorted(w.replace(r["ref"], "") for w in r["why_not"])  # noqa: E731
+    ok(not rc["eligible"] and strip(rc) == strip(ra) and any("component cm" in w for w in ra["why_not"]),
+       f"G24 an alias import of the malaria engine is assessed exactly like the canonical reference "
+       f"({strip(ra)[:1]})")
 
 
 def _self_test() -> int:

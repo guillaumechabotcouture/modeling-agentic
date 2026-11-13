@@ -1852,6 +1852,15 @@ def _self_test() -> int:
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
+        _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
+        try:
+            sign(d, "owner", "ok")
+            ok(False, "T17p the spike sign-off refuses a spec failing a registered precondition")
+        except ValueError as e:
+            ok("refused for owner" in str(e), f"T17p the spike sign-off refuses a spec failing a registered precondition")
+        finally:
+            _PC.CHECKS.pop("_t17", None)
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
