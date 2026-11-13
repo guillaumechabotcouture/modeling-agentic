@@ -1,0 +1,13 @@
+---
+phase: "F6"
+commit: "WM-L"
+status_group: "F6 progressive steps"
+---
+
+## Changelog
+
+**The world model learns only from evidence it has not seen and could not have fitted (F6 WM-L, follow-up to F6 WM).** Every direction (package × feature) and flip (pair × feature) in the summary of `toolkit/analysis/world_model.py` is one test in a Benjamini-Hochberg false-discovery control (q 0.05; the number tested and discovered is reported). Only discoveries become simulation beliefs (`screened: true`). They are labelled as marginal associations with the design features each is correlated with (|rho| ≥ 0.5). A hypothesis claims a conditional mechanism by default, and a correlated feature makes its direction or flip test inconclusive rather than supported or refuted. Each confrontation is identified by the sha256 of its test and of its evidence: the sweep tables, or the plan. Replays and aliases count once and move no confidence, and counters are recomputed from the history (`reconciled` records a difference from the seed's). A hypothesis counts only when its `registered_at` precedes the evidence (the analysis manifest's `finished_at`, or `point.yaml`'s `written_at`). Otherwise it is `post_hoc`, reported apart and never in the share confirmed. A produced world model can seed the next build: its simulation beliefs are superseded (`version`, `superseded_simulation`), literature and data beliefs kept, and hypotheses reloaded with `--hypotheses`. Ids starting `sim.` are reserved. In `--engine-identity recorded` mode the run's engine identity must appear in the engine's benchmark history: `benchmarks/results.yaml` or `history/*`, or `results.yaml` in a commit that is an ancestor of HEAD. Where it matched is recorded, else the build is refused. The shadow price is stated as an upper bound on the budget row's dual, and every paired result carries the value used. Self-test WM35-43, written first.
+
+## Status
+
+- **WM-L:** world model screening, marginal labels, confrontation identity, pre-registration, reuse and recorded-identity check; still standalone (a LEARN stage and the seed-writing task are later PRs).
