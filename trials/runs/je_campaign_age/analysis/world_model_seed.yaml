@@ -1,0 +1,312 @@
+beliefs:
+- id: B1
+  mechanism: 'A one-dose SA14-14-2 campaign of ages 1-14 at ~85% reach removes the child share of cases: share 0.60-0.85
+    x reach 0.85 x single-dose effectiveness 0.80-0.99, over 2026-2028 with little waning'
+  about:
+    package: child
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.72
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Hennessy S, et al. Effectiveness of live-attenuated Japanese encephalitis vaccine (SA14-14-2): a
+      case-control study. Lancet 1996'
+    location: Results (single dose about 80%, two doses about 97.5%); page not checked
+  - citation: 'Bista MB, et al. Efficacy of single-dose SA 14-14-2 vaccine against Japanese encephalitis: a case
+      control study. Lancet 2001'
+    location: Results (about 99% shortly after campaign); page not checked
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: Discussion, share of cases in children (about 75% under 15 in endemic areas); location not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Extending to ages 1-29 adds the 15-29 share (premise: most of the 15-40% non-child share), so WIDE
+    removes nearly all cases reached; the gain over CHILD is 0.10-0.30 of cases'
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.62
+    - 0.84
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Hennessy S, et al. Effectiveness of live-attenuated Japanese encephalitis vaccine (SA14-14-2): a
+      case-control study. Lancet 1996'
+    location: Results; page not checked
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: age distribution discussion; location not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'Pig density drives the force of infection, so it raises baseline incidence, but it does not change
+    the relative reduction: vaccine-derived protection is individual, with no herd effect, and the baseline is already
+    in inc'
+  about:
+    package: child
+    feature: pig_density
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: Introduction (zoonotic cycle, humans dead-end hosts); location not checked
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B4
+  mechanism: Humans are dead-end hosts, so the relative reduction is the same at any baseline incidence; inc moves
+    the absolute cases averted only
+  about:
+    package: child
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: Introduction; location not checked
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B5
+  mechanism: WIDE buys 0.10-0.30 of cases for +US$0.90 per resident while CHILD buys 0.40-0.72 for US$1.00, so CHILD
+    averts 2-3x more cases per US$; at the shadow price CHILD beats WIDE across the incidence range
+  about:
+    pair:
+    - child
+    - wide
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+  source_type: literature
+  evidence:
+  - citation: 'Hennessy S, et al. Effectiveness of live-attenuated Japanese encephalitis vaccine (SA14-14-2): a
+      case-control study. Lancet 1996'
+    location: Results; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: At 0.018 cases per US$ (a case valued at about US$56) CHILD's benefit, at most about 2.6e-4 cases per
+    resident over 3 years, is far below its US$1 cost, so no campaign beats none at the shadow price. With the corrected
+    value (about 5.6e-5 per US$) CHILD would beat none above inc of about 3.4e-5
+  about:
+    pair:
+    - child
+    - none
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+  source_type: literature
+  evidence:
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: case fatality and sequelae ranges used in the shadow-price basis; location not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: WIDE costs US$1.90 per resident for at most about 2.9e-4 cases averted per resident, so at 0.018 cases
+    per US$ it loses to none everywhere
+  about:
+    pair:
+    - wide
+    - none
+  direction: none
+  conditions:
+  - feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+  source_type: literature
+  evidence:
+  - citation: 'Campbell GL, et al. Estimated global incidence of Japanese encephalitis: a systematic review. Bull
+      World Health Organ 2011'
+    location: location not checked
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B8
+  mechanism: The budget binds (CHILD in all 24 districts probably costs more than US$6M), so the decision rule is
+    to rank districts by inc and give CHILD to the highest-incidence districts until the money runs out; WIDE only
+    where inc is near the top of the range and CHILD is already funded everywhere it pays. Effectiveness evidence
+    for SA14-14-2 is case-control, not randomised; the only randomised efficacy trial is of the inactivated mouse-brain
+    vaccine (about 91%)
+  about:
+    component: child
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Hoke CH, et al. Protection against Japanese encephalitis by inactivated vaccines. N Engl J Med 1988
+    location: Results (two-dose efficacy about 91%); page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Is the shadow price 0.018 cases per US$ a unit slip? 18 DALYs per case at US$1000 per DALY values a
+    case at about US$18,000 (5.6e-5 cases per US$), not US$56. At 0.018 every campaign loses to none and every paired
+    test favours the cheaper option, whatever the epidemiology
+  beliefs:
+  - B5
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: What share of cases is aged 15-29 in these districts (premise 15-40% non-child)? This sets the WIDE
+    increment and whether WIDE ever beats CHILD in the highest-incidence districts
+  beliefs:
+  - B2
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Single-dose SA14-14-2 effectiveness ranges from about 80% (Hennessy 1996) to about 99% (Bista 2001);
+    none is randomised. Which applies over 2026-2028?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q4
+  question: 'Total population against the US$6M budget: how many districts CHILD can cover, and so where the inc
+    cut-off sits. No optimised plan is produced, so the harness cannot test this'
+  beliefs:
+  - B8
+  decision_relevant: true
+- id: Q5
+  question: Does the baseline inc already include any routine JE immunisation? If so the campaign reduction applies
+    only to the unvaccinated remainder
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CHILD reduces 2026-2028 JE cases by 40-72% at most design points
+  test:
+    kind: effect_band
+    package: child
+    band:
+    - 0.4
+    - 0.72
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: WIDE reduces 2026-2028 JE cases by 62-84% at most design points
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.62
+    - 0.84
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: CHILD's relative reduction does not vary with pig_density (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: child
+    feature: pig_density
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: CHILD's relative reduction does not vary with baseline incidence inc (|rho| bound within 0.1)
+  test:
+    kind: effect_direction
+    package: child
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: At the shadow price CHILD beats WIDE at 90% or more of points across the inc range
+  test:
+    kind: paired_sign
+    a: child
+    b: wide
+    feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+    sign: positive
+    min_share: 0.9
+- id: H6
+  belief: B6
+  claim: 'At 0.018 cases per US$, no campaign beats CHILD: net benefit of CHILD minus none is negative at 95% or
+    more of points'
+  test:
+    kind: paired_sign
+    a: child
+    b: none
+    feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+    sign: negative
+    min_share: 0.95
+- id: H7
+  belief: B7
+  claim: At 0.018 cases per US$, net benefit of WIDE minus none is negative at 95% or more of points
+  test:
+    kind: paired_sign
+    a: wide
+    b: none
+    feature: inc
+    range:
+    - 1.23e-05
+    - 8.76e-05
+    sign: negative
+    min_share: 0.95
