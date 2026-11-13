@@ -180,7 +180,11 @@ def engine_tables(A, cands, z0, out0, res):
         tabs = []
         for scale in (1.0, 2.0):
             A.model = _Stub(hybrid(scale))
-            tabs.append(A.evaluate(A.theta0, z0, ids=list(eng))[1:])
+            # F6 S2-5d review r2: the engine side at the decision's point anchor factors, as the emulator side (ben0,
+            # cost0) has them: the check compares orderings, and the hybrid's window burden is the emulator's
+            from toolkit.analysis.burden import point_factors
+            fx = None if getattr(A, "anchor", None) is None else point_factors(A.anchor)
+            tabs.append(A.evaluate(A.theta0, z0, ids=list(eng), anchor_factors=fx)[1:])
     finally:
         A.model, A.last_events, A.last_cost_floors = saved, saved_ev, saved_fl
     (ben, cost), (ben2, cost2) = tabs

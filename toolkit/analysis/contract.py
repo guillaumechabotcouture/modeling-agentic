@@ -146,7 +146,7 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     return reserve_findings(rule, point or {}, unc or {})
 
 
-def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
+def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
     """F6 S2-5: the signed spec's validation.burden, judged from the artifact's numbers (toolkit/analysis/burden.py);
     a group outside its tolerance is declarable, every other problem is not (fail closed)."""
     try:
@@ -176,7 +176,8 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     if data is not None and not (isinstance(pv, dict) and pv.get("independent") is True):
         out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
                       "independent of the calibration inputs", "burden"))
-    return out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
+    return (out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
+            + BV.anchor_findings(raw, anchor, None if bad else refs, sp))       # F6 S2-5d
 
 
 def _boundary(run_dir: str, data, point) -> list[dict]:
@@ -229,7 +230,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc = None, None, None, None, None, None
+    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc, ba_doc = None, None, None, None, None, None, None
     bd_doc = voi_doc = None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
@@ -320,6 +321,8 @@ def gate_findings(run_dir: str) -> list[dict]:
             bd_doc = doc.get("data") or {}
         if kind == "burden_validation":
             bv_doc = doc.get("data") or {}
+        if kind == "burden_anchor":
+            ba_doc = doc.get("data") or {}
         if kind == "plan_variants":
             pv_doc = doc.get("data") or {}
         if kind == "value_of_information":
@@ -344,7 +347,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _reserve(run_dir, pt_doc, unc_doc or {})
     if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
         out += _plan_variants(run_dir, pt_doc, pv_doc)
-    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True)
+    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
