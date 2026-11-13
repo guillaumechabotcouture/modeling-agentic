@@ -1,0 +1,253 @@
+beliefs:
+- id: B1
+  mechanism: 'A two-dose killed whole-cell OCV campaign reaching 70% of residents reduces suspected cholera over
+    a 2-year window by direct protection of vaccinees only (engine excludes herd effects): population relative reduction
+    ~ 0.7 x two-dose VE averaged over years 1-2 (~0.5-0.7 in trials and effectiveness studies).'
+  about:
+    package: ocv2
+  direction: reduces
+  magnitude:
+    band:
+    - 0.32
+    - 0.5
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Bi Q, Ferreras E, Pezzoli L, et al. Protection against cholera from killed whole-cell oral cholera
+      vaccines: a systematic review and meta-analysis. Lancet Infect Dis 2017'
+    location: Results, pooled two-dose efficacy and effectiveness, and protection by year since vaccination (figure;
+      exact table number unsure)
+  - citation: 'Bhattacharya SK, Sur D, Ali M, et al. 5 year efficacy of a bivalent killed whole-cell oral cholera
+      vaccine in Kolkata, India: a cluster-randomised, double-blind, placebo-controlled trial. Lancet Infect Dis
+      2013'
+    location: abstract, cumulative 5-year efficacy and year-specific efficacy (table location unsure)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: A single-dose campaign gives ~40% protection in the 2 years after vaccination overall (lower, near
+    zero, in children <5), so the population relative reduction at 70% coverage is ~0.7 x 0.3-0.5; more than half
+    the two-dose effect for half the cost.
+  about:
+    package: ocv1
+  direction: reduces
+  magnitude:
+    band:
+    - 0.18
+    - 0.36
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: Qadri F, Wierzba TF, Ali M, et al. Efficacy of a Single-Dose, Inactivated Oral Cholera Vaccine in
+      Bangladesh. N Engl J Med 2016
+    location: abstract, protective efficacy at 6 months overall and by age
+  - citation: 'Qadri F, Ali M, Lynch J, et al. Efficacy of a single-dose regimen of inactivated whole-cell oral
+      cholera vaccine: results from 2 years of follow-up of a randomised trial. Lancet Infect Dis 2018'
+    location: abstract, 2-year protective efficacy overall and in children under 5
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'The engine applies a constant multiplicative rate ratio with no herd effect, so the relative reduction
+    of a package does not vary with district incidence; cases averted per resident scale linearly with inc. (Real-world:
+    herd protection rises with coverage and may vary with transmission intensity -- Ali 2005 -- but the engine excludes
+    it.)'
+  about:
+    package: ocv1
+    feature: inc
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Ali M, Emch M, von Seidlein L, et al. Herd immunity conferred by killed oral cholera vaccines in
+      Bangladesh: a reanalysis. Lancet 2005'
+    location: abstract, incidence among placebo recipients by vaccine coverage of the bari (herd effect excluded
+      by this engine)
+  confidence: high
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: Improved sanitation lowers baseline cholera incidence, which is already captured in inc; the engine
+    does not read wash, so wash does not modify the relative effect of a campaign.
+  about:
+    package: ocv2
+    feature: wash
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Lessler J, Moore SM, Luquero FJ, et al. Mapping the burden of cholera in sub-Saharan Africa and implications
+      for control: an analysis of data across geographical scales. Lancet 2018'
+    location: Discussion, concentration of burden and association with sanitation access (page unsure)
+  confidence: medium
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: With a binding budget and equal cost per resident everywhere, a district is worth vaccinating with
+    ocv1 only if its incidence exceeds the marginal (shadow-price) incidence; with a budget covering roughly a third
+    to half of the population, that threshold sits around the middle of the incidence range. Above it ocv1 beats
+    none; below it none beats ocv1.
+  about:
+    pair:
+    - ocv1
+    - none
+  direction: flips
+  conditions:
+  - feature: inc
+    range:
+    - 0.002
+    - 0.0055
+  source_type: literature
+  evidence:
+  - citation: 'Lessler J, Moore SM, Luquero FJ, et al. Mapping the burden of cholera in sub-Saharan Africa and implications
+      for control: an analysis of data across geographical scales. Lancet 2018'
+    location: Results, share of burden concentrated in a minority of the population (page unsure); threshold location
+      is the modeller's arithmetic, not from the paper
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: The second dose adds only rr2 - rr1 (~0.05-0.25) for the same US$2.1 per resident that buys rr1 (~0.2-0.35)
+    in a new district, so at the budget's shadow price ocv1 beats ocv2 wherever incidence is low or moderate; ocv2
+    can only win in the highest-incidence districts, if at all.
+  about:
+    pair:
+    - ocv1
+    - ocv2
+  direction: increases
+  conditions:
+  - feature: inc
+    range:
+    - 0.000535
+    - 0.004
+  source_type: literature
+  evidence:
+  - citation: 'Qadri F, Ali M, Lynch J, et al. Efficacy of a single-dose regimen of inactivated whole-cell oral
+      cholera vaccine: results from 2 years of follow-up of a randomised trial. Lancet Infect Dis 2018'
+    location: abstract, 2-year single-dose efficacy
+  - citation: 'Bi Q, Ferreras E, Pezzoli L, et al. Protection against cholera from killed whole-cell oral cholera
+      vaccines: a systematic review and meta-analysis. Lancet Infect Dis 2017'
+    location: Results, two-dose protection in years 1-2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What is the single-dose relative reduction relative to two doses over 2026-2027 in this population (age
+    structure; single-dose protection is near zero in children under 5)? If rr1 < rr2/2, the second dose becomes
+    the efficient choice in high-incidence districts and the plan shifts from wide ocv1 to targeted ocv2.
+  beliefs:
+  - B2
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: Is past five-year suspected incidence a good predictor of 2026-2027 incidence? Cholera is epidemic and
+    clustered in time; suspected-case ascertainment (and the share confirmed) varies by district, which can re-rank
+    districts. A measured surveillance series vs a modelled burden map should be compared on the same estimand (suspected
+    vs confirmed, reporting completeness).
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Would herd protection (not in the engine) at 70% coverage raise the effect of both packages, and more
+    so for two-dose campaigns or in low-sanitation districts? This could favour concentrating doses in fewer districts.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Is US$3.00 per dose delivered right for both regimens (single-dose campaigns may have higher delivery
+    cost per dose; global OCV stockpile supply constraints may limit two-dose campaigns)? The ocv1/ocv2 choice turns
+    on this price ratio.
+  beliefs:
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Across design points, the ocv2 relative reduction in cases over 2026-2027 lies within 0.32-0.50 in at least
+    80% of usable points.
+  test:
+    kind: effect_band
+    package: ocv2
+    band:
+    - 0.32
+    - 0.5
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Across design points, the ocv1 relative reduction in cases over 2026-2027 lies within 0.18-0.36 in at least
+    80% of usable points.
+  test:
+    kind: effect_band
+    package: ocv1
+    band:
+    - 0.18
+    - 0.36
+    min_share: 0.8
+- id: H3
+  belief: B3
+  claim: The ocv1 relative reduction does not vary with district incidence (Spearman rho within +/-0.1); a clear
+    trend would refute the constant-rate-ratio understanding.
+  test:
+    kind: effect_direction
+    package: ocv1
+    feature: inc
+    direction: negligible
+    equivalence: 0.1
+- id: H4
+  belief: B4
+  claim: The ocv2 relative reduction does not vary with the share with improved sanitation (Spearman rho within
+    +/-0.1).
+  test:
+    kind: effect_direction
+    package: ocv2
+    feature: wash
+    direction: negligible
+    equivalence: 0.1
+- id: H5
+  belief: B5
+  claim: At the budget's shadow price, the ocv1-versus-none transition along incidence is located within inc 0.002-0.0055
+    (around the middle of the incidence range).
+  test:
+    kind: flip_in
+    a: ocv1
+    b: none
+    feature: inc
+    range:
+    - 0.002
+    - 0.0055
+- id: H6
+  belief: B6
+  claim: At the budget's shadow price, ocv1 has higher net benefit than ocv2 in at least 90% of usable points with
+    inc between 0.000535 and 0.004.
+  test:
+    kind: paired_sign
+    a: ocv1
+    b: ocv2
+    feature: inc
+    range:
+    - 0.000535
+    - 0.004
+    sign: positive
+    min_share: 0.9
