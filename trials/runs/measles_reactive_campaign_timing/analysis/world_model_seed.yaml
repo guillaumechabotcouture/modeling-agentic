@@ -1,0 +1,243 @@
+beliefs:
+- id: B1
+  mechanism: An early campaign (complete 14 days, ~1 measles generation after detection) that protects ~80% of remaining
+    susceptibles pushes Reff below 1 (0.2 x R0 x s0 <= ~0.7 across s0 0.08-0.20, R0 12-18) and stops most of the
+    outbreak still to come; what it cannot avert is infections already in the chain by day 14 plus a short tail.
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.5
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results, cases averted by intervention start day (figures); location not verified
+  - citation: 'Guerra FM, Bolotin S, Lim G et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Abstract (R0 12-18 range)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: A late campaign (complete 42 days, ~3.5 generations of ~12 days after detection) arrives after the
+    outbreak has grown by roughly Reff^3.5; in fast districts a large share of the final size has already occurred
+    or is incubating, so it averts much less than early.
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.2
+    - 0.8
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table 2 (measles serial interval ~11-12 days); value from memory
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results; location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B3
+  mechanism: 'The cost of waiting grows with the speed of the outbreak: higher susceptible share means higher Reff
+    and faster growth, so the share of the outbreak a late campaign still averts falls as s0 rises.'
+  about:
+    package: late
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Ch. 2-3, epidemic growth and final size; general theory
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: A district further along at detection (larger share already infected) has less left to avert, and the
+    late campaign loses proportionally more of it; relative reduction of late falls with seed_share.
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Cairns KL, Perry RT, Ryman TK, Nandy RK, Grais RF. Should outbreak response immunization be recommended
+      for measles outbreaks in middle- and low-income countries? An update. J Infect Dis 2011
+    location: Results/Discussion on timing of response vs cases averted; location not verified
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: 'Timing choice early vs late flips with outbreak speed: near the threshold (low s0, Reff ~1-1.5) the
+    outbreak is slow, waiting loses little and the cheaper late campaign gives more net benefit; at high s0 (Reff
+    >~2.2) early wins despite the 1.57x price. The flip is roughly at s0 0.11-0.17, shifted by seed_share, R0 and
+    the shadow price (a lower shadow price favours early).'
+  about:
+    pair:
+    - early
+    - late
+    feature: s0
+  direction: flips
+  conditions:
+  - feature: s0
+    range:
+    - 0.11
+    - 0.17
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Discussion; flip location is my own reasoning, not from the paper
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: Per-capita outcomes do not depend on district size under frequency-dependent (homogeneous) mixing in
+    a deterministic closed population; pop scales cost and benefit equally, so it does not change the relative reduction
+    (it matters only through the budget's lumpiness).
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Ch. 2, final-size relation independent of N under frequency dependence
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: How does the engine represent timing? Its card says interventions act before the epidemic, so the 14-
+    vs 42-day delay must enter through efficacy:early / efficacy:late; are those priors derived from outbreak growth
+    to day 14/42 in each district, or a single scalar? If scalar, the s0/seed dependence of the timing penalty (B3-B5)
+    is lost and the flip will not appear.
+  beliefs:
+  - B2
+  - B3
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Is the serosurvey s0 comparable to the model's susceptible share (age frame, assay sensitivity, maternal
+    antibody in infants)? A biased s0 shifts Reff and the flip district set.
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: What shadow price does the budget imply? With the budget covering only part of the districts, the marginal
+    district gets none, and early vs late in the rest turns on lambda.
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Is reach really 80% of susceptibles at both timings (emergency early campaigns may reach fewer), and
+    are doses to immune people wasted (targets_susceptible not declared)?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Early averts 50-95% of infections relative to no campaign in most design points.
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.5
+    - 0.95
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Late averts 20-80% of infections relative to no campaign in most design points.
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.2
+    - 0.8
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: Late's relative reduction falls as s0 rises (faster outbreaks burn through before day 42).
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: Late's relative reduction falls as seed_share rises (outbreak further along at detection).
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: The early/late choice flips along s0 within 0.11-0.17.
+  test:
+    kind: flip_in
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.11
+    - 0.17
+- id: H6
+  belief: B5
+  claim: In high-susceptibility districts (s0 0.17-0.197) early beats late on net benefit in at least 60% of points.
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.17
+    - 0.197
+    sign: positive
+    min_share: 0.6
+- id: H7
+  belief: B6
+  claim: Early's relative reduction does not depend on district population (|rho| bound within 0.25).
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.25
