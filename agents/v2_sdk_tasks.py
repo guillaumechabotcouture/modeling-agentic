@@ -170,7 +170,10 @@ Write """ + SEED_FILE + """ in the world model's format, documented below by too
 - hypotheses: 5 to 8, each tied to one belief and with a machine-checkable refutation test of one of the kinds
   below, with explicit thresholds, naming only the packages and features listed in {out_in}. Each states what you
   expect the sweep to show and what would refute it. Choose each threshold from the belief, never to make the
-  test easy to pass: a band wide enough to hold any plausible result tests nothing. The harness registers the
+  test easy to pass. Give every band as tight as the cited evidence supports: a band wider than the plausible
+  range makes its test lenient (it passes whatever the simulation shows), and a lenient test tests nothing.
+  Every literature citation is looked up after you finish (title, first author and year); one that is not found
+  lowers its belief's confidence to low, so cite the paper's title, first author and year exactly. The harness registers the
   hypotheses before the sweep runs (you do not write registered_at).
 
 """ + doc[a:b].strip() + """

@@ -74,6 +74,7 @@ SEED = "analysis/world_model_seed.yaml"                  # the validated copy th
 TRIAL = "trial.json"
 BRANCH, REMOTE = "wm-trials", "origin"
 HYPOTHESES = (5, 8)
+DEFAULT_MAX_ENGINE_RUNS = 400      # 60-100 design points x up to 4 packages (owner, 2026-11-13); each batch about a minute
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STEPS = ("prepare", "seed", "register", "anchor", "engine", "build")
 NUMBER_RE = re.compile(r"(?<![A-Za-z_\d.])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?")    # a standalone number
@@ -343,7 +344,7 @@ def _save(run_dir, t):
     _sio().write_nofollow(run_dir, TRIAL, json.dumps(t, indent=1, sort_keys=True, default=str).encode(), atomic=True)
 
 
-def prepare(q, run_dir, root=REPO, max_engine_runs=50) -> dict:
+def prepare(q, run_dir, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> dict:
     """Copy the template, load the spec, build and store the engine design, and return the seed context (inputs
     only: no result exists). A design over the engine-run limit is refused here and again at run time."""
     from toolkit.analysis import batch as B
@@ -546,6 +547,178 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
     return dict(out, status="seed_refused")
 
 
+# ---------------------------------------------------------------- citation lookup (no LLM)
+S2_SEARCH = "https://api.semanticscholar.org/graph/v1/paper/search"
+_S2_LOCK, _S2_LAST = threading.Lock(), [0.0]
+TITLE_OVERLAP = 0.5           # share of the found title's words (4+ letters) that appear in the citation
+
+
+CROSSREF = "https://api.crossref.org/works"
+
+
+class RateLimited(OSError):
+    """The lookup service refused for rate (HTTP 429) after its retries."""
+
+
+def crossref_lookup(query, pause_s=1.1, author=None) -> list[dict]:
+    """Works matching `query` from the Crossref public API (no key), in the Semantic Scholar shape."""
+    import urllib.parse
+    import urllib.request
+    first = author or (re.findall(r"[A-Za-z][A-Za-z'\-]+", query) or [""])[0]     # the first author
+    url = CROSSREF + "?" + urllib.parse.urlencode({"query.bibliographic": query[:300], "query.author": first, "rows": 10})
+    with _S2_LOCK:
+        wait = _S2_LAST[0] + pause_s - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "world-model-trials"}),
+                                        timeout=30) as r:
+                items = (json.loads(r.read().decode("utf-8")).get("message") or {}).get("items") or []
+        finally:
+            _S2_LAST[0] = time.time()
+    out = []
+    for it in items:
+        dp = ((it.get("issued") or {}).get("date-parts") or [[None]])[0]
+        out.append({"paperId": f"doi:{it.get('DOI')}", "title": (it.get("title") or [""])[0],
+                    "year": dp[0] if dp else None, "source": "crossref",
+                    "authors": [{"name": f"{a.get('given', '')} {a.get('family', '')}".strip()}
+                                for a in it.get("author") or []]})
+    return out
+
+
+class Lookup:
+    """Semantic Scholar first; when it refuses for rate, Crossref answers. After `breaker` refusals in a row, Semantic
+    Scholar is not called again by this lookup (the public endpoint shares one rate pool). `source` is the last one
+    used, and each found record carries its own."""
+
+    def __init__(self, primary=None, fallback=None, breaker=3):
+        self.primary, self.fallback = primary or s2_lookup, fallback or crossref_lookup
+        self.breaker, self.refusals, self.source = breaker, 0, "semantic_scholar"
+
+    def __call__(self, query, author=None):
+        if self.refusals < self.breaker:
+            try:
+                hits = self.primary(query)
+                self.refusals, self.source = 0, "semantic_scholar"
+                return [dict(h, source=h.get("source", "semantic_scholar")) for h in hits]
+            except RateLimited:
+                self.refusals += 1
+        self.source = "crossref"
+        return self.fallback(query) if author is None else self.fallback(query, author)
+
+
+def s2_lookup(query, pause_s=1.1, tries=3) -> list[dict]:
+    """Papers matching `query` from the Semantic Scholar public search API (no key; one call at a time across threads,
+    at least `pause_s` apart; a 429 backs off 2, 4 s, then RateLimited). Raises OSError when it cannot answer."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    url = S2_SEARCH + "?" + urllib.parse.urlencode({"query": query[:300], "limit": 5,
+                                                    "fields": "title,year,authors,externalIds,venue"})
+    for k in range(tries):
+        with _S2_LOCK:
+            wait = _S2_LAST[0] + pause_s - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "world-model-trials"}),
+                                            timeout=30) as r:
+                    return json.loads(r.read().decode("utf-8")).get("data") or []
+            except urllib.error.HTTPError as e:
+                if e.code != 429 or k == tries - 1:
+                    raise (RateLimited if e.code == 429 else OSError)(f"Semantic Scholar: HTTP {e.code}")
+            finally:
+                _S2_LAST[0] = time.time()
+        time.sleep(2 ** (k + 1))
+    raise RateLimited("Semantic Scholar: rate limited")
+
+
+def _words(s):
+    return {w for w in re.findall(r"[a-z]{4,}", str(s).lower())}
+
+
+def citation_match(citation, paper) -> bool:
+    """A found paper matches a citation when its year is the cited year (or one off: online versus print), its
+    first author's surname is the citation's first word, and most of its title's words are in the citation."""
+    yrs = [int(m.group(0)) for m in re.finditer(r"\b(19|20)\d\d\b", citation)]
+    first = (re.findall(r"[A-Za-z][A-Za-z'\-]+", citation) or [""])[0].lower()
+    authors = paper.get("authors") or []
+    a0 = str((authors[0] if authors else {}).get("name") or "").lower()
+    tw = _words(paper.get("title"))
+    return bool(yrs and paper.get("year") and any(abs(int(paper["year"]) - y) <= 1 for y in yrs) and first and
+                first in re.findall(r"[a-z'\-]+", a0) and tw and len(tw & _words(citation)) / len(tw) >= TITLE_OVERLAP)
+
+
+_LOOKUP = []
+
+
+def _title_guess(c):
+    """The title part of an author-title-venue citation: the longest sentence between full stops (None if short)."""
+    parts = [p.strip() for p in re.split(r"\.\s+", c) if p.strip()]
+    best = max(parts, key=lambda p: len(_words(p)), default="")
+    return best if len(_words(best)) >= 3 and best != c else None
+
+
+def _default_lookup(pause_s):
+    """One Lookup per process, shared by the questions' threads, so the circuit breaker holds across questions."""
+    with _S2_LOCK:
+        if not _LOOKUP:
+            _LOOKUP.append(Lookup(lambda q: s2_lookup(q, pause_s), lambda q, a=None: crossref_lookup(q, pause_s, a)))
+        return _LOOKUP[0]
+
+
+def verify_citations(seed, lookup=None, pause_s=1.1) -> tuple[dict, list[dict]]:
+    """(seed, records): every literature citation looked up (s2_lookup unless `lookup` is given); a belief with a
+    citation not found is set to confidence low, keeping the claimed confidence in citation_check. A lookup that
+    fails is recorded as lookup_failed and changes nothing. Data beliefs are not looked up."""
+    import copy
+    out, recs = copy.deepcopy(seed), []
+    look = lookup or _default_lookup(pause_s)
+    for b in out.get("beliefs") or []:
+        if b.get("source_type") != "literature":
+            continue
+        rows = []
+        for e in b.get("evidence") or []:
+            c = str(e.get("citation") or "")
+            first = (re.findall(r"[A-Za-z][A-Za-z'\-]+", c) or [""])[0]      # the first author, as citation_match reads it
+            try:
+                m = None
+                for qq in dict.fromkeys(x for x in (c, _title_guess(c)) if x):    # the citation, then its title alone
+                    hits = look(qq, first) if isinstance(look, Lookup) else look(qq)
+                    m = next((p for p in hits if citation_match(c, p)), None)
+                    if m:
+                        break
+                r = {"belief": b["id"], "citation": c[:300], "status": "found" if m else "not_found",
+                     "paper_id": (m or {}).get("paperId"), "title": (m or {}).get("title"),
+                     "year": (m or {}).get("year"), "source": (m or {}).get("source")}
+            except (OSError, ValueError) as ex:
+                r = {"belief": b["id"], "citation": c[:300], "status": "lookup_failed", "error": str(ex)[:200]}
+            rows.append(r)
+        recs += rows
+        miss = [r["citation"] for r in rows if r["status"] == "not_found"]
+        b["citation_check"] = {"confidence_claimed": b["confidence"],
+                               "found": sum(r["status"] == "found" for r in rows), "not_found": len(miss),
+                               "lookup_failed": sum(r["status"] == "lookup_failed" for r in rows)}
+        if miss:
+            b["confidence"] = "low"
+    return out, recs
+
+
+def citation_step(run_dir, lookup=None) -> dict:
+    """The seed's citations checked between its validation and its registration: the registered seed carries the
+    check (analysis/world_model_seed.yaml) and analysis/citations.json records each lookup."""
+    import yaml
+    seed = yaml.safe_load(open(os.path.join(run_dir, SEED)))
+    out, recs = verify_citations(seed, lookup)
+    from toolkit.analysis import world_model as W
+    W.validate(out)
+    _sio().write_nofollow(run_dir, SEED, yaml.safe_dump(out, sort_keys=False, width=110).encode(), atomic=True)
+    _sio().write_nofollow(run_dir, "analysis/citations.json", json.dumps(
+        {"source": S2_SEARCH if lookup is None else "injected lookup", "at": _now(), "records": recs},
+        indent=1).encode(), atomic=True)
+    return {k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "lookup_failed")}
+
+
 def register_step(run_dir) -> dict:
     from toolkit.analysis import world_model as W
     buf = io.StringIO()
@@ -554,7 +727,7 @@ def register_step(run_dir) -> dict:
     return {"note": buf.getvalue().strip()}
 
 
-def engine_step(q, run_dir, max_engine_runs=50, workers=2) -> dict:
+def engine_step(q, run_dir, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, workers=2) -> dict:
     """The batch on the stored design (re-derived from the spec and required to be identical), on a local pool of at
     most `workers` processes; a cloud scheduler in the environment or a design over the limit is refused. Then the
     batch's first appearance is recorded (world_model.record_first_seen)."""
@@ -618,8 +791,9 @@ def _wait_past(at):
 
 
 def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anchor=None, task_cap_usd=2.0,
-               llm_concurrency=5, engine_workers=2, max_engine_runs=50, engines=CHEAP_ENGINES, engine_probe=None,
-               root=None) -> dict:
+               llm_concurrency=5, engine_workers=2, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, engines=CHEAP_ENGINES,
+               engine_probe=None,
+               root=None, citation_lookup=None) -> dict:
     """Every question through prepare, seed, register, anchor, engine and build (module docstring). Returns {id:
     trial record}; each record is also trials/runs/<id>/trial.json."""
     import queue
@@ -666,6 +840,10 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
                     _save(rd, t)
                     return record(q["id"], t)
                 t["steps"]["seed"] = _now()
+                _save(rd, t)
+            if "citations" not in t["steps"] and "register" not in t["steps"]:     # between validation and registration
+                t["citations"] = citation_step(rd, citation_lookup)
+                t["steps"]["citations"] = _now()
                 _save(rd, t)
             if "register" not in t["steps"]:
                 t["register"] = register_step(rd)
@@ -790,6 +968,16 @@ def _yaml(p):
         return None
 
 
+def _citations(run_dir):
+    """Counts from analysis/citations.json (None for a run made before the citation check)."""
+    p = os.path.join(run_dir, "analysis", "citations.json")
+    if not os.path.isfile(p):
+        return None
+    recs = json.load(open(p)).get("records") or []
+    return dict({k: sum(r["status"] == k for r in recs) for k in ("found", "not_found", "lookup_failed")},
+                beliefs_downgraded=sorted({r["belief"] for r in recs if r["status"] == "not_found"}))
+
+
 def score_question(run_dir) -> dict:
     t = _trial(run_dir)
     out = {"status": t.get("status", "not_started"), "engine": t.get("engine_ref"), "rerun_of": t.get("rerun_of"),
@@ -827,6 +1015,7 @@ def score_question(run_dir) -> dict:
                where_to_look={"top": wl, "decision_relevant": bool(wb.get("decision_relevant"))},
                failure_modes=failure_modes(hs, seed, wm, t.get("context")),
                seed_refusals=(t.get("seed") or {}).get("refusals") or [],
+               citations=_citations(run_dir),
                track_record={k: (wm.get("track_record") or {}).get(k) for k in ("confirmed", "contradicted",
                                                                                  "inconclusive", "untestable",
                                                                                  "share_confirmed")})
@@ -848,6 +1037,7 @@ def score(trials_root) -> dict:
     tot = {"written": 0, "testable": 0, "circular": 0, "post_hoc": 0, "by_status": {}}
     conf = {c: {"supported": 0, "refuted": 0, "other": 0} for c in ("low", "medium", "high")}
     fm, wtl = {}, {"decision_relevant": 0, "questions": 0}
+    cit = {"found": 0, "not_found": 0, "lookup_failed": 0, "questions_checked": 0}
     sup = {q["rerun_of"]: i for i, q in Q.items() if q.get("rerun_of") and q["status"] == "complete"}
     for i, q in Q.items():
         if i in sup:                    # an earlier run of a question rerun under newer rules: listed, not scored
@@ -868,6 +1058,10 @@ def score(trials_root) -> dict:
             fm[m]["count"] += len(v)
             fm[m]["questions"].append(i)
         wtl["questions"] += q["where_to_look"]["top"] is not None
+        if q.get("citations"):
+            cit["questions_checked"] += 1
+            for k in ("found", "not_found", "lookup_failed"):
+                cit[k] += q["citations"][k]
         wtl["decision_relevant"] += q["where_to_look"]["decision_relevant"]
     for c in conf.values():
         n = c["supported"] + c["refuted"]
@@ -878,7 +1072,7 @@ def score(trials_root) -> dict:
     S = {"schema": "trials.world_model/0", "producer": "scripts/world_model_trials.py", "written_at": _now(),
          "scoring": dict(SCORING, note="review heuristics of this scoring, not world-model rules; verdicts are the "
                                        "build's own"),
-         "overall": {"questions": statuses, "hypotheses": tot, "confidence": conf, "failure_modes": fm,
+         "overall": {"questions": statuses, "hypotheses": tot, "confidence": conf, "failure_modes": fm, "citations": cit,
                      "where_to_look": wtl,
                      "spend_usd": {"llm": round(sum(v["llm_usd"] for v in spend.values()), 4),
                                    "compute": round(sum(v["compute_usd"] for v in spend.values()), 4)}},
@@ -941,7 +1135,7 @@ def sdk_seed_fn():
     return fn
 
 
-def check_templates(qs, out_root, max_engine_runs=50) -> dict:
+def check_templates(qs, out_root, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> dict:
     """Each template as the run will use it (prepare, the engine step, world_model.load_sweep), with no LLM call and
     no push: a question that fails here fails before any spend."""
     from toolkit.analysis import world_model as W
@@ -997,7 +1191,7 @@ def main(argv=None) -> int:
             p.add_argument("--only", help="comma-separated question ids")
             p.add_argument("--batch", help="only questions with this batch value")
             p.add_argument("--limit", type=int)
-            p.add_argument("--max-engine-runs", type=int, default=50)
+            p.add_argument("--max-engine-runs", type=int, default=DEFAULT_MAX_ENGINE_RUNS)
     r = sub.choices["run"]
     r.add_argument("--total-cap-usd", type=float, required=True, help="the cap on cumulative spend in the ledger")
     r.add_argument("--task-cap-usd", type=float, default=2.0)
@@ -1634,6 +1828,25 @@ def _self_test() -> int:
                f"WT15d in a run the check sits between the seed and its registration (the registered seed carries it) "
                f"and the summary counts it: {S['questions']['toy0'].get('citations')}")
     tryit("WT15 citations", wt15)
+
+    def wt15e():
+        calls_ = {"s2": 0, "cr": 0}
+
+        def s2(q):
+            calls_["s2"] += 1
+            raise RateLimited("429")
+
+        def cr(q):
+            calls_["cr"] += 1
+            return [{"paperId": "doi:10.1/x", "title": "A trial of things in places", "year": 2019,
+                     "authors": [{"name": "Jane Doe"}], "source": "crossref"}]
+        look = Lookup(s2, cr, breaker=2)
+        c = "Doe J et al. A trial of things in places. Lancet 2019"
+        hits = [look(c) for _ in range(4)]
+        ok(all(citation_match(c, h[0]) for h in hits) and calls_ == {"s2": 2, "cr": 4} and look.source == "crossref",
+           f"WT15e when Semantic Scholar rate-limits, Crossref answers, and after {2} refusals in a row Semantic "
+           f"Scholar is not called again in this run: {calls_}, source {look.source}")
+    tryit("WT15e citation fallback", wt15e)
 
     def wt16():
         from agents.v2_sdk_tasks import seed_prompt_text

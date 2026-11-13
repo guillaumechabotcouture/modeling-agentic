@@ -89,6 +89,34 @@ def windows(spec) -> dict:
     return dict(out, **({BV.WINDOW: mw["window"]} if mw else {}))
 
 
+def independent_features(spec) -> tuple[list, dict]:
+    """(features, basis) of the signed spec's `analysis.emulator.independent_features: {features, basis, generator}`:
+    declared unit features of a synthetic units table that its generator draws independently of the table's other
+    columns. A declared fact about the data-generating process, never a statistical claim and never for measured
+    data: the generator (a file beside the spec) is named and fingerprinted. toolkit/analysis/world_model.py reads the
+    design's independent_features to settle conditional claims. A feature that is not a declared design feature, a
+    missing basis or a missing generator is refused (ValueError)."""
+    import hashlib
+    from toolkit.analysis import features as FT
+    dec = (spec["analysis"].get("emulator") or {}).get("independent_features")
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    if not isinstance(dec, dict) or not isinstance(dec.get("features"), list) or not dec["features"]:
+        raise ValueError("analysis.emulator.independent_features: {features: [...], basis, generator}")
+    bad = [f for f in dec["features"] if f not in names]
+    if bad:
+        raise ValueError(f"analysis.emulator.independent_features: {bad} are not declared design features {names}")
+    if not str(dec.get("basis") or "").strip():
+        raise ValueError("analysis.emulator.independent_features.basis: how the generator draws them independently")
+    gen = str(dec.get("generator") or "").strip()
+    path = spec.resolve(gen) if gen else None
+    if not path or not os.path.isfile(path):
+        raise ValueError(f"analysis.emulator.independent_features.generator: {gen!r} is not a file beside the spec "
+                         "(the synthetic table's generator)")
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha}
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -148,6 +176,8 @@ def design(spec) -> tuple[dict, list[dict]]:
         d["prior_names"] = pnames
     if ext:
         d["design_ranges"] = ext          # parameters whose design box was widened to span decision-test values
+    if em.get("independent_features") is not None:     # only when declared, so other designs stay
+        d["independent_features"], d["independent_features_basis"] = independent_features(spec)
     if snames:                            # only with spec values a decision test varies, so other designs stay
         d["spec_value_names"], d["spec_value_ranges"] = snames, {k: list(sbox[k]) for k in snames}
     return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
