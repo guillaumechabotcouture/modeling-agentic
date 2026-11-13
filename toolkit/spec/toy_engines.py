@@ -17,11 +17,12 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from toolkit.engines.contract import ParamSpec, resolve_params  # noqa: E402
+from toolkit.engines.contract import EngineCard, ParamSpec, ToyEngine, resolve_params  # noqa: E402
 from toolkit.engines.empirical.engine import PackageRateEngine  # noqa: E402
 from toolkit.engines.hooks import ToyScheduleEngine  # noqa: E402
 
-REFS = ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")
+REFS = ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine",
+        "toolkit.spec.toy_engines:ToyDossierEngine")
 LOG_STATE = "toy_spec_log_root"      # the call log's root, registered by the self-test (never read from the environment)
 LOG_FILE = "calls.{pid}.jsonl"
 
@@ -93,3 +94,17 @@ class ToySpecRateEngine(PackageRateEngine):
         o.per_capita = {k: {g: v * p["scale"] for g, v in d.items()} for k, d in o.per_capita.items()}
         o.windows = {w: {m: v * p["scale"] for m, v in d.items()} for w, d in o.windows.items()}
         return o
+
+
+class ToyDossierEngine(ToyEngine):
+    """The toy engine whose component `a` declares decision inputs (the fitted effect eff_a and the unit attribute x;
+    none when a = 0), and `b` none, with its reason: the evidence dossier's self-tests (toolkit/spec/evidence_dossier.py,
+    toolkit/spec/signoff.py)."""
+
+    def describe(self) -> EngineCard:
+        c = super().describe()
+        return EngineCard(**dict(c.to_dict(), decision_inputs={
+            "a": {"inactive": [0], "inputs": [
+                {"kind": "parameter", "name": "eff_a", "why": "the relative reduction component a gives"},
+                {"kind": "unit_attribute", "name": "x", "why": "the transmission index the reduction acts on"}]},
+            "b": {"inputs": [], "none_reason": "toy: the effect of b is not checked against field data"}}))

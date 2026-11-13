@@ -4656,6 +4656,27 @@ def _self_test_sheet(ok) -> None:
     # resume flag is read as main.py's argparse reads it (an abbreviation, the last value wins).
     none_mode = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "SIGN",
                                      "signoff": "none"}).encode(), f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    # RC81 (F6 evidence dossier): the sheet and the signature bind the dossier the spec names; a launch refuses a
+    # run whose shipped dossier is not the one its sheet (at SIGN) or its sign-off (past SIGN) recorded
+    dspec, dos = b"spec: 1\nevidence: {dossier: evidence_dossier.yaml}\n", b"inputs: {}\n"
+
+    def sheet_d(sp, rc, ds):
+        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
+            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest(),
+             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest()}) + " -->\n").encode()
+    dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos,
+             f"{R}/decision_spec.signoff_sheet.md": sheet_d(dspec, rec, dos)}
+    d_fresh = stale_sheet_problems(tar_of(dbase), flags)
+    d_edit = stale_sheet_problems(tar_of({**dbase, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
+    signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest()}}).encode()
+    past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
+    p_ok = stale_sheet_problems(tar_of(past), flags)
+    p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    ok(d_fresh == [] and p_ok == [] and len(d_edit) == 1 and "evidence dossier" in d_edit[0] and len(d_gone) == 1
+       and len(p_edit) == 1 and "evidence dossier" in p_edit[0] and "sign" in p_edit[0],
+       f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
+       f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
     abbrev = stale_sheet_problems(stale_tar, ("--res", R))
     last = stale_sheet_problems(stale_tar, ("--resume", "runs/old", "--resume=" + R))
     ok(none_mode == [] and len(abbrev) == 1 and len(last) == 1 and "runs/old" not in last[0],

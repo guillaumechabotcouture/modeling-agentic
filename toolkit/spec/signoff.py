@@ -832,6 +832,74 @@ def _self_test() -> int:
                f"IG-S4 a sheet without its sources footer is refused: it predates source binding ({why[:90]})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"IG-S4 a sheet without its sources footer is refused: {type(e).__name__}: {e}")
+    # ED1-ED9 (F6 evidence dossier, owner decision 2026-11-12): no sign-off until every input that drives an option's
+    # effect has a checked, sourced entry; the sheet shows the dossier and the signature binds its bytes
+    from toolkit.spec import evidence_dossier as ED
+    _TOYS.enable_for_test()
+
+    def refusal(d):
+        try:
+            sign(d, "owner", note="n")
+            return ""
+        except ValueError as e:
+            return str(e)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            why = refusal(d)
+            ok("evidence dossier" in why and "parameter:eff_a" in why and status(d) == "awaiting",
+               f"ED1 a spec whose options need decision inputs and that has no dossier is refused, listing them: {why}")
+            raw = yaml.safe_load(open(os.path.join(d, SPEC)))
+            raw["evidence"] = {"dossier": "evidence_dossier.yaml"}
+            yaml.safe_dump(raw, open(os.path.join(d, SPEC), "w"), sort_keys=False)
+            why = refusal(d)
+            ok("evidence_dossier.yaml" in why and "does not exist" in why,
+               f"ED1b a dossier the spec names but that does not exist is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            e = ED.toy_entries()
+            e.pop("unit_attribute:x")
+            ED.toy_dossier_spec(d, entries=e)
+            why = refusal(d)
+            ok("unit_attribute:x" in why and status(d) == "awaiting", f"ED2 an uncovered input is refused by name: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            e = ED.toy_entries()
+            e["unit_attribute:x"] = {"model_value": "", "model_source": "", "chosen": {}}
+            ED.toy_dossier_spec(d, entries=e)
+            why = refusal(d)
+            ok("unit_attribute:x" in why and "model_value" in why, f"ED3 a blank entry is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            open(os.path.join(d, "evidence_dossier.yaml"), "w").write("inputs: [unclosed\n")
+            why = refusal(d)
+            ok("evidence_dossier.yaml" in why and "parse" in why, f"ED9 an unparseable dossier is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            write_sheet(d)
+            md = open(os.path.join(d, SHEET)).read()
+            sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
+            ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.6" in sec
+               and "DT1" in sec and "no data" in sec and "0.5" in sec,
+               f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
+               f"test): {sec[:600]!r}")
+            src = sheet_sources(md) or {}
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after the sheet\n")
+            why = refusal(d)
+            ok(isinstance(src.get("evidence_dossier_sha256"), str) and "stale" in why and status(d) == "awaiting",
+               f"ED7 a sheet generated before a dossier edit cannot authorise the sign-off: {why}")
+            write_sheet(d)
+            rec = sign(d, "owner", note="n")
+            ok(status(d) == "signed" and rec["sha256"].get("evidence_dossier.yaml"),
+               f"ED4 a complete dossier (with a 'no data' entry and its borrowing rule) signs and its hash is recorded: "
+               f"{sorted(rec['sha256'])}")
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after sign-off\n")
+            ok(status(d) == "changed" and dossier_changed(d, _spec_record(d)) == ["evidence_dossier.yaml"],
+               f"ED6 a dossier edit after sign-off makes the signature stale: {status(d)}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
+            ok(refusal(d) == "" and status(d) == "signed",
+               "ED8 a spec whose options use no component with decision inputs signs with no dossier")
+    except Exception as e:  # noqa: BLE001 -- before the dossier exists (step α) this is the failure
+        ok(False, f"ED1-ED9 evidence dossier sign-off: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

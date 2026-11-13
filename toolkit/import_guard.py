@@ -41,7 +41,8 @@ _TEST_MODULES: dict = {k: set() for k in POLICIES}
 # references can be enabled, and only by code in a self-test process (allow_test_refs); no file and no environment
 # variable is read (Codex P1 on #133: an agent-set environment must enable nothing). The worker processes a self-test
 # starts receive the registration explicitly, as their pool initializer's argument (pool_kwargs, init_worker).
-TEST_ONLY_REFS = {"engine": ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine")}
+TEST_ONLY_REFS = {"engine": ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine",
+                             "toolkit.spec.toy_engines:ToyDossierEngine")}
 _TEST_REFS: set = set()          # "kind|ref", this process only
 _TEST_STATE: dict = {}           # plain values the self-test hands its workers with the registration (toy log root)
 ENGINE_METHODS = ("describe", "parameters", "run")      # the Engine contract (toolkit/engines/contract.py)
