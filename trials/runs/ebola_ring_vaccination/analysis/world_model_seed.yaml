@@ -1,0 +1,233 @@
+beliefs:
+- id: B1
+  mechanism: Ring vaccination added from week 20 averts a large share of the 2026 infections that tracing alone
+    leaves, because the rVSV-ZEBOV ring trial showed near-complete protection of vaccinated contacts and an Ebola
+    epidemic near R=1 under tracing is pushed below threshold by a further multiplier on R_t
+  about:
+    package: ring
+  direction: reduces
+  magnitude:
+    band:
+    - 0.4
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Henao-Restrepo AM et al. Efficacy and effectiveness of an rVSV-vectored vaccine in preventing Ebola
+      virus disease: final results from the Guinea ring vaccination, open-label, cluster-randomised trial (Ebola
+      Ca Suffit!). Lancet 2017'
+    location: Results, primary outcome (vaccine efficacy 100%, 95% CI 68.9-100); Table 2
+  - citation: Kucharski AJ et al. Effectiveness of Ring Vaccination as Control Strategy for Ebola Virus Disease.
+      Emerging Infectious Diseases 2016
+    location: Results and Figure 3 (ring vaccination controls outbreaks only alongside isolation; effect depends
+      on contact-tracing coverage); location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 2
+    not_found: 0
+    lookup_failed: 0
+- id: B2
+  mechanism: 'Districts with a larger starting seed are further along their epidemic by week 20, so a smaller share
+    of their 2026 infections remains to be averted: the relative reduction falls with seed'
+  about:
+    package: ring
+    feature: seed (calibration scale)
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: WHO Ebola Response Team. Ebola Virus Disease in West Africa - The First 9 Months of the Epidemic and
+      Forward Projections. New England Journal of Medicine 2014
+    location: 'Table 2 (R0 about 1.5-2.0, serial interval about 15 days): roughly 10 generations elapse before week
+      20'
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proceedings of the Royal Society B 2007
+    location: Equations 2.7-2.9 (renewal-equation growth)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: medium
+    found: 1
+    not_found: 1
+    lookup_failed: 0
+- id: B3
+  mechanism: 'Absolute infections averted per resident (and so net benefit per US$) rise with the seed share: burden
+    scales with the seed far faster than the relative reduction falls, so high-seed districts get ring vaccination
+    first and low-seed districts may not repay US$2 per resident'
+  about:
+    pair:
+    - ring
+    - none
+  direction: flips
+  conditions:
+  - feature: seed (calibration scale)
+    range:
+    - -12.5
+    - -10.0
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proceedings of the Royal Society B 2007
+    location: Equations 2.7-2.9; the flip location depends on the withheld shadow price and is a guess
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B4
+  mechanism: 'Population size does not change the relative reduction: the seed is a share of population and the
+    renewal model is scale-free in N; population only sets cost and absolute size'
+  about:
+    package: ring
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Wallinga J, Lipsitch M. How generation intervals shape the relationship between growth rates and reproductive
+      numbers. Proceedings of the Royal Society B 2007
+    location: Equations 2.7-2.9 (growth and final size depend on R and the generation interval, not N)
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B5
+  mechanism: Ring vaccination reaches only traced contacts, so its relative reduction rises with contact-tracing
+    coverage (if the engine reads coverage; the card lists only N, s0 and seed as unit attributes, so it may not)
+  about:
+    package: ring
+    feature: contact_coverage
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: Kucharski AJ et al. Effectiveness of Ring Vaccination as Control Strategy for Ebola Virus Disease.
+      Emerging Infectious Diseases 2016
+    location: Figure 3 (control depends on the share of contacts traced); location approximate
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: low
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+- id: B6
+  mechanism: The larger the engine's ring effect multiplier, the larger the share of infections averted (monotone,
+    near-proportional while R_t stays above 1 under the comparator)
+  about:
+    package: ring
+    feature: effect:ring
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Henao-Restrepo AM et al. Efficacy and effectiveness of an rVSV-vectored vaccine in preventing Ebola
+      virus disease: final results from the Guinea ring vaccination, open-label, cluster-randomised trial (Ebola
+      Ca Suffit!). Lancet 2017'
+    location: Table 2 (individual efficacy; population effect depends on ring coverage)
+  confidence: high
+  decision_relevant: false
+  citation_check:
+    confidence_claimed: high
+    found: 1
+    not_found: 0
+    lookup_failed: 0
+open_questions:
+- id: Q1
+  question: What R under contact tracing and isolation does the spec assume? Near 1 makes the 2026 burden small
+    and seed-dependent; well above 1 makes districts exhaust susceptibles and shrinks what ring vaccination can
+    avert after week 20.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: What population-level R multiplier does the spec's ring effect represent (trial individual efficacy
+    near 100% times ring coverage and delay to vaccination)?
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Does contact_coverage enter the engine at all (the card's unit attributes are N, s0 and seed)?
+  beliefs:
+  - B5
+  decision_relevant: false
+- id: Q4
+  question: What shadow price (infections per US$) is declared? It sets the seed level below which ring vaccination
+    does not repay its cost.
+  beliefs:
+  - B3
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Ring vaccination averts 40-95% of 2026 infections relative to tracing only in at least 70% of points
+  test:
+    kind: effect_band
+    package: ring
+    band:
+    - 0.4
+    - 0.95
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: The relative reduction from ring vaccination decreases with the starting seed
+  test:
+    kind: effect_direction
+    package: ring
+    feature: seed (calibration scale)
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: In districts with the highest seeds, ring beats tracing only on net benefit in at least 70% of points
+  test:
+    kind: paired_sign
+    a: ring
+    b: none
+    feature: seed (calibration scale)
+    range:
+    - -10.7
+    - -9.225282375141978
+    sign: positive
+    min_share: 0.7
+- id: H4
+  belief: B3
+  claim: The ring/none choice flips at an intermediate seed, between -12.5 and -10.0 on the calibration scale
+  test:
+    kind: flip_in
+    a: ring
+    b: none
+    feature: seed (calibration scale)
+    range:
+    - -12.5
+    - -10.0
+- id: H5
+  belief: B4
+  claim: Population has a negligible effect on the relative reduction (|rho| bound within 0.2)
+  test:
+    kind: effect_direction
+    package: ring
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H6
+  belief: B5
+  claim: The relative reduction increases with contact-tracing coverage
+  test:
+    kind: effect_direction
+    package: ring
+    feature: contact_coverage
+    direction: increases
+- id: H7
+  belief: B6
+  claim: The relative reduction increases with the engine's ring effect
+  test:
+    kind: effect_direction
+    package: ring
+    feature: effect:ring
+    direction: increases
