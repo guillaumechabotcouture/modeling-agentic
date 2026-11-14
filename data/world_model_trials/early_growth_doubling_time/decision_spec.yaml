@@ -1,0 +1,148 @@
+# World-model trial template (early_growth_doubling_time, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every town and number is synthetic. A new respiratory virus
+  with a generation interval of about one week (weekly grid 0.5, 0.4, 0.1) has been seeded in 24 towns at the start
+  of 2026, each with its own number of infections; the share of residents still susceptible is uncertain (50-100%).
+  Estimate for each town the epidemic growth rate and doubling time in the first weeks, the peak week and the 2026
+  attack rate, each with a 95% uncertainty interval, and the infections averted by a mild hygiene campaign from
+  week 6 (about US$0.50 per resident). Input file: units.csv (population, infections seeded as a share of the population).'
+decision_maker: regional public health office (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.renewal.engine:RenewalEngine
+  config:
+    dt: week
+    generation_interval:
+    - 0.5
+    - 0.4
+    - 0.1
+    transmissibility: constant
+    components:
+      hygiene:
+        start: 2026.11499
+        stop: 2027.0
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+    seed:
+      column: seed_share
+options:
+  populations:
+    total: pop
+  components:
+    hygiene: {}
+  packages:
+    none: []
+    hygiene:
+    - hygiene
+  engine_map:
+    hygiene:
+      hygiene: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: hygiene_cost
+    component: hygiene
+    value: 0.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - hygiene
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 5000000
+comparator:
+  package: none
+  text: no measure
+outcomes_reported:
+- infections
+engine_parameters:
+  effect:hygiene:
+    value: 0.1
+    range:
+    - 0.03
+    - 0.2
+    dist: uniform
+    basis: literature
+    source: 'Jefferson T et al. Physical interventions to interrupt or reduce the spread of respiratory viruses.
+      Cochrane Database Syst Rev 2023;1:CD006207 (hand hygiene: modest reductions in respiratory illness)'
+    reason: the cited range
+calibration:
+  method: emulator_inversion
+  attribute: s0
+  scale: linear
+  range:
+  - 0.5
+  - 1.0
+  target_column: s0
+  window:
+  - 2026.0
+  - 2026.1
+  metric: s_start
+  target_uncertainty:
+    region_sd_logit: 0.2
+  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share
+    spans R_eff = 2 s0 from 1.0 to 2.0'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 5
+    features:
+    - seed_share
+    - pop
+    independent_features:
+      features:
+      - seed_share
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: id
+    package: package
+    value: infections_averted
+  headline:
+    name: infections_averted
+    outcome: infections
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: assumed unit cost, not varied
+  - kind: emulator
+    reason: trial sweep only

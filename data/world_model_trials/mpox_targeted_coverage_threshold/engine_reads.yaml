@@ -1,0 +1,4 @@
+# Declared design features that reach the engine through derived bound attributes (group sizes N and the susceptible share by group, s0, built from them by the units table's derivation): read, not engine-blind.
+features_read_via:
+  high_share: n_groups
+  s0_high: s0_groups

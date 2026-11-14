@@ -1,0 +1,220 @@
+# World-model trial template (hepa_catchup_age_saturation, batch 3): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Hepatitis A is in transition
+  in 24 districts: fewer children are infected early, so more infections occur at older ages, when they are symptomatic.
+  A one-off catch-up campaign in 2026 can target YOUNG (children under five, 80% reached, US$0.60 per resident)
+  or WIDE (children under 15, 80% reached, US$1.60 per resident), or none. The budget is US$8 million. The basic
+  reproduction number is uncertain (2.5-4), mixing is homogeneous, and symptomatic shares rise with age (under 5
+  about 10%, 5-14 about 40%, 15 and older about 75%). Input file: units.csv (population; susceptible shares under
+  5, 5-14 and 15 and older from a synthetic serosurvey). Choose the target per district that maximises symptomatic
+  hepatitis A cases averted over the coming epidemic within the budget, report the total with a 95% uncertainty
+  interval, and state the rule (when does vaccinating children protect adults enough?).'
+decision_maker: national immunisation programme (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - u5
+    - a5_14
+    - a15p
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    components:
+      young:
+        kind: campaign
+        targets:
+        - u5
+        reach: 0.8
+        day: 0
+      wide:
+        kind: campaign
+        targets:
+        - u5
+        - a5_14
+        reach: 0.8
+        day: 0
+    tol: 1.0e-09
+    generation_interval:
+      seir:
+        latent_days: 28.0
+        infectious_days: 14.0
+    outcomes:
+    - cases
+horizon:
+  start: 0
+  stop: 3650
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    seed:
+      value: 1.0e-05
+      source: a few imported infections per district (assumption)
+    intro:
+      value: u5
+      source: infection enters through young children (assumption)
+    ratio:cases:
+      value:
+      - 0.1
+      - 0.4
+      - 0.75
+      source: 'symptomatic share of hepatitis A infection by age: under 10% below age 6, 40-50% at 6-14, 70-80%
+        in adults (Lemon SM. Type A viral hepatitis: new developments in an old disease. N Engl J Med 1985;313:1059-67)'
+  defaults_accepted:
+    reach:young: the configured reach (question text)
+    reach:wide: the configured reach (question text)
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    young:
+      group: target
+    wide:
+      group: target
+  packages:
+    none: []
+    young:
+    - young
+    wide:
+    - wide
+  engine_map:
+    young:
+      young: 1
+    wide:
+      wide: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: young_cost
+    component: young
+    value: 0.6
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - young
+  - id: wide_cost
+    component: wide
+    value: 1.6
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - wide
+objective:
+  outcome: cases
+  sense: avert
+  horizon:
+  - 0
+  - 3650
+  discounting: none
+constraints:
+  envelope_usd: 8000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- cases
+engine_parameters:
+  efficacy:young:
+    value: 0.93
+    range:
+    - 0.85
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: Irving GJ, Holden J, Yang R, Pope D. Hepatitis A immunisation in persons not previously exposed to hepatitis
+      A. Cochrane Database Syst Rev 2012;(7):CD009051 (inactivated vaccine efficacy against clinical hepatitis A
+      high, roughly 0.9 or more)
+    reason: protection of the susceptibles reached
+  efficacy:wide:
+    value: 0.93
+    range:
+    - 0.85
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: Irving GJ, Holden J, Yang R, Pope D. Hepatitis A immunisation in persons not previously exposed to hepatitis
+      A. Cochrane Database Syst Rev 2012;(7):CD009051 (inactivated vaccine efficacy against clinical hepatitis A
+      high, roughly 0.9 or more)
+    reason: protection of the susceptibles reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 12.5
+  - 20.0
+  target_column: r0_target
+  window:
+  - 0
+  - 3650
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); with homogeneous mixing R0
+    = q x contact_rate, so contact_rate over [12.5, 20.0] spans R0 2.5-4
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 64
+    holdout_share: 0.0
+    seed: 5
+    features: &id002
+    - s_u5
+    - s_5_14
+    - s_15p
+    - pop
+    independent_features:
+      features: *id002
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: cases_averted
+  headline:
+    name: total_cases_averted
+    outcome: cases

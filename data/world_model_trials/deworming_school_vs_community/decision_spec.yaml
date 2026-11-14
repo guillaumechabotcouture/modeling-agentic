@@ -1,0 +1,181 @@
+# World-model trial template (deworming_school_vs_community, batch 4): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A deworming programme
+  has US$1.5 million for 2026 across 24 districts. For each district choose: none; SCHOOL (school-based treatment
+  of children twice a year, US$0.25 per resident); COMMUNITY (community-wide treatment of all ages twice a year,
+  US$0.70 per resident). Input file: units.csv (population, soil-transmitted helminth infection prevalence from
+  a synthetic survey, school enrolment). Choose the strategy per district that maximises infection-years averted
+  in 2026 within the budget, report the total with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: national NTD programme (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - school
+    - community
+    outcome: sth
+    mode: trial_priors
+    outcomes:
+      sth:
+        baseline_source: 'synthetic district survey: soil-transmitted helminth infection prevalence (infection-years
+          per person-year)'
+    baseline:
+      measured_under: no_components
+      source: no deworming in the past two years (synthetic)
+    effects:
+      school:
+        sth:
+          rr: 0.7
+          range:
+          - 0.55
+          - 0.85
+          dist: triangular
+          measure: rate_ratio
+          source: 'Clarke NE, Clements ACA, Doi SA, et al. Differential effect of mass and targeted anthelmintic
+            drug administration on soil-transmitted helminth infection: a systematic review and meta-analysis. Lancet
+            2017;389:287-97 (community-wide treatment reduced infection more than child-targeted treatment)'
+          verified: false
+      community:
+        relative_to: school
+        sth:
+          rr: 0.75
+          range:
+          - 0.6
+          - 0.9
+          dist: triangular
+          measure: rate_ratio
+          source: 'Clarke NE, Clements ACA, Doi SA, et al. Differential effect of mass and targeted anthelmintic
+            drug administration on soil-transmitted helminth infection: a systematic review and meta-analysis. Lancet
+            2017;389:287-97 (community-wide treatment reduced infection more than child-targeted treatment)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: 'alternatives: community-wide treatment''s effect is relative to school-based; one strategy per district'
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        sth: inc
+options:
+  populations:
+    total: pop
+  components:
+    school:
+      group: strategy
+    community:
+      group: strategy
+  packages:
+    none: []
+    school:
+    - school
+    community:
+    - community
+  engine_map:
+    school:
+      school: 1
+    community:
+      community: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: school_cost
+    component: school
+    value: 0.25
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - school_delivery
+  - id: community_cost
+    component: community
+    value: 0.7
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - community_delivery
+objective:
+  outcome: sth
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 1500000
+comparator:
+  package: none
+  text: no programme
+outcomes_reported:
+- sth
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - school_enrol
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column, and keeps the first seed (here 4207) whose realized table has pairwise |Spearman| <= 0.2 among
+        them (realized maximum 0.180)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: sth_averted
+  headline:
+    name: total_sth_averted
+    outcome: sth

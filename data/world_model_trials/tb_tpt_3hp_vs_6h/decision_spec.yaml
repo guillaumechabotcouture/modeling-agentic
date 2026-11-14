@@ -1,0 +1,191 @@
+# World-model trial template (tb_tpt_3hp_vs_6h, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme has
+  US$2.5 million for 2026-2027 to offer TB preventive treatment to the household contacts of notified patients in
+  20 districts. For each district choose one regimen: none; 6H (six months of daily isoniazid); 3HP (three months
+  of weekly rifapentine and isoniazid). Costs per contact offered treatment: 6H US$25, 3HP US$45 (drugs, screening
+  and follow-up). Input file: units.csv (household contacts expected in 2026, TB incidence among contacts per person-year
+  without preventive treatment, HIV prevalence among adult contacts). Choose the regimens that maximise incident
+  TB cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval, and state
+  the decision rule.'
+decision_maker: national TB programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - h6
+    - hp3
+    outcome: tb
+    mode: trial_priors
+    outcomes:
+      tb:
+        baseline_source: synthetic contact-investigation records (TB incidence among household contacts)
+    baseline:
+      measured_under: no_components
+      source: no preventive treatment offered to contacts before 2026 (synthetic)
+    effects:
+      h6:
+        tb:
+          rr: 0.4
+          range:
+          - 0.31
+          - 0.52
+          dist: triangular
+          measure: risk_ratio
+          source: Smieja MJ et al. Isoniazid for preventing tuberculosis in non-HIV infected persons. Cochrane Database
+            Syst Rev 2000;(2):CD001363 (RR of active TB 0.40, 0.31-0.52)
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.03
+            source: placebo-arm TB risk over follow-up of a few percent (Smieja 2000)
+      hp3:
+        relative_to: h6
+        tb:
+          rr: 0.9
+          range:
+          - 0.6
+          - 1.2
+          dist: triangular
+          measure: risk_ratio
+          source: Sterling TR et al. Three months of rifapentine and isoniazid for latent tuberculosis infection.
+            N Engl J Med 2011;365:2155-66 (3HP non-inferior to 9H, higher completion; ratio against isoniazid derived,
+            wide)
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.03
+            source: placebo-arm TB risk over follow-up of a few percent (Smieja 2000)
+    combination:
+      rule: multiplicative
+      source: 'alternatives: 3HP''s effect is relative to 6H; one regimen per district'
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        tb: tb_rate
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    h6:
+      group: regimen
+    hp3:
+      group: regimen
+  packages:
+    none: []
+    h6:
+    - h6
+    hp3:
+    - hp3
+  engine_map:
+    h6:
+      h6: 1
+    hp3:
+      hp3: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: h6_cost
+    component: h6
+    value: 25.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - h6_delivery
+  - id: hp3_cost
+    component: hp3
+    value: 45.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - hp3_delivery
+objective:
+  outcome: tb
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 2500000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- tb
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - tb_rate
+    - hiv
+    - pop
+    independent_features:
+      features:
+      - tb_rate
+      - hiv
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: tb_averted
+  headline:
+    name: total_tb_averted
+    outcome: tb

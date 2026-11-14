@@ -1,0 +1,176 @@
+# World-model trial template (ntd_vl_irs_vs_acd, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every block and number is synthetic. A visceral leishmaniasis
+  elimination programme has US$1.2 million for 2026 in 24 endemic blocks. For each block choose one package: none;
+  IRS (two rounds of indoor residual spraying of houses and cattle sheds); ACD (house-to-house active case detection
+  with rapid diagnostic tests every six months); or IRS+ACD. Costs per resident: IRS US$1.50, ACD US$0.60. Input
+  file: units.csv (population, visceral leishmaniasis cases per resident in 2025, share of houses with mud walls).
+  Choose the packages that maximise cases averted in 2026 within the budget, report the total with a 95% uncertainty
+  interval, and state the decision rule.'
+decision_maker: national VL elimination programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - irs
+    - acd
+    outcome: cases
+    mode: trial_priors
+    outcomes:
+      cases:
+        baseline_source: synthetic 2025 VL case register (cases per resident)
+    baseline:
+      measured_under: no_components
+      source: routine passive case detection only, no IRS in 2025 (synthetic)
+    effects:
+      irs:
+        cases:
+          rr: 0.7
+          range:
+          - 0.45
+          - 0.95
+          dist: triangular
+          measure: rate_ratio
+          source: 'Joshi AB et al. Chemical and environmental vector control as a contribution to the elimination
+            of visceral leishmaniasis on the Indian subcontinent: cluster randomized controlled trials in Bangladesh,
+            India and Nepal. BMC Med 2009;7:54 (sandfly density reduced about 72% by IRS; the case ratio is derived
+            and wide)'
+          verified: false
+      acd:
+        cases:
+          rr: 0.85
+          range:
+          - 0.65
+          - 1.0
+          dist: triangular
+          measure: rate_ratio
+          source: 'assumption: earlier detection and treatment shortens the infectious period; no trial measured
+            its effect on incidence (wide range)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action (no trial tested the two together)
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        cases: vl_rate
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    irs: {}
+    acd: {}
+  packages:
+    generate: true
+  engine_map:
+    irs:
+      irs: 1
+    acd:
+      acd: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: irs_cost
+    component: irs
+    value: 1.5
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - irs_delivery
+  - id: acd_cost
+    component: acd
+    value: 0.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - acd_delivery
+objective:
+  outcome: cases
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 1200000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- cases
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - vl_rate
+    - mud_share
+    - pop
+    independent_features:
+      features:
+      - vl_rate
+      - mud_share
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: cases_averted
+  headline:
+    name: total_cases_averted
+    outcome: cases

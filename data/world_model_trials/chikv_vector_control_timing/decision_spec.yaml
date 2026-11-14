@@ -1,0 +1,179 @@
+# World-model trial template (chikv_vector_control_timing, batch 3): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A chikungunya season
+  is starting in 24 cities at the start of 2026, each with its own number of infections and its own share of residents
+  still susceptible (uncertain, 50-100%; R0 about 2). A city can run an eight-week vector-control campaign (space
+  spraying and source reduction) once: EARLY (weeks 4-12), PEAK (weeks 12-20, when cases are usually visible), or
+  none; either costs about US$2 per resident. The budget is US$20 million. Input file: units.csv (population, infections
+  at the start as a share of the population). Choose the timing per city that maximises infections averted in 2026
+  within the budget, report the total with a 95% uncertainty interval, and state the rule (what decides whether
+  control is better before or at the expected peak?).'
+decision_maker: city vector-control service (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.renewal.engine:RenewalEngine
+  config:
+    dt: week
+    generation_interval:
+    - 0.2
+    - 0.5
+    - 0.3
+    transmissibility: constant
+    components:
+      early:
+        start: 2026.07666
+        stop: 2026.229979
+      peak:
+        start: 2026.229979
+        stop: 2026.383299
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+    seed:
+      column: seed_share
+options:
+  populations:
+    total: pop
+  components:
+    early:
+      group: timing
+    peak:
+      group: timing
+  packages:
+    none: []
+    early:
+    - early
+    peak:
+    - peak
+  engine_map:
+    early:
+      early: 1
+    peak:
+      peak: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: early_cost
+    component: early
+    value: 2.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - early
+  - id: peak_cost
+    component: peak
+    value: 2.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - peak
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 20000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- infections
+engine_parameters:
+  effect:early:
+    value: 0.25
+    range:
+    - 0.1
+    - 0.4
+    dist: uniform
+    basis: literature
+    source: Esu E, Lenhart A, Smith L, Horstick O. Effectiveness of peridomestic space spraying with insecticide
+      on dengue transmission; systematic review. Trop Med Int Health 2010;15:619-31 (evidence on transmission effects
+      weak; reductions of transmission assumed 0.1-0.4 while spraying lasts)
+    reason: share of transmission prevented
+  effect:peak:
+    value: 0.25
+    range:
+    - 0.1
+    - 0.4
+    dist: uniform
+    basis: literature
+    source: Esu E, Lenhart A, Smith L, Horstick O. Effectiveness of peridomestic space spraying with insecticide
+      on dengue transmission; systematic review. Trop Med Int Health 2010;15:619-31 (evidence on transmission effects
+      weak; reductions of transmission assumed 0.1-0.4 while spraying lasts)
+    reason: share of transmission prevented
+calibration:
+  method: emulator_inversion
+  attribute: s0
+  scale: linear
+  range:
+  - 0.5
+  - 1.0
+  target_column: s0_survey
+  window:
+  - 2026.0
+  - 2026.1
+  metric: s_start
+  target_uncertainty:
+    region_sd_logit: 0.2
+  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share
+    spans R_eff = 2 s0 from 1.0 to 2.0'
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: id
+    package: package
+    value: infections_averted
+  headline:
+    name: infections_averted
+    outcome: infections

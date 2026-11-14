@@ -131,9 +131,127 @@ Limitations section that repeats each declaration in full with its required reme
 report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
 .claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
+SEED_FILE = "world_model_seed.yaml"       # the harness validates it and copies it to analysis/world_model_seed.yaml
+WORLD_MODEL_PY = os.path.join(_REPO, "toolkit", "analysis", "world_model.py")
+
+
+def seed_prompt_text() -> str:
+    """The world model's own documentation of its seed format and tests, read from toolkit/analysis/world_model.py's
+    docstring (from "Seed (YAML)" up to the paragraph on analysis/point.yaml), so the prompt never restates the
+    format. Missing markers fail closed."""
+    import ast
+    doc = ast.get_docstring(ast.parse(open(WORLD_MODEL_PY).read())) or ""
+    a, b = doc.find("Seed (YAML)"), doc.find("analysis/point.yaml is used only")
+    if a < 0 or b <= a:
+        raise RuntimeError(f"{WORLD_MODEL_PY}: its docstring no longer documents the seed format where expected")
+    common = COMMON.replace("{{", "{").replace("}}", "}")          # COMMON is a .format template: as delivered
+    return (common + """
+
+Task: write the world model's version 0 for this question, before any simulation: the modeller's working
+understanding of how the decision works, meant to be mostly right, not precise. {out_in} holds the question, the
+decision spec's options (each package and its components, the comparator, the primary outcome), the engine's card
+(mechanisms, components, notes) and the sweep the harness runs after you finish: its design features (the only
+names your tests may use), their ranges, the number of design points, which features the design samples
+independently of the others, and whether a shadow price and an optimised plan will exist. No results exist yet,
+and the harness refuses any read of analysis/ or of other runs: nothing you write can depend on a simulation
+output. The spec's values, the engine's effect values and priors and the input data values are withheld on
+purpose: the world model is built from literature and reasoning, then confronted with the simulation, never with its
+own inputs. In the run directory only {out_in} and your own seed file are readable; the repository's code and
+documentation (toolkit/, docs/, .claude/) are readable, its data/ and scripts/ are not.
+
+Write """ + SEED_FILE + """ in the world model's format, documented below by toolkit/analysis/world_model.py itself:
+- beliefs: the mechanisms that drive this decision, each with its direction, a rough magnitude band on a stated
+  scale (a band, never a point value), the conditions or branching points where the answer changes, roughly
+  located, its basis (literature: the citation and its table or page; data: a dataset of the run listed in
+  {out_in}, its file and column, never a file the harness writes such as {out_in}) and your confidence. Mark decision_relevant: true on the beliefs the choice turns on. Cite only
+  sources you know, with authors, journal and year; when unsure of a value or a location say so and set confidence
+  low; never invent a citation or a table.
+- open_questions: what is unknown and would change the choice if known.
+- hypotheses: 5 to 8, each tied to one belief and with a machine-checkable refutation test of one of the kinds
+  below, with explicit thresholds, naming only the packages and features listed in {out_in}. Each states what you
+  expect the sweep to show and what would refute it. Choose each threshold from the belief, never to make the
+  test easy to pass. Give every band as tight as the cited evidence supports: a band wider than the plausible
+  range makes its test lenient (it passes whatever the simulation shows), and a lenient test tests nothing.
+  Every literature citation is looked up after you finish (title, first author and year), so cite the paper's
+  title, first author and year exactly.
+- p: every hypothesis also states p, your probability between 0.02 and 0.98 that its claim holds in this sweep.
+  Be calibrated: of claims you give p 0.7, about 7 in 10 should hold. Each outcome is scored against its p.
+  Each claim competes with its alternatives: an effect_direction claim with the other direction and "no material
+  effect", any other claim with "does not hold". An effect_direction hypothesis may also state weights, e.g.
+  {increases: 0.2, decreases: 0.5, no material effect: 0.3}: all three, summing to 1, its own claim's weight equal
+  to p. Without weights the remainder 1 - p is split equally.
+- A feature the sweep does not sample independently (not in independent_features) needs an adjusted test: an
+  effect_direction test on it states adjust_for (the independent features to adjust for); a flip_in test uses an
+  independent feature. Refused otherwise.
+- When {out_in} carries prior_world_model (earlier questions' belief tables), start from it. Each claim set lists
+  its competing claims, their prior, engine and world weights, and its evidence log: one row per simulation result,
+  with the claim it favours, a likelihood ratio (10 for a decided test, at most 2 for an undecided one leaning toward
+  the sign of its estimate) and the observed rho, interval and p, including inconclusive results. check_items name
+  where our simulations and the literature disagree. Carry forward what held, weigh what leaned, revise what was
+  refuted (never repeat a refuted claim unless this question's setting differs, and then say how), and turn open
+  questions and check items into claims this sweep can test. The harness registers the
+  hypotheses before the sweep runs (you do not write registered_at).
+
+""" + doc[a:b].strip() + """
+
+Then write {out} = {"ok": true, "notes": "<one line: what drives the choice, in your view>"}.""")
+
+
+# as a .format template: every brace literal except the two fields the task method fills
+PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}", "}}") \
+    .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",)}
+        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
+        "seed_world_model": (SEED_FILE,)}
+
+
+SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
+SEED_REPO_READABLE = ("toolkit", "docs", ".claude")
+
+
+def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
+    """Why the world-model seed task may not run this Read, Grep or Glob: the seed exists before any result, so
+    nothing under the run's analysis/ (the batch, the world model, the hypotheses) and nothing in another run is
+    readable, and a search that would reach analysis/ is refused. The repository's code and docs are readable (after
+    the evaluation answer-key rules)."""
+    import glob as _glob
+    why = _search_denied(tool, ti, run_dir)
+    if why:
+        return why
+    root = os.path.realpath(run_dir)
+    target = str(ti.get("file_path") or ti.get("path") or "")
+    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
+    if tool == "Glob" and ti.get("pattern"):
+        pat = str(ti["pattern"]).replace("\\", "/")
+        lit = []
+        for part in pat.split("/"):
+            if _glob.has_magic(part):
+                break
+            lit.append(part)
+        if lit:
+            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pat.startswith("/") else
+                                    "/" + "/".join(lit).lstrip("/"))
+        if ".." in pat.split("/"):
+            return "the seed task may not search outside its run directory"
+    analysis = os.path.join(root, "analysis")
+    if _within(base, analysis):
+        return "the world-model seed is written before any result: analysis/ is not readable"
+    repo = os.path.realpath(_REPO)
+    if not _within(base, root) and _within(base, repo) and not _within(root, base):
+        # the repository's code and documentation only: no run, no template, no input data, no driver files
+        rel = os.path.relpath(base, repo).replace(os.sep, "/")
+        if rel.split("/")[0] not in SEED_REPO_READABLE:
+            return (f"the seed task may read the repository's {', '.join(SEED_REPO_READABLE)} only: inputs, "
+                    "templates and runs are withheld")
+        return None
+    if not _within(base, root):
+        return "the seed task may read only its run directory's input and the repository's code"
+    rel = os.path.relpath(base, root).replace(os.sep, "/")
+    if rel not in SEED_RUN_READABLE:
+        return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
+                "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
+    return None
 
 
 def _answer_key(target: str, run_dir: str) -> bool:
@@ -302,7 +420,7 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                why = _search_denied(name, ti, self.run_dir)
+                why = (_seed_read_denied if kind == "seed_world_model" else _search_denied)(name, ti, self.run_dir)
                 if why:
                     return enforcement.deny_output(why)
             return {}
@@ -421,6 +539,17 @@ class SdkTasks:
               "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
                              OWNS["write"])
+
+    def seed_world_model(self, context, feedback=None):
+        """The world model's version 0 (docs/design/v2-progressive-steps.md §4): beliefs and 5-8 pre-registrable
+        hypotheses written before any result exists, to world_model_seed.yaml. `context`: the question, the options,
+        the engine card and the sweep's design features (no results). `feedback`: the harness's refusal, for the one
+        repair."""
+        inp = self._input(context)
+        fb = ("\n\nThis is a repair: the harness refused your " + SEED_FILE + ". These are all of its errors; fix "
+              "every one and keep the rest of your world model:\n- " + "\n- ".join(feedback)) if feedback else ""
+        return self._session("seed_world_model", PROMPTS["seed_world_model"].format(out_in=inp, out=OUT) + fb,
+                             "Write the world-model seed.", OWNS["seed_world_model"])
 
 
 def _self_test() -> int:
@@ -646,6 +775,9 @@ def _self_test() -> int:
                                  d, {"k": "{v}"}),
             "write": lambda: t.write(d, "accepted"),
         }
+        # first, so plan_fixes' packet is the last _task_input.json written (PF4 reads it)
+        calls = dict({"seed_world_model": lambda: t.seed_world_model({"question": "Q?", "packages": {"none": []}},
+                                                                     ["fb {x}"])}, **calls)
         for k, call in calls.items():
             try:
                 call()
@@ -660,6 +792,44 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+    # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
+    # readable, one owned output outside the harness's analysis/ tree.
+    try:
+        import ast
+        wm_doc = ast.get_docstring(ast.parse(open(os.path.join(_REPO, "toolkit", "analysis", "world_model.py")).read()))
+        sp = seed_prompt_text()
+        ok("Seed (YAML)" in sp and "effect_band {package, band, min_share, where?}" in sp
+           and wm_doc[wm_doc.index("Tests (each declares"):wm_doc.index("Statuses:")] in sp and PRINCIPLES in sp,
+           "SW1 the seed prompt carries the world model's own seed and test documentation (read from world_model.py) "
+           "and the decision design principles")
+        ok("results" in sp.lower() and "5 to 8" in sp and SEED_FILE in sp,
+           "SW1b the seed prompt says no results are readable, asks for 5 to 8 hypotheses and names its output file")
+        with tempfile.TemporaryDirectory() as d:
+            rd = os.path.join(d, "run")
+            os.makedirs(os.path.join(rd, "analysis", "batch"))
+            got = {
+                "results": _seed_read_denied("Read", {"file_path": "analysis/batch/results.jsonl"}, rd),
+                "analysis glob": _seed_read_denied("Glob", {"pattern": "analysis/**"}, rd),
+                "grep root": _seed_read_denied("Grep", {"pattern": "rho"}, rd) is None,
+                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd),
+                "input": _seed_read_denied("Read", {"file_path": "_task_input.json"}, rd) is None,
+                "sibling run": _seed_read_denied("Read", {"file_path": os.path.join(d, "other", "analysis",
+                                                                                     "hypotheses.yaml")}, rd),
+                "climb": _seed_read_denied("Glob", {"pattern": "../**/world_model.yaml"}, rd),
+                "repo world model": _seed_read_denied("Read", {"file_path": os.path.join(
+                    _REPO, "toolkit", "analysis", "world_model.py")}, rd) is None,
+            }
+            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "input": True, "sibling run": True,
+                    "climb": True, "repo world model": True}
+            ok({k: bool(v) for k, v in got.items()} == want,
+               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) or the spec, and "
+               f"can read its input and the repository's code: {got}")
+            # a recursive search at the run root would reach analysis/: refused unless it is confined elsewhere
+            ok(_allowed(SEED_FILE, rd, OWNS["seed_world_model"]) is None
+               and _allowed("analysis/world_model_seed.yaml", rd, OWNS["seed_world_model"]) is not None,
+               "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
+    except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
+        ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

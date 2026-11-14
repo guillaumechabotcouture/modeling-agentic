@@ -1,0 +1,179 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated for this
+  test; none describes a real place. A TB programme has US$1.1 million for one round of active case finding among high-risk
+  adults in 10 districts in 2026. For each district choose one screening algorithm: none; SYM (symptom screening, with Xpert
+  MTB/RIF Ultra for people with presumptive TB); CXR (chest X-ray for everyone screened, with Xpert if the X-ray is abnormal).
+  A round reaches 70% of each district''s target population, and costs are per person screened. Input files: data/evals/tb_acf/districts.csv
+  (target population), data/evals/tb_acf/acf_records_2022_2025.csv (people screened and bacteriologically confirmed cases
+  detected, by district, year and algorithm; assume the prevalence of undiagnosed TB in the target population was stable over
+  2022-2025 and is unchanged in 2026), data/evals/tb_acf/algorithm_costs.csv, data/evals/tb_acf/national_reference_yields.csv.
+  Choose the algorithms that maximise bacteriologically confirmed TB cases detected within the budget, report the total with
+  a 95% uncertainty interval, and state the decision rule. Deliverables: allocation_optimized.csv in the run directory with
+  columns district, package (none, SYM or CXR) and cases_detected; and the uncertainty analysis must report the total as an
+  output named total_cases_detected.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - sym
+    - cxr
+    outcome: undetected
+    mode: trial_priors
+    outcomes:
+      undetected:
+        baseline_source: 'derived: prevalence of undiagnosed bacteriologically confirmed TB = mean CXR-round yield per person
+          screened in data/evals/tb_acf/acf_records_2022_2025.csv / CXR algorithm sensitivity 0.83'
+    baseline:
+      measured_under: no_components
+      source: no ACF round in 2026 before the decision
+    effects:
+      sym:
+        undetected:
+          rr: 0.69
+          range:
+          - 0.58
+          - 0.79
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: share left undetected = 1 - reach 0.7 x algorithm sensitivity 0.44 (0.3-0.6): about half of bacteriologically
+            confirmed TB is symptom-negative (Frascella et al. 2021, Clin Infect Dis 73:e830) and Xpert Ultra sensitivity
+            about 0.88 (Dorman et al. 2018, Lancet Infect Dis 18:76)'
+          verified: false
+      cxr:
+        undetected:
+          rr: 0.42
+          range:
+          - 0.37
+          - 0.51
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - reach 0.7 x algorithm sensitivity 0.83 (0.7-0.9): CXR any abnormality sensitivity about 0.95
+            (WHO 2021 consolidated guidelines on TB, Module 2: screening) x Xpert Ultra about 0.88 (Dorman et al. 2018)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: 'alternatives: one algorithm per district'
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        undetected: prev_undiag
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    sym:
+      group: algorithm
+    cxr:
+      group: algorithm
+  packages:
+    none: []
+    sym:
+    - sym
+    cxr:
+    - cxr
+  engine_map:
+    sym:
+      sym: 1
+    cxr:
+      cxr: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: sym_screen
+    component: sym
+    value: 2.8
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - sym_screen
+    share: 0.7
+  - id: cxr_screen
+    component: cxr
+    value: 7.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - cxr_screen
+    share: 0.7
+objective:
+  outcome: undetected
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 1100000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- undetected
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - prev_undiag
+    - pop
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: undetected_averted
+  headline:
+    name: total_undetected_averted
+    outcome: undetected

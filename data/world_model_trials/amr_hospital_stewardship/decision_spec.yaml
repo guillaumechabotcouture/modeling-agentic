@@ -1,0 +1,181 @@
+# World-model trial template (amr_hospital_stewardship, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every hospital and number is synthetic. A health ministry
+  has US$3 million for 2026 antibiotic stewardship in 20 hospitals. For each hospital choose one policy: none; AUDIT
+  (prospective audit and feedback by a stewardship team); RESTRICT (restrictive formulary with pre-authorisation
+  of broad-spectrum agents). Costs per admission: AUDIT US$6, RESTRICT US$4. Input file: units.csv (admissions per
+  year, hospital-onset Clostridioides difficile infections per admission in 2025, share of admissions to surgical
+  wards). Choose the policies that maximise C. difficile infections averted in 2026 within the budget, report the
+  total with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: national antimicrobial stewardship programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - audit
+    - restrict
+    outcome: cdi
+    mode: trial_priors
+    outcomes:
+      cdi:
+        baseline_source: synthetic 2025 hospital-onset C. difficile surveillance (infections per admission)
+    baseline:
+      measured_under: no_components
+      source: no stewardship programme in 2025 (synthetic)
+    effects:
+      audit:
+        cdi:
+          rr: 0.8
+          range:
+          - 0.6
+          - 1.0
+          dist: triangular
+          measure: rate_ratio
+          source: 'Baur D et al. Effect of antibiotic stewardship on the incidence of infection and colonisation
+            with antibiotic-resistant bacteria and Clostridium difficile infection: a systematic review and meta-analysis.
+            Lancet Infect Dis 2017;17:990-1001 (pooled CDI incidence ratio 0.68, 0.53-0.88 across programme types;
+            audit and feedback alone taken as weaker, wide)'
+          verified: false
+      restrict:
+        cdi:
+          rr: 0.68
+          range:
+          - 0.53
+          - 0.88
+          dist: triangular
+          measure: rate_ratio
+          source: Baur D et al. Lancet Infect Dis 2017;17:990-1001 (pooled CDI incidence ratio 0.68, 0.53-0.88)
+          verified: false
+    combination:
+      rule: multiplicative
+      source: 'alternatives: one policy per hospital'
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        cdi: cdi_rate
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    audit:
+      group: policy
+    restrict:
+      group: policy
+  packages:
+    none: []
+    audit:
+    - audit
+    restrict:
+    - restrict
+  engine_map:
+    audit:
+      audit: 1
+    restrict:
+      restrict: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: audit_cost
+    component: audit
+    value: 6.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - audit_delivery
+  - id: restrict_cost
+    component: restrict
+    value: 4.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - restrict_delivery
+objective:
+  outcome: cdi
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- cdi
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - cdi_rate
+    - surgical_share
+    - pop
+    independent_features:
+      features:
+      - cdi_rate
+      - surgical_share
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: cdi_averted
+  headline:
+    name: total_cdi_averted
+    outcome: cdi

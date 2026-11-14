@@ -44,3 +44,6 @@ bundle.enc
 
 # Licensed run inputs (DHS/MAP-derived): never committed to this public repo; see cloud/nigeria_gf13_inputs.py
 /data/nigeria_gf13/
+
+# World-model trials (scripts/world_model_trials.py): run data stays local; ledgers and seeds go to branch wm-trials
+/trials/

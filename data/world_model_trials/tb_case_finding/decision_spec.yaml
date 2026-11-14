@@ -1,0 +1,172 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. A TB programme has US$12 million
+  for 2026-2028 case-finding packages in 24 districts. For each district choose one package: none; CACF (community-wide active
+  case finding: annual door-to-door screening with sputum Xpert for everyone who can produce sputum, three rounds); HHC (enhanced
+  household-contact investigation of every notified case); or CACF+HHC. Costs: CACF US$4.00 per resident per round; HHC US$0.40
+  per resident per year. Input file: units.csv (population, prevalence of bacteriologically confirmed pulmonary TB from a
+  2024 synthetic survey, HIV prevalence among adults). Choose the packages that maximise the reduction in prevalent bacteriologically
+  confirmed TB by the end of 2028 within the budget, report it with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - cacf
+    - hhc
+    outcome: prevalent
+    mode: trial_priors
+    outcomes:
+      prevalent:
+        baseline_source: synthetic 2024 prevalence survey (bacteriologically confirmed)
+    baseline:
+      measured_under: no_components
+      source: no ACF and no enhanced contact investigation before 2026 (synthetic)
+    effects:
+      cacf:
+        prevalent:
+          rr: 0.56
+          range:
+          - 0.4
+          - 0.78
+          dist: triangular
+          measure: rate_ratio
+          source: 'ACT3: Marks et al. 2019, N Engl J Med 381:1347 (community-wide screening, Vietnam; prevalence ratio 0.56,
+            0.40-0.78, after three annual rounds)'
+          verified: false
+          note: a prevalence ratio applied to prevalence (the outcome is prevalence)
+      hhc:
+        prevalent:
+          rr: 0.82
+          range:
+          - 0.64
+          - 1.04
+          dist: triangular
+          measure: rate_ratio
+          source: 'ZAMSTAR: Ayles et al. 2013, Lancet 382:1183 (household intervention; adjusted prevalence ratio 0.82, 0.64-1.04)'
+          verified: false
+          note: a prevalence ratio applied to prevalence
+    combination:
+      rule: multiplicative
+      source: independent action (no trial tested the two together)
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        prevalent: prev
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    cacf: {}
+    hhc: {}
+  packages:
+    generate: true
+  engine_map:
+    cacf:
+      cacf: 1
+    hhc:
+      hhc: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: cacf_rounds
+    component: cacf
+    value: 12.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - cacf_rounds
+  - id: hhc_years
+    component: hhc
+    value: 1.2
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - hhc_years
+objective:
+  outcome: prevalent
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 12000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- prevalent
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - prev
+    - hiv
+    independent_features:
+      features:
+      - prev
+      - hiv
+      basis: generate_units.py draws prev log-uniform and hiv uniform, independently of each other and of pop (24 synthetic
+        districts)
+      generator: generate_units.py
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: prevalent_averted
+  headline:
+    name: total_prevalent_averted
+    outcome: prevalent

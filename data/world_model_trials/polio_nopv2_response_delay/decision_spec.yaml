@@ -1,0 +1,189 @@
+# World-model trial template (polio_nopv2_response_delay, batch 4): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Circulating vaccine-derived
+  type 2 poliovirus has been detected in 24 districts in January 2026. Each district can run two nOPV2 campaign
+  rounds starting in week 4 (FAST, with pre-positioned vaccine, US$1.60 per resident) or in week 12 (STANDARD, after
+  the usual approvals and shipment, US$1.10 per resident), or no campaign. Type 2 immunity is uncertain. The budget
+  is US$15 million. Input file: units.csv (population, poliovirus infections at the start of 2026 as a share of
+  the population). Choose the option per district that maximises type 2 poliovirus infections averted in 2026 within
+  the budget, report the total with a 95% uncertainty interval, and say how much the eight weeks of delay cost and
+  where.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.renewal.engine:RenewalEngine
+  config:
+    dt: week
+    generation_interval:
+    - 0.15
+    - 0.35
+    - 0.3
+    - 0.15
+    - 0.05
+    transmissibility: constant
+    components:
+      fast:
+        start: 2026.07666
+        stop: 2027.0
+      standard:
+        start: 2026.229979
+        stop: 2027.0
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+    seed:
+      column: seed_share
+options:
+  populations:
+    total: pop
+  components:
+    fast:
+      group: campaign
+    standard:
+      group: campaign
+  packages:
+    none: []
+    fast:
+    - fast
+    standard:
+    - standard
+  engine_map:
+    fast:
+      fast: 1
+    standard:
+      standard: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: fast_cost
+    component: fast
+    value: 1.6
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - fast
+  - id: standard_cost
+    component: standard
+    value: 1.1
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - standard
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 15000000
+comparator:
+  package: none
+  text: no measure
+outcomes_reported:
+- infections
+engine_parameters:
+  effect:fast:
+    value: 0.6
+    range:
+    - 0.4
+    - 0.75
+    dist: uniform
+    basis: literature
+    source: 'novel OPV2 candidates gave type 2 seroconversion comparable to monovalent OPV2 in children and infants
+      (Saez-Llorens X, Bandyopadhyay AS, Gast C et al. Safety and immunogenicity of two novel type 2 oral poliovirus
+      vaccine candidates compared with a monovalent type 2 oral poliovirus vaccine in children and infants: two
+      clinical trials. Lancet 2021;397:27-38); with two rounds reaching 70-90% of children under five, and intestinal
+      immunity incomplete, the reduction in transmission is assumed 0.4-0.75'
+    reason: the derived range
+  effect:standard:
+    value: 0.6
+    range:
+    - 0.4
+    - 0.75
+    dist: uniform
+    basis: literature
+    source: 'novel OPV2 candidates gave type 2 seroconversion comparable to monovalent OPV2 in children and infants
+      (Saez-Llorens X, Bandyopadhyay AS, Gast C et al. Safety and immunogenicity of two novel type 2 oral poliovirus
+      vaccine candidates compared with a monovalent type 2 oral poliovirus vaccine in children and infants: two
+      clinical trials. Lancet 2021;397:27-38); with two rounds reaching 70-90% of children under five, and intestinal
+      immunity incomplete, the reduction in transmission is assumed 0.4-0.75'
+    reason: the derived range
+calibration:
+  method: emulator_inversion
+  attribute: s0
+  scale: linear
+  range:
+  - 0.4
+  - 1.0
+  target_column: s0
+  window:
+  - 2026.0
+  - 2026.1
+  metric: s_start
+  target_uncertainty:
+    region_sd_logit: 0.2
+  note: 'R0 stays at the engine default 2.0 (kind calibrated, not varied by the batch): the swept susceptible share
+    spans R_eff = 2 s0 from 0.8 to 2, across the epidemic threshold. Weekly generation interval of poliovirus, mean
+    about 2.5 weeks (assumed).'
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: 'generate_units.py draws each of these columns from its own seeded random stream, independently of
+        every other column, and searches seeds until the realized table''s maximum pairwise |Spearman| among them
+        is at most 0.2 (seed 4440 (searched from 4440): max |Spearman| among [''pop'', ''seed_share''] = 0.121)
+        (synthetic units table)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

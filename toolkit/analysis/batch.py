@@ -114,6 +114,63 @@ def windows(spec) -> dict:
     return dict(out, **({BV.WINDOW: mw["window"]} if mw else {}))
 
 
+def independent_features(spec) -> tuple[list, dict]:
+    """(features, basis) of the signed spec's `analysis.emulator.independent_features: {features, basis, generator}`:
+    declared unit features of a synthetic units table that its generator draws independently of the table's other
+    columns. A declared fact about the data-generating process, never a statistical claim and never for measured
+    data: the generator (a file beside the spec) is named and fingerprinted. toolkit/analysis/world_model.py reads the
+    design's independent_features to settle conditional claims. A feature that is not a declared design feature, a
+    missing basis or a missing generator is refused (ValueError)."""
+    import hashlib
+    from toolkit.analysis import features as FT
+    dec = (spec["analysis"].get("emulator") or {}).get("independent_features")
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    if not isinstance(dec, dict) or not isinstance(dec.get("features"), list) or not dec["features"]:
+        raise ValueError("analysis.emulator.independent_features: {features: [...], basis, generator}")
+    bad = [f for f in dec["features"] if f not in names]
+    if bad:
+        raise ValueError(f"analysis.emulator.independent_features: {bad} are not declared design features {names}")
+    if not str(dec.get("basis") or "").strip():
+        raise ValueError("analysis.emulator.independent_features.basis: how the generator draws them independently")
+    gen = str(dec.get("generator") or "").strip()
+    path = spec.resolve(gen) if gen else None
+    if not path or not os.path.isfile(path):
+        raise ValueError(f"analysis.emulator.independent_features.generator: {gen!r} is not a file beside the spec "
+                         "(the synthetic table's generator)")
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    # A generator that draws columns independently can still realize a correlated table on a few units (a world-model
+    # trial's 24 units gave rank correlation 0.82 between two separately drawn columns): the declaration holds only
+    # when the realized table's declared features are also uncorrelated (|Spearman| <= INDEPENDENCE_RHO_MAX pairwise).
+    rho = realized_rank_correlations(spec, list(dec["features"]))
+    big = {k: v for k, v in rho.items() if abs(v) > INDEPENDENCE_RHO_MAX}
+    if big:
+        raise ValueError(f"analysis.emulator.independent_features: the realized units table correlates declared features "
+                         f"{ {k: round(v, 3) for k, v in big.items()} } (|Spearman| > {INDEPENDENCE_RHO_MAX}): draw a "
+                         "table whose declared columns are uncorrelated, or do not declare them independent")
+    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha,
+                                   "realized_max_abs_spearman": max((abs(v) for v in rho.values()), default=0.0)}
+
+
+INDEPENDENCE_RHO_MAX = 0.3
+
+
+def realized_rank_correlations(spec, features) -> dict:
+    """{"a|b": Spearman rho} between each pair of declared features over the units table (as features.vector reads
+    them)."""
+    from scipy.stats import spearmanr
+    from toolkit.analysis import features as FT
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    rows = [FT.vector(spec, u) for u in spec.units()]
+    col = {f: [r[names.index(f)] for r in rows] for f in features}
+    out = {}
+    for i, a in enumerate(features):
+        for b in features[i + 1:]:
+            if len(set(col[a])) > 1 and len(set(col[b])) > 1:
+                out[f"{a}|{b}"] = float(spearmanr(col[a], col[b])[0])
+    return out
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -159,6 +216,8 @@ def design(spec) -> tuple[dict, list[dict]]:
         d["prior_names"] = pnames
     if ext:
         d["design_ranges"] = ext          # parameters whose design box was widened to span decision-test values
+    if em.get("independent_features") is not None:     # only when declared, so other designs stay
+        d["independent_features"], d["independent_features_basis"] = independent_features(spec)
     if snames:                            # only with spec values a decision test varies, so other designs stay
         d["spec_value_names"], d["spec_value_ranges"] = snames, {k: list(sbox[k]) for k in snames}
     return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]

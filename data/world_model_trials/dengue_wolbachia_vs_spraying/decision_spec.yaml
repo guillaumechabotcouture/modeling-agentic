@@ -1,0 +1,181 @@
+# World-model trial template (dengue_wolbachia_vs_spraying, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national vector-control
+  programme has US$40 million for 2026-2027 dengue control in 20 cities. For each city choose one option: none;
+  SPRAY (reactive and routine ultra-low-volume space spraying, US$2.50 per resident per year); WOLBACHIA (wMel Wolbachia
+  mosquito releases, US$12 per resident once, effective from deployment). Input file: units.csv (population, reported
+  dengue incidence per person-year 2021-2025, population density, Aedes house index). Choose the options that maximise
+  symptomatic dengue cases averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval
+  and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - spray
+    - wolbachia
+    outcome: dengue_cases
+    mode: trial_priors
+    outcomes:
+      dengue_cases:
+        baseline_source: synthetic notified dengue incidence, 2021-2025, no Wolbachia releases
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      spray:
+        dengue_cases:
+          rr: 0.88
+          range:
+          - 0.75
+          - 1.0
+          dist: triangular
+          measure: rate_ratio
+          source: 'space spraying: little and low-certainty evidence of an effect on dengue transmission (Esu E
+            et al. Effectiveness of peridomestic space spraying with insecticide on dengue transmission; systematic
+            review. Trop Med Int Health 2010;15:619-631)'
+          verified: false
+      wolbachia:
+        dengue_cases:
+          rr: 0.35
+          range:
+          - 0.23
+          - 0.55
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 77% protective efficacy against virologically confirmed dengue in the trial area (Utarini
+            A et al. Efficacy of Wolbachia-infected mosquito deployments for the control of dengue. N Engl J Med
+            2021;384:2177-2186), reduced for incomplete establishment in the first year'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        dengue_cases: inc
+options:
+  populations:
+    total: pop
+  components:
+    spray:
+      group: vector
+    wolbachia:
+      group: vector
+  packages:
+    none: []
+    spray:
+    - spray
+    wolbachia:
+    - wolbachia
+  engine_map:
+    spray:
+      spray: 1
+    wolbachia:
+      wolbachia: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: spray_cost
+    component: spray
+    value: 5.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - spray
+  - id: wolbachia_cost
+    component: wolbachia
+    value: 12.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - wolbachia
+objective:
+  outcome: dengue_cases
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 40000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- dengue_cases
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - density
+    - aedes_index
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: dengue_cases_averted
+  headline:
+    name: total_dengue_cases_averted
+    outcome: dengue_cases
