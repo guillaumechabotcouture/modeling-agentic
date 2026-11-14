@@ -25,6 +25,12 @@ outputs, then measures the job cluster's USD before it returns any state, the jo
 stopped by id, --keep-on-failure or not, in three cases: at the cap (after one last copy of the outputs), after
 three failed readings in a row, or after a failed reading at a terminal state.
 
+Re-attaching a cap (2026-11-13: a session restart killed the `run` that metered a job, and its cluster ran on with
+no cap). `wait <name> <job_id> --cap-usd N` meters the cluster id recorded in job.json the way `run` does and stops
+it by id at the cap, after three failed readings, or once the job ends (the launcher that would have stopped it is
+gone). Before attaching, it refuses unless the cluster is live, its spend so far is under N, and the signed budget
+of its scope covers that spend plus the rest of N; a cost that cannot be read three times stops the cluster.
+
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
 were lost. Coiled counts `idle_timeout` from cluster start, not from the first task (there
@@ -36,6 +42,7 @@ is no setting for "only after work"), so an `up` with no `start` behind it is wa
                                   [--setup-sdk] [--anthropic-key] -- <command ...>
     python cloud/vm_job.py status <name> <job_id>          # state + log tail; saves outputs locally
     python cloud/vm_job.py wait <name> <job_id> [--every 300]   # poll until the job ends, saving each time
+    python cloud/vm_job.py wait <name> <job_id> --cap-usd N [--budget-scope S]   # re-attach a cap (below)
     python cloud/vm_job.py down <name>
     python cloud/vm_job.py --self-test
 
@@ -479,7 +486,7 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
         over = (_cap_reading(meter, cid, a.cap_usd, a.job_id, misses, final)
                 if meter is not None and cid is not None else None)
         if over is not None and flags is not None:
-            flags["over_cap"] = True
+            flags["over_cap"], flags["cap_why"] = True, over["state"]["why"]
         return over
     while True:
         over, checked = None, False
@@ -530,8 +537,74 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
 
 def cmd_wait(a):
     dest = local_dir(a.name, a.job_id, a.out)
+    if getattr(a, "cap_usd", None) is not None:
+        return _wait_capped(a, dest)
     a.name = _job_cluster(dest, a.name)
     return _poll(a, dest)
+
+
+def _wait_gate(a, name, cid):
+    """`wait --cap-usd`: fn(cluster id) -> USD, once the cluster's spend so far is under the cap and the signed budget
+    of its scope covers that spend plus the rest of the cap (nothing new is reserved: the cluster exists, and its own
+    spend counts in the scope's). A cost that cannot be read three times in a row stops the cluster (fail closed)."""
+    import budget
+    scope = a.budget_scope or budget.scope_for_name(name)
+    if not scope:
+        raise SystemExit(f"{name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    try:
+        meter = budget.job_meter(scope)
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"{name}: the {scope} budget cannot be read ({type(e).__name__}: {e}); refusing") from e
+    for i in range(3):
+        try:
+            spent = meter(cid)
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"{a.job_id}: cost reading failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
+            if i < 2:
+                time.sleep(5)
+    else:
+        why = f"cost cap: cluster {cid}'s cost could not be read 3 times in a row; fail closed"
+        _stop_by_id(name, cid, why)
+        raise SystemExit(f"{a.job_id} on {name}: {why}")
+    if spent >= a.cap_usd:
+        raise SystemExit(f"{a.job_id}: refused: cluster {cid} has already spent ${spent:.2f}, at or above the "
+                         f"${a.cap_usd:.2f} cap; `down <name> {a.job_id}` stops it")
+    ok, why = budget.launch_budget_ok(scope, a.cap_usd - spent, name=name, reserve=False)
+    if not ok:
+        raise SystemExit(f"{name}: the budget refuses this cap: {why}")
+    print(f"budget: {why} (cluster {cid} spent ${spent:.2f} of its ${a.cap_usd:.2f} cap)", flush=True)
+    return meter
+
+
+def _wait_capped(a, dest):
+    """`wait --cap-usd`: the cluster id job.json records, checked live, gated (_wait_gate), attached by that id, then
+    polled with `run`'s cost readings; it is stopped by id whatever ends the wait (the cap, a terminal state, an
+    error, Ctrl-C), as `run` would have."""
+    rec = _job_record(dest)
+    name, cid = rec.get("cluster") or a.name, rec.get("cluster_id")
+    if cid is None:
+        raise SystemExit(f"{a.job_id}: {dest}/job.json records no cluster id (only `run` records one); "
+                         "`wait --cap-usd` meters and stops a cluster by its id only")
+    state = _clusters(name).get(cid, "")
+    if state not in rc._ATTACH:
+        print(f"{name} ({cid}): {state or 'not listed'}; nothing to meter")
+        return None
+    meter = _wait_gate(a, name, cid)
+    a.name, flags, why, st = name, {}, "interrupted", None
+    try:
+        cl = ws.attach_existing(name, rc.WORKSPACE, cid)     # refuses any cluster but `cid`
+        print(f"{a.job_id}: metering cluster {name} ({cid}) to ${a.cap_usd:.2f}", flush=True)
+        st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter, flags=flags)
+        why = f"{a.job_id}: " + ((st or {}).get("state", {}).get("state") or "cluster gone")
+    except BaseException as e:  # noqa: BLE001 -- recorded, then re-raised after the stop
+        why = f"{a.job_id}: {type(e).__name__}: {e}"
+        raise
+    finally:
+        _stop_by_id(name, cid, why[:200])
+    if flags.get("over_cap"):
+        raise SystemExit(f"{a.job_id} on {name}: {flags['cap_why']}")
+    return st
 
 
 def run_outcome(st, store_requested) -> tuple[bool, str]:
@@ -1969,6 +2042,10 @@ def main(argv=None) -> int:
         p.add_argument("job_id")
         if nm == "wait":
             p.add_argument("--every", type=float, default=300)
+            p.add_argument("--cap-usd", type=float, default=None,
+                           help="re-attach a cost cap: meter the job's recorded cluster id and stop it by id at the "
+                                "cap or when the job ends")
+            p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
     dn = sub.add_parser("down")
     dn.add_argument("name")
     dn.add_argument("job_id", nargs="?", default=None, help="stop this job's cluster (as recorded by `run`)")
