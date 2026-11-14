@@ -1,0 +1,282 @@
+beliefs:
+- id: B1
+  mechanism: Early campaign (day 14, about one generation after detection) lands before most of the outbreak and
+    drives Reff well below 1; it averts most infections that would occur without response, less the seed already
+    infected and the tail from people infected before day 14
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 0.97
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results, impact of intervention timing figure (location of the specific figure uncertain)
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: Late campaign (day 42, about three generations after detection) lands after a large share of the outbreak
+    in fast-growing districts; its relative reduction is smaller than early and falls as Reff (s0) rises
+  about:
+    package: late
+  direction: reduces
+  magnitude:
+    band:
+    - 0.25
+    - 0.85
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Results, delay scenarios (exact figure uncertain)
+  - citation: Minetti A, Kagoli M, Katsulukuta A, et al. Lessons and challenges for measles control from unexpected
+      large outbreak, Malawi. Emerg Infect Dis 2013
+    location: Discussion, late response
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B3
+  mechanism: Higher susceptible share means higher Reff and faster growth, so more of the outbreak has already happened
+    by day 42; late's relative reduction falls with s0
+  about:
+    package: late
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results, R0 range
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press
+      1991'
+    location: Table 4.1 (measles R0 12-18)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: A larger share already infected at detection means a larger infection burden locked in before any campaign,
+    so the relative reduction of early falls with seed_share
+  about:
+    package: early
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation with initial infecteds, Section 2
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'Closed, homogeneous district populations: per-capita outcomes and relative reductions do not depend
+    on population size'
+  about:
+    package: early
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation is per capita, Section 2
+  confidence: high
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B6
+  mechanism: The 28-day wait lets through several percent of the population in infections in most districts, far
+    above the 0.07%-per-resident break-even implied by the US$0.80 saving at lambda 0.00086; early beats late in
+    net benefit across the s0 range
+  about:
+    pair:
+    - early
+    - late
+    feature: s0
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Discussion, earlier response averts more cases
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'Early beats doing nothing in net benefit almost everywhere: final size without response is a large
+    fraction of s0 (8-20% of residents), far above the 0.19% break-even'
+  about:
+    pair:
+    - early
+    - none
+    feature: s0
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Results, single-dose effectiveness
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Does the engine represent campaign timing dynamically (vaccination at day 14 or day 42 of a running
+    outbreak) or as protection given before the epidemic with timing folded into efficacy:early and efficacy:late?
+    The card lists interventions as applied before the epidemic, so the timing penalty may live entirely in the
+    withheld efficacy priors.
+  beliefs:
+  - B1
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q2
+  question: Is effective protection per susceptible reached (efficacy) high enough that 0.8 x efficacy pushes post-campaign
+    Reff below 1 in the highest-s0 districts? If not, late (and even early) leaves a supercritical outbreak where
+    s0 is high.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q3
+  question: In districts with Reff near 1 (low s0, low R0), the outbreak barely grows; does the extra infection
+    count from waiting fall below the 0.07% break-even there, making late the better buy?
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: With the budget binding (early everywhere costs roughly twice US$4M), is the right plan early in high-burden
+    districts and late or none elsewhere, or late everywhere? This turns on per-dollar averted infections, which
+    the sweep's paired tests at the fixed lambda only partly answer.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Early reduces infections relative to none by 60-97% in at least 70% of usable points
+  p: 0.55
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.6
+    - 0.97
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: Late reduces infections relative to none by 25-85% in at least 60% of usable points
+  p: 0.45
+  test:
+    kind: effect_band
+    package: late
+    band:
+    - 0.25
+    - 0.85
+    min_share: 0.6
+- id: H3
+  belief: B3
+  claim: Late's relative reduction decreases as s0 rises
+  p: 0.6
+  weights:
+    decreases: 0.6
+    increases: 0.1
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: Early's relative reduction decreases as seed_share rises
+  p: 0.5
+  weights:
+    decreases: 0.5
+    increases: 0.1
+    no material effect: 0.4
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Early's relative reduction does not depend on district population (|rho| bound within 0.2)
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: early
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
+- id: H6
+  belief: B6
+  claim: Early beats late in net benefit at the shadow price in at least 80% of usable points across the s0 range
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.0806
+    - 0.1982
+    sign: positive
+    min_share: 0.8
+- id: H7
+  belief: B7
+  claim: Early beats none in net benefit at the shadow price in at least 90% of usable points across the s0 range
+  p: 0.8
+  test:
+    kind: paired_sign
+    a: early
+    b: none
+    feature: s0
+    range:
+    - 0.0806
+    - 0.1982
+    sign: positive
+    min_share: 0.9
