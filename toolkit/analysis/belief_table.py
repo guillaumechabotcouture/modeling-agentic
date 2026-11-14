@@ -15,6 +15,14 @@ outcomes)}. Three rules:
 A guard (in the caller, which has the run's inputs: scripts/world_model_trials.py guard_reasons) sets aside a claim
 whose outcome the simulation's declared inputs determine without running the dynamics. Pure arithmetic: no
 engine, no I/O.
+
+v2 (owner, 2026-11-14): each claim competes with its alternatives (claim_set: increases / decreases / no material
+effect, or holds / does not hold, plus "simulator artefact" in the world layer for a belief resting on our engine
+only), with weights summing to 1. An evidence log holds one row per item {source, type: trial | observational |
+our_sim | expert, favours, lr, group, layer}; the ratio comes from the test result (evidence_lr: decided LR_STRONG,
+undecided at most LR_WEAK toward the sign of the estimate); posterior multiplies the weights by one ratio per
+dependence group; our simulations update the engine layer, papers and data the world layer, and check_items names
+where they disagree. A scored claim's p is its weight before the question's own evidence.
 """
 from __future__ import annotations
 
@@ -94,6 +102,124 @@ def calibration(rows, bins=None) -> list:
 def next_simulation(beliefs) -> list:
     """Beliefs with decides yes, nearest p = 0.5 first: where a simulation is most informative for the choice."""
     return sorted((b for b in beliefs if b.get("decides")), key=lambda b: (abs(b["p"] - 0.5), str(b.get("id"))))
+
+
+# ---------------------------------------------------------------- v2 (owner, 2026-11-14)
+# Competing claims with weights; an evidence log (one row per item: source, type, the claim it favours, a coarse
+# likelihood ratio derived from the test result, a dependence group); odds updates with one ratio per group; an
+# engine layer (our simulations) and a world layer (papers and data); a check item where the two disagree.
+DIRECTION_CLAIMS = ("increases", "decreases", "no material effect")
+BINARY_CLAIMS = ("holds", "does not hold")
+ARTEFACT = "simulator artefact"
+ARTEFACT_PRIOR = 0.1     # the world-layer weight of "simulator artefact" for a belief resting on our engine only
+LR_STRONG = 10.0         # a decided test
+LR_WEAK = 2.0            # the most an undecided or marginal-only result can weigh
+EVIDENCE_TYPES = ("trial", "observational", "our_sim", "expert")
+LAYER_OF = {"our_sim": "engine", "trial": "world", "observational": "world", "expert": "world"}
+CHECK_AT = 0.5           # a check item when the layers' leading claims differ and the engine's leads at this weight
+
+
+def claim_set(test, p, weights=None, engine_only=False) -> dict:
+    """The competing claims a hypothesis's test can tell apart and their prior weights: an effect_direction test
+    weighs increases / decreases / no material effect, any other test holds / does not hold. `weights` (the seed's,
+    optional) must name every claim, sum to 1 and give the tested claim its p; otherwise the remainder 1 - p is
+    split equally. A belief resting on our engine only also carries ARTEFACT in its world layer."""
+    if test.get("kind") == "effect_direction":
+        claims = list(DIRECTION_CLAIMS)
+        claim = "no material effect" if test.get("direction") == "negligible" else test.get("direction")
+    else:
+        claims, claim = list(BINARY_CLAIMS), "holds"
+    if claim not in claims:
+        raise ValueError(f"claim_set: direction {test.get('direction')!r} is not one of {claims}")
+    if weights is not None:
+        w = {k: float(v) for k, v in dict(weights).items()}
+        if set(w) != set(claims) or any(not 0 < v < 1 for v in w.values()) or abs(sum(w.values()) - 1) > 1e-6 \
+                or abs(w[claim] - p) > 1e-6:
+            raise ValueError(f"claim_set: weights {weights} must name {claims}, each in (0, 1), sum to 1 and give "
+                             f"{claim!r} its p {p}")
+    else:
+        w = {k: p if k == claim else (1.0 - p) / (len(claims) - 1) for k in claims}
+    world = {k: v * (1.0 - ARTEFACT_PRIOR) for k, v in w.items()}
+    if engine_only:
+        world[ARTEFACT] = ARTEFACT_PRIOR
+    else:
+        world = dict(w)
+    return {"claims": claims, "claim": claim, "prior": w, "world": world}
+
+
+def _lean(f):
+    """A weak ratio from f, how far an undecided result sits from no effect (1 = at the edge of significance)."""
+    return 1.0 if f < 1 / 3 else 1.5 if f < 2 / 3 else LR_WEAK
+
+
+def evidence_lr(test, status, observed, min_share=None) -> tuple:
+    """(the claim a test result favours, its likelihood ratio, strength), derived from the result alone: a decided
+    test (supported / refuted) is strong (LR_STRONG) for what it observed; an undecided direction test leans toward
+    the sign of rho by 1, 1.5 or 2 as its z (from its p value) reaches a third, two thirds or all of 1.96; a
+    marginal-only association weighs at most LR_WEAK; an undecided band leans by its coverage. Else (None, 1)."""
+    from statistics import NormalDist
+    o, k = observed or {}, test.get("kind")
+    direc = k == "effect_direction"
+    sign = lambda r: "increases" if r > 0 else "decreases"  # noqa: E731
+    if status in ("supported", "refuted"):
+        if status == "supported":
+            fav = claim_set(test, 0.5)["claim"]
+        elif direc:
+            fav = o["direction"] if o.get("direction") in ("increases", "decreases") else \
+                sign(o["rho"]) if isinstance(o.get("rho"), (int, float)) and o["rho"] else None
+            if fav is None:
+                return None, 1.0, "none"
+        else:
+            fav = "does not hold"
+        return fav, LR_STRONG, "decided"
+    if status != "inconclusive":
+        return None, 1.0, "none"
+    if direc and isinstance(o.get("rho"), (int, float)) and o["rho"]:
+        pv = o.get("p")
+        z = NormalDist().inv_cdf(1 - max(min(float(pv), 1.0), 1e-12) / 2) if isinstance(pv, (int, float)) else 0.0
+        lr = _lean(z / 1.959964)
+        if o.get("marginal_only"):
+            return (sign(o["rho"]), lr, "weak (marginal only)") if lr > 1 else (None, 1.0, "none")
+        return (sign(o["rho"]), lr, "weak") if lr > 1 else (None, 1.0, "none")
+    if k == "effect_band" and isinstance(o.get("coverage"), (int, float)) and min_share:
+        c, m = float(o["coverage"]), float(min_share)
+        lr = _lean(abs(c - 0.5) / max(m - 0.5, 1e-9))
+        return ("holds" if c > 0.5 else "does not hold", lr, "weak") if lr > 1 else (None, 1.0, "none")
+    return None, 1.0, "none"
+
+
+def posterior(prior, evidence, layer) -> dict:
+    """The weights after the evidence of one layer, in odds form: each dependence group counts once (its strongest
+    row), its favoured claim's weight is multiplied by the row's ratio, then the weights are renormalised. Claims
+    keep their place: a refutation shifts weight, it overwrites nothing."""
+    best = {}
+    for e in evidence:
+        if e.get("layer") != layer or e.get("favours") not in prior or not e.get("lr") or e["lr"] <= 1:
+            continue
+        g = e.get("group") or id(e)
+        if g not in best or e["lr"] > best[g]["lr"]:
+            best[g] = e
+    w = dict(prior)
+    for e in best.values():
+        w[e["favours"]] *= float(e["lr"])
+    s = sum(w.values())
+    return {k: v / s for k, v in w.items()}
+
+
+def _lead(w):
+    """The leading substantive claim, or None when two claims tie for the lead."""
+    sub = sorted(((v, k) for k, v in w.items() if k != ARTEFACT), reverse=True)
+    return None if len(sub) > 1 and abs(sub[0][0] - sub[1][0]) < 1e-9 else sub[0][1]
+
+
+def check_items(cid, engine, world) -> list:
+    """A check item where our simulations and the world layer lead with different claims (the engine's at
+    CHECK_AT or more): the simulator, the test or the literature is wrong, and which one is to be checked."""
+    e, w = _lead(engine), _lead(world)
+    if e is None or w is None or e == w or engine[e] < CHECK_AT:
+        return []
+    return [{"id": cid, "engine": e, "engine_weight": engine[e], "world": w, "world_weight": world[w],
+             "check": ["simulator", "test", "literature"]}]
 
 
 def _self_test() -> int:
@@ -210,6 +336,8 @@ def _self_test() -> int:
            and set(ci[0]["check"]) == {"simulator", "test", "literature"},
            f"BT8c where the layers disagree, a check item: simulator, test or literature: {ci}")
         ok(check_items("H1", w, w) == [], "BT8d no check item when the layers agree")
+        ok(check_items("H2", {"holds": 0.9, "does not hold": 0.1}, {"holds": 0.5, "does not hold": 0.5}) == [],
+           "BT8e no check item when the world layer has no leading claim (a tie)")
 
     for n, f in (("BT1", bt1), ("BT2", bt2), ("BT3", bt3), ("BT4", bt4), ("BT5", bt5), ("BT6", bt6), ("BT7", bt7),
                  ("BT8", bt8)):

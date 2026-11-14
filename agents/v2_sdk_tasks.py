@@ -176,10 +176,20 @@ Write """ + SEED_FILE + """ in the world model's format, documented below by too
   title, first author and year exactly.
 - p: every hypothesis also states p, your probability between 0.02 and 0.98 that its claim holds in this sweep.
   Be calibrated: of claims you give p 0.7, about 7 in 10 should hold. Each outcome is scored against its p.
-- When {out_in} carries prior_world_model (earlier questions' belief tables: beliefs with their updated p and
-  history, the claims refuted with what was observed, and open questions), start from it. Carry forward what held,
-  revise what was refuted (never repeat a refuted claim unless this question's setting differs, and then say how),
-  and turn its open questions into claims this sweep can test. The harness registers the
+  Each claim competes with its alternatives: an effect_direction claim with the other direction and "no material
+  effect", any other claim with "does not hold". An effect_direction hypothesis may also state weights, e.g.
+  {increases: 0.2, decreases: 0.5, no material effect: 0.3}: all three, summing to 1, its own claim's weight equal
+  to p. Without weights the remainder 1 - p is split equally.
+- A feature the sweep does not sample independently (not in independent_features) needs an adjusted test: an
+  effect_direction test on it states adjust_for (the independent features to adjust for); a flip_in test uses an
+  independent feature. Refused otherwise.
+- When {out_in} carries prior_world_model (earlier questions' belief tables), start from it. Each claim set lists
+  its competing claims, their prior, engine and world weights, and its evidence log: one row per simulation result,
+  with the claim it favours, a likelihood ratio (10 for a decided test, at most 2 for an undecided one leaning toward
+  the sign of its estimate) and the observed rho, interval and p, including inconclusive results. check_items name
+  where our simulations and the literature disagree. Carry forward what held, weigh what leaned, revise what was
+  refuted (never repeat a refuted claim unless this question's setting differs, and then say how), and turn open
+  questions and check items into claims this sweep can test. The harness registers the
   hypotheses before the sweep runs (you do not write registered_at).
 
 """ + doc[a:b].strip() + """

@@ -444,7 +444,7 @@ def prepare(q, run_dir, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, tria
                       "untestable: no shadow price is declared",
                       "optimised_plan": False,
                       "min_points": W.SETTINGS["min_points"], "small_sample_below": W.SETTINGS["perm_n_max"]},
-            "hypotheses": {"min": HYPOTHESES[0], "max": HYPOTHESES[1], "p_required": True},
+            "hypotheses": {"min": HYPOTHESES[0], "max": HYPOTHESES[1], "p_required": True, "adjusted_required": True},
             "prior_world_model": carried(q, trials_root)}
 
 
@@ -467,6 +467,23 @@ def seed_problems(seed, ctx) -> list[str]:
             if isinstance(p, bool) or not isinstance(p, (int, float)) or not P_RANGE[0] <= p <= P_RANGE[1]:
                 bad.append(f"hypothesis {h.get('id')}: p, the probability that the claim holds, a number in "
                            f"[{P_RANGE[0]}, {P_RANGE[1]}] (never 0 or 1: a claim must be able to surprise)")
+        from toolkit.analysis import belief_table as BT
+        for h in hs:
+            if h.get("weights") is None or not isinstance(h.get("test"), dict):
+                continue
+            try:
+                BT.claim_set(h["test"], h.get("p"), h["weights"])
+            except (ValueError, TypeError, AttributeError) as e:
+                bad.append(f"hypothesis {h.get('id')}: weights {e}")
+    if (ctx.get("hypotheses") or {}).get("adjusted_required"):
+        ind = set(ctx["sweep"].get("independent_features") or [])
+        for h in hs:
+            t = h.get("test") or {}
+            if t.get("kind") in ("effect_direction", "flip_in") and t.get("feature") and t["feature"] not in ind \
+                    and not t.get("adjust_for"):
+                bad.append(f"hypothesis {h.get('id')}: {t['feature']!r} is not sampled independently "
+                           f"(independent: {sorted(ind)}); state adjust_for (the features to adjust for) on an "
+                           f"effect_direction test, or test a feature that is sampled independently")
     pk, ft = set(ctx["packages"]), set(ctx["sweep"]["features"])
     for h in hs:
         t = h["test"]
@@ -966,18 +983,19 @@ def register_step(run_dir) -> dict:
     return {"note": buf.getvalue().strip()}
 
 
-def engine_step(q, run_dir, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, workers=2) -> dict:
+def engine_step(q, run_dir, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, workers=2, vm=False) -> dict:
     """The batch on the stored design (re-derived from the spec and required to be identical), on a local pool of at
     most `workers` processes; a cloud scheduler in the environment or a design over the limit is refused. Then the
-    batch's first appearance is recorded (world_model.record_first_seen)."""
+    batch's first appearance is recorded (world_model.record_first_seen). More than 2 workers only in a VM job
+    (`vm`: engine_only under cloud/vm_job.py, which sets JOB_OUT)."""
     from toolkit.analysis import batch as B
     from toolkit.analysis import world_model as W
     from toolkit.spec import schema
     if any(os.environ.get(k) for k in CLOUD_ENV):
         raise TrialError(f"a cloud scheduler is configured ({[k for k in CLOUD_ENV if os.environ.get(k)]}); the "
                          "trials run locally unless the owner approves a cloud backend")
-    if workers > 2:
-        raise TrialError("at most 2 worker processes (owner's laptop rule)")
+    if workers > 2 and not vm:
+        raise TrialError("at most 2 worker processes outside a VM job (owner's laptop rule)")
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     design, jobs = B.design(spec)
     stored = json.load(open(os.path.join(run_dir, "analysis", "batch", "design.json")))
@@ -1491,6 +1509,7 @@ def _table_rows(rd, q):
     g = guard_reasons(rd, seed, (t.get("shadow_price") or {}).get("value"), tpl)
     by = {b["id"]: b for b in seed["beliefs"]}
     stated = {h["id"]: h.get("p") for h in seed.get("hypotheses") or []}
+    weights = {h["id"]: h.get("weights") for h in seed.get("hypotheses") or []}
     rows = []
     for h in hy:
         b = by[h["belief"]]
@@ -1499,46 +1518,76 @@ def _table_rows(rd, q):
                      "claim": h.get("claim"), "test": h["test"],
                      "label": (b.get("citation_check") or {}).get("confidence_claimed") or b.get("confidence"),
                      "stated_p": p if isinstance(p, (int, float)) and not isinstance(p, bool) else None,
+                     "weights": weights.get(h["id"]),
                      "outcome": OUTCOME_OF.get(h["status"], "undecided"), "status": h["status"],
                      "observed": (h.get("result") or {}).get("observed"), "guard": g.get(h["id"]),
                      "post_hoc": bool((h.get("confrontation") or {}).get("post_hoc"))})
     return seed, rows
 
 
+def _evidence_group(rd):
+    """The dependence group of a question's simulations: our engine on this design (every run of one engine on one
+    design is one group, counted once)."""
+    from toolkit.analysis.artifacts import sha256
+    dp = os.path.join(rd, "analysis", "batch", "design.json")
+    ref = ((json.load(open(dp)).get("spec_engine") or {}).get("ref") if os.path.isfile(dp) else None) or "engine"
+    return f"our_sim:{ref.rsplit(':', 1)[-1]}@design:{(sha256(dp) or 'none')[:12]}"
+
+
 def write_belief_table(rd, q, at=None, label_p=None, rows=None, seed=None) -> dict:
-    """One question's belief table (analysis/belief_table.yaml): each claim's p is the seed's stated p, else its
-    label's rate (`label_p`, default LABEL_P); surprise for unguarded, pre-registered, decided claims; beliefs (p =
-    the mean stated p of their claims, else the label's) updated by the stated rule; the next simulation."""
+    """One question's belief table v2 (analysis/belief_table.yaml, owner 2026-11-14). Each hypothesis is a claim set
+    (belief_table.claim_set: competing claims with prior weights from the seed's stated p or weights, else its
+    label's rate, `label_p`, default LABEL_P); its evidence log holds the question's simulation result as one row
+    (type our_sim, the engine layer, the claim it favours and its likelihood ratio from belief_table.evidence_lr,
+    dependence group = engine + design; a guarded claim's row carries ratio 1); the engine and world weights follow
+    by belief_table.posterior, with check items where they disagree. A scored claim's p is its prior weight (the
+    prediction before this question's evidence); surprise for unguarded, pre-registered, decided claims."""
     import yaml
     from toolkit.analysis import belief_table as BT
     at = at or _now()
     if rows is None:
         seed, rows = _table_rows(rd, q)
     lp = label_p or LABEL_P
+    group, by = _evidence_group(rd), {b["id"]: b for b in seed["beliefs"]}
+    sets, checks = [], []
     for r in rows:
-        r["p"] = r["stated_p"] if r["stated_p"] is not None else lp.get(r["label"], 0.5)
-        r["p_source"] = "stated" if r["stated_p"] is not None else "label rate"
+        p = r["stated_p"] if r["stated_p"] is not None else lp.get(r["label"], 0.5)
+        b = by.get(r["belief"]) or {}
+        cs = BT.claim_set(r["test"], p, r.get("weights"), engine_only=b.get("source_type") == "simulation")
+        r["p"], r["p_source"] = cs["prior"][cs["claim"]], "stated" if r["stated_p"] is not None else "label rate"
         r["surprise"] = None if r["guard"] or r["post_hoc"] else BT.surprise(r["p"], r["outcome"])
+        fav, lr, strength = BT.evidence_lr(r["test"], r["status"], r["observed"], r["test"].get("min_share"))
+        if r["guard"]:
+            fav, lr, strength = None, 1.0, f"guarded: {r['guard']['class']}"
+        o = r["observed"] if isinstance(r["observed"], dict) else {}
+        ev = [{"source": f"{q['id']} {r['id']}", "type": "our_sim", "layer": BT.LAYER_OF["our_sim"], "group": group,
+               "favours": fav, "lr": lr, "strength": strength, "status": r["status"], "post_hoc": r["post_hoc"],
+               "observed": {k: o[k] for k in ("direction", "rho", "ci", "p", "n", "adjusted_for", "coverage",
+                                              "share_a", "share_b") if k in o}
+               | ({"marginal_result": o["marginal_only"].get("marginal_result")} if o.get("marginal_only") else {})}]
+        eng, wor = BT.posterior(cs["prior"], ev, "engine"), BT.posterior(cs["world"], ev, "world")
+        ci = BT.check_items(r["id"], eng, wor)
+        checks += [dict(c, question=q["id"], claim=r["claim"]) for c in ci]
+        sets.append({"id": r["id"], "belief": r["belief"], "statement": r["claim"], "claims": cs["claims"],
+                     "claim": cs["claim"], "prior": cs["prior"], "engine": eng, "world": wor, "evidence": ev,
+                     "decides": bool(b.get("decision_relevant")), "check": ci})
     beliefs = []
     for b in seed["beliefs"]:
-        mine = [r for r in rows if r["belief"] == b["id"]]
-        st = [r["stated_p"] for r in mine if r["stated_p"] is not None]
-        lab = (b.get("citation_check") or {}).get("confidence_claimed") or b.get("confidence")
         ev = (b.get("evidence") or [{}])[0]
-        nb = {"id": b["id"], "claim": b.get("mechanism"), "p": sum(st) / len(st) if st else lp.get(lab, 0.5),
-              "basis": f"{b.get('source_type')}: " + str(ev.get("citation") or ev.get("dossier_entry") or
-                                                           ev.get("artifact") or "")[:200],
-              "decides": bool(b.get("decision_relevant")), "history": []}
-        for r in mine:
-            if not r["guard"] and not r["post_hoc"]:
-                nb = BT.update(nb, r["outcome"], at, observed=f"refuted by {r['id']}: not ({r['claim']}); observed "
-                                                              f"{json.dumps(r['observed'], default=str)[:200]}")
-        beliefs.append(nb)
-    nxt = [b["id"] for b in BT.next_simulation(beliefs)][:3]
-    doc = {"schema": "analysis.belief_table/0", "producer": "scripts/world_model_trials.py write_belief_table",
-           "p_rule": {"stated_p_first": True, "label_p": lp,
-                      "update": {"confirm_step": BT.CONFIRM_STEP, "refuted_p": BT.REFUTED_P}},
-           "rows": rows, "beliefs": beliefs, "next_simulation": nxt}
+        beliefs.append({"id": b["id"], "claim": b.get("mechanism"), "source_type": b.get("source_type"),
+                        "basis": f"{b.get('source_type')}: " + str(ev.get("citation") or ev.get("dossier_entry") or
+                                                                     ev.get("artifact") or "")[:200],
+                        "decides": bool(b.get("decision_relevant")),
+                        "claim_sets": [c["id"] for c in sets if c["belief"] == b["id"]]})
+    nxt = [c["id"] for c in BT.next_simulation([{"id": c["id"], "decides": c["decides"], "p": c["engine"][c["claim"]]}
+                                                for c in sets])][:3]
+    doc = {"schema": "analysis.belief_table/1", "producer": "scripts/world_model_trials.py write_belief_table",
+           "written_at": at,
+           "p_rule": {"scored_p": "the claim's prior weight (stated p or weights, else its label's rate)",
+                      "label_p": lp, "lr": {"decided": BT.LR_STRONG, "undecided_max": BT.LR_WEAK},
+                      "artefact_prior": BT.ARTEFACT_PRIOR, "check_at": BT.CHECK_AT},
+           "rows": rows, "claim_sets": sets, "beliefs": beliefs, "check_items": checks,
+           "open_questions": seed.get("open_questions") or [], "next_simulation": nxt}
     _sio().write_nofollow(rd, "analysis/belief_table.yaml", yaml.safe_dump(doc, sort_keys=False, width=110,
                                                                             default_flow_style=None).encode(),
                           atomic=True)
@@ -1546,9 +1595,10 @@ def write_belief_table(rd, q, at=None, label_p=None, rows=None, seed=None) -> di
 
 
 def carried(q, trials_root) -> list:
-    """The earlier questions' belief tables a chained question is seeded with (q["carry_from"]): their beliefs with
-    updated p and history, the claims refuted with what was observed, and the open questions. A carried question
-    without a belief table is refused (TrialError)."""
+    """The earlier questions' belief tables a chained question is seeded with (q["carry_from"]): every claim set
+    with its competing claims, prior, engine and world weights and its full evidence log (inconclusive results with
+    their observed rho and interval too), the check items, the beliefs, the claims refuted with what was observed
+    and the open questions. A carried question without a v2 belief table is refused (TrialError)."""
     import yaml
     out = []
     for qid in q.get("carry_from") or []:
@@ -1556,14 +1606,20 @@ def carried(q, trials_root) -> list:
         if not trials_root or not os.path.isfile(p):
             raise TrialError(f"{q['id']}: carry_from {qid} has no belief table ({p})")
         t = yaml.safe_load(open(p))
+        if t.get("schema") != "analysis.belief_table/1":
+            raise TrialError(f"{q['id']}: carry_from {qid}'s belief table is {t.get('schema')}, not v2 (rescore it)")
         out.append({"question": qid,
                     "question_text": (_trial(os.path.join(trials_root, "runs", qid)).get("context") or {}).get(
                         "question"),
-                    "beliefs": [{k: b.get(k) for k in ("id", "claim", "p", "basis", "decides", "history")}
+                    "claim_sets": [{k: c.get(k) for k in ("id", "belief", "statement", "claims", "claim", "prior",
+                                                          "engine", "world", "evidence", "decides")}
+                                   for c in t["claim_sets"]],
+                    "check_items": t.get("check_items") or [],
+                    "beliefs": [{k: b.get(k) for k in ("id", "claim", "basis", "decides", "claim_sets")}
                                 for b in t["beliefs"]],
                     "refuted": [{"claim": r["claim"], "observed": r["observed"]} for r in t["rows"]
                                 if r["outcome"] == "refuted" and not r["guard"]],
-                    "open_questions": [b["open_question"] for b in t["beliefs"] if b.get("open_question")]})
+                    "open_questions": t.get("open_questions") or []})
     return out
 
 
@@ -1591,7 +1647,8 @@ def belief_rescore(trials_root, qs, fit_batches=("1r3", "2", "3"), at=None) -> d
     lp = {k: v["p"] for k, v in rates.items()}
     for qid, x in runs.items():
         d = write_belief_table(os.path.join(trials_root, "runs", qid), x["q"], at, lp, x["rows"], x["seed"])
-        x["next_simulation"] = d["next_simulation"]
+        x["next_simulation"], x["check_items"] = d["next_simulation"], d["check_items"]
+        x["strength"] = [e["strength"] for c in d["claim_sets"] for e in c["evidence"]]
     batches = sorted({r["batch"] for r in rows})
     guard_counts = {}
     for r in rows:
@@ -1608,7 +1665,10 @@ def belief_rescore(trials_root, qs, fit_batches=("1r3", "2", "3"), at=None) -> d
                           "calibration": BT.calibration([r for r in scored if r["batch"] == b])} for b in batches},
          "top_surprises": sorted([{k: r[k] for k in ("question", "id", "claim", "label", "p", "outcome", "surprise")}
                                   for r in scored if r["surprise"] is not None], key=lambda r: -r["surprise"])[:10],
-         "next_simulation": {qid: x["next_simulation"] for qid, x in runs.items()}}
+         "next_simulation": {qid: x["next_simulation"] for qid, x in runs.items()},
+         "evidence_strength": {k: sum(v.count(k) for v in (x["strength"] for x in runs.values()))
+                               for k in sorted({z for x in runs.values() for z in x["strength"]})},
+         "check_items": [c for x in runs.values() for c in x["check_items"]]}
     _sio().write_nofollow(trials_root, "belief_summary.yaml", yaml.safe_dump(S, sort_keys=False, width=110).encode(),
                           atomic=True)
     _sio().write_nofollow(trials_root, "belief_summary.md", belief_summary_md(S).encode(), atomic=True)
@@ -1635,6 +1695,14 @@ def belief_summary_md(S) -> str:
         L.append(f"| {c['bin'][0]:.1f}-{min(c['bin'][1], 1):.1f} | {c['decided']} | "
                  f"{'' if c['mean_p'] is None else round(c['mean_p'], 3)} | "
                  f"{'' if c['observed'] is None else round(c['observed'], 3)} |")
+    L += ["", "## Evidence rows by strength (v2)", "", "| Strength | Rows |", "|---|---|"]
+    for k, v in S.get("evidence_strength", {}).items():
+        L.append(f"| {k} | {v} |")
+    L += ["", f"## Check items: {len(S.get('check_items') or [])} (our simulations and the world layer lead with "
+              f"different claims: check the simulator, the test or the literature)", ""]
+    for c in S.get("check_items") or []:
+        L.append(f"- {c['question']} {c['id']}: engine {c['engine']} ({c['engine_weight']:.2f}) vs world {c['world']} "
+                 f"({c['world_weight']:.2f}): {str(c['claim'])[:140]}")
     L += ["", "## Top surprises", ""]
     for r in S["top_surprises"]:
         L.append(f"- {r['question']} {r['id']} ({r['label']}, p {r['p']:.2f}, {r['outcome']}, "
@@ -1646,7 +1714,7 @@ def belief_summary_md(S) -> str:
 BATCH_FILES = ("results.jsonl", "first_seen.jsonl", "points.jsonl")     # what an imported batch brings
 
 
-def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS) -> dict:
+def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS, workers=2) -> dict:
     """The VM job's step: for each question, prepare its run directory from the template exactly as the laptop did
     (the same commit's code and template give the same design), run the engine step (engine_step: the batch, then
     record_first_seen on the VM, when the batch first appears) and keep analysis/batch/ under out_root/runs/<id>/.
@@ -1656,7 +1724,7 @@ def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS
         rd = os.path.join(out_root, "runs", q["id"])
         try:
             prepare(dict(q, shadow_price=None, carry_from=[]), rd, root, max_engine_runs)   # the design only
-            e = engine_step(q, rd, max_engine_runs)
+            e = engine_step(q, rd, max_engine_runs, workers, vm=bool(os.environ.get("JOB_OUT")))
             out[q["id"]] = dict(e, ok=True)
         except Exception as ex:  # noqa: BLE001 -- recorded per question; the others run
             out[q["id"]] = {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:400]}
@@ -1796,6 +1864,7 @@ def main(argv=None) -> int:
     r.add_argument("--engine", choices=("remote", "local"), default="remote",
                    help="remote (default; owner, 2026-11-13): stop at awaiting_engine for a VM job; local runs it here")
     sub.choices["engine-only"].add_argument("--out", required=True, help="the VM job's output directory ($JOB_OUT)")
+    sub.choices["engine-only"].add_argument("--workers", type=int, default=2, help="engine processes on the VM")
     ie = sub.choices["import-engine"]
     ie.add_argument("--from", dest="src", required=True, help="the job's collected output directory")
     ie.add_argument("--usd", type=float, required=True, help="the job's real USD (vm_job's measured spend)")
@@ -1824,7 +1893,7 @@ def main(argv=None) -> int:
         score(a.trials_dir)
         return 0 if all(r["status"] != "failed" for r in res.values()) else 1
     if a.cmd == "engine-only":
-        res = engine_only(qs, os.path.expandvars(a.out), REPO, a.max_engine_runs)
+        res = engine_only(qs, os.path.expandvars(a.out), REPO, a.max_engine_runs, a.workers)
         return 0 if all(v["ok"] for v in res.values()) else 1
     if a.cmd == "vm-commands":
         for c in vm_commands(qs, a.per_job, a.cap_usd, a.prefix, a.store):
