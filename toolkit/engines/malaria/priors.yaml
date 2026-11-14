@@ -158,7 +158,9 @@ fixed:
     Briet et al. 2012 Malar J 11:20 (PMC3273435) used k = 18 for the same function. The median retention, which the
     paper estimates, carries the uncertainty (net_retention_half)"
   cfp_half: "attempt 8's range (1.5-3.5 y, registry cfp_half_life_years) is a modeller reading of Mosha 2022/2024
-    durability, not a published half-life estimate"
+    durability, not a published half-life estimate. The net-effect fit's wave-2 design box, 270-1650 days, is half-lives
+    derived from Ngufor 2024 Parasites & Vectors 17:420 Tables 7-8 and Fagbohoun 2026 PLOS Glob Public Health
+    (ENGINE_NOTES.md, v0.17 wave 2): a design box, not a prior"
   irs_rep: "no published range on the card or in the attempt 8 registry"
   irs_half: "no published range (attempt 8 value; used only by the generic short-lived product)"
   irs_divert: "the card's range [0, 1] is an assumption with no source"
