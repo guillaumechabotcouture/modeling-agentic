@@ -301,6 +301,33 @@ def budget_guard(cfg, reserve=True, inv=None) -> None:
     print(f"budget: {why}", flush=True)
 
 
+def vm_request(cfg, compute=None) -> dict:
+    """{role: worker_vm_types and scheduler_vm_types} for each cluster this config can construct ("run" when
+    `compute` is given, "overflow" when it has an overflow pool, "keeper"), every type priced in cloud/vm_prices.yaml.
+    Coiled is given these lists, never cpu/memory, so what the budget prices is what it gets (2026-11-13: a cpu/memory
+    request got Standard_F8s_v2, unpriced, refused only once the cluster existed). A configured type the table lacks
+    (compute.WORKER_VM_TYPES, overflow_vm_types) is pinned as configured with a printed WARNING, never refused (owner,
+    2026-11-13: spend controls fail soft); budget.py counts it at its fallback bound."""
+    import budget
+    try:
+        sched = budget.scheduler_vm_types()
+        out = {"keeper": {"worker_vm_types": budget.vm_types_for(2, "8 GiB"), "scheduler_vm_types": sched}}
+    except budget.BudgetError as e:     # the tracked table has no 2-vCPU, 8 GiB type: a broken table, not a request
+        raise SystemExit(f"{cfg.name}: refusing before any cluster is created: {e}") from None
+    roles = {}
+    if cfg.keeper and cfg.overflow_max:
+        roles["overflow"] = (list(cfg.overflow_vm_types), "overflow_vm_types")
+    if compute is not None:
+        roles["run"] = (list(compute.WORKER_VM_TYPES), "compute.WORKER_VM_TYPES")
+    for role, (types, what) in roles.items():
+        missing = budget.unpriced(types)
+        if missing:
+            print(f"WARNING: {cfg.name}: {what} {missing} not in cloud/vm_prices.yaml: launching with them, counted at "
+                  f"the fallback bound; add them to the table", flush=True)
+        out[role] = {"worker_vm_types": types, "scheduler_vm_types": sched}
+    return out
+
+
 def load_config(path: str) -> RunConfig:
     spec = importlib.util.spec_from_file_location("run_config", path)
     mod = importlib.util.module_from_spec(spec)
@@ -960,16 +987,17 @@ def _launch_locked(cfg, inv) -> int:
     if stale:
         raise SystemExit("refusing: " + "; ".join(stale))
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
+    compute = _compute(cfg)
+    vm = vm_request(cfg, compute)                 # every VM type priced, before the budget reserves anything
     budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
     keys = read_keys()
-    compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
-        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=compute.WORKER_VM_TYPES,
-        worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
+        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=vm["run"]["worker_vm_types"],
+        scheduler_vm_types=vm["run"]["scheduler_vm_types"], worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix,
                  **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv)))
+        spot_policy="on-demand", shutdown_on_close=False, **_lifetime(cfg, inv)))
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     # S1-8: recorded once the run cluster exists, before any submission or acknowledgement wait; this invocation's
     # record replaces the previous launch's (no cluster of the name was live, and the config lock is held)
@@ -1218,6 +1246,7 @@ def keeper_later(cfg) -> int:
                 clusters.pop("keeper", None)
                 keep_k = None
         if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
+            vm_request(cfg)                   # every helper VM type priced, before the reservation
             budget_guard(cfg, inv=clusters.get("invocation"))   # a new overflow pool or keeper is paid: reserved then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
@@ -1275,13 +1304,14 @@ def start_overflow(cfg, compute, record=None, inv=None) -> dict:
     here (so it gets this launch's software environment) and scaled by the keeper. Its
     idle timeout outlasts the keeper; the keeper deletes it on exit."""
     import coiled
+    vm = vm_request(cfg)["overflow"]
     _fresh(cfg.overflow_name)
     oc = _construct(cfg, cfg.overflow_name, inv, lambda: coiled.Cluster(
-        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=list(cfg.overflow_vm_types),
-        worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
+        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
         worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix, **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False,
+        spot_policy="on-demand", shutdown_on_close=False, wait_for_workers=False,
         **_lifetime(cfg, inv)))
     if record:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
@@ -1304,10 +1334,11 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None, inv=No
     lo, hi = len(cfg.labels) + cfg.compute_start, len(cfg.labels) + cfg.compute_max
     # An earlier launch's keeper (still polling, or stopping) must not be reused:
     # its task would hold the old cluster id and exit, leaving this pool unscaled.
+    vm = vm_request(cfg)["keeper"]
     _fresh(cfg.keeper_name)
     kc = _construct(cfg, cfg.keeper_name, inv, lambda: coiled.Cluster(
-        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2, worker_memory="8 GiB", scheduler_cpu=2,
-        spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
+        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
     if record:
         record("keeper", cfg.keeper_name, kc.cluster_id)         # before anything that can fail (Codex P2-5)
     c = kc.get_client()
@@ -2436,7 +2467,7 @@ def _self_test_52(ok) -> None:
     old_c, new_c = LaunchClient([{}]), LaunchClient([{"workers": {f"tls://a:{i}": {} for i in range(4)}}])
     run_cl = types.SimpleNamespace(cluster_id=12, get_client=lambda: old_c if old_c.status == "running" else new_c)
     used = []
-    comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+    comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                  register_compute_tags=lambda c, exclude: used.append(c))
     fake_coiled = types.ModuleType("coiled")
     rc52_made = []
@@ -2811,7 +2842,8 @@ def _self_test_attach(ok) -> None:
     sys.modules["coiled"] = fake
     try:
         cl = ws.attach_existing("n", "w", 5)
-        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60a attach_existing attaches by name without waiting for workers: {calls}")
         made = []
         fake.Cluster = lambda **kw: made.append(Cl(**kw)) or made[-1]
@@ -2833,14 +2865,17 @@ def _self_test_attach(ok) -> None:
             ok(not calls and "not running" in str(e), f"RC60c attach never constructs a Cluster for a stopping one: {calls}")
         listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "running"}}]
         cl = attach("n")
-        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60d attach checks running, then attaches with wait_for_workers=False: {calls}")
         calls.clear()
         ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
         ov.cl = None
         Cl.get_client = lambda self: "C"
         ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
-                                                     "wait_for_workers": False}],
+                                                     "wait_for_workers": False,
+                                                     "worker_vm_types": ws.ATTACH_VM_TYPES,
+                                                     "scheduler_vm_types": ws.ATTACH_VM_TYPES}],
            f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
         # Codex round 3 (P2-b): an attach refusal leaves the overflow pool unavailable for the tick; the keeper goes on
         fake.Cluster = lambda **kw: Cl(_id=9, **kw)
@@ -2934,7 +2969,7 @@ def _self_test_s18(ok, tb) -> None:
             def tags(c, exclude):
                 if tags_exc:
                     raise tags_exc
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=tags)
             fake_coiled = types.ModuleType("coiled")
             made = []
@@ -3037,7 +3072,7 @@ def _self_test_s18(ok, tb) -> None:
                   open(cfg.clusters_file, "w"))
         P = mock.patch.object
         refused = None
-        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=[])), \
+        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                 P(M, "start_keeper", side_effect=fake_helper("keeper", "lt-keeper", 79, types.SimpleNamespace(cluster_id=79))) as sk, \
                 P(M, "confirm_keeper", return_value=["tick"]), P(time, "sleep", lambda s: None), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -3138,7 +3173,7 @@ def _self_test_s18_r1(ok) -> None:
             fake_coiled = types.ModuleType("coiled")
             fake_coiled.Cluster = cluster
             fake_coiled.list_clusters = lambda workspace: list(made)
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=lambda c, exclude: None)
             pats = [P(M, "is_running", return_value=running),
                     P(M, "live_id", side_effect=live_exc or (lambda n: 77)),
@@ -3340,7 +3375,7 @@ def _self_test_s18_r2(ok) -> None:
                     raise SystemExit("not confirmed")
                 return ["tick"]
             out = io.StringIO()
-            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["a"])), \
+            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                     P(M, "live_id", side_effect=lambda n: live.get(n)), \
                     P(M, "start_overflow", side_effect=so), P(M, "start_keeper", side_effect=sk), \
                     P(M, "confirm_keeper", side_effect=conf), \
@@ -3647,7 +3682,7 @@ def _self_test_s18_r4(ok) -> None:
         open(q, "w").write("question")
         cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
                         pipeline="v2", cluster_timeout="40 minutes")
-        comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+        comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                      register_compute_tags=lambda c, exclude: None)
         if ctor_calls is not None:
             real = fake.Cluster
@@ -4037,7 +4072,7 @@ def _self_test_budget(ok) -> None:
        and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
        "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
     made, keys, kws = [], [], []
-    calls = []
+    calls, wvt = [], [["Standard_E8s_v5", "Standard_E8as_v5"]]
 
     def try_launch(cfg, verdict):
         made.clear(), keys.clear(), calls.clear()
@@ -4046,6 +4081,7 @@ def _self_test_budget(ok) -> None:
         with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
                 mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
                                             "pipeline_preflight": lambda c, code: "v2",
+                                            "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=wvt[0]),
                                             "read_keys": lambda: keys.append(1) or 1 / 0}):   # stops past the guard
             try:
                 _launch_locked(cfg, "inv")
@@ -4066,6 +4102,32 @@ def _self_test_budget(ok) -> None:
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
     ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
        f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
+    # BU7 (2026-11-13; owner: spend controls fail soft): a VM type missing from cloud/vm_prices.yaml never refuses a
+    # launch. It is warned about before the budget is asked (budget.py counts it at the fallback rate)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
+                                   overflow_vm_types=("Standard_D8s_v5", "Fake_X9_v9")), (True, "ok"))
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_X9_v9" in out.getvalue(),
+       f"BU7 an unpriced overflow VM type warns and the launch goes on: {msg} {calls} {out.getvalue()[:200]!r}")
+    wvt[0] = ["Standard_E8s_v5", "Fake_F8s_v2"]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         (True, "ok"))
+    wvt[0] = ["Standard_E8s_v5", "Standard_E8as_v5"]
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_F8s_v2" in out.getvalue(),
+       f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) warns the same way: {msg} {calls}")
+    try:
+        req = vm_request(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"]))
+        prices = budget.load_prices(budget.PRICES_FILE)
+        good = (set(req) == {"run", "overflow", "keeper"} and all(
+            r["worker_vm_types"] and r["scheduler_vm_types"] and set(r["worker_vm_types"]) | set(r["scheduler_vm_types"])
+            <= set(prices) for r in req.values()) and req["run"]["worker_vm_types"] == ["Standard_E8s_v5"])
+    except Exception as e:  # noqa: BLE001 -- a missing function is a failing case
+        req, good = f"{type(e).__name__}: {e}", False
+    ok(good, f"BU7c vm_request pins every cluster's worker and scheduler types to priced ones: {req}")
     import tempfile
     with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
         cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
@@ -4105,6 +4167,22 @@ def _self_test_budget(ok) -> None:
                 msg = f"{type(e).__name__}: {e}"
         ok(msg is None and not seen and started == [{"keep_overflow": 7, "keep_keeper": True}],
            f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
+        seen.clear(), started.clear()
+        bad = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d,
+                        overflow_vm_types=("Fake_X9_v9",))
+        with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, reserve=True, **k: (
+                    seen.append(reserve), (True, "ok"))[1]), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                            "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(bad)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg is None and seen == [True] and started,
+           f"BU7d `keeper` with an unpriced overflow VM type warns and goes on (fail soft): {msg} {seen}")
     import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
     ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
     for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):

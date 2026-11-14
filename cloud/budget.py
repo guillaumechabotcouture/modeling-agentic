@@ -34,7 +34,9 @@ states rather than the cluster's, of hours in the window x max(the scope's media
 last stopped clusters, the instance's VM-type upper bound from cloud/vm_prices.yaml). A finished cluster (every
 process stopped or errored, with its stop time) counts what it billed, or the estimate if a cost is missing; its VM
 records end with their processes. A cluster with a live instance counts max(billed, estimate). One created before
-the budget's start counts its estimate from the start only. These refuse: an unknown VM type, missing scheduler,
+the budget's start counts its estimate from the start only. A VM type not in cloud/vm_prices.yaml never refuses
+(owner, 2026-11-13: spend controls fail soft): it is counted at fallback_bound (the table's highest per-vCPU rate x
+margin x its vCPUs, or the largest type's bound) and warned about in status and the launch output. These refuse: missing scheduler,
 worker or instance data, a negative cost, and a missing cost while an instance is live. A VM with no type yet
 (still being provisioned) is priced at the bound of the VM type its cluster's other workers have (an untyped
 scheduler: the highest among the scope's recent schedulers), or the table's highest when none is typed; a VM that
@@ -245,18 +247,127 @@ def scope_for_name(name, path=SCOPES_FILE):
     return hits[0] if len(hits) == 1 else None
 
 
+class Prices(dict):
+    """{VM type: bound}, plus per_vcpu: the table's highest USD per vCPU-hour x margin, plus the credit term, per
+    vCPU (fallback_bound prices an unlisted type with it)."""
+    per_vcpu = None
+
+
 def load_prices(path=PRICES_FILE) -> dict:
-    """{VM type: upper-bound USD per instance-hour} (see cloud/vm_prices.yaml)."""
+    """{VM type: upper-bound USD per instance-hour} (see cloud/vm_prices.yaml), as a Prices dict."""
     import yaml
     try:
         y = yaml.safe_load(open(path))
         m, c = _num(y["margin"], "margin", 1.0), _num(y["credits_per_vcpu_hour"], "credits_per_vcpu_hour", 0.0)
-        return {t: _num(v["usd_per_hour"], t, 0.0) * m + _num(v["vcpu"], t, 1) * c * USD_PER_CREDIT
-                for t, v in y["types"].items()}
+        out = Prices({t: _num(v["usd_per_hour"], t, 0.0) * m + _num(v["vcpu"], t, 1) * c * USD_PER_CREDIT
+                      for t, v in y["types"].items()})
+        out.per_vcpu = max(_num(v["usd_per_hour"], t, 0.0) / _num(v["vcpu"], t, 1)
+                           for t, v in y["types"].items()) * m + c * USD_PER_CREDIT
+        return out
     except BudgetError:
         raise
     except Exception as e:  # noqa: BLE001
         raise BudgetError(f"{path} cannot be read: {type(e).__name__}: {e}") from None
+
+
+_VCPU_RE = re.compile(r"^[A-Za-z]+_[A-Za-z]+([0-9]+)")      # Standard_F8s_v2 -> 8
+
+
+def fallback_bound(vm, prices) -> float:
+    """The bound of `vm`: its table bound when listed; otherwise (owner, 2026-11-13: fail soft) the table's highest
+    per-vCPU rate x margin x the vCPUs its Azure name states, or the largest type's bound when the name states none
+    (or the prices carry no per-vCPU rate). Conservative: no listed type costs more per vCPU."""
+    if vm in prices:
+        return prices[vm]
+    m = _VCPU_RE.match(str(vm or ""))
+    per = getattr(prices, "per_vcpu", None)
+    return per * int(m.group(1)) if m and per and int(m.group(1)) > 0 else max(prices.values())
+
+
+def _unpriced_note(vm, prices) -> str:
+    return (f"WARNING: VM type {vm!r} is not in cloud/vm_prices.yaml: counted at the fallback bound "
+            f"${fallback_bound(vm, prices):.3f} per hour; add it to the table")
+
+
+def vm_table(path=None) -> dict:
+    """{VM type: {vcpu, memory_gib, bound}} from cloud/vm_prices.yaml (bound as in load_prices). `path` defaults to
+    PRICES_FILE as it is at call time."""
+    import yaml
+    path = path or PRICES_FILE
+    bounds = load_prices(path)
+    try:
+        types = yaml.safe_load(open(path))["types"]
+        return {t: {"vcpu": int(_num(v["vcpu"], t, 1)), "memory_gib": _num(v["memory_gib"], t, 0.0),
+                    "bound": bounds[t]} for t, v in types.items()}
+    except BudgetError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise BudgetError(f"{path}: every VM type needs vcpu and memory_gib: {type(e).__name__}: {e}") from None
+
+
+_MEM_UNITS = {"": 2 ** 30, "b": 1, "kib": 2 ** 10, "mib": 2 ** 20, "gib": 2 ** 30, "tib": 2 ** 40, "kb": 1e3,
+              "mb": 1e6, "gb": 1e9, "tb": 1e12, "k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}   # as dask.utils.parse_bytes
+
+
+def _gib(memory) -> float | None:
+    """A memory request in GiB, read as Coiled reads it (dask parse_bytes: '16 GiB' is 16 x 2^30 bytes, '16 GB' is
+    16 x 10^9); a bare number is GiB. None for no memory request."""
+    if memory is None or memory == "":
+        return None
+    if isinstance(memory, (int, float)) and not isinstance(memory, bool) and memory > 0:
+        return float(memory)
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)\s*", str(memory))
+    unit = m.group(2).lower() if m else None
+    if not m or unit not in _MEM_UNITS or not float(m.group(1)) > 0:
+        raise BudgetError(f"memory {memory!r} is not a size (e.g. '16 GiB')")
+    return float(m.group(1)) * _MEM_UNITS[unit] / 2 ** 30
+
+
+def vm_types_for(cpu, memory=None, path=None) -> list[str]:
+    """resolve_vm_types' list (its note is for the caller to print)."""
+    return resolve_vm_types(cpu, memory, path)[0]
+
+
+def resolve_vm_types(cpu, memory=None, path=None) -> tuple[list[str], str | None]:
+    """The priced VM types a request for `cpu` vCPUs and at least `memory` can be given: exactly that many vCPUs, at
+    least that memory. Coiled tries the first type and does not fall back on a quota refusal, so the first is one known
+    to run here: a type seen on our clusters (OBSERVED_VM_TYPES, what Coiled picked before), then one of a series seen
+    there (the same quota family), then the least memory and the cheapest bound. Coiled is then given this list (worker_vm_types / scheduler_vm_types), never cpu/memory, so
+    every type it can pick is priced. When no priced type matches exactly (owner, 2026-11-13: fail soft), the
+    closest that satisfies the request: the fewest vCPUs at or above it with enough memory, and a note saying so.
+    Refuses (BudgetError) only when nothing in the table satisfies the request, or it cannot be read."""
+    tab, gib = vm_table(path), _gib(memory)
+    try:
+        n = int(cpu)
+    except (TypeError, ValueError):
+        raise BudgetError(f"cpu {cpu!r} is not a whole number of vCPUs") from None
+    fit = {t: v for t, v in tab.items() if v["vcpu"] >= n and (gib is None or v["memory_gib"] >= gib)}
+    if not fit:
+        raise BudgetError(f"no VM type in {os.path.basename(path or PRICES_FILE)} has at least {n} vCPUs and "
+                          f"{memory or 'any'} memory: price one there (cloud/vm_prices.yaml) or change the request")
+    least = min(v["vcpu"] for v in fit.values())
+    hits = [t for t, v in fit.items() if v["vcpu"] == least]
+    note = None if least == n else (f"WARNING: no priced VM type has exactly {n} vCPUs with at least "
+                                    f"{memory or 'any'} memory; using the closest that satisfies the request "
+                                    f"({least} vCPUs)")
+    series = {re.sub(r"[0-9]+", "#", t, count=1) for t in OBSERVED_VM_TYPES}
+    return sorted(hits, key=lambda t: (t not in OBSERVED_VM_TYPES, re.sub(r"[0-9]+", "#", t, count=1) not in series,
+                                       tab[t]["memory_gib"], tab[t]["bound"], t)), note
+
+
+def unpriced(types, path=None) -> list[str]:
+    """The types in `types` with no bound in cloud/vm_prices.yaml, for a warning: they are never refused (owner,
+    2026-11-13), and budget.py counts them at fallback_bound."""
+    types = [types] if isinstance(types, str) else list(types or ())
+    prices = load_prices(path or PRICES_FILE)
+    return [t for t in types if t not in prices]
+
+
+SCHEDULER_CPU, SCHEDULER_MEMORY = 2, "8 GiB"     # what the launchers' schedulers got before pinning (Standard_D2_v5)
+
+
+def scheduler_vm_types(path=None) -> list[str]:
+    return vm_types_for(SCHEDULER_CPU, SCHEDULER_MEMORY, path)
 
 
 def _check_record(rec) -> dict:
@@ -416,9 +527,9 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
     procs = [d["scheduler"]] + d["workers"]
     done = all(isinstance(p, dict) and state_of(p) in ENDED and _ts((p.get("current_state") or {}).get("updated"))
                is not None for p in procs)
-    live, hours, est, untyped, failed = 0, 0.0, 0.0, 0, 0
+    live, hours, est, untyped, failed, warn = 0, 0.0, 0.0, 0, 0, []
     top = max(prices.values())
-    worker_typed = [prices[t] for t in map(_vm_type, d["workers"]) if t in prices]
+    worker_typed = [fallback_bound(t, prices) for t in map(_vm_type, d["workers"]) if t]   # unpriced: fallback
     worker_bound = max(worker_typed) if worker_typed else top     # an untyped worker: like the cluster's other workers
     sched_bound = top if sched_bound is None else sched_bound     # an untyped scheduler: like the scope's schedulers
     for p in procs:
@@ -442,8 +553,10 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
         if vm is None or vm == "":        # a VM still being provisioned has no type yet
             bound = sched_bound if p is d["scheduler"] else worker_bound
             untyped += 1
-        elif vm not in prices:
-            raise BudgetError(f"cluster {d.get('id')}: VM type {vm!r} is not in cloud/vm_prices.yaml")
+        elif vm not in prices:            # fail soft (owner, 2026-11-13): counted at the fallback, and warned
+            bound = fallback_bound(vm, prices)
+            if _unpriced_note(vm, prices) not in warn:
+                warn.append(_unpriced_note(vm, prices))
         else:
             bound = prices[vm]
         hours += max(0.0, t1 - t0) / 3600
@@ -467,7 +580,7 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
     return {"id": d.get("id"), "name": d.get("name"), "state": state_of(d), "created": created, "live_instances": live,
             "instance_hours": hours, "billed_usd": 0.0 if before else billed, "estimate_usd": est,
             "usd": est if before else count, "_billed_all": None if fallback or partial else billed,
-            "assumptions": ([f"{untyped} instance(s) with no VM type yet (still provisioning), priced at the bound "
+            "assumptions": warn + ([f"{untyped} instance(s) with no VM type yet (still provisioning), priced at the bound "
                              f"of the cluster's other workers' VM type (an untyped scheduler: the scope's schedulers'), "
                              f"or the table's highest, ${top:.2f} per hour, when none is typed"] if untyped else [])
             + ([f"{failed} instance(s) failed to create, counted $0"] if failed else [])
@@ -508,8 +621,8 @@ def _measure(rec, env, now) -> dict:
     n = len(sample)
     median = 0.0 if not n else sample[n // 2] if n % 2 else (sample[n // 2 - 1] + sample[n // 2]) / 2
     median = max(median, _num(rec["floor_usd_per_instance_hour"], "floor"))
-    seen = [prices[t] for t in (_vm_type(x.get("scheduler")) for x in dets.values() if isinstance(x, dict))
-            if t in prices]
+    seen = [fallback_bound(t, prices) for t in (_vm_type(x.get("scheduler")) for x in dets.values()
+                                                if isinstance(x, dict)) if t]
     sched_bound = max(seen) if seen else None
     rows = [_cluster_cost(dets[c["id"]], now, start, median, prices, sched_bound) for c in counted]
     for r, c in zip(rows, counted):
@@ -659,8 +772,11 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
                 os.replace(env.reservations + ".tmp", env.reservations)
     except Exception as e:  # noqa: BLE001 -- fail closed
         return False, f"budget check failed closed: {type(e).__name__}: {e}"
+    warns = sorted({f"{r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", [])
+                    if a.startswith("WARNING")})
     return fits, (f"{scope}: used ${s['used_usd']:.2f} (billed ${s['billed_usd']:.2f}) + reserved "
-                  f"${s['reserved_usd']:.2f} + cap ${cap:.2f} {'<=' if fits else '>'} budget ${s['budget_usd']:.2f}")
+                  f"${s['reserved_usd']:.2f} + cap ${cap:.2f} {'<=' if fits else '>'} budget ${s['budget_usd']:.2f}"
+                  + "".join(f"\n{w}" for w in warns))
 
 
 def job_meter(scope):
@@ -749,6 +865,7 @@ def status_lines(s) -> list[str]:
     out += [f"{str(r['name']):<40} {str(r['id']):>9} {r['state']:<9} {r['billed_usd']:>9.2f} {r['estimate_usd']:>9.2f} "
             f"{r['usd']:>9.2f} {r['live_instances']:>8}" for r in s["clusters"]]
     out += [f"  assumption, {r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", [])]
+    out += [f"{r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", []) if a.startswith("WARNING")]
     return out + [f"reservation {r['name']}: cap ${r['cap_usd']:.2f}, outstanding ${r['outstanding_usd']:.2f} "
                   f"({r['invocation']})" for r in s["reservations"]]
 
@@ -1039,8 +1156,6 @@ def _self_test() -> int:
             for label, cid, mut in (("no scheduler key", 2, lambda x: x.pop("scheduler")),
                                     ("a running process without instance data",
                                      2, lambda x: x["workers"][0].__setitem__("instance", None)),
-                                    ("an unknown VM type", 2, lambda x: x["scheduler"]["instance"].__setitem__(
-                                        "instance_type_id", "vmZ")),
                                     ("a negative cost", 1, lambda x: x.__setitem__("total_cost", -5)),
                                     ("an invalid creation time", 1, lambda x: x.__setitem__("created", "garbage")),
                                     ("no creation time", 1, lambda x: x.__setitem__("created", None)),
@@ -1057,6 +1172,56 @@ def _self_test() -> int:
                 ok(refused(lambda: spend("f6")) is not None
                    and not launch_budget_ok("f6", 1, "lw-smoke-z")[0], f"BR9 {label} refuses")
         case("BR8-9", bg8)
+
+        def bg25():
+            # BR25 (owner, 2026-11-13: spend controls fail soft): an unpriced VM type never refuses status, a launch or
+            # a meter reading. It is counted at the fallback bound (no vCPU count in the name: the table's largest
+            # bound, vmB's 10.0) and warned about in the cluster's assumptions, status and the launch's reason.
+            for cid, label in ((1, "a stopped cluster"), (2, "a live cluster")):
+                bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+                bad[str(cid)]["scheduler"]["instance"]["instance_type_id"] = "vmZ"
+                bad = {int(k): v for k, v in bad.items()}
+                bad[4] = bad[5] = ValueError("not this scope")
+                with_env(env(r8, source=_FakeSource(items, bad)))
+                st = spend("f6")
+                row = {c["id"]: c for c in st["clusters"]}[cid]
+                lines = "\n".join(status_lines(st))
+                okl, why = launch_budget_ok("f6", 1, "lw-smoke-z")
+                want = 10.1 if cid == 1 else 28.315 + 3 * (10.0 - 5.55)    # stopped: billed; live: 3 h at the fallback
+                ok(abs(row["usd"] - want) < 1e-6 and okl and "WARNING" in why and "vmZ" in why
+                   and "WARNING" in lines and "vmZ" in lines and "vm_prices.yaml" in lines,
+                   f"BR25 {label} on an unpriced VM type is counted (at the fallback bound while live), and neither "
+                   f"status nor a later launch is refused; both warn: usd {row['usd']:.3f} (want {want:.3f}), launch "
+                   f"{okl} {why!r}")
+            nof8p = os.path.join(d, "nof8b.yaml")
+            open(nof8p, "w").write("margin: 1.25\ncredits_per_vcpu_hour: 1.5\ntypes:\n"
+                                   "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                                   "  Standard_E8s_v5: {vcpu: 8, memory_gib: 64, usd_per_hour: 0.504}\n"
+                                   "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n")
+            pr8 = load_prices(nof8p)
+            per = 0.504 / 8 * 1.25 + 1.5 * USD_PER_CREDIT        # the highest per-vCPU rate x margin, plus credits
+            ok(abs(fallback_bound("Standard_F8s_v2", pr8) - 8 * per) < 1e-9
+               and abs(fallback_bound("Fake_D96x_v9", pr8) - 96 * per) < 1e-9
+               and abs(fallback_bound("oddname", pr8) - max(pr8.values())) < 1e-9
+               and fallback_bound("Standard_D8_v5", pr8) == pr8["Standard_D8_v5"],
+               f"BR25b the F8s_v2 case: an unpriced type is priced at the table's highest per-vCPU rate x margin x its "
+               f"vCPUs ({8 * per:.4f}/h for 8 vCPUs), or the largest type's bound when its vCPUs are unknown")
+            det = _det(9, "lw-smoke-f8", T0, None, None, state="running",
+                       insts=[(now - H, None, "Standard_D2_v5"), (now - H, None, "Standard_F8s_v2")])
+            c = _cluster_cost(det, now, T0, 0.0, pr8)
+            ok(abs(c["usd"] - (pr8["Standard_D2_v5"] + 8 * per)) < 1e-6
+               and any("Standard_F8s_v2" in a and "WARNING" in a for a in c["assumptions"]),
+               f"BR25c a running F8s_v2 worker is metered at the fallback rate (the cap keeps working, nothing is "
+               f"stopped for want of a price): {c['usd']:.4f} {c['assumptions']}")
+            det2 = json.loads(json.dumps(det))
+            det2["workers"].append({"current_state": {"state": "started", "updated": _iso(now - H)},
+                                    "instance": {"created": _iso(now - H), "instance_type_id": None,
+                                                 "current_state": {"state": "ready", "updated": _iso(now - H)}}})
+            c2 = _cluster_cost(det2, now, T0, 0.0, pr8)
+            ok(abs(c2["usd"] - (pr8["Standard_D2_v5"] + 2 * 8 * per)) < 1e-6,
+               f"BR25d (Codex on this PR) a worker with no type yet is priced like its unpriced peer, at the peer's "
+               f"fallback bound (not a cheaper listed one): {c2['usd']:.4f}")
+        case("BR25", bg25)
 
         def bg8f():
             for field in ("cloud_total_cost", "total_cost"):
@@ -1366,8 +1531,11 @@ def _self_test() -> int:
                f"{got['usd']:.3f} == {want['usd']:.3f}; {got['assumptions']}")
             with_env(env(r8, source=_FakeSource(items + [_item(X, "lw-smoke-scale", now - 3 * H, "running", now)],
                                                 {**dets, X: cluster("vmA", ["Azure_Z99"])})))
-            ok(refused(lambda: spend("f6")) is not None and not launch_budget_ok("f6", 1, "lw-smoke-z")[0],
-               "BR21b a named VM type that is not in the table still refuses")
+            sp_err, lb = refused(lambda: spend("f6")), launch_budget_ok("f6", 1, "lw-smoke-z")
+            ok(sp_err is None and "Azure_Z99" in lb[1] and "fallback bound $990.000" in lb[1],
+               f"BR21b (owner, 2026-11-13: fail soft) a named VM type that is not in the table no longer refuses the "
+               f"status: it is counted at the fallback bound (99 vCPUs x the highest per-vCPU rate, 10.0) and the "
+               f"launch's reason warns about it (here the 3 h at that bound exceed this toy budget): {lb}")
         case("BR21", bg21)
 
         def bg13():
@@ -1403,6 +1571,54 @@ def _self_test() -> int:
                f"BR18 every VM type the configs, launchers and vm_job sizing can request, and every type seen on our "
                f"clusters, has a price bound ({len(named)} named in code): missing {missing}")
         case("BR18", bg18)
+
+        def bg23():
+            # BR23 (2026-11-13): `vm_job --cpu 8` with the default --memory got Standard_F8s_v2, which this table
+            # lacked; the cap stopped the cluster and every later f6 launch was refused until #230 priced it. The
+            # launchers now pin their VM types from this table, so what is priced is what is requested.
+            tab = vm_table()
+            ok(tab and all(v["vcpu"] >= 1 and v["memory_gib"] > 0 and v["bound"] > 0 for v in tab.values())
+               and set(tab) == set(load_prices(PRICES_FILE)),
+               f"BR23a every VM type in the tracked table states its vCPUs, memory and bound ({len(tab)} types)")
+            nof8 = os.path.join(d, "nof8.yaml")
+            open(nof8, "w").write("margin: 1.0\ncredits_per_vcpu_hour: 0\ntypes:\n"
+                                  "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                                  "  Standard_D8as_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.344}\n"
+                                  "  Standard_E8s_v5: {vcpu: 8, memory_gib: 64, usd_per_hour: 0.504}\n"
+                                  "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n"
+                                  "  Standard_D4_v5: {vcpu: 4, memory_gib: 16, usd_per_hour: 0.192}\n")
+            got = vm_types_for(8, "16 GiB", nof8)
+            ok(got and "Standard_F8s_v2" not in got and set(got) <= set(load_prices(nof8))
+               and all(vm_table(nof8)[t]["vcpu"] == 8 and vm_table(nof8)[t]["memory_gib"] >= 16 for t in got)
+               and got == ["Standard_E8s_v5", "Standard_D8_v5", "Standard_D8as_v5"],
+               f"BR23b the F8s_v2 case: --cpu 8 --memory '16 GiB' on a table without F8s_v2 resolves to priced 8-vCPU "
+               f"types with at least 16 GiB, never F8s_v2: a type seen on our clusters first, then one of a series "
+               f"seen there, then the cheapest: {got}")
+            ok(vm_types_for(8, "16 GiB")[0] == "Standard_F8s_v2" and vm_types_for(2, "8 GiB")[0] == "Standard_D2_v5"
+               and vm_types_for(32, "16 GiB")[0] == "Standard_D32_v5" and vm_types_for(4, "16 GiB")[0] == "Standard_D4_v5",
+               f"BR23c on the tracked table a type seen on our clusters comes first (what Coiled picked before): "
+               f"{[vm_types_for(c, m)[:1] for c, m in ((8, '16 GiB'), (2, '8 GiB'), (32, '16 GiB'), (4, '16 GiB'))]}")
+            t12, note12 = resolve_vm_types(12, "16 GiB")
+            t4, note4 = resolve_vm_types(5, "16 GiB", nof8)
+            ok(t12 and all(tab[t]["vcpu"] == 16 for t in t12) and note12 and "closest" in note12
+               and t4 and all(vm_table(nof8)[t]["vcpu"] == 8 for t in t4) and note4
+               and resolve_vm_types(8, "16 GiB")[1] is None,
+               f"BR23d (owner: fail soft) a request no priced type matches exactly gets the closest priced types that "
+               f"satisfy it (12 vCPUs -> 16; 5 on a table with 2, 4 and 8 -> 8), with a note to warn: {t12[:2]} {note12!r}")
+            msgs = [refused(lambda: vm_types_for(8, "128 GiB", nof8)), refused(lambda: vm_types_for(500, None)),
+                    refused(lambda: vm_types_for(8, "lots"))]
+            ok(all(msgs) and "vm_prices.yaml" in msgs[0],
+               f"BR23d' only a request nothing in the table can satisfy (or an unreadable memory) is refused: {msgs}")
+            ok(unpriced(["Standard_D8_v5", "Standard_F8s_v2"], nof8) == ["Standard_F8s_v2"]
+               and unpriced(["Standard_D8_v5"], nof8) == [],
+               "BR23e unpriced() names the unpriced types for a warning (it refuses nothing)")
+            ok(abs(_gib("68 GB") - 63.33) < 0.01 and _gib("16 GiB") == 16.0 and _gib("16384 MiB") == 16.0
+               and _gib("1 TiB") == 1024.0 and "Standard_E8s_v5" in vm_types_for(8, "68 GB"),
+               "BR23g (Codex on this PR) memory reads as Coiled reads it: 68 GB is 63.3 GiB (a 64 GiB type fits), MiB "
+               "and TiB are accepted")
+            ok(vm_types_for(2, "8 GiB") == scheduler_vm_types() and set(scheduler_vm_types()) <= set(tab),
+               f"BR23f schedulers are pinned to priced 2-vCPU, 8 GiB types: {scheduler_vm_types()}")
+        case("BR23", bg23)
 
         def bg22():
             # BR22 (Codex on #232): re-attaching a cap replaces the cluster's reservation with the new cap's remaining
