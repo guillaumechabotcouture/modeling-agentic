@@ -717,36 +717,77 @@ def calibration_ok(cal: dict) -> list:
 
 Z95 = 1.96
 ACCEPTANCE_RULE = ("owner, 14 Nov: a verified point, and the chosen point, is in band for a target when the 95% interval "
-                   "of its seed mean, mean +- 1.96 x sd / sqrt(n_seeds) over the run's seeds (sd with n - 1), overlaps "
-                   "the target's band; fewer than 2 finite seed values, or a target without them, fail closed. Control "
-                   "arms within 10% and no calibration-grid clamp are unchanged")
+                   "of its seed mean overlaps the target's band. The seed mean is the geometric mean over the run's "
+                   "seeds, the statistic of the target's `computed` value; its interval is exp(mean(log v) +- 1.96 x "
+                   "sd(log v) / sqrt(n_seeds)) (sd with n - 1). The point must hold exactly one finite, positive value "
+                   "per seed the run declares (pack.yaml's seeds, which the run records); a missing, extra or "
+                   "duplicate seed, or a target without values, fails closed. Control arms within 10% and no "
+                   "calibration-grid clamp are unchanged")
+ACCEPTANCE_STATISTIC = ("geometric mean over seeds; 95% interval exp(mean(log v) +- 1.96 sd(log v)/sqrt(n)), "
+                        "one value per declared seed")
 
 
-def seed_interval(values) -> tuple[float, float] | None:
-    """(lo, hi) of the seed mean's 95% interval, mean +- Z95 sd/sqrt(n); None with fewer than 2 finite values."""
+def declared_seeds(seeds) -> list:
+    """The run's declared seeds as a list of distinct integers; ValueError otherwise (fail closed)."""
+    if not isinstance(seeds, (list, tuple)) or not seeds:
+        raise ValueError(f"no declared seeds ({seeds!r})")
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in seeds):
+        raise ValueError(f"declared seeds must be integers ({list(seeds)!r})")
+    dup = sorted({x for x in seeds if list(seeds).count(x) > 1})
+    if dup:
+        raise ValueError(f"duplicate declared seeds {dup} in {list(seeds)}")
+    return list(seeds)
+
+
+def seed_interval(values, n_seeds: int) -> tuple[float, float] | None:
+    """(lo, hi) of the seed geometric mean's 95% interval, exp(mean(log v) +- Z95 sd(log v)/sqrt(n)); None unless
+    there are exactly `n_seeds` (>= 2) values, all finite and positive."""
     try:
         v = [float(x) for x in values]
+        n_seeds = int(n_seeds)
     except (TypeError, ValueError):
         return None
-    if len(v) < 2 or not all(np.isfinite(v)):
+    if n_seeds < 2 or len(v) != n_seeds or not all(np.isfinite(v)) or min(v) <= 0:
         return None
-    m, h = float(np.mean(v)), Z95 * float(np.std(v, ddof=1)) / float(np.sqrt(len(v)))
-    return m - h, m + h
+    lg = np.log(v)
+    m, h = float(np.mean(lg)), Z95 * float(np.std(lg, ddof=1)) / float(np.sqrt(len(v)))
+    return float(np.exp(m - h)), float(np.exp(m + h))
 
 
-def ci_in_band(values, band) -> bool:
-    """The acceptance rule (ACCEPTANCE_RULE) for one target: the seed mean's 95% interval overlaps the band."""
-    iv = seed_interval(values)
+def ci_in_band(values, band, n_seeds: int) -> bool:
+    """ACCEPTANCE_RULE for one target: the seed geometric mean's 95% interval overlaps the band."""
+    iv = seed_interval(values, n_seeds)
     return iv is not None and iv[0] <= float(band[1]) and iv[1] >= float(band[0])
 
 
-def point_in_band(p: dict, bands: dict) -> tuple[bool, dict]:
-    """(every target in band under ACCEPTANCE_RULE, {target: [interval lo, hi] or None}) from the point's own seed
-    evidence `per_seed` {target: [values]}; a target without evidence fails the point."""
+def _per_seed(p) -> dict:
     per = (p or {}).get("per_seed") if isinstance(p, dict) else None
-    per = per if isinstance(per, dict) else {}
-    ivs = {t: seed_interval(per.get(t) or []) for t in bands}
-    return all(ci_in_band(per.get(t) or [], b) for t, b in bands.items()), {
+    return per if isinstance(per, dict) else {}
+
+
+def seed_count_errors(p: dict, bands: dict, seeds) -> list:
+    """Targets whose seed values are not one per declared seed, as readable reasons."""
+    per, n = _per_seed(p), len(seeds) if isinstance(seeds, (list, tuple)) else 0
+    out = []
+    for t in bands:
+        v = per.get(t)
+        k = len(v) if isinstance(v, (list, tuple)) else 0
+        if k != n:
+            out.append(f"{t}: {k} seed values for {n} declared seeds")
+    return out
+
+
+def point_in_band(p: dict, bands: dict, seeds) -> tuple[bool, dict]:
+    """(every target in band under ACCEPTANCE_RULE, {target: [interval lo, hi] or None}) from the point's own seed
+    evidence `per_seed` {target: [values]}, one value per declared seed in `seeds`; a target without exactly that
+    evidence, or an invalid seed declaration, fails the point."""
+    try:
+        n = len(declared_seeds(seeds))
+    except ValueError:
+        return False, {t: None for t in bands}
+    per = _per_seed(p)
+    ivs = {t: seed_interval(per.get(t) or [], n) for t in bands}
+    return all(ci_in_band(per.get(t) or [], b, n) for t, b in bands.items()), {
         t: [round(v[0], 4), round(v[1], 4)] if v else None for t, v in ivs.items()}
 
 
@@ -755,19 +796,35 @@ def pack_bands() -> dict:
     return target_bands(build_pack(yaml.safe_load(open(PACK))))
 
 
-def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(), bands: dict | None = None
-             ) -> tuple[dict, int]:
+def pack_seeds() -> list:
+    """The fit's seeds from pack.yaml (the loader's replay uses these; the file's recorded seeds must match)."""
+    return list(build_pack(yaml.safe_load(open(PACK)))["seeds"])
+
+
+def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(), bands: dict | None = None,
+             seeds=None) -> tuple[dict, int]:
     """The acceptance gate (review rounds 1-2; owner, 14 Nov: ACCEPTANCE_RULE). The sample is `verified` (code 0)
     only if every verified point and the chosen point are in band for every target under the rule, from their own
     seed evidence (the summary flags are not evidence), their control arms are within CAL_TOL of the calibration
-    targets, and no site's calibration grid clamps at its edge. `bands`: the targets' bands (default pack.yaml's).
+    targets, and no site's calibration grid clamps at its edge. `bands`: the targets' bands (default pack.yaml's);
+    `seeds`: the run's declared seeds, one seed value each per target (default pack.yaml's).
     Otherwise the sample moves to `sample_unverified`, `sample` is emptied, the reasons are recorded, and the code is
     2. run() and load_posterior's replay both call this function."""
     bands = pack_bands() if bands is None else bands
+    seeds = pack_seeds() if seeds is None else seeds
+    why = []
+    try:
+        declared_seeds(seeds)
+    except ValueError as ex:
+        why.append(f"the run's seeds cannot be checked against: {ex}")
     for c in checked:
-        c["in_band_by_rule"], c["seed_mean_interval"] = point_in_band(c, bands)
+        c["in_band_by_rule"], c["seed_mean_interval"] = point_in_band(c, bands, seeds)
     failed = [c["point"] for c in checked if not c["in_band_by_rule"] or calibration_ok(c.get("calibration_check"))]
-    why = [f"verified point out of band (rule) or off calibration: {p}" for p in failed]
+    why += [f"verified point out of band (rule) or off calibration: {p}" for p in failed]
+    for c in checked:
+        if seed_count_errors(c, bands, seeds):
+            why.append(f"verified point without one seed value per declared seed at {c.get('point')}: "
+                       f"{seed_count_errors(c, bands, seeds)}")
     for c in checked:
         if calibration_ok(c.get("calibration_check")):
             why.append(f"control arms off target by more than {CAL_TOL:.0%} at {c['point']}: "
@@ -775,9 +832,12 @@ def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(),
     if chosen is None:
         why.append("the chosen point's verification is missing")
     else:
-        chosen["in_band_by_rule"], chosen["seed_mean_interval"] = point_in_band(chosen, bands)
+        chosen["in_band_by_rule"], chosen["seed_mean_interval"] = point_in_band(chosen, bands, seeds)
         if not chosen["in_band_by_rule"]:
             why.append(f"the chosen point fails its verification under the rule: {chosen['seed_mean_interval']}")
+        if seed_count_errors(chosen, bands, seeds):
+            why.append(f"the chosen point lacks one seed value per declared seed: "
+                       f"{seed_count_errors(chosen, bands, seeds)}")
         if calibration_ok(chosen.get("calibration_check")):
             why.append(f"the chosen point's control arms are off target: {calibration_ok(chosen['calibration_check'])}")
     if grid_edge:
@@ -786,7 +846,9 @@ def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(),
         why.append("no verified sample point")
     reg["verified"] = {"n": len(checked), "all_in_band": len(checked) - len(failed), "failed": failed,
                        "points": checked, "chosen": chosen, "calibration_tolerance": CAL_TOL,
-                       "acceptance_rule": ACCEPTANCE_RULE, "bands": {t: list(b) for t, b in bands.items()}}
+                       "acceptance_rule": ACCEPTANCE_RULE, "acceptance_statistic": ACCEPTANCE_STATISTIC,
+                       "seeds": list(seeds) if isinstance(seeds, (list, tuple)) else seeds,
+                       "bands": {t: list(b) for t, b in bands.items()}}
     reg["acceptance"] = why
     if why:
         reg["sample_status"] = "unverified" if why == ["no verified sample point"] else "invalid"
@@ -814,13 +876,14 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
 
 def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
-    mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in (-1, 0, 1, 0)]  # noqa: E731
+    ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
+    mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in ks]  # noqa: E731
                      for t, (lo, hi) in pack_bands().items()}            # seed values around each band's middle
     pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"per_seed": mid(1.0), "all_in_band": True,
                                                                 "disproved_by_verification": [], "calibration_check": {}})
-    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []}), open(path, "w"),
-                   sort_keys=False)
+    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
+                            fit_rule={"seeds": pack_seeds()}), open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
@@ -893,9 +956,12 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             not isinstance(p, dict) or p.get("point") not in rows for p in pts):
         no("the fit's acceptance gate cannot be replayed: a calibration_grid.at_grid_edge record and verified points "
            "that are rows of the sample are needed")
+    seeds = pack_seeds()
+    if (doc.get("fit_rule") or {}).get("seeds") != seeds:
+        no(f"the run's recorded seeds {(doc.get('fit_rule') or {}).get('seeds')} are not pack.yaml's {seeds}")
     try:
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
-                           edge)
+                           edge, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
@@ -1019,7 +1085,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                         "computed": {t: round(r["computed"], 4) for t, r in rows.items()},
                         "per_seed": {t: list(r.get("per_seed") or []) for t, r in rows.items()},
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
-    reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands)
+    reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands, seeds=list(runner.seeds))
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
@@ -1162,7 +1228,7 @@ def _self_test() -> int:
                                         "all_in_band": True, "calibration_check": cal(**kw)}
         chosen_ok = {"per_seed": {"T": inb}, "all_in_band": True, "disproved_by_verification": [],
                      "calibration_check": cal()}
-        fz = lambda c, ch, **kw: finalize(copy.deepcopy(reg), c, ch, bands=bd, **kw)  # noqa: E731
+        fz = lambda c, ch, **kw: finalize(copy.deepcopy(reg), c, ch, bands=bd, seeds=[1, 2, 3, 4], **kw)  # noqa: E731
         runs = {
             "good": (fz([pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
             "ratio": (fz([pt(0.1), pt(0.2, False)], chosen_ok), 2),
@@ -1562,19 +1628,20 @@ def _self_test() -> int:
                  "one seed (no spread)": ([0.50], False),
                  "a non-finite value": ([0.5, float("nan"), 0.5], False),
                  "no values": ([], False)}
-        got = {k: ci_in_band(v, b) for k, (v, _) in cases.items()}
+        got = {k: ci_in_band(v, b, len(v)) for k, (v, _) in cases.items()}
         wrong = sorted(k for k, (_, w) in cases.items() if got[k] != w)
         v = cases["mean below, interval overlaps"][0]
-        lo, hi = seed_interval(v)
-        h = 1.96 * float(np.std(v, ddof=1)) / np.sqrt(len(v))
-        ok(not wrong and abs(lo - (np.mean(v) - h)) < 1e-12 and abs(hi - (np.mean(v) + h)) < 1e-12
+        lo, hi = seed_interval(v, len(v))
+        lg = np.log(v)
+        h = 1.96 * float(np.std(lg, ddof=1)) / np.sqrt(len(v))
+        ok(not wrong and abs(lo - np.exp(np.mean(lg) - h)) < 1e-12 and abs(hi - np.exp(np.mean(lg) + h)) < 1e-12
            and "1.96" in ACCEPTANCE_RULE,
            f"F24 (owner, 14 Nov) a verified or chosen point is in band for a target when the 95% interval of its seed "
-           f"mean, mean +- 1.96 sd/sqrt(n) over the run's seeds, overlaps the band; fewer than 2 seeds or a non-finite "
-           f"value fail closed ({len(cases)} cases; wrong: {wrong or 'none'})")
+           f"(geometric) mean, on the log scale +- 1.96 sd/sqrt(n) over the run's seeds, overlaps the band; fewer "
+           f"than 2 seeds or a non-finite value fail closed ({len(cases)} cases; wrong: {wrong or 'none'})")
         p = {"point": {}, "per_seed": {"B10": [0.5, 0.5, 0.6, 0.6]}}
-        ok(point_in_band(p, {"B10": [0.3, 0.67], "B11": [0.42, 0.7]})[0] is False
-           and point_in_band(p, {"B10": [0.3, 0.67]})[0] is True,
+        ok(point_in_band(p, {"B10": [0.3, 0.67], "B11": [0.42, 0.7]}, [1, 2, 3, 4])[0] is False
+           and point_in_band(p, {"B10": [0.3, 0.67]}, [1, 2, 3, 4])[0] is True,
            "F24b a target without seed evidence fails the point (fail closed)")
     case("F24", f24)
 
