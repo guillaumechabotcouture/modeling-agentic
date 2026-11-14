@@ -1,0 +1,204 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Measles outbreaks have
+  just been detected in 20 districts at the start of 2026. Each district can run one reactive vaccination campaign
+  targeting everyone susceptible-eligible (about 80% reached), and the choice is its timing: none; EARLY (campaign
+  completed 14 days after detection, US$2.20 per resident because of emergency logistics); LATE (completed 42 days
+  after detection, US$1.40 per resident). The budget is US$4 million. R0 is between 12 and 18. Input file: units.csv
+  (population, susceptible share at detection from a synthetic serosurvey, share of the population already infected
+  at detection). Choose the timing per district that maximises measles infections averted over the outbreak within
+  the budget, report the total with a 95% uncertainty interval, and state the rule (when does waiting for a cheaper
+  campaign cost more infections than it saves money?).'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups:
+    - all
+    structure: single_group
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 8.0
+        infectious_days: 5.0
+    components:
+      early:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.8
+        day: 14
+      late:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.8
+        day: 42
+    tol: 1.0e-09
+horizon:
+  start: 0
+  stop: 730
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+      split: ' '
+    s0:
+      column: s0
+      split: ' '
+    seed:
+      column: seed_share
+  defaults_accepted:
+    reach:early: the configured reach (question text)
+    reach:late: the configured reach (question text)
+    intro: 'single group: the infection enters the only group'
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    early:
+      group: response
+    late:
+      group: response
+  packages:
+    none: []
+    early:
+    - early
+    late:
+    - late
+  engine_map:
+    early:
+      early: 1
+    late:
+      late: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: early_cost
+    component: early
+    value: 2.2
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - early
+  - id: late_cost
+    component: late
+    value: 1.4
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - late
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 730
+  discounting: none
+constraints:
+  envelope_usd: 4000000
+comparator:
+  package: none
+  text: no response
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:early:
+    value: 0.88
+    range:
+    - 0.8
+    - 0.95
+    dist: triangular
+    basis: literature
+    source: 'measles vaccine effectiveness of one dose about 0.84 at 9-11 months and 0.92 at 12 months or later
+      (Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review of
+      published literature. J Infect Dis 2011;204 Suppl 1:S133-S148)'
+    reason: protection of the susceptibles reached
+  efficacy:late:
+    value: 0.88
+    range:
+    - 0.8
+    - 0.95
+    dist: triangular
+    basis: literature
+    source: 'measles vaccine effectiveness of one dose about 0.84 at 9-11 months and 0.92 at 12 months or later
+      (Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review of
+      published literature. J Infect Dis 2011;204 Suppl 1:S133-S148)'
+    reason: protection of the susceptibles reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 60.0
+  - 90.0
+  target_column: r0_target
+  window:
+  - 0
+  - 365
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); in one homogeneous group R0
+    = q x contact_rate, so contact_rate over [60, 90] spans R0 12-18
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 128
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - s0
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table) Seed 41407 chosen by a deterministic search so the realized table's declared features have max |Spearman| 0.120 <= 0.2 (chain b copy, 128 design points).
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections
