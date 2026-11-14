@@ -6,11 +6,16 @@ are they confirmed, and where does it fail.
     python3 scripts/world_model_trials.py run --total-cap-usd 1000 [--questions FILE] [--only id,id] [--batch B]
         [--limit N] [--trials-dir trials] [--task-cap-usd 2] [--llm-concurrency 5] [--push]
     python3 scripts/world_model_trials.py check-templates [--only id,id]   # inputs only: no LLM, no push
+    python3 scripts/world_model_trials.py lint-templates [--only id,id]    # specs and tables only: no LLM, no engine
     python3 scripts/world_model_trials.py rebuild [--only id,id]           # circular flags + build again: no LLM, no engine
     python3 scripts/world_model_trials.py score [--trials-dir trials]      # trials/summary.yaml and summary.md
     python3 scripts/world_model_trials.py --self-test
 
 Per question (scripts/world_model_trials_questions.yaml: {id, question, engine, template, shadow_price, ...}):
+  0. check    template_problems (inputs only, no engine run): schema, declared-independent features uncorrelated in
+              the realized units table, every declared feature read by the engine or declared derived, costs in the
+              willingness to pay's currency, a pre-registered shadow price. A failing template is never seeded
+              (status template_refused, no spend)
   1. prepare  copy the template (a decision spec and its synthetic or public inputs) into trials/runs/<id>/, load
               the spec (toolkit/spec/schema.py), build the engine design (toolkit/analysis/batch.py design) and
               store it; the design's features come from world_model.design_features, the function load_sweep uses
@@ -555,6 +560,142 @@ def engine_unread_features(spec_dir, reads_dir=None) -> set:
     return unread
 
 
+# ---------------------------------------------------------------- template check, before any seed (2026-11-13)
+TEMPLATE_CHECKS = ("schema", "independence", "engine_reads", "cost_units", "shadow_price")
+USD_AMOUNT_RE = re.compile(r"US\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*(million|thousand|billion|[mk])\b)?", re.I)
+_SCALE = {"million": 1e6, "m": 1e6, "thousand": 1e3, "k": 1e3, "billion": 1e9}
+SWEEP_RE = re.compile(r"\b(sweep|swept|check run|design point|engine run|batch result)", re.I)
+SHADOW_KEYS = ("shadow_price", "shadow_price_basis", "lambda", "willingness_to_pay")
+WTP_KEYS = ("outcome_type", "cost_units")      # all a template's wtp.yaml may hold: never a value
+
+
+def _usd_amounts(text) -> list[float]:
+    """The US$ amounts a question states ('US$17.0 million', 'US$850,000', 'US$1.20')."""
+    return [float(a.replace(",", "")) * _SCALE.get((m or "").lower(), 1.0) for a, m in USD_AMOUNT_RE.findall(text)]
+
+
+def _keys_deep(x, path=""):
+    if isinstance(x, dict):
+        for k, v in x.items():
+            yield f"{path}{k}", str(k)
+            yield from _keys_deep(v, f"{path}{k}.")
+    elif isinstance(x, list):
+        for i, v in enumerate(x):
+            yield from _keys_deep(v, f"{path}{i}.")
+
+
+def template_problems(q, root=REPO) -> dict:
+    """{check: [problems]} for one question's template, from its inputs only (the decision spec, its units table, the
+    template's wtp.yaml and engine_reads.yaml, the willingness-to-pay table, the question text): no LLM call and no
+    engine run. A template with any problem is not seeded (run_trials). The checks:
+      schema        toolkit/spec/schema.py load and validate
+      independence  declared-independent features are uncorrelated in the realized units table (|Spearman| <=
+                    batch.INDEPENDENCE_RHO_MAX pairwise, batch.realized_rank_correlations), with the generator and
+                    basis batch.independent_features requires
+      engine_reads  every declared feature reaches the engine: on a bound column or attribute, or declared derived
+                    in engine_reads.yaml (engine_unread_features, the engine-blind input of guard_reasons)
+      cost_units    with a willingness to pay (wtp.yaml), costs are in its currency (USD): the question's stated US$
+                    budget is the spec's envelope_usd, or wtp.yaml declares cost_units {currency: USD, basis}; a
+                    prices.currency other than USD needs its exchange rate (flu_vaccine, batch 1: costs counted doses
+                    against a willingness to pay per USD)
+      shadow_price  the shadow price is pre-registered, never set from a sweep: no value in the question, the template
+                    or the spec, only the outcome type in wtp.yaml, and table sources that cite no sweep or harness file
+    """
+    import yaml
+    from toolkit.analysis import batch as B
+    from toolkit.spec import schema
+    out = {c: [] for c in TEMPLATE_CHECKS}
+    tpl = os.path.join(root, str(q.get("template") or ""))
+    path = os.path.join(tpl, "decision_spec.yaml")
+    try:
+        spec = schema.load(path)
+    except Exception as e:  # noqa: BLE001 -- an unloadable spec fails every check that reads it
+        out["schema"].append(f"decision_spec.yaml does not load: {type(e).__name__}: {str(e)[:300]}")
+        return out
+    out["schema"] += [str(x) for x in schema.validate(spec)]
+    dec = (spec["analysis"].get("emulator") or {}).get("independent_features")
+    if dec is not None:
+        feats = list(dec.get("features") or []) if isinstance(dec, dict) else []
+        try:
+            rho = B.realized_rank_correlations(spec, feats)
+            big = {k: round(v, 3) for k, v in rho.items() if abs(v) > B.INDEPENDENCE_RHO_MAX}
+            if big:
+                out["independence"].append(f"declared-independent features correlate in the realized units table "
+                                           f"{big} (|Spearman| > {B.INDEPENDENCE_RHO_MAX})")
+        except Exception as e:  # noqa: BLE001
+            out["independence"].append(f"the realized correlations cannot be read: {type(e).__name__}: {e}")
+        if not out["independence"]:
+            try:
+                B.independent_features(spec)
+            except ValueError as e:
+                out["independence"].append(str(e))
+    try:
+        unread = engine_unread_features(tpl)
+        if unread:
+            out["engine_reads"].append(f"declared features {sorted(unread)} reach no engine attribute (bind them, "
+                                       f"or declare the derived attribute they reach in {ENGINE_READS})")
+    except Exception as e:  # noqa: BLE001
+        out["engine_reads"].append(f"{type(e).__name__}: {e}")
+    wtp_path = os.path.join(tpl, WTP_FILE)
+    w = {}
+    if os.path.isfile(wtp_path):
+        try:
+            w = yaml.safe_load(open(wtp_path)) or {}
+        except yaml.YAMLError as e:
+            out["shadow_price"].append(f"{WTP_FILE} does not parse: {e}")
+        w = w if isinstance(w, dict) else {}
+        extra = sorted(set(w) - set(WTP_KEYS))
+        if extra:
+            out["shadow_price"].append(f"{WTP_FILE} holds {extra}: a template states only its outcome type (and cost "
+                                       f"units); the value comes from {WTP_TABLE}")
+        prices = spec["options"].get("prices") or {}
+        cur = prices.get("currency")
+        if cur not in (None, "USD") and not prices.get("exchange_rate"):
+            out["cost_units"].append(f"options.prices.currency {cur!r} with no exchange_rate to USD, the currency "
+                                     f"of the willingness to pay")
+        env = (spec.raw.get("constraints") or {}).get("envelope_usd")
+        amts = _usd_amounts(str(q.get("question") or ""))
+        stated = isinstance(env, (int, float)) and any(abs(a - env) <= 0.01 * abs(env) for a in amts)
+        cu = w.get("cost_units")
+        if cu is not None and not (isinstance(cu, dict) and cu.get("currency") == "USD"
+                                   and str(cu.get("basis") or "").strip()):
+            out["cost_units"].append(f"{WTP_FILE} cost_units {cu!r}: {{currency: USD, basis: how the costs and the "
+                                     f"envelope are in USD}}")
+        elif cu is None and not stated:
+            out["cost_units"].append(f"the question states no US$ amount equal to envelope_usd {env} (US$ amounts "
+                                     f"stated: {amts[:6]}) and {WTP_FILE} declares no cost_units: the costs may not be "
+                                     f"in USD, the willingness to pay's currency")
+        try:
+            lam = shadow_price_of(q, root)
+            tab = yaml.safe_load(open(os.path.join(root, WTP_TABLE))) or {}
+            srcs = [str((tab.get("threshold") or {}).get("source") or ""),
+                    str(((tab.get("outcome_types") or {}).get(lam.get("outcome_type")) or {}).get("source") or "")]
+            bad = [s[:80] for s in srcs if SWEEP_RE.search(s) or any(x in s for x in HARNESS_NAMES)]
+            if bad:
+                out["shadow_price"].append(f"{WTP_TABLE} sources cite a sweep or a harness file: {bad}")
+        except TrialError as e:
+            out["shadow_price"].append(str(e))
+    keys = [k for k in SHADOW_KEYS if k in q]
+    if keys:
+        out["shadow_price"].append(f"the question sets {keys}: the template pre-registers its willingness to pay")
+    deep = sorted(p for p, k in _keys_deep(spec.raw) if k in SHADOW_KEYS)
+    if deep:
+        out["shadow_price"].append(f"the decision spec sets {deep}: the shadow price comes from {WTP_TABLE} only")
+    return out
+
+
+def lint_templates(qs, root=REPO) -> dict:
+    """{id: {ok, problems}} for each question's template (template_problems): inputs only, no LLM, no engine."""
+    res = {}
+    for q in qs:
+        try:
+            pr = {k: v for k, v in template_problems(q, root).items() if v}
+        except Exception as e:  # noqa: BLE001 -- a check that cannot run is a failing check
+            pr = {"error": [f"{type(e).__name__}: {e}"[:400]]}
+        res[q["id"]] = {"ok": not pr, "template": q.get("template"), "problems": pr}
+    return res
+
+
 def classify_tests(run_dir, seed, lam=None, template_dir=None) -> dict:
     """{hypothesis id: {class, why}} from the spec's inputs and the engine's own sweep (world_model.load_sweep,
     canonical_test and the sweep's reduction, as the build reads them). Classes, applied in world_model build
@@ -1066,6 +1207,19 @@ def run_trials(questions, trials_root, repo=REPO, seed_fn=None, ledger=None, anc
             return record(q["id"], dict(t, skipped=True))
         t = dict(t, id=q["id"], engine_ref=q["engine"], rerun_of=q.get("rerun_of"),
                  steps=dict(t.get("steps") or {}), status="running")
+        try:
+            if "seed" not in t["steps"]:      # 2026-11-13: a template that fails its input checks is never seeded
+                pr = {k: v for k, v in template_problems(q, root).items() if v}
+                t["template_check"] = {"at": _now(), "ok": not pr}
+                if pr:
+                    t.update(status="template_refused", template_problems=pr)
+                    _save(rd, t)
+                    return record(q["id"], t)
+                t.pop("template_problems", None)
+        except Exception as e:  # noqa: BLE001 -- a check that cannot run refuses the seed
+            t.update(status="template_refused", template_problems={"error": [f"{type(e).__name__}: {e}"[:400]]})
+            _save(rd, t)
+            return record(q["id"], t)
         t["shadow_price"] = shadow_price_of(q, root)
         q = dict(q, shadow_price=t["shadow_price"]["value"], shadow_price_basis=t["shadow_price"]["basis"])
         try:
@@ -1776,8 +1930,8 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser(prog="world_model_trials.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "check-templates", "rebuild", "score", "engine-only", "import-engine", "vm-commands",
-                 "belief-rescore"):
+    for name in ("run", "check-templates", "lint-templates", "rebuild", "score", "engine-only", "import-engine",
+                 "vm-commands", "belief-rescore"):
         p = sub.add_parser(name)
         p.add_argument("--trials-dir", default=os.path.join(REPO, "trials"))
         if name not in ("score", "belief-rescore"):
@@ -1838,6 +1992,13 @@ def main(argv=None) -> int:
             print(json.dumps({i: r}, default=str))
         score(a.trials_dir)
         return 0 if all(r["status"] == "complete" for r in res.values()) else 1
+    if a.cmd == "lint-templates":
+        res = lint_templates(qs)
+        for i, v in res.items():
+            print(json.dumps({i: v}, default=str))
+        n = sum(not v["ok"] for v in res.values())
+        print(json.dumps({"templates_checked": len(res), "failing": n}))
+        return 0 if n == 0 else 1
     if a.cmd == "check-templates":
         res = check_templates(qs, os.path.join(a.trials_dir, "checks"), a.max_engine_runs)
         return 0 if all(v["ok"] for v in res.values()) else 1
@@ -1869,7 +2030,8 @@ def _toy_template(d, points=12, wtp=True):
         yaml.safe_dump(raw, f, sort_keys=False)
     if wtp:
         with open(os.path.join(d, "wtp.yaml"), "w") as f:
-            yaml.safe_dump({"outcome_type": "toy_daly"}, f)
+            yaml.safe_dump({"outcome_type": "toy_daly", "cost_units": {"currency": "USD", "basis": "toy costs in "
+                                                                                                "USD"}}, f)
     return d
 
 
