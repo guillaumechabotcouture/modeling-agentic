@@ -702,9 +702,11 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
 
 def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
-    pt = {"point": rows[0], "all_in_band": gate_ok, "calibration_check": {}}
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"all_in_band": True, "disproved_by_verification": [],
-                                                                "calibration_check": {}})
+    mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in (-1, 0, 1, 0)]  # noqa: E731
+                     for t, (lo, hi) in pack_bands().items()}            # seed values around each band's middle
+    pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"per_seed": mid(1.0), "all_in_band": True,
+                                                                "disproved_by_verification": [], "calibration_check": {}})
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []}), open(path, "w"),
                    sort_keys=False)
 
@@ -1023,18 +1025,23 @@ def _self_test() -> int:
         reg = {"sample": [{"a": 0.1}, {"a": 0.2}], "hull": {"a": [0.1, 0.2]}}
         cal = lambda **kw: {s: {"target": t, "achieved": kw.get(s, t)} for s, t in  # noqa: E731
                             (("muleba", 0.55), ("misungwi", 0.458), ("benin", 2.06), ("irs_added", 0.40))}
-        pt = lambda a, ok_=True, **kw: {"point": {"a": a}, "all_in_band": ok_, "calibration_check": cal(**kw)}  # noqa
-        chosen_ok = {"all_in_band": True, "disproved_by_verification": [], "calibration_check": cal()}
+        bd = {"T": [0.4, 0.6]}
+        inb, outb = [0.5, 0.52, 0.48, 0.5], [0.9, 0.92, 0.88, 0.9]      # seed values: in band, far out of band
+        pt = lambda a, ok_=True, **kw: {"point": {"a": a}, "per_seed": {"T": inb if ok_ else outb},  # noqa: E731
+                                        "all_in_band": True, "calibration_check": cal(**kw)}
+        chosen_ok = {"per_seed": {"T": inb}, "all_in_band": True, "disproved_by_verification": [],
+                     "calibration_check": cal()}
+        fz = lambda c, ch, **kw: finalize(copy.deepcopy(reg), c, ch, bands=bd, **kw)  # noqa: E731
         runs = {
-            "good": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
-            "ratio": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, False)], chosen_ok), 2),
-            "misungwi 0.30 vs 0.458": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, misungwi=0.30)], chosen_ok), 2),
-            "muleba 0.15 vs 0.55": (finalize(copy.deepcopy(reg), [pt(0.1, muleba=0.15)], chosen_ok), 2),
-            "chosen disproved B10": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(
-                chosen_ok, all_in_band=False, disproved_by_verification=["B10"])), 2),
-            "chosen calibration": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(chosen_ok, calibration_check=cal(
-                benin=1.5))), 2),
-            "grid at its edge": (finalize(copy.deepcopy(reg), [pt(0.1)], chosen_ok, grid_edge=["misungwi"]), 2),
+            "good": (fz([pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
+            "ratio": (fz([pt(0.1), pt(0.2, False)], chosen_ok), 2),
+            "misungwi 0.30 vs 0.458": (fz([pt(0.1), pt(0.2, misungwi=0.30)], chosen_ok), 2),
+            "muleba 0.15 vs 0.55": (fz([pt(0.1, muleba=0.15)], chosen_ok), 2),
+            "chosen out of band (seed evidence)": (fz([pt(0.1)], dict(chosen_ok, per_seed={"T": outb})), 2),
+            "chosen calibration": (fz([pt(0.1)], dict(chosen_ok, calibration_check=cal(benin=1.5))), 2),
+            "grid at its edge": (fz([pt(0.1)], chosen_ok, grid_edge=["misungwi"]), 2),
+            "a summary flag is not evidence": (fz([dict(pt(0.1, False), all_in_band=True)], chosen_ok), 2),
+            "no seed evidence": (fz([{k: v for k, v in pt(0.1).items() if k != "per_seed"}], chosen_ok), 2),
         }
         bad = {k: (r[1], r[0]["sample_status"]) for k, (r, want) in runs.items()
                if r[1] != want or (want == 0) != (r[0]["sample_status"] == "verified")
@@ -1048,12 +1055,13 @@ def _self_test() -> int:
 
     def f13():
         cmd = launch_command(VCPUS)
-        ok(cmd[:5] == ["python3", "cloud/vm_job.py", "run", "f6-refit-netfit-v017w2", "net-effect-fit"]
-           and cmd[cmd.index("--cap-usd") + 1] == "30" and cmd[cmd.index("--store-account") + 1] == "modelingagentic"
-           and "--approved" in cmd and "--margin-loo" in cmd and str(VCPUS) in cmd
+        ok(cmd[:5] == ["python3", "cloud/vm_job.py", "run", "f6-refit-netfit-v017r2", "net-effect-fit"]
+           and cmd[cmd.index("--cap-usd") + 1] == "15" and cmd[cmd.index("--store-account") + 1] == "modelingagentic"
+           and cmd[cmd.index("--store") + 1] == "outputs/_engine/net_effect_fit/round2"
+           and "--approved" in cmd and "--margin-loo" in cmd and "--verify-round" in cmd and str(VCPUS) in cmd
            and cmd[cmd.index("--") + 1:][:2] == ["python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
-           f"F13 the wave-2 launch goes through cloud/vm_job.py run with --cap-usd 30, so the job's USD meter stops the "
-           f"VM at the cap: {' '.join(cmd)}")
+           f"F13 the verification-round launch goes through cloud/vm_job.py run with --cap-usd 15 and its own store "
+           f"prefix (wave 2's copies are kept), so the job's USD meter stops the VM at the cap: {' '.join(cmd)}")
     case("F13", f13)
 
     def f12():
@@ -1195,8 +1203,10 @@ def _self_test() -> int:
             variant("an edited row under the signed digest", lambda x: jr(x)["sample"][5].update(cfp_kill=0.55),
                     digest=dg(good))
             # Codex r1 P1-2: the gate is replayed (finalize) on the evidence; passing summaries do not carry it
-            variant("a verified point out of band", lambda x: jr(x)["verified"]["points"][0].update(all_in_band=False))
-            variant("the chosen point out of band", lambda x: jr(x)["verified"]["chosen"].update(all_in_band=False))
+            far = lambda p: p["per_seed"].update(B12m=[0.95, 0.96, 0.94, 0.95])  # noqa: E731 -- seed evidence
+            variant("a verified point out of band", lambda x: far(jr(x)["verified"]["points"][0]))
+            variant("the chosen point out of band", lambda x: far(jr(x)["verified"]["chosen"]))
+            variant("a verified point without seed evidence", lambda x: jr(x)["verified"]["points"][0].pop("per_seed"))
             variant("no verified point", lambda x: jr(x)["verified"].update(points=[]))
             variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
             variant("no calibration grid record", lambda x: x.pop("calibration_grid"))
@@ -1229,7 +1239,7 @@ def _self_test() -> int:
             sha2 = load_posterior(other, e, rg, dg(other))["sha256"]
         gate = ("acceptance gate failed (finalize)", "a verified point out of band", "the chosen point out of band",
                 "no verified point", "a clamped calibration grid", "no calibration grid record",
-                "a verified point not in the sample")
+                "a verified point not in the sample", "a verified point without seed evidence")
         why = {**dict.fromkeys(gate, "acceptance gate"), "missing file": "unreadable", "malformed YAML": "malformed",
                "an edited row under the signed digest": "signed sha256",
                "a value outside priors.yaml under a wider range": "priors.yaml",
@@ -1366,6 +1376,117 @@ def _self_test() -> int:
            f"F22b the margin is each target's leave-one-out error of the log surrogate, root mean square over the points "
            f"in the wave-2 box ({lo})")
     case("F22", f22)
+
+    def f23():
+        n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 2.0]])
+        g2 = np.linspace(0, 1, 9)
+        X2 = np.array([[u, v] for u in g2 for v in g2])
+        Y2 = {"T": np.exp(X2[:, 0] + X2[:, 1])}
+        sup = [{"a": [0.0, 0.5], "b": [0.0, 2.0]}, {"a": [0.0, 1.0], "b": [0.0, 0.6]}]
+        r = joint_region(X2, Y2, {"T": [float(np.exp(0.8)), float(np.exp(1.2))]}, n2, b2, 5, support=sup)
+        inside = lambda s: any(all(bx[k][0] <= s[k] <= bx[k][1] for k in n2) for bx in sup)  # noqa: E731
+        ok(r["sample"] and all(inside(s) for s in r["sample"]) and r["support"]["boxes"] == sup
+           and 0 < r["support"]["share_of_box"] < 1,
+           f"F23 (wave 2's extrapolation) the joint-sample candidates lie in the union of the waves' boxes, where the "
+           f"engine-evaluated points are ({r['support']['share_of_box']} of the box), never outside it")
+
+        class Fake:
+            seeds, calibrated = [1], {}
+
+            def calibrate_settings(self, fitted, names=None):
+                pass
+
+            def prefetch(self, arms, thetas):
+                pass
+
+            def evaluate(self, b, th):       # the target 0.7 is reached only at (0.8, 1.2), outside the support
+                v = float(0.7 * np.exp(-((th["a"] - 0.8) ** 2 + (th["b"] - 1.2) ** 2)))
+                return {"computed": v, "in_band": True, "per_seed": [v], "seed_min": v, "seed_max": v}
+        pk = {"fit_joint": {"rule": "joint-v1", "params": {"a": [0.0, 1.0], "b": [0.0, 2.0]}, "targets": ["T"],
+                            "design": {"n": 6, "seed": 3}},
+              "benchmarks": [{"id": "T", "band": [0.6, 0.8], "target": 0.7,
+                              "estimand": {"type": "ratio", "num": "x", "den": "y"}}],
+              "arms": {"x": {"setting": "s"}, "y": {"setting": "s"}}}
+        w1 = [{"x": {"a": float(u), "b": float(v)}, "wave": 1, "computed": {"T": Fake().evaluate(
+            None, {"a": float(u), "b": float(v)})["computed"]}} for u, v in BM.lhs(12, 2, 1) * [1, 2]]
+        fit = fit_waves(pk, Fake(), {"points": w1}, {"a": [0.0, 0.5], "b": [0.0, 2.0]}, n=6, seed=3, support=sup)
+        best = {k: v["value"] for k, v in fit["parameters"].items()}
+        ok(inside(best) and fit["fit_rule"]["support"] == sup,
+           f"F23b the chosen point is chosen inside the same support ({best})")
+    case("F23", f23)
+
+    def f24():
+        b = [0.42, 0.70]
+        cases = {"mean in band": ([0.50, 0.52, 0.48, 0.51], True),
+                 "mean below, interval overlaps": ([0.40, 0.41, 0.42, 0.43, 0.39, 0.41, 0.42, 0.40], True),
+                 "interval entirely below": ([0.30, 0.31, 0.30, 0.29, 0.30, 0.31, 0.30, 0.30], False),
+                 "mean above, interval overlaps": ([0.71, 0.72, 0.69, 0.70], True),
+                 "one seed (no spread)": ([0.50], False),
+                 "a non-finite value": ([0.5, float("nan"), 0.5], False),
+                 "no values": ([], False)}
+        got = {k: ci_in_band(v, b) for k, (v, _) in cases.items()}
+        wrong = sorted(k for k, (_, w) in cases.items() if got[k] != w)
+        v = cases["mean below, interval overlaps"][0]
+        lo, hi = seed_interval(v)
+        h = 1.96 * float(np.std(v, ddof=1)) / np.sqrt(len(v))
+        ok(not wrong and abs(lo - (np.mean(v) - h)) < 1e-12 and abs(hi - (np.mean(v) + h)) < 1e-12
+           and "1.96" in ACCEPTANCE_RULE,
+           f"F24 (owner, 14 Nov) a verified or chosen point is in band for a target when the 95% interval of its seed "
+           f"mean, mean +- 1.96 sd/sqrt(n) over the run's seeds, overlaps the band; fewer than 2 seeds or a non-finite "
+           f"value fail closed ({len(cases)} cases; wrong: {wrong or 'none'})")
+        p = {"point": {}, "per_seed": {"B10": [0.5, 0.5, 0.6, 0.6]}}
+        ok(point_in_band(p, {"B10": [0.3, 0.67], "B11": [0.42, 0.7]})[0] is False
+           and point_in_band(p, {"B10": [0.3, 0.67]})[0] is True,
+           "F24b a target without seed evidence fails the point (fail closed)")
+    case("F24", f24)
+
+    def f25():
+        import hashlib
+        import tempfile
+        q = plan(p, verify_round=True)
+        ok(q["design_points"] == 0 and q["design_points_from_cache"] == WAVE2["n"] and q["waves"]["design"] == 0
+           and q["arm_runs"] == (1 + VERIFY) * 8 * 8 and max(q["usd"][1], q["usd_real"][1]) <= VERIFY_ROUND["plan_cap_usd"]
+           and VERIFY_ROUND["candidate_seed"] != DESIGN["seed"] and VERIFY_ROUND["pick_seed"] != DESIGN["seed"] + 1,
+           f"F25 the verification round runs only the chosen point and {VERIFY} new sample points ({q['arm_runs']} arm "
+           f"runs; wave 2's {WAVE2['n']} design points come from its cache), ${q['usd'][0]}-{q['usd'][1]} on the VM "
+           f"bound, ${q['usd_real'][0]}-{q['usd_real'][1]} measured (plan cap ${VERIFY_ROUND['plan_cap_usd']}); the "
+           f"candidates and the picks take new seeds {VERIFY_ROUND['candidate_seed']}, {VERIFY_ROUND['pick_seed']}")
+
+        class Store:
+            def __init__(self, data):
+                self.data, self.asked = data, []
+
+            def download(self, blob, path, account=None):
+                self.asked.append((blob, account))
+                open(path, "wb").write(self.data)
+                return {"blob": blob}
+        body = b'{"key": "x"}\n'
+        sha = hashlib.sha256(body).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            st = Store(body)
+            got = fetch_cache("outputs/x/netfit_cache.jsonl", sha, d, "acct", store=st)
+            fine = got == d and open(os.path.join(d, CACHE_NAME), "rb").read() == body \
+                and st.asked == [("outputs/x/netfit_cache.jsonl", "acct")]
+            try:
+                fetch_cache("outputs/x/netfit_cache.jsonl", "0" * 64, os.path.join(d, "b"), "acct", store=Store(body))
+                refused = ""
+            except ValueError as ex:
+                refused = str(ex)
+        ok(fine and "sha256" in refused and VERIFY_ROUND["cache_sha256"] == "3bde5c6ec7b6e6b204968b3a52b33541300316d1f0"
+           "aa7f571bb5b30f91f3311b",
+           f"F25b wave 2's checkpoint is read from storage only under its recorded sha256 (else refused: {refused!r})")
+        rr = RecalRunner.__new__(RecalRunner)
+        rr.ran_tasks = 3
+        try:
+            no_rerun(rr, "wave 2's design")
+            r2 = ""
+        except ValueError as ex:
+            r2 = str(ex)
+        rr.ran_tasks = 0
+        no_rerun(rr, "wave 2's design")
+        ok("3 engine task" in r2, f"F25c a verification round that would rerun a design point stops before verifying "
+                                  f"({r2!r})")
+    case("F25", f25)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
