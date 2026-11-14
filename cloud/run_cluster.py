@@ -2463,7 +2463,7 @@ def _self_test_52(ok) -> None:
     old_c, new_c = LaunchClient([{}]), LaunchClient([{"workers": {f"tls://a:{i}": {} for i in range(4)}}])
     run_cl = types.SimpleNamespace(cluster_id=12, get_client=lambda: old_c if old_c.status == "running" else new_c)
     used = []
-    comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+    comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                  register_compute_tags=lambda c, exclude: used.append(c))
     fake_coiled = types.ModuleType("coiled")
     rc52_made = []
@@ -2838,7 +2838,8 @@ def _self_test_attach(ok) -> None:
     sys.modules["coiled"] = fake
     try:
         cl = ws.attach_existing("n", "w", 5)
-        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60a attach_existing attaches by name without waiting for workers: {calls}")
         made = []
         fake.Cluster = lambda **kw: made.append(Cl(**kw)) or made[-1]
@@ -2860,14 +2861,17 @@ def _self_test_attach(ok) -> None:
             ok(not calls and "not running" in str(e), f"RC60c attach never constructs a Cluster for a stopping one: {calls}")
         listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "running"}}]
         cl = attach("n")
-        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60d attach checks running, then attaches with wait_for_workers=False: {calls}")
         calls.clear()
         ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
         ov.cl = None
         Cl.get_client = lambda self: "C"
         ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
-                                                     "wait_for_workers": False}],
+                                                     "wait_for_workers": False,
+                                                     "worker_vm_types": ws.ATTACH_VM_TYPES,
+                                                     "scheduler_vm_types": ws.ATTACH_VM_TYPES}],
            f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
         # Codex round 3 (P2-b): an attach refusal leaves the overflow pool unavailable for the tick; the keeper goes on
         fake.Cluster = lambda **kw: Cl(_id=9, **kw)
@@ -2961,7 +2965,7 @@ def _self_test_s18(ok, tb) -> None:
             def tags(c, exclude):
                 if tags_exc:
                     raise tags_exc
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=tags)
             fake_coiled = types.ModuleType("coiled")
             made = []
@@ -3064,7 +3068,7 @@ def _self_test_s18(ok, tb) -> None:
                   open(cfg.clusters_file, "w"))
         P = mock.patch.object
         refused = None
-        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=[])), \
+        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                 P(M, "start_keeper", side_effect=fake_helper("keeper", "lt-keeper", 79, types.SimpleNamespace(cluster_id=79))) as sk, \
                 P(M, "confirm_keeper", return_value=["tick"]), P(time, "sleep", lambda s: None), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -3165,7 +3169,7 @@ def _self_test_s18_r1(ok) -> None:
             fake_coiled = types.ModuleType("coiled")
             fake_coiled.Cluster = cluster
             fake_coiled.list_clusters = lambda workspace: list(made)
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=lambda c, exclude: None)
             pats = [P(M, "is_running", return_value=running),
                     P(M, "live_id", side_effect=live_exc or (lambda n: 77)),
@@ -3367,7 +3371,7 @@ def _self_test_s18_r2(ok) -> None:
                     raise SystemExit("not confirmed")
                 return ["tick"]
             out = io.StringIO()
-            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["a"])), \
+            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                     P(M, "live_id", side_effect=lambda n: live.get(n)), \
                     P(M, "start_overflow", side_effect=so), P(M, "start_keeper", side_effect=sk), \
                     P(M, "confirm_keeper", side_effect=conf), \
@@ -3674,7 +3678,7 @@ def _self_test_s18_r4(ok) -> None:
         open(q, "w").write("question")
         cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
                         pipeline="v2", cluster_timeout="40 minutes")
-        comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+        comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                      register_compute_tags=lambda c, exclude: None)
         if ctor_calls is not None:
             real = fake.Cluster

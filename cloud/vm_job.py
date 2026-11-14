@@ -391,9 +391,12 @@ def _vm_request(a) -> dict:
 
 
 def _live_vm_types_ok(name) -> None:
-    """`start` on a cluster made elsewhere: refuse (SystemExit) unless every live VM of it runs a priced type, read
-    from the cluster's own record. A VM with no type yet, or a record that cannot be read, is refused (fail closed):
-    the job would keep a cluster busy whose cost the budget cannot bound."""
+    """`start` on a cluster made elsewhere: refuse (SystemExit) unless every live process of it runs a priced VM type
+    and every process's configured fallback list (spec.prioritized_instance_types, the types Coiled may give it or a
+    replacement) is priced, read from the cluster's own record. Cluster 2376181 (2026-11-13, --cpu 8 without pinning)
+    listed 16 candidate worker types and 50 scheduler types, most unpriced. A live process with no VM type yet, a
+    missing list, or a record that cannot be read is refused (fail closed): the job would keep a cluster busy whose
+    cost the budget cannot bound."""
     import budget
     cid = rc.live_id(name)
     if cid is None:
@@ -401,12 +404,19 @@ def _live_vm_types_ok(name) -> None:
     try:
         d = budget.CoiledSource().details(cid)
         procs = [d["scheduler"]] + list(d["workers"])
-        live = [p["instance"] for p in procs if isinstance(p, dict) and isinstance(p.get("instance"), dict)
-                and ws.state_of(p) not in budget.ENDED and ws.state_of(p["instance"]) not in budget.ENDED]
-        types = [i.get("instance_type_id") for i in live]
-        if not types or not all(types):
-            raise budget.BudgetError(f"cluster {cid}: a live VM has no type yet (or none is live); retry once it runs")
-        budget.require_priced(sorted(set(types)), f"{name} (cluster {cid})")
+        live = [p for p in procs if not (isinstance(p, dict) and ws.state_of(p) in budget.ENDED)]
+        if not live:
+            raise budget.BudgetError(f"cluster {cid}: no live process")
+        types = set()
+        for p in live:
+            inst = p.get("instance") if isinstance(p, dict) else None
+            vm = inst.get("instance_type_id") if isinstance(inst, dict) else None
+            listed = ((p.get("spec") or {}).get("prioritized_instance_types") if isinstance(p, dict) else None)
+            if not vm or not isinstance(listed, list) or not listed:
+                raise budget.BudgetError(f"cluster {cid}: a live process has no VM type yet, or no listed candidate "
+                                         f"types; retry once it runs")
+            types |= {vm, *map(str, listed)}
+        budget.require_priced(sorted(types), f"{name} (cluster {cid}, running and candidate types)")
     except budget.BudgetError as e:
         raise SystemExit(f"{name}: refusing to start a job: {e}") from None
     except Exception as e:  # noqa: BLE001 -- unreadable record: fail closed
@@ -1325,13 +1335,14 @@ def _self_test_vm_types(ok) -> None:
                f"before the budget reservation and any cluster: msg={msg} gates={gates}")
         case("VT3", vt3)
 
-        def start_on(vm):
+        def start_on(vm, listed=None, extra=()):
             attached, msg = [], None
-            det = {"id": 7, "scheduler": {"current_state": {"state": "started"},
-                                          "instance": {"instance_type_id": "Standard_D2_v5",
-                                                       "current_state": {"state": "started"}}},
-                   "workers": [{"current_state": {"state": "started"},
-                                "instance": {"instance_type_id": vm, "current_state": {"state": "started"}}}]}
+
+            def proc(t, cand):
+                return {"current_state": {"state": "started"}, "spec": {"prioritized_instance_types": cand},
+                        "instance": {"instance_type_id": t, "current_state": {"state": "started"}}}
+            det = {"id": 7, "scheduler": proc("Standard_D2_v5", ["Standard_D2_v5"]),
+                   "workers": [proc(vm, [vm] if listed is None else listed), *extra]}
             src = types.SimpleNamespace(details=lambda cid: det)
             a = types.SimpleNamespace(name="lw-smoke-vt", command=["true"], budget_scope="f6", cap_usd=1.0, tree=None,
                                       dir=None, anthropic_key=False, job_id="j4")
@@ -1358,12 +1369,22 @@ def _self_test_vm_types(ok) -> None:
             attached, msg = start_on("Standard_D8_v5")
             ok(attached and msg == "attached",
                f"VT4b `start` on a cluster running priced types passes the check: msg={msg}")
+            # Codex on this PR: a pending worker with no VM record yet, and an unpriced fallback type, were not checked
+            attached, msg = start_on("Standard_D8_v5", extra=({"current_state": {"state": "pending"}, "instance": None},))
+            ok(not attached and msg and "no VM type yet" in msg,
+               f"VT4c a live (pending) worker with no VM record is refused, not skipped: msg={msg}")
+            attached, msg = start_on("Standard_D8_v5", listed=["Standard_D8_v5", "Fake_D8ls_v5"])
+            ok(not attached and msg and "Fake_D8ls_v5" in msg,
+               f"VT4d a cluster whose candidate list (spec.prioritized_instance_types, as cluster 2376181 had) names an "
+               f"unpriced type is refused: msg={msg}")
+            attached, msg = start_on("Standard_D8_v5", listed=[])
+            ok(not attached and msg and "candidate" in msg, f"VT4e a missing candidate list is refused: msg={msg}")
         case("VT4", vt4)
 
         def vt5():
             import inspect
             srcs = {f.__name__: inspect.getsource(f) for f in (_create, rc._launch_locked, rc.start_overflow,
-                                                                rc.start_keeper)}
+                                                                rc.start_keeper, ws.attach_existing)}
             bad = {n: k for n, s in srcs.items() for k in ("worker_cpu=", "worker_memory=", "scheduler_cpu=",
                                                             "scheduler_memory=") if k in s}
             pinned = {n: ("scheduler_vm_types=" in s and "worker_vm_types=" in s) or "**_vm_request(a)" in s

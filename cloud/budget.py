@@ -275,16 +275,22 @@ def vm_table(path=None) -> dict:
         raise BudgetError(f"{path}: every VM type needs vcpu and memory_gib: {type(e).__name__}: {e}") from None
 
 
+_MEM_UNITS = {"": 2 ** 30, "b": 1, "kib": 2 ** 10, "mib": 2 ** 20, "gib": 2 ** 30, "tib": 2 ** 40, "kb": 1e3,
+              "mb": 1e6, "gb": 1e9, "tb": 1e12, "k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}   # as dask.utils.parse_bytes
+
+
 def _gib(memory) -> float | None:
-    """'16 GiB', '16GiB', '16 GB', '16G' or a number, as GiB; None for no memory request."""
+    """A memory request in GiB, read as Coiled reads it (dask parse_bytes: '16 GiB' is 16 x 2^30 bytes, '16 GB' is
+    16 x 10^9); a bare number is GiB. None for no memory request."""
     if memory is None or memory == "":
         return None
     if isinstance(memory, (int, float)) and not isinstance(memory, bool) and memory > 0:
         return float(memory)
-    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(GiB|GB|G)?\s*", str(memory), re.IGNORECASE)
-    if not m:
-        raise BudgetError(f"memory {memory!r} is not a size in GiB (e.g. '16 GiB')")
-    return float(m.group(1))
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)\s*", str(memory))
+    unit = m.group(2).lower() if m else None
+    if not m or unit not in _MEM_UNITS or not float(m.group(1)) > 0:
+        raise BudgetError(f"memory {memory!r} is not a size (e.g. '16 GiB')")
+    return float(m.group(1)) * _MEM_UNITS[unit] / 2 ** 30
 
 
 def vm_types_for(cpu, memory=None, path=None) -> list[str]:
@@ -1506,6 +1512,10 @@ def _self_test() -> int:
                                                                         "workers", nof8)) or "")
                and refused(lambda: require_priced([], "workers", nof8)),
                "BR23e require_priced passes priced types and refuses an unpriced one, or none")
+            ok(abs(_gib("68 GB") - 63.33) < 0.01 and _gib("16 GiB") == 16.0 and _gib("16384 MiB") == 16.0
+               and _gib("1 TiB") == 1024.0 and "Standard_E8s_v5" in vm_types_for(8, "68 GB"),
+               "BR23g (Codex on this PR) memory reads as Coiled reads it: 68 GB is 63.3 GiB (a 64 GiB type fits), MiB "
+               "and TiB are accepted")
             ok(vm_types_for(2, "8 GiB") == scheduler_vm_types() and set(scheduler_vm_types()) <= set(tab),
                f"BR23f schedulers are pinned to priced 2-vCPU, 8 GiB types: {scheduler_vm_types()}")
         case("BR23", bg23)
