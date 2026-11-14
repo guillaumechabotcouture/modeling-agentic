@@ -3035,6 +3035,7 @@ def _self_test() -> int:
         # columns at |Spearman| 0.82; engine-blind features and sweep-placed shadow prices reached seeded runs.
         from unittest import mock
         from toolkit.analysis import batch as B
+        from toolkit.spec import schema
         with tempfile.TemporaryDirectory() as d:
             _toy_wtp_table(d)
             q = {"id": "t", "question": "Which package per unit?", "engine": toy_ref, "template": "tpl",
@@ -3113,7 +3114,7 @@ def _self_test() -> int:
             raw["analysis"]["emulator"]["features"] = ["cov", "tgt"]
             raw["analysis"]["emulator"]["independent_features"] = dict(good, features=["cov", "tgt"])
             yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
-            rho = B.realized_rank_correlations(__import__("toolkit.spec.schema", fromlist=["load"]).load(sp),
+            rho = B.realized_rank_correlations(schema.load(sp),
                                                ["cov", "tgt"])
             pr = template_problems(q, d)
             ok(abs(rho["cov|tgt"]) > 0.3 and pr["independence"] and "cov|tgt" in pr["independence"][0],
