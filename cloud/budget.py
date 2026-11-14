@@ -48,7 +48,8 @@ max(0, cap - their spend) until all of them are stopped, when it is released; on
 lapses after 2 h. Its launch's clusters are the ids its clusters.json records for its invocation, when it does.
 Otherwise they are the exact cluster it names and its helpers (<name>-keeper, <name>-overflow), created after the
 reservation and before the next reservation of the same name, so a relaunch's clusters never hold an earlier
-launch's reservation. A malformed ledger refuses. This guards against concurrent launches from this machine only.
+launch's reservation. `reattach_budget_ok` (`vm_job wait --cap-usd`) replaces a running cluster's reservations
+with one of the new cap less the cluster's lifetime cost, bound to its id. A malformed ledger refuses. This guards against concurrent launches from this machine only.
 """
 from __future__ import annotations
 
@@ -585,7 +586,7 @@ def _reservations(env, scope, rows, now):
         else:
             continue                       # no cluster within 2 h: lapsed
         keep.append(r)
-        mine.append(dict(r, outstanding_usd=out))
+        mine.append(dict(r, outstanding_usd=out, cluster_ids=[x["id"] for x in match]))
     return mine, keep
 
 
@@ -672,6 +673,70 @@ def job_meter(scope):
         return _cluster_cost(env.coiled().details(cid), env.clock(), m["start"], m["median"], m["prices"],
                              m["sched_bound"])["usd"]
     return meter
+
+
+def lifetime_meter(scope):
+    """fn(cluster id) -> that cluster's USD since its creation (max of billed and the estimate while it runs), at the
+    scope's rates: what a re-attached cap (`vm_job wait --cap-usd`) is enforced on. Scope accounting keeps the
+    windowed figure (job_meter)."""
+    env = _ENV
+    m = _spend(scope, env, env.clock())["_m"]
+
+    def meter(cid):
+        return _cluster_cost(env.coiled().details(cid), env.clock(), -math.inf, m["median"], m["prices"],
+                             m["sched_bound"])["usd"]
+    return meter
+
+
+def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocation=None) -> tuple[bool, str]:
+    """`vm_job wait --cap-usd`: re-attach a cap to the running cluster `cluster_id`. Under the ledger lock: refused when
+    its lifetime cost is at or above the cap, or when used + the other launches' reservations + (cap - lifetime cost)
+    exceeds the budget. When it fits, the cluster's reservations are replaced by one, bound to `cluster_id` through
+    `clusters_file`, whose outstanding amount is the cap's remaining. A budget, listing or cost that cannot be read
+    raises (BudgetError or the source's error): the caller retries, then stops the cluster."""
+    env = _ENV
+    cap = _num(cap_usd, "cap_usd")
+    if cap <= 0:
+        raise BudgetError(f"cap_usd must be positive, not {cap}")
+    with _Lock(env.reservations):
+        now = env.clock()
+        s = _spend(scope, env, now)
+        if not name.startswith(tuple(s["prefixes"])):
+            return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}"
+        row = next((x for x in s["clusters"] if x["id"] == cluster_id), None)
+        if row is None:
+            raise BudgetError(f"cluster {cluster_id} is not among the {scope} budget's clusters")
+        m = s["_m"]
+        life = _cluster_cost(env.coiled().details(cluster_id), now, -math.inf, m["median"], m["prices"],
+                             m["sched_bound"])["usd"]
+        if life >= cap:
+            return False, (f"cluster {cluster_id} has already spent ${life:.2f} since its creation, at or above the "
+                           f"${cap:.2f} cap")
+        remaining = cap - life
+        own = [r for r in s["reservations"] if cluster_id in r["cluster_ids"]]
+        others = s["reserved_usd"] - sum(r["outstanding_usd"] for r in own)
+        fits = round(s["used_usd"] + others + remaining, 6) <= round(s["budget_usd"], 6)
+        why = (f"{scope}: used ${s['used_usd']:.2f} + other reservations ${others:.2f} + the rest of this cap "
+               f"${remaining:.2f} (cap ${cap:.2f} - ${life:.2f} spent) {'<=' if fits else '>'} budget "
+               f"${s['budget_usd']:.2f}")
+        if fits:
+            fields = ("scope", "cap_usd", "name", "invocation", "time", "clusters_file")
+            drop = [{k: r[k] for k in fields if k in r} for r in own]
+            keep = [r for r in s["_keep"] if r not in drop]
+            inv = invocation or os.urandom(6).hex()
+            _write_json_atomic(clusters_file, {"invocation": inv, "run": {"id": cluster_id, "name": name}})
+            # outstanding = max(0, cap - the cluster's windowed spend), so the entry's cap is the remaining plus that
+            keep.append({"scope": scope, "cap_usd": remaining + row["usd"], "name": name, "invocation": inv,
+                         "time": now, "clusters_file": os.path.abspath(str(clusters_file))})
+            _write_json_atomic(env.reservations, keep)
+    return fits, why
+
+
+def _write_json_atomic(path, obj) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(path + ".tmp", path)
 
 
 def status_lines(s) -> list[str]:
@@ -1338,6 +1403,47 @@ def _self_test() -> int:
                f"BR18 every VM type the configs, launchers and vm_job sizing can request, and every type seen on our "
                f"clusters, has a price bound ({len(named)} named in code): missing {missing}")
         case("BR18", bg18)
+
+        def bg22():
+            # BR22 (Codex on #232): re-attaching a cap replaces the cluster's reservation with the new cap's remaining
+            # amount, counted on the cluster's lifetime cost
+            t = clock[0]
+
+            def world(label, usd, cap, cloud, created=None):
+                r = signed(f"k22{label}", usd=usd)
+                c0 = t + 10 if created is None else created
+                src = _FakeSource([], {})
+                with_env(env(r, source=src))
+                ok1 = launch_budget_ok("f6", cap, "lw-smoke-w")[0]
+                src.items = [_item(40, "lw-smoke-w", c0, "running", t + 20)]
+                src.det = {40: _det(40, "lw-smoke-w", c0, 0, cloud, "running", insts=[(c0, None, "vmA")])}
+                return r, src, ok1, os.path.join(r, "reattach_clusters.json")
+            r, src, ok1, cf = world("a", 100.0, 20, 10.0)
+            g = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)
+            later = launch_budget_ok("f6", 80, "lw-smoke-z", reserve=False)
+            fits = launch_budget_ok("f6", 50, "lw-smoke-z", reserve=False)
+            ok(ok1 and g[0] and not later[0] and "reserved $40.00" in later[1] and fits[0],
+               f"BR22a raising a re-attached cap from $20 to $50 ($10 spent) reserves $40, so a later $80 launch is "
+               f"refused under $100: {g[1]} / {later[1]}")
+            r, src, ok1, cf = world("b", 20.0, 20, 10.0)
+            g = reattach_budget_ok("f6", 20, "lw-smoke-w", 40, cf)
+            g2 = reattach_budget_ok("f6", 20, "lw-smoke-w", 40, cf)
+            led = [x for x in json.load(open(_ENV.reservations)) if x["scope"] == "f6"]
+            ok(g[0] and g2[0] and len(led) == 1 and abs(spend("f6")["reserved_usd"] - 10.0) < 1e-6,
+               f"BR22b re-attaching the original $20 cap with $10 spent fits a $20 budget and leaves one reservation "
+               f"of $10 for the cluster, however often it is re-attached: {g[1]} {led}")
+            r, src, ok1, cf = world("c", 300.0, 20, 100.0, created=t - 50 * H)
+            g = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)
+            m = lifetime_meter("f6")
+            ok(not g[0] and "already spent" in g[1] and m(40) >= 100.0 and job_meter("f6")(40) < 50,
+               f"BR22c a cluster created before the budget's window is capped on its lifetime cost, not the window's: "
+               f"{g[1]} lifetime={m(40):.2f}")
+            r, src, ok1, cf = world("d", 100.0, 20, 10.0)
+            src.det[40] = BudgetError("details unavailable")
+            ok(refused(lambda: reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)) is not None
+               and refused(lambda: lifetime_meter("f6")(40)) is not None,
+               "BR22d an unreadable cluster cost raises (the caller retries, then stops the cluster), never returns")
+        case("BR22", bg22)
     _ENV = real_env
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

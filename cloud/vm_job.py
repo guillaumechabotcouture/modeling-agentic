@@ -25,6 +25,14 @@ outputs, then measures the job cluster's USD before it returns any state, the jo
 stopped by id, --keep-on-failure or not, in three cases: at the cap (after one last copy of the outputs), after
 three failed readings in a row, or after a failed reading at a terminal state.
 
+Re-attaching a cap (2026-11-13: a session restart killed the `run` that metered a job, and its cluster ran on with
+no cap). `wait <name> <job_id> --cap-usd N` meters the cluster id recorded in job.json the way `run` does and stops
+it by id at the cap, after three failed readings, or once the job ends (the launcher that would have stopped it is
+gone). The cap is on the cluster's lifetime cost. Before attaching, it refuses unless that cost is under N and the
+signed budget of its scope covers used + other reservations + the rest of N; the cluster's reservation is then
+replaced by one of the rest of N (budget.reattach_budget_ok). A budget or cost that cannot be read three times, before
+attaching or while waiting, stops the cluster.
+
 Why one command. On 2026-11-03 an agent ran `up`, ended its turn to wait for the cluster,
 and never sent `start`: the VM idled out after 20 minutes with no job, and about two hours
 were lost. Coiled counts `idle_timeout` from cluster start, not from the first task (there
@@ -36,6 +44,7 @@ is no setting for "only after work"), so an `up` with no `start` behind it is wa
                                   [--setup-sdk] [--anthropic-key] -- <command ...>
     python cloud/vm_job.py status <name> <job_id>          # state + log tail; saves outputs locally
     python cloud/vm_job.py wait <name> <job_id> [--every 300]   # poll until the job ends, saving each time
+    python cloud/vm_job.py wait <name> <job_id> --cap-usd N [--budget-scope S]   # re-attach a cap (below)
     python cloud/vm_job.py down <name>
     python cloud/vm_job.py --self-test
 
@@ -479,7 +488,7 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
         over = (_cap_reading(meter, cid, a.cap_usd, a.job_id, misses, final)
                 if meter is not None and cid is not None else None)
         if over is not None and flags is not None:
-            flags["over_cap"] = True
+            flags["over_cap"], flags["cap_why"] = True, over["state"]["why"]
         return over
     while True:
         over, checked = None, False
@@ -530,8 +539,81 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
 
 def cmd_wait(a):
     dest = local_dir(a.name, a.job_id, a.out)
+    if getattr(a, "cap_usd", None) is not None:
+        return _wait_capped(a, dest)
     a.name = _job_cluster(dest, a.name)
     return _poll(a, dest)
+
+
+class _CapRefused(SystemExit):
+    """`wait --cap-usd` refused before attaching (no scope, cap at or below the spend so far, budget short): the
+    cluster is left as it was."""
+
+
+def _wait_gate(a, name, cid, dest):
+    """`wait --cap-usd`: fn(cluster id) -> its lifetime USD, once budget.reattach_budget_ok has replaced the
+    cluster's reservation with the cap's remaining amount; None when the cluster is no longer live. Raises _CapRefused
+    on a refusal. The listing, the budget and the cost are read up to three times; still unreadable, it raises
+    SystemExit and the caller stops the cluster (fail closed)."""
+    import budget
+    scope = a.budget_scope or budget.scope_for_name(name)
+    if not scope:
+        raise _CapRefused(f"{name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    for i in range(3):
+        try:
+            state = _clusters(name).get(cid, "")
+            if state not in rc._ATTACH:
+                print(f"{name} ({cid}): {state or 'not listed'}; nothing to meter")
+                return None
+            ok, why = budget.reattach_budget_ok(scope, a.cap_usd, name, cid,
+                                                os.path.join(dest, "reattach_clusters.json"))
+            if not ok:
+                raise _CapRefused(f"{a.job_id}: the budget refuses this cap: {why}; `down <name> {a.job_id}` "
+                                  "stops the cluster")
+            meter = budget.lifetime_meter(scope)
+            print(f"budget: {why}", flush=True)
+            return meter
+        except _CapRefused:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"{a.job_id}: budget or cost reading failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
+            if i < 2:
+                time.sleep(5)
+    raise SystemExit(f"{a.job_id} on {name}: cost cap: cluster {cid}'s cost could not be read 3 times in a row; "
+                     "fail closed")
+
+
+def _wait_capped(a, dest):
+    """`wait --cap-usd`: the cluster id job.json records, gated (_wait_gate), attached by that id, then polled with
+    `run`'s cost readings on its lifetime cost. Once gating starts, it is stopped by id whatever ends the wait (the cap,
+    a terminal state, an unreadable cost, an error, Ctrl-C), as `run` would have; only a refusal leaves it as it was."""
+    rec = _job_record(dest)
+    name, cid = rec.get("cluster") or a.name, rec.get("cluster_id")
+    if cid is None:
+        raise SystemExit(f"{a.job_id}: {dest}/job.json records no cluster id (only `run` records one); "
+                         "`wait --cap-usd` meters and stops a cluster by its id only")
+    a.name, flags, why, st, stop = name, {}, "interrupted", None, True
+    try:
+        meter = _wait_gate(a, name, cid, dest)
+        if meter is None:
+            stop = False
+            return None
+        cl = ws.attach_existing(name, rc.WORKSPACE, cid)     # refuses any cluster but `cid`
+        print(f"{a.job_id}: metering cluster {name} ({cid}) to ${a.cap_usd:.2f}", flush=True)
+        st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter, flags=flags)
+        why = f"{a.job_id}: " + ((st or {}).get("state", {}).get("state") or "cluster gone")
+    except _CapRefused:
+        stop = False
+        raise
+    except BaseException as e:  # noqa: BLE001 -- recorded, then re-raised after the stop
+        why = f"{a.job_id}: {type(e).__name__}: {e}"
+        raise
+    finally:
+        if stop:
+            _stop_by_id(name, cid, why[:200])
+    if flags.get("over_cap"):
+        raise SystemExit(f"{a.job_id} on {name}: {flags['cap_why']}")
+    return st
 
 
 def run_outcome(st, store_requested) -> tuple[bool, str]:
@@ -1250,6 +1332,14 @@ def _self_test_run(ok, real_gate=None) -> None:
             def shutdown(self):
                 stop(self.cluster_id, "cl_shutdown")
 
+        def attach_by_id(name, workspace, cid):     # ws.attach_existing: refuses any cluster but the checked id
+            ev.append(("attach_id", cid))
+            if W["clusters"].get(cid) not in LIVE:
+                raise SystemExit(f"cluster {cid} is not live")
+            cl = FakeCluster.__new__(FakeCluster)
+            cl.cluster_id = cid
+            return cl
+
         def job_down():
             ev.append("job_shutdown_request")
             cid = max(W["clusters"])
@@ -1280,6 +1370,7 @@ def _self_test_run(ok, real_gate=None) -> None:
         with mock.patch.dict(sys.modules, {"coiled": fake_coiled, "distributed": fake_dist}), \
                 mock.patch.object(rc, "attach", no_attach), \
                 mock.patch.object(ws, "_shutdown_cluster", job_down), \
+                mock.patch.object(ws, "attach_existing", attach_by_id), \
                 mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out), \
                 mock.patch.dict(globals(), {"_budget_gate": gate} if gate else {}), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -1824,6 +1915,79 @@ def _self_test_run(ok, real_gate=None) -> None:
                         pass
                 ok(errs and "--cap-usd" in errs[0], f"RN31c start requires --cap-usd: {errs}")
             case("RN31", rn31)
+
+            def rn32():
+                # RN32 (2026-11-13): a session restart killed the `run` metering cluster 2375765, which ran on with no
+                # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
+                import budget
+
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False):
+                    jid, seen, lbo_calls = f"r32{label}", [], []
+
+                    def meter(cid):
+                        seen.append(cid)
+                        v = readings[min(len(seen), len(readings)) - 1]
+                        if isinstance(v, Exception):
+                            raise v
+                        return v
+                    def reattach(s_, c, name, cid, clusters_file):     # budget.reattach_budget_ok, on the same meter
+                        spent = meter(cid)
+                        if spent >= c:
+                            return False, f"cluster {cid} has already spent ${spent:.2f}"
+                        lbo_calls.append((s_, round(c, 2), cid, os.path.basename(clusters_file)))
+                        return lbo_ok, "f6: ok" if lbo_ok else "f6: over"
+
+                    def lifetime(s_):
+                        if meter_fails:
+                            raise RuntimeError("details unavailable")
+                        return meter
+                    wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
+                    if argv_cap:
+                        wait += ["--cap-usd", cap, "--budget-scope", "f6"]
+                    with mock.patch.object(budget, "lifetime_meter", lifetime, create=True), \
+                            mock.patch.object(budget, "reattach_budget_ok", reattach, create=True), \
+                            mock.patch.object(budget, "job_meter", lambda s_: (_ for _ in ()).throw(AssertionError)), \
+                            mock.patch.object(budget, "launch_budget_ok", lambda *x, **k: (False, "not this check")):
+                        W, msg, out, exc = world(d, jid, interrupt_at=1, extra=("--keep-on-failure",), then=[wait])
+                    ev = W["events"]
+                    return W, ev, W["then"][0], seen, lbo_calls, isinstance(exc, KeyboardInterrupt)
+
+                W, ev, res, seen, lbo_calls, killed = rewait("a", [1.0, 6.0])
+                ok(killed and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and isinstance(res, SystemExit) and "cap" in str(res.code) and set(seen) == {100}
+                   and lbo_calls == [("f6", 5.0, 100, "reattach_clusters.json")] and clean(W),
+                   f"RN32a after the launcher died, `wait --cap-usd` meters the recorded cluster id, checks the budget "
+                   f"covers the rest of the cap, and stops the cluster by id at the cap: {res!r} {lbo_calls} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("b", [1.0])
+                ok(killed and res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and len(seen) >= 2 and clean(W),
+                   f"RN32b a job that ends under a re-attached cap has its cluster stopped by id: {res!r} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("c", [1.0], argv_cap=False)
+                ok(killed and isinstance(res, SystemExit) and "rc.attach" in str(res.code) and not seen
+                   and not lbo_calls and ("attach_id", 100) not in ev and W["stops"] == 0
+                   and W["clusters"][100] == "running",
+                   f"RN32c without --cap-usd `wait` is unchanged (its attach, no meter, no budget, no stop): {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("d", [3.0], cap="2")
+                ok(isinstance(res, SystemExit) and "already spent" in str(res.code) and not lbo_calls
+                   and ("attach_id", 100) not in ev and W["stops"] == 0,
+                   f"RN32d a cap at or below the cluster's spend so far is refused, nothing attached: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("e", [1.0], lbo_ok=False)
+                ok(isinstance(res, SystemExit) and "budget" in str(res.code) and ("attach_id", 100) not in ev
+                   and W["stops"] == 0, f"RN32e a budget that does not cover the rest of the cap refuses: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("f", [RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and len(seen) == 3
+                   and ("delete", 100) in ev and W["stops"] == 1 and not lbo_calls,
+                   f"RN32f a cost that cannot be read three times before attaching stops the cluster: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("h", [1.0], meter_fails=True)
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("delete", 100) in ev
+                   and W["stops"] == 1 and ("attach_id", 100) not in ev,
+                   f"RN32h a meter that cannot be built (its cost unreadable) stops the cluster, never leaves it "
+                   f"unmetered (Codex P1 on #232): {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("g", [1.0, RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("attach_id", 100) in ev
+                   and ("delete", 100) in ev and W["stops"] == 1,
+                   f"RN32g three failed readings while waiting stop the cluster by id (fail closed): {res!r}")
+            case("RN32", rn32)
         finally:
             ws.JOBS = old
 
@@ -1903,6 +2067,10 @@ def main(argv=None) -> int:
         p.add_argument("job_id")
         if nm == "wait":
             p.add_argument("--every", type=float, default=300)
+            p.add_argument("--cap-usd", type=float, default=None,
+                           help="re-attach a cost cap: meter the job's recorded cluster id and stop it by id at the "
+                                "cap or when the job ends")
+            p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
     dn = sub.add_parser("down")
     dn.add_argument("name")
     dn.add_argument("job_id", nargs="?", default=None, help="stop this job's cluster (as recorded by `run`)")
