@@ -1,0 +1,286 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold: removing susceptibles before the importation reduces Reff proportionally; where
+    the school campaign takes Reff below 1 it averts nearly all infections, elsewhere a fraction. School removes
+    about 0.9 x efficacy of the 5-14 susceptibles, plausibly 20-35% of the district susceptible pool, so its relative
+    reduction in infections is large but not total where the baseline Reff is well above 1.'
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.35
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 4 (final size) and Ch. 5 (herd immunity threshold 1 - 1/R0)
+  - citation: 'Guerra FM et al. The basic reproduction number (R0) of measles: a systematic review. Lancet Infect
+      Dis 2017'
+    location: Results, summary of R0 estimates (most 12-18); exact page not recalled
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: 'Results: median one-dose VE at >=12 months about 92%; table number not recalled'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 3
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Dilution by young susceptibles: a larger 1-4 gap adds susceptibles school cannot reach and raises
+    the baseline Reff, so school''s relative reduction falls as gap_1_4 rises.'
+  about:
+    package: school
+    feature: gap_1_4
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 5, vaccination and the critical proportion immunised
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: Community reaches the 1-9 cohorts, so its share of the susceptible pool, and its relative reduction,
+    rises with the 1-4 gap (partly offset by the higher baseline Reff that gap brings).
+  about:
+    package: community
+    feature: gap_1_4
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 5, vaccination and the critical proportion immunised
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'Which option averts more turns on the age profile of the gap: community removes 0.75 x (1-4 + 5-9
+    susceptibles), school 0.9 x (5-9 + 10-14 susceptibles). With cohort sizes roughly equal per year of age, community
+    removes more when gap_1_4 exceeds roughly 0.25 x gap_5_9 + 1.2 x gap_10_14; school wins where the 1-4 gap is
+    small. The 70-day delay shifts the flip toward larger gap_1_4. The choice flips along gap_1_4, roughly at 0.10-0.22.'
+  about:
+    pair:
+    - community
+    - school
+    feature: gap_1_4
+  direction: flips
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.1
+    - 0.22
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: 'Ch. 5 (homogeneous mixing: value of a removed susceptible independent of age)'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'Timing penalty of the late campaign: infections in the first ~70 days (about 5-6 measles generations
+    at a serial interval near 11-12 days) are not prevented by community, and the penalty grows with the size of
+    the seed and the growth rate. With small seeds and Reff near 1 the outbreak is still small at day 70, so the
+    penalty is modest except at the largest seeds.'
+  about:
+    package: community
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF et al. Time is of the essence: exploring a measles outbreak response vaccination in Niamey,
+      Niger. J R Soc Interface 2008'
+    location: 'Results: cases averted fall as response delay grows; figure numbers not recalled'
+  - citation: Klinkenberg D, Nishiura H. The correlation between infectivity and incubation period of measles, estimated
+      from households with two cases. J Theor Biol 2011
+    location: 'Results: serial interval about 11-12 days'
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'School versus nothing: wherever a major outbreak is possible, school averts far more than the ~0.0007
+    infections per person its US$0.80 is worth at the shadow price; it loses to none only where Reff is already
+    below 1 so there is little to avert. Higher 5-9 gaps make both the outbreak and school''s reach larger.'
+  about:
+    pair:
+    - school
+    - none
+    feature: gap_5_9
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 4 (final size above and below threshold)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Does the engine apply the community campaign at day 70 of a running epidemic, or (as its card says 'interventions
+    before the epidemic') before seeding? If before, the timing penalty vanishes and community wins on susceptibles
+    reached wherever the 1-4 gap is large.
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: What share of districts have baseline Reff above 1 (R0 x district susceptible share)? Below threshold
+    neither option is worth its cost; near threshold the cheaper option that just crosses it dominates.
+  beliefs:
+  - B1
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: Is efficacy the same for the two delivery modes (doses to already-immune children wasted in both)? A
+    lower community efficacy prior would move the flip toward school.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Does the US$5M budget bind, so that some districts get the cheaper school option or nothing even where
+    community averts more?
+  beliefs:
+  - B4
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: School reduces infections by 35-100% relative to none in at least 70% of usable points.
+  p: 0.6
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.35
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: School's relative reduction decreases as gap_1_4 rises.
+  p: 0.65
+  weights:
+    decreases: 0.65
+    increases: 0.1
+    no material effect: 0.25
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_1_4
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: Community's relative reduction increases as gap_1_4 rises.
+  p: 0.5
+  weights:
+    increases: 0.5
+    decreases: 0.2
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: community
+    feature: gap_1_4
+    direction: increases
+- id: H4
+  belief: B4
+  claim: Where gap_1_4 is high (0.20-0.297), community beats school on net benefit at the shadow price in at least
+    60% of usable points.
+  p: 0.5
+  test:
+    kind: paired_sign
+    a: community
+    b: school
+    feature: gap_1_4
+    range:
+    - 0.2
+    - 0.2969
+    sign: positive
+    min_share: 0.6
+- id: H5
+  belief: B4
+  claim: Where gap_1_4 is low (0.0546-0.12), school beats community on net benefit in at least 65% of usable points.
+  p: 0.6
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.0546
+    - 0.12
+    sign: positive
+    min_share: 0.65
+- id: H6
+  belief: B4
+  claim: The community/school transition along gap_1_4 lies within 0.10-0.22.
+  p: 0.35
+  test:
+    kind: flip_in
+    a: community
+    b: school
+    feature: gap_1_4
+    range:
+    - 0.1
+    - 0.22
+- id: H7
+  belief: B5
+  claim: Community's relative reduction decreases as seed_share rises (late campaign loses more against a larger
+    seed).
+  p: 0.4
+  weights:
+    decreases: 0.4
+    increases: 0.1
+    no material effect: 0.5
+  test:
+    kind: effect_direction
+    package: community
+    feature: seed_share
+    direction: decreases
+- id: H8
+  belief: B6
+  claim: School beats none on net benefit at the shadow price in at least 70% of usable points across the full gap_5_9
+    range.
+  p: 0.6
+  test:
+    kind: paired_sign
+    a: school
+    b: none
+    feature: gap_5_9
+    range:
+    - 0.0224
+    - 0.2097
+    sign: positive
+    min_share: 0.7
