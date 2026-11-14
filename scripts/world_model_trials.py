@@ -2858,6 +2858,53 @@ def _self_test() -> int:
             ok(out["toyc"]["ok"], f"WT25d the VM's engine step ignores carry_from (it needs the design only): {out}")
     tryit("WT25d engine-only with carry_from", wt25d)
 
+    # Owner, 2026-11-14: belief table v2 (competing claims, an evidence log with mechanical likelihood ratios and
+    # dependence groups, engine and world layers, check items) carried in full; adjusted tests where a feature is not
+    # sampled independently.
+    def wt27():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd0 = os.path.join(troot, "runs", "toy0")
+            t = write_belief_table(rd0, {"id": "toy0", "batch": "c"}, at="2026-11-14T00:00:00+00:00")
+            cs = {c["id"]: c for c in t.get("claim_sets") or []}
+            ev = [e for c in cs.values() for e in c["evidence"]]
+            ok(t.get("schema") == "analysis.belief_table/1" and set(cs) == {r["id"] for r in t["rows"]}
+               and all(abs(sum(c["engine"].values()) - 1) < 1e-9 for c in cs.values())
+               and all(e["type"] == "our_sim" and e["layer"] == "engine" and e["group"] and e["lr"] >= 1 for e in ev)
+               and len({e["group"] for e in ev}) == 1,
+               f"WT27 each claim set has competing claims with weights per layer and an evidence log row per item (our "
+               f"simulation, the engine layer, one dependence group per engine and design): "
+               f"{[(c['id'], c['claims']) for c in cs.values()][:2]} {ev[:1]}")
+            ok(all(abs(r["p"] - cs[r["id"]]["prior"][cs[r["id"]]["claim"]]) < 1e-12 for r in t["rows"]),
+               "WT27b a scored claim's p is its current weight before this question's evidence")
+            q1 = {"id": "toy1", "question": "Which package per unit?", "engine": toy_ref, "template": "data/tpl/toy0",
+                  "inputs": "synthetic", "carry_from": ["toy0"]}
+            ctx = prepare(q1, os.path.join(troot, "runs", "toy1"), repo, trials_root=troot)
+            pw = (ctx.get("prior_world_model") or [{}])[0]
+            ok(pw.get("claim_sets") and all("evidence" in c and "engine" in c and "world" in c
+                                            for c in pw["claim_sets"]) and "check_items" in pw,
+               f"WT27c a chained question carries the full evidence log (inconclusive results too) and the current "
+               f"weights: {list(pw)}")
+        ctx = {"packages": {"none": [], "a": ["a"], "b": ["b"], "a+b": ["a", "b"]},
+               "sweep": {"features": {"x (calibration scale)": {}, "eff_a": {}, "eff_b": {}},
+                         "independent_features": ["eff_a"]},
+               "datasets": [{"file": "units.csv", "columns": ["id"]}],
+               "hypotheses": {"min": 5, "max": 8, "p_required": True, "adjusted_required": True}}
+        sd = _toy_seed()
+        sd["hypotheses"][2]["test"].pop("scope")
+        sd["hypotheses"][2]["test"]["feature"] = sd["beliefs"][2]["about"]["feature"] = "eff_b"
+        bad = seed_problems(sd, ctx)
+        ok(any("H3" in x and "adjust_for" in x for x in bad),
+           f"WT27d a direction test on a feature not sampled independently must state adjust_for: {bad}")
+        sd["hypotheses"][2]["test"]["adjust_for"] = ["eff_a"]
+        ok(not seed_problems(sd, ctx), f"WT27e with adjust_for it is accepted: {seed_problems(sd, ctx)}")
+        sd["hypotheses"][2]["weights"] = {"increases": 0.5, "decreases": 0.4}
+        ok(any("H3" in x and "weights" in x for x in seed_problems(sd, ctx)),
+           "WT27f stated weights must cover the competing claims, sum to 1 and give the claim its p")
+        ok("workers" in __import__("inspect").signature(engine_only).parameters,
+           "WT27g the VM's engine step takes a worker count")
+    tryit("WT27 belief table v2", wt27)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

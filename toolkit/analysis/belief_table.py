@@ -151,7 +151,68 @@ def _self_test() -> int:
         ok([b["id"] for b in next_simulation(bs)] == ["b", "d", "a"],
            "BT5 the next simulation goes where decides is yes and p is nearest 0.5")
 
-    for n, f in (("BT1", bt1), ("BT2", bt2), ("BT3", bt3), ("BT4", bt4), ("BT5", bt5)):
+    # Owner, 2026-11-14 (belief table v2): competing claims with weights, an evidence log with mechanical likelihood
+    # ratios and dependence groups, odds updates, an engine and a world layer, check items where they disagree.
+    def bt6():
+        d = claim_set({"kind": "effect_direction", "direction": "decreases"}, 0.6)
+        ok(d["claims"] == ["increases", "decreases", "no material effect"] and d["claim"] == "decreases"
+           and abs(d["prior"]["decreases"] - 0.6) < 1e-12 and abs(sum(d["prior"].values()) - 1) < 1e-12
+           and abs(d["prior"]["increases"] - 0.2) < 1e-12, f"BT6 a direction claim competes with the opposite "
+                                                            f"direction and no material effect; weights sum to 1: {d}")
+        b = claim_set({"kind": "paired_sign"}, 0.7)
+        ok(b["claims"] == ["holds", "does not hold"] and abs(b["prior"]["does not hold"] - 0.3) < 1e-12,
+           f"BT6b any other test: holds / does not hold: {b}")
+        w = claim_set({"kind": "effect_direction", "direction": "increases"}, 0.5,
+                      weights={"increases": 0.5, "decreases": 0.1, "no material effect": 0.4})
+        ok(w["prior"]["no material effect"] == 0.4, f"BT6c stated weights are kept: {w['prior']}")
+        for bad in ({"increases": 0.5, "decreases": 0.1}, {"increases": 0.6, "decreases": 0.1,
+                                                          "no material effect": 0.3}):
+            try:
+                claim_set({"kind": "effect_direction", "direction": "increases"}, 0.5, weights=bad)
+                ok(False, f"BT6d weights that miss a claim, or whose claim weight is not p, are refused: {bad}")
+            except ValueError:
+                ok(True, f"BT6d weights that miss a claim, or whose claim weight is not p, are refused: {bad}")
+        e = claim_set({"kind": "effect_band"}, 0.8, engine_only=True)
+        ok(ARTEFACT in e["world"] and ARTEFACT not in e["prior"] and abs(sum(e["world"].values()) - 1) < 1e-12,
+           f"BT6e a belief resting on our engine only also carries 'simulator artefact' in its world layer: {e}")
+
+    def bt7():
+        t = {"kind": "effect_direction", "direction": "decreases"}
+        ok(evidence_lr(t, "refuted", {"direction": "increases", "rho": 0.4, "ci": [0.2, 0.6], "p": 1e-4})
+           == ("increases", LR_STRONG, "decided"), "BT7 a decided test is strong evidence for what it observed")
+        ok(evidence_lr(t, "supported", {"direction": "decreases", "rho": -0.4, "ci": [-0.6, -0.2], "p": 1e-4})[:2]
+           == ("decreases", LR_STRONG), "BT7b a confirmed claim gets the strong ratio")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": 0.165, "ci": [-0.08, 0.39],
+                                                   "p": 0.19})
+        ok(f == "increases" and 1.0 < lr <= 2.0 and s == "weak",
+           f"BT7c an undecided direction test leans weakly toward the sign of rho: {(f, lr, s)}")
+        ok(evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.007, "ci": [-0.25, 0.24],
+                                           "p": 0.96})[1] == 1.0, "BT7d a point estimate near 0 carries no lean")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "increases", "rho": 0.44, "ci": [0.22, 0.62],
+                                                   "p": 2e-4, "marginal_only": {"marginal_result": "refuted"}})
+        ok(f == "increases" and lr == 2.0, f"BT7e a marginal-only result is weak evidence, at most 2: {(f, lr, s)}")
+        ok(evidence_lr({"kind": "effect_band"}, "inconclusive", {"coverage": 0.62}, min_share=0.7)[0] == "holds",
+           "BT7f an undecided band leans by its coverage")
+
+    def bt8():
+        prior = {"increases": 0.2, "decreases": 0.6, "no material effect": 0.2}
+        ev = [{"favours": "increases", "lr": 10.0, "group": "g1", "layer": "engine"},
+              {"favours": "increases", "lr": 2.0, "group": "g1", "layer": "engine"},     # same group: counted once
+              {"favours": "decreases", "lr": 4.0, "group": "w1", "layer": "world"}]
+        e = posterior(prior, ev, "engine")
+        ok(abs(e["increases"] - 2.0 / (2.0 + 0.6 + 0.2)) < 1e-12 and abs(sum(e.values()) - 1) < 1e-12,
+           f"BT8 odds update, one ratio per dependence group (the strongest): {e}")
+        w = posterior(prior, ev, "world")
+        ok(abs(w["decreases"] - 2.4 / (0.2 + 2.4 + 0.2)) < 1e-12 and set(e) == set(prior),
+           f"BT8b each layer is updated by its own evidence; a refutation shifts weights, nothing is overwritten: {w}")
+        ci = check_items("H1", e, w)
+        ok(ci and ci[0]["engine"] == "increases" and ci[0]["world"] == "decreases"
+           and set(ci[0]["check"]) == {"simulator", "test", "literature"},
+           f"BT8c where the layers disagree, a check item: simulator, test or literature: {ci}")
+        ok(check_items("H1", w, w) == [], "BT8d no check item when the layers agree")
+
+    for n, f in (("BT1", bt1), ("BT2", bt2), ("BT3", bt3), ("BT4", bt4), ("BT5", bt5), ("BT6", bt6), ("BT7", bt7),
+                 ("BT8", bt8)):
         tryit(n, f)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
