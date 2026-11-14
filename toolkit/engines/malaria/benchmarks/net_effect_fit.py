@@ -322,8 +322,7 @@ def fetch_cache(blob: str, digest: str, dest: str, account: str | None = None, s
     path = os.path.join(dest, CACHE_NAME)
     store.download(blob, path, account)
     got = hashlib.sha256(open(path, "rb").read()).hexdigest()
-    if got != digest:
-        os.remove(path)
+    if got != digest:              # refused; the file stays in the scratch directory and nothing reads it
         raise ValueError(f"checkpoint {blob}: sha256 {got} is not the recorded {digest}")
     return dest
 
