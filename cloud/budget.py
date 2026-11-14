@@ -1404,6 +1404,45 @@ def _self_test() -> int:
                f"clusters, has a price bound ({len(named)} named in code): missing {missing}")
         case("BR18", bg18)
 
+        def bg23():
+            # BR23 (2026-11-13): `vm_job --cpu 8` with the default --memory got Standard_F8s_v2, which this table
+            # lacked; the cap stopped the cluster and every later f6 launch was refused until #230 priced it. The
+            # launchers now pin their VM types from this table, so what is priced is what is requested.
+            tab = vm_table()
+            ok(tab and all(v["vcpu"] >= 1 and v["memory_gib"] > 0 and v["bound"] > 0 for v in tab.values())
+               and set(tab) == set(load_prices(PRICES_FILE)),
+               f"BR23a every VM type in the tracked table states its vCPUs, memory and bound ({len(tab)} types)")
+            nof8 = os.path.join(d, "nof8.yaml")
+            open(nof8, "w").write("margin: 1.0\ncredits_per_vcpu_hour: 0\ntypes:\n"
+                                  "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                                  "  Standard_D8as_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.344}\n"
+                                  "  Standard_E8s_v5: {vcpu: 8, memory_gib: 64, usd_per_hour: 0.504}\n"
+                                  "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n"
+                                  "  Standard_D4_v5: {vcpu: 4, memory_gib: 16, usd_per_hour: 0.192}\n")
+            got = vm_types_for(8, "16 GiB", nof8)
+            ok(got and "Standard_F8s_v2" not in got and set(got) <= set(load_prices(nof8))
+               and all(vm_table(nof8)[t]["vcpu"] == 8 and vm_table(nof8)[t]["memory_gib"] >= 16 for t in got)
+               and got[0] == "Standard_D8as_v5",
+               f"BR23b the F8s_v2 case: --cpu 8 --memory '16 GiB' on a table without F8s_v2 resolves to priced 8-vCPU "
+               f"types with at least 16 GiB, cheapest first, never F8s_v2: {got}")
+            ok(vm_types_for(8, "16 GiB")[0] == "Standard_F8s_v2" and vm_types_for(2, "8 GiB")[0] == "Standard_D2_v5"
+               and vm_types_for(32, "16 GiB")[0] == "Standard_D32_v5",
+               f"BR23c on the tracked table a type seen on our clusters comes first (what Coiled picked before): "
+               f"{[vm_types_for(c, m)[:1] for c, m in ((8, '16 GiB'), (2, '8 GiB'), (32, '16 GiB'))]}")
+            msgs = [refused(lambda: vm_types_for(12, "16 GiB")), refused(lambda: vm_types_for(8, "128 GiB", nof8)),
+                    refused(lambda: vm_types_for(8, "lots"))]
+            ok(all(msgs) and "12" in msgs[0] and "vm_prices.yaml" in msgs[0],
+               f"BR23d a request no priced type matches, or an unreadable memory, is refused: {msgs}")
+            ok(require_priced(["Standard_D8_v5", "Standard_E8s_v5"], "workers", nof8) == ["Standard_D8_v5",
+                                                                                          "Standard_E8s_v5"]
+               and "Standard_F8s_v2" in (refused(lambda: require_priced(["Standard_D8_v5", "Standard_F8s_v2"],
+                                                                        "workers", nof8)) or "")
+               and refused(lambda: require_priced([], "workers", nof8)),
+               "BR23e require_priced passes priced types and refuses an unpriced one, or none")
+            ok(vm_types_for(2, "8 GiB") == scheduler_vm_types() and set(scheduler_vm_types()) <= set(tab),
+               f"BR23f schedulers are pinned to priced 2-vCPU, 8 GiB types: {scheduler_vm_types()}")
+        case("BR23", bg23)
+
         def bg22():
             # BR22 (Codex on #232): re-attaching a cap replaces the cluster's reservation with the new cap's remaining
             # amount, counted on the cluster's lifetime cost

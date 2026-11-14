@@ -4037,7 +4037,7 @@ def _self_test_budget(ok) -> None:
        and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
        "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
     made, keys, kws = [], [], []
-    calls = []
+    calls, wvt = [], [["Standard_E8s_v5", "Standard_E8as_v5"]]
 
     def try_launch(cfg, verdict):
         made.clear(), keys.clear(), calls.clear()
@@ -4046,6 +4046,7 @@ def _self_test_budget(ok) -> None:
         with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
                 mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
                                             "pipeline_preflight": lambda c, code: "v2",
+                                            "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=wvt[0]),
                                             "read_keys": lambda: keys.append(1) or 1 / 0}):   # stops past the guard
             try:
                 _launch_locked(cfg, "inv")
@@ -4066,6 +4067,27 @@ def _self_test_budget(ok) -> None:
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
     ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
        f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
+    # BU7 (2026-11-13: a VM type missing from cloud/vm_prices.yaml was refused only once its cluster existed): every
+    # VM type a launch would request is priced before the budget is asked, any key is read or any cluster is made
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
+                               overflow_vm_types=("Standard_D8s_v5", "Standard_X9_v9")), (True, "ok"))
+    ok(msg and "Standard_X9_v9" in msg and "vm_prices.yaml" in msg and not made and not keys and not calls,
+       f"BU7 an unpriced overflow VM type is refused before the budget, any key or any cluster: {msg} {calls}")
+    wvt[0] = ["Standard_E8s_v5", "Standard_F8s_v2_unpriced"]
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    wvt[0] = ["Standard_E8s_v5", "Standard_E8as_v5"]
+    ok(msg and "Standard_F8s_v2_unpriced" in msg and not made and not keys and not calls,
+       f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) is refused the same way: {msg} {calls}")
+    try:
+        req = vm_request(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"]))
+        prices = budget.load_prices(budget.PRICES_FILE)
+        good = (set(req) == {"run", "overflow", "keeper"} and all(
+            r["worker_vm_types"] and r["scheduler_vm_types"] and set(r["worker_vm_types"]) | set(r["scheduler_vm_types"])
+            <= set(prices) for r in req.values()) and req["run"]["worker_vm_types"] == ["Standard_E8s_v5"])
+    except Exception as e:  # noqa: BLE001 -- a missing function is a failing case
+        req, good = f"{type(e).__name__}: {e}", False
+    ok(good, f"BU7c vm_request pins every cluster's worker and scheduler types to priced ones: {req}")
     import tempfile
     with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
         cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
@@ -4105,6 +4127,23 @@ def _self_test_budget(ok) -> None:
                 msg = f"{type(e).__name__}: {e}"
         ok(msg is None and not seen and started == [{"keep_overflow": 7, "keep_keeper": True}],
            f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
+        seen.clear(), started.clear()
+        bad = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d,
+                        overflow_vm_types=("Standard_X9_v9",))
+        with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, reserve=True, **k: (
+                    seen.append(reserve), (True, "ok"))[1]), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                            "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(bad)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg and "Standard_X9_v9" in msg and not seen and not started,
+           f"BU7d `keeper` with an unpriced overflow VM type is refused before it reserves or creates anything: "
+           f"{msg} {seen}")
     import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
     ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
     for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):

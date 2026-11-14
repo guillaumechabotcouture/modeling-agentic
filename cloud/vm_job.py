@@ -892,6 +892,7 @@ def _self_test() -> int:
     globals()["_budget_gate"] = lambda a, name, meter=False, reserve=True: None   # cases before RN28 predate it
     _self_test_sched(ok)
     _self_test_batch(ok)
+    _self_test_vm_types(ok)
     _self_test_run(ok, real_gate)
     _self_test_pipeline(ok)
     if fails:
@@ -1094,8 +1095,12 @@ def _self_test_batch(ok) -> None:
                 mock.patch.object(rc, "cluster_states", lambda n: states.pop(0) if len(states) > 1 else states[0]):
             cmd_up(a)
         kw = made[0] if made and isinstance(made[0], dict) else {}
+        import budget
+        tab = budget.vm_table()
         ok(len([m for m in made if isinstance(m, dict)]) == 1 and kw.get("n_workers") == 6
-           and kw.get("scheduler_cpu") == 2 and kw.get("worker_cpu") == 8 and kw.get("shutdown_on_close") is False
+           and kw.get("scheduler_vm_types") and all(tab[t]["vcpu"] == 2 for t in kw["scheduler_vm_types"])
+           and kw.get("worker_vm_types") and all(tab[t]["vcpu"] == 8 and tab[t]["memory_gib"] >= 32
+                                                 for t in kw["worker_vm_types"]) and kw.get("shutdown_on_close") is False
            and kw.get("workspace") == rc.WORKSPACE and ("wait", 1) in made and not states[:-1],
            f"OC1 `up --workers 6` makes one cluster (one 2-vCPU scheduler, 6 workers) only after a stopping one has "
            f"stopped, and waits for the first worker: {kw}")
@@ -1187,6 +1192,141 @@ def _self_test_batch(ok) -> None:
                 case("OC6", oc6)
         finally:
             ws.JOBS = old
+
+
+def _self_test_vm_types(ok) -> None:
+    """VT (2026-11-13): `--cpu 8` with the default --memory got Standard_F8s_v2, which cloud/vm_prices.yaml lacked.
+    budget.py refused it only once the cluster existed: the cap stopped it, and every later launch in the f6 scope was
+    refused until #230 priced it. Now `up` and `run` pin the cluster's VM types from the price table before anything
+    is created or reserved, and `start` refuses a live cluster running an unpriced type. No network: fake coiled, a
+    temporary price table without F8s_v2, and a recording budget gate."""
+    import contextlib
+    import tempfile
+    import types
+    from unittest import mock
+    import budget
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    with tempfile.TemporaryDirectory() as d:
+        nof8 = os.path.join(d, "vm_prices.yaml")
+        open(nof8, "w").write("margin: 1.0\ncredits_per_vcpu_hour: 0\ntypes:\n"
+                              "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n"
+                              "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                              "  Standard_D8as_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.344}\n")
+        priced = set(budget.load_prices(nof8))
+
+        def up(cpu, memory, cmd="up"):
+            made, gates, listed = [], [], []
+
+            class FakeCluster:
+                def __init__(self, **kw):
+                    made.append(kw)
+
+                def get_client(self):
+                    return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+            a = types.SimpleNamespace(name="lw-smoke-vt", cpu=cpu, memory=memory, idle_timeout="10 minutes", workers=1,
+                                      budget_scope="f6", cap_usd=1.0)
+            gate = lambda a_, name, meter=False, reserve=True: gates.append(name)   # noqa: E731
+            msg = None
+            with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                    mock.patch.object(budget, "PRICES_FILE", nof8), \
+                    mock.patch.dict(globals(), {"_budget_gate": gate}), \
+                    mock.patch.object(rc, "cluster_states", lambda n: listed.append(n) or []), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    cmd_up(a)
+                except SystemExit as e:
+                    msg = str(e.code)
+            return made, gates, listed, msg
+
+        def vt1():
+            made, gates, _, msg = up(8, "16 GiB")
+            kw = made[0] if made else {}
+            wt, st = list(kw.get("worker_vm_types") or []), list(kw.get("scheduler_vm_types") or [])
+            ok(msg is None and len(made) == 1 and wt and st and set(wt) <= priced and set(st) <= priced
+               and "Standard_F8s_v2" not in wt
+               and not {"worker_cpu", "worker_memory", "scheduler_cpu", "scheduler_memory"} & set(kw),
+               f"VT1 the F8s_v2 case: `up --cpu 8 --memory '16 GiB'` on a table without F8s_v2 pins the workers and the "
+               f"scheduler to priced types (no cpu/memory left for Coiled to pick from): msg={msg} {kw}")
+        case("VT1", vt1)
+
+        def vt2():
+            made, gates, listed, msg = up(12, "16 GiB")
+            ok(msg is not None and "vm_prices.yaml" in msg and "12" in msg and not made and not gates and not listed,
+               f"VT2 `up` with a request no priced type matches is refused before any listing, budget reservation or "
+               f"cluster: msg={msg} made={len(made)} gates={gates} listed={listed}")
+        case("VT2", vt2)
+
+        def vt3():
+            made, gates, msg = [], [], None
+            fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw), list_clusters=lambda workspace=None: [])
+            gate = lambda a_, name, meter=False, reserve=True: gates.append(name)   # noqa: E731
+            src = os.path.join(d, "src")
+            os.makedirs(src, exist_ok=True)
+            open(os.path.join(src, "job.py"), "w").write("print(1)\n")
+            with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "PRICES_FILE", nof8), \
+                    mock.patch.dict(globals(), {"_budget_gate": gate}), contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    main(["run", "lw-smoke-vt", "j3", "--dir", src, "--out", os.path.join(d, "local"), "--cpu", "4",
+                          "--cap-usd", "1", "--store", "outputs/t/j3", "--", sys.executable, "job.py"])
+                except SystemExit as e:
+                    msg = str(e.code)
+            ok(msg is not None and "vm_prices.yaml" in msg and not made and not gates,
+               f"VT3 `run` with a request no priced type matches (--cpu 4 on a table with no 4-vCPU type) is refused "
+               f"before the budget reservation and any cluster: msg={msg} gates={gates}")
+        case("VT3", vt3)
+
+        def start_on(vm):
+            attached, msg = [], None
+            det = {"id": 7, "scheduler": {"current_state": {"state": "started"},
+                                          "instance": {"instance_type_id": "Standard_D2_v5",
+                                                       "current_state": {"state": "started"}}},
+                   "workers": [{"current_state": {"state": "started"},
+                                "instance": {"instance_type_id": vm, "current_state": {"state": "started"}}}]}
+            src = types.SimpleNamespace(details=lambda cid: det)
+            a = types.SimpleNamespace(name="lw-smoke-vt", command=["true"], budget_scope="f6", cap_usd=1.0, tree=None,
+                                      dir=None, anthropic_key=False, job_id="j4")
+
+            def attach(name):
+                attached.append(name)
+                raise SystemExit("attached")
+            with mock.patch.object(budget, "PRICES_FILE", nof8), mock.patch.object(budget, "CoiledSource", lambda: src), \
+                    mock.patch.object(rc, "live_id", lambda n, lister=None: 7), mock.patch.object(rc, "attach", attach), \
+                    mock.patch.dict(globals(), {"_budget_gate": lambda *x, **k: None}), \
+                    mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    cmd_start(a)
+                except SystemExit as e:
+                    msg = str(e.code)
+            return attached, msg
+
+        def vt4():
+            attached, msg = start_on("Standard_F8s_v2")
+            ok(not attached and msg and "Standard_F8s_v2" in msg and "vm_prices.yaml" in msg,
+               f"VT4 `start` on a live cluster whose worker runs an unpriced type (F8s_v2) is refused before any job is "
+               f"submitted: msg={msg}")
+            attached, msg = start_on("Standard_D8_v5")
+            ok(attached and msg == "attached",
+               f"VT4b `start` on a cluster running priced types passes the check: msg={msg}")
+        case("VT4", vt4)
+
+        def vt5():
+            import inspect
+            srcs = {f.__name__: inspect.getsource(f) for f in (_create, rc._launch_locked, rc.start_overflow,
+                                                                rc.start_keeper)}
+            bad = {n: k for n, s in srcs.items() for k in ("worker_cpu=", "worker_memory=", "scheduler_cpu=",
+                                                            "scheduler_memory=") if k in s}
+            pinned = {n: "scheduler_vm_types=" in s and "worker_vm_types=" in s for n, s in srcs.items()}
+            ok(not bad and all(pinned.values()),
+               f"VT5 every cluster constructor in vm_job and run_cluster pins worker and scheduler VM types (no "
+               f"cpu/memory request Coiled could resolve to an unpriced type): cpu/memory {bad}, pinned {pinned}")
+        case("VT5", vt5)
 
 
 def _self_test_run(ok, real_gate=None) -> None:
