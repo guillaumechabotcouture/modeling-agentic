@@ -1,0 +1,265 @@
+beliefs:
+- id: B1
+  mechanism: Wide campaign protects women of childbearing age directly (all-or-nothing protection of ~85% reach
+    x efficacy of their susceptibles) and removes the children's susceptible pool as well, so CRS falls by at least
+    the direct-protection share, more when the herd effect also stops the outbreak.
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Rubella vaccines: WHO position paper. Wkly Epidemiol Rec 2011;86:301-316'
+    location: recommendations on initial campaign age range (children and women of childbearing age)
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983;90:259-325'
+    location: section on vaccinating girls/women vs children; location within paper uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Children-only campaign cuts CRS through the herd effect only: it lowers Reff by removing the largest
+    susceptible group. Where residual Reff < 1 the outbreak among women is (nearly) averted; where it stays > 1
+    a smaller outbreak still reaches susceptible women. In a closed population with no ageing in the horizon, there
+    is no paradoxical age shift, so the reduction is never negative.'
+  about:
+    package: children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.5
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983;90:259-325'
+    location: threshold analysis; exact location uncertain
+  - citation: Lessler J, Metcalf CJE. Balancing evidence and uncertainty when considering rubella vaccine introduction.
+      PLoS One 2013
+    location: results on campaign effects; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'The herd effect of a children-only campaign weakens as more susceptibles remain outside the children''s
+    group: higher s0_other and s0_women keep residual Reff above 1, so the children package''s relative CRS reduction
+    falls as these rise.'
+  about:
+    package: children
+    feature: s0_women
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983;90:259-325'
+    location: herd immunity threshold 1 - 1/R0; location uncertain
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'Same mechanism as B3 for susceptibles among everyone else (adults outside 15-39 women): they sustain
+    transmission after a children campaign and reduce the herd protection reaching pregnant women.'
+  about:
+    package: children
+    feature: s0_other
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983;90:259-325'
+    location: herd immunity threshold; location uncertain
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: 'Choice between children and wide: where women''s susceptibility is low, children alone pushes residual
+    Reff below 1 (or leaves few susceptible women), so wide''s extra cost (about US$1.10 per woman 15-39) buys little
+    CRS and children has the higher net benefit; where s0_women is high, residual transmission and the large directly-protectable
+    pool favour wide. The flip sits in the mid range of s0_women, and moves with R0.'
+  about:
+    pair:
+    - children
+    - wide
+    feature: s0_women
+  direction: flips
+  conditions:
+  - feature: s0_women
+    range:
+    - 0.1
+    - 0.22
+  source_type: literature
+  evidence:
+  - citation: 'Rubella vaccines: WHO position paper. Wkly Epidemiol Rec 2011;86:301-316'
+    location: campaign age-range options
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, et al. Using seroprevalence and immunisation coverage data to estimate
+      the global burden of congenital rubella syndrome, 1996-2010: a systematic review. PLoS One 2016'
+    location: CRS incidence vs susceptibility of women; location uncertain
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 1
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Wide's relative reduction is nearly insensitive to women's baseline susceptibility, because direct
+    protection removes a fixed share of susceptible women regardless of their number.
+  about:
+    package: wide
+    feature: s0_women
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983;90:259-325'
+    location: reasoning from all-or-nothing protection; not a stated result
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What share of districts reach residual Reff < 1 after a children-only campaign across R0 4-7 (contact_rate)?
+    This sets where herd protection suffices.
+  beliefs:
+  - B2
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Is the shadow price on a scale where the incremental CRS averted by vaccinating women outweighs US$1.10
+    per woman, or does it make the cheaper option win almost everywhere?
+  beliefs:
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: How large is the subcritical seed-chain burden in districts with baseline Reff near 1, which shrinks
+    relative reductions without much absolute CRS?
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: false
+- id: Q4
+  question: Do district CRS ratios (births per woman, first-trimester risk ~0.9 in Miller E et al. Lancet 1982)
+    vary enough to re-rank districts?
+  beliefs:
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: Wide cuts CRS by 80-100% relative to none in at least 80% of usable points.
+  p: 0.75
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.8
+- id: H2
+  belief: B2
+  claim: Children-only cuts CRS by 50-100% relative to none in at least 70% of usable points.
+  p: 0.6
+  test:
+    kind: effect_band
+    package: children
+    band:
+    - 0.5
+    - 1.0
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: Children's relative CRS reduction decreases as s0_women rises.
+  p: 0.6
+  weights:
+    decreases: 0.6
+    increases: 0.1
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_women
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: Children's relative CRS reduction decreases as s0_other rises.
+  p: 0.45
+  weights:
+    decreases: 0.45
+    increases: 0.05
+    no material effect: 0.5
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_other
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Where s0_women is low (0.05-0.12), children has higher net benefit than wide at the shadow price in at
+    least 70% of usable points.
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.05
+    - 0.12
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: The children/wide transition along s0_women lies within 0.10-0.22.
+  p: 0.3
+  test:
+    kind: flip_in
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.1
+    - 0.22
+- id: H7
+  belief: B6
+  claim: Wide's relative CRS reduction has negligible rank correlation with s0_women (|rho| bound within 0.3).
+  p: 0.45
+  weights:
+    no material effect: 0.45
+    increases: 0.15
+    decreases: 0.4
+  test:
+    kind: effect_direction
+    package: wide
+    feature: s0_women
+    direction: negligible
+    equivalence: 0.3
