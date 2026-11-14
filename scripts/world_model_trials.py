@@ -2858,6 +2858,144 @@ def _self_test() -> int:
             ok(out["toyc"]["ok"], f"WT25d the VM's engine step ignores carry_from (it needs the design only): {out}")
     tryit("WT25d engine-only with carry_from", wt25d)
 
+    def wt26():
+        # WT26 (2026-11-13): a template checker that reads inputs only, run before any seed. Batch 1's flu_vaccine
+        # counted costs in doses against a willingness to pay per USD; batch 3's Ebola H8 had two declared-independent
+        # columns at |Spearman| 0.82; engine-blind features and sweep-placed shadow prices reached seeded runs.
+        from unittest import mock
+        from toolkit.analysis import batch as B
+        with tempfile.TemporaryDirectory() as d:
+            _toy_wtp_table(d)
+            q = {"id": "t", "question": "Which package per unit?", "engine": toy_ref, "template": "tpl",
+                 "inputs": "synthetic"}
+            tpl = os.path.join(d, "tpl")
+            _toy_template(tpl)
+            pr = template_problems(q, d)
+            ok(set(pr) == set(TEMPLATE_CHECKS) and not any(pr.values()),
+               f"WT26a the toy template passes every check: {pr}")
+            sp = os.path.join(tpl, "decision_spec.yaml")
+            raw0 = yaml.safe_load(open(sp))
+
+            def spec_with(fn):
+                raw = json.loads(json.dumps(raw0))
+                fn(raw)
+                with open(sp, "w") as f:
+                    yaml.safe_dump(raw, f, sort_keys=False)
+
+            # the flu_vaccine case: costs counted doses; the question states no US$ budget; no cost units declared
+            with open(os.path.join(tpl, WTP_FILE), "w") as f:
+                yaml.safe_dump({"outcome_type": "toy_daly"}, f)
+            spec_with(lambda r: (r["options"]["cost_items"][0].update(value=0.7, includes=["doses"]),
+                                 r["constraints"].update(envelope_usd=800000)))
+            qd = dict(q, question="A ministry receives 770,000 doses: allocate them to minimise hospitalisations.")
+            pr = template_problems(qd, d)
+            ok(pr["cost_units"] and "cost_units" in pr["cost_units"][0] and not pr["shadow_price"],
+               f"WT26b the flu_vaccine case (costs in doses, no US$ budget stated, no cost units declared) fails "
+               f"cost_units: {pr['cost_units']}")
+            pr = template_problems(dict(qd, question="A ministry has US$800,000 for 770,000 doses."), d)
+            ok(not pr["cost_units"], f"WT26c the question's stated US$ budget equal to envelope_usd passes: {pr}")
+            with open(os.path.join(tpl, WTP_FILE), "w") as f:
+                yaml.safe_dump({"outcome_type": "toy_daly",
+                                "cost_units": {"currency": "USD", "basis": "US$4.00 per dose delivered"}}, f)
+            ok(not template_problems(qd, d)["cost_units"], "WT26c' a declared cost_units {currency: USD, basis} passes")
+            with open(os.path.join(tpl, WTP_FILE), "w") as f:
+                yaml.safe_dump({"outcome_type": "toy_daly", "cost_units": {"currency": "doses", "basis": "one dose"}}, f)
+            ok(template_problems(qd, d)["cost_units"], "WT26c'' cost_units in doses, not USD, fails")
+            _toy_template(tpl)
+            spec_with(lambda r: r["options"]["prices"].update(currency="NGN"))
+            ok(template_problems(q, d)["cost_units"], "WT26d a prices.currency other than USD with no exchange rate fails")
+            spec_with(lambda r: r["options"]["prices"].update(currency="NGN", exchange_rate={"2024": 1500.0}))
+            ok(not template_problems(q, d)["cost_units"], "WT26d' with its exchange rate it passes")
+            # the shadow price is pre-registered: never a value in the question, the template or the spec
+            spec_with(lambda r: None)
+            with open(os.path.join(tpl, WTP_FILE), "w") as f:
+                yaml.safe_dump({"outcome_type": "toy_daly", "cost_units": {"currency": "USD", "basis": "toy"},
+                                "value": 0.1}, f)
+            pr = template_problems(q, d)
+            ok(pr["shadow_price"] and "value" in pr["shadow_price"][0],
+               f"WT26e a value in wtp.yaml (a shadow price placed from a sweep) fails: {pr['shadow_price']}")
+            _toy_template(tpl)
+            ok(template_problems(dict(q, shadow_price_basis="from the check sweep"), d)["shadow_price"],
+               "WT26e' a shadow price basis in the question fails")
+            spec_with(lambda r: r["analysis"].update(shadow_price=0.1))
+            ok(template_problems(q, d)["shadow_price"], "WT26e'' a shadow price in the decision spec fails")
+            spec_with(lambda r: None)
+            tab = yaml.safe_load(open(os.path.join(d, WTP_TABLE)))
+            tab["outcome_types"]["toy_daly"]["source"] = "placed so the check sweep's packages tie"
+            yaml.safe_dump(tab, open(os.path.join(d, WTP_TABLE), "w"))
+            ok(template_problems(q, d)["shadow_price"], "WT26e''' a willingness-to-pay source citing a sweep fails")
+            _toy_wtp_table(d)
+            # independence, engine reads, schema
+            good = {"features": ["cov"], "generator": "generate_units.py", "basis": "drawn independently"}
+            _indep_template(tpl, good)
+            with open(os.path.join(tpl, ENGINE_READS), "w") as f:
+                yaml.safe_dump({"features_read_via": {"cov": "x"}}, f)
+            pr = template_problems(q, d)
+            ok(not pr["independence"] and not pr["engine_reads"], f"WT26f a declared, read feature passes: {pr}")
+            os.remove(os.path.join(tpl, ENGINE_READS))
+            pr = template_problems(q, d)
+            ok(pr["engine_reads"] and "cov" in pr["engine_reads"][0],
+               f"WT26g a declared feature on a column no engine attribute reads, not declared derived, fails: "
+               f"{pr['engine_reads']}")
+            raw = yaml.safe_load(open(sp))
+            raw["analysis"]["emulator"]["features"] = ["cov", "tgt"]
+            raw["analysis"]["emulator"]["independent_features"] = dict(good, features=["cov", "tgt"])
+            yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+            rho = B.realized_rank_correlations(__import__("toolkit.spec.schema", fromlist=["load"]).load(sp),
+                                               ["cov", "tgt"])
+            pr = template_problems(q, d)
+            ok(abs(rho["cov|tgt"]) > 0.3 and pr["independence"] and "cov|tgt" in pr["independence"][0],
+               f"WT26h declared-independent features correlated in the realized units table (|Spearman| "
+               f"{abs(rho['cov|tgt']):.2f} > 0.3) fail: {pr['independence']}")
+            _toy_template(tpl)
+            spec_with(lambda r: r.pop("objective"))
+            ok(template_problems(q, d)["schema"], "WT26i a spec schema.validate refuses fails the schema check")
+            _toy_template(tpl)
+            with open(os.path.join(tpl, WTP_FILE), "w") as f:      # no cost units declared: t2 states no US$ budget
+                yaml.safe_dump({"outcome_type": "toy_daly"}, f)
+            q = dict(q, question="Which package per unit, within US$9,000?")
+            # no engine run anywhere, and run_trials refuses to seed a failing template
+            with mock.patch.object(B, "run", side_effect=AssertionError("engine run")), \
+                    mock.patch.object(B, "design", side_effect=AssertionError("design")), \
+                    mock.patch.dict(globals(), {"engine_step": lambda *a, **k: 1 / 0}):
+                res = lint_templates([q, dict(q, id="t2", question="770,000 doses")], d)
+            ok(res["t"]["ok"] and not res["t2"]["ok"] and "cost_units" in res["t2"]["problems"],
+               f"WT26j lint_templates reads inputs only (no design, no engine run): {res}")
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            _toy_template(os.path.join(repo, "data", "tpl", "good"))
+            _toy_template(os.path.join(repo, "data", "tpl", "bad"))
+            with open(os.path.join(repo, "data", "tpl", "bad", WTP_FILE), "w") as f:
+                yaml.safe_dump({"outcome_type": "toy_daly", "value": 0.1}, f)
+            qs = [{"id": i, "question": "Which package per unit?", "engine": toy_ref, "template": f"data/tpl/{i}",
+                   "inputs": "synthetic"} for i in ("good", "bad")]
+            called = []
+
+            def seed_fn(run_dir, ctx, feedback, cap_usd):
+                called.append(os.path.basename(run_dir))
+                with open(os.path.join(run_dir, "world_model_seed.yaml"), "w") as f:
+                    yaml.safe_dump(_toy_seed(), f, sort_keys=False)
+                from agents.v2_tasks import TaskResult
+                return TaskResult(True, {"ok": True}, 0.25, "stub")
+            troot = os.path.join(repo, "trials")
+            L = SpendLedger(os.path.join(troot, "spend.jsonl"), 20.0)
+            res = run_trials(qs, troot, repo=repo, seed_fn=seed_fn, ledger=L, anchor=None, engines={toy_ref},
+                             citation_lookup=lambda query: [], engine="remote")
+            ok(res["bad"]["status"] == "template_refused" and "bad" not in called and called == ["good"]
+               and res["good"]["status"] == "awaiting_engine"
+               and "shadow_price" in (res["bad"].get("template_problems") or {})
+               and not os.path.exists(os.path.join(troot, "runs", "bad", "analysis", "batch", "design.json"))
+               and "bad" not in json.dumps(L.by_question()),
+               f"WT26k run_trials refuses to seed a failing template (no seed task, no spend, no design) and seeds "
+               f"the passing one: {({k: (v.get('status'), v.get('template_problems')) for k, v in res.items()})} "
+               f"seeded {called}")
+        real = load_questions(QUESTIONS)
+        res = lint_templates(real)
+        bad = {k: sorted(v["problems"]) for k, v in res.items() if not v["ok"]}
+        ok(len(res) == len(real), f"WT26l every shipped question's template is checked ({len(res)}); "
+           f"{len(bad)} fail: {bad}")
+    tryit("WT26 template check", wt26)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
