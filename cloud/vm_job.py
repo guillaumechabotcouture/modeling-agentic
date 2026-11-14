@@ -378,53 +378,59 @@ def _vm_request(a) -> dict:
     """The cluster's VM types, pinned from cloud/vm_prices.yaml (budget.vm_types_for): worker_vm_types for --cpu and
     --memory, scheduler_vm_types for a 2-vCPU scheduler. Coiled is given these lists, never cpu/memory, so every type
     it can pick is priced (2026-11-13: --cpu 8 with the default --memory got Standard_F8s_v2, unpriced, and budget.py
-    refused it only once the cluster existed). A request no priced type matches is refused (SystemExit) before
-    anything is listed, reserved or created. Resolved once per command."""
+    refused it only once the cluster existed). A request no priced type matches exactly gets the closest priced types
+    that satisfy it, with a warning (owner, 2026-11-13: spend controls fail soft); only a request nothing in the table
+    can satisfy is refused (SystemExit), before anything is listed, reserved or created. Resolved once per command."""
     if getattr(a, "_vm", None) is None:
         import budget
         try:
-            a._vm = {"worker_vm_types": budget.vm_types_for(a.cpu, a.memory),
-                     "scheduler_vm_types": budget.scheduler_vm_types()}
+            workers, note = budget.resolve_vm_types(a.cpu, a.memory)
+            a._vm = {"worker_vm_types": workers, "scheduler_vm_types": budget.scheduler_vm_types()}
         except budget.BudgetError as e:
             raise SystemExit(f"{a.name}: refusing before any cluster is created: {e}") from None
+        if note:
+            print(f"{a.name}: {note}", flush=True)
         print(f"VM types (all priced in cloud/vm_prices.yaml): workers {', '.join(a._vm['worker_vm_types'])}; "
               f"scheduler {', '.join(a._vm['scheduler_vm_types'])}", flush=True)
     return a._vm
 
 
 def _live_vm_types_ok(name):
-    """`start` on a cluster made elsewhere: refuse (SystemExit) unless every live process of it runs a priced VM type
-    and every process's configured fallback list (spec.prioritized_instance_types, the types Coiled may give it or a
-    replacement) is priced, read from the cluster's own record. Cluster 2376181 (2026-11-13, --cpu 8 without pinning)
-    listed 16 candidate worker types and 50 scheduler types, most unpriced. A live process with no VM type yet, a
-    missing list, or a record that cannot be read is refused (fail closed): the job would keep a cluster busy whose
-    cost the budget cannot bound."""
+    """`start` on a cluster made elsewhere: the id of the live cluster `start` attaches to (and only that one), after
+    reading its record for VM types the budget has no price for: a live process's type and its configured fallback
+    list (spec.prioritized_instance_types, the types Coiled may give it or a replacement). Cluster 2376181
+    (2026-11-13, --cpu 8 without pinning) listed 16 candidate worker types and 50 scheduler types, most unpriced.
+    Each finding (an unpriced type, a live process with no type yet, a missing list, a record that cannot be read) is
+    a printed WARNING, never a refusal (owner, 2026-11-13: spend controls fail soft); budget.py counts an unpriced
+    type at its fallback bound."""
     import budget
     cid = rc.live_id(name)
     if cid is None:
         raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
+    warn = []
     try:
         d = budget.CoiledSource().details(cid)
         procs = [d["scheduler"]] + list(d["workers"])
-        live = [p for p in procs if not (isinstance(p, dict) and ws.state_of(p) in budget.ENDED)]
-        if not live:
-            raise budget.BudgetError(f"cluster {cid}: no live process")
         types = set()
-        for p in live:
+        for p in procs:
+            if isinstance(p, dict) and ws.state_of(p) in budget.ENDED:
+                continue
             inst = p.get("instance") if isinstance(p, dict) else None
             vm = inst.get("instance_type_id") if isinstance(inst, dict) else None
             listed = ((p.get("spec") or {}).get("prioritized_instance_types") if isinstance(p, dict) else None)
             if not vm or not isinstance(listed, list) or not listed:
-                raise budget.BudgetError(f"cluster {cid}: a live process has no VM type yet, or no listed candidate "
-                                         f"types; retry once it runs")
-            types |= {vm, *map(str, listed)}
-        budget.require_priced(sorted(types), f"{name} (cluster {cid}, running and candidate types)")
-        return cid
-    except budget.BudgetError as e:
-        raise SystemExit(f"{name}: refusing to start a job: {e}") from None
-    except Exception as e:  # noqa: BLE001 -- unreadable record: fail closed
-        raise SystemExit(f"{name}: refusing to start a job: the cluster's VM types cannot be read "
-                         f"({type(e).__name__}: {str(e)[:120]})") from None
+                warn.append(f"cluster {cid}: a live process has no VM type yet, or no listed candidate types: its "
+                            f"cost is estimated at its cluster's other workers' bound")
+            types |= {x for x in (vm, *(listed if isinstance(listed, list) else ())) if x}
+        missing = budget.unpriced(sorted(map(str, types)))
+        if missing:
+            warn.append(f"cluster {cid} runs or may run VM type(s) {missing} not in cloud/vm_prices.yaml: counted at "
+                        f"the fallback bound; add them to the table")
+    except Exception as e:  # noqa: BLE001 -- warned, not refused (fail soft)
+        warn.append(f"the VM types of cluster {cid} cannot be read ({type(e).__name__}: {str(e)[:120]})")
+    for w in warn:
+        print(f"WARNING: {name}: {w}", flush=True)
+    return cid
 
 
 def _budget_gate(a, name, meter=False, reserve=True):

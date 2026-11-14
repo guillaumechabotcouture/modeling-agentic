@@ -305,22 +305,26 @@ def vm_request(cfg, compute=None) -> dict:
     """{role: worker_vm_types and scheduler_vm_types} for each cluster this config can construct ("run" when
     `compute` is given, "overflow" when it has an overflow pool, "keeper"), every type priced in cloud/vm_prices.yaml.
     Coiled is given these lists, never cpu/memory, so what the budget prices is what it gets (2026-11-13: a cpu/memory
-    request got Standard_F8s_v2, unpriced, refused only once the cluster existed). Refuses (SystemExit) before any
-    budget reservation, key or cluster when a type is not priced."""
+    request got Standard_F8s_v2, unpriced, refused only once the cluster existed). A configured type the table lacks
+    (compute.WORKER_VM_TYPES, overflow_vm_types) is pinned as configured with a printed WARNING, never refused (owner,
+    2026-11-13: spend controls fail soft); budget.py counts it at its fallback bound."""
     import budget
     try:
         sched = budget.scheduler_vm_types()
         out = {"keeper": {"worker_vm_types": budget.vm_types_for(2, "8 GiB"), "scheduler_vm_types": sched}}
-        if cfg.keeper and cfg.overflow_max:
-            out["overflow"] = {"worker_vm_types": budget.require_priced(cfg.overflow_vm_types,
-                                                                        f"{cfg.name} overflow_vm_types"),
-                               "scheduler_vm_types": sched}
-        if compute is not None:
-            out["run"] = {"worker_vm_types": budget.require_priced(compute.WORKER_VM_TYPES,
-                                                                   f"{cfg.name} compute.WORKER_VM_TYPES"),
-                          "scheduler_vm_types": sched}
-    except budget.BudgetError as e:
+    except budget.BudgetError as e:     # the tracked table has no 2-vCPU, 8 GiB type: a broken table, not a request
         raise SystemExit(f"{cfg.name}: refusing before any cluster is created: {e}") from None
+    roles = {}
+    if cfg.keeper and cfg.overflow_max:
+        roles["overflow"] = (list(cfg.overflow_vm_types), "overflow_vm_types")
+    if compute is not None:
+        roles["run"] = (list(compute.WORKER_VM_TYPES), "compute.WORKER_VM_TYPES")
+    for role, (types, what) in roles.items():
+        missing = budget.unpriced(types)
+        if missing:
+            print(f"WARNING: {cfg.name}: {what} {missing} not in cloud/vm_prices.yaml: launching with them, counted at "
+                  f"the fallback bound; add them to the table", flush=True)
+        out[role] = {"worker_vm_types": types, "scheduler_vm_types": sched}
     return out
 
 
