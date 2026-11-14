@@ -1,0 +1,313 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold after an early campaign: baseline Reff = R0 x s0 is about 1.0-3.6 (R0 12-18,
+    s0 0.08-0.20). Removing about 0.8 x efficacy (~0.7) of susceptibles at day 14 (about one serial interval after
+    detection) leaves residual Reff mostly below 1, so EARLY averts most of the outbreak. What it cannot avert is
+    the seed cohort and its first generation, plus residual spread where R0 x s0 is at the top of the range.'
+  about:
+    package: early
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation and critical vaccination threshold, ch. 5 (page not checked)
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: measles serial interval about 11-12 days (table not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: 'Timing penalty of the late campaign: between day 14 and day 42 (about 2-3 more generations) the outbreak
+    keeps growing at Reff per generation. Infections in that window cannot be averted, and they grow with the seed
+    share at detection. So LATE''s relative reduction falls as seed_share rises.'
+  about:
+    package: late
+    feature: seed_share
+  direction: decreases
+  magnitude:
+    band:
+    - 0.1
+    - 0.7
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: 'results: cases averted fall steeply with delay in response (figure not checked)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: A higher susceptible share raises Reff and the growth per generation, so more of the outbreak happens
+    before day 42. LATE's relative reduction falls with s0, and so does EARLY's, more weakly (higher residual Reff
+    after the campaign).
+  about:
+    package: late
+    feature: s0
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: epidemic growth rate vs R (page not checked)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'Waiting is false economy: EARLY costs US$0.80 more per resident, worth only ~0.0007 infections per
+    resident at the shadow price (0.00086 per USD). EARLY''s extra infections averted over LATE (about 0.005-0.05
+    per resident where a major outbreak is under way) are far larger, so EARLY wins on net benefit almost everywhere.
+    Where the seed is large the gap is largest. LATE can only win where Reff is near 1 and the seed is small, so
+    little happens before day 42. The binding US$4M budget (EARLY everywhere would cost roughly twice that) decides
+    how many districts get a campaign. The rule within a district is still timing first.'
+  about:
+    pair:
+    - early
+    - late
+  direction: increases
+  conditions:
+  - feature: s0
+    range:
+    - 0.0806
+    - 0.1982
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: results on response delay (figure not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Any flip between early and late, if one exists, lies at the low-s0 edge, where R0 x s0 is near 1. That
+    regime is rare in this design and may not show up at all (one-sided).
+  about:
+    pair:
+    - early
+    - late
+  direction: flips
+  conditions:
+  - feature: s0
+    range:
+    - 0.0806
+    - 0.11
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, Heffernan J, Deeks SL, Li Y, Crowcroft NS. The basic reproduction number
+      (R0) of measles: a systematic review. Lancet Infect Dis 2017'
+    location: R0 range 12-18 commonly cited (abstract)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Versus doing nothing, EARLY costs US$2.20 per resident (~0.0019 infections per resident at the shadow
+    price). It averts roughly s0 x attack rate (0.03-0.15 per resident) wherever Reff > ~1.2, so it beats none except
+    at the subcritical edge.
+  about:
+    pair:
+    - early
+    - none
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation (page not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Even EARLY cannot avert the seed's first generation (day 0-14). That loss grows with the seed share,
+    so EARLY's relative reduction falls weakly as seed_share rises.
+  about:
+    package: early
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, Djibo A, Le Menach A, Bjornstad ON, Grenfell BT. Time is of the
+      essence: exploring a measles outbreak response vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: results on response delay (figure not checked)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: How does the engine represent a campaign completed 14 or 42 days into a running epidemic, when its card
+    says interventions act before the epidemic? If timing enters only through efficacy:late / reach:late, the seed_share
+    dependence of B2 may be weak or absent.
+  beliefs:
+  - B2
+  - B4
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: What share of districts are subcritical or near threshold (R0 x s0 <= 1.2)? Only there can LATE or none
+    beat EARLY.
+  beliefs:
+  - B4
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q3
+  question: With the budget binding (EARLY in all districts costs roughly twice US$4M), is it better to run LATE
+    in more districts than EARLY in fewer? The budget's dual, not the DALY shadow price, governs that trade.
+  beliefs:
+  - B4
+  decision_relevant: true
+- id: Q4
+  question: Are the seeded (already infected) individuals counted in the outcome? If so, they cap the relative reduction
+    of both options in low-Reff districts.
+  beliefs:
+  - B1
+  - B7
+  decision_relevant: false
+hypotheses:
+- id: H1
+  belief: B1
+  claim: EARLY reduces infections by 60-100% relative to none in at least 70% of usable points.
+  p: 0.7
+  test:
+    kind: effect_band
+    package: early
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: LATE's relative reduction decreases as seed_share rises.
+  p: 0.7
+  weights:
+    decreases: 0.7
+    increases: 0.08
+    no material effect: 0.22
+  test:
+    kind: effect_direction
+    package: late
+    feature: seed_share
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: LATE's relative reduction decreases as s0 rises.
+  p: 0.5
+  weights:
+    decreases: 0.5
+    increases: 0.2
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: late
+    feature: s0
+    direction: decreases
+- id: H4
+  belief: B4
+  claim: EARLY beats LATE on net benefit at the shadow price in at least 70% of usable points across the full s0
+    range.
+  p: 0.7
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.0806
+    - 0.1982
+    sign: positive
+    min_share: 0.7
+- id: H5
+  belief: B4
+  claim: Where seed_share is high (0.003-0.007154), EARLY beats LATE on net benefit in at least 85% of usable points.
+  p: 0.72
+  test:
+    kind: paired_sign
+    a: early
+    b: late
+    feature: seed_share
+    range:
+    - 0.003
+    - 0.007154
+    sign: positive
+    min_share: 0.85
+- id: H6
+  belief: B5
+  claim: The early/late transition along s0 lies within 0.0806-0.11.
+  p: 0.25
+  test:
+    kind: flip_in
+    a: early
+    b: late
+    feature: s0
+    range:
+    - 0.0806
+    - 0.11
+- id: H7
+  belief: B6
+  claim: EARLY beats none on net benefit at the shadow price in at least 75% of usable points across the full s0
+    range.
+  p: 0.75
+  test:
+    kind: paired_sign
+    a: early
+    b: none
+    feature: s0
+    range:
+    - 0.0806
+    - 0.1982
+    sign: positive
+    min_share: 0.75
+- id: H8
+  belief: B7
+  claim: EARLY's relative reduction decreases as seed_share rises.
+  p: 0.5
+  weights:
+    decreases: 0.5
+    increases: 0.1
+    no material effect: 0.4
+  test:
+    kind: effect_direction
+    package: early
+    feature: seed_share
+    direction: decreases
