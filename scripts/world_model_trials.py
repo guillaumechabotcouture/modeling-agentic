@@ -2871,7 +2871,7 @@ def _self_test() -> int:
                  "test": {"kind": "effect_band", "package": "a", "band": [0.7, 0.9], "min_share": 0.7}},
                 {"id": "E2", "belief": "B7", "claim": "cov does not change a's effect", "p": 0.6,
                  "test": {"kind": "effect_direction", "package": "a", "feature": "cov", "direction": "negligible",
-                          "equivalence": 0.2}},
+                          "equivalence": 0.2, "scope": "marginal"}},   # marginal: past the adjusted-test rule (WT27d)
                 {"id": "E3", "belief": "B8", "claim": "a's effect rises with x", "p": 0.6,
                  "test": {"kind": "effect_direction", "package": "a", "feature": "x (calibration scale)",
                           "direction": "increases", "scope": "marginal"}}]
