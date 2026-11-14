@@ -664,9 +664,10 @@ def _self_test() -> int:
         q["fit_joint"]["targets"].append(t)
         ok(any(f"{t} is held out" in x for x in check(q, base)), f"F1b a held-out benchmark ({t}) as a target is refused")
     ok(list(p["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill", "cfp_half"]
-       and "pbo" not in train_nets(base, train) and p["fit_joint"]["params"]["cfp_half"] == [547.5, 1277.5],
+       and "pbo" not in train_nets(base, train) and p["fit_joint"]["params"]["cfp_half"] == [270.0, 1650.0],
        "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets), cfp_kill, irs_kill and cfp_half "
-       "(owner, 13 Nov; box 1.5-3.5 y); the PBO parameters stay out: no training arm has a PBO net")
+       "(owner, 13 Nov; wave-2 box 270-1650 days, from the durability studies); the PBO parameters stay out: no "
+       "training arm has a PBO net")
     from toolkit.engines.malaria.engine import MalariaEngine
     from toolkit.spec import priors as PR
     e = MalariaEngine()
@@ -678,22 +679,24 @@ def _self_test() -> int:
 
     def f4():
         q = plan(p)
-        npt = 45 + 1 + 1 + 12
         w = q["waves"]
+        n2 = WAVE2["n"]
         naive = q["cpu_work_hours"] * VM_FACTOR[1] * USD_PER_VCPU_H[1]
         q64 = plan(p, vcpus=64)
-        ok(q["design_points"] == 46 and q["seeds"] == 8 and len(q["arms"]) == 8
+        ok(q["design_points"] == n2 and q["reused_points"] == 46 + 12 + 1 and q["seeds"] == 8 and len(q["arms"]) == 8
            and q["settings"] == ["benin", "irs_added", "misungwi", "muleba"]
-           and q["calibration_runs"] == 5 * 21 * 2 and q["arm_runs"] == npt * 8 * 8 + q["calibration_runs"]
+           and q["calibration_runs"] == 0 and q["calibration_reused"] is True
+           and q["arm_runs"] == (n2 + 1 + 12) * 8 * 8
            and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held
-           and q["vcpus"] == VCPUS and w["calibration"] == 5 * -(-42 // VCPUS) and w["chosen"] == 4
-           and w["design"] == sum(-(-min(300, 1472 - i) // VCPUS) for i in range(0, 1472, 300))
-           and w["sample"] == sum(-(-min(300, 384 - i) // VCPUS) for i in range(0, 384, 300))
-           and q["usd"][1] > naive and q64["usd"][1] > q["usd"][1] and q["usd"][1] <= CAP_USD,
-           f"F4 (review P2) the price is allocated VM time: {q['vcpus']} vCPUs x the wall time of the calibration "
-           f"({w['calibration']}), design ({w['design']}), chosen-point ({w['chosen']}) and sample ({w['sample']}) "
-           f"waves plus start-up, {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]} (cap ${CAP_USD}); the "
-           f"CPU-work estimate would say ${naive:.1f}; 64 vCPUs ${q64['usd'][1]}")
+           and q["vcpus"] == VCPUS and w["calibration"] == 0 and w["chosen"] == 4
+           and w["design"] == _waves(n2 * 4 * 8, VCPUS) and w["sample"] == _waves(12 * 4 * 8, VCPUS)
+           and q["usd"][1] > naive and len(q["usd_real"]) == 2 and q["usd_real"][1] < CAP_USD
+           and q["usd"][1] < CAP_USD and q64["usd"][1] > q["usd"][1],
+           f"F4 (wave 2) the plan prices only the runs not reused: {n2} wave-2 design points, the chosen point and 12 "
+           f"verified points ({q['arm_runs']} arm runs); wave 1's {q['reused_points']} evaluated points and its "
+           f"calibration grid are reused (0 calibration runs); {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-"
+           f"{q['usd'][1]} on the VM price bound, ${q['usd_real'][0]}-{q['usd_real'][1]} at the measured $0.124 per "
+           f"vCPU-hour (cap ${CAP_USD}); the CPU-work estimate would say ${naive:.1f}; 64 vCPUs ${q64['usd'][1]}")
     case("F4", f4)
     # F5: a narrow trade-off (a + b = 1 +- 0.05) is kept by the joint sample and lost by independent marginal draws
     names, box = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
@@ -782,11 +785,12 @@ def _self_test() -> int:
 
     def f13():
         cmd = launch_command(VCPUS)
-        ok(cmd[:3] == ["python3", "cloud/vm_job.py", "run"] and cmd[cmd.index("--cap-usd") + 1] == "25"
-           and "--approved" in cmd and str(VCPUS) in cmd and cmd[cmd.index("--") + 1:][:2] == [
-               "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
-           f"F13 the launch goes through cloud/vm_job.py run with --cap-usd 25, so the job's USD meter stops the VM at "
-           f"the cap: {' '.join(cmd)}")
+        ok(cmd[:5] == ["python3", "cloud/vm_job.py", "run", "f6-refit-netfit-v017w2", "net-effect-fit"]
+           and cmd[cmd.index("--cap-usd") + 1] == "30" and cmd[cmd.index("--store-account") + 1] == "modelingagentic"
+           and "--approved" in cmd and "--margin-loo" in cmd and str(VCPUS) in cmd
+           and cmd[cmd.index("--") + 1:][:2] == ["python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
+           f"F13 the wave-2 launch goes through cloud/vm_job.py run with --cap-usd 30, so the job's USD meter stops the "
+           f"VM at the cap: {' '.join(cmd)}")
     case("F13", f13)
 
     def f12():
@@ -976,6 +980,127 @@ def _self_test() -> int:
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
            f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
+
+    def f19():
+        import hashlib
+        import tempfile
+        w1 = load_wave1(WAVE1, e, base)
+        grid = [float(v) for v in np.linspace(*NET_PARAMS["net_kill_shift"][1], CAL_N)]
+        ok(len(w1["points"]) == 46 + 12 + 1 and [x["wave"] for x in w1["points"]].count(1) == 59
+           and w1["calibration_grid"]["values"] == grid and w1["at_grid_edge"] == []
+           and set(w1["calibration_grid"]["m0"]) == {"benin", "irs_added", "misungwi", "muleba"}
+           and w1["sha256"] == WAVE1_SHA256 and all(set(x["computed"]) == set(train) for x in w1["points"]),
+           f"F19 wave 1's engine results are reused from its output ({os.path.basename(WAVE1)}, sha256 "
+           f"{WAVE1_SHA256[:12]}): its 46 design points, 12 verified points and chosen point, and its calibration grid")
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            def variant(label, mut, pack=base):
+                doc = yaml.safe_load(open(WAVE1))
+                mut(doc)
+                q = os.path.join(d, label.replace(" ", "_") + ".yaml")
+                yaml.safe_dump(doc, open(q, "w"), sort_keys=False)
+                try:
+                    load_wave1(q, e, pack, hashlib.sha256(open(q, "rb").read()).hexdigest())
+                    got[label] = ""
+                except ValueError as ex:
+                    got[label] = str(ex)
+            variant("other engine code", lambda x: x["engine_identity"].update(code_sha256="0" * 64))
+            variant("other parameters", lambda x: x["engine_identity"].update(params_sha256="0" * 64))
+            variant("a smoke", lambda x: x.update(smoke=True))
+            variant("other seeds", lambda x: x["fit_rule"].update(seeds=[1, 2]))
+            variant("other targets", lambda x: x["fit_rule"].update(targets=["B10"]))
+            variant("another calibration grid", lambda x: x["calibration_grid"].update(net_kill_shift=[0.0, 0.1]))
+            variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
+            variant("a design point without its result", lambda x: x["design"]["computed"]["B10"].pop())
+            pk = copy.deepcopy(base)
+            pk["seeds"] = pk["seeds"][:2]
+            variant("another pack", lambda x: None, pack=pk)
+            try:
+                load_wave1(WAVE1, e, base, "0" * 64)
+                got["an edited file"] = ""
+            except ValueError as ex:
+                got["an edited file"] = str(ex)
+        why = {"other engine code": "code_sha256", "other parameters": "params_sha256", "a smoke": "smoke",
+               "other seeds": "seeds", "other targets": "targets", "another calibration grid": "calibration grid",
+               "a clamped calibration grid": "edge", "a design point without its result": "result",
+               "another pack": "pack", "an edited file": "sha256"}
+        wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
+        ok(not wrong, f"F19b wave 1 is reused only under the same engine identity, pack, seeds, targets and calibration "
+                      f"grid, from the recorded file ({len(why)} refusals; for another reason or not at all: "
+                      f"{wrong or 'none'})")
+    case("F19", f19)
+
+    def f20():
+        old = {"a": [0.0, 1.0], "b": [10.0, 20.0], "c": [0.0, 1.0]}
+        new = {"a": [0.0, 1.0], "b": [5.0, 30.0], "c": [0.0, 1.0]}
+        hull = {"a": [0.4, 0.6], "b": [10.0, 19.0], "c": [0.1, 0.95]}
+        bx = wave2_box(hull, old, new, 0.25)
+        ok(bx == {"a": [0.35, 0.65], "b": [5.0, 21.25], "c": [0.0, 1.0]},
+           f"F20 the wave-2 box is wave 1's accepted hull widened by a margin (here 25%) of its width on each side, "
+           f"clipped to the box; a side where the hull reached the old box edge goes to the new box edge ({bx})")
+    case("F20", f20)
+
+    def f21():
+        box2 = {"a": [0.0, 1.0], "b": [0.0, 2.0]}
+
+        class Fake:
+            seeds, calibrated = [1], {}
+
+            def __init__(self):
+                self.ran = []
+
+            def calibrate_settings(self, fitted, names=None):
+                pass
+
+            def prefetch(self, arms, thetas):
+                self.ran += [dict(t) for t in thetas]
+
+            def evaluate(self, b, th):
+                v = float(np.exp(-0.5 * th["a"] - 0.2 * th["b"] + 0.1 * th["a"] * th["b"]))
+                return {"computed": v, "in_band": b["band"][0] <= v <= b["band"][1], "seed_min": v, "seed_max": v}
+        pk = {"fit_joint": {"rule": "joint-v1", "params": box2, "targets": ["T"], "design": {"n": 10, "seed": 3}},
+              "benchmarks": [{"id": "T", "band": [0.6, 0.8], "target": 0.7,
+                              "estimand": {"type": "ratio", "num": "x", "den": "y"}}],
+              "arms": {"x": {"setting": "s"}, "y": {"setting": "s"}}}
+        fk = Fake()
+        w1pts = [{"x": {"a": float(u), "b": float(v)}, "wave": 1, "computed": {"T": fk.evaluate(
+            pk["benchmarks"][0], {"a": float(u), "b": float(v)})["computed"]}} for u, v in BM.lhs(8, 2, 1) * [1, 2]]
+        fit = fit_waves(pk, fk, {"points": w1pts}, {"a": [0.2, 0.8], "b": [0.5, 1.5]}, n=10, seed=3)
+        waves = fit["design"]["wave"]
+        ok(len(fk.ran) == 10 + 1 and waves.count(1) == 8 and waves.count(2) == 10
+           and all(0.2 <= r["a"] <= 0.8 and 0.5 <= r["b"] <= 1.5 for r in fk.ran[:10])
+           and fit["fit_rule"]["version"] == "joint-v1-wave2" and len(fit["design"]["x"]) == 18
+           and fit["surrogate"]["T"]["n_points"] == 18 and set(fit["parameters"]) == set(box2)
+           and fit["verification"]["T"]["in_band"],
+           f"F21 wave 2 runs only its own {waves.count(2)} design points (in the wave-2 box) and the chosen point on the "
+           f"engine; the surrogate is refitted on both waves ({len(fit['design']['x'])} points)")
+    case("F21", f21)
+
+    def f22():
+        n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
+        g2 = np.linspace(0, 1, 9)
+        X2 = np.array([[u, v] for u in g2 for v in g2])
+        Y2 = {"T": np.exp(X2[:, 0] + X2[:, 1])}
+        bands2 = {"T": [float(np.exp(0.8)), float(np.exp(1.2))]}
+        plain = joint_region(X2, Y2, bands2, n2, b2, 5)
+        same = joint_region(X2, Y2, bands2, n2, b2, 5, margin=None)
+        mg = joint_region(X2, Y2, bands2, n2, b2, 5, margin={"T": 0.05})
+        S = np.array([[s["a"], s["b"]] for s in mg["sample"]])
+        m = mg.get("margin") or {}
+        ok(same == plain and "margin" not in plain and m.get("by_target") == {"T": 0.05}
+           and 0 < mg["n_accepted"] < plain["n_accepted"] and np.all(np.abs(S.sum(1) - 1.0) <= 0.15 + 1e-3)
+           and m.get("n_in_band_without_margin") == plain["n_accepted"]
+           and abs(m.get("share_excluded", -1) - (1 - mg["n_accepted"] / plain["n_accepted"])) < 1e-3
+           and set(m.get("excluded_ranges") or {}) == set(n2)
+           and m["excluded_ranges"]["a"][0] < mg["hull"]["a"][0],
+           f"F22 with the margin flag the sample holds only candidates the surrogate puts in band by the margin "
+           f"({m.get('by_target')}); it records the share of the in-band region excluded ({m.get('share_excluded')}) "
+           f"and the excluded points' ranges; without it the region is unchanged")
+        lo = local_loo({"T": np.log(Y2["T"]) + 0.01 * np.sin(40 * X2[:, 0])}, X2, X2[:, 0] <= 0.5)
+        ok(set(lo) == {"T"} and 0 < lo["T"] < 0.05,
+           f"F22b the margin is each target's leave-one-out error of the log surrogate, root mean square over the points "
+           f"in the wave-2 box ({lo})")
+    case("F22", f22)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
