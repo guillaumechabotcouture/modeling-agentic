@@ -1339,6 +1339,11 @@ def _self_test() -> int:
             variant("the chosen point out of band", lambda x: far(jr(x)["verified"]["chosen"]))
             variant("a verified point without seed evidence", lambda x: jr(x)["verified"]["points"][0].pop("per_seed"))
             variant("no verified point", lambda x: jr(x)["verified"].update(points=[]))
+            # Codex P2 (PR #233): one seed value per declared seed; the run's recorded seeds are pack.yaml's
+            variant("a per-seed list truncated to 2 seeds",
+                    lambda x: jr(x)["verified"]["points"][0]["per_seed"].update(B11=[0.5, 0.6]))
+            variant("recorded seeds other than the pack's", lambda x: x["fit_rule"].update(seeds=[11, 12]))
+            variant("no recorded seeds", lambda x: x.pop("fit_rule"))
             variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
             variant("no calibration grid record", lambda x: x.pop("calibration_grid"))
             variant("a verified point not in the sample",
@@ -1370,7 +1375,8 @@ def _self_test() -> int:
             sha2 = load_posterior(other, e, rg, dg(other))["sha256"]
         gate = ("acceptance gate failed (finalize)", "a verified point out of band", "the chosen point out of band",
                 "no verified point", "a clamped calibration grid", "no calibration grid record",
-                "a verified point not in the sample", "a verified point without seed evidence")
+                "a verified point not in the sample", "a verified point without seed evidence",
+                "a per-seed list truncated to 2 seeds")
         why = {**dict.fromkeys(gate, "acceptance gate"), "missing file": "unreadable", "malformed YAML": "malformed",
                "an edited row under the signed digest": "signed sha256",
                "a value outside priors.yaml under a wider range": "priors.yaml",
@@ -1378,7 +1384,8 @@ def _self_test() -> int:
                "other engine code": "code_sha256", "empty sample": "empty sample",
                "a row lacks a parameter": "the fit's parameters", "a non-finite value": "non-finite",
                "a non-numeric value": "non-numeric", "a column the fit did not fit": "the fit's parameters",
-               "a parameter these draws do not vary": "not varied", "a value outside its draw range": "draw range"}
+               "a parameter these draws do not vary": "not varied", "a value outside its draw range": "draw range",
+               "recorded seeds other than the pack's": "seeds", "no recorded seeds": "seeds"}
         wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
         ok(not wrong and set(got) == set(why) and sha2 != P["sha256"],
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
@@ -1618,6 +1625,66 @@ def _self_test() -> int:
         ok("3 engine task" in r2, f"F25c a verification round that would rerun a design point stops before verifying "
                                   f"({r2!r})")
     case("F25", f25)
+
+    def f26():
+        s8 = list(base["seeds"])
+        bd = {"B11": [0.42, 0.70]}
+        full = {"point": {}, "per_seed": {"B11": [0.2, 0.4] + [0.2] * 6}}
+        trunc = {"point": {}, "per_seed": {"B11": [0.2, 0.4]}}
+        rf, rt = point_in_band(full, bd, s8), point_in_band(trunc, bd, s8)
+        ok(len(s8) == 8 and rf[0] is False and rt[0] is False and rt[1]["B11"] is None,
+           f"F26 (Codex P2, PR #233) the reviewer's probe: B11 seed values [0.2, 0.4] + [0.2]*6 fail, and the list "
+           f"truncated to [0.2, 0.4] is refused, not passed, against the {len(s8)} declared seeds ({rf[0]}, {rt})")
+        good = [0.50, 0.52, 0.48, 0.51, 0.49, 0.50, 0.53, 0.47]
+        cases = {"one value per declared seed": (good, s8, True),
+                 "a missing seed (7 values)": (good[:7], s8, False),
+                 "an extra seed (9 values)": (good + [0.5], s8, False),
+                 "a duplicate declared seed": (good, s8[:7] + [s8[0]], False),
+                 "no declared seeds": (good, [], False),
+                 "declared seeds missing": (good, None, False),
+                 "a non-integer declared seed": (good, s8[:7] + ["x"], False),
+                 "a boolean declared seed": (good, s8[:7] + [True], False)}
+        got = {k: point_in_band({"per_seed": {"B11": v}}, bd, sd)[0] for k, (v, sd, _) in cases.items()}
+        wrong = sorted(k for k, (_, _, w) in cases.items() if got[k] is not w)
+        ok(not wrong, f"F26b exactly one seed value per declared seed; a missing, extra or duplicate seed, or no valid "
+                      f"declaration, fails closed ({len(cases)} cases; wrong: {wrong or 'none'})")
+        pt = {"point": {"a": 0.1}, "per_seed": {"B11": [0.5, 0.52]}, "calibration_check": {}}
+        ch = {"per_seed": {"B11": good}, "calibration_check": {}}
+        r1, c1 = finalize({"sample": [{"a": 0.1}]}, [copy.deepcopy(pt)], copy.deepcopy(ch), bands=bd, seeds=s8)
+        r2, c2 = finalize({"sample": [{"a": 0.1}]}, [dict(pt, per_seed={"B11": good})], copy.deepcopy(ch), bands=bd,
+                          seeds=s8[:7] + [s8[0]])
+        r3, c3 = finalize({"sample": [{"a": 0.1}]}, [dict(pt, per_seed={"B11": good})], copy.deepcopy(ch), bands=bd,
+                          seeds=s8)
+        ok(c1 == 2 and any("2 seed values" in w and "8 declared seeds" in w for w in r1["acceptance"])
+           and c2 == 2 and any("duplicate" in w for w in r2["acceptance"])
+           and c3 == 0 and r3["verified"]["seeds"] == s8,
+           f"F26c finalize() names the seed mismatch ({r1['acceptance']}; {r2['acceptance']}) and records the seeds "
+           f"it checked against")
+    case("F26", f26)
+
+    def f27():
+        s8 = list(base["seeds"])
+        v = [0.40, 0.43, 0.41, 0.42, 0.39, 0.42, 0.41, 0.43]
+        lo, hi = seed_interval(v, len(v))
+        lg = np.log(v)
+        h = 1.96 * float(np.std(lg, ddof=1)) / np.sqrt(len(v))
+        gm = float(np.exp(np.mean(lg)))
+        ok(abs(lo - np.exp(np.mean(lg) - h)) < 1e-12 and abs(hi - np.exp(np.mean(lg) + h)) < 1e-12
+           and abs(np.sqrt(lo * hi) - gm) < 1e-12,
+           f"F27 the rule's interval is on the log scale around the geometric mean of the seed values, the statistic "
+           f"each target's `computed` is (benchmark.py: exp(mean(log per_seed))): [{lo:.4f}, {hi:.4f}] around {gm:.4f}")
+        skew = [0.1] * 7 + [2.0]          # arithmetic mean 0.34 (its interval reaches 0.80); geometric mean 0.15
+        ok(point_in_band({"per_seed": {"B11": skew}}, {"B11": [0.42, 0.70]}, s8)[0] is False
+           and point_in_band({"per_seed": {"B11": [0.5, 0.0] + [0.5] * 6}}, {"B11": [0.42, 0.70]}, s8)[0] is False
+           and point_in_band({"per_seed": {"B11": [0.5, -0.1] + [0.5] * 6}}, {"B11": [0.42, 0.70]}, s8)[0] is False,
+           "F27b a skewed seed set whose arithmetic interval overlaps the band but whose geometric one does not "
+           "fails; a zero or negative seed value fails closed (no log)")
+        r, _ = finalize({"sample": [{"a": 0.1}]}, [{"point": {"a": 0.1}, "per_seed": {"B11": v}, "calibration_check": {}}],
+                        {"per_seed": {"B11": v}, "calibration_check": {}}, bands={"B11": [0.42, 0.70]}, seeds=s8)
+        ok(r["verified"].get("acceptance_statistic") == ACCEPTANCE_STATISTIC and "geometric" in ACCEPTANCE_STATISTIC
+           and "log" in ACCEPTANCE_STATISTIC and "geometric" in ACCEPTANCE_RULE,
+           f"F27c the output records the statistic the rule used: {r['verified'].get('acceptance_statistic')!r}")
+    case("F27", f27)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
