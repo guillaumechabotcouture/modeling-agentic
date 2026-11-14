@@ -1,0 +1,240 @@
+beliefs:
+- id: B1
+  mechanism: 'Herd-immunity threshold / final-size nonlinearity: infections averted by removing susceptibles are
+    small while post-campaign Reff stays well above 1 and jump to nearly all infections once Reff falls below 1
+    (only the seed''s short chains remain in the deterministic final size).'
+  about:
+    package: D_9mto14y
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation and critical vaccination threshold, chapters on simple epidemic models (exact
+      pages not recalled)
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results (R0 estimates commonly 12-18, wider range overall)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: D removes ~76% of susceptibles aged 9 m-14 y, leaving mainly infants under 9 months; with R0 10-16
+    and a plausible residual mean susceptible share of a few percent, post-D Reff is below 1 in most districts,
+    so D averts nearly all outbreak infections.
+  about:
+    package: D_9mto14y
+    feature: susc_5_14y
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: 'Results: median effectiveness ~84% at 9-11 months, ~92% at 12 months or older'
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: C reaches only the 9-59 m gap; the larger the 5-14 y immunity gap, the more susceptibles C leaves behind,
+    so the more likely post-C Reff stays above 1 and the smaller C's relative reduction.
+  about:
+    package: C_9to59m
+    feature: susc_5_14y
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Lessler J, Metcalf CJE, Grais RF, et al. Measuring the performance of vaccination programs using
+      cross-sectional surveys: a likelihood framework and retrospective analysis. PLoS Med 2011'
+    location: 'Results: substantial immunity gaps persist in older children in several African settings (figure
+      location not recalled)'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: A larger 9-59 m gap means a larger share of all susceptibles sits in C's target ages, so C removes
+    a larger fraction of the susceptible pool; this pushes C's relative reduction up, although a larger gap also
+    raises baseline Reff, which works the other way. Net direction uncertain, leaning increases.
+  about:
+    package: C_9to59m
+    feature: susc_9_59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: critical vaccination threshold arguments (exact pages not recalled)
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: At the declared shadow price, D beats C wherever C leaves a major outbreak (large 5-14 y gap), because
+    the extra infections D averts per head far exceed lambda x its extra cost per head; C beats D where C alone
+    brings Reff below 1 (small 5-14 y gap), since D then buys almost nothing for ~US$0.4 more per head. The choice
+    therefore flips along susc_5_14y, roughly in its middle third (location uncertain; it also depends on susc_9_59m
+    and the district's R0).
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+    feature: susc_5_14y
+  direction: flips
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.06
+    - 0.14
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation (exact pages not recalled)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: What is each district's baseline Reff (R0 x mean susceptible)? If many districts are already near or
+    below 1, baseline burden is small and the threshold logic changes which option matters.
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: Does C alone bring Reff below 1 in most districts (C everywhere affordable within US$2.9M), or does
+    the 5-14 y gap keep outbreaks major so D is needed in some districts?
+  beliefs:
+  - B3
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: How large is the under-9-month susceptible share, which no option reaches and which sets a floor on
+    residual Reff after D?
+  beliefs:
+  - B2
+  decision_relevant: false
+- id: Q4
+  question: How do district population sizes trade the fixed US$18,000 cost against per-child cost; does the budget
+    force 'none' in some districts?
+  beliefs:
+  - B5
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: D_9mto14y averts 80-100% of infections relative to no campaign at most usable points, because it pushes
+    Reff below 1.
+  p: 0.65
+  test:
+    kind: effect_band
+    package: D_9mto14y
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B3
+  claim: C_9to59m's relative reduction falls as the 5-14 y immunity gap grows.
+  p: 0.75
+  weights:
+    decreases: 0.75
+    increases: 0.07
+    no material effect: 0.18
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_5_14y
+    direction: decreases
+- id: H3
+  belief: B4
+  claim: C_9to59m's relative reduction rises with the 9-59 m immunity gap.
+  p: 0.5
+  weights:
+    increases: 0.5
+    decreases: 0.25
+    no material effect: 0.25
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_9_59m
+    direction: increases
+- id: H4
+  belief: B2
+  claim: D_9mto14y's relative reduction barely varies with the 5-14 y gap (|rho| bound inside 0.3).
+  p: 0.4
+  test:
+    kind: effect_direction
+    package: D_9mto14y
+    feature: susc_5_14y
+    direction: negligible
+    equivalence: 0.3
+- id: H5
+  belief: B5
+  claim: Where the 5-14 y gap is large (susc_5_14y 0.12-0.19), D beats C on net benefit at the shadow price at >=70%
+    of points.
+  p: 0.65
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.12
+    - 0.1863
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B5
+  claim: Where the 5-14 y gap is small (susc_5_14y 0.027-0.06), C beats D on net benefit at >=60% of points.
+  p: 0.45
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.0271
+    - 0.06
+    sign: positive
+    min_share: 0.6
+- id: H7
+  belief: B5
+  claim: The C/D transition along susc_5_14y lies within 0.06-0.14.
+  p: 0.3
+  test:
+    kind: flip_in
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.06
+    - 0.14
