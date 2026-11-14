@@ -4098,17 +4098,22 @@ def _self_test_budget(ok) -> None:
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
     ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
        f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
-    # BU7 (2026-11-13: a VM type missing from cloud/vm_prices.yaml was refused only once its cluster existed): every
-    # VM type a launch would request is priced before the budget is asked, any key is read or any cluster is made
-    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
-                               overflow_vm_types=("Standard_D8s_v5", "Fake_X9_v9")), (True, "ok"))
-    ok(msg and "Fake_X9_v9" in msg and "vm_prices.yaml" in msg and not made and not keys and not calls,
-       f"BU7 an unpriced overflow VM type is refused before the budget, any key or any cluster: {msg} {calls}")
+    # BU7 (2026-11-13; owner: spend controls fail soft): a VM type missing from cloud/vm_prices.yaml never refuses a
+    # launch. It is warned about before the budget is asked (budget.py counts it at the fallback rate)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
+                                   overflow_vm_types=("Standard_D8s_v5", "Fake_X9_v9")), (True, "ok"))
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_X9_v9" in out.getvalue(),
+       f"BU7 an unpriced overflow VM type warns and the launch goes on: {msg} {calls} {out.getvalue()[:200]!r}")
     wvt[0] = ["Standard_E8s_v5", "Fake_F8s_v2"]
-    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         (True, "ok"))
     wvt[0] = ["Standard_E8s_v5", "Standard_E8as_v5"]
-    ok(msg and "Fake_F8s_v2" in msg and not made and not keys and not calls,
-       f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) is refused the same way: {msg} {calls}")
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_F8s_v2" in out.getvalue(),
+       f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) warns the same way: {msg} {calls}")
     try:
         req = vm_request(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
                          types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"]))
@@ -4172,9 +4177,8 @@ def _self_test_budget(ok) -> None:
                 msg = None
             except BaseException as e:  # noqa: BLE001
                 msg = f"{type(e).__name__}: {e}"
-        ok(msg and "Fake_X9_v9" in msg and not seen and not started,
-           f"BU7d `keeper` with an unpriced overflow VM type is refused before it reserves or creates anything: "
-           f"{msg} {seen}")
+        ok(msg is None and seen == [True] and started,
+           f"BU7d `keeper` with an unpriced overflow VM type warns and goes on (fail soft): {msg} {seen}")
     import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
     ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
     for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):

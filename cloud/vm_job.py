@@ -1326,20 +1326,23 @@ def _self_test_vm_types(ok) -> None:
             src = os.path.join(d, "src")
             os.makedirs(src, exist_ok=True)
             open(os.path.join(src, "job.py"), "w").write("print(1)\n")
+            out = io.StringIO()
             with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "PRICES_FILE", nof8), \
-                    mock.patch.dict(globals(), {"_budget_gate": gate}), contextlib.redirect_stdout(io.StringIO()):
+                    mock.patch.dict(globals(), {"_budget_gate": gate}), contextlib.redirect_stdout(out):
                 try:
                     main(["run", "lw-smoke-vt", "j3", "--dir", src, "--out", os.path.join(d, "local"), "--cpu", "4",
                           "--cap-usd", "1", "--store", "outputs/t/j3", "--", sys.executable, "job.py"])
                 except SystemExit as e:
                     msg = str(e.code)
-            ok(msg is not None and "vm_prices.yaml" in msg and not made and not gates,
-               f"VT3 `run` with a request no priced type matches (--cpu 4 on a table with no 4-vCPU type) is refused "
-               f"before the budget reservation and any cluster: msg={msg} gates={gates}")
+            wt = list((made[0] if made else {}).get("worker_vm_types") or [])
+            ok(len(made) == 1 and gates and wt and set(wt) <= priced and "WARNING" in out.getvalue()
+               and "closest" in out.getvalue(),
+               f"VT3 (owner: fail soft) `run --cpu 4` on a table with no 4-vCPU type launches on the closest priced "
+               f"types that satisfy it (8 vCPUs), with a warning: types {wt} gates={gates} out={out.getvalue()[:300]!r}")
         case("VT3", vt3)
 
         def start_on(vm, listed=None, extra=()):
-            attached, msg = [], None
+            attached, msg, out = [], None, io.StringIO()
 
             def proc(t, cand):
                 return {"current_state": {"state": "started"}, "spec": {"prioritized_instance_types": cand},
@@ -1358,32 +1361,35 @@ def _self_test_vm_types(ok) -> None:
                     mock.patch.object(ws, "attach_existing", lambda n, w_, cid: attach((n, cid))), \
                     mock.patch.dict(globals(), {"_budget_gate": lambda *x, **k: None}), \
                     mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                    contextlib.redirect_stdout(out):
                 try:
                     cmd_start(a)
                 except SystemExit as e:
                     msg = str(e.code)
-            return attached, msg
+            return attached, msg, out.getvalue()
 
         def vt4():
-            attached, msg = start_on("Standard_F8s_v2")
-            ok(not attached and msg and "Standard_F8s_v2" in msg and "vm_prices.yaml" in msg,
-               f"VT4 `start` on a live cluster whose worker runs an unpriced type (F8s_v2) is refused before any job is "
-               f"submitted: msg={msg}")
-            attached, msg = start_on("Standard_D8_v5")
-            ok(attached == [("lw-smoke-vt", 7)] and msg == "attached",
-               f"VT4b `start` on a cluster running priced types passes the check, and attaches to that cluster id only "
+            # owner, 2026-11-13: spend controls fail soft. Each case below attaches (to the checked id) and warns.
+            here = [("lw-smoke-vt", 7)]
+            attached, msg, out = start_on("Standard_F8s_v2")
+            ok(attached == here and msg == "attached" and "WARNING" in out and "Standard_F8s_v2" in out,
+               f"VT4 the F8s_v2 case: `start` on a live cluster whose worker runs an unpriced type goes ahead with a "
+               f"warning naming it (budget.py counts it at the fallback rate): msg={msg} out={out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5")
+            ok(attached == here and msg == "attached" and "WARNING" not in out,
+               f"VT4b `start` on a cluster running priced types attaches to that cluster id only, with no warning "
                f"(Codex r2: not a replacement of the same name): msg={msg} attached={attached}")
-            # Codex on this PR: a pending worker with no VM record yet, and an unpriced fallback type, were not checked
-            attached, msg = start_on("Standard_D8_v5", extra=({"current_state": {"state": "pending"}, "instance": None},))
-            ok(not attached and msg and "no VM type yet" in msg,
-               f"VT4c a live (pending) worker with no VM record is refused, not skipped: msg={msg}")
-            attached, msg = start_on("Standard_D8_v5", listed=["Standard_D8_v5", "Fake_D8ls_v5"])
-            ok(not attached and msg and "Fake_D8ls_v5" in msg,
-               f"VT4d a cluster whose candidate list (spec.prioritized_instance_types, as cluster 2376181 had) names an "
-               f"unpriced type is refused: msg={msg}")
-            attached, msg = start_on("Standard_D8_v5", listed=[])
-            ok(not attached and msg and "candidate" in msg, f"VT4e a missing candidate list is refused: msg={msg}")
+            attached, msg, out = start_on("Standard_D8_v5",
+                                          extra=({"current_state": {"state": "pending"}, "instance": None},))
+            ok(attached == here and "WARNING" in out and "no VM type yet" in out,
+               f"VT4c a live (pending) worker with no VM record is warned about, not skipped silently: {out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5", listed=["Standard_D8_v5", "Fake_D8ls_v5"])
+            ok(attached == here and "WARNING" in out and "Fake_D8ls_v5" in out,
+               f"VT4d an unpriced candidate type (spec.prioritized_instance_types, as cluster 2376181 had) is warned "
+               f"about: {out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5", listed=[])
+            ok(attached == here and "WARNING" in out and "candidate" in out,
+               f"VT4e a missing candidate list is warned about: {out[:200]!r}")
         case("VT4", vt4)
 
         def vt5():

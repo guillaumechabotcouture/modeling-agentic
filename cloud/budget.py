@@ -1111,8 +1111,6 @@ def _self_test() -> int:
             for label, cid, mut in (("no scheduler key", 2, lambda x: x.pop("scheduler")),
                                     ("a running process without instance data",
                                      2, lambda x: x["workers"][0].__setitem__("instance", None)),
-                                    ("an unknown VM type", 2, lambda x: x["scheduler"]["instance"].__setitem__(
-                                        "instance_type_id", "vmZ")),
                                     ("a negative cost", 1, lambda x: x.__setitem__("total_cost", -5)),
                                     ("an invalid creation time", 1, lambda x: x.__setitem__("created", "garbage")),
                                     ("no creation time", 1, lambda x: x.__setitem__("created", None)),
@@ -1129,6 +1127,48 @@ def _self_test() -> int:
                 ok(refused(lambda: spend("f6")) is not None
                    and not launch_budget_ok("f6", 1, "lw-smoke-z")[0], f"BR9 {label} refuses")
         case("BR8-9", bg8)
+
+        def bg25():
+            # BR25 (owner, 2026-11-13: spend controls fail soft): an unpriced VM type never refuses status, a launch or
+            # a meter reading. It is counted at the fallback bound (no vCPU count in the name: the table's largest
+            # bound, vmB's 10.0) and warned about in the cluster's assumptions, status and the launch's reason.
+            for cid, label in ((1, "a stopped cluster"), (2, "a live cluster")):
+                bad = json.loads(json.dumps({k: v for k, v in dets.items() if not isinstance(v, Exception)}))
+                bad[str(cid)]["scheduler"]["instance"]["instance_type_id"] = "vmZ"
+                bad = {int(k): v for k, v in bad.items()}
+                bad[4] = bad[5] = ValueError("not this scope")
+                with_env(env(r8, source=_FakeSource(items, bad)))
+                st = spend("f6")
+                row = {c["id"]: c for c in st["clusters"]}[cid]
+                lines = "\n".join(status_lines(st))
+                okl, why = launch_budget_ok("f6", 1, "lw-smoke-z")
+                want = 10.1 if cid == 1 else 28.315 + 3 * (10.0 - 5.55)    # stopped: billed; live: 3 h at the fallback
+                ok(abs(row["usd"] - want) < 1e-6 and okl and "WARNING" in why and "vmZ" in why
+                   and "WARNING" in lines and "vmZ" in lines and "vm_prices.yaml" in lines,
+                   f"BR25 {label} on an unpriced VM type is counted (at the fallback bound while live), and neither "
+                   f"status nor a later launch is refused; both warn: usd {row['usd']:.3f} (want {want:.3f}), launch "
+                   f"{okl} {why!r}")
+            nof8p = os.path.join(d, "nof8b.yaml")
+            open(nof8p, "w").write("margin: 1.25\ncredits_per_vcpu_hour: 1.5\ntypes:\n"
+                                   "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                                   "  Standard_E8s_v5: {vcpu: 8, memory_gib: 64, usd_per_hour: 0.504}\n"
+                                   "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n")
+            pr8 = load_prices(nof8p)
+            per = 0.504 / 8 * 1.25 + 1.5 * USD_PER_CREDIT        # the highest per-vCPU rate x margin, plus credits
+            ok(abs(fallback_bound("Standard_F8s_v2", pr8) - 8 * per) < 1e-9
+               and abs(fallback_bound("Fake_D96x_v9", pr8) - 96 * per) < 1e-9
+               and abs(fallback_bound("oddname", pr8) - max(pr8.values())) < 1e-9
+               and fallback_bound("Standard_D8_v5", pr8) == pr8["Standard_D8_v5"],
+               f"BR25b the F8s_v2 case: an unpriced type is priced at the table's highest per-vCPU rate x margin x its "
+               f"vCPUs ({8 * per:.4f}/h for 8 vCPUs), or the largest type's bound when its vCPUs are unknown")
+            det = _det(9, "lw-smoke-f8", T0, None, None, state="running",
+                       insts=[(now - H, None, "Standard_D2_v5"), (now - H, None, "Standard_F8s_v2")])
+            c = _cluster_cost(det, now, T0, 0.0, pr8)
+            ok(abs(c["usd"] - (pr8["Standard_D2_v5"] + 8 * per)) < 1e-6
+               and any("Standard_F8s_v2" in a and "WARNING" in a for a in c["assumptions"]),
+               f"BR25c a running F8s_v2 worker is metered at the fallback rate (the cap keeps working, nothing is "
+               f"stopped for want of a price): {c['usd']:.4f} {c['assumptions']}")
+        case("BR25", bg25)
 
         def bg8f():
             for field in ("cloud_total_cost", "total_cost"):
@@ -1502,16 +1542,20 @@ def _self_test() -> int:
                and vm_types_for(32, "16 GiB")[0] == "Standard_D32_v5" and vm_types_for(4, "16 GiB")[0] == "Standard_D4_v5",
                f"BR23c on the tracked table a type seen on our clusters comes first (what Coiled picked before): "
                f"{[vm_types_for(c, m)[:1] for c, m in ((8, '16 GiB'), (2, '8 GiB'), (32, '16 GiB'), (4, '16 GiB'))]}")
-            msgs = [refused(lambda: vm_types_for(12, "16 GiB")), refused(lambda: vm_types_for(8, "128 GiB", nof8)),
+            t12, note12 = resolve_vm_types(12, "16 GiB")
+            t4, note4 = resolve_vm_types(4, "16 GiB", nof8)
+            ok(t12 and all(tab[t]["vcpu"] == 16 for t in t12) and note12 and "closest" in note12
+               and t4 and all(vm_table(nof8)[t]["vcpu"] == 8 for t in t4) and note4
+               and resolve_vm_types(8, "16 GiB")[1] is None,
+               f"BR23d (owner: fail soft) a request no priced type matches exactly gets the closest priced types that "
+               f"satisfy it (12 vCPUs -> 16; 4 on a table with 2 and 8 -> 8), with a note to warn: {t12[:2]} {note12!r}")
+            msgs = [refused(lambda: vm_types_for(8, "128 GiB", nof8)), refused(lambda: vm_types_for(500, None)),
                     refused(lambda: vm_types_for(8, "lots"))]
-            ok(all(msgs) and "12" in msgs[0] and "vm_prices.yaml" in msgs[0],
-               f"BR23d a request no priced type matches, or an unreadable memory, is refused: {msgs}")
-            ok(require_priced(["Standard_D8_v5", "Standard_E8s_v5"], "workers", nof8) == ["Standard_D8_v5",
-                                                                                          "Standard_E8s_v5"]
-               and "Standard_F8s_v2" in (refused(lambda: require_priced(["Standard_D8_v5", "Standard_F8s_v2"],
-                                                                        "workers", nof8)) or "")
-               and refused(lambda: require_priced([], "workers", nof8)),
-               "BR23e require_priced passes priced types and refuses an unpriced one, or none")
+            ok(all(msgs) and "vm_prices.yaml" in msgs[0],
+               f"BR23d' only a request nothing in the table can satisfy (or an unreadable memory) is refused: {msgs}")
+            ok(unpriced(["Standard_D8_v5", "Standard_F8s_v2"], nof8) == ["Standard_F8s_v2"]
+               and unpriced(["Standard_D8_v5"], nof8) == [],
+               "BR23e unpriced() names the unpriced types for a warning (it refuses nothing)")
             ok(abs(_gib("68 GB") - 63.33) < 0.01 and _gib("16 GiB") == 16.0 and _gib("16384 MiB") == 16.0
                and _gib("1 TiB") == 1024.0 and "Standard_E8s_v5" in vm_types_for(8, "68 GB"),
                "BR23g (Codex on this PR) memory reads as Coiled reads it: 68 GB is 63.3 GiB (a 64 GiB type fits), MiB "
