@@ -311,6 +311,34 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 
 **Cost.** `plan` reports 3,904 arm runs on one 16-vCPU VM: $11.0–22.5 on the VM price bound, and $12.5–18.4 at the measured $0.124 per vCPU-hour. `run` refuses a plan whose upper bound is above $25 on either basis.
 
+**Wave 2's result (cluster 2377496, $14.23 billed).** The joint sample was invalid.
+- 9 of 12 verified points were in band. The three misses were all on B11, at 0.397, 0.406 and 0.414 against the band's lower bound of 0.42.
+- The chosen point failed B12b: 0.603 against the band's lower bound of 0.61.
+- The chosen point (`cfp_half` 1,600 days) and two of the misses (about 1,620 days) lay beyond wave 2's design box, which ends at 1,456 days. The candidates spanned the whole box, so the surrogate was extrapolated there.
+- The output's sha256 is `148621e3…a79f`. Its checkpoint `netfit_cache.jsonl` (1,952 tasks, sha256 `3bde5c6e…311b`) is stored under `outputs/_engine/net_effect_fit/`.
+
+### Verification round 2 (owner, 14 Nov; plan at most $10, cap $15)
+
+The owner set this round's rule before the run.
+
+- **Support (fix; F23).** The joint-sample candidates and the chosen point are restricted to the union of the two waves' design boxes, where the engine-evaluated points are. The surrogate is never extrapolated.
+- **Acceptance rule (F24; F11, F15).** A verified point, and the chosen point, counts as in band for a target when the 95% interval of its seed mean overlaps the target's band. The interval is mean ± 1.96 × sd / √n, over the run's 8 seeds, with the sd taken with n − 1.
+  - Fewer than 2 finite seed values, or a target without them, fail closed.
+  - The rule reads each point's own seed values (`per_seed`). The summary flags are not evidence.
+  - The bands come from `pack.yaml`.
+  - It is one function (`point_in_band`), called by `finalize()`. `load_posterior` replays `finalize()`, so the loader uses the same rule.
+  - Control arms within 10% and no calibration-grid clamp are unchanged.
+  - The rule's text is recorded in the output, under `joint_region.verified.acceptance_rule`.
+  - The rule is applied to the arithmetic mean of the seed values, as stated. A target's `computed` value is the geometric mean.
+- **No engine point is refitted (F25).**
+  - Wave 2's checkpoint is read from storage under its recorded sha256, and `load_cache` checks every row.
+  - Wave 1's points come from `net_effect_fit_wave1.yaml`.
+  - The run stops before verifying if any wave-2 design task is missing from the checkpoint (`no_rerun`).
+- **A new joint sample.** The candidates use seed 29 and the picks seed 31, so the 12 points verified before are not rescored. The engine runs 12 new points plus the chosen point: 832 arm runs.
+- **Cost and storage.** `plan --verify-round` gives $2.9–5.7 on the VM bound and $3.3–4.6 at the measured rate. Outputs go to `outputs/_engine/net_effect_fit/round2/`, so wave 2's stored copies are kept.
+- **Margin.** The margin option stays on.
+- **Not done: points up to 1,650 days.** Running design points for `cfp_half` from 1,456 to 1,650 days would let the region extend there. On the per-point costs measured in wave 2, about 15 points would cost roughly $4–6 more.
+
 ## v0.16 scope: BR3 at dual-AI nets and 70% use is reported, not judged (owner, 2026-11-10)
 
 **What changed.** No model change. `engine.py` and the card say 0.16, BR3 reports instead of judging one case, and the
