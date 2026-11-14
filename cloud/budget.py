@@ -529,7 +529,7 @@ def _cluster_cost(d, now, start, median, prices, sched_bound=None) -> dict:
                is not None for p in procs)
     live, hours, est, untyped, failed, warn = 0, 0.0, 0.0, 0, 0, []
     top = max(prices.values())
-    worker_typed = [prices[t] for t in map(_vm_type, d["workers"]) if t in prices]
+    worker_typed = [fallback_bound(t, prices) for t in map(_vm_type, d["workers"]) if t]   # unpriced: fallback
     worker_bound = max(worker_typed) if worker_typed else top     # an untyped worker: like the cluster's other workers
     sched_bound = top if sched_bound is None else sched_bound     # an untyped scheduler: like the scope's schedulers
     for p in procs:
@@ -621,8 +621,8 @@ def _measure(rec, env, now) -> dict:
     n = len(sample)
     median = 0.0 if not n else sample[n // 2] if n % 2 else (sample[n // 2 - 1] + sample[n // 2]) / 2
     median = max(median, _num(rec["floor_usd_per_instance_hour"], "floor"))
-    seen = [prices[t] for t in (_vm_type(x.get("scheduler")) for x in dets.values() if isinstance(x, dict))
-            if t in prices]
+    seen = [fallback_bound(t, prices) for t in (_vm_type(x.get("scheduler")) for x in dets.values()
+                                                if isinstance(x, dict)) if t]
     sched_bound = max(seen) if seen else None
     rows = [_cluster_cost(dets[c["id"]], now, start, median, prices, sched_bound) for c in counted]
     for r, c in zip(rows, counted):
@@ -1213,6 +1213,14 @@ def _self_test() -> int:
                and any("Standard_F8s_v2" in a and "WARNING" in a for a in c["assumptions"]),
                f"BR25c a running F8s_v2 worker is metered at the fallback rate (the cap keeps working, nothing is "
                f"stopped for want of a price): {c['usd']:.4f} {c['assumptions']}")
+            det2 = json.loads(json.dumps(det))
+            det2["workers"].append({"current_state": {"state": "started", "updated": _iso(now - H)},
+                                    "instance": {"created": _iso(now - H), "instance_type_id": None,
+                                                 "current_state": {"state": "ready", "updated": _iso(now - H)}}})
+            c2 = _cluster_cost(det2, now, T0, 0.0, pr8)
+            ok(abs(c2["usd"] - (pr8["Standard_D2_v5"] + 2 * 8 * per)) < 1e-6,
+               f"BR25d (Codex on this PR) a worker with no type yet is priced like its unpriced peer, at the peer's "
+               f"fallback bound (not a cheaper listed one): {c2['usd']:.4f}")
         case("BR25", bg25)
 
         def bg8f():
