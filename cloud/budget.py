@@ -1338,6 +1338,47 @@ def _self_test() -> int:
                f"BR18 every VM type the configs, launchers and vm_job sizing can request, and every type seen on our "
                f"clusters, has a price bound ({len(named)} named in code): missing {missing}")
         case("BR18", bg18)
+
+        def bg22():
+            # BR22 (Codex on #232): re-attaching a cap replaces the cluster's reservation with the new cap's remaining
+            # amount, counted on the cluster's lifetime cost
+            t = clock[0]
+
+            def world(label, usd, cap, cloud, created=None):
+                r = signed(f"k22{label}", usd=usd)
+                c0 = t + 10 if created is None else created
+                src = _FakeSource([], {})
+                with_env(env(r, source=src))
+                ok1 = launch_budget_ok("f6", cap, "lw-smoke-w")[0]
+                src.items = [_item(40, "lw-smoke-w", c0, "running", t + 20)]
+                src.det = {40: _det(40, "lw-smoke-w", c0, 0, cloud, "running", insts=[(c0, None, "vmA")])}
+                return r, src, ok1, os.path.join(r, "reattach_clusters.json")
+            r, src, ok1, cf = world("a", 100.0, 20, 10.0)
+            g = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)
+            later = launch_budget_ok("f6", 80, "lw-smoke-z", reserve=False)
+            fits = launch_budget_ok("f6", 50, "lw-smoke-z", reserve=False)
+            ok(ok1 and g[0] and not later[0] and "reserved $40.00" in later[1] and fits[0],
+               f"BR22a raising a re-attached cap from $20 to $50 ($10 spent) reserves $40, so a later $80 launch is "
+               f"refused under $100: {g[1]} / {later[1]}")
+            r, src, ok1, cf = world("b", 20.0, 20, 10.0)
+            g = reattach_budget_ok("f6", 20, "lw-smoke-w", 40, cf)
+            g2 = reattach_budget_ok("f6", 20, "lw-smoke-w", 40, cf)
+            led = [x for x in json.load(open(_ENV.reservations)) if x["scope"] == "f6"]
+            ok(g[0] and g2[0] and len(led) == 1 and abs(spend("f6")["reserved_usd"] - 10.0) < 1e-6,
+               f"BR22b re-attaching the original $20 cap with $10 spent fits a $20 budget and leaves one reservation "
+               f"of $10 for the cluster, however often it is re-attached: {g[1]} {led}")
+            r, src, ok1, cf = world("c", 300.0, 20, 100.0, created=t - 50 * H)
+            g = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)
+            m = lifetime_meter("f6")
+            ok(not g[0] and "already spent" in g[1] and m(40) >= 100.0 and job_meter("f6")(40) < 50,
+               f"BR22c a cluster created before the budget's window is capped on its lifetime cost, not the window's: "
+               f"{g[1]} lifetime={m(40):.2f}")
+            r, src, ok1, cf = world("d", 100.0, 20, 10.0)
+            src.det[40] = BudgetError("details unavailable")
+            ok(refused(lambda: reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)) is not None
+               and refused(lambda: lifetime_meter("f6")(40)) is not None,
+               "BR22d an unreadable cluster cost raises (the caller retries, then stops the cluster), never returns")
+        case("BR22", bg22)
     _ENV = real_env
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

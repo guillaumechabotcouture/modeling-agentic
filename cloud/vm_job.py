@@ -1912,7 +1912,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                 # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
                 import budget
 
-                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True):
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False):
                     jid, seen, lbo_calls = f"r32{label}", [], []
 
                     def meter(cid):
@@ -1921,13 +1921,24 @@ def _self_test_run(ok, real_gate=None) -> None:
                         if isinstance(v, Exception):
                             raise v
                         return v
-                    lbo = lambda s_, c, name=None, reserve=True: (  # noqa: E731
-                        lbo_calls.append((s_, round(c, 2), reserve)), (lbo_ok, "f6: ok" if lbo_ok else "f6: over"))[1]
+                    def reattach(s_, c, name, cid, clusters_file):     # budget.reattach_budget_ok, on the same meter
+                        spent = meter(cid)
+                        if spent >= c:
+                            return False, f"cluster {cid} has already spent ${spent:.2f}"
+                        lbo_calls.append((s_, round(c, 2), cid, os.path.basename(clusters_file)))
+                        return lbo_ok, "f6: ok" if lbo_ok else "f6: over"
+
+                    def lifetime(s_):
+                        if meter_fails:
+                            raise RuntimeError("details unavailable")
+                        return meter
                     wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
                     if argv_cap:
                         wait += ["--cap-usd", cap, "--budget-scope", "f6"]
-                    with mock.patch.object(budget, "job_meter", lambda s_: meter), \
-                            mock.patch.object(budget, "launch_budget_ok", lbo):
+                    with mock.patch.object(budget, "lifetime_meter", lifetime, create=True), \
+                            mock.patch.object(budget, "reattach_budget_ok", reattach, create=True), \
+                            mock.patch.object(budget, "job_meter", lambda s_: (_ for _ in ()).throw(AssertionError)), \
+                            mock.patch.object(budget, "launch_budget_ok", lambda *x, **k: (False, "not this check")):
                         W, msg, out, exc = world(d, jid, interrupt_at=1, extra=("--keep-on-failure",), then=[wait])
                     ev = W["events"]
                     return W, ev, W["then"][0], seen, lbo_calls, isinstance(exc, KeyboardInterrupt)
@@ -1935,7 +1946,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                 W, ev, res, seen, lbo_calls, killed = rewait("a", [1.0, 6.0])
                 ok(killed and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
                    and isinstance(res, SystemExit) and "cap" in str(res.code) and set(seen) == {100}
-                   and lbo_calls == [("f6", 4.0, False)] and clean(W),
+                   and lbo_calls == [("f6", 5.0, 100, "reattach_clusters.json")] and clean(W),
                    f"RN32a after the launcher died, `wait --cap-usd` meters the recorded cluster id, checks the budget "
                    f"covers the rest of the cap, and stops the cluster by id at the cap: {res!r} {lbo_calls} {ev}")
                 W, ev, res, seen, lbo_calls, killed = rewait("b", [1.0])
@@ -1958,6 +1969,11 @@ def _self_test_run(ok, real_gate=None) -> None:
                 ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and len(seen) == 3
                    and ("delete", 100) in ev and W["stops"] == 1 and not lbo_calls,
                    f"RN32f a cost that cannot be read three times before attaching stops the cluster: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("h", [1.0], meter_fails=True)
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("delete", 100) in ev
+                   and W["stops"] == 1 and ("attach_id", 100) not in ev,
+                   f"RN32h a meter that cannot be built (its cost unreadable) stops the cluster, never leaves it "
+                   f"unmetered (Codex P1 on #232): {res!r}")
                 W, ev, res, seen, lbo_calls, killed = rewait("g", [1.0, RuntimeError("api")])
                 ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("attach_id", 100) in ev
                    and ("delete", 100) in ev and W["stops"] == 1,
