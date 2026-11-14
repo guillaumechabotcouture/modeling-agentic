@@ -304,7 +304,7 @@ def run_cluster_name(name: str, job_id: str, suffix: str | None = None) -> str:
     return f"{base[:63 - 1 - len(sfx)].rstrip('-')}-{sfx}"
 
 
-def _client(name, cluster=None, want=None):
+def _client(name, cluster=None, want=None, cid=None):
     """The VM cluster's client and its worker. The table is read with worker_side's bounded
     reader (scheduler_info() is {} while the client is not connected; a closed client is
     replaced from the cluster), so only a connected scheduler with no worker says so.
@@ -312,7 +312,9 @@ def _client(name, cluster=None, want=None):
     coiled.Cluster(name=...) attach); otherwise the guarded attach by name. `want` is the
     job's own worker: the job's state lives on that VM's disk only, so a poll goes there
     (another worker would read 'missing'), and its absence raises WorkerGone."""
-    cl, box = (cluster if cluster is not None else rc.attach(name)), [None]
+    cl = cluster if cluster is not None else ws.attach_existing(name, rc.WORKSPACE, cid) if cid is not None \
+        else rc.attach(name)          # `cid`: the cluster `start` checked, and only that one (Codex r2 on the price PR)
+    box = [None]
 
     def client():
         box[0] = ws.live_client(cl, box[0])
@@ -390,7 +392,7 @@ def _vm_request(a) -> dict:
     return a._vm
 
 
-def _live_vm_types_ok(name) -> None:
+def _live_vm_types_ok(name):
     """`start` on a cluster made elsewhere: refuse (SystemExit) unless every live process of it runs a priced VM type
     and every process's configured fallback list (spec.prioritized_instance_types, the types Coiled may give it or a
     replacement) is priced, read from the cluster's own record. Cluster 2376181 (2026-11-13, --cpu 8 without pinning)
@@ -417,6 +419,7 @@ def _live_vm_types_ok(name) -> None:
                                          f"types; retry once it runs")
             types |= {vm, *map(str, listed)}
         budget.require_priced(sorted(types), f"{name} (cluster {cid}, running and candidate types)")
+        return cid
     except budget.BudgetError as e:
         raise SystemExit(f"{name}: refusing to start a job: {e}") from None
     except Exception as e:  # noqa: BLE001 -- unreadable record: fail closed
@@ -476,13 +479,13 @@ def cmd_start(a, cluster=None):
         raise SystemExit("no command given (put it after --)")
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
-        _live_vm_types_ok(a.name)       # and the budget must be able to price every VM it runs
+        checked = _live_vm_types_ok(a.name)     # and the budget must be able to price every VM it runs
         _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
                       base, a.job_id)
-    c, w = _client(a.name, cluster)
+    c, w = _client(a.name, cluster, cid=None if cluster is not None else checked)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
         raise SystemExit(f"{a.job_id} is queued or running on {a.name}; pick another id")
@@ -1352,6 +1355,7 @@ def _self_test_vm_types(ok) -> None:
                 raise SystemExit("attached")
             with mock.patch.object(budget, "PRICES_FILE", nof8), mock.patch.object(budget, "CoiledSource", lambda: src), \
                     mock.patch.object(rc, "live_id", lambda n, lister=None: 7), mock.patch.object(rc, "attach", attach), \
+                    mock.patch.object(ws, "attach_existing", lambda n, w_, cid: attach((n, cid))), \
                     mock.patch.dict(globals(), {"_budget_gate": lambda *x, **k: None}), \
                     mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -1367,8 +1371,9 @@ def _self_test_vm_types(ok) -> None:
                f"VT4 `start` on a live cluster whose worker runs an unpriced type (F8s_v2) is refused before any job is "
                f"submitted: msg={msg}")
             attached, msg = start_on("Standard_D8_v5")
-            ok(attached and msg == "attached",
-               f"VT4b `start` on a cluster running priced types passes the check: msg={msg}")
+            ok(attached == [("lw-smoke-vt", 7)] and msg == "attached",
+               f"VT4b `start` on a cluster running priced types passes the check, and attaches to that cluster id only "
+               f"(Codex r2: not a replacement of the same name): msg={msg} attached={attached}")
             # Codex on this PR: a pending worker with no VM record yet, and an unpriced fallback type, were not checked
             attached, msg = start_on("Standard_D8_v5", extra=({"current_state": {"state": "pending"}, "instance": None},))
             ok(not attached and msg and "no VM type yet" in msg,
