@@ -301,6 +301,29 @@ def budget_guard(cfg, reserve=True, inv=None) -> None:
     print(f"budget: {why}", flush=True)
 
 
+def vm_request(cfg, compute=None) -> dict:
+    """{role: worker_vm_types and scheduler_vm_types} for each cluster this config can construct ("run" when
+    `compute` is given, "overflow" when it has an overflow pool, "keeper"), every type priced in cloud/vm_prices.yaml.
+    Coiled is given these lists, never cpu/memory, so what the budget prices is what it gets (2026-11-13: a cpu/memory
+    request got Standard_F8s_v2, unpriced, refused only once the cluster existed). Refuses (SystemExit) before any
+    budget reservation, key or cluster when a type is not priced."""
+    import budget
+    try:
+        sched = budget.scheduler_vm_types()
+        out = {"keeper": {"worker_vm_types": budget.vm_types_for(2, "8 GiB"), "scheduler_vm_types": sched}}
+        if cfg.keeper and cfg.overflow_max:
+            out["overflow"] = {"worker_vm_types": budget.require_priced(cfg.overflow_vm_types,
+                                                                        f"{cfg.name} overflow_vm_types"),
+                               "scheduler_vm_types": sched}
+        if compute is not None:
+            out["run"] = {"worker_vm_types": budget.require_priced(compute.WORKER_VM_TYPES,
+                                                                   f"{cfg.name} compute.WORKER_VM_TYPES"),
+                          "scheduler_vm_types": sched}
+    except budget.BudgetError as e:
+        raise SystemExit(f"{cfg.name}: refusing before any cluster is created: {e}") from None
+    return out
+
+
 def load_config(path: str) -> RunConfig:
     spec = importlib.util.spec_from_file_location("run_config", path)
     mod = importlib.util.module_from_spec(spec)
@@ -960,16 +983,17 @@ def _launch_locked(cfg, inv) -> int:
     if stale:
         raise SystemExit("refusing: " + "; ".join(stale))
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
+    compute = _compute(cfg)
+    vm = vm_request(cfg, compute)                 # every VM type priced, before the budget reserves anything
     budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
     keys = read_keys()
-    compute = _compute(cfg)
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
-        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=compute.WORKER_VM_TYPES,
-        worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
+        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=vm["run"]["worker_vm_types"],
+        scheduler_vm_types=vm["run"]["scheduler_vm_types"], worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix,
                  **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv)))
+        spot_policy="on-demand", shutdown_on_close=False, **_lifetime(cfg, inv)))
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     # S1-8: recorded once the run cluster exists, before any submission or acknowledgement wait; this invocation's
     # record replaces the previous launch's (no cluster of the name was live, and the config lock is held)
@@ -1218,6 +1242,7 @@ def keeper_later(cfg) -> int:
                 clusters.pop("keeper", None)
                 keep_k = None
         if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
+            vm_request(cfg)                   # every helper VM type priced, before the reservation
             budget_guard(cfg, inv=clusters.get("invocation"))   # a new overflow pool or keeper is paid: reserved then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
@@ -1275,13 +1300,14 @@ def start_overflow(cfg, compute, record=None, inv=None) -> dict:
     here (so it gets this launch's software environment) and scaled by the keeper. Its
     idle timeout outlasts the keeper; the keeper deletes it on exit."""
     import coiled
+    vm = vm_request(cfg)["overflow"]
     _fresh(cfg.overflow_name)
     oc = _construct(cfg, cfg.overflow_name, inv, lambda: coiled.Cluster(
-        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=list(cfg.overflow_vm_types),
-        worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
+        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
         worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix, **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False,
+        spot_policy="on-demand", shutdown_on_close=False, wait_for_workers=False,
         **_lifetime(cfg, inv)))
     if record:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
@@ -1304,10 +1330,11 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None, inv=No
     lo, hi = len(cfg.labels) + cfg.compute_start, len(cfg.labels) + cfg.compute_max
     # An earlier launch's keeper (still polling, or stopping) must not be reused:
     # its task would hold the old cluster id and exit, leaving this pool unscaled.
+    vm = vm_request(cfg)["keeper"]
     _fresh(cfg.keeper_name)
     kc = _construct(cfg, cfg.keeper_name, inv, lambda: coiled.Cluster(
-        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2, worker_memory="8 GiB", scheduler_cpu=2,
-        spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
+        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
     if record:
         record("keeper", cfg.keeper_name, kc.cluster_id)         # before anything that can fail (Codex P2-5)
     c = kc.get_client()
@@ -4070,13 +4097,13 @@ def _self_test_budget(ok) -> None:
     # BU7 (2026-11-13: a VM type missing from cloud/vm_prices.yaml was refused only once its cluster existed): every
     # VM type a launch would request is priced before the budget is asked, any key is read or any cluster is made
     msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
-                               overflow_vm_types=("Standard_D8s_v5", "Standard_X9_v9")), (True, "ok"))
-    ok(msg and "Standard_X9_v9" in msg and "vm_prices.yaml" in msg and not made and not keys and not calls,
+                               overflow_vm_types=("Standard_D8s_v5", "Fake_X9_v9")), (True, "ok"))
+    ok(msg and "Fake_X9_v9" in msg and "vm_prices.yaml" in msg and not made and not keys and not calls,
        f"BU7 an unpriced overflow VM type is refused before the budget, any key or any cluster: {msg} {calls}")
-    wvt[0] = ["Standard_E8s_v5", "Standard_F8s_v2_unpriced"]
+    wvt[0] = ["Standard_E8s_v5", "Fake_F8s_v2"]
     msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
     wvt[0] = ["Standard_E8s_v5", "Standard_E8as_v5"]
-    ok(msg and "Standard_F8s_v2_unpriced" in msg and not made and not keys and not calls,
+    ok(msg and "Fake_F8s_v2" in msg and not made and not keys and not calls,
        f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) is refused the same way: {msg} {calls}")
     try:
         req = vm_request(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
@@ -4129,7 +4156,7 @@ def _self_test_budget(ok) -> None:
            f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
         seen.clear(), started.clear()
         bad = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d,
-                        overflow_vm_types=("Standard_X9_v9",))
+                        overflow_vm_types=("Fake_X9_v9",))
         with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, reserve=True, **k: (
                     seen.append(reserve), (True, "ok"))[1]), \
                 mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
@@ -4141,7 +4168,7 @@ def _self_test_budget(ok) -> None:
                 msg = None
             except BaseException as e:  # noqa: BLE001
                 msg = f"{type(e).__name__}: {e}"
-        ok(msg and "Standard_X9_v9" in msg and not seen and not started,
+        ok(msg and "Fake_X9_v9" in msg and not seen and not started,
            f"BU7d `keeper` with an unpriced overflow VM type is refused before it reserves or creates anything: "
            f"{msg} {seen}")
     import ast                                   # BU6: the archived launchers refuse unless deliberately allowed

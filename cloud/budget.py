@@ -259,6 +259,72 @@ def load_prices(path=PRICES_FILE) -> dict:
         raise BudgetError(f"{path} cannot be read: {type(e).__name__}: {e}") from None
 
 
+def vm_table(path=None) -> dict:
+    """{VM type: {vcpu, memory_gib, bound}} from cloud/vm_prices.yaml (bound as in load_prices). `path` defaults to
+    PRICES_FILE as it is at call time."""
+    import yaml
+    path = path or PRICES_FILE
+    bounds = load_prices(path)
+    try:
+        types = yaml.safe_load(open(path))["types"]
+        return {t: {"vcpu": int(_num(v["vcpu"], t, 1)), "memory_gib": _num(v["memory_gib"], t, 0.0),
+                    "bound": bounds[t]} for t, v in types.items()}
+    except BudgetError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise BudgetError(f"{path}: every VM type needs vcpu and memory_gib: {type(e).__name__}: {e}") from None
+
+
+def _gib(memory) -> float | None:
+    """'16 GiB', '16GiB', '16 GB', '16G' or a number, as GiB; None for no memory request."""
+    if memory is None or memory == "":
+        return None
+    if isinstance(memory, (int, float)) and not isinstance(memory, bool) and memory > 0:
+        return float(memory)
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(GiB|GB|G)?\s*", str(memory), re.IGNORECASE)
+    if not m:
+        raise BudgetError(f"memory {memory!r} is not a size in GiB (e.g. '16 GiB')")
+    return float(m.group(1))
+
+
+def vm_types_for(cpu, memory=None, path=None) -> list[str]:
+    """The priced VM types a request for `cpu` vCPUs and at least `memory` can be given: exactly that many vCPUs, at
+    least that memory. Coiled tries the first type and does not fall back on a quota refusal, so the first is one known
+    to run here: a type seen on our clusters (OBSERVED_VM_TYPES, what Coiled picked before), then one of a series seen
+    there (the same quota family), then the least memory and the cheapest bound. Coiled is then given this list (worker_vm_types / scheduler_vm_types), never cpu/memory, so
+    every type it can pick is priced. Refuses (BudgetError) when no priced type matches."""
+    tab, gib = vm_table(path), _gib(memory)
+    try:
+        n = int(cpu)
+    except (TypeError, ValueError):
+        raise BudgetError(f"cpu {cpu!r} is not a whole number of vCPUs") from None
+    hits = [t for t, v in tab.items() if v["vcpu"] == n and (gib is None or v["memory_gib"] >= gib)]
+    if not hits:
+        raise BudgetError(f"no VM type in {os.path.basename(path or PRICES_FILE)} has {n} vCPUs and at least "
+                          f"{memory or 'any'} memory: price one there (cloud/vm_prices.yaml) or change the request")
+    series = {re.sub(r"[0-9]+", "#", t, count=1) for t in OBSERVED_VM_TYPES}
+    return sorted(hits, key=lambda t: (t not in OBSERVED_VM_TYPES, re.sub(r"[0-9]+", "#", t, count=1) not in series,
+                                       tab[t]["memory_gib"], tab[t]["bound"], t))
+
+
+def require_priced(types, what, path=None) -> list[str]:
+    """`types` as a list when every one has a price bound in cloud/vm_prices.yaml; otherwise BudgetError naming them."""
+    types = [types] if isinstance(types, str) else list(types or ())
+    prices = load_prices(path or PRICES_FILE)
+    missing = [t for t in types if t not in prices]
+    if not types or missing:
+        raise BudgetError(f"{what}: VM type(s) {missing or '(none given)'} not in cloud/vm_prices.yaml: price them "
+                          f"there before launching")
+    return types
+
+
+SCHEDULER_CPU, SCHEDULER_MEMORY = 2, "8 GiB"     # what the launchers' schedulers got before pinning (Standard_D2_v5)
+
+
+def scheduler_vm_types(path=None) -> list[str]:
+    return vm_types_for(SCHEDULER_CPU, SCHEDULER_MEMORY, path)
+
+
 def _check_record(rec) -> dict:
     if not isinstance(rec, dict) or sorted(rec) != sorted(FIELDS):
         raise BudgetError(f"the budget record's fields are not {FIELDS}")
@@ -1422,13 +1488,14 @@ def _self_test() -> int:
             got = vm_types_for(8, "16 GiB", nof8)
             ok(got and "Standard_F8s_v2" not in got and set(got) <= set(load_prices(nof8))
                and all(vm_table(nof8)[t]["vcpu"] == 8 and vm_table(nof8)[t]["memory_gib"] >= 16 for t in got)
-               and got[0] == "Standard_D8as_v5",
+               and got == ["Standard_E8s_v5", "Standard_D8_v5", "Standard_D8as_v5"],
                f"BR23b the F8s_v2 case: --cpu 8 --memory '16 GiB' on a table without F8s_v2 resolves to priced 8-vCPU "
-               f"types with at least 16 GiB, cheapest first, never F8s_v2: {got}")
+               f"types with at least 16 GiB, never F8s_v2: a type seen on our clusters first, then one of a series "
+               f"seen there, then the cheapest: {got}")
             ok(vm_types_for(8, "16 GiB")[0] == "Standard_F8s_v2" and vm_types_for(2, "8 GiB")[0] == "Standard_D2_v5"
-               and vm_types_for(32, "16 GiB")[0] == "Standard_D32_v5",
+               and vm_types_for(32, "16 GiB")[0] == "Standard_D32_v5" and vm_types_for(4, "16 GiB")[0] == "Standard_D4_v5",
                f"BR23c on the tracked table a type seen on our clusters comes first (what Coiled picked before): "
-               f"{[vm_types_for(c, m)[:1] for c, m in ((8, '16 GiB'), (2, '8 GiB'), (32, '16 GiB'))]}")
+               f"{[vm_types_for(c, m)[:1] for c, m in ((8, '16 GiB'), (2, '8 GiB'), (32, '16 GiB'), (4, '16 GiB'))]}")
             msgs = [refused(lambda: vm_types_for(12, "16 GiB")), refused(lambda: vm_types_for(8, "128 GiB", nof8)),
                     refused(lambda: vm_types_for(8, "lots"))]
             ok(all(msgs) and "12" in msgs[0] and "vm_prices.yaml" in msgs[0],

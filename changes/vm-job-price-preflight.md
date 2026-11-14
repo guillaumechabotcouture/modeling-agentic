@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "α–β"
+---
+
+## Changelog
+
+**Launchers pin priced VM types before any cluster is created.** On 2026-11-13 a `vm_job --cpu 8` request with the default `--memory` got Standard_F8s_v2, which cloud/vm_prices.yaml did not list; budget.py refused it only once the cluster existed, the cap stopped it, and every later f6 launch was refused until #230 priced it. cloud/vm_prices.yaml now states `memory_gib` per type. `budget.vm_types_for(cpu, memory)` resolves a request to the priced types with that many vCPUs and at least that memory (a type seen on our clusters first, then one of a series seen there, then least memory and cheapest), `budget.require_priced` refuses any unpriced type, and `budget.scheduler_vm_types()` pins 2-vCPU, 8 GiB schedulers. `vm_job up` and `run` pass Coiled `worker_vm_types` and `scheduler_vm_types` from the table, never cpu/memory, and refuse a request no priced type matches before any listing, budget reservation or cluster; `vm_job start` on a cluster made elsewhere refuses one whose live VMs run an unpriced type, or whose types cannot be read. `run_cluster` launch and `keeper` call `vm_request(cfg, compute)` before the budget guard: the run cluster, overflow pool and keeper constructors are pinned the same way, and an unpriced `compute.WORKER_VM_TYPES` or `overflow_vm_types` is refused before any reservation, key or cluster. Self-tests BR23a-f, VT1-5, OC1, BU7-7d.

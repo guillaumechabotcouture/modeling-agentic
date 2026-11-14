@@ -360,9 +360,8 @@ def _create(a, if_live="keep", box=None, gate=False):
     n = int(getattr(a, "workers", 1) or 1)
     if box is not None:
         box["constructing"] = True   # from here a cluster with this (unique, for `run`) name may exist
-    cl = coiled.Cluster(name=a.name, workspace=rc.WORKSPACE, n_workers=n, worker_cpu=a.cpu, worker_memory=a.memory,
-                        scheduler_cpu=2, spot_policy="on-demand", idle_timeout=a.idle_timeout,
-                        shutdown_on_close=False)
+    cl = coiled.Cluster(name=a.name, workspace=rc.WORKSPACE, n_workers=n, **_vm_request(a), spot_policy="on-demand",
+                        idle_timeout=a.idle_timeout, shutdown_on_close=False)
     if box is not None:
         box["cl"] = cl
     # the first worker is enough to start: compute.py re-reads the worker table every 2 s and gives a worker that
@@ -371,6 +370,48 @@ def _create(a, if_live="keep", box=None, gate=False):
     print(f"{a.name} up with {n} worker(s) requested (idle timeout {a.idle_timeout}; a running job holds it "
           "regardless)")
     return True
+
+
+def _vm_request(a) -> dict:
+    """The cluster's VM types, pinned from cloud/vm_prices.yaml (budget.vm_types_for): worker_vm_types for --cpu and
+    --memory, scheduler_vm_types for a 2-vCPU scheduler. Coiled is given these lists, never cpu/memory, so every type
+    it can pick is priced (2026-11-13: --cpu 8 with the default --memory got Standard_F8s_v2, unpriced, and budget.py
+    refused it only once the cluster existed). A request no priced type matches is refused (SystemExit) before
+    anything is listed, reserved or created. Resolved once per command."""
+    if getattr(a, "_vm", None) is None:
+        import budget
+        try:
+            a._vm = {"worker_vm_types": budget.vm_types_for(a.cpu, a.memory),
+                     "scheduler_vm_types": budget.scheduler_vm_types()}
+        except budget.BudgetError as e:
+            raise SystemExit(f"{a.name}: refusing before any cluster is created: {e}") from None
+        print(f"VM types (all priced in cloud/vm_prices.yaml): workers {', '.join(a._vm['worker_vm_types'])}; "
+              f"scheduler {', '.join(a._vm['scheduler_vm_types'])}", flush=True)
+    return a._vm
+
+
+def _live_vm_types_ok(name) -> None:
+    """`start` on a cluster made elsewhere: refuse (SystemExit) unless every live VM of it runs a priced type, read
+    from the cluster's own record. A VM with no type yet, or a record that cannot be read, is refused (fail closed):
+    the job would keep a cluster busy whose cost the budget cannot bound."""
+    import budget
+    cid = rc.live_id(name)
+    if cid is None:
+        raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
+    try:
+        d = budget.CoiledSource().details(cid)
+        procs = [d["scheduler"]] + list(d["workers"])
+        live = [p["instance"] for p in procs if isinstance(p, dict) and isinstance(p.get("instance"), dict)
+                and ws.state_of(p) not in budget.ENDED and ws.state_of(p["instance"]) not in budget.ENDED]
+        types = [i.get("instance_type_id") for i in live]
+        if not types or not all(types):
+            raise budget.BudgetError(f"cluster {cid}: a live VM has no type yet (or none is live); retry once it runs")
+        budget.require_priced(sorted(set(types)), f"{name} (cluster {cid})")
+    except budget.BudgetError as e:
+        raise SystemExit(f"{name}: refusing to start a job: {e}") from None
+    except Exception as e:  # noqa: BLE001 -- unreadable record: fail closed
+        raise SystemExit(f"{name}: refusing to start a job: the cluster's VM types cannot be read "
+                         f"({type(e).__name__}: {str(e)[:120]})") from None
 
 
 def _budget_gate(a, name, meter=False, reserve=True):
@@ -410,6 +451,7 @@ def _cap_reading(meter, cid, cap, job_id, misses, final=False):
 
 
 def cmd_up(a):
+    _vm_request(a)                      # a request no priced VM type matches is refused before anything is listed
     if _create(a, gate=True):
         # Coiled counts idle time from cluster start, not from the first task: there is no setting for "only after
         # work", so an `up` with no `start` behind it idles out with nothing done (2026-11-03, about two hours lost)
@@ -424,6 +466,7 @@ def cmd_start(a, cluster=None):
         raise SystemExit("no command given (put it after --)")
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
+        _live_vm_types_ok(a.name)       # and the budget must be able to price every VM it runs
         _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
@@ -721,6 +764,7 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
+    _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
     meter = _budget_gate(a, unique, meter=True)   # before any listing or cluster; reserved for the exact name it creates
     a.shutdown_when_stored = True
@@ -1322,7 +1366,8 @@ def _self_test_vm_types(ok) -> None:
                                                                 rc.start_keeper)}
             bad = {n: k for n, s in srcs.items() for k in ("worker_cpu=", "worker_memory=", "scheduler_cpu=",
                                                             "scheduler_memory=") if k in s}
-            pinned = {n: "scheduler_vm_types=" in s and "worker_vm_types=" in s for n, s in srcs.items()}
+            pinned = {n: ("scheduler_vm_types=" in s and "worker_vm_types=" in s) or "**_vm_request(a)" in s
+                      for n, s in srcs.items()}
             ok(not bad and all(pinned.values()),
                f"VT5 every cluster constructor in vm_job and run_cluster pins worker and scheduler VM types (no "
                f"cpu/memory request Coiled could resolve to an unpriced type): cpu/memory {bad}, pinned {pinned}")
@@ -2028,7 +2073,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                 with mock.patch.object(budget, "launch_budget_ok",
                                        lambda s_, c, name=None, reserve=True: (reached.append(reserve), (False, "over"))[1]), \
                         mock.patch.object(budget, "scope_for_name", lambda n, *x: "f6"), \
-                        mock.patch.dict(globals(), {"_budget_gate": real_gate,
+                        mock.patch.dict(globals(), {"_budget_gate": real_gate, "_live_vm_types_ok": lambda n: None,
                                                     "_client": lambda *x, **k: (_ for _ in ()).throw(RuntimeError("client"))}):
                     try:
                         cmd_start(a)
