@@ -1,0 +1,309 @@
+beliefs:
+- id: B1
+  mechanism: Pre-epidemic school catch-up removes ~20-35% of all susceptibles; near the epidemic threshold this
+    averts most of the final size
+  about:
+    package: school
+  direction: reduces
+  magnitude:
+    band:
+    - 0.6
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 2-3, final-size relation and herd immunity threshold (page not checked)
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Results, vaccine effectiveness by dose and age (median ~92-94%); table number not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: A larger 1-4 gap adds susceptibles that school cannot reach and raises Reff, so school's relative reduction
+    falls
+  about:
+    package: school
+    feature: gap_1_4
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 2, final size as a function of R0 x s (page not checked)
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: A larger 1-4 gap raises the share of susceptibles the community campaign reaches, so its relative reduction
+    rises despite a faster epidemic
+  about:
+    package: community
+    feature: gap_1_4
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 2-3 (page not checked)
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: A larger 10-14 gap raises the share of susceptibles reachable by school, so its relative reduction
+    rises
+  about:
+    package: school
+    feature: gap_10_14
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 2-3 (page not checked)
+  confidence: low
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: A larger seed advances the epidemic before day 70, so more infections occur before the late community
+    campaign and its relative reduction falls
+  about:
+    package: community
+    feature: seed_share
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table of serial interval estimates, measles ~11-12 days (table number not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: 'School-early vs community-late flips along the 1-4 gap: community removes more susceptibles when the
+    1-4 gap is large; school wins when it is small'
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_1_4
+  direction: flips
+  conditions:
+  - feature: gap_1_4
+    range:
+    - 0.1
+    - 0.22
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Ch. 3, vaccination and the critical susceptible fraction (page not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: Where the 1-4 gap is large, community-late beats school-early at the shadow price, because the slow
+    near-threshold epidemic leaves most susceptibles uninfected at day 70
+  about:
+    pair:
+    - school
+    - community
+    feature: gap_1_4
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: measles serial interval (table number not checked)
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: 'School catch-up vs nothing is net positive at the shadow price almost everywhere: infections averted
+    per resident (~1e-2) far exceed the cost term (~7e-4)'
+  about:
+    pair:
+    - school
+    - none
+    feature: gap_5_9
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results, R0 estimates (table number not checked)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Is baseline Reff in these districts just above 1 (slow epidemic, late campaign loses little) or well
+    above (fast epidemic, early school wins)? Depends on cohort sizes and contact_rate calibration.
+  beliefs:
+  - B1
+  - B5
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q2
+  question: Do the engine's efficacies differ between school (ages 5-14) and community (from age 1)? A lower efficacy
+    at age 1 shifts the flip toward school.
+  beliefs:
+  - B6
+  - B7
+  decision_relevant: true
+- id: Q3
+  question: Are the three age gaps strongly correlated across districts? If so the flip along gap_1_4 alone may
+    be blurred and the rule should be stated on the ratio of the 1-4 gap to the 10-14 gap.
+  beliefs:
+  - B6
+  decision_relevant: true
+- id: Q4
+  question: Does any district start below the threshold (Reff < 1), where neither option averts much and none is
+    preferred?
+  beliefs:
+  - B8
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: School averts 60-100% of infections in at least 60% of usable points
+  p: 0.55
+  test:
+    kind: effect_band
+    package: school
+    band:
+    - 0.6
+    - 1.0
+    min_share: 0.6
+- id: H2
+  belief: B2
+  claim: School's relative reduction decreases with gap_1_4
+  p: 0.65
+  weights:
+    decreases: 0.65
+    increases: 0.1
+    no material effect: 0.25
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_1_4
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: Community's relative reduction increases with gap_1_4
+  p: 0.45
+  weights:
+    increases: 0.45
+    decreases: 0.2
+    no material effect: 0.35
+  test:
+    kind: effect_direction
+    package: community
+    feature: gap_1_4
+    direction: increases
+- id: H4
+  belief: B4
+  claim: School's relative reduction increases with gap_10_14
+  p: 0.5
+  weights:
+    increases: 0.5
+    decreases: 0.15
+    no material effect: 0.35
+  test:
+    kind: effect_direction
+    package: school
+    feature: gap_10_14
+    direction: increases
+- id: H5
+  belief: B5
+  claim: Community's relative reduction decreases with seed_share
+  p: 0.4
+  weights:
+    decreases: 0.4
+    increases: 0.1
+    no material effect: 0.5
+  test:
+    kind: effect_direction
+    package: community
+    feature: seed_share
+    direction: decreases
+- id: H6
+  belief: B6
+  claim: The school/community transition along gap_1_4 lies within 0.10-0.22
+  p: 0.3
+  test:
+    kind: flip_in
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.1
+    - 0.22
+- id: H7
+  belief: B7
+  claim: Where gap_1_4 is 0.20 or more, community beats school at the shadow price in at least 70% of usable points
+  p: 0.5
+  test:
+    kind: paired_sign
+    a: school
+    b: community
+    feature: gap_1_4
+    range:
+    - 0.2
+    - 0.2969
+    sign: negative
+    min_share: 0.7
+- id: H8
+  belief: B8
+  claim: School beats no campaign at the shadow price in at least 85% of usable points
+  p: 0.8
+  test:
+    kind: paired_sign
+    a: school
+    b: none
+    feature: gap_5_9
+    range:
+    - 0.0224
+    - 0.2097
+    sign: positive
+    min_share: 0.85
