@@ -1,0 +1,328 @@
+beliefs:
+- id: B1
+  mechanism: 'Final-size threshold: removing ~77% of the susceptibles aged 9 months-14 years leaves only infants
+    under 9 months and the unreached, so residual Reff falls below 1 in almost every district and D averts nearly
+    all infections of the major outbreak wherever one would occur.'
+  about:
+    package: D_9mto14y
+  direction: reduces
+  magnitude:
+    band:
+    - 0.85
+    - 1.0
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 3 (final size and threshold) and Chapter 5 (vaccination thresholds); page not checked
+  - citation: 'Fine P, Eames K, Heymann DL. ''Herd immunity'': a rough guide. Clin Infect Dis 2011'
+    location: Table 1 (herd immunity thresholds by R0)
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: C leaves the 5-14 year susceptibles untouched; as susc_5_14y rises, the residual pool after C grows
+    (and pushes residual Reff above 1), so C's relative reduction falls.
+  about:
+    package: C_9to59m
+    feature: susc_5_14y
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'A larger 9-59 month gap raises the baseline outbreak but C removes ~77% of exactly those susceptibles,
+    so the residual after C changes little while the baseline grows: C''s relative reduction rises with susc_9_59m
+    (partly offset where the residual Reff stays above 1).'
+  about:
+    package: C_9to59m
+    feature: susc_9_59m
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B4
+  mechanism: 'Which age range to target turns on the older-child gap: where susc_5_14y is high, C leaves Reff above
+    1 and D''s extra infections averted (~0.01-0.05 per resident) dwarf its extra cost at the shadow price (~0.0003
+    per resident); where susc_5_14y is low, C already takes Reff below 1 and the cheaper C wins. The flip lies roughly
+    at susc_5_14y 0.07-0.17, moving up with lower R0 and lower susc_9_59m.'
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+    feature: susc_5_14y
+  direction: flips
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.07
+    - 0.17
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results (range of R0 estimates); table not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Versus doing nothing, D is worth its cost wherever baseline Reff exceeds 1 (most districts, given s
+    ~0.06-0.15 and R0 10-16); it loses to none only where the district is already below threshold, where one importation
+    produces a minor chain only.
+  about:
+    pair:
+    - D_9mto14y
+    - none
+    feature: susc_5_14y
+  direction: reduces
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 3; page not checked
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: 'Low older-child gap regime (below the B4 flip region): with few 5-14 year susceptibles, C alone takes
+    residual Reff below 1, so D''s extra cost (~2.5-3x as many children) buys almost no extra infections averted
+    and the cheaper C wins on net benefit at the shadow price.'
+  about:
+    pair:
+    - C_9to59m
+    - D_9mto14y
+    feature: susc_5_14y
+  direction: raises
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.0271
+    - 0.07
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: 'High older-child gap regime (above the lower end of the B4 flip region): C leaves the 5-14 year pool
+    large enough that residual Reff stays above 1, so D''s extra infections averted (~0.01-0.05 per resident) dwarf
+    its extra cost at the shadow price and D wins.'
+  about:
+    pair:
+    - D_9mto14y
+    - C_9to59m
+    feature: susc_5_14y
+  direction: raises
+  conditions:
+  - feature: susc_5_14y
+    range:
+    - 0.12
+    - 0.1863
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 5; page not checked
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B6
+  mechanism: Field effectiveness of one measles dose is about 85-95% when given at 9 months or later, consistent
+    with the question's 90% all-or-nothing protection; it matters for the flip only through residual Reff.
+  about:
+    component: C_9to59m
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 0.95
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Results (median effectiveness by age at vaccination); table not checked
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+open_questions:
+- id: Q1
+  question: Does the engine report the deterministic final size, or weight it by p_major (1 - 1/Reff for one importation)?
+    Weighting by p_major shrinks benefits near threshold and moves the C/D flip upward.
+  beliefs:
+  - B1
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q2
+  question: What are the age shares (infants under 9 months, 9-59 months, 5-14 years) in districts.csv? A larger
+    infant share raises the residual after either campaign and can leave Reff above 1 even after D.
+  beliefs:
+  - B1
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Does the US$2.9M budget bind if D is chosen wherever it beats C? If so, the optimiser trades D in high-gap
+    districts against C in others, and district population (fixed cost share) matters.
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: How much does the calibration contact_rate (R0 10-16) move the flip? Higher R0 lowers the flip along
+    susc_5_14y; across the sweep it blurs a single threshold.
+  beliefs:
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: D_9mto14y reduces infections by 85-100% relative to none in at least 70% of usable points.
+  p: 0.65
+  test:
+    kind: effect_band
+    package: D_9mto14y
+    band:
+    - 0.85
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: C_9to59m's relative reduction decreases as susc_5_14y rises.
+  p: 0.75
+  weights:
+    decreases: 0.75
+    increases: 0.07
+    no material effect: 0.18
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_5_14y
+    direction: decreases
+- id: H3
+  belief: B3
+  claim: C_9to59m's relative reduction increases as susc_9_59m rises.
+  p: 0.5
+  weights:
+    increases: 0.5
+    decreases: 0.2
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: C_9to59m
+    feature: susc_9_59m
+    direction: increases
+- id: H4
+  belief: B8
+  claim: Where susc_5_14y is high (0.12-0.1863), D_9mto14y beats C_9to59m on net benefit at the shadow price in
+    at least 65% of usable points.
+  p: 0.65
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: C_9to59m
+    feature: susc_5_14y
+    range:
+    - 0.12
+    - 0.1863
+    sign: positive
+    min_share: 0.65
+- id: H5
+  belief: B7
+  claim: Where susc_5_14y is low (0.0271-0.06), C_9to59m beats D_9mto14y on net benefit at the shadow price in at
+    least 65% of usable points.
+  p: 0.65
+  test:
+    kind: paired_sign
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.0271
+    - 0.06
+    sign: positive
+    min_share: 0.65
+- id: H6
+  belief: B4
+  claim: The C_9to59m/D_9mto14y transition along susc_5_14y lies within 0.07-0.17.
+  p: 0.3
+  test:
+    kind: flip_in
+    a: C_9to59m
+    b: D_9mto14y
+    feature: susc_5_14y
+    range:
+    - 0.07
+    - 0.17
+- id: H7
+  belief: B5
+  claim: D_9mto14y beats none on net benefit at the shadow price in at least 70% of usable points across the full
+    susc_5_14y range.
+  p: 0.65
+  test:
+    kind: paired_sign
+    a: D_9mto14y
+    b: none
+    feature: susc_5_14y
+    range:
+    - 0.0271
+    - 0.1863
+    sign: positive
+    min_share: 0.7
