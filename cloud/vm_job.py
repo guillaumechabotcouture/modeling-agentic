@@ -1250,6 +1250,14 @@ def _self_test_run(ok, real_gate=None) -> None:
             def shutdown(self):
                 stop(self.cluster_id, "cl_shutdown")
 
+        def attach_by_id(name, workspace, cid):     # ws.attach_existing: refuses any cluster but the checked id
+            ev.append(("attach_id", cid))
+            if W["clusters"].get(cid) not in LIVE:
+                raise SystemExit(f"cluster {cid} is not live")
+            cl = FakeCluster.__new__(FakeCluster)
+            cl.cluster_id = cid
+            return cl
+
         def job_down():
             ev.append("job_shutdown_request")
             cid = max(W["clusters"])
@@ -1280,6 +1288,7 @@ def _self_test_run(ok, real_gate=None) -> None:
         with mock.patch.dict(sys.modules, {"coiled": fake_coiled, "distributed": fake_dist}), \
                 mock.patch.object(rc, "attach", no_attach), \
                 mock.patch.object(ws, "_shutdown_cluster", job_down), \
+                mock.patch.object(ws, "attach_existing", attach_by_id), \
                 mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out), \
                 mock.patch.dict(globals(), {"_budget_gate": gate} if gate else {}), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -1824,6 +1833,63 @@ def _self_test_run(ok, real_gate=None) -> None:
                         pass
                 ok(errs and "--cap-usd" in errs[0], f"RN31c start requires --cap-usd: {errs}")
             case("RN31", rn31)
+
+            def rn32():
+                # RN32 (2026-11-13): a session restart killed the `run` metering cluster 2375765, which ran on with no
+                # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
+                import budget
+
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True):
+                    jid, seen, lbo_calls = f"r32{label}", [], []
+
+                    def meter(cid):
+                        seen.append(cid)
+                        v = readings[min(len(seen), len(readings)) - 1]
+                        if isinstance(v, Exception):
+                            raise v
+                        return v
+                    lbo = lambda s_, c, name=None, reserve=True: (  # noqa: E731
+                        lbo_calls.append((s_, round(c, 2), reserve)), (lbo_ok, "f6: ok" if lbo_ok else "f6: over"))[1]
+                    wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
+                    if argv_cap:
+                        wait += ["--cap-usd", cap, "--budget-scope", "f6"]
+                    with mock.patch.object(budget, "job_meter", lambda s_: meter), \
+                            mock.patch.object(budget, "launch_budget_ok", lbo):
+                        W, msg, out, exc = world(d, jid, interrupt_at=1, extra=("--keep-on-failure",), then=[wait])
+                    ev = W["events"]
+                    return W, ev, W["then"][0], seen, lbo_calls, isinstance(exc, KeyboardInterrupt)
+
+                W, ev, res, seen, lbo_calls, killed = rewait("a", [1.0, 6.0])
+                ok(killed and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and isinstance(res, SystemExit) and "cap" in str(res.code) and set(seen) == {100}
+                   and lbo_calls == [("f6", 4.0, False)] and clean(W),
+                   f"RN32a after the launcher died, `wait --cap-usd` meters the recorded cluster id, checks the budget "
+                   f"covers the rest of the cap, and stops the cluster by id at the cap: {res!r} {lbo_calls} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("b", [1.0])
+                ok(killed and res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and len(seen) >= 2 and clean(W),
+                   f"RN32b a job that ends under a re-attached cap has its cluster stopped by id: {res!r} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("c", [1.0], argv_cap=False)
+                ok(killed and isinstance(res, SystemExit) and "rc.attach" in str(res.code) and not seen
+                   and not lbo_calls and ("attach_id", 100) not in ev and W["stops"] == 0
+                   and W["clusters"][100] == "running",
+                   f"RN32c without --cap-usd `wait` is unchanged (its attach, no meter, no budget, no stop): {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("d", [3.0], cap="2")
+                ok(isinstance(res, SystemExit) and "already spent" in str(res.code) and not lbo_calls
+                   and ("attach_id", 100) not in ev and W["stops"] == 0,
+                   f"RN32d a cap at or below the cluster's spend so far is refused, nothing attached: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("e", [1.0], lbo_ok=False)
+                ok(isinstance(res, SystemExit) and "budget" in str(res.code) and ("attach_id", 100) not in ev
+                   and W["stops"] == 0, f"RN32e a budget that does not cover the rest of the cap refuses: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("f", [RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and len(seen) == 3
+                   and ("delete", 100) in ev and W["stops"] == 1 and not lbo_calls,
+                   f"RN32f a cost that cannot be read three times before attaching stops the cluster: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("g", [1.0, RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("attach_id", 100) in ev
+                   and ("delete", 100) in ev and W["stops"] == 1,
+                   f"RN32g three failed readings while waiting stop the cluster by id (fail closed): {res!r}")
+            case("RN32", rn32)
         finally:
             ws.JOBS = old
 
