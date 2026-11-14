@@ -1,0 +1,317 @@
+beliefs:
+- id: B1
+  mechanism: Baseline burden (no intervention) is set by Reff = R0 x susceptible share; the per-capita final size
+    is near zero below Reff 1 and rises steeply above it, so districts with larger immunity gaps carry most of the
+    infections
+  about:
+    package: none
+    feature: gap_5_9
+  direction: increases
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.0206
+    - 0.1896
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  - citation: 'Guerra FM, Bolotin S, Lim G, et al. The basic reproduction number (R0) of measles: a systematic review.
+      Lancet Infect Dis 2017'
+    location: Results; R0 range reported, location uncertain
+  confidence: high
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: high
+- id: B2
+  mechanism: ROUTINE removes about 60% x efficacy of susceptibles under five (infants included) but leaves every
+    5-14 susceptible; where older-child gaps are small this pushes Reff below 1 and averts almost all infections,
+    where they are large Reff stays above 1 and the relative reduction falls sharply
+  about:
+    package: routine
+    feature: gap_5_9
+  direction: decreases
+  magnitude:
+    band:
+    - 0.2
+    - 1.0
+    scale: relative_reduction
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.0206
+    - 0.1896
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: 'Results: median VE by age at vaccination (about 84% before 12 months, about 92% at 12 months or later);
+      exact table not recalled'
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'RESPONSE at day 42 is early relative to the epidemic: with a ~12-day generation interval and Reff
+    mostly 1-2, a single importation produces few cases in 3-4 generations, so the campaign acts almost like prevention
+    over 85% of the 1-9 susceptibles; it misses infants and 10-14 year olds, so its relative reduction is high but
+    falls where the 10-14 gap is large or Reff is high enough that the outbreak is well under way by day 42'
+  about:
+    package: response
+    feature: gap_10_14
+  direction: decreases
+  magnitude:
+    band:
+    - 0.6
+    - 0.98
+    scale: relative_reduction
+  conditions:
+  - feature: gap_10_14
+    range:
+    - 0.0108
+    - 0.1039
+  source_type: literature
+  evidence:
+  - citation: 'Vink MA, Bootsma MCJ, Wallinga J. Serial intervals of respiratory infectious diseases: a systematic
+      review and analysis. Am J Epidemiol 2014'
+    location: Table of serial intervals; measles about 11-12 days
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: 'Results: cases averted fall with delay of the response; figure not recalled'
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: At the declared shadow price (0.00086 infections per US$) the extra US$0.80 per resident of RESPONSE
+    costs only ~0.0007 infections per resident, far below the extra infections it averts wherever the 5-9 gap is
+    material; ROUTINE wins only where both options avert nearly everything or the baseline outbreak is tiny
+  about:
+    pair:
+    - response
+    - routine
+  direction: flips
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.0206
+    - 0.08
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Discussion; reactive campaigns avert a substantial share when early
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B5
+  mechanism: Relative reduction of each option rises with its vaccine efficacy, but saturates where the option already
+    drives Reff well below 1
+  about:
+    package: response
+    feature: efficacy:response
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011'
+    location: Results; VE range across studies
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: With homogeneous mixing and deterministic final size, per-capita outcomes and relative reductions do
+    not depend on district population size
+  about:
+    package: routine
+    feature: pop
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation is per capita, Section 2
+  confidence: medium
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B7
+  mechanism: Where the 5-9 immunity gap is large, ROUTINE (under-fives only) leaves Reff above 1 and averts a modest
+    share, while RESPONSE reaches the 5-9 cohort before most transmission; its extra infections averted per resident
+    outweigh its extra US$0.80 per resident at the declared shadow price, so RESPONSE has the higher net benefit
+  about:
+    pair:
+    - response
+    - routine
+  direction: increases
+  conditions:
+  - feature: gap_5_9
+    range:
+    - 0.1
+    - 0.1896
+  source_type: literature
+  evidence:
+  - citation: 'Grais RF, Conlan AJK, Ferrari MJ, et al. Time is of the essence: exploring a measles outbreak response
+      vaccination in Niamey, Niger. J R Soc Interface 2008'
+    location: Discussion; reactive campaigns avert a substantial share when early
+  - citation: Ma J, Earn DJD. Generality of the final size formula for an epidemic of a newly invading infectious
+      disease. Bull Math Biol 2006
+    location: final size relation, Section 2
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: What share of residents are infants and children 1-4, 5-9, 10-14 in each district? It sets s and how
+    close each district sits to Reff 1, which decides where ROUTINE suffices.
+  beliefs:
+  - B1
+  - B2
+  decision_relevant: true
+- id: Q2
+  question: How fast does the outbreak grow before day 42 at the high end of R0 and gaps? If many infections occur
+    before the campaign, RESPONSE loses its advantage in exactly the high-gap districts.
+  beliefs:
+  - B3
+  - B4
+  decision_relevant: true
+- id: Q3
+  question: Does ROUTINE's 60% reach count infants with lower efficacy (maternal antibody), and does RESPONSE waste
+    doses on immune children (no targets_susceptible)?
+  beliefs:
+  - B2
+  - B3
+  decision_relevant: true
+- id: Q4
+  question: Does the US$5M budget bind? All-RESPONSE likely exceeds it, so the plan mixes options; the binding dual
+    would be far above the declared shadow price and could favour ROUTINE in low-gap districts.
+  beliefs:
+  - B4
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B2
+  claim: 'ROUTINE''s relative reduction in infections falls as the 5-9 immunity gap rises (adjusted design: gap_5_9
+    sampled independently)'
+  p: 0.72
+  test:
+    kind: effect_direction
+    package: routine
+    feature: gap_5_9
+    direction: decreases
+  weights:
+    decreases: 0.72
+    increases: 0.06
+    no material effect: 0.22
+- id: H2
+  belief: B3
+  claim: RESPONSE's relative reduction falls as the 10-14 gap rises, since that cohort is outside its age band
+  p: 0.55
+  test:
+    kind: effect_direction
+    package: response
+    feature: gap_10_14
+    direction: decreases
+  weights:
+    decreases: 0.55
+    increases: 0.1
+    no material effect: 0.35
+- id: H3
+  belief: B3
+  claim: RESPONSE averts 60-98% of infections at at least 70% of usable points
+  p: 0.5
+  test:
+    kind: effect_band
+    package: response
+    band:
+    - 0.6
+    - 0.98
+    min_share: 0.7
+- id: H4
+  belief: B7
+  claim: Where the 5-9 gap exceeds 0.10, RESPONSE beats ROUTINE on net benefit at the declared shadow price at >=
+    75% of usable points
+  p: 0.65
+  test:
+    kind: paired_sign
+    a: response
+    b: routine
+    feature: gap_5_9
+    range:
+    - 0.1
+    - 0.1896
+    sign: positive
+    min_share: 0.75
+- id: H5
+  belief: B4
+  claim: The ROUTINE-to-RESPONSE transition along the 5-9 gap lies at low gaps, within 0.02-0.08
+  p: 0.3
+  test:
+    kind: flip_in
+    a: routine
+    b: response
+    feature: gap_5_9
+    range:
+    - 0.0206
+    - 0.08
+- id: H6
+  belief: B5
+  claim: RESPONSE's relative reduction rises with its efficacy draw, after adjusting for the district gaps and population
+  p: 0.7
+  test:
+    kind: effect_direction
+    package: response
+    feature: efficacy:response
+    direction: increases
+    adjust_for:
+    - gap_1_4
+    - gap_5_9
+    - gap_10_14
+    - pop
+  weights:
+    increases: 0.7
+    decreases: 0.03
+    no material effect: 0.27
+- id: H7
+  belief: B6
+  claim: ROUTINE's relative reduction does not depend on district population (|rho| bound within 0.2)
+  p: 0.6
+  test:
+    kind: effect_direction
+    package: routine
+    feature: pop
+    direction: negligible
+    equivalence: 0.2
