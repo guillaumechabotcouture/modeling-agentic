@@ -97,7 +97,9 @@ def design_box(spec, eng) -> tuple:
     ne = UQ.net_effect_sample(spec, eng)
     fr, _ = UQ.with_posterior_ranges(ne, fr)
     ext = {k: list(fr[k][:2]) for k in (ne or {}).get("ranges", {}) if k in fr}
-    tv = test_value_ranges(spec, set(fr))
+    # a decision test does not widen a posterior column's box (Codex r1 P1-1): the hull stays the box, and the sign-off
+    # precondition refuses a test value outside it (toolkit/spec/preconditions.py net_effect_posterior)
+    tv = test_value_ranges(spec, set(fr) - set(ext))
     for nm, (tlo, thi) in tv.items():
         lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
         if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
@@ -889,6 +891,15 @@ def _self_test() -> int:
                and th[:, 0].min() < 0.3 and th[:, 0].max() > 0.7,
                f"BA-NP3 the design points cover the posterior's hull (eff_a {th[:, 0].min():.3f}-{th[:, 0].max():.3f}, "
                f"beyond the fitted 0.3-0.7) and stay inside it")
+            # Codex r1 P1-1: a decision test's values do not widen a posterior column's box (the hull stays the box; the
+            # sign-off precondition refuses such a test, the runner would not run its values outside the design)
+            raw["analysis"]["decision_tests"] = list(raw["analysis"].get("decision_tests") or []) + [
+                {"id": "DTpa", "type": "parameter_value", "parameter": "eff_a", "values": [0.0, 1.0], "text": "t"}]
+            yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            s2 = schema.load(os.path.join(d, "decision_spec.yaml"))
+            fr2, _n, _p, _s, ext2 = design_box(s2, s2.engine())
+            ok(tuple(fr2["eff_a"][:2]) == hull["eff_a"] and ext2["eff_a"] == list(hull["eff_a"]),
+               f"BA-NP4 a decision test on a posterior column does not widen its box: {fr2['eff_a'][:2]}")
     case("BA-NP", bnp)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")

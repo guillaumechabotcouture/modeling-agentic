@@ -78,7 +78,8 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     The Drawer, the analysis (core), batch.design_box and the sign-off precondition all read them here. The columns
     must be parameters the draws vary: drawn priors (`priors`, default toolkit/spec/priors.py drawn) and, under the
     engine_parameters source, fitted parameters (`fitted`, default batch.fitted_ranges), less calibrated and jointly
-    calibrated ones and `held`. Cached on the spec per (sha256, margin, varied names). None without the field."""
+    calibrated ones and `held`. Cached on the spec per (sha256, margin, varied names, engine identity). None without
+    the field."""
     post = posterior_input(spec)
     if post is None:
         return None
@@ -96,7 +97,8 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     if "engine_parameters" in src:
         varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
     varied = {k: v for k, v in varied.items() if k not in held}
-    key = (post["sha256"], post["margin"], tuple(sorted(varied)))
+    from toolkit.engines.contract import engine_identity      # Codex r1 P2-3: the engine is part of what was verified
+    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())))
     cache = getattr(spec, "_net_effect_sample", None)
     if cache is not None and cache[0] == key:
         return cache[1]
@@ -116,8 +118,10 @@ def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = N
     import dataclasses
     rg = ne["ranges"]
     fr = {k: ((*rg[k], *v[2:]) if k in rg else v) for k, v in fitted.items()}
-    pr = None if priors is None else {k: (dataclasses.replace(p, lo=rg[k][0], hi=rg[k][1]) if k in rg else p)
-                                      for k, p in priors.items()}
+    # a replaced prior is drawn as uniform over the hull (Codex r1 P2-1: a log-uniform over a hull reaching zero is
+    # undefined); every prior kind takes one uniform from the stream and the value is replaced by the sample's row
+    pr = None if priors is None else {k: (dataclasses.replace(p, lo=rg[k][0], hi=rg[k][1], dist="uniform")
+                                          if k in rg else p) for k, p in priors.items()}
     return fr, pr
 
 
@@ -765,6 +769,27 @@ def _self_test_posterior(ok):
         ok(D0.ranges == {"cfp_kill": (0.3, 0.7), "net_kill_shift": (card["net_kill_shift"].lo, card["net_kill_shift"].hi),
                          "use_rate": (card["use_rate"].lo, card["use_rate"].hi)},
            f"NP7 without the field every draw range is the fitted or prior range, as before: {D0.ranges}")
+        # Codex r1 P2-1: a log-uniform prior whose posterior hull reaches zero or below is still drawn (and replaced)
+        A8 = fake(d, "wide.yaml")
+        A8.pr = dict(A8.pr, net_kill_shift=PRI.Prior("net_kill_shift", 0.1, 0.01, 0.66, "loguniform", "s"))
+        try:            # the analysis (core) hands the Drawer the priors with_posterior_ranges rewrote
+            A8.fr, A8.pr = with_posterior_ranges(net_effect_sample(A8.spec, e, fitted=A8.fr, priors=A8.pr), A8.fr, A8.pr)
+            D8 = Drawer(A8, 9)
+            t8 = [D8.draw()[0]["net_kill_shift"] for _ in range(5)]
+            why8 = "" if all(v in {r["net_kill_shift"] for r in wide} for v in t8) else f"not sample values {t8}"
+        except Exception as ex:  # noqa: BLE001
+            why8 = f"{type(ex).__name__}: {ex}"
+        ok(not why8, f"NP8 a log-uniform prior whose posterior hull crosses zero is drawn without error ({why8 or 'ok'})")
+        # Codex r1 P2-3: the cached sample is per engine: another engine's identity is checked again, and refused
+        from toolkit.engines.contract import ToyEngine
+        A9 = fake(d, "wide.yaml")
+        net_effect_sample(A9.spec, e, fitted=A9.fr, priors=A9.pr)
+        try:
+            net_effect_sample(A9.spec, ToyEngine(), fitted=A9.fr, priors=A9.pr)
+            why9 = "accepted"
+        except NEF.PosteriorRefused as ex:
+            why9 = str(ex)
+        ok("fitted under engine" in why9, f"NP9 the cached sample does not bypass another engine's check: {why9[:100]}")
 
 
 def _self_test_reserve(ok):
