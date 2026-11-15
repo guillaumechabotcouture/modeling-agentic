@@ -308,7 +308,6 @@ def _allow(a):
 
 def main(argv=None) -> int:
     import argparse
-    import shutil
     import yaml
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
@@ -371,9 +370,9 @@ def main(argv=None) -> int:
                 r = dict(r, licensed_repair={"hits": hits, "usd": usd, "after": again},
                          usd=r.get("usd", 0) + usd, status="ok" if not again else "seed_refused")
                 if not again:
-                    shutil.copyfile(os.path.join(rd, WMT.SEED_FILE), os.path.join(rd, WMT.SEED))
+                    WMT._sio().copy_nofollow(rd, WMT.SEED_FILE, WMT.SEED)
         if r.get("status") == "ok":
-            shutil.copyfile(os.path.join(rd, WMT.SEED), seed_p)
+            WMT._sio().copy_nofollow(d, os.path.join("seed_run", WMT.SEED), SEED_REL)
         print(json.dumps(dict(r, seed=seed_p if r.get("status") == "ok" else None,
                               committed_usd=round(led.committed(), 4)), default=str))
         return 0 if r.get("status") == "ok" else 1
@@ -397,7 +396,7 @@ def main(argv=None) -> int:
         print(json.dumps({"error": "no reflog entry shows the remote holding the commit", **r}))
         return 1
     rec = dict(r, anchored_at=at, files=rels, rule="first reflog entry of the remote-tracking ref holding the commit")
-    open(os.path.join(d, "anchor.json"), "w").write(json.dumps(rec, indent=1) + "\n")
+    WMT._sio().write_nofollow(d, "anchor.json", (json.dumps(rec, indent=1) + "\n").encode(), atomic=True)
     print(json.dumps(rec, indent=1))
     return 0
 
