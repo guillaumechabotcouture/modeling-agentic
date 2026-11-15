@@ -991,6 +991,7 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
 UNIT_BOUNDS = {"probability": (0.0, 1.0), "share": (0.0, 1.0), "days": (0.0, math.inf), "months": (0.0, math.inf),
                "years": (0.0, math.inf)}
+DURATIONS = ("days", "months", "years")     # a margin may not take one to zero (Codex r2 P2: NaN effects at 0)
 
 
 def hard_bounds(engine, names, both: bool = False) -> dict:
@@ -1017,8 +1018,9 @@ def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
     the draw ranges and the emulator design box of the sample's columns (toolkit/analysis/uncertainty.py
     net_effect_sample; owner, 14 Nov). Refused: a negative or non-numeric margin; a column without spread (a zero-width
     design box cannot be emulated)."""
-    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or margin < 0:
-        raise ValueError(f"net-effect posterior margin {margin!r}: a share of the hull's width >= 0")
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) \
+            or not 0 <= margin <= 1:
+        raise ValueError(f"net-effect posterior margin {margin!r}: a share of the hull's width in [0, 1]")
     X = np.asarray(ne["rows"], float)
     out = {}
     for j, k in enumerate(ne["names"]):
@@ -1027,8 +1029,11 @@ def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
             raise PosteriorRefused(f"net-effect posterior: column {k} has no spread ({lo}): it cannot set a range")
         if margin:      # never past a hard bound, never inside the hull (a row on a bound within its tolerance)
             w = hi - lo
-            blo, bhi = (bounds or {}).get(k, (-math.inf, math.inf, ""))[:2]
+            blo, bhi, what = (bounds or {}).get(k, (-math.inf, math.inf, ""))
             lo, hi = min(lo, max(lo - margin * w, blo)), max(hi, min(hi + margin * w, bhi))
+            if lo <= 0 < X[:, j].min() and any(f"card units {u}" in what for u in DURATIONS):
+                raise PosteriorRefused(f"net-effect posterior: margin {margin} takes {k}, a duration, to {lo} (a zero "
+                                       "duration is not physical); use a smaller margin")
         out[k] = (lo, hi)
     return out
 
@@ -1554,6 +1559,17 @@ def _self_test() -> int:
             c2 = posterior_ranges(edge, margin=0.5, bounds=hard_bounds(e, ["cfp_kill"]))
             ok(c2["cfp_kill"][1] >= 1.000001, f"F28f (Codex r1 P2-2) the range never cuts inside the hull, even where a "
                                               f"row sits on a hard bound within its tolerance: {c2}")
+            half = {"names": ["cfp_half"], "rows": np.array([[500.0], [1450.0]])}
+            why2 = {}
+            for label, m_ in (("a margin taking a half-life to zero", 0.6), ("a margin above 1", 1e308)):
+                try:
+                    posterior_ranges(half, margin=m_, bounds=hard_bounds(e, ["cfp_half"]))
+                    why2[label] = ""
+                except (PosteriorRefused, ValueError) as ex:
+                    why2[label] = str(ex)
+            ok(all(why2.values()) and posterior_ranges(half, 0.5, hard_bounds(e, ["cfp_half"]))["cfp_half"] == (25.0, 1925.0),
+               f"F28g (Codex r2 P2s) a margin that takes a duration to zero, or above 1, is refused: "
+               f"{ {k: v[:70] for k, v in why2.items()} }")
             why = {}
             for label, arg, kw in (("a column without spread", {"names": ["irs_kill"], "rows": np.array([[0.4], [0.4]])},
                                     {}),

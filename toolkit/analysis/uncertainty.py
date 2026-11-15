@@ -58,10 +58,10 @@ def posterior_input(spec) -> dict | None:
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
             or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
-                         "signed digest, margin (optional): a share of the sample's hull width >= 0}")
+                         "signed digest, margin (optional): a share of the sample's hull width in [0, 1]}")
     m = p.get("margin", 0.0)
-    if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or m < 0:
-        raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width >= 0")
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or not 0 <= m <= 1:
+        raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width in [0, 1]")
     path, dig = spec.resolve(p["path"]), p["sha256"].lower()
     got = getattr(spec, "_net_effect_posterior", None)
     if got is None or (got["path"], got["sha256"]) != (path, dig):
