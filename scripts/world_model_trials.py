@@ -846,6 +846,9 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
                 feedback = seed_problems(seed, ctx) if isinstance(seed, dict) else [f"{SEED_FILE}: a mapping"]
             except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
                 feedback = [f"{SEED_FILE} is not readable YAML: {e}"[:300]]
+            except Exception as e:  # noqa: BLE001 -- Codex P1: the session is charged; a shape the validator cannot
+                # read is a refusal with feedback (repaired once), never a crash that loses the charged seed
+                feedback = [f"{SEED_FILE} has a shape the validator cannot read: {type(e).__name__}: {e}"[:300]]
         if not feedback:
             data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
             _sio().write_nofollow(run_dir, SEED, data, atomic=True)
@@ -3586,6 +3589,20 @@ def _self_test() -> int:
             r = seed_step({"id": "decision_t"}, d, ctx, fn, SpendLedger(os.path.join(d, "s.jsonl"), 5.0), 1.0)
             ok(r.get("status") == "ok" and r.get("hypotheses") == 1 and os.path.isfile(os.path.join(d, SEED)),
                f"WT29f the seed step accepts and keeps a decision-run seed (it has beliefs, not hypotheses): {r}")
+            # Codex P1 (306ab98): nothing after the charge may crash: a seed whose shape breaks the validator is
+            # refused with feedback (and repaired once), never raised
+            calls = []
+
+            def fn_bad(rd, c, fb, cap):
+                calls.append(fb)
+                open(os.path.join(rd, SEED_FILE), "w").write("hypotheses: 7\nbeliefs: [1, 2]\n")
+                return SimpleNamespace(usd=0.25, note="n")
+            d2 = os.path.join(d, "bad")
+            os.makedirs(d2)
+            led = SpendLedger(os.path.join(d2, "s.jsonl"), 5.0)
+            r = seed_step({"id": "t2"}, d2, {"sweep": {"features": {}}, "packages": {}}, fn_bad, led, 1.0)
+            ok(r.get("status") == "seed_refused" and len(calls) == 2 and abs(led.spent() - 0.5) < 1e-9,
+               f"WT29g a seed that breaks the validator is refused after both charges, not raised: {r}")
     tryit("WT29 decision seed step", wt29_seed_step)
 
     if fails:

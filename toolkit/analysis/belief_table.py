@@ -291,8 +291,8 @@ def decision_seed_problems(seed, run) -> list:
         if not isinstance(b, dict):
             bad.append(f"belief {k + 1}: a mapping")
             continue
-        i = str(b.get("id"))
-        if not _DID.match(i):
+        i = b.get("id")
+        if not isinstance(i, str) or not _DID.match(i):      # Codex P2: a missing id is not the string "None"
             bad.append(f"belief {k + 1}: id {b.get('id')!r}: letters, digits, . _ -")
         if i in seen:
             bad.append(f"belief {i}: duplicate id")
@@ -537,6 +537,9 @@ def _self_test() -> int:
                                                                         {"claim": "a", "weight": 0.5}]),
                                                       bel("D2", "smc")]},
             "not a mapping": ["D1"],
+            "a missing id": {"decision_beliefs": [{k: v for k, v in bel("D1").items() if k != "id"},
+                                                  bel("D2", "smc")]},
+            "a non-string id": {"decision_beliefs": [bel(7), bel("D2", "smc")]},
         }
         for why, seed in cases.items():
             pr = decision_seed_problems(seed, run)
