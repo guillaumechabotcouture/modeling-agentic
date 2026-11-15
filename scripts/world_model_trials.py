@@ -849,7 +849,8 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
         if not feedback:
             data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
             _sio().write_nofollow(run_dir, SEED, data, atomic=True)
-            return dict(out, status="ok", hypotheses=len(seed["hypotheses"]), refusals=out.get("refusals", []))
+            return dict(out, status="ok", hypotheses=len(seed.get("hypotheses") or seed.get("decision_beliefs") or []),
+                        refusals=out.get("refusals", []))
         out.setdefault("refusals", []).append(feedback)
         if attempt == 0:
             out["repairs"] = 1
@@ -3570,6 +3571,22 @@ def _self_test() -> int:
                 except TrialError:
                     ok(True, f"WT29e {bad} is refused (a decision's seed and outcome map only)")
     tryit("WT29 decision run", wt29_decision)
+
+    def wt29_seed_step():
+        from types import SimpleNamespace
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        seed = {"decision_beliefs": [{"id": "D1", "topic": "net_type", "question": "q", "decides": True,
+                                      "claims": [{"claim": "a", "weight": 0.6}, {"claim": "b", "weight": 0.4}],
+                                      "basis": [{"mechanism": "m"}], "why_decides": "w", "layer": "world"}]}
+
+        def fn(rd, c, fb, cap):
+            open(os.path.join(rd, SEED_FILE), "w").write(yaml.safe_dump(seed))
+            return SimpleNamespace(usd=0.5, note="n")
+        with tempfile.TemporaryDirectory() as d:
+            r = seed_step({"id": "decision_t"}, d, ctx, fn, SpendLedger(os.path.join(d, "s.jsonl"), 5.0), 1.0)
+            ok(r.get("status") == "ok" and r.get("hypotheses") == 1 and os.path.isfile(os.path.join(d, SEED)),
+               f"WT29f the seed step accepts and keeps a decision-run seed (it has beliefs, not hypotheses): {r}")
+    tryit("WT29 decision seed step", wt29_seed_step)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

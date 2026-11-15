@@ -349,7 +349,11 @@ def main(argv=None) -> int:
         os.makedirs(rd, exist_ok=True)
         led = WMT.SpendLedger(os.path.join(a.trials_dir, "spend.jsonl"), a.total_cap_usd)
         fn = WMT.sdk_seed_fn()
-        r = WMT.seed_step({"id": f"decision_{a.id}"}, rd, ctx, fn, led, a.task_cap_usd)
+        kept = os.path.join(rd, WMT.SEED)
+        if os.path.isfile(kept) and not WMT.seed_problems(yaml.safe_load(open(kept)), ctx):
+            r = {"status": "ok", "reused": kept, "usd": 0.0}     # a validated seed is never paid for twice
+        else:
+            r = WMT.seed_step({"id": f"decision_{a.id}"}, rd, ctx, fn, led, a.task_cap_usd)
         hits = licensed_problems(open(os.path.join(rd, WMT.SEED), "rb").read(), lic, allow) \
             if r.get("status") == "ok" else []
         if hits:                    # one repair of the same seed task, told only where its numbers are refused
