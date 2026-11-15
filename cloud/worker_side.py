@@ -625,6 +625,10 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     return res
 
 
+# The attach call's VM types, used by Coiled only when the named cluster has stopped and the attach creates a new one
+# (which verify_attached then shuts down): one priced type (cloud/vm_prices.yaml, budget.py BR18 checks it), so even
+# that short-lived cluster never runs a type the budget cannot price (Codex on the VM price preflight PR, 2026-11-13).
+ATTACH_VM_TYPES = ["Standard_D2_v5"]
 ATTACH_SKEW_S = 120.0    # clock skew allowed against Coiled's `created` time; equal to run_cluster.OWN_SKEW_S (RC18f)
 
 
@@ -671,7 +675,8 @@ def attach_existing(name, workspace, expected_id):
     import time
     import coiled
     started = time.time()
-    cl = coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False, wait_for_workers=False)
+    cl = coiled.Cluster(name=name, workspace=workspace, shutdown_on_close=False, wait_for_workers=False,
+                        worker_vm_types=list(ATTACH_VM_TYPES), scheduler_vm_types=list(ATTACH_VM_TYPES))
     lister = lambda: (lambda cs: cs if isinstance(cs, list) else list(cs.values()))(  # noqa: E731
         coiled.list_clusters(workspace=workspace))
     return verify_attached(cl, expected_id, started=started, lister=lister)

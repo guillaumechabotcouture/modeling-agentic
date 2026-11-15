@@ -216,7 +216,7 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 | `net_kill_shift` | −0.618 to 0.66 | its card prior, the hut-trial CrI. The field trials may narrow it, not leave it: a target out of band everywhere in the box is reported as infeasible (a principle-4 finding) |
 | `cfp_kill` | 0 to 0.8 | the pack's |
 | `irs_kill` | 0 to 0.95 | the pack's |
-| `cfp_half` | 547.5 to 1,277.5 days (1.5–3.5 years) | owner, 13 Nov. Attempt 8's range, a modeller reading of the dual-AI trials' durability: a design assumption, not a prior |
+| `cfp_half` | wave 1: 547.5 to 1,277.5 days (1.5–3.5 years); wave 2: 270 to 1,650 days | wave 1: owner, 13 Nov, attempt 8's range, a design assumption. Wave 2: see "Wave 2" below. Either way a design box, not a prior |
 
 `pbo_gain_scale` and `pbo_adv_decay` stay out: no training arm has a PBO net. They keep their card priors.
 
@@ -273,6 +273,71 @@ One proposal remains, for the owner: making B9, B9b and B9c training targets, wi
 3. `validate_once.sh` recomputes the evidence, and the held-out benchmarks are scored once, as validation.
 
 **Smoke.** `run --smoke --out <scratch>` ran locally end to end: 1 seed, 3 design points, 600 agents, 2-year burn-in, 2 calibration grid points. Its numbers are not evidence.
+
+### Wave 2 of the trial fit (owner, 13 Nov, "option 1"; cap $30 real USD)
+
+**Wave 1's result.** Cluster 2375765 at commit fb8deac, $15.18. The output is kept verbatim as `benchmarks/net_effect_fit_wave1.yaml` (sha256 `54958ad2…a067`).
+- The chosen point was verified in band on all 5 targets.
+- The joint sample was invalid: 8 of 12 verified points were in band. The four misses were narrow: B12b 0.6071 and 0.6089 against its lower bound of 0.61, and B12m 0.5511 and 0.557 against its upper bound of 0.55.
+- The accepted region covered 0.54% of the box (272 candidates). Its `cfp_half` hull ran from 547.6 to 1,274 days, so it reached the lower box edge.
+
+**`cfp_half` box, 270 to 1,650 days.** `cfp_half` is the half-life, in days of net age, of the chlorfenapyr kill share (`vector.py`: `cfp_kill exp(−ln2 t / cfp_half)`). No published half-life exists (`priors.yaml`, `fixed`). The ends are exponential half-lives that we derived from two field durability studies of Interceptor G2. Both were opened. The arithmetic is ours, so the box is a modeller reading of these studies, not a prior.
+- *Lower end, from chlorfenapyr content.* Content decays faster than the kill it causes, so it bounds the half-life from below.
+  - Ngufor et al. 2024, Parasites & Vectors 17:420, Table 8 (Benin): 5.0 g/kg new, 2.0 at 12 months, 1.2 at 24 months and 0.7 at 36 months. These give half-lives of 276, 355 and 386 days.
+  - Fagbohoun et al. 2026, PLOS Global Public Health, abstract (Mozambique): 32% of the content left at 24 months, a half-life of 444 days.
+- *Upper end, from bioefficacy.*
+  - Ngufor 2024, Table 7: tunnel-test mortality of pyrethroid-resistant *An. coluzzii* was 95.7% new, 82.1% at 12 months, 51.7% at 24 months and 60.2% at 36 months. Taken as ratios to the new net, these give half-lives of 1,650, 822 and 1,637 days.
+  - Fagbohoun 2026: hut mortality fell from 55% to 39% by 24 months, a half-life of 1,472 days.
+- `priors.yaml` keeps `cfp_half` under `fixed` (no prior range), so `load_posterior`'s `priors.yaml` range check does not apply to it. Its draw range comes from the spec that adopts the sample, which must hold the sample.
+
+**Reuse (no engine run repeated).** Wave 1 ran before the checkpoint code (#231), so it has no per-task cache. Its output does hold every engine-evaluated point's target values: 46 design points, 12 verified points and the chosen point, 59 in all. It also holds the calibration grid's m0. `load_wave1` reuses all of these only under these conditions; otherwise it refuses (F19):
+- the file's sha256 is the recorded one;
+- the run was full, not a smoke;
+- the engine identity is identical (name, code, parameters, configuration);
+- `pack.yaml` hashes to the one wave 1 ran on;
+- the seeds, the targets and the calibration grid are this script's, and the grid does not clamp.
+
+**Design.**
+- *Wave-2 box (F20).* Wave 1's accepted hull is widened by 25% of its width on each side and clipped to the box. A side where the hull reached the old box edge goes to the new box edge, because wave 1 holds no point past it.
+- *Points.* 48 new LHS points, seed 23, in that box, which is `net_kill_shift` −0.618 to 0.66, `cfp_kill` 0.327 to 0.8, `irs_kill` 0.347 to 0.492 and `cfp_half` 270 to 1,456 days.
+- *Refit (rule `joint-v1-wave2`, `fit_waves`, F21).* The quadratic surrogates are refitted on both waves (107 points). joint-v1's choice, range and verification follow. Every point is calibrated by interpolation on wave 1's grid.
+- *Gate.* The acceptance gate, `finalize()`, is unchanged.
+
+**Margin option (`--margin-loo`, off by default; owner, 13 Nov: on for this run).**
+- *Rule (F22).* A candidate enters the exported sample only if each target's surrogate value is inside its band by that target's local leave-one-out error. That error is the root mean square, in log, over the design points in the wave-2 box.
+- *Why.* In wave 1, 46% of the accepted region lay within 1% (log) of a band edge, and the surrogate's error at the verified points had an sd of 0.9–1.9%.
+- *Recorded with the sample.* The output records, under `joint_region.margin`, each target's margin, the share of the in-band region it excludes, and the excluded candidates' parameter ranges.
+- *Declared limitation.* The sample is narrower than the trial-compatible region. It leaves out parameter sets near the band edges that may be compatible.
+
+**Cost.** `plan` reports 3,904 arm runs on one 16-vCPU VM: $11.0–22.5 on the VM price bound, and $12.5–18.4 at the measured $0.124 per vCPU-hour. `run` refuses a plan whose upper bound is above $25 on either basis.
+
+**Wave 2's result (cluster 2377496, $14.23 billed).** The joint sample was invalid.
+- 9 of 12 verified points were in band. The three misses were all on B11, at 0.397, 0.406 and 0.414 against the band's lower bound of 0.42.
+- The chosen point failed B12b: 0.603 against the band's lower bound of 0.61.
+- The chosen point (`cfp_half` 1,600 days) and two of the misses (about 1,620 days) lay beyond wave 2's design box, which ends at 1,456 days. The candidates spanned the whole box, so the surrogate was extrapolated there.
+- The output's sha256 is `148621e3…a79f`. Its checkpoint `netfit_cache.jsonl` (1,952 tasks, sha256 `3bde5c6e…311b`) is stored under `outputs/_engine/net_effect_fit/`.
+
+### Verification round 2 (owner, 14 Nov; plan at most $10, cap $15)
+
+The owner set this round's rule before the run.
+
+- **Support (fix; F23).** The joint-sample candidates and the chosen point are restricted to the union of the two waves' design boxes, where the engine-evaluated points are. The surrogate is never extrapolated.
+- **Acceptance rule (F24; F11, F15).** A verified point, and the chosen point, counts as in band for a target when the 95% interval of its seed mean overlaps the target's band. The interval is mean ± 1.96 × sd / √n, over the run's 8 seeds, with the sd taken with n − 1.
+  - Fewer than 2 finite seed values, or a target without them, fail closed.
+  - The rule reads each point's own seed values (`per_seed`). The summary flags are not evidence.
+  - The bands come from `pack.yaml`.
+  - It is one function (`point_in_band`), called by `finalize()`. `load_posterior` replays `finalize()`, so the loader uses the same rule.
+  - Control arms within 10% and no calibration-grid clamp are unchanged.
+  - The rule's text is recorded in the output, under `joint_region.verified.acceptance_rule`.
+  - The rule is applied to the arithmetic mean of the seed values, as stated. A target's `computed` value is the geometric mean.
+- **No engine point is refitted (F25).**
+  - Wave 2's checkpoint is read from storage under its recorded sha256, and `load_cache` checks every row.
+  - Wave 1's points come from `net_effect_fit_wave1.yaml`.
+  - The run stops before verifying if any wave-2 design task is missing from the checkpoint (`no_rerun`).
+- **A new joint sample.** The candidates use seed 29 and the picks seed 31, so the 12 points verified before are not rescored. The engine runs 12 new points plus the chosen point: 832 arm runs.
+- **Cost and storage.** `plan --verify-round` gives $2.9–5.7 on the VM bound and $3.3–4.6 at the measured rate. Outputs go to `outputs/_engine/net_effect_fit/round2/`, so wave 2's stored copies are kept.
+- **Margin.** The margin option stays on.
+- **Not done: points up to 1,650 days.** Running design points for `cfp_half` from 1,456 to 1,650 days would let the region extend there. On the per-point costs measured in wave 2, about 15 points would cost roughly $4–6 more.
 
 ## v0.16 scope: BR3 at dual-AI nets and 70% use is reported, not judged (owner, 2026-11-10)
 

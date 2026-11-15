@@ -81,6 +81,11 @@ class Analysis:
         self.fr = fitted_ranges(self.eng)
         from toolkit.spec import priors as PRI
         self.pr = PRI.drawn(spec)             # prior parameters, drawn in every uncertainty draw
+        # owner, 14 Nov (f6-posterior-ranges): a declared net-effect posterior's hull is its columns' range in every step
+        # that reads one (draws, sensitivity ends, automatic range tests), as in the design box (batch.design_box)
+        from toolkit.analysis import uncertainty as UQ
+        self.fr, self.pr = UQ.with_posterior_ranges(UQ.net_effect_sample(spec, self.eng, fitted=self.fr,
+                                                                         priors=self.pr), self.fr, self.pr)
         self.dr = dict(self.fr, **{k: (p.lo, p.hi, p.value) for k, p in self.pr.items()})   # every drawn parameter
         from toolkit.spec import engine_parameters as PV
         # the spec's engine parameter values under every parameter set built from here (point, draws, decision tests,

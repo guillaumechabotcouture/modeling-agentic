@@ -161,6 +161,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
     if stale:
         raise AnalysisBlocked("fitted_values", [], reason="; ".join(stale))
+    ne = UQ_.net_effect_sample(spec, eng)   # f6-posterior-ranges: loaded, verified; its hull sets its columns' ranges
+    if ne is not None:                      # before any artifact: the manifest and every artifact record where from
+        info["net_effect_posterior_ranges"] = UQ_.posterior_range_record(ne)
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
@@ -1494,6 +1497,49 @@ def _self_test_priors(ok, q):
         ok(rec["status"] == "not_run" and "outside the emulator design" in rec["reason"],
            f"RP11 a parameter_value test value outside the emulator design box is refused, not extrapolated: {rec}")
     _self_test_test_ranges(ok, q)
+    _self_test_posterior_ranges(ok, q)
+
+
+def _self_test_posterior_ranges(ok, q):
+    """RNP1-RNP2 (f6-posterior-ranges): a toy run whose spec names a net-effect posterior whose hull exceeds the fitted
+    ranges completes; the design box, the draws, the manifest and the uncertainty report all carry the hull."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+        rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+        hull = {k: [min(r[k] for r in rows), max(r[k] for r in rows)] for k in ("eff_a", "eff_b")}
+        sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+        r = yaml.safe_load(open(p))
+        r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RNP1 a run with a posterior beyond the fitted ranges completes: {type(e).__name__}: {str(e)[:300]}")
+            return
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+        unc = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        want = {"sha256": sha, "range_source": "posterior_hull", "margin": 0.0, "ranges": hull}
+        ok(design.get("design_ranges") == hull and design.get("posterior_ranges") == want
+           and man["engine"].get("net_effect_posterior_ranges") == want
+           and {k: unc["data"]["net_effect_posterior"][k] for k in want} == want
+           and rep.get("net_effect_posterior_ranges") == want,
+           f"RNP1 the design box is the posterior's hull, and the manifest, the uncertainty artifact and the uncertainty "
+           f"report say the ranges came from the posterior with its sha256: "
+           f"{man['engine'].get('net_effect_posterior_ranges')}")
+        s = rep["parameter_samples"]["eff_a"]
+        ok(hull["eff_a"][0] <= s["ci_low"] < s["ci_high"] <= hull["eff_a"][1],
+           f"RNP2 the draws of a posterior column stay inside its hull: {s}")
 
 
 def _self_test_test_ranges(ok, q):

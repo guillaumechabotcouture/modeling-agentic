@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Trial fit of the v0.17 net-effect parameters on the pack's training targets (design: ENGINE_NOTES.md, v0.17).
-Not yet run.
+Wave 1 ran on cluster 2375765 (net_effect_fit_wave1.yaml: sample invalid, 8/12 verified points in band); `run` is
+now wave 2, which reuses wave 1's engine results (load_wave1) and runs only new points (fit_waves). Wave 2 ran on
+cluster 2377496 (invalid, 9/12; its choice extrapolated past the design); `run --verify-round` reads wave 2's stored
+checkpoint, keeps candidates inside the waves' boxes, and verifies a new sample under ACCEPTANCE_RULE (owner, 14 Nov).
 
     python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py plan                 # design, run count, cost
     python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py run --approved "<owner approval>" --workers W
@@ -30,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import math
 import os
 import sys
 import time
@@ -53,9 +58,39 @@ PROTECTED = ("fitted.yaml", "results.yaml")
 NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
               "pbo_gain_scale": ({"pbo"}, [0.0, 2.0]),
               "pbo_adv_decay": ({"pbo"}, [0.0, 1.5])}
-# owner, 13 Nov: cfp_half joins the fit. Box 1.5-3.5 years (547.5-1277.5 days): attempt 8's range, a modeller reading
-# of the dual-AI trials' durability (priors.yaml: no published half-life), a design assumption, not a prior
-FIT_EXTRA = {"cfp_half": [547.5, 1277.5]}
+# owner, 13 Nov: cfp_half joins the fit. cfp_half is the half-life, in days of net age, of the chlorfenapyr kill share
+# (vector.py: cfp_kill exp(-ln2 t / cfp_half)). Wave 1's box, 547.5-1277.5 days (attempt 8's 1.5-3.5 y), put its
+# accepted region at both box edges. Wave 2's box, 270-1650 days, is a design box, not a prior: no published half-life
+# exists (priors.yaml), so its ends are exponential half-lives derived here from two field durability studies of
+# Interceptor G2 (both opened; arithmetic ours, so the box is a modeller reading of them):
+#  - lower end, from chlorfenapyr content, which decays faster than the kill it causes: Ngufor et al. 2024 Parasites &
+#    Vectors 17:420, 10.1186/s13071-024-06504-1, Table 8 (Benin): 5.0 g/kg new, 2.0 at 12 m, 1.2 at 24 m, 0.7 at 36 m,
+#    half-lives 276, 355 and 386 days; Fagbohoun et al. 2026 PLOS Glob Public Health 10.1371/journal.pgph.0005306,
+#    abstract (Mozambique): 32% left at 24 m, 444 days. 270 is below the shortest.
+#  - upper end, from bioefficacy: Ngufor 2024 Table 7, tunnel-test mortality of pyrethroid-resistant An. coluzzii
+#    95.7% new, 82.1% at 12 m, 51.7% at 24 m, 60.2% at 36 m (ratios to new: half-lives 1650, 822 and 1637 days);
+#    Fagbohoun 2026 abstract, hut mortality 55% to 39% by 24 m (1472 days). 1650 is the longest.
+FIT_EXTRA = {"cfp_half": [270.0, 1650.0]}
+# Wave 2 (owner, 13 Nov, "option 1"): wave 1's engine results are reused from its output, a verbatim copy of the run
+# on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml unchanged: WAVE1_PACK_SHA256).
+# 48 new LHS points in the wave-2 box: wave 1's accepted hull widened by `margin` of its width on each side, to the
+# new box edge on a side where the hull reached the old box edge (wave 1 holds no point past it). 48 points: 3 per
+# quadratic coefficient in 4 dimensions (15) plus 3; the plan stays under CAP_USD.
+WAVE1 = os.path.join(HERE, "net_effect_fit_wave1.yaml")
+WAVE1_SHA256 = "54958ad2e79716edf19f2b4b60f263ca41056d3202147ff4bfa23277b318a067"
+WAVE1_PACK_SHA256 = "32abb2bb6457ed7008c6410c55b4e0b620b2e982073a7dd5cbdcb7988114a905"
+WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+             "cfp_half": [547.5, 1277.5]}
+WAVE2 = {"n": 48, "seed": 23, "margin": 0.25}
+# Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
+# point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
+# wave 2's engine results from its stored checkpoint (no design point rerun), refits with the candidates and the
+# chosen point inside the waves' support, and verifies a NEW joint sample (new candidate and pick seeds: the 12 points
+# verified before are not rescored) under ACCEPTANCE_RULE, set before this run.
+VERIFY_ROUND = {"n": 2, "candidate_seed": 29, "pick_seed": 31, "plan_cap_usd": 10.0,
+                "cache_blob": "outputs/_engine/net_effect_fit/netfit_cache.jsonl",
+                "cache_sha256": "3bde5c6ec7b6e6b204968b3a52b33541300316d1f0aa7f571bb5b30f91f3311b",
+                "wave2_output_sha256": "148621e379e8049a32bb7399057bef4b4b514244086f755b2df006ccce3ba79f"}
 CAL_PARAM = "net_kill_shift"       # the only fitted parameter the sites' calibration arms depend on (F9)
 CAL_N = 5                          # calibration grid points in net_kill_shift across its box
 DESIGN = {"n": 45, "seed": 17}     # 15 quadratic coefficients in 4 dimensions; 3 points per coefficient
@@ -78,6 +113,9 @@ POOL_S = 20.0                      # a fresh process pool per _map chunk (an ass
 GROUP_S, ARM_S = 70.0, 7.4
 VM_FACTOR = (2.0, 3.0)
 USD_PER_VCPU_H = (1.0 * 0.061 + 0.048, 1.5 * 0.061 + 0.048 * 1.25)
+# Measured (wave 1, cluster 2375765): $15.18 billed for 27,464 s on 16 vCPUs plus start-up, about 1 credit per
+# vCPU-hour at $0.124 per credit (credits x $0.061 plus the Azure VM). `run` refuses a plan above the cap on either basis
+USD_REAL_PER_VCPU_H = 0.124
 ACTS = {"irs": {"irs_kill"}, "dual": {"cfp_kill", "cfp_half"}}      # fitted parameters by package element
 
 
@@ -164,6 +202,12 @@ class RecalRunner(BM.Runner):
                 rows[s].append(self.calibrated[s])
         self.cal_grid = {"values": vals, "m0": m0, "rows": rows}
 
+    def use_grid(self, grid: dict):
+        """A calibration grid computed before (wave 1's: {values, m0}), reused instead of rerun."""
+        rows = {s: [{"attribute": self._p["settings"][s]["calibrate"]["attribute"], "at_grid_edge": False}
+                    for _ in grid["values"]] for s in grid["m0"]}
+        self.cal_grid = {"values": list(grid["values"]), "m0": dict(grid["m0"]), "rows": rows}
+
     def set_calibration(self, values: dict):
         for s, v in values.items():
             row = dict(self.calibrated.get(s) or {"attribute": self._p["settings"][s]["calibrate"]["attribute"]})
@@ -202,6 +246,156 @@ class RecalRunner(BM.Runner):
         key = (tuple(sorted(fitted.items())), self._calkey())
         return {a: self.cache[(a, key)] for a in arms}
 
+    # ---- checkpoint (owner, 13 Nov: a cap stop must not lose the finished tasks)
+    ckpt, ckpt_out = None, None       # {key: result JSON} loaded from --resume-from; the directory appended to
+    task_fn = staticmethod(BM._job_list)
+
+    def code_sha256(self) -> str:
+        from toolkit.engines.contract import code_fingerprint
+        return code_fingerprint(self.engine)
+
+    def checkpoint(self, out_dir: str | None = None, resume_from: str | None = None):
+        """Append each finished engine task to <out_dir>/CACHE_NAME as it lands; reuse the matching tasks of
+        <resume_from>/CACHE_NAME (load_cache: refused rows fail closed), so a relaunch runs only the missing ones."""
+        rows = []
+        self.ckpt = load_cache(resume_from, self.code_sha256(), rows) if resume_from else {}
+        if out_dir:      # Codex r1 P2: a fresh file of the accepted rows (atomic), never appended after a cut row
+            os.makedirs(out_dir, exist_ok=True)
+            _safe_io().write_nofollow(out_dir, CACHE_NAME, "".join(r + "\n" for r in rows).encode(), atomic=True)
+            self.ckpt_out = out_dir
+
+    def _map(self, jobs, chunk: int = 300):
+        """benchmark.Runner._map's tasks (the same grouping and order within a task), each run once: a task in the
+        checkpoint is read from it, a new one is appended as it finishes. Every result passes through its JSON form,
+        so a resumed run returns exactly what an uninterrupted one does."""
+        if self.ckpt is None:
+            return BM.Runner._map(self, jobs, chunk)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        by = {}
+        for n, j in enumerate(jobs):
+            ref, config, _, unit, _, horizon, seed = j
+            by.setdefault(_jdump([ref, config, unit, horizon, seed]) if self._shared(j) else n, []).append(j)
+        tasks, code = list(by.values()), self.code_sha256()
+        canon = [json.loads(_jdump(t)) for t in tasks]
+        keys = [_task_key(code, t) for t in canon]
+        res = [json.loads(self.ckpt[k]) if k in self.ckpt else None for k in keys]
+
+        def land(i, r):
+            s = _rdump(r)
+            res[i] = json.loads(s)
+            self.ckpt[keys[i]] = s
+            if self.ckpt_out:
+                with _safe_io().open_append_nofollow(self.ckpt_out, CACHE_NAME) as fh:
+                    fh.write(json.dumps({"key": keys[i], "code_sha256": code, "task": canon[i], "result": res[i],
+                                         "result_sha256": _sha(s)}) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        todo = [i for i, r in enumerate(res) if r is None]
+        self.ran_tasks = getattr(self, "ran_tasks", 0) + len(todo)
+        if self.workers <= 1 or len(todo) <= 1:
+            for i in todo:
+                land(i, self.task_fn(tasks[i]))
+        else:
+            for c in range(0, len(todo), chunk):
+                part = todo[c:c + chunk]
+                with ProcessPoolExecutor(min(self.workers, len(part)), **BM._pool_kw()) as ex:
+                    fut = {ex.submit(self.task_fn, tasks[i]): i for i in part}
+                    for f in as_completed(fut):
+                        land(fut[f], f.result())
+                print(f"  ran {min(c + chunk, len(todo))}/{len(todo)} engine tasks ({len(tasks) - len(todo)} from "
+                      "the checkpoint)", flush=True)
+        done = {id(j): o for t, r in zip(tasks, res) for j, o in zip(t, r)}
+        return [done[id(j)] for j in jobs]
+
+
+CACHE_NAME = "netfit_cache.jsonl"
+
+
+def fetch_cache(blob: str, digest: str, dest: str, account: str | None = None, store=None) -> str:
+    """Download a stored checkpoint (CACHE_NAME) into `dest` and return `dest`, refused (ValueError) unless its bytes'
+    sha256 is `digest`; load_cache then checks every row."""
+    import hashlib
+    if store is None:
+        if os.path.join(ROOT, "scripts") not in sys.path:
+            sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import results_store as store
+    os.makedirs(dest, exist_ok=True)
+    path = os.path.join(dest, CACHE_NAME)
+    store.download(blob, path, account)
+    got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if got != digest:              # refused; the file stays in the scratch directory and nothing reads it
+        raise ValueError(f"checkpoint {blob}: sha256 {got} is not the recorded {digest}")
+    return dest
+
+
+def no_rerun(runner, what: str) -> None:
+    """Refuse (ValueError) once `runner` has run any engine task: a verification round reruns no design point."""
+    n = int(getattr(runner, "ran_tasks", 0) or 0)
+    if n:
+        raise ValueError(f"{what}: {n} engine task(s) were not in the checkpoint; a verification round reruns no "
+                         "design point (stopped before verifying)")
+
+
+def _safe_io():
+    if os.path.join(ROOT, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from lib import safe_io
+    return safe_io
+
+
+def _plain(x):
+    return x.tolist() if hasattr(x, "tolist") else repr(x)
+
+
+def _jdump(x) -> str:
+    return json.dumps(x, sort_keys=True, default=_plain)
+
+
+def _rdump(x) -> str:
+    return json.dumps(x, default=_plain)
+
+
+def _sha(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _task_key(code: str, task) -> str:
+    """A task's key: the engine code and every job's full parameter tuple (fitted values and the calibrated unit
+    attribute included, so the existing cache key's calibration is part of it)."""
+    return _sha(_jdump([code, task]))
+
+
+def load_cache(d: str, code: str, accepted: list | None = None) -> dict:
+    """{key: result JSON} of <d>/CACHE_NAME. Refused (ValueError, fail closed): no cache file; a malformed row; a row
+    from other engine code; a key that is not its task's; a result whose sha256 is not the recorded one. A last row
+    without its newline (cut by the stop) is dropped."""
+    p = os.path.join(d, CACHE_NAME)
+    if not os.path.isfile(p):
+        raise ValueError(f"--resume-from {d}: no cache file {CACHE_NAME}")
+    lines = open(p).read().split("\n")
+    if lines[-1]:
+        print(f"  {p}: dropped a last row cut before its newline", flush=True)
+    out = {}
+    for n, ln in enumerate(lines[:-1], 1):
+        try:
+            row = json.loads(ln)
+        except ValueError as ex:
+            raise ValueError(f"{p}: row {n} is malformed ({ex})") from ex
+        if not isinstance(row, dict):
+            raise ValueError(f"{p}: row {n} is malformed (not an object)")
+        if row.get("code_sha256") != code:
+            raise ValueError(f"{p}: row {n} is from engine code_sha256 {row.get('code_sha256')}, this engine's is {code}")
+        if row.get("key") != _task_key(code, row.get("task")):
+            raise ValueError(f"{p}: row {n}'s key is not its task's")
+        s = _rdump(row.get("result"))
+        if _sha(s) != row.get("result_sha256"):
+            raise ValueError(f"{p}: row {n}'s result does not match its result_sha256")
+        out[row["key"]] = s
+        if accepted is not None:      # the accepted rows as read (checkpoint() rewrites them)
+            accepted.append(ln)
+    return out
+
 
 def _task_s(k: int) -> float:
     """Laptop seconds of one engine task: a burn-in group of k arms of one setting at one point and seed."""
@@ -213,24 +407,32 @@ def _waves(n_tasks: int, vcpus: int, chunk: int = 300) -> int:
     return sum(-(-min(chunk, n_tasks - i) // vcpus) for i in range(0, n_tasks, chunk))
 
 
-def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPUS) -> dict:
+WAVE1_POINTS = 46 + VERIFY + 1        # wave 1's engine-evaluated points: design, verified sample points, chosen point
+
+
+def plan(pack: dict, verify: int = VERIFY, cal_n: int = 0, vcpus: int = VCPUS, wave2_n: int = WAVE2["n"],
+         wave1_n: int = 0, verify_round: bool = False) -> dict:
     """Run counts and the price of the allocated VM (review round 2): vcpus x the wall time of each _map wave
-    (calibration: cal_n calls of 42 single-arm tasks; design: one call; the chosen point: one call per training
-    setting; the sample: one call), at VM_FACTOR x the laptop task time, plus START_H and POOL_S per pool."""
+    (calibration: cal_n calls of 42 single-arm tasks, none when wave 1's grid is reused; design: the wave-2 points,
+    plus wave 1's when it runs here (a smoke); the chosen point: one call per training setting; the sample: one call),
+    at VM_FACTOR x the laptop task time, plus START_H and POOL_S per pool. Wave 1's points are not rerun."""
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = _fit_settings(pack)
     per_set = max(sum(1 for a in arms if pack["arms"][a]["setting"] == s) for s in settings)
-    npts, ns = int(fj["design"]["n"]) + 1, len(pack["seeds"])
+    cached = int(wave2_n) if verify_round else 0       # a verification round reads wave 2's points from its cache
+    wave2_n = 0 if verify_round else wave2_n
+    npts, ns = int(wave1_n) + int(wave2_n), len(pack["seeds"])
     grid = sum(len(pack["settings"][s]["calibrate"]["grid"]) for s in settings if pack["settings"][s].get("calibrate"))
     cal_tasks = grid * min(2, ns)
     cal = cal_n * cal_tasks                         # the calibration grid in CAL_PARAM; each run its own burn-in
     pts = npts + 1 + verify                         # design, the chosen value, the verified joint-sample points
     groups, sims = pts * len(settings) * ns, pts * len(arms) * ns
     cpu_h = (groups * GROUP_S + sims * ARM_S + cal * (GROUP_S + ARM_S)) / 3600
-    waves = {"calibration": cal_n * _waves(cal_tasks, vcpus), "design": _waves(npts * len(settings) * ns, vcpus),
+    dtasks = npts * len(settings) * ns
+    waves = {"calibration": cal_n * _waves(cal_tasks, vcpus), "design": _waves(dtasks, vcpus) if dtasks else 0,
              "chosen": len(settings) * _waves(ns, vcpus), "sample": _waves(verify * len(settings) * ns, vcpus)}
-    pools = cal_n + len(settings) + sum(-(-n // 300) for n in (npts * len(settings) * ns, verify * len(settings) * ns))
+    pools = cal_n + len(settings) + sum(-(-n // 300) for n in (dtasks, verify * len(settings) * ns))
     lap = waves["calibration"] * _task_s(1) + (waves["design"] + waves["chosen"] + waves["sample"]) * _task_s(per_set)
     wall = [lap * f / 3600 + START_H + pools * POOL_S / 3600 for f in VM_FACTOR]
     vh = [vcpus * w for w in wall]
@@ -238,22 +440,26 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
     return {"params": fj["params"], "targets_train": fj["targets"], "held_out_untouched": held,
             "not_fitted": sorted(set(NET_PARAMS) - set(fj["params"])), "calibration_depends_on": sorted(
                 calibration_params(pack)), "arms": arms, "settings": settings,
-            "design_points": npts, "verified_sample_points": verify, "seeds": ns, "calibration_runs": cal,
+            "design_points": int(wave2_n), "design_points_from_cache": cached, "wave1_points_run": int(wave1_n),
+            "reused_points": 0 if wave1_n else WAVE1_POINTS, "calibration_reused": not cal_n,
+            "verified_sample_points": verify, "seeds": ns, "calibration_runs": cal,
             "arm_runs": sims + cal, "burn_in_groups": groups + cal, "cpu_work_hours": round(cpu_h, 1),
             "vcpus": vcpus, "waves": waves, "wall_hours": [round(w, 2) for w in wall],
             "vm_vcpu_hours": [round(v, 1) for v in vh],
             "usd": [round(vh[0] * USD_PER_VCPU_H[0], 1), round(vh[1] * USD_PER_VCPU_H[1], 1)],
+            "usd_real": [round(v * USD_REAL_PER_VCPU_H, 1) for v in vh],
             "launch": " ".join(launch_command(vcpus))}
 
 
 def launch_command(vcpus: int = VCPUS) -> list:
-    """The launch (the lead session runs it after the owner's approval): one VM through cloud/vm_job.py, whose job
+    """The verification-round launch (owner, 14 Nov: plan <= $10, cap $15; wave 2's was cap $30): one VM through cloud/vm_job.py, whose job
     meter stops the VM at --cap-usd in USD (cloud/budget.py); the fit writes a copy of its output under $JOB_OUT."""
-    return ["python3", "cloud/vm_job.py", "run", "f6-netfit", "net-effect-fit", "--tree", ".",
-            "--store", "outputs/_engine/net_effect_fit", "--cap-usd", f"{CAP_USD:g}", "--budget-scope", "f6",
-            "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--",
+    return ["python3", "cloud/vm_job.py", "run", "f6-refit-netfit-v017r2", "net-effect-fit", "--tree", ".",
+            "--store", "outputs/_engine/net_effect_fit/round2", "--store-account", "modelingagentic", "--cap-usd", "15",
+            "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--",
             "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
-            "--approved", "owner 2026-11-13: fit approved, hard cap 25 USD", "--workers", str(vcpus)]
+            "--approved", "owner 2026-11-14: verification round 2, noise-aware rule, cap 15 USD", "--margin-loo",
+            "--verify-round", "--resume-account", "modelingagentic", "--workers", str(vcpus)]
 
 
 def target_bands(pack: dict) -> dict:
@@ -263,18 +469,42 @@ def target_bands(pack: dict) -> dict:
 
 
 def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarray, seed: int,
-                 n_sample: int = SAMPLE) -> dict:
+                 n_sample: int = SAMPLE, margin: dict | None = None, support: list | None = None) -> dict:
     """Each target's quadratic surrogate (as joint-v1) on dense candidates; the region where every target is in band:
     its share of the box, its marginal hull and box-edge flags (from every accepted candidate), and a joint sample of
-    its points (parameter sets, not marginals)."""
+    its points (parameter sets, not marginals). `margin` {target: log margin} (owner, 13 Nov, off by default): a
+    candidate is accepted only if its surrogate value is inside each band by the margin (in log); the in-band
+    candidates it excludes are recorded (count, share, ranges), a declared limitation of the sample. `support`: a list
+    of boxes {name: [lo, hi]} (the waves' design boxes); candidates outside their union are dropped, so the surrogate
+    is never extrapolated past the engine-evaluated points (wave 2's finding)."""
     cand = BM._candidates(X.shape[1], seed)
+    n_all, sup_extra = len(cand), {}
+    if support is not None:
+        keep = in_support(cand, support, names, box)
+        sup_extra = {"support": {"boxes": support, "share_of_box": round(float(keep.mean()), 4),
+                                 "rule": "candidates inside the union of the waves' design boxes"}}
+        cand = cand[keep]
     Fc = BM._quad_features(cand)
-    m = np.ones(len(cand), bool)
+    m, plain = np.ones(len(cand), bool), np.ones(len(cand), bool)
     for t, y in Y.items():
         coef, _ = BM._quad_fit(X, np.log(np.maximum(np.asarray(y, float), 1e-12)))
-        v = np.exp(Fc @ coef)
-        m &= (v >= bands[t][0]) & (v <= bands[t][1])
+        lv = Fc @ coef
+        lo, hi = np.log(bands[t][0]), np.log(bands[t][1])
+        plain &= (lv >= lo) & (lv <= hi)
+        mt = float((margin or {}).get(t, 0.0))
+        m &= (lv >= lo + mt) & (lv <= hi - mt)
     to = lambda c: {k: round(float(box[i, 0] + c[i] * (box[i, 1] - box[i, 0])), 6) for i, k in enumerate(names)}  # noqa
+    scale = lambda a: {k: [round(float(box[i, 0] + a[:, i].min() * (box[i, 1] - box[i, 0])), 6),  # noqa: E731
+                           round(float(box[i, 0] + a[:, i].max() * (box[i, 1] - box[i, 0])), 6)]
+                       for i, k in enumerate(names)} if len(a) else None
+    extra = {}
+    if margin is not None:
+        out = plain & ~m
+        extra = {"margin": {"rule": "surrogate value inside each band by the target's local leave-one-out error (log)",
+                            "by_target": {t: round(float(v), 6) for t, v in margin.items()},
+                            "n_in_band_without_margin": int(plain.sum()), "n_excluded": int(out.sum()),
+                            "share_excluded": round(float(out.sum() / max(plain.sum(), 1)), 4),
+                            "in_band_hull_without_margin": scale(cand[plain]), "excluded_ranges": scale(cand[out])}}
     acc = cand[m]
     hull = ({k: [round(float(box[i, 0] + acc[:, i].min() * (box[i, 1] - box[i, 0])), 6),
                  round(float(box[i, 0] + acc[:, i].max() * (box[i, 1] - box[i, 0])), 6)] for i, k in enumerate(names)}
@@ -286,8 +516,198 @@ def joint_region(X: np.ndarray, Y: dict, bands: dict, names: list, box: np.ndarr
     idx = np.flatnonzero(m)
     if len(idx) > n_sample:
         idx = np.sort(np.random.default_rng(seed).choice(idx, n_sample, replace=False))
-    return {"share_of_box": round(float(m.mean()), 4), "n_accepted": int(m.sum()), "hull": hull, "at_box_edge": edge,
-            "correlation": {"names": names, "matrix": corr}, "sample": [to(cand[i]) for i in idx]}
+    return {"share_of_box": round(float(m.sum() / n_all), 4), "n_accepted": int(m.sum()), "hull": hull, "at_box_edge": edge,
+            "correlation": {"names": names, "matrix": corr}, **extra, **sup_extra, "sample": [to(cand[i]) for i in idx]}
+
+
+def in_support(cand: np.ndarray, support: list, names: list, box: np.ndarray) -> np.ndarray:
+    """Mask of normalised candidates inside the union of the boxes in `support` (parameter units)."""
+    theta = box[:, 0] + cand * (box[:, 1] - box[:, 0])
+    m = np.zeros(len(cand), bool)
+    for bx in support:
+        lo = np.array([bx[k][0] for k in names], float) - 1e-9
+        hi = np.array([bx[k][1] for k in names], float) + 1e-9
+        m |= np.all((theta >= lo) & (theta <= hi), axis=1)
+    return m
+
+
+def loo_residuals(X: np.ndarray, y) -> np.ndarray:
+    """Each point's leave-one-out residual of the quadratic surrogate (as benchmark._quad_fit computes its RMSE)."""
+    F, y = BM._quad_features(X), np.asarray(y, float)
+    out = []
+    for i in range(len(y)):
+        k = np.arange(len(y)) != i
+        c, *_ = np.linalg.lstsq(F[k], y[k], rcond=None)
+        out.append(float(F[i] @ c - y[i]))
+    return np.asarray(out)
+
+
+def local_loo(Ylog: dict, X: np.ndarray, local) -> dict:
+    """{target: root mean square leave-one-out residual of its log surrogate over the `local` points} (the margin)."""
+    local = np.asarray(local, bool)
+    return {t: round(float(np.sqrt(np.mean(np.square(loo_residuals(X, y)[local])))), 6) for t, y in Ylog.items()}
+
+
+def wave2_box(hull: dict, old: dict, new: dict, margin: float) -> dict:
+    """Wave 1's accepted hull widened by `margin` of its width on each side, clipped to the new box; a side where the
+    hull reached the old box's edge (within 1e-3 of the box width) goes to the new box's edge."""
+    out = {}
+    for k, (lo, hi) in hull.items():
+        (olo, ohi), (nlo, nhi), w = old[k], new[k], hi - lo
+        tol = 1e-3 * (ohi - olo)
+        a = nlo if lo <= olo + tol else max(nlo, lo - margin * w)
+        b = nhi if hi >= ohi - tol else min(nhi, hi + margin * w)
+        out[k] = [round(float(a), 6), round(float(b), 6)]
+    return out
+
+
+def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dict:
+    """Wave 1's engine results, for reuse (no engine run repeated): every engine-evaluated point with its target values
+    (46 design points, the verified sample points, the chosen point) and the calibration grid. Refused (ValueError,
+    fail closed) unless the file's sha256 is `digest`, it is a full run (not a smoke) of this script, its engine
+    identity (name, code, parameters, configuration) is this engine's, the pack is the one it ran on, its seeds and
+    targets are the pack's, its calibration grid is this script's (CAL_N points across the kill shift's box) and does
+    not clamp, and every point has a value for every target."""
+    import hashlib
+    from toolkit.engines.contract import engine_identity
+    data = open(path, "rb").read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError(f"wave 1 {path}: sha256 {hashlib.sha256(data).hexdigest()} is not the recorded {digest}")
+    doc = yaml.safe_load(data)
+    if not isinstance(doc, dict) or doc.get("producer") != BM.PRODUCER or doc.get("smoke") is not False:
+        raise ValueError(f"wave 1 {path}: not a full (non-smoke) output of net_effect_fit.py run")
+    have, want = doc.get("engine_identity") or {}, engine_identity(engine)
+    for k in ("name", "code_sha256", "params_sha256", "config_sha256"):
+        if have.get(k) != want[k]:
+            raise ValueError(f"wave 1 {path}: engine {k} {have.get(k)}, this engine's is {want[k]}")
+    if base != yaml.safe_load(open(PACK)):
+        raise ValueError(f"wave 1 {path}: the pack given is not pack.yaml")
+    if _pack_digest(PACK) != WAVE1_PACK_SHA256:
+        raise ValueError(f"wave 1 {path}: pack.yaml (sha256 {_pack_digest(PACK)}) is not the pack wave 1 ran on "
+                         f"({WAVE1_PACK_SHA256})")
+    fr, train = doc.get("fit_rule") or {}, split(base)[0]
+    if list(fr.get("seeds") or []) != list(base["seeds"]):
+        raise ValueError(f"wave 1 {path}: seeds {fr.get('seeds')}, the pack's are {base['seeds']}")
+    if list(fr.get("targets") or []) != train:
+        raise ValueError(f"wave 1 {path}: targets {fr.get('targets')}, the pack's are {train}")
+    cg = doc.get("calibration_grid") or {}
+    grid = [float(v) for v in np.linspace(*NET_PARAMS[CAL_PARAM][1], CAL_N)]
+    vals = [float(v) for v in cg.get(CAL_PARAM) or []]
+    if len(vals) != len(grid) or any(abs(a - b) > 1e-9 for a, b in zip(vals, grid)):
+        raise ValueError(f"wave 1 {path}: calibration grid {vals} is not this script's {grid}")
+    if cg.get("at_grid_edge") != []:
+        raise ValueError(f"wave 1 {path}: the calibration grid clamps at its edge for {cg.get('at_grid_edge')}")
+    m0 = cg.get("m0") or {}
+    if sorted(m0) != _fit_settings(base) or any(len(v) != CAL_N for v in m0.values()):
+        raise ValueError(f"wave 1 {path}: calibration grid m0 for {sorted(m0)}, the fit's sites are "
+                         f"{_fit_settings(base)}")
+    des, jr = doc.get("design") or {}, doc.get("joint_region") or {}
+    ver = jr.get("verified") or {}
+    comp = des.get("computed") or {}
+    at = lambda t, i: comp[t][i] if isinstance(comp.get(t), list) and i < len(comp[t]) else None  # noqa: E731
+    pts = [(x, {t: at(t, i) for t in train}) for i, x in enumerate(des.get("x") or [])]
+    pts += [(p.get("point"), p.get("computed") or {}) for p in ver.get("points") or []]
+    ch = (ver.get("chosen") or {}).get("point")
+    pts += [(ch, {t: (doc.get("verification") or {}).get(t, {}).get("computed") for t in train})]
+    names = list(WAVE1_BOX)
+    out = []
+    for x, y in pts:
+        if not isinstance(x, dict) or sorted(x) != sorted(names) or any(
+                not isinstance(y.get(t), (int, float)) or not y[t] > 0 for t in train):
+            raise ValueError(f"wave 1 {path}: a point without its result for every target: {x} {y}")
+        out.append({"x": {k: float(x[k]) for k in names}, "wave": 1, "computed": {t: float(y[t]) for t in train}})
+    return {"path": path, "sha256": digest, "points": out, "hull": jr.get("hull"), "at_grid_edge": [],
+            "calibration_grid": {"values": vals, "m0": {s: [float(v) for v in m0[s]] for s in m0}}}
+
+
+def _pack_digest(path: str) -> str:
+    import hashlib
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], seed: int = WAVE2["seed"],
+              support: list | None = None, cand_seed: int | None = None, after_design=None) -> dict:
+    """The joint fit on two waves (rule joint-v1-wave2): joint-v1's steps (quadratic surrogate of each target's log
+    value, argmin of (n out of band, band-scaled squared log error) on the dense candidates, the range, verification at
+    the chosen value) on wave 1's reused points plus `n` new LHS points in `box2`; only the new points and the chosen
+    point run on the engine. Returns benchmark.fit_joint's keys; the design records each point's wave."""
+    import itertools
+    spec = pack["fit_joint"]
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    names, targets = list(spec["params"]), list(spec["targets"])
+    box = np.array([spec["params"][k] for k in names], float)
+    d = len(names)
+    to_theta = lambda x: {k: round(float(box[j, 0] + x[j] * (box[j, 1] - box[j, 0])), 6) for j, k in enumerate(names)}  # noqa: E731
+    b2 = np.array([box2[k] for k in names], float)
+    new = [{k: round(float(b2[j, 0] + u[j] * (b2[j, 1] - b2[j, 0])), 6) for j, k in enumerate(names)}
+           for u in BM.lhs(int(n), d, int(seed))]
+    arms = sorted({a for t in targets for a in BM._arms_of(byid[t]["estimand"])})
+    t0 = time.time()
+    runner.prefetch(arms, new)
+    print(f"wave 2: {len(new)} design points x {len(arms)} arms x {len(runner.seeds)} seeds in {time.time() - t0:.0f}s"
+          f" (wave 1: {len(wave1['points'])} points reused)", flush=True)
+    Y2 = {t: [float(runner.evaluate(byid[t], th)["computed"]) for th in new] for t in targets}
+    if after_design is not None:
+        after_design()
+    thetas = [p["x"] for p in wave1["points"]] + new
+    wave = [1] * len(wave1["points"]) + [2] * len(new)
+    Y = {t: np.array([p["computed"][t] for p in wave1["points"]] + Y2[t]) for t in targets}
+    X = np.array([[(th[k] - box[j, 0]) / (box[j, 1] - box[j, 0]) for j, k in enumerate(names)] for th in thetas])
+    surr, cand = {}, BM._candidates(d, int(seed if cand_seed is None else cand_seed))
+    if support is not None:          # the choice and its range stay where engine-evaluated points are
+        cand = cand[in_support(cand, support, names, box)]
+    Fc = BM._quad_features(cand)
+    pred, inband = {}, {}
+    for t in targets:
+        coef, loo = BM._quad_fit(X, np.log(np.maximum(Y[t], 1e-12)))
+        surr[t] = {"loo_rmse_log": round(loo, 4), "n_points": len(thetas)}
+        pred[t] = np.exp(Fc @ coef)
+        lo, hi = byid[t]["band"]
+        inband[t] = (pred[t] >= lo) & (pred[t] <= hi)
+    feasible = [t for t in targets if inband[t].any()]
+    conflicts = [[a, b] for a, b in itertools.combinations(feasible, 2) if not (inband[a] & inband[b]).any()]
+    n_out = sum((~inband[t]).astype(int) for t in feasible) if feasible else np.zeros(len(cand))
+    L = sum(np.array([BM._loss(byid[t], v) for v in pred[t]]) for t in feasible) if feasible else np.zeros(len(cand))
+    j = int(np.argmin(n_out * 1e6 + L))
+    best = to_theta(cand[j])
+    region = cand[n_out == 0] if (n_out == 0).any() else cand[L <= max(len(feasible), 1)]
+    if not len(region):
+        region = cand[j:j + 1]
+    rng_ = {k: (round(float(box[i, 0] + region[:, i].min() * (box[i, 1] - box[i, 0])), 4),
+                round(float(box[i, 0] + region[:, i].max() * (box[i, 1] - box[i, 0])), 4)) for i, k in enumerate(names)}
+    settings = sorted({pack["arms"][a]["setting"] for a in arms})
+    runner.calibrate_settings(best, settings)
+    cal_best = {s: round(runner.calibrated[s]["value"], 4) for s in settings if s in runner.calibrated}
+    runner.prefetch(arms, [best])
+    ver = {}
+    for t in targets:
+        r = runner.evaluate(byid[t], best)
+        ver[t] = {"computed": round(r["computed"], 4), "predicted": round(float(pred[t][j]), 4),
+                  "in_band": r["in_band"], "seed_min": r.get("seed_min"), "seed_max": r.get("seed_max"),
+                  "per_seed": list(r.get("per_seed") or [])}
+    params = {k: {"value": best[k], "lo": min(rng_[k][0], best[k]), "hi": max(rng_[k][1], best[k]),
+                  "box": [float(box[i, 0]), float(box[i, 1])], "benchmarks": targets} for i, k in enumerate(names)}
+    for k, v in params.items():
+        print(f"fit_waves {k}: {v['value']} [{v['lo']}, {v['hi']}]", flush=True)
+    return {"parameters": params,
+            "fit_rule": {"version": "joint-v1-wave2", "description": JOINT_WAVE2, "seeds": list(runner.seeds),
+                         "design_points": len(thetas), "wave2_points": len(new), "wave2_seed": int(seed),
+                         "wave2_box": box2, "support": support, "targets": targets},
+            "feasibility": {"feasible_in_box": feasible, "infeasible_in_box": [t for t in targets if t not in feasible],
+                            "conflicting_pairs": conflicts,
+                            "all_feasible_in_band_at_value": bool(feasible) and all(ver[t]["in_band"] for t in feasible),
+                            "surrogate_all_feasible_in_band": bool(n_out[j] == 0),
+                            "disproved_by_verification": [t for t in feasible if inband[t][j] and not ver[t]["in_band"]],
+                            "feasibility_verified": all(ver[t]["in_band"] == bool(inband[t][j]) for t in targets)},
+            "surrogate": surr, "calibration": {"at_fitted_value": cal_best}, "verification": ver,
+            "design": {"x": [dict(th) for th in thetas], "wave": wave,
+                       "computed": {t: [round(float(v), 4) for v in Y[t]] for t in targets}}}
+
+
+JOINT_WAVE2 = ("joint-v1's surrogate, choice, range and verification on two waves: wave 1's engine-evaluated points "
+               "(reused from its output) plus an LHS of new points in wave 1's accepted hull widened by a stated "
+               "margin (to the new box edge where the hull reached the old box edge); every point calibrated by "
+               "interpolation on wave 1's calibration grid in net_kill_shift")
 
 
 def calibration_ok(cal: dict) -> list:
@@ -296,13 +716,118 @@ def calibration_ok(cal: dict) -> list:
                   if not abs(float(c["achieved"]) / float(c["target"]) - 1.0) <= CAL_TOL)
 
 
-def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=()) -> tuple[dict, int]:
-    """The acceptance gate (review rounds 1-2). The sample is `verified` (code 0) only if every verified point and
-    the chosen point keep every target in band, their control arms are within CAL_TOL of the calibration targets,
-    the chosen point is not disproved, and no site's calibration grid clamps at its edge. Otherwise the sample moves
-    to `sample_unverified`, `sample` is emptied, the reasons are recorded, and the code is 2."""
-    failed = [c["point"] for c in checked if not c["all_in_band"] or calibration_ok(c.get("calibration_check"))]
-    why = [f"verified point out of band or off calibration: {p}" for p in failed]
+Z95 = 1.96
+ACCEPTANCE_RULE = ("owner, 14 Nov: a verified point, and the chosen point, is in band for a target when the 95% interval "
+                   "of its seed mean overlaps the target's band. The seed mean is the geometric mean over the run's "
+                   "seeds, the statistic of the target's `computed` value; its interval is exp(mean(log v) +- 1.96 x "
+                   "sd(log v) / sqrt(n_seeds)) (sd with n - 1). The point must hold exactly one finite, positive value "
+                   "per seed the run declares (pack.yaml's seeds, which the run records); a missing, extra or "
+                   "duplicate seed, or a target without values, fails closed. Control arms within 10% and no "
+                   "calibration-grid clamp are unchanged")
+ACCEPTANCE_STATISTIC = ("geometric mean over seeds; 95% interval exp(mean(log v) +- 1.96 sd(log v)/sqrt(n)), "
+                        "one value per declared seed")
+
+
+def declared_seeds(seeds) -> list:
+    """The run's declared seeds as a list of distinct integers; ValueError otherwise (fail closed)."""
+    if not isinstance(seeds, (list, tuple)) or not seeds:
+        raise ValueError(f"no declared seeds ({seeds!r})")
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in seeds):
+        raise ValueError(f"declared seeds must be integers ({list(seeds)!r})")
+    dup = sorted({x for x in seeds if list(seeds).count(x) > 1})
+    if dup:
+        raise ValueError(f"duplicate declared seeds {dup} in {list(seeds)}")
+    return list(seeds)
+
+
+def seed_interval(values, n_seeds: int) -> tuple[float, float] | None:
+    """(lo, hi) of the seed geometric mean's 95% interval, exp(mean(log v) +- Z95 sd(log v)/sqrt(n)); None unless
+    there are exactly `n_seeds` (>= 2) values, all finite and positive."""
+    if not isinstance(values, (list, tuple)):
+        return None
+    try:
+        v = [float(x) for x in values]
+        n_seeds = int(n_seeds)
+    except (TypeError, ValueError):
+        return None
+    if n_seeds < 2 or len(v) != n_seeds or not all(np.isfinite(v)) or min(v) <= 0:
+        return None
+    lg = np.log(v)
+    m, h = float(np.mean(lg)), Z95 * float(np.std(lg, ddof=1)) / float(np.sqrt(len(v)))
+    return float(np.exp(m - h)), float(np.exp(m + h))
+
+
+def ci_in_band(values, band, n_seeds: int) -> bool:
+    """ACCEPTANCE_RULE for one target: the seed geometric mean's 95% interval overlaps the band."""
+    iv = seed_interval(values, n_seeds)
+    return iv is not None and iv[0] <= float(band[1]) and iv[1] >= float(band[0])
+
+
+def _per_seed(p) -> dict:
+    per = (p or {}).get("per_seed") if isinstance(p, dict) else None
+    return per if isinstance(per, dict) else {}
+
+
+def seed_count_errors(p: dict, bands: dict, seeds) -> list:
+    """Targets whose seed values are not one per declared seed, as readable reasons."""
+    per, n = _per_seed(p), len(seeds) if isinstance(seeds, (list, tuple)) else 0
+    out = []
+    for t in bands:
+        v = per.get(t)
+        k = len(v) if isinstance(v, (list, tuple)) else 0
+        if k != n:
+            out.append(f"{t}: {k} seed values for {n} declared seeds")
+    return out
+
+
+def point_in_band(p: dict, bands: dict, seeds) -> tuple[bool, dict]:
+    """(every target in band under ACCEPTANCE_RULE, {target: [interval lo, hi] or None}) from the point's own seed
+    evidence `per_seed` {target: [values]}, one value per declared seed in `seeds`; a target without exactly that
+    evidence, or an invalid seed declaration, fails the point."""
+    try:
+        n = len(declared_seeds(seeds))
+    except ValueError:
+        return False, {t: None for t in bands}
+    per = _per_seed(p)
+    ivs = {t: seed_interval(per.get(t) or [], n) for t in bands}
+    return all(ci_in_band(per.get(t) or [], b, n) for t, b in bands.items()), {
+        t: [round(v[0], 4), round(v[1], 4)] if v else None for t, v in ivs.items()}
+
+
+def pack_bands() -> dict:
+    """The fit's targets' bands from pack.yaml (the loader's replay uses these, never bands written in the file)."""
+    return target_bands(build_pack(yaml.safe_load(open(PACK))))
+
+
+def pack_seeds() -> list:
+    """The fit's seeds from pack.yaml (the loader's replay uses these; the file's recorded seeds must match)."""
+    return list(build_pack(yaml.safe_load(open(PACK)))["seeds"])
+
+
+def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(), bands: dict | None = None,
+             seeds=None) -> tuple[dict, int]:
+    """The acceptance gate (review rounds 1-2; owner, 14 Nov: ACCEPTANCE_RULE). The sample is `verified` (code 0)
+    only if every verified point and the chosen point are in band for every target under the rule, from their own
+    seed evidence (the summary flags are not evidence), their control arms are within CAL_TOL of the calibration
+    targets, and no site's calibration grid clamps at its edge. `bands`: the targets' bands (default pack.yaml's);
+    `seeds`: the run's declared seeds, one seed value each per target (default pack.yaml's).
+    Otherwise the sample moves to `sample_unverified`, `sample` is emptied, the reasons are recorded, and the code is
+    2. run() and load_posterior's replay both call this function."""
+    bands = pack_bands() if bands is None else bands
+    seeds = pack_seeds() if seeds is None else seeds
+    why = []
+    try:
+        declared_seeds(seeds)
+    except ValueError as ex:
+        why.append(f"the run's seeds cannot be checked against: {ex}")
+    for c in checked:
+        c["in_band_by_rule"], c["seed_mean_interval"] = point_in_band(c, bands, seeds)
+    failed = [c["point"] for c in checked if not c["in_band_by_rule"] or calibration_ok(c.get("calibration_check"))]
+    why += [f"verified point out of band (rule) or off calibration: {p}" for p in failed]
+    for c in checked:
+        if seed_count_errors(c, bands, seeds):
+            why.append(f"verified point without one seed value per declared seed at {c.get('point')}: "
+                       f"{seed_count_errors(c, bands, seeds)}")
     for c in checked:
         if calibration_ok(c.get("calibration_check")):
             why.append(f"control arms off target by more than {CAL_TOL:.0%} at {c['point']}: "
@@ -310,8 +835,12 @@ def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=())
     if chosen is None:
         why.append("the chosen point's verification is missing")
     else:
-        if not chosen.get("all_in_band") or chosen.get("disproved_by_verification"):
-            why.append(f"the chosen point fails its verification: {chosen.get('disproved_by_verification')}")
+        chosen["in_band_by_rule"], chosen["seed_mean_interval"] = point_in_band(chosen, bands, seeds)
+        if not chosen["in_band_by_rule"]:
+            why.append(f"the chosen point fails its verification under the rule: {chosen['seed_mean_interval']}")
+        if seed_count_errors(chosen, bands, seeds):
+            why.append(f"the chosen point lacks one seed value per declared seed: "
+                       f"{seed_count_errors(chosen, bands, seeds)}")
         if calibration_ok(chosen.get("calibration_check")):
             why.append(f"the chosen point's control arms are off target: {calibration_ok(chosen['calibration_check'])}")
     if grid_edge:
@@ -319,7 +848,10 @@ def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=())
     if not checked:
         why.append("no verified sample point")
     reg["verified"] = {"n": len(checked), "all_in_band": len(checked) - len(failed), "failed": failed,
-                       "points": checked, "chosen": chosen, "calibration_tolerance": CAL_TOL}
+                       "points": checked, "chosen": chosen, "calibration_tolerance": CAL_TOL,
+                       "acceptance_rule": ACCEPTANCE_RULE, "acceptance_statistic": ACCEPTANCE_STATISTIC,
+                       "seeds": list(seeds) if isinstance(seeds, (list, tuple)) else seeds,
+                       "bands": {t: list(b) for t, b in bands.items()}}
     reg["acceptance"] = why
     if why:
         reg["sample_status"] = "unverified" if why == ["no verified sample point"] else "invalid"
@@ -347,11 +879,14 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
 
 def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
-    pt = {"point": rows[0], "all_in_band": gate_ok, "calibration_check": {}}
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"all_in_band": True, "disproved_by_verification": [],
-                                                                "calibration_check": {}})
-    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []}), open(path, "w"),
-                   sort_keys=False)
+    ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
+    mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in ks]  # noqa: E731
+                     for t, (lo, hi) in pack_bands().items()}            # seed values around each band's middle
+    pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"per_seed": mid(1.0), "all_in_band": True,
+                                                                "disproved_by_verification": [], "calibration_check": {}})
+    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
+                            fit_rule={"seeds": pack_seeds()}), open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
@@ -381,13 +916,13 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     the engine name or code differs from `engine`; the sample is empty, or a row lacks a fitted parameter or holds a
     non-finite or non-numeric value; the acceptance gate fails when finalize() is replayed on the file's own evidence
     (verified points, which must be sample rows, the chosen point, the calibration grid's edge record), whatever its
-    summary fields say (Codex r1 P1-2); a column is not in `ranges`; a value is outside its priors.yaml card range
-    (whatever `ranges` says, Codex r1 P2-3) or its draw range."""
+    summary fields say (Codex r1 P1-2); a column is not in `ranges`; a value is outside its hard bounds (hard_bounds:
+    the priors.yaml range, whatever `ranges` says, Codex r1 P2-3, and the bounds the card's units imply). The values
+    of `ranges` are not a bound (owner, 14 Nov, f6-posterior-ranges): the sample's hull sets its columns' draw ranges
+    and design box (posterior_ranges)."""
     import copy as _copy
     import hashlib
-    import math
     from toolkit.engines.contract import engine_identity
-    from toolkit.spec import priors as PR
 
     def no(why):
         raise PosteriorRefused(f"net-effect posterior {path}: {why}")
@@ -424,9 +959,17 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             not isinstance(p, dict) or p.get("point") not in rows for p in pts):
         no("the fit's acceptance gate cannot be replayed: a calibration_grid.at_grid_edge record and verified points "
            "that are rows of the sample are needed")
+    seeds, fr = pack_seeds(), doc.get("fit_rule")
+    rec = fr.get("seeds") if isinstance(fr, dict) else None
+    try:
+        declared_seeds(rec)
+    except ValueError as ex:
+        no(f"the run's recorded seeds (fit_rule.seeds) are not a valid declaration: {ex}")
+    if rec != seeds:
+        no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
     try:
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
-                           edge)
+                           edge, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
@@ -437,19 +980,71 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
         no(f"{miss} are not varied by these draws (an engine-card or spec prior, or a fitted parameter under the "
            f"engine_parameters source, and not calibrated); the draws vary {sorted(ranges)}")
     X = np.asarray(X, float)
-    card = PR.load_card(engine)["priors"]
     for j, k in enumerate(names):
-        for lo, hi, what in ([(card[k].lo, card[k].hi, "priors.yaml range")] if k in card else []) + [
-                (*ranges[k], "draw range")]:
-            lo, hi = float(lo), float(hi)
-            tol = 1e-6 * max(1.0, hi - lo)          # the sample is rounded to 6 decimals
+        for lo, hi, what in hard_bounds(engine, [k], both=True).get(k, []):
+            tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
-                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its {what} [{lo}, {hi}]")
+                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
     return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
 
 
+# hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
+UNIT_BOUNDS = {"probability": (0.0, 1.0), "share": (0.0, 1.0), "days": (0.0, math.inf), "months": (0.0, math.inf),
+               "years": (0.0, math.inf)}
+DURATIONS = ("days", "months", "years")     # a margin may not take one to zero (Codex r2 P2: NaN effects at 0)
+
+
+def hard_bounds(engine, names, both: bool = False) -> dict:
+    """{name: (lo, hi, what)}: each parameter's hard bounds from the engine, never a fitted or spec range. Two sources:
+    the bounds its card units imply (UNIT_BOUNDS: a probability or share in [0, 1], a duration >= 0) and its
+    priors.yaml range, the support of the engine's prior (Codex r1 P2-3: a spec prior wider than the card does not
+    widen it). A parameter with neither has no entry. `both`: {name: [every bound]} for load_posterior's check;
+    otherwise the intersection."""
+    from toolkit.spec import priors as PR
+    card = PR.load_card(engine)["priors"]
+    units = {q.name: q.units for q in engine.parameters()}
+    out = {}
+    for k in names:
+        b = ([(*UNIT_BOUNDS[units[k]], f"card units {units[k]}")] if units.get(k) in UNIT_BOUNDS else []) + (
+            [(float(card[k].lo), float(card[k].hi), "priors.yaml range")] if k in card else [])
+        if b:
+            out[k] = b if both else (max(x[0] for x in b), min(x[1] for x in b), "; ".join(x[2] for x in b))
+    return out
+
+
+def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
+    """{name: (lo, hi)} of each column of a loaded, verified sample (load_posterior): its hull, each side widened by
+    `margin` x the hull's width and never past the column's hard bounds (`bounds`, hard_bounds). The single source of
+    the draw ranges and the emulator design box of the sample's columns (toolkit/analysis/uncertainty.py
+    net_effect_sample; owner, 14 Nov). Refused: a negative or non-numeric margin; a column without spread (a zero-width
+    design box cannot be emulated)."""
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) \
+            or not 0 <= margin <= 1:
+        raise ValueError(f"net-effect posterior margin {margin!r}: a share of the hull's width in [0, 1]")
+    X = np.asarray(ne["rows"], float)
+    out = {}
+    for j, k in enumerate(ne["names"]):
+        lo, hi = float(X[:, j].min()), float(X[:, j].max())
+        if not hi > lo:
+            raise PosteriorRefused(f"net-effect posterior: column {k} has no spread ({lo}): it cannot set a range")
+        if margin:      # never past a hard bound, never inside the hull (a row on a bound within its tolerance)
+            w = hi - lo
+            blo, bhi, what = (bounds or {}).get(k, (-math.inf, math.inf, ""))
+            lo, hi = min(lo, max(lo - margin * w, blo)), max(hi, min(hi + margin * w, bhi))
+            if lo <= 0 < X[:, j].min() and any(f"card units {u}" in what for u in DURATIONS):
+                raise PosteriorRefused(f"net-effect posterior: margin {margin} takes {k}, a duration, to {lo} (a zero "
+                                       "duration is not physical); use a smaller margin")
+        out[k] = (lo, hi)
+    return out
+
+
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
-        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None) -> int:
+        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None, resume_from: str | None = None,
+        margin_loo: bool = False, verify_round: bool = False, resume_account: str | None = None) -> int:
+    """Wave 2 of the fit (with `verify_round`, VERIFY_ROUND: wave 2's points read from its stored checkpoint, a new
+    joint sample verified): wave 1's points and calibration grid reused (load_wave1), WAVE2's points run, the surrogate
+    refitted on both, the joint region (with --margin-loo, inside each band by the local leave-one-out error), the
+    chosen and verified points run, and finalize()'s gate. A smoke runs a small wave 1 itself (fit_joint), then wave 2."""
     if os.path.basename(out_path) in PROTECTED:
         raise ValueError(f"net_effect_fit writes its own file, never {PROTECTED}")
     bad = check(pack, base)
@@ -457,34 +1052,83 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError("net_effect_fit: " + "; ".join(bad))
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
-    cal_n = 2 if smoke else CAL_N
-    q = plan(pack, verify, cal_n, vcpus or max(int(workers), 1))
-    if not smoke and q["usd"][1] > cap_usd:
-        raise ValueError(f"the plan's upper cost ${q['usd'][1]} on {q['vcpus']} vCPUs is above the cap ${cap_usd}")
+    nv = vcpus or max(int(workers), 1)
+    q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 1) if smoke else plan(
+        pack, verify, 0, nv, verify_round=verify_round)
+    if verify_round:
+        cap_usd = min(cap_usd, VERIFY_ROUND["plan_cap_usd"])
+    if not smoke and max(q["usd"][1], q["usd_real"][1]) > cap_usd:
+        raise ValueError(f"the plan's upper cost ${max(q['usd'][1], q['usd_real'][1])} on {q['vcpus']} vCPUs is above "
+                         f"the cap ${cap_usd}")
     if calibration_params(pack) != {CAL_PARAM}:
         raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
     runner = RecalRunner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
+    wave1 = None if smoke else load_wave1(WAVE1, eng, base)        # before any engine run: refused fails closed
+    if verify_round and not smoke:          # wave 2's engine results, under the sha256 recorded when it was stored
+        import tempfile
+        resume_from = fetch_cache(VERIFY_ROUND["cache_blob"], VERIFY_ROUND["cache_sha256"],
+                                  tempfile.mkdtemp(prefix="netfit_w2_"), resume_account)
+    ck_out = None if smoke else os.environ.get("JOB_OUT")    # the job's outputs: each finished task as it lands
+    if ck_out or resume_from:
+        runner.checkpoint(out_dir=ck_out, resume_from=resume_from)
     t0 = time.time()
     names = list(pack["fit_joint"]["params"])
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
-    centre = {k: float(box[i].mean()) for i, k in enumerate(names)}
-    runner.calibrate_grid(_fit_settings(pack), centre, cal_n)
-    grid_edge = sorted(s for s, rows in runner.cal_grid["rows"].items() if any(r.get("at_grid_edge") for r in rows))
-    fit = BM.fit_joint(pack, eng, runner)
+    bands = target_bands(pack)
+    if smoke:
+        runner.calibrate_grid(_fit_settings(pack), {k: float(box[i].mean()) for i, k in enumerate(names)}, 2)
+        grid_edge = sorted(s for s, rows in runner.cal_grid["rows"].items() if any(r.get("at_grid_edge") for r in rows))
+        f1 = BM.fit_joint(pack, eng, runner)
+        X1 = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
+                       for th in f1["design"]["x"]])
+        wave1 = {"path": None, "sha256": None, "hull": joint_region(X1, f1["design"]["computed"], bands, names, box,
+                                                                    int(pack["fit_joint"]["design"]["seed"]))["hull"],
+                 "points": [{"x": x, "wave": 1, "computed": {t: f1["design"]["computed"][t][i] for t in bands}}
+                            for i, x in enumerate(f1["design"]["x"])]}
+        old_box = {k: list(pack["fit_joint"]["params"][k]) for k in names}
+    else:
+        runner.use_grid(wave1["calibration_grid"])
+        grid_edge = list(wave1["at_grid_edge"])
+        old_box = WAVE1_BOX
+    new_box = {k: list(pack["fit_joint"]["params"][k]) for k in names}
+    box2 = wave2_box(wave1["hull"], old_box, new_box, WAVE2["margin"]) if wave1["hull"] else new_box
+    support = [old_box, box2]          # the waves' design boxes: candidates and the choice stay inside their union
+    rv = verify_round and not smoke
+    fit = fit_waves(pack, runner, wave1, box2, 3 if smoke else WAVE2["n"], WAVE2["seed"], support=support,
+                    cand_seed=VERIFY_ROUND["candidate_seed"] if verify_round else None,
+                    after_design=(lambda: no_rerun(runner, "wave 2's design")) if rv else None)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
-    reg = joint_region(X, fit["design"]["computed"], target_bands(pack), names, box,
-                       int(pack["fit_joint"]["design"]["seed"]))
+    margin = None
+    if margin_loo:      # owner, 13 Nov: the margin option; each target's leave-one-out error over the wave-2 box
+        inside = np.array([all(box2[k][0] - 1e-9 <= th[k] <= box2[k][1] + 1e-9 for k in names)
+                           for th in fit["design"]["x"]])
+        margin = local_loo({t: np.log(np.maximum(np.asarray(v, float), 1e-12))
+                            for t, v in fit["design"]["computed"].items()}, X, inside)
+    reg = joint_region(X, fit["design"]["computed"], bands, names, box, int(
+        VERIFY_ROUND["candidate_seed"] if verify_round else pack["fit_joint"]["design"]["seed"]), margin=margin,
+                       support=support)
+    waves = {"wave1": {"file": os.path.basename(WAVE1) if not smoke else None, "sha256": wave1["sha256"],
+                       "points_reused": 0 if smoke else len(wave1["points"]), "calibration_grid_reused": not smoke,
+                       "box": old_box, "accepted_hull": wave1["hull"]},
+             "wave2": {"box": box2, "n": 3 if smoke else WAVE2["n"], "seed": WAVE2["seed"],
+                       "hull_widening": WAVE2["margin"]},
+             "margin_loo": margin_loo,
+             "verify_round": ({k: VERIFY_ROUND[k] for k in ("n", "candidate_seed", "pick_seed", "cache_blob",
+                                                            "cache_sha256", "wave2_output_sha256")}
+                              if verify_round else None), "acceptance_rule": ACCEPTANCE_RULE}
     byid = {b["id"]: b for b in pack["benchmarks"]}
     ctrl = {s: next(a for a, c in pack["arms"].items() if c["setting"] == s and (c.get("package") or {}) ==
                     (pack["settings"][s]["calibrate"].get("arm_package") or {})) for s in _fit_settings(pack)}
     best = {k: v["value"] for k, v in fit["parameters"].items()}
     chosen = {"point": best, "all_in_band": all(v["in_band"] for v in fit["verification"].values()),
+              "per_seed": {t: list(v.get("per_seed") or []) for t, v in fit["verification"].items()},
               "disproved_by_verification": fit["feasibility"]["disproved_by_verification"],
               "calibration_check": _control_check(runner, pack, ctrl, best)}
     # re-run `verify` joint-sample points, each at its own interpolated calibration, as the design points were
-    rng = np.random.default_rng(int(pack["fit_joint"]["design"]["seed"]) + 1)
+    rng = np.random.default_rng(int(VERIFY_ROUND["pick_seed"] if verify_round
+                                    else int(pack["fit_joint"]["design"]["seed"]) + 1))
     pick = sorted(rng.choice(len(reg["sample"]), min(verify, len(reg["sample"])), replace=False).tolist()) \
         if reg["sample"] else []
     runner.prefetch(sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])}),
@@ -494,9 +1138,10 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         rows = {t: runner.evaluate(byid[t], reg["sample"][i]) for t in pack["fit_joint"]["targets"]}
         checked.append({"point": reg["sample"][i], "all_in_band": all(r["in_band"] for r in rows.values()),
                         "computed": {t: round(r["computed"], 4) for t, r in rows.items()},
+                        "per_seed": {t: list(r.get("per_seed") or []) for t, r in rows.items()},
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
-    reg, code = finalize(reg, checked, chosen, grid_edge)
-    doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims,
+    reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands, seeds=list(runner.seeds))
+    doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
                                      "at_grid_edge": grid_edge}, **fit)
@@ -536,9 +1181,10 @@ def _self_test() -> int:
         q["fit_joint"]["targets"].append(t)
         ok(any(f"{t} is held out" in x for x in check(q, base)), f"F1b a held-out benchmark ({t}) as a target is refused")
     ok(list(p["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill", "cfp_half"]
-       and "pbo" not in train_nets(base, train) and p["fit_joint"]["params"]["cfp_half"] == [547.5, 1277.5],
+       and "pbo" not in train_nets(base, train) and p["fit_joint"]["params"]["cfp_half"] == [270.0, 1650.0],
        "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets), cfp_kill, irs_kill and cfp_half "
-       "(owner, 13 Nov; box 1.5-3.5 y); the PBO parameters stay out: no training arm has a PBO net")
+       "(owner, 13 Nov; wave-2 box 270-1650 days, from the durability studies); the PBO parameters stay out: no "
+       "training arm has a PBO net")
     from toolkit.engines.malaria.engine import MalariaEngine
     from toolkit.spec import priors as PR
     e = MalariaEngine()
@@ -550,22 +1196,24 @@ def _self_test() -> int:
 
     def f4():
         q = plan(p)
-        npt = 45 + 1 + 1 + 12
         w = q["waves"]
+        n2 = WAVE2["n"]
         naive = q["cpu_work_hours"] * VM_FACTOR[1] * USD_PER_VCPU_H[1]
         q64 = plan(p, vcpus=64)
-        ok(q["design_points"] == 46 and q["seeds"] == 8 and len(q["arms"]) == 8
+        ok(q["design_points"] == n2 and q["reused_points"] == 46 + 12 + 1 and q["seeds"] == 8 and len(q["arms"]) == 8
            and q["settings"] == ["benin", "irs_added", "misungwi", "muleba"]
-           and q["calibration_runs"] == 5 * 21 * 2 and q["arm_runs"] == npt * 8 * 8 + q["calibration_runs"]
+           and q["calibration_runs"] == 0 and q["calibration_reused"] is True
+           and q["arm_runs"] == (n2 + 1 + 12) * 8 * 8
            and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held
-           and q["vcpus"] == VCPUS and w["calibration"] == 5 * -(-42 // VCPUS) and w["chosen"] == 4
-           and w["design"] == sum(-(-min(300, 1472 - i) // VCPUS) for i in range(0, 1472, 300))
-           and w["sample"] == sum(-(-min(300, 384 - i) // VCPUS) for i in range(0, 384, 300))
-           and q["usd"][1] > naive and q64["usd"][1] > q["usd"][1] and q["usd"][1] <= CAP_USD,
-           f"F4 (review P2) the price is allocated VM time: {q['vcpus']} vCPUs x the wall time of the calibration "
-           f"({w['calibration']}), design ({w['design']}), chosen-point ({w['chosen']}) and sample ({w['sample']}) "
-           f"waves plus start-up, {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-{q['usd'][1]} (cap ${CAP_USD}); the "
-           f"CPU-work estimate would say ${naive:.1f}; 64 vCPUs ${q64['usd'][1]}")
+           and q["vcpus"] == VCPUS and w["calibration"] == 0 and w["chosen"] == 4
+           and w["design"] == _waves(n2 * 4 * 8, VCPUS) and w["sample"] == _waves(12 * 4 * 8, VCPUS)
+           and q["usd"][1] > naive and len(q["usd_real"]) == 2 and q["usd_real"][1] < CAP_USD
+           and q["usd"][1] < CAP_USD and q64["usd"][1] > q["usd"][1],
+           f"F4 (wave 2) the plan prices only the runs not reused: {n2} wave-2 design points, the chosen point and 12 "
+           f"verified points ({q['arm_runs']} arm runs); wave 1's {q['reused_points']} evaluated points and its "
+           f"calibration grid are reused (0 calibration runs); {q['vm_vcpu_hours']} vCPU-h, ${q['usd'][0]}-"
+           f"{q['usd'][1]} on the VM price bound, ${q['usd_real'][0]}-{q['usd_real'][1]} at the measured $0.124 per "
+           f"vCPU-hour (cap ${CAP_USD}); the CPU-work estimate would say ${naive:.1f}; 64 vCPUs ${q64['usd'][1]}")
     case("F4", f4)
     # F5: a narrow trade-off (a + b = 1 +- 0.05) is kept by the joint sample and lost by independent marginal draws
     names, box = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
@@ -629,18 +1277,23 @@ def _self_test() -> int:
         reg = {"sample": [{"a": 0.1}, {"a": 0.2}], "hull": {"a": [0.1, 0.2]}}
         cal = lambda **kw: {s: {"target": t, "achieved": kw.get(s, t)} for s, t in  # noqa: E731
                             (("muleba", 0.55), ("misungwi", 0.458), ("benin", 2.06), ("irs_added", 0.40))}
-        pt = lambda a, ok_=True, **kw: {"point": {"a": a}, "all_in_band": ok_, "calibration_check": cal(**kw)}  # noqa
-        chosen_ok = {"all_in_band": True, "disproved_by_verification": [], "calibration_check": cal()}
+        bd = {"T": [0.4, 0.6]}
+        inb, outb = [0.5, 0.52, 0.48, 0.5], [0.9, 0.92, 0.88, 0.9]      # seed values: in band, far out of band
+        pt = lambda a, ok_=True, **kw: {"point": {"a": a}, "per_seed": {"T": inb if ok_ else outb},  # noqa: E731
+                                        "all_in_band": True, "calibration_check": cal(**kw)}
+        chosen_ok = {"per_seed": {"T": inb}, "all_in_band": True, "disproved_by_verification": [],
+                     "calibration_check": cal()}
+        fz = lambda c, ch, **kw: finalize(copy.deepcopy(reg), c, ch, bands=bd, seeds=[1, 2, 3, 4], **kw)  # noqa: E731
         runs = {
-            "good": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
-            "ratio": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, False)], chosen_ok), 2),
-            "misungwi 0.30 vs 0.458": (finalize(copy.deepcopy(reg), [pt(0.1), pt(0.2, misungwi=0.30)], chosen_ok), 2),
-            "muleba 0.15 vs 0.55": (finalize(copy.deepcopy(reg), [pt(0.1, muleba=0.15)], chosen_ok), 2),
-            "chosen disproved B10": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(
-                chosen_ok, all_in_band=False, disproved_by_verification=["B10"])), 2),
-            "chosen calibration": (finalize(copy.deepcopy(reg), [pt(0.1)], dict(chosen_ok, calibration_check=cal(
-                benin=1.5))), 2),
-            "grid at its edge": (finalize(copy.deepcopy(reg), [pt(0.1)], chosen_ok, grid_edge=["misungwi"]), 2),
+            "good": (fz([pt(0.1), pt(0.2, muleba=0.58)], chosen_ok), 0),
+            "ratio": (fz([pt(0.1), pt(0.2, False)], chosen_ok), 2),
+            "misungwi 0.30 vs 0.458": (fz([pt(0.1), pt(0.2, misungwi=0.30)], chosen_ok), 2),
+            "muleba 0.15 vs 0.55": (fz([pt(0.1, muleba=0.15)], chosen_ok), 2),
+            "chosen out of band (seed evidence)": (fz([pt(0.1)], dict(chosen_ok, per_seed={"T": outb})), 2),
+            "chosen calibration": (fz([pt(0.1)], dict(chosen_ok, calibration_check=cal(benin=1.5))), 2),
+            "grid at its edge": (fz([pt(0.1)], chosen_ok, grid_edge=["misungwi"]), 2),
+            "a summary flag is not evidence": (fz([dict(pt(0.1, False), all_in_band=True)], chosen_ok), 2),
+            "no seed evidence": (fz([{k: v for k, v in pt(0.1).items() if k != "per_seed"}], chosen_ok), 2),
         }
         bad = {k: (r[1], r[0]["sample_status"]) for k, (r, want) in runs.items()
                if r[1] != want or (want == 0) != (r[0]["sample_status"] == "verified")
@@ -654,11 +1307,13 @@ def _self_test() -> int:
 
     def f13():
         cmd = launch_command(VCPUS)
-        ok(cmd[:3] == ["python3", "cloud/vm_job.py", "run"] and cmd[cmd.index("--cap-usd") + 1] == "25"
-           and "--approved" in cmd and str(VCPUS) in cmd and cmd[cmd.index("--") + 1:][:2] == [
-               "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
-           f"F13 the launch goes through cloud/vm_job.py run with --cap-usd 25, so the job's USD meter stops the VM at "
-           f"the cap: {' '.join(cmd)}")
+        ok(cmd[:5] == ["python3", "cloud/vm_job.py", "run", "f6-refit-netfit-v017r2", "net-effect-fit"]
+           and cmd[cmd.index("--cap-usd") + 1] == "15" and cmd[cmd.index("--store-account") + 1] == "modelingagentic"
+           and cmd[cmd.index("--store") + 1] == "outputs/_engine/net_effect_fit/round2"
+           and "--approved" in cmd and "--margin-loo" in cmd and "--verify-round" in cmd and str(VCPUS) in cmd
+           and cmd[cmd.index("--") + 1:][:2] == ["python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py"],
+           f"F13 the verification-round launch goes through cloud/vm_job.py run with --cap-usd 15 and its own store "
+           f"prefix (wave 2's copies are kept), so the job's USD meter stops the VM at the cap: {' '.join(cmd)}")
     case("F13", f13)
 
     def f12():
@@ -672,6 +1327,93 @@ def _self_test() -> int:
            f"F12 (review P2) the hull and the box-edge flags come from every accepted candidate, not the 50-point "
            f"subsample ({r2['hull']}, edges {r2['at_box_edge']})")
     case("F12", f12)
+
+    def f16():
+        import tempfile
+        from toolkit.engines.contract import ToyEngine
+        hz = {"start": 0.0, "stop": 2.0, "window": [0.0, 2.0]}
+        jobs = [("toolkit.engines.contract:ToyEngine", {}, {"eff_a": 0.4 + 0.01 * i, "noise": 0.1}, {"x": 0.1 * i},
+                 {"a": i % 2}, hz, s) for i in range(6) for s in (1, 2)]
+
+        def mk():
+            r = RecalRunner.__new__(RecalRunner)      # only what _map reads: the engine and the worker count
+            r.engine, r.workers = ToyEngine(), 1
+            return r
+        plain = mk()._map(jobs)                       # no checkpoint: benchmark.Runner's own path
+        with tempfile.TemporaryDirectory() as d:
+            dirs = {k: os.path.join(d, k) for k in ("full", "cut", "res")}
+            full = mk()
+            full.checkpoint(out_dir=dirs["full"])
+            r_full = full._map(jobs)
+            cut, n = mk(), [0]
+            cut.checkpoint(out_dir=dirs["cut"])
+
+            def boom(t):                              # the cap stops the job after five engine tasks
+                n[0] += 1
+                if n[0] > 5:
+                    raise KeyboardInterrupt
+                return BM._job_list(t)
+            cut.task_fn = boom
+            try:
+                cut._map(jobs)
+            except KeyboardInterrupt:
+                pass
+            kept = open(os.path.join(dirs["cut"], CACHE_NAME)).read().count("\n")
+            res, ran = mk(), []
+            res.checkpoint(out_dir=dirs["res"], resume_from=dirs["cut"])
+            res.task_fn = lambda t: (ran.append(1), BM._job_list(t))[1]
+            r_res = res._map(jobs)
+            # Codex r1 P2 probe: resuming into the same directory, after a stop that cut the last row mid-write
+            same_dir, frag = os.path.join(d, "same"), json.dumps({"key": "cut by the stop"})[:12]
+            os.makedirs(same_dir)
+            open(os.path.join(same_dir, CACHE_NAME), "w").write(
+                open(os.path.join(dirs["cut"], CACHE_NAME)).read() + frag)
+            again = mk()
+            again.checkpoint(out_dir=same_dir, resume_from=same_dir)
+            r_again = again._map(jobs)
+            try:
+                n_again = len(load_cache(same_dir, again.code_sha256()))
+            except ValueError as ex:
+                n_again = str(ex)
+            ok(n_again == len(jobs) and r_again == r_full,
+               f"F18 (Codex r1 P2) resuming into the directory it resumes from rewrites the accepted rows first "
+               f"(atomically), so new rows never follow a cut row: the next resume reads {n_again} rows")
+            dump =lambda x: yaml.safe_dump(json.loads(json.dumps(x)), sort_keys=False)  # noqa: E731
+            same = r_res == r_full == plain and dump(r_res) == dump(plain) and json.dumps(r_res) == json.dumps(plain)
+            ok(kept == 5 and len(ran) == len(jobs) - 5 and same,
+               f"F16 (checkpoint) each finished engine task is appended to {CACHE_NAME} as it lands ({kept} rows after "
+               f"the stop); a relaunch with --resume-from reruns only the {len(ran)} missing tasks, and its results "
+               f"equal an uninterrupted run's, with or without a checkpoint ({same})")
+            rows = [json.loads(x) for x in open(os.path.join(dirs["full"], CACHE_NAME))]
+            code = mk().code_sha256()
+            got = {}
+
+            def bad(label, lines, tail=""):
+                q = os.path.join(d, label.replace(" ", "_"))
+                os.makedirs(q)
+                open(os.path.join(q, CACHE_NAME), "w").write("".join(json.dumps(x) + "\n" for x in lines) + tail)
+                try:
+                    got[label] = len(load_cache(q, code))
+                except ValueError as ex:
+                    got[label] = str(ex)
+            bad("other engine code", [dict(rows[0], code_sha256="0" * 64)] + rows[1:])
+            bad("an edited task", [dict(rows[0], task=rows[1]["task"])] + rows[1:])
+            bad("an edited result", [dict(rows[0], result=rows[1]["result"])] + rows[1:])
+            bad("a malformed middle row", rows[:2], tail="{not json\n" + json.dumps(rows[2]) + "\n")
+            bad("a truncated last row", rows[:3], tail=json.dumps(rows[3])[:20])
+            try:
+                load_cache(os.path.join(d, "absent"), code)
+                got["no cache file"] = 0
+            except ValueError as ex:
+                got["no cache file"] = str(ex)
+        want = {"other engine code": "code_sha256", "an edited task": "key", "an edited result": "result_sha256",
+                "a malformed middle row": "malformed", "no cache file": "no cache"}
+        wrong = sorted(k for k, w in want.items() if w not in str(got.get(k)))
+        ok(not wrong and got.get("a truncated last row") == 3,
+           f"F17 (checkpoint) a cache row from other engine code, with an edited task or result, a malformed row and a "
+           f"missing cache are refused (fail closed); a last row cut by the stop is dropped ({got.get('a truncated '
+           f'last row')} rows kept; refused for another reason or not at all: {wrong or 'none'})")
+    case("F16", f16)
 
     def f14():
         import tempfile
@@ -713,9 +1455,19 @@ def _self_test() -> int:
             variant("an edited row under the signed digest", lambda x: jr(x)["sample"][5].update(cfp_kill=0.55),
                     digest=dg(good))
             # Codex r1 P1-2: the gate is replayed (finalize) on the evidence; passing summaries do not carry it
-            variant("a verified point out of band", lambda x: jr(x)["verified"]["points"][0].update(all_in_band=False))
-            variant("the chosen point out of band", lambda x: jr(x)["verified"]["chosen"].update(all_in_band=False))
+            far = lambda p: p["per_seed"].update(B12m=[0.95, 0.96, 0.94, 0.95])  # noqa: E731 -- seed evidence
+            variant("a verified point out of band", lambda x: far(jr(x)["verified"]["points"][0]))
+            variant("the chosen point out of band", lambda x: far(jr(x)["verified"]["chosen"]))
+            variant("a verified point without seed evidence", lambda x: jr(x)["verified"]["points"][0].pop("per_seed"))
             variant("no verified point", lambda x: jr(x)["verified"].update(points=[]))
+            # Codex P2 (PR #233): one seed value per declared seed; the run's recorded seeds are pack.yaml's
+            variant("a per-seed list truncated to 2 seeds",
+                    lambda x: jr(x)["verified"]["points"][0]["per_seed"].update(B11=[0.5, 0.6]))
+            variant("recorded seeds other than the pack's", lambda x: x["fit_rule"].update(seeds=[11, 12]))
+            variant("no recorded seeds", lambda x: x.pop("fit_rule"))
+            # Codex r1 P2 (this PR): the recorded declaration is validated, and a malformed one is a refusal
+            variant("recorded seeds as floats", lambda x: x["fit_rule"].update(seeds=[float(v) for v in pack_seeds()]))
+            variant("fit_rule not a mapping", lambda x: x.update(fit_rule=["seeds"]))
             variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
             variant("no calibration grid record", lambda x: x.pop("calibration_grid"))
             variant("a verified point not in the sample",
@@ -739,7 +1491,10 @@ def _self_test() -> int:
             variant("a non-numeric value", lambda x: x["joint_region"]["sample"][3].update(cfp_kill="high"))
             variant("a column the fit did not fit", lambda x: x["plan"]["params"].pop("irs_kill"))
             refuse("a parameter these draws do not vary", good, {k: v for k, v in rg.items() if k != "cfp_half"})
-            refuse("a value outside its draw range", good, dict(rg, net_kill_shift=(0.0, pr.hi)))
+            # owner, 14 Nov (f6-posterior-ranges): the sample's hull sets the draw ranges of its columns, so a narrower
+            # draw range no longer refuses it; a value outside the engine's hard bounds still does
+            variant("a probability above 1", lambda x: jr(x)["sample"][7].update(cfp_kill=1.2))
+            variant("a negative half-life", lambda x: jr(x)["sample"][7].update(cfp_half=-5.0))
             rows2 = [dict(r) for r in rows]
             rows2[1]["cfp_half"] = 701.0
             other = os.path.join(d, "other.yaml")
@@ -747,7 +1502,8 @@ def _self_test() -> int:
             sha2 = load_posterior(other, e, rg, dg(other))["sha256"]
         gate = ("acceptance gate failed (finalize)", "a verified point out of band", "the chosen point out of band",
                 "no verified point", "a clamped calibration grid", "no calibration grid record",
-                "a verified point not in the sample")
+                "a verified point not in the sample", "a verified point without seed evidence",
+                "a per-seed list truncated to 2 seeds")
         why = {**dict.fromkeys(gate, "acceptance gate"), "missing file": "unreadable", "malformed YAML": "malformed",
                "an edited row under the signed digest": "signed sha256",
                "a value outside priors.yaml under a wider range": "priors.yaml",
@@ -755,12 +1511,374 @@ def _self_test() -> int:
                "other engine code": "code_sha256", "empty sample": "empty sample",
                "a row lacks a parameter": "the fit's parameters", "a non-finite value": "non-finite",
                "a non-numeric value": "non-numeric", "a column the fit did not fit": "the fit's parameters",
-               "a parameter these draws do not vary": "not varied", "a value outside its draw range": "draw range"}
+               "a parameter these draws do not vary": "not varied", "a probability above 1": "hard bound",
+               "a negative half-life": "hard bound",
+               "recorded seeds other than the pack's": "seeds", "no recorded seeds": "seeds",
+               "recorded seeds as floats": "seeds", "fit_rule not a mapping": "seeds"}
         wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
         ok(not wrong and set(got) == set(why) and sha2 != P["sha256"],
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
            f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
+
+    def f28():
+        """owner, 14 Nov (f6-posterior-ranges): the sample's own hull sets its columns' draw ranges and design box."""
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [270.0, 1650.0]}
+        u = [float(v) for v in np.random.default_rng(8).uniform(0, 1, 30)]
+        rows = [{"net_kill_shift": round(-0.3 + 0.9 * x, 6), "cfp_kill": round(0.45 + 0.33 * x, 6),
+                 "irs_kill": round(0.40 + 0.06 * (1 - x), 6), "cfp_half": round(490 + 960 * x, 6)} for x in u]
+        narrow = {"net_kill_shift": (pr.lo, pr.hi), "cfp_kill": (0.465, 0.585), "irs_kill": (0.38, 0.45125),
+                  "cfp_half": (547.5, 1277.5)}          # the fitted.yaml and spec ranges the F6 sample fell outside
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "net_effect_fit.yaml")
+            _fixture_placeholder(good, e, rows, box)
+            P = load_posterior(good, e, narrow, hashlib.sha256(open(good, "rb").read()).hexdigest())
+            X = np.asarray([[r[k] for k in P["names"]] for r in rows])
+            hull = {k: (float(X[:, j].min()), float(X[:, j].max())) for j, k in enumerate(P["names"])}
+            hb = hard_bounds(e, P["names"])
+            got = posterior_ranges(P, bounds=hb)
+            ok(P["rows"].shape == (30, 4) and got == hull,
+               f"F28 a sample whose hull exceeds its fitted and spec draw ranges loads; its ranges are its hull {got}")
+            ok(hb["cfp_kill"][:2] == (0.0, 1.0) and hb["irs_kill"][:2] == (0.0, 1.0)
+               and hb["cfp_half"][:2] == (0.0, float("inf")) and hb["net_kill_shift"][:2] == (pr.lo, pr.hi),
+               f"F28b the hard bounds: a probability in [0, 1], a half-life in days >= 0 (card units), a priors.yaml "
+               f"range as the prior's support: {hb}")
+            m = posterior_ranges(P, margin=0.1, bounds=hb)
+            w = {k: hull[k][1] - hull[k][0] for k in hull}
+            ok(all(abs(m[k][0] - (hull[k][0] - 0.1 * w[k])) < 1e-12 and abs(m[k][1] - (hull[k][1] + 0.1 * w[k])) < 1e-12
+                   for k in ("cfp_kill", "irs_kill", "cfp_half")),
+               f"F28c a stated margin widens each side by that share of the hull's width: {m}")
+            near = {"names": ["cfp_kill"], "rows": np.array([[0.9], [0.98]])}
+            c = posterior_ranges(near, margin=0.5, bounds=hard_bounds(e, ["cfp_kill"]))
+            ok(abs(c["cfp_kill"][0] - 0.86) < 1e-12 and c["cfp_kill"][1] == 1.0,
+               f"F28d a margin never crosses a hard bound: {c}")
+            edge = {"names": ["cfp_kill"], "rows": np.array([[0.9], [1.000001]])}     # within the rounding tolerance
+            c2 = posterior_ranges(edge, margin=0.5, bounds=hard_bounds(e, ["cfp_kill"]))
+            ok(c2["cfp_kill"][1] >= 1.000001, f"F28f (Codex r1 P2-2) the range never cuts inside the hull, even where a "
+                                              f"row sits on a hard bound within its tolerance: {c2}")
+            half = {"names": ["cfp_half"], "rows": np.array([[500.0], [1450.0]])}
+            why2 = {}
+            for label, m_ in (("a margin taking a half-life to zero", 0.6), ("a margin above 1", 1e308)):
+                try:
+                    posterior_ranges(half, margin=m_, bounds=hard_bounds(e, ["cfp_half"]))
+                    why2[label] = ""
+                except (PosteriorRefused, ValueError) as ex:
+                    why2[label] = str(ex)
+            ok(all(why2.values()) and posterior_ranges(half, 0.5, hard_bounds(e, ["cfp_half"]))["cfp_half"] == (25.0, 1925.0),
+               f"F28g (Codex r2 P2s) a margin that takes a duration to zero, or above 1, is refused: "
+               f"{ {k: v[:70] for k, v in why2.items()} }")
+            why = {}
+            for label, arg, kw in (("a column without spread", {"names": ["irs_kill"], "rows": np.array([[0.4], [0.4]])},
+                                    {}),
+                                   ("a negative margin", P, {"margin": -0.1}),
+                                   ("a margin that is not a number", P, {"margin": "wide"})):
+                try:
+                    posterior_ranges(arg, bounds=hb, **kw)
+                    why[label] = ""
+                except (PosteriorRefused, ValueError) as ex:
+                    why[label] = str(ex)
+            ok(all(why.values()), f"F28e refused (fail closed): {sorted(k for k, v in why.items() if v)}; accepted: "
+                                  f"{sorted(k for k, v in why.items() if not v) or 'none'}")
+    case("F28", f28)
+
+    def f19():
+        import hashlib
+        import tempfile
+        w1 = load_wave1(WAVE1, e, base)
+        grid = [float(v) for v in np.linspace(*NET_PARAMS["net_kill_shift"][1], CAL_N)]
+        ok(len(w1["points"]) == 46 + 12 + 1 and [x["wave"] for x in w1["points"]].count(1) == 59
+           and w1["calibration_grid"]["values"] == grid and w1["at_grid_edge"] == []
+           and set(w1["calibration_grid"]["m0"]) == {"benin", "irs_added", "misungwi", "muleba"}
+           and w1["sha256"] == WAVE1_SHA256 and all(set(x["computed"]) == set(train) for x in w1["points"]),
+           f"F19 wave 1's engine results are reused from its output ({os.path.basename(WAVE1)}, sha256 "
+           f"{WAVE1_SHA256[:12]}): its 46 design points, 12 verified points and chosen point, and its calibration grid")
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            def variant(label, mut, pack=base):
+                doc = yaml.safe_load(open(WAVE1))
+                mut(doc)
+                q = os.path.join(d, label.replace(" ", "_") + ".yaml")
+                yaml.safe_dump(doc, open(q, "w"), sort_keys=False)
+                try:
+                    load_wave1(q, e, pack, hashlib.sha256(open(q, "rb").read()).hexdigest())
+                    got[label] = ""
+                except ValueError as ex:
+                    got[label] = str(ex)
+            variant("other engine code", lambda x: x["engine_identity"].update(code_sha256="0" * 64))
+            variant("other parameters", lambda x: x["engine_identity"].update(params_sha256="0" * 64))
+            variant("a smoke", lambda x: x.update(smoke=True))
+            variant("other seeds", lambda x: x["fit_rule"].update(seeds=[1, 2]))
+            variant("other targets", lambda x: x["fit_rule"].update(targets=["B10"]))
+            variant("another calibration grid", lambda x: x["calibration_grid"].update(net_kill_shift=[0.0, 0.1]))
+            variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
+            variant("a design point without its result", lambda x: x["design"]["computed"]["B10"].pop())
+            pk = copy.deepcopy(base)
+            pk["seeds"] = pk["seeds"][:2]
+            variant("another pack", lambda x: None, pack=pk)
+            try:
+                load_wave1(WAVE1, e, base, "0" * 64)
+                got["an edited file"] = ""
+            except ValueError as ex:
+                got["an edited file"] = str(ex)
+        why = {"other engine code": "code_sha256", "other parameters": "params_sha256", "a smoke": "smoke",
+               "other seeds": "seeds", "other targets": "targets", "another calibration grid": "calibration grid",
+               "a clamped calibration grid": "edge", "a design point without its result": "result",
+               "another pack": "pack", "an edited file": "sha256"}
+        wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
+        ok(not wrong, f"F19b wave 1 is reused only under the same engine identity, pack, seeds, targets and calibration "
+                      f"grid, from the recorded file ({len(why)} refusals; for another reason or not at all: "
+                      f"{wrong or 'none'})")
+    case("F19", f19)
+
+    def f20():
+        old = {"a": [0.0, 1.0], "b": [10.0, 20.0], "c": [0.0, 1.0]}
+        new = {"a": [0.0, 1.0], "b": [5.0, 30.0], "c": [0.0, 1.0]}
+        hull = {"a": [0.4, 0.6], "b": [10.0, 19.0], "c": [0.1, 0.95]}
+        bx = wave2_box(hull, old, new, 0.25)
+        ok(bx == {"a": [0.35, 0.65], "b": [5.0, 21.25], "c": [0.0, 1.0]},
+           f"F20 the wave-2 box is wave 1's accepted hull widened by a margin (here 25%) of its width on each side, "
+           f"clipped to the box; a side where the hull reached the old box edge goes to the new box edge ({bx})")
+    case("F20", f20)
+
+    def f21():
+        box2 = {"a": [0.0, 1.0], "b": [0.0, 2.0]}
+
+        class Fake:
+            seeds, calibrated = [1], {}
+
+            def __init__(self):
+                self.ran = []
+
+            def calibrate_settings(self, fitted, names=None):
+                pass
+
+            def prefetch(self, arms, thetas):
+                self.ran += [dict(t) for t in thetas]
+
+            def evaluate(self, b, th):
+                v = float(np.exp(-0.5 * th["a"] - 0.2 * th["b"] + 0.1 * th["a"] * th["b"]))
+                return {"computed": v, "in_band": b["band"][0] <= v <= b["band"][1], "seed_min": v, "seed_max": v}
+        pk = {"fit_joint": {"rule": "joint-v1", "params": box2, "targets": ["T"], "design": {"n": 10, "seed": 3}},
+              "benchmarks": [{"id": "T", "band": [0.6, 0.8], "target": 0.7,
+                              "estimand": {"type": "ratio", "num": "x", "den": "y"}}],
+              "arms": {"x": {"setting": "s"}, "y": {"setting": "s"}}}
+        fk = Fake()
+        w1pts = [{"x": {"a": float(u), "b": float(v)}, "wave": 1, "computed": {"T": fk.evaluate(
+            pk["benchmarks"][0], {"a": float(u), "b": float(v)})["computed"]}} for u, v in BM.lhs(8, 2, 1) * [1, 2]]
+        fit = fit_waves(pk, fk, {"points": w1pts}, {"a": [0.2, 0.8], "b": [0.5, 1.5]}, n=10, seed=3)
+        waves = fit["design"]["wave"]
+        ok(len(fk.ran) == 10 + 1 and waves.count(1) == 8 and waves.count(2) == 10
+           and all(0.2 <= r["a"] <= 0.8 and 0.5 <= r["b"] <= 1.5 for r in fk.ran[:10])
+           and fit["fit_rule"]["version"] == "joint-v1-wave2" and len(fit["design"]["x"]) == 18
+           and fit["surrogate"]["T"]["n_points"] == 18 and set(fit["parameters"]) == set(box2)
+           and fit["verification"]["T"]["in_band"],
+           f"F21 wave 2 runs only its own {waves.count(2)} design points (in the wave-2 box) and the chosen point on the "
+           f"engine; the surrogate is refitted on both waves ({len(fit['design']['x'])} points)")
+    case("F21", f21)
+
+    def f22():
+        n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 1.0]])
+        g2 = np.linspace(0, 1, 9)
+        X2 = np.array([[u, v] for u in g2 for v in g2])
+        Y2 = {"T": np.exp(X2[:, 0] + X2[:, 1])}
+        bands2 = {"T": [float(np.exp(0.8)), float(np.exp(1.2))]}
+        plain = joint_region(X2, Y2, bands2, n2, b2, 5)
+        same = joint_region(X2, Y2, bands2, n2, b2, 5, margin=None)
+        mg = joint_region(X2, Y2, bands2, n2, b2, 5, margin={"T": 0.05})
+        S = np.array([[s["a"], s["b"]] for s in mg["sample"]])
+        m = mg.get("margin") or {}
+        ok(same == plain and "margin" not in plain and m.get("by_target") == {"T": 0.05}
+           and 0 < mg["n_accepted"] < plain["n_accepted"] and np.all(np.abs(S.sum(1) - 1.0) <= 0.15 + 1e-3)
+           and m.get("n_in_band_without_margin") == plain["n_accepted"]
+           and abs(m.get("share_excluded", -1) - (1 - mg["n_accepted"] / plain["n_accepted"])) < 1e-3
+           and set(m.get("excluded_ranges") or {}) == set(n2)
+           and m["in_band_hull_without_margin"] == plain["hull"]
+           and all(plain["hull"][k][0] <= m["excluded_ranges"][k][0] <= m["excluded_ranges"][k][1]
+                   <= plain["hull"][k][1] for k in n2),
+           f"F22 with the margin flag the sample holds only candidates the surrogate puts in band by the margin "
+           f"({m.get('by_target')}); it records the share of the in-band region excluded ({m.get('share_excluded')}) "
+           f"and the excluded points' ranges; without it the region is unchanged")
+        lo = local_loo({"T": np.log(Y2["T"]) + 0.01 * np.sin(40 * X2[:, 0])}, X2, X2[:, 0] <= 0.5)
+        ok(set(lo) == {"T"} and 0 < lo["T"] < 0.05,
+           f"F22b the margin is each target's leave-one-out error of the log surrogate, root mean square over the points "
+           f"in the wave-2 box ({lo})")
+    case("F22", f22)
+
+    def f23():
+        n2, b2 = ["a", "b"], np.array([[0.0, 1.0], [0.0, 2.0]])
+        g2 = np.linspace(0, 1, 9)
+        X2 = np.array([[u, v] for u in g2 for v in g2])
+        Y2 = {"T": np.exp(X2[:, 0] + X2[:, 1])}
+        sup = [{"a": [0.0, 0.5], "b": [0.0, 2.0]}, {"a": [0.0, 1.0], "b": [0.0, 0.6]}]
+        r = joint_region(X2, Y2, {"T": [float(np.exp(0.8)), float(np.exp(1.2))]}, n2, b2, 5, support=sup)
+        inside = lambda s: any(all(bx[k][0] <= s[k] <= bx[k][1] for k in n2) for bx in sup)  # noqa: E731
+        ok(r["sample"] and all(inside(s) for s in r["sample"]) and r["support"]["boxes"] == sup
+           and 0 < r["support"]["share_of_box"] < 1,
+           f"F23 (wave 2's extrapolation) the joint-sample candidates lie in the union of the waves' boxes, where the "
+           f"engine-evaluated points are ({r['support']['share_of_box']} of the box), never outside it")
+
+        class Fake:
+            seeds, calibrated = [1], {}
+
+            def calibrate_settings(self, fitted, names=None):
+                pass
+
+            def prefetch(self, arms, thetas):
+                pass
+
+            def evaluate(self, b, th):       # the target 0.7 is reached only at (0.8, 1.2), outside the support
+                v = float(0.7 * np.exp(-((th["a"] - 0.8) ** 2 + (th["b"] - 1.2) ** 2)))
+                return {"computed": v, "in_band": True, "per_seed": [v], "seed_min": v, "seed_max": v}
+        pk = {"fit_joint": {"rule": "joint-v1", "params": {"a": [0.0, 1.0], "b": [0.0, 2.0]}, "targets": ["T"],
+                            "design": {"n": 6, "seed": 3}},
+              "benchmarks": [{"id": "T", "band": [0.6, 0.8], "target": 0.7,
+                              "estimand": {"type": "ratio", "num": "x", "den": "y"}}],
+              "arms": {"x": {"setting": "s"}, "y": {"setting": "s"}}}
+        w1 = [{"x": {"a": float(u), "b": float(v)}, "wave": 1, "computed": {"T": Fake().evaluate(
+            None, {"a": float(u), "b": float(v)})["computed"]}} for u, v in BM.lhs(12, 2, 1) * [1, 2]]
+        fit = fit_waves(pk, Fake(), {"points": w1}, {"a": [0.0, 0.5], "b": [0.0, 2.0]}, n=6, seed=3, support=sup)
+        best = {k: v["value"] for k, v in fit["parameters"].items()}
+        ok(inside(best) and fit["fit_rule"]["support"] == sup,
+           f"F23b the chosen point is chosen inside the same support ({best})")
+    case("F23", f23)
+
+    def f24():
+        b = [0.42, 0.70]
+        cases = {"mean in band": ([0.50, 0.52, 0.48, 0.51], True),
+                 "mean below, interval overlaps": ([0.40, 0.43, 0.41, 0.42, 0.39, 0.42, 0.41, 0.43], True),
+                 "interval entirely below": ([0.30, 0.31, 0.30, 0.29, 0.30, 0.31, 0.30, 0.30], False),
+                 "mean above, interval overlaps": ([0.71, 0.72, 0.69, 0.70], True),
+                 "one seed (no spread)": ([0.50], False),
+                 "a non-finite value": ([0.5, float("nan"), 0.5], False),
+                 "no values": ([], False)}
+        got = {k: ci_in_band(v, b, len(v)) for k, (v, _) in cases.items()}
+        wrong = sorted(k for k, (_, w) in cases.items() if got[k] != w)
+        v = cases["mean below, interval overlaps"][0]
+        lo, hi = seed_interval(v, len(v))
+        lg = np.log(v)
+        h = 1.96 * float(np.std(lg, ddof=1)) / np.sqrt(len(v))
+        ok(not wrong and abs(lo - np.exp(np.mean(lg) - h)) < 1e-12 and abs(hi - np.exp(np.mean(lg) + h)) < 1e-12
+           and "1.96" in ACCEPTANCE_RULE,
+           f"F24 (owner, 14 Nov) a verified or chosen point is in band for a target when the 95% interval of its seed "
+           f"(geometric) mean, on the log scale +- 1.96 sd/sqrt(n) over the run's seeds, overlaps the band; fewer "
+           f"than 2 seeds or a non-finite value fail closed ({len(cases)} cases; wrong: {wrong or 'none'})")
+        p = {"point": {}, "per_seed": {"B10": [0.5, 0.5, 0.6, 0.6]}}
+        ok(point_in_band(p, {"B10": [0.3, 0.67], "B11": [0.42, 0.7]}, [1, 2, 3, 4])[0] is False
+           and point_in_band(p, {"B10": [0.3, 0.67]}, [1, 2, 3, 4])[0] is True,
+           "F24b a target without seed evidence fails the point (fail closed)")
+    case("F24", f24)
+
+    def f25():
+        import hashlib
+        import tempfile
+        q = plan(p, verify_round=True)
+        ok(q["design_points"] == 0 and q["design_points_from_cache"] == WAVE2["n"] and q["waves"]["design"] == 0
+           and q["arm_runs"] == (1 + VERIFY) * 8 * 8 and max(q["usd"][1], q["usd_real"][1]) <= VERIFY_ROUND["plan_cap_usd"]
+           and VERIFY_ROUND["candidate_seed"] != DESIGN["seed"] and VERIFY_ROUND["pick_seed"] != DESIGN["seed"] + 1,
+           f"F25 the verification round runs only the chosen point and {VERIFY} new sample points ({q['arm_runs']} arm "
+           f"runs; wave 2's {WAVE2['n']} design points come from its cache), ${q['usd'][0]}-{q['usd'][1]} on the VM "
+           f"bound, ${q['usd_real'][0]}-{q['usd_real'][1]} measured (plan cap ${VERIFY_ROUND['plan_cap_usd']}); the "
+           f"candidates and the picks take new seeds {VERIFY_ROUND['candidate_seed']}, {VERIFY_ROUND['pick_seed']}")
+
+        class Store:
+            def __init__(self, data):
+                self.data, self.asked = data, []
+
+            def download(self, blob, path, account=None):
+                self.asked.append((blob, account))
+                open(path, "wb").write(self.data)
+                return {"blob": blob}
+        body = b'{"key": "x"}\n'
+        sha = hashlib.sha256(body).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            st = Store(body)
+            got = fetch_cache("outputs/x/netfit_cache.jsonl", sha, d, "acct", store=st)
+            fine = got == d and open(os.path.join(d, CACHE_NAME), "rb").read() == body \
+                and st.asked == [("outputs/x/netfit_cache.jsonl", "acct")]
+            try:
+                fetch_cache("outputs/x/netfit_cache.jsonl", "0" * 64, os.path.join(d, "b"), "acct", store=Store(body))
+                refused = ""
+            except ValueError as ex:
+                refused = str(ex)
+        ok(fine and "sha256" in refused and VERIFY_ROUND["cache_sha256"] == "3bde5c6ec7b6e6b204968b3a52b33541300316d1f0"
+           "aa7f571bb5b30f91f3311b",
+           f"F25b wave 2's checkpoint is read from storage only under its recorded sha256 (else refused: {refused!r})")
+        rr = RecalRunner.__new__(RecalRunner)
+        rr.ran_tasks = 3
+        try:
+            no_rerun(rr, "wave 2's design")
+            r2 = ""
+        except ValueError as ex:
+            r2 = str(ex)
+        rr.ran_tasks = 0
+        no_rerun(rr, "wave 2's design")
+        ok("3 engine task" in r2, f"F25c a verification round that would rerun a design point stops before verifying "
+                                  f"({r2!r})")
+    case("F25", f25)
+
+    def f26():
+        s8 = list(base["seeds"])
+        bd = {"B11": [0.42, 0.70]}
+        full = {"point": {}, "per_seed": {"B11": [0.2, 0.4] + [0.2] * 6}}
+        trunc = {"point": {}, "per_seed": {"B11": [0.2, 0.4]}}
+        rf, rt = point_in_band(full, bd, s8), point_in_band(trunc, bd, s8)
+        ok(len(s8) == 8 and rf[0] is False and rt[0] is False and rt[1]["B11"] is None,
+           f"F26 (Codex P2, PR #233) the reviewer's probe: B11 seed values [0.2, 0.4] + [0.2]*6 fail, and the list "
+           f"truncated to [0.2, 0.4] is refused, not passed, against the {len(s8)} declared seeds ({rf[0]}, {rt})")
+        good = [0.50, 0.52, 0.48, 0.51, 0.49, 0.50, 0.53, 0.47]
+        cases = {"one value per declared seed": (good, s8, True),
+                 "a missing seed (7 values)": (good[:7], s8, False),
+                 "an extra seed (9 values)": (good + [0.5], s8, False),
+                 "a duplicate declared seed": (good, s8[:7] + [s8[0]], False),
+                 "no declared seeds": (good, [], False),
+                 "declared seeds missing": (good, None, False),
+                 "a non-integer declared seed": (good, s8[:7] + ["x"], False),
+                 "a boolean declared seed": (good, s8[:7] + [True], False),
+                 "values as a mapping (Codex r1 P2)": ({0.5 + i / 100: None for i in range(8)}, s8, False)}
+        got = {k: point_in_band({"per_seed": {"B11": v}}, bd, sd)[0] for k, (v, sd, _) in cases.items()}
+        wrong = sorted(k for k, (_, _, w) in cases.items() if got[k] is not w)
+        ok(not wrong, f"F26b exactly one seed value per declared seed; a missing, extra or duplicate seed, or no valid "
+                      f"declaration, fails closed ({len(cases)} cases; wrong: {wrong or 'none'})")
+        pt = {"point": {"a": 0.1}, "per_seed": {"B11": [0.5, 0.52]}, "calibration_check": {}}
+        ch = {"per_seed": {"B11": good}, "calibration_check": {}}
+        r1, c1 = finalize({"sample": [{"a": 0.1}]}, [copy.deepcopy(pt)], copy.deepcopy(ch), bands=bd, seeds=s8)
+        r2, c2 = finalize({"sample": [{"a": 0.1}]}, [dict(pt, per_seed={"B11": good})], copy.deepcopy(ch), bands=bd,
+                          seeds=s8[:7] + [s8[0]])
+        r3, c3 = finalize({"sample": [{"a": 0.1}]}, [dict(pt, per_seed={"B11": good})], copy.deepcopy(ch), bands=bd,
+                          seeds=s8)
+        ok(c1 == 2 and any("2 seed values" in w and "8 declared seeds" in w for w in r1["acceptance"])
+           and c2 == 2 and any("duplicate" in w for w in r2["acceptance"])
+           and c3 == 0 and r3["verified"]["seeds"] == s8,
+           f"F26c finalize() names the seed mismatch ({r1['acceptance']}; {r2['acceptance']}) and records the seeds "
+           f"it checked against")
+    case("F26", f26)
+
+    def f27():
+        s8 = list(base["seeds"])
+        v = [0.40, 0.43, 0.41, 0.42, 0.39, 0.42, 0.41, 0.43]
+        lo, hi = seed_interval(v, len(v))
+        lg = np.log(v)
+        h = 1.96 * float(np.std(lg, ddof=1)) / np.sqrt(len(v))
+        gm = float(np.exp(np.mean(lg)))
+        ok(abs(lo - np.exp(np.mean(lg) - h)) < 1e-12 and abs(hi - np.exp(np.mean(lg) + h)) < 1e-12
+           and abs(np.sqrt(lo * hi) - gm) < 1e-12,
+           f"F27 the rule's interval is on the log scale around the geometric mean of the seed values, the statistic "
+           f"each target's `computed` is (benchmark.py: exp(mean(log per_seed))): [{lo:.4f}, {hi:.4f}] around {gm:.4f}")
+        skew = [0.1] * 7 + [2.0]          # arithmetic mean 0.34 (its interval reaches 0.80); geometric mean 0.15
+        ok(point_in_band({"per_seed": {"B11": skew}}, {"B11": [0.42, 0.70]}, s8)[0] is False
+           and point_in_band({"per_seed": {"B11": [0.5, 0.0] + [0.5] * 6}}, {"B11": [0.42, 0.70]}, s8)[0] is False
+           and point_in_band({"per_seed": {"B11": [0.5, -0.1] + [0.5] * 6}}, {"B11": [0.42, 0.70]}, s8)[0] is False,
+           "F27b a skewed seed set whose arithmetic interval overlaps the band but whose geometric one does not "
+           "fails; a zero or negative seed value fails closed (no log)")
+        r, _ = finalize({"sample": [{"a": 0.1}]}, [{"point": {"a": 0.1}, "per_seed": {"B11": v}, "calibration_check": {}}],
+                        {"per_seed": {"B11": v}, "calibration_check": {}}, bands={"B11": [0.42, 0.70]}, seeds=s8)
+        ok(r["verified"].get("acceptance_statistic") == ACCEPTANCE_STATISTIC and "geometric" in ACCEPTANCE_STATISTIC
+           and "log" in ACCEPTANCE_STATISTIC and "geometric" in ACCEPTANCE_RULE,
+           f"F27c the output records the statistic the rule used: {r['verified'].get('acceptance_statistic')!r}")
+    case("F27", f27)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -779,16 +1897,24 @@ def main(argv=None) -> int:
     ap.add_argument("--vcpus", type=int, default=VCPUS, help="the VM's vCPUs (plan; run: defaults to --workers)")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--resume-from", default=None, help=f"a directory holding an earlier run's {CACHE_NAME}")
+    ap.add_argument("--verify-round", action="store_true", help="VERIFY_ROUND: wave 2's points from its stored "
+                    "checkpoint, a new joint sample verified (owner, 14 Nov)")
+    ap.add_argument("--resume-account", default=None, help="storage account of the stored checkpoint")
+    ap.add_argument("--margin-loo", action="store_true", help="export only candidates in band by each target's local "
+                    "leave-one-out error (owner, 13 Nov; off by default)")
     a = ap.parse_args(argv)
     base = yaml.safe_load(open(PACK))
     pack = build_pack(base, a.smoke)
     if a.action == "plan":
-        print(yaml.safe_dump(plan(pack, a.verify, vcpus=a.vcpus), sort_keys=False))
+        print(yaml.safe_dump(plan(pack, a.verify, vcpus=a.vcpus, verify_round=a.verify_round), sort_keys=False))
         return 0
     if a.smoke and not a.out:
         print("--smoke needs --out (a scratch file): a smoke is not evidence")
         return 2
-    return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify)
+    return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify,
+               resume_from=a.resume_from, margin_loo=a.margin_loo, verify_round=a.verify_round,
+               resume_account=a.resume_account)
 
 
 if __name__ == "__main__":
