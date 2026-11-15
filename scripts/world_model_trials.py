@@ -340,8 +340,12 @@ class GitAnchor:
         self.repo, self.wt = os.path.realpath(repo), os.path.abspath(worktree)
         self.branch, self.remote = branch, remote
         self.ref = f"refs/remotes/{remote}/{branch}"
-        self.allowed = re.compile(rf"^{re.escape(trials_rel.strip('/'))}/runs/[A-Za-z0-9][A-Za-z0-9_.-]*/analysis/"
-                                  r"(hypotheses_registry\.jsonl|world_model_seed\.yaml)$")
+        t = re.escape(trials_rel.strip('/'))
+        # a decision run's pre-registered beliefs and outcome map (scripts/decision_beliefs.py) go under decisions/<id>/
+        # and only through a licensed-number check (publish's `check`)
+        self.decision = re.compile(rf"^{t}/decisions/[A-Za-z0-9][A-Za-z0-9_.-]*/(world_model_seed|outcome_map)\.yaml$")
+        self.allowed = re.compile(rf"^(?:{t}/runs/[A-Za-z0-9][A-Za-z0-9_.-]*/analysis/"
+                                  rf"(hypotheses_registry\.jsonl|world_model_seed\.yaml)|{self.decision.pattern[1:-1]})$")
         self._lock = threading.Lock()
 
     def _git(self, *a, cwd=None, check=True):
@@ -372,9 +376,19 @@ class GitAnchor:
         if os.path.islink(src) or not os.path.isfile(src):
             raise TrialError(f"{rel}: not a regular file in the working tree")
 
-    def publish(self, rels, qid) -> dict:
+    def publish(self, rels, qid, check=None) -> dict:
+        """`check(rel, bytes) -> [problems]`: required for a decision file (refused without one, or when it reports
+        any problem: nothing is committed)."""
         for rel in rels:
             self._check(rel)
+        for rel in rels:
+            if self.decision.match(rel):
+                if check is None:
+                    raise TrialError(f"{rel}: a decision file is published only through a licensed-number check")
+                data, _ = _sio().read_nofollow(self.repo, rel)
+                bad = check(rel, data)
+                if bad:
+                    raise TrialError(f"{rel}: the licensed-number check refused it: {list(bad)[:5]}")
         with self._lock:
             self.ensure()
             for rel in rels:
@@ -481,6 +495,9 @@ def seed_problems(seed, ctx) -> list[str]:
     as register and build call it), the number of hypotheses, and every package and feature a test names being one of
     the design's (a name the sweep lacks would fail the build)."""
     from toolkit.analysis import world_model as W
+    if ctx.get("decision_run"):            # a full decision run: no sweep, competing claims about its outputs
+        from toolkit.analysis import belief_table as BT
+        return BT.decision_seed_problems(seed, ctx["decision_run"])
     try:
         W.validate(seed)
     except W.WorldModelError as e:
@@ -3508,6 +3525,51 @@ def _self_test() -> int:
         ok(fm.get("untestable") == ["H1", "H3"] and fm.get("engine_blind") == ["H2"],
            f"WT28k failure_modes: an untestable first row, then each row's own class: {fm}")
     tryit("WT28 failure modes", wt28_modes)
+
+    def wt29_decision():
+        # F6 pre-registration (2026-11-15): a decision run's beliefs are validated by the belief table's own rule, and
+        # go to the wm-trials branch under decisions/<id>/ only after a licensed-number check has passed on them
+        from toolkit.analysis import belief_table as BT
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        good = {"decision_beliefs": [{"id": "D1", "topic": "net_type", "question": "q", "decides": True,
+                                      "claims": [{"claim": "a", "weight": 0.6}, {"claim": "b", "weight": 0.4}],
+                                      "basis": [{"mechanism": "m"}], "why_decides": "w", "layer": "world"}]}
+        ok(seed_problems(good, ctx) == [] and seed_problems({"decision_beliefs": []}, ctx)
+           == BT.decision_seed_problems({"decision_beliefs": []}, ctx["decision_run"]),
+           f"WT29 with decision_run the seed is judged by the decision-run rule: {seed_problems(good, ctx)}")
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            A = GitAnchor(repo, os.path.join(repo, "trials", ".wm-trials"))
+            rel = "trials/decisions/f6/world_model_seed.yaml"
+            os.makedirs(os.path.join(repo, "trials", "decisions", "f6"))
+            with open(os.path.join(repo, rel), "w") as f:
+                f.write("decision_beliefs: []\n")
+            for why, chk in (("without a check", None), ("when the check refuses", lambda r, b: ["0.4123 in units"])):
+                try:
+                    A.publish([rel], "f6", check=chk)
+                    ok(False, f"WT29b a decision file is refused {why}")
+                except TrialError as e:
+                    ok("check" in str(e) or "licensed" in str(e), f"WT29b a decision file is refused {why}: {e}")
+            seen = []
+            r = A.publish([rel], "f6", check=lambda r_, b: seen.append(r_) or [])
+            ok(seen == [rel] and r["commit"] and _git("cat-file", "-e", f"{r['commit']}:{rel}", cwd=repo) == "",
+               f"WT29c with a passing check the decision file is committed, pushed and fetched: {r}")
+            rr = "trials/runs/q1/analysis/hypotheses_registry.jsonl"
+            os.makedirs(os.path.join(repo, "trials", "runs", "q1", "analysis"))
+            with open(os.path.join(repo, rr), "w") as f:
+                f.write("")
+            try:
+                A.publish([rr], "q1")
+                ok(True, "WT29d a question's ledger still publishes beside a decision directory on the branch")
+            except TrialError as e:
+                ok(False, f"WT29d a question's ledger still publishes beside a decision directory: {e}")
+            for bad in ("trials/decisions/f6/units.csv", "trials/decisions/f6/sub/world_model_seed.yaml"):
+                try:
+                    A.publish([bad], "f6", check=lambda r_, b: [])
+                    ok(False, f"WT29e {bad} is refused (a decision's seed and outcome map only)")
+                except TrialError:
+                    ok(True, f"WT29e {bad} is refused (a decision's seed and outcome map only)")
+    tryit("WT29 decision run", wt29_decision)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

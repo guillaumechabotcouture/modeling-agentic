@@ -241,6 +241,118 @@ def check_items(cid, engine, world) -> list:
              "check": ["simulator", "test", "literature"]}]
 
 
+# ---------------------------------------------------------------- decision run (F6 pre-registration, 2026-11-15)
+# A full decision run has no sweep: its beliefs are competing claims about the run's own outputs (which package wins
+# where, whether a decision test changes the plan, how far the plan departs from a funded one), written before the
+# run and scored against its analysis files. The seed task writes them when its input carries decision_run.
+DECISION_SEED_FORMAT = """decision_beliefs:            # min to max beliefs, as decision_run.beliefs states
+  - id: D1                    # letters, digits, . _ -
+    topic: net_type           # one of decision_run.topics; every topic needs at least one belief
+    question: "the decision question this belief answers, in words"
+    claims:                   # 2 to 4 competing claims: mutually exclusive and together exhaustive
+      - {claim: "dual-AI nets are chosen in most LGAs of the northern states", weight: 0.55}
+      - {claim: "PBO nets are chosen in most of them", weight: 0.30}
+      - {claim: "neither type is chosen in most of them", weight: 0.15}
+    basis:                    # at least one: a paper (citation with authors, journal, year, and its location) or
+      - {citation: "Mosha JF et al. 2022 Lancet", location: "Table 2"}    # a mechanism stated in words
+      - {mechanism: "chlorfenapyr kills pyrethroid-resistant mosquitoes the pyrethroid no longer kills"}
+    decides: true             # would being wrong about this belief change the recommendation?
+    why_decides: "one sentence"
+    layer: world              # world: about malaria and programmes; engine: about what this engine and harness show
+open_questions: [{id: Q1, question: "...", beliefs: [D1]}]
+notes: "one line: what drives the choice, in your view"
+Weights are multiples of 0.05 between 0.05 and 0.95 and sum to 1 within each belief. Claims state directions,
+rankings, shares in words ("most", "few", "none") and conditions as where/when; a claim names packages, components,
+states, zones and decision tests, never a value of the run's inputs (they are withheld). Write no other numbers:
+weights, citation years, and ids such as DT10 or B8 only; cite authors, journal and year without volume or pages,
+with a table, figure or section as the location; a ratio band is written in words ("between a tenth and a third
+more"). The harness refuses a file holding a number that matches a withheld input."""
+DECISION_LAYERS = ("world", "engine")
+WEIGHT_GRID = 0.05
+_DID = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def _on_grid(w) -> bool:
+    return isinstance(w, (int, float)) and not isinstance(w, bool) and WEIGHT_GRID - 1e-9 <= w <= 1 - WEIGHT_GRID \
+        + 1e-9 and abs(w / WEIGHT_GRID - round(w / WEIGHT_GRID)) < 1e-6
+
+
+def decision_seed_problems(seed, run) -> list:
+    """Why a decision-run seed is refused (empty when accepted). `run`: the input's decision_run block, {topics,
+    beliefs: {min, max}}. Fail closed on any shape it does not recognise."""
+    if not isinstance(seed, dict) or not isinstance(seed.get("decision_beliefs"), list):
+        return ["decision_beliefs: a list of beliefs (the seed is not a mapping holding one)"]
+    topics, lim = list(run.get("topics") or []), run.get("beliefs") or {}
+    bs, bad, seen = seed["decision_beliefs"], [], set()
+    lo, hi = int(lim.get("min", 1)), int(lim.get("max", 10 ** 6))
+    if not lo <= len(bs) <= hi:
+        bad.append(f"{len(bs)} beliefs: write {lo} to {hi}")
+    for k, b in enumerate(bs):
+        if not isinstance(b, dict):
+            bad.append(f"belief {k + 1}: a mapping")
+            continue
+        i = str(b.get("id"))
+        if not _DID.match(i):
+            bad.append(f"belief {k + 1}: id {b.get('id')!r}: letters, digits, . _ -")
+        if i in seen:
+            bad.append(f"belief {i}: duplicate id")
+        seen.add(i)
+        if b.get("topic") not in topics:
+            bad.append(f"belief {i}: topic {b.get('topic')!r} is not one of {topics}")
+        if not isinstance(b.get("question"), str) or not b["question"].strip():
+            bad.append(f"belief {i}: question, in words")
+        cl = b.get("claims")
+        if not isinstance(cl, list) or not 2 <= len(cl) <= 4 or not all(isinstance(c, dict) for c in cl):
+            bad.append(f"belief {i}: claims: 2 to 4 competing claims, each {{claim, weight}}")
+        else:
+            texts = [c.get("claim") for c in cl]
+            if not all(isinstance(t, str) and t.strip() for t in texts) or len({t.strip().lower() for t in texts
+                                                                               if isinstance(t, str)}) != len(texts):
+                bad.append(f"belief {i}: each claim is a distinct sentence")
+            ws = [c.get("weight") for c in cl]
+            if not all(_on_grid(w) for w in ws):
+                bad.append(f"belief {i}: weights {ws}: multiples of {WEIGHT_GRID} between {WEIGHT_GRID} and "
+                           f"{1 - WEIGHT_GRID}")
+            elif abs(sum(ws) - 1) > 1e-6:
+                bad.append(f"belief {i}: weights {ws} sum to {sum(ws):.2f}, not 1")
+        basis = b.get("basis")
+        if not isinstance(basis, list) or not basis:
+            bad.append(f"belief {i}: basis: at least one paper or mechanism")
+        else:
+            for e in basis:
+                if not isinstance(e, dict) or not ((isinstance(e.get("citation"), str) and e["citation"].strip()
+                                                    and isinstance(e.get("location"), str) and e["location"].strip())
+                                                   or (isinstance(e.get("mechanism"), str) and e["mechanism"].strip())):
+                    bad.append(f"belief {i}: basis entry {e!r}: {{citation, location}} or {{mechanism}}")
+        if not isinstance(b.get("decides"), bool):
+            bad.append(f"belief {i}: decides: true or false")
+        if b.get("layer") not in DECISION_LAYERS:
+            bad.append(f"belief {i}: layer {b.get('layer')!r}: one of {DECISION_LAYERS}")
+    have = {b.get("topic") for b in bs if isinstance(b, dict)}
+    for t in topics:
+        if t not in have:
+            bad.append(f"topic {t!r}: no belief covers it")
+    if bs and not any(isinstance(b, dict) and b.get("decides") is True for b in bs):
+        bad.append("no belief has decides: true; mark those the recommendation turns on")
+    return bad
+
+
+def decision_table(seed) -> list:
+    """One row per belief: its heaviest claim, that weight as p, all weights and decides."""
+    out = []
+    for b in seed["decision_beliefs"]:
+        lead = max(b["claims"], key=lambda c: c["weight"])
+        out.append({"id": b["id"], "topic": b["topic"], "claim": lead["claim"], "p": lead["weight"],
+                    "weights": [c["weight"] for c in b["claims"]], "decides": b["decides"]})
+    return out
+
+
+def decision_checklist(seed) -> list:
+    """The reading checklist: rows with decides true, leading weight nearest 0.5 first (where the run's outcome
+    teaches most about the choice)."""
+    return sorted((r for r in decision_table(seed) if r["decides"]), key=lambda r: (abs(r["p"] - 0.5), str(r["id"])))
+
+
 def _self_test() -> int:
     fails = []
 
@@ -391,8 +503,56 @@ def _self_test() -> int:
         ok(f is None, f"BT9f a test's own equivalence bound is the near-null bound (CI not inside +/-0.15): "
                       f"{(f, lr, s)}")
 
+
+    # Decision run (F6 pre-registration, 2026-11-15): competing claims about a full decision run's outputs, before it
+    def bt10():
+        run = {"topics": ["net_type", "smc"], "beliefs": {"min": 2, "max": 4}}
+
+        def bel(i, topic="net_type", w=(0.6, 0.4), decides=True, **kw):
+            return dict({"id": i, "topic": topic, "question": "Which net wins in the north?",
+                         "claims": [{"claim": f"claim {k}", "weight": x} for k, x in enumerate(w)],
+                         "basis": [{"citation": "Mosha JF et al. 2022 Lancet", "location": "Table 2"}],
+                         "decides": decides, "why_decides": "it sets the package", "layer": "world"}, **kw)
+        good = {"decision_beliefs": [bel("D1"), bel("D2", "smc", (0.5, 0.3, 0.2), False,
+                                                    basis=[{"mechanism": "SMC prevents most cases in its season"}])]}
+        ok(decision_seed_problems(good, run) == [], f"BT10 a valid decision-run seed is accepted: "
+                                                    f"{decision_seed_problems(good, run)}")
+        cases = {
+            "too few beliefs": {"decision_beliefs": [bel("D1")]},
+            "a topic not covered": {"decision_beliefs": [bel("D1"), bel("D2")]},
+            "weights not summing to 1": {"decision_beliefs": [bel("D1", w=(0.6, 0.3)), bel("D2", "smc")]},
+            "a weight off the 0.05 grid": {"decision_beliefs": [bel("D1", w=(0.62, 0.38)), bel("D2", "smc")]},
+            "one claim only": {"decision_beliefs": [bel("D1", w=(1.0,)), bel("D2", "smc")]},
+            "five claims": {"decision_beliefs": [bel("D1", w=(0.2,) * 5), bel("D2", "smc")]},
+            "an unknown topic": {"decision_beliefs": [bel("D1"), bel("D2", "smc"), bel("D3", "voodoo")]},
+            "duplicate ids": {"decision_beliefs": [bel("D1"), bel("D1", "smc")]},
+            "no basis": {"decision_beliefs": [bel("D1", basis=[]), bel("D2", "smc")]},
+            "a citation without location": {"decision_beliefs": [bel("D1", basis=[{"citation": "X 2020"}]),
+                                                                 bel("D2", "smc")]},
+            "decides not a bool": {"decision_beliefs": [bel("D1", decides="yes"), bel("D2", "smc")]},
+            "an unknown layer": {"decision_beliefs": [bel("D1", layer="vibes"), bel("D2", "smc")]},
+            "no decision-relevant belief": {"decision_beliefs": [bel("D1", decides=False),
+                                                                 bel("D2", "smc", decides=False)]},
+            "duplicate claims": {"decision_beliefs": [bel("D1", claims=[{"claim": "a", "weight": 0.5},
+                                                                        {"claim": "a", "weight": 0.5}]),
+                                                      bel("D2", "smc")]},
+            "not a mapping": ["D1"],
+        }
+        for why, seed in cases.items():
+            pr = decision_seed_problems(seed, run)
+            ok(bool(pr), f"BT10b refused: {why}: {pr[:2]}")
+        rows = decision_table(good)
+        ok([r["id"] for r in rows] == ["D1", "D2"] and rows[0]["p"] == 0.6 and rows[0]["claim"] == "claim 0"
+           and rows[1]["p"] == 0.5, f"BT10c the table leads with each belief's heaviest claim and its weight: {rows}")
+        three = {"decision_beliefs": [bel("D1", w=(0.9, 0.1)), bel("D2", "smc", w=(0.55, 0.45)),
+                                      bel("D3", w=(0.5, 0.5), decides=False)]}
+        ok([r["id"] for r in decision_checklist(three)] == ["D2", "D1"],
+           f"BT10d the checklist: decides yes only, leading weight nearest 0.5 first: {decision_checklist(three)}")
+        ok("decision_beliefs" in DECISION_SEED_FORMAT and "weight" in DECISION_SEED_FORMAT,
+           "BT10e the format is documented in one place (the seed prompt carries it)")
+
     for n, f in (("BT1", bt1), ("BT2", bt2), ("BT3", bt3), ("BT4", bt4), ("BT5", bt5), ("BT6", bt6), ("BT7", bt7),
-                 ("BT8", bt8), ("BT9", bt9)):
+                 ("BT8", bt8), ("BT9", bt9), ("BT10", bt10)):
         tryit(n, f)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

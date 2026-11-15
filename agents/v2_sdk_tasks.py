@@ -131,6 +131,7 @@ Limitations section that repeats each declaration in full with its required reme
 report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
 .claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
+from toolkit.analysis import belief_table as _BT  # noqa: E402 -- the decision-run seed format, documented there
 SEED_FILE = "world_model_seed.yaml"       # the harness validates it and copies it to analysis/world_model_seed.yaml
 WORLD_MODEL_PY = os.path.join(_REPO, "toolkit", "analysis", "world_model.py")
 
@@ -194,7 +195,18 @@ Write """ + SEED_FILE + """ in the world model's format, documented below by too
 
 """ + doc[a:b].strip() + """
 
-Then write {out} = {"ok": true, "notes": "<one line: what drives the choice, in your view>"}.""")
+Then write {out} = {"ok": true, "notes": "<one line: what drives the choice, in your view>"}.
+
+A decision run instead of a sweep: when {out_in} carries decision_run, the harness will not run a sweep; it runs a
+full decision analysis (named in decision_run: its options, comparator, plan variants, decision tests and the
+outputs it writes) and scores your beliefs against those outputs. Then ignore the sweep, the tests and the 5 to 8
+hypotheses above and write """ + SEED_FILE + """ in the belief table's decision-run format (toolkit/analysis/
+belief_table.py), with as many beliefs as decision_run.beliefs states and at least one per topic in
+decision_run.topics. Each belief is your forecast of what that analysis will show, as competing claims with
+weights: be calibrated, reason from the literature and from how the engine works (its card and code are readable),
+and set the weights from that reasoning, never to hedge every belief toward an even split.
+
+""" + _BT.DECISION_SEED_FORMAT + """""")
 
 
 # as a .format template: every brace literal except the two fields the task method fills
@@ -804,6 +816,10 @@ def _self_test() -> int:
            "and the decision design principles")
         ok("results" in sp.lower() and "5 to 8" in sp and SEED_FILE in sp,
            "SW1b the seed prompt says no results are readable, asks for 5 to 8 hypotheses and names its output file")
+        from toolkit.analysis import belief_table as _BT
+        ok("decision_run" in sp and _BT.DECISION_SEED_FORMAT in sp,
+           "SW1c the seed prompt carries the belief table's decision-run format, for an input that names a decision run "
+           "instead of a sweep")
         with tempfile.TemporaryDirectory() as d:
             rd = os.path.join(d, "run")
             os.makedirs(os.path.join(rd, "analysis", "batch"))
