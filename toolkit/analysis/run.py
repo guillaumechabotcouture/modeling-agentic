@@ -2533,7 +2533,7 @@ def _self_test_unit_attr_r2(ok, q):
            f"UA-R7 a value written into a binary eligibility column is read back by the eligibility reader "
            f"({rec.get('status')}, {rec.get('reason')})")
         rec = one(toy(d, 6, bind_elig), {"column": "elig", "values": [0.5]})
-        ok(rec.get("status") == "not_run" and "units table" in str(rec.get("reason")),
+        ok(rec.get("status") == "not_run" and "is not a boolean" in str(rec.get("rejected_values")),
            f"UA-R7b a value the units reader rejects is refused with the reader's reason, not a crash "
            f"({rec.get('status')}, {rec.get('reason')})")
 
