@@ -3308,6 +3308,174 @@ def _self_test() -> int:
                f"{res['toy0'].get('status')} {res['toy0'].get('template_problems')}")
     tryit("WT26 template check", wt26)
 
+    # Codex review of #225 (2026-11-15): the reviewer's reproductions, one case each.
+    def wt28_ledger():
+        import math as _m
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "spend.jsonl")
+            L = SpendLedger(p, 5.0)
+            L.compute("q1", 0.25, "coiled:j/1")
+            L.compute("q2", 0.25, "coiled:j/1")              # the same job's other question: its own share
+            try:
+                L.compute("q1", 0.25, "coiled:j/1")
+                ok(False, "WT28 a second compute line for the same job and question is refused")
+            except TrialError:
+                ok(abs(L.committed() - 0.5) < 1e-9, "WT28 a second compute line for the same job and question is "
+                                                    "refused (a job is charged once per question)")
+            bad = []
+            for name, fn in (("compute nan", lambda: L.compute("q3", float("nan"), "s")),
+                             ("compute negative", lambda: L.compute("q3", -1.0, "s")),
+                             ("reserve inf", lambda: L.reserve("q3", "seed", float("inf"))),
+                             ("charge nan", lambda: L.charge(L.reserve("q4", "seed", 1.0), float("nan"), "s"))):
+                try:
+                    fn()
+                    bad.append(name)
+                except TrialError:
+                    pass
+            ok(not bad, f"WT28b non-finite or negative spend is refused when written: accepted {bad}")
+            prev = [json.loads(x) for x in open(p) if x.strip()][-1]["line_sha"]
+            e = {"kind": "compute", "rid": None, "question": "q5", "usd": float("nan"), "source": "s",
+                 "at": _now(), "total_cap_usd": 5.0, "prev": prev}
+            e["line_sha"] = _sha(e)
+            with open(p, "a") as f:
+                f.write(json.dumps(e, sort_keys=True) + "\n")
+            try:
+                c = SpendLedger(p, 1.0).committed()
+                ok(False, f"WT28c a hash-valid NaN line is refused when read (committed {c}, nan {_m.isnan(c)})")
+            except TrialError:
+                ok(True, "WT28c a hash-valid NaN line is refused when read")
+    tryit("WT28 spend ledger", wt28_ledger)
+
+    def wt28_import():
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            for i in range(2):
+                _toy_template(os.path.join(repo, "data", "tpl", f"toy{i}"))
+            qs = [{"id": f"toy{i}", "question": "Which package per unit?", "engine": toy_ref,
+                   "template": f"data/tpl/toy{i}", "inputs": "synthetic"} for i in range(2)]
+
+            def seed_fn(run_dir, ctx, feedback, cap_usd):
+                from agents.v2_tasks import TaskResult
+                with open(os.path.join(run_dir, "world_model_seed.yaml"), "w") as f:
+                    yaml.safe_dump(_toy_seed(), f, sort_keys=False)
+                return TaskResult(True, {"ok": True}, 0.25, "stub")
+            troot = os.path.join(repo, "trials")
+            L = SpendLedger(os.path.join(troot, "spend.jsonl"), 20.0)
+            A = GitAnchor(repo, os.path.join(troot, ".wm-trials"))
+            run_trials(qs, troot, repo=repo, seed_fn=seed_fn, ledger=L, anchor=A, engines={toy_ref},
+                       citation_lookup=lambda q: [], engine="remote")
+            vm = os.path.join(d, "vm_out")
+            engine_only(qs, vm, root=repo)
+            real = build_step
+
+            def flaky(q, *a, **k):
+                if q["id"] == "toy1":
+                    raise TrialError("build failed (planted)")
+                return real(q, *a, **k)
+            comp = lambda: sorted((e["question"], round(e["usd"], 6)) for e in  # noqa: E731
+                                  (json.loads(x) for x in open(os.path.join(troot, "spend.jsonl")))
+                                  if e["kind"] == "compute")
+            with mock.patch.dict(globals(), {"build_step": flaky}):
+                r1 = import_engine(troot, vm, qs, usd_total=0.5, source="coiled:wmt-x/j1", ledger=L, repo=repo,
+                                   anchor_ref=A.ref)
+            ok(r1["toy1"]["status"] == "failed" and comp() == [("toy0", 0.25)],
+               f"WT28d a question whose build fails is not charged: {r1}, {comp()}")
+            for qid in ("toy0", "toy1"):                 # run --engine remote restores awaiting_engine on a retry
+                t = json.load(open(os.path.join(troot, "runs", qid, TRIAL)))
+                t.update(status="awaiting_engine")
+                json.dump(t, open(os.path.join(troot, "runs", qid, TRIAL), "w"))
+            r2 = import_engine(troot, vm, qs, usd_total=0.5, source="coiled:wmt-x/j1", ledger=L, repo=repo,
+                               anchor_ref=A.ref)
+            ok(all(v["status"] == "complete" for v in r2.values()) and comp() == [("toy0", 0.25), ("toy1", 0.25)],
+               f"WT28e a retried import charges each question of the job once, at the job's share (USD over the "
+               f"job's questions, not over the questions retried): {comp()}")
+    tryit("WT28 import charged once", wt28_import)
+
+    def wt28_guard():
+        with tempfile.TemporaryDirectory() as d:
+            repo, troot, res, calls, L, _ = e2e(d, lambda q, k: _toy_seed())
+            rd = os.path.join(troot, "runs", "toy0")
+            seed = yaml.safe_load(open(os.path.join(rd, SEED)))
+            aside = json.load(open(os.path.join(rd, "analysis", "set_aside.json")))
+            hy = {h["id"]: h for h in yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))[
+                "hypotheses"]}
+            g = guard_reasons(rd, seed, 0.1)
+            ok(aside == g and (hy["H4"]["confrontation"].get("set_aside") or {}).get("class") == "input_determined",
+               f"WT28f the build sets aside what guard_reasons sets aside (one guard): H4 "
+               f"{hy['H4']['confrontation'].get('set_aside')}; build {sorted(aside)} vs guard {sorted(g)}")
+            ok("classify_tests" not in globals() and "circular_tests" not in globals(),
+               "WT28g no second classification path: classify_tests and circular_tests are gone")
+    tryit("WT28 build guard", wt28_guard)
+
+    def wt28_anchor():
+        import subprocess
+        from toolkit.analysis import world_model as W
+        with tempfile.TemporaryDirectory() as d:
+            work, remote = os.path.join(d, "work"), os.path.join(d, "remote.git")
+            vcs = lambda *a, env=None: subprocess.run(["git", "-C", work, *a], capture_output=True, text=True,  # noqa
+                                                     env=env)
+            subprocess.run(["git", "init", "-q", "--bare", remote], capture_output=True)
+            os.makedirs(work)
+            vcs("init", "-q")
+            vcs("config", "user.email", "t@t")
+            vcs("config", "user.name", "t")
+            reg = W.register(_toy_seed(), [], at="2020-01-01T10:00:00+00:00")
+            path = os.path.join(work, "hypotheses_registry.jsonl")
+            open(path, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in reg))
+            vcs("add", ".")
+            old = dict(os.environ, GIT_COMMITTER_DATE="2020-01-01T11:00:00+00:00",
+                       GIT_AUTHOR_DATE="2020-01-01T11:00:00+00:00")
+            vcs("commit", "-qm", "register (local, 11:00)", env=old)
+            vcs("remote", "add", "origin", remote)
+            vcs("push", "-q", "origin", "HEAD:refs/heads/main")       # reachable on the remote only now
+            vcs("fetch", "-q", "origin")
+            an = W.git_anchors(path, "origin/main")
+            at = W._when(an[0]["at"]) if an else None
+            ok(an and at is not None and at.year >= 2026,
+               f"WT28h a late push is anchored when the remote first held the commit (the first fetch or push that "
+               f"made it reachable), not at the commit's time: {an and an[0]['at']}")
+            vcs("update-ref", "-d", "refs/remotes/origin/main")
+            vcs("config", "core.logAllRefUpdates", "false")
+            subprocess.run(["rm", "-rf", os.path.join(work, ".git", "logs", "refs", "remotes")])
+            vcs("fetch", "-q", "origin")
+            ok(W.git_anchors(path, "origin/main") == [],
+               "WT28i without a record of when the remote first held the commit there is no anchor (post hoc)")
+    tryit("WT28 anchor reachability", wt28_anchor)
+
+    def wt28_independence():
+        from toolkit.analysis import batch as B
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d:
+            _toy_wtp_table(d)
+            tpl = os.path.join(d, "data", "tpl", "t")
+            q = {"id": "t", "question": "Which package per unit?", "engine": toy_ref, "template": "data/tpl/t",
+                 "inputs": "synthetic"}
+            _indep_template(tpl, {"features": ["cov"], "generator": "generate_units.py", "basis": "independent"})
+            sp = os.path.join(tpl, "decision_spec.yaml")
+            raw = yaml.safe_load(open(sp))
+            raw["analysis"]["emulator"]["features"] = ["cov", "tgt"]       # tgt is a design feature, not declared
+            yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)            # independent
+            rho = B.realized_rank_correlations(schema.load(sp), ["cov"])
+            pr = template_problems(q, d)
+            ok("cov|tgt" in rho and abs(rho["cov|tgt"]) > 0.3 and pr["independence"],
+               f"WT28j a declared-independent feature correlated with another design feature (not itself declared "
+               f"independent) fails: {rho}, {pr['independence']}")
+    tryit("WT28 independence against every design feature", wt28_independence)
+
+    def wt28_modes():
+        rows = [{"id": "H1", "status": "untestable", "test": {"kind": "effect_direction", "feature": "x",
+                                                              "direction": "increases"}},
+                {"id": "H2", "status": "untestable", "test": {"kind": "effect_direction", "feature": "x",
+                                                              "direction": "increases"},
+                 "confrontation": {"set_aside": {"class": "engine_blind", "why": "w"}}},
+                {"id": "H3", "status": "untestable", "test": {"kind": "effect_direction", "feature": "x",
+                                                              "direction": "increases"}}]
+        fm = failure_modes(rows, {"beliefs": []}, {})
+        ok(fm.get("untestable") == ["H1", "H3"] and fm.get("engine_blind") == ["H2"],
+           f"WT28k failure_modes: an untestable first row, then each row's own class: {fm}")
+    tryit("WT28 failure modes", wt28_modes)
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
