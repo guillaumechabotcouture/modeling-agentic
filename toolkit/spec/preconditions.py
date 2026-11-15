@@ -77,18 +77,21 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
            if k not in box or not (box[k][0] <= r[0] and r[1] <= box[k][1])]
     tol = lambda r: 1e-9 * max(1.0, abs(r[1] - r[0]))       # noqa: E731
     # Codex r1 P1-2: the point plan is evaluated at these values; outside the emulator's box it would extrapolate
-    out += [f"net_effect_posterior: the run's point value of {k}, {point.get(k)}, is outside the posterior's range "
-            f"{list(r)} (the emulator design box); set it inside, or widen the range with a margin"
-            for k, r in ne["ranges"].items() if k in point
-            and not r[0] - tol(r) <= float(point[k]) <= r[1] + tol(r)]
-    # Codex r1 P1-1: a parameter_value test on a posterior column must set values inside its box
+    out += [f"net_effect_posterior: the run's point value of {k}, {point.get(k)}, is outside {k}'s emulator design box "
+            f"{list(box[k][:2])} (the posterior's range {list(r)}); set it inside, or widen the range with a margin"
+            for k, r in ne["ranges"].items() if k in point and k in box
+            and not box[k][0] - tol(box[k]) <= float(point[k]) <= box[k][1] + tol(box[k])]
+    # owner, 15 Nov ("tests may go wider"): a parameter_value test on a posterior column may go beyond the hull (it
+    # widens the design box, batch.design_box), but never past the column's hard bounds
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    hb = NEF.hard_bounds(eng, list(ne["ranges"]))
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(t, dict) and t.get("type") == "parameter_value" and t.get("parameter") in ne["ranges"]:
-            r = ne["ranges"][t["parameter"]]
-            bad = [v for v in t.get("values") or [] if not r[0] - tol(r) <= float(v) <= r[1] + tol(r)]
+        if isinstance(t, dict) and t.get("type") == "parameter_value" and t.get("parameter") in hb:
+            lo, hi, what = hb[t["parameter"]]
+            bad = [v for v in t.get("values") or [] if not lo <= float(v) <= hi]
             if bad:
                 out.append(f"net_effect_posterior: decision test {t.get('id')} sets {t['parameter']} to {bad}, outside "
-                           f"the posterior's range {list(r)} (the emulator design box)")
+                           f"its hard bound [{lo}, {hi}] ({what})")
     return out
 
 
@@ -344,16 +347,26 @@ def _self_test_posterior(ok) -> None:
         p = schema.toy_spec(d)
         ok(problems(d, None, None) == [] and _net_effect_posterior(d, schema.load(p), None) == [],
            "PC15 a spec without a net-effect posterior is unaffected")
-    # Codex r1 P1-1, P1-2: the run's point and its parameter_value tests must lie inside the posterior's box
+    # owner, 15 Nov ("tests may go wider"): a parameter_value test on a posterior column outside the hull is accepted (it
+    # widens the design box, not the draws); a value outside the engine's hard bounds is refused
     with tempfile.TemporaryDirectory() as d:
         p = run_dir(d)
         raw = yaml.safe_load(open(p))
         raw["analysis"]["decision_tests"] = list(raw["analysis"].get("decision_tests") or []) + [
-            {"id": "DTpa", "type": "parameter_value", "parameter": "eff_a", "values": [0.1, 0.9], "text": "t"}]
+            {"id": "DTpa", "type": "parameter_value", "parameter": "eff_a", "values": [0.1, 0.5, 0.9], "text": "t"}]
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         got = problems(d, None, None)
-        ok(any("DTpa" in g and "eff_a" in g for g in got),
-           f"PC16 a parameter_value test that sets a posterior column outside its range is refused: {got[:1]}")
+        ok(got == [], f"PC16 a parameter_value test that sets a posterior column outside its hull (inside its hard "
+                      f"bounds) is accepted: {got[:1]}")
+        raw["analysis"]["decision_tests"][-1]["values"] = [0.1, 1.5]
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)        # the toy engine's parameters have no units: give them [0, 1] here
+        try:
+            got = problems(d, None, None)
+        finally:
+            NEF.UNIT_BOUNDS.pop("", None)
+        ok(any("DTpa" in g and "hard bound" in g for g in got),
+           f"PC16b a parameter_value test that sets a posterior column outside its hard bounds is refused: {got[:1]}")
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
