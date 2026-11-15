@@ -20,7 +20,8 @@ v2 (owner, 2026-11-14): each claim competes with its alternatives (claim_set: in
 effect, or holds / does not hold, plus "simulator artefact" in the world layer for a belief resting on our engine
 only), with weights summing to 1. An evidence log holds one row per item {source, type: trial | observational |
 our_sim | expert, favours, lr, group, layer}; the ratio comes from the test result (evidence_lr: decided LR_STRONG,
-undecided at most LR_WEAK toward the sign of the estimate); posterior multiplies the weights by one ratio per
+undecided at most LR_WEAK: toward no material effect when the interval excludes a material effect, toward the sign
+of the estimate only when it leans clearly); posterior multiplies the weights by one ratio per
 dependence group; our simulations update the engine layer, papers and data the world layer, and check_items names
 where they disagree. A scored claim's p is its weight before the question's own evidence.
 """
@@ -114,6 +115,9 @@ ARTEFACT = "simulator artefact"
 ARTEFACT_PRIOR = 0.1     # the world-layer weight of "simulator artefact" for a belief resting on our engine only
 LR_STRONG = 10.0         # a decided test
 LR_WEAK = 2.0            # the most an undecided or marginal-only result can weigh
+NEAR_NULL_EQUIV = 0.3    # |rho| bound of "no material effect" for a direction test that states none (the widest
+                         # bound the trial seeds use for a negligible claim); a test's own equivalence bound wins
+NEAR_NULL_LR = 1.5       # an undecided interval inside +/- the bound, centred near 0: weak, toward no material effect
 EVIDENCE_TYPES = ("trial", "observational", "our_sim", "expert")
 LAYER_OF = {"our_sim": "engine", "trial": "world", "observational": "world", "expert": "world"}
 CHECK_AT = 0.5           # a check item when the layers' leading claims differ and the engine's leads at this weight
@@ -152,11 +156,24 @@ def _lean(f):
     return 1.0 if f < 1 / 3 else 1.5 if f < 2 / 3 else LR_WEAK
 
 
+def _near_null(test, o) -> bool:
+    """An undecided direction result that excludes a material effect: its interval lies inside +/- the equivalence
+    bound (the test's own, else NEAR_NULL_EQUIV) and its estimate within half the bound. Without an interval, no."""
+    ci, rho = o.get("ci"), o.get("rho")
+    eq = test.get("equivalence")
+    eq = float(eq) if isinstance(eq, (int, float)) and 0 < eq < 1 else NEAR_NULL_EQUIV
+    if not (isinstance(ci, (list, tuple)) and len(ci) == 2 and all(isinstance(x, (int, float)) for x in ci)):
+        return False
+    return -eq <= ci[0] and ci[1] <= eq and isinstance(rho, (int, float)) and abs(rho) <= eq / 2
+
+
 def evidence_lr(test, status, observed, min_share=None) -> tuple:
     """(the claim a test result favours, its likelihood ratio, strength), derived from the result alone: a decided
     test (supported / refuted) is strong (LR_STRONG) for what it observed; an undecided direction test leans toward
-    the sign of rho by 1, 1.5 or 2 as its z (from its p value) reaches a third, two thirds or all of 1.96; a
-    marginal-only association weighs at most LR_WEAK; an undecided band leans by its coverage. Else (None, 1)."""
+    "no material effect" (NEAR_NULL_LR) when its interval excludes a material effect (_near_null), else toward the
+    sign of rho (LR_WEAK) only when it leans clearly, its z (from its p value) at two thirds of 1.96 or more (chain b,
+    2026-11-14: near-null results had been carried as weak support for a direction); a marginal-only association
+    weighs at most LR_WEAK; an undecided band leans by its coverage. Else (None, 1)."""
     from statistics import NormalDist
     o, k = observed or {}, test.get("kind")
     direc = k == "effect_direction"
@@ -174,13 +191,15 @@ def evidence_lr(test, status, observed, min_share=None) -> tuple:
         return fav, LR_STRONG, "decided"
     if status != "inconclusive":
         return None, 1.0, "none"
-    if direc and isinstance(o.get("rho"), (int, float)) and o["rho"]:
+    if direc and isinstance(o.get("rho"), (int, float)):
+        tag = " (marginal only)" if o.get("marginal_only") else ""
+        if _near_null(test, o):
+            return "no material effect", NEAR_NULL_LR, "weak (near null)" + tag
         pv = o.get("p")
         z = NormalDist().inv_cdf(1 - max(min(float(pv), 1.0), 1e-12) / 2) if isinstance(pv, (int, float)) else 0.0
-        lr = _lean(z / 1.959964)
-        if o.get("marginal_only"):
-            return (sign(o["rho"]), lr, "weak (marginal only)") if lr > 1 else (None, 1.0, "none")
-        return (sign(o["rho"]), lr, "weak") if lr > 1 else (None, 1.0, "none")
+        if o["rho"] and z / 1.959964 >= 2 / 3:
+            return sign(o["rho"]), LR_WEAK, "weak" + tag
+        return None, 1.0, "none"
     if k == "effect_band" and isinstance(o.get("coverage"), (int, float)) and min_share:
         c, m = float(o["coverage"]), float(min_share)
         lr = _lean(abs(c - 0.5) / max(m - 0.5, 1e-9))
