@@ -1,0 +1,336 @@
+beliefs:
+- id: B1
+  mechanism: 'Herd protection through children: CHILDREN removes ~80% of child susceptibles, who hold most of the
+    susceptible pool, so the residual Reff falls below 1 in most districts and CRS (infections in women) falls by
+    most of its baseline.'
+  about:
+    package: children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.8
+    - 1.0
+    scale: relative_reduction
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Vaccination against rubella and measles: quantitative investigations of different
+      policies. J Hyg (Lond) 1983'
+    location: final-size and herd-immunity arguments; exact page not recalled (low confidence on location)
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: Chapter 14 (rubella), location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B2
+  mechanism: WIDE removes ~80% of both child and female susceptibles. The residual Reff is far below 1 in almost
+    every district, and women are also protected directly, so the CRS reduction is near complete.
+  about:
+    package: wide
+  direction: reduces
+  magnitude:
+    band:
+    - 0.9
+    - 1.0
+    scale: relative_reduction
+  conditions: []
+  source_type: literature
+  evidence:
+  - citation: 'Vynnycky E, Adams EJ, Cutts FT, Reef SE, Navar AM, Simons E, Yoshida LM, Brown DW, Jackson C, Strebel
+      PM, Dabbagh AJ. Using seroprevalence and immunisation coverage data to estimate the global burden of congenital
+      rubella syndrome, 1996-2010: a systematic review. PLoS One 2016'
+    location: methods (force of infection and CRS risk by age); location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B3
+  mechanism: 'Own-target cohort: a larger child gap raises the baseline outbreak, and CHILDREN removes most of exactly
+    those susceptibles. So CHILDREN''s relative reduction rises with s0_children. Where the baseline is subcritical
+    (low s0_children) there is little outbreak to avert, and the seed''s chain is not averted. Analogues held in
+    chainb1 H3 and chainb2 H3 (rho 0.35-0.54).'
+  about:
+    package: children
+    feature: s0_children
+  direction: increases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation; location approximate
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B4
+  mechanism: 'Women CHILDREN cannot reach: higher s0_women raises the residual Reff after CHILDREN and puts more
+    of the residual infections into the group that carries CRS, so CHILDREN''s relative CRS reduction falls as s0_women
+    rises. Earlier ''dilution'' claims were inconclusive twice (saturation near 100% where the residual Reff ends
+    below 1), so ''no material effect'' carries almost as much weight.'
+  about:
+    package: children
+    feature: s0_women
+  direction: decreases
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation; location approximate
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B5
+  mechanism: Where the female gap is small, CHILDREN already takes Reff below 1. WIDE's extra cost (~US$0.2 per
+    resident) buys almost no extra CRS averted, so CHILDREN beats WIDE on net benefit. This holds under the literal
+    lambda (0.032) and under the derivation-consistent one (3.1e-5).
+  about:
+    pair:
+    - children
+    - wide
+    feature: s0_women
+  direction: none
+  conditions:
+  - feature: s0_women
+    range:
+    - 0.0501
+    - 0.15
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: herd-immunity threshold 1 - 1/R0; location approximate
+  confidence: medium
+  decision_relevant: true
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+- id: B6
+  mechanism: 'At the declared shadow price of 0.032 CRS per USD, the cost of CHILDREN (~US$0.4-0.5 per resident,
+    ~0.014 CRS-equivalents) exceeds the CRS it can avert per resident (plausibly 1e-4 to 3e-3: women ~20% of residents
+    x susceptible share x attack rate x CRS risk per infection ~0.01-0.05), so ''none'' beats CHILDREN on net benefit
+    in most points. With lambda = 3.1e-5, CHILDREN would beat none wherever a major outbreak is possible. The sign
+    flips with the lambda, not with the epidemiology.'
+  about:
+    pair:
+    - none
+    - children
+    feature: s0_children
+  direction: none
+  source_type: literature
+  evidence:
+  - citation: Salomon JA, Haagsma JA, Davis A, et al. Disability weights for the Global Burden of Disease 2013 study.
+      Lancet Glob Health 2015
+    location: disability weights table (as cited in the sweep's shadow-price basis)
+  - citation: Hutubessy R, Chisholm D, Tan-Torres Edejer T. Generalized cost-effectiveness analysis for national-level
+      priority-setting in the health sector. Cost Eff Resour Alloc 2003
+    location: threshold convention
+  confidence: low
+  decision_relevant: true
+  citation_check:
+    found: 2
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B7
+  mechanism: 'WIDE saturates: after WIDE the residual Reff is well below 1 across the s0_children range, so its
+    relative reduction barely moves with the child gap.'
+  about:
+    package: wide
+    feature: s0_children
+  direction: negligible
+  source_type: literature
+  evidence:
+  - citation: 'Anderson RM, May RM. Infectious Diseases of Humans: Dynamics and Control. Oxford University Press,
+      1991'
+    location: final-size relation; location approximate
+  confidence: low
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: low
+- id: B8
+  mechanism: 'Vaccine effect: one dose of rubella-containing vaccine seroconverts about 95% of recipients aged 9-12
+    months or older, with long-lasting protection, so all-or-nothing protection of about 0.95 per reached susceptible
+    is the trial-anchored value.'
+  about:
+    component: children
+  direction: reduces
+  magnitude:
+    band:
+    - 0.9
+    - 0.99
+    scale: relative_reduction
+  source_type: literature
+  evidence:
+  - citation: 'World Health Organization. Rubella vaccines: WHO position paper. Wkly Epidemiol Rec 2011'
+    location: section on immunogenicity and efficacy; location approximate
+  confidence: medium
+  decision_relevant: false
+  citation_check:
+    found: 1
+    not_found: 0
+    not_a_citation: 0
+    lookup_failed: 0
+    confidence_claimed: medium
+open_questions:
+- id: Q1
+  question: Is the shadow price 0.032 CRS per USD intended? Its own basis (32 DALYs per CRS case, US$1000 per DALY)
+    gives 3.1e-5 CRS per USD, about 1000 times lower. At 0.032, 'none' wins every campaign comparison, and the paired
+    tests and any plan would report a units error, not the epidemiology. The owner should confirm the value before
+    the plan is read.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+- id: Q2
+  question: What are the group sizes (n_children, n_women, n_other) and crs_ratio_c/w/o in units.csv? The child
+    share of the susceptible pool decides whether CHILDREN alone takes Reff below 1. If crs_ratio_c or crs_ratio_o
+    is non-zero (for example, pregnant girls under 15 or women over 39), CHILDREN's CRS reduction and WIDE's added
+    value both change.
+  beliefs:
+  - B1
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q3
+  question: Is the outcome the deterministic final size, or weighted by p_major? With one importation and a residual
+    Reff just above 1 after CHILDREN, p_major (~1 - 1/Reff) is small, which shrinks WIDE's added value and favours
+    CHILDREN.
+  beliefs:
+  - B1
+  - B5
+  decision_relevant: true
+- id: Q4
+  question: Where exactly does CHILDREN fail to protect women? Roughly where R0 x (s_women_share + s_other_share
+    + 0.2 x s_children_share) exceeds 1, at high s0_women, high s0_other and R0 near 7. Whether any district of
+    the 24 sits there decides whether WIDE is ever chosen.
+  beliefs:
+  - B4
+  - B5
+  decision_relevant: true
+- id: Q5
+  question: Does the US$12M budget bind? It does only if CHILDREN or WIDE everywhere costs more. With district sizes
+    unknown, I cannot tell. At the literal lambda the budget is irrelevant because none wins.
+  beliefs:
+  - B5
+  - B6
+  decision_relevant: true
+hypotheses:
+- id: H1
+  belief: B1
+  claim: CHILDREN reduces CRS by 80-100% relative to none in at least 70% of usable points.
+  p: 0.62
+  test:
+    kind: effect_band
+    package: children
+    band:
+    - 0.8
+    - 1.0
+    min_share: 0.7
+- id: H2
+  belief: B2
+  claim: WIDE reduces CRS by 90-100% relative to none in at least 70% of usable points.
+  p: 0.72
+  test:
+    kind: effect_band
+    package: wide
+    band:
+    - 0.9
+    - 1.0
+    min_share: 0.7
+- id: H3
+  belief: B3
+  claim: CHILDREN's relative reduction in CRS increases as s0_children rises.
+  p: 0.55
+  weights:
+    increases: 0.55
+    decreases: 0.15
+    no material effect: 0.3
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_children
+    direction: increases
+- id: H4
+  belief: B4
+  claim: CHILDREN's relative reduction in CRS decreases as s0_women rises.
+  p: 0.45
+  weights:
+    decreases: 0.45
+    increases: 0.1
+    no material effect: 0.45
+  test:
+    kind: effect_direction
+    package: children
+    feature: s0_women
+    direction: decreases
+- id: H5
+  belief: B5
+  claim: Where s0_women is low (0.0501-0.15), CHILDREN beats WIDE on net benefit at the shadow price in at least
+    70% of usable points.
+  p: 0.82
+  test:
+    kind: paired_sign
+    a: children
+    b: wide
+    feature: s0_women
+    range:
+    - 0.0501
+    - 0.15
+    sign: positive
+    min_share: 0.7
+- id: H6
+  belief: B6
+  claim: At the declared shadow price (0.032), none beats CHILDREN on net benefit in at least 70% of usable points
+    across the full s0_children range.
+  p: 0.6
+  test:
+    kind: paired_sign
+    a: none
+    b: children
+    feature: s0_children
+    range:
+    - 0.2193
+    - 0.5851
+    sign: positive
+    min_share: 0.7
+- id: H7
+  belief: B7
+  claim: s0_children has no material effect on WIDE's relative reduction in CRS (Spearman rho within +/-0.3).
+  p: 0.4
+  weights:
+    no material effect: 0.4
+    increases: 0.4
+    decreases: 0.2
+  test:
+    kind: effect_direction
+    package: wide
+    feature: s0_children
+    direction: negligible
+    equivalence: 0.3
