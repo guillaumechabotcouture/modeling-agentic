@@ -201,12 +201,22 @@ def select(qs, only=None, batch=None, limit=None) -> list[dict]:
 
 
 # ---------------------------------------------------------------- spend
+def _usd(v, what) -> float:
+    """A finite, non-negative USD amount, or TrialError."""
+    import math
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+        raise TrialError(f"{what}: {v!r} is not a finite, non-negative USD amount")
+    return float(v)
+
+
 class SpendLedger:
     """Append-only, hash-chained spend ledger across invocations (trials/spend.jsonl). Lines: {kind: reserve, rid,
     question, task, cap_usd} before a task is launched, then {kind: charge, rid, usd, source}; {kind: compute, ...}
     records an engine step's cost. Committed spend = charges + compute + every open reservation at its cap. The chain
     (each line's sha256 and the previous line's) is verified on every read: an edited, removed or reordered line
-    refuses the ledger. One lock (threads and processes) spans each read-check-append."""
+    refuses the ledger. One lock (threads and processes) spans each read-check-append. Amounts are finite and
+    non-negative, when written and when read (a NaN would make every later cap comparison false). An engine job is
+    charged once per question: a second compute line with the same source and question is refused."""
 
     def __init__(self, path, total_cap_usd):
         if isinstance(total_cap_usd, bool) or not isinstance(total_cap_usd, (int, float)) or not total_cap_usd > 0:
@@ -239,6 +249,9 @@ class SpendLedger:
                 raise TrialError(f"{self.path} line {k + 1}: malformed")
             if e.get("prev") != prev or e.get("line_sha") != _sha({x: v for x, v in e.items() if x != "line_sha"}):
                 raise TrialError(f"{self.path} line {k + 1}: edited, removed or reordered (the chain does not verify)")
+            for x in ("usd", "cap_usd"):
+                if x in e:
+                    _usd(e[x], f"{self.path} line {k + 1}: {x}")
             prev = e["line_sha"]
             out.append(e)
         return out
@@ -270,7 +283,7 @@ class SpendLedger:
         """A reservation id, or None when committed spend plus this cap would exceed the total cap (refused)."""
         with self._locked() as f:
             L = self._lines()
-            if self._committed(L) + float(cap_usd) > self.cap + 1e-9:
+            if self._committed(L) + _usd(cap_usd, "reservation cap") > self.cap + 1e-9:
                 return None
             rid = _sha([question, task, _now(), len(L), os.getpid(), threading.get_ident()])[:16]
             self._append(f, L, {"kind": "reserve", "rid": rid, "question": question, "task": task,
@@ -283,12 +296,22 @@ class SpendLedger:
             if rid not in {e["rid"] for e in L if e["kind"] == "reserve"} or \
                     rid in {e["rid"] for e in L if e["kind"] == "charge"}:
                 raise TrialError(f"spend ledger: no open reservation {rid}")
-            self._append(f, L, {"kind": "charge", "rid": rid, "usd": float(usd), "source": source})
+            self._append(f, L, {"kind": "charge", "rid": rid, "usd": _usd(usd, "charge"), "source": source})
 
     def compute(self, question, usd, backend):
+        """An engine job's share for one question. Refused when the same job (source) is already charged for it."""
+        usd = _usd(usd, "compute")
         with self._locked() as f:
-            self._append(f, self._lines(), {"kind": "compute", "rid": None, "question": question, "usd": float(usd),
-                                            "source": backend})
+            L = self._lines()
+            if any(e["kind"] == "compute" and e.get("source") == backend and e.get("question") == question for e in L):
+                raise TrialError(f"spend ledger: {backend} is already charged for {question}")
+            self._append(f, L, {"kind": "compute", "rid": None, "question": question, "usd": usd, "source": backend})
+
+    def computed(self, question, backend) -> bool:
+        """Is this engine job (source) already charged for this question?"""
+        with self._locked():
+            return any(e["kind"] == "compute" and e.get("source") == backend and e.get("question") == question
+                       for e in self._lines())
 
     def by_question(self) -> dict:
         with self._locked():
@@ -714,8 +737,8 @@ def lint_templates(qs, root=REPO) -> dict:
     return res
 
 
-def classify_tests(run_dir, seed, lam=None, template_dir=None) -> dict:
-    """{hypothesis id: {class, why}} from the spec's inputs and the engine's own sweep (world_model.load_sweep,
+def _declared_effect_classes(run_dir, seed, lam=None, template_dir=None) -> dict:
+    """Part of guard_reasons, the one guard (called by nothing else). {hypothesis id: {class, why}} from the spec's inputs and the engine's own sweep (world_model.load_sweep,
     canonical_test and the sweep's reduction, as the build reads them). Classes, applied in world_model build
     (--set-aside): reported, counted apart, never a confirmation, never moving confidence.
       circular      a test of a package's effect against one of its own effect parameters (its feature); or an effect
@@ -771,11 +794,6 @@ def classify_tests(run_dir, seed, lam=None, template_dir=None) -> dict:
                                + (f"lies inside the band {t['band']}" if inside else
                                   f"against the band {t['band']}: the verdict compares the seed with the prior")}
     return out
-
-
-def circular_tests(run_dir, seed, lam=None) -> dict:
-    """{hypothesis id: why} of the circular class of classify_tests."""
-    return {k: v["why"] for k, v in classify_tests(run_dir, seed, lam).items() if v["class"] == "circular"}
 
 
 def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
@@ -1162,8 +1180,8 @@ def build_step(q, run_dir, anchor_ref=None) -> dict:
     import yaml
     from toolkit.analysis import world_model as W
     seed = yaml.safe_load(open(os.path.join(run_dir, SEED)))
-    aside = classify_tests(run_dir, seed, q.get("shadow_price"),
-                           os.path.join(q.get("_root") or REPO, q["template"]) if q.get("template") else None)
+    aside = guard_reasons(run_dir, seed, q.get("shadow_price"),        # the one guard, as belief_rescore reads it
+                          os.path.join(q.get("_root") or REPO, q["template"]) if q.get("template") else None)
     circ = {k: v["why"] for k, v in aside.items() if v["class"] == "circular"}
     _sio().write_nofollow(run_dir, "analysis/circular.json", json.dumps(circ, indent=1, sort_keys=True).encode(),
                           atomic=True)
@@ -1337,15 +1355,15 @@ SCORING = {"lenient_width": 0.6, "lenient_share": 0.6, "lenient_equivalence": 0.
 YEAR_RE = re.compile(r"\b(19|20)\d\d\b")
 LOC_RE = re.compile(r"\b(table|tab\.|fig|figure|p\.|pp\.|page|section|supplement|appendix|abstract|results|methods|"
                     r"discussion|introduction|main text|summary of findings|eq\.|equation)", re.I)
-MODES = ("circular", "prior_echo", "engine_blind", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
+MODES = ("circular", "prior_echo", "engine_blind", "input_determined", "confounded_independence", "untestable", "post_hoc", "conditional_not_settled", "too_few_points", "test_too_lenient", "wrong_estimand",
          "inert_feature", "high_confidence_refuted", "contradiction_without_open_question", "citation_not_verifiable")
 
 
-ASIDE = ("circular", "prior_echo", "engine_blind")
+ASIDE = ("circular", "prior_echo", "engine_blind", "input_determined", "confounded_independence")
 
 
 def _aside(h):
-    """The set-aside class of a checked hypothesis (circular, prior_echo, engine_blind), or None."""
+    """The set-aside class of a checked hypothesis (one of ASIDE), or None."""
     c = h.get("confrontation") or {}
     return (c.get("set_aside") or {}).get("class") or ("circular" if c.get("circular") else None)
 
@@ -1359,9 +1377,9 @@ def failure_modes(hyps, seed, wm, ctx=None) -> dict:
     for h in hyps:
         t, st, obs = h.get("test") or {}, h.get("status"), (h.get("result") or {}).get("observed") or {}
         b = by.get(h.get("belief")) or {}
+        cls = _aside(h)
         if st == "untestable" and cls != "engine_blind":
             out["untestable"].append(h["id"])
-        cls = _aside(h)
         if cls:
             out[cls].append(h["id"])
         if (h.get("confrontation") or {}).get("post_hoc"):
@@ -1579,7 +1597,7 @@ def sdk_seed_fn():
 # ---------------------------------------------------------------- one guard and the belief table (owner, 2026-11-13)
 def _input_determined(sw, package, mask) -> tuple[bool, float | None]:
     """Is the package's relative reduction over `mask` fixed by its own declared effect parameters alone (R^2 >=
-    CIRCULAR_R2, the fit classify_tests uses)? The comparator (no components) is: its reduction is zero."""
+    CIRCULAR_R2, the fit _declared_effect_classes uses)? The comparator (no components) is: its reduction is zero."""
     import numpy as np
     comps = sw.packages.get(package) or []
     if not comps:
@@ -1604,18 +1622,19 @@ def _input_determined(sw, package, mask) -> tuple[bool, float | None]:
 def guard_reasons(run_dir, seed, lam=None, template_dir=None) -> dict:
     """{hypothesis id: {class, why}}: the one guard. A claim cannot be tested by a simulation whose declared inputs
     determine its outcome without running the dynamics. Mechanically, from the run's own artifacts and code
-    (classify_tests, world_model.load_sweep and canonical_test, batch.realized_rank_correlations):
+    (_declared_effect_classes, world_model.load_sweep and canonical_test, batch.realized_rank_correlations). The build
+    (build_step) and the rescoring (belief_rescore) both call it: there is no second classification path.
       circular, prior_echo  the claimed quantity is a declared effect (tested against its own parameter, or a band on
                             a reduction its declared parameters explain alone)
       engine_blind          a direction claim on a feature the engine never reads
       input_determined      a paired comparison (or flip) of packages whose reductions are each fixed by their declared
                             parameters: the winner is arithmetic on declared burden, priors, prices and lambda
       confounded_independence  a conditional claim settled on a feature declared independent whose realized units
-                            table correlates it with another declared feature (|Spearman| > 0.3)"""
+                            table correlates it with another design feature (|Spearman| > 0.3)"""
     from toolkit.analysis import batch as B
     from toolkit.analysis import world_model as W
     from toolkit.spec import schema
-    out = dict(classify_tests(run_dir, seed, lam, template_dir))
+    out = dict(_declared_effect_classes(run_dir, seed, lam, template_dir))
     sw, spec = W.load_sweep(run_dir, "current", lam, use_plan=False)
     ind = list(sw.design.get("independent") or [])
     worst = {}
@@ -1642,7 +1661,7 @@ def guard_reasons(run_dir, seed, lam=None, template_dir=None) -> dict:
                 not t.get("adjust_for") and t.get("feature") in ind and worst.get(t["feature"], 0.0) > 0.3:
             out[h["id"]] = {"class": "confounded_independence",
                             "why": f"{t['feature']} is declared independent but the realized units table correlates it "
-                                   f"with another declared feature (|Spearman| {worst[t['feature']]:.2f} > 0.3)"}
+                                   f"with another design feature (|Spearman| {worst[t['feature']]:.2f} > 0.3)"}
     return out
 
 
@@ -1897,12 +1916,17 @@ def engine_only(qs, out_root, root=REPO, max_engine_runs=DEFAULT_MAX_ENGINE_RUNS
 def import_engine(trials_root, src_root, qs, usd_total, source, ledger, repo=REPO, anchor_ref=None) -> dict:
     """The laptop's step after a VM job: for each question awaiting its engine, the job's batch (BATCH_FILES under
     src_root/runs/<id>/analysis/batch/) is copied into the local run directory when the job's design.json is the
-    local one byte for byte (refused otherwise), the job's real USD is charged to the spend ledger in equal shares,
-    and the question is built (build_step) and completed. The build then checks the rows' bindings (job sha256 and
-    engine identity) and dates the evidence by the VM's first-seen record, after the anchor commit."""
+    local one byte for byte (refused otherwise), the question is built (build_step) and completed, and only then is
+    its share of the job's real USD charged: usd_total over the questions the job holds (src_root/runs/<id> with a
+    design), once per job and question (a retried import does not charge again; the ledger refuses a second line).
+    The build checks the rows' bindings (job sha256 and engine identity) and dates the evidence by the VM's
+    first-seen record, after the anchor."""
     from toolkit.analysis.artifacts import sha256
     todo = [q for q in qs if _trial(os.path.join(trials_root, "runs", q["id"])).get("status") == "awaiting_engine"]
-    share = float(usd_total) / len(todo) if todo else 0.0
+    rr = os.path.join(src_root, "runs")
+    held = [x for x in (sorted(os.listdir(rr)) if os.path.isdir(rr) else [])
+            if os.path.isfile(os.path.join(rr, x, "analysis", "batch", "design.json"))]
+    share = _usd(usd_total, "job USD") / len(held) if held else 0.0
     out = {}
     for q in todo:
         rd = os.path.join(trials_root, "runs", q["id"])
@@ -1918,13 +1942,15 @@ def import_engine(trials_root, src_root, qs, usd_total, source, ledger, repo=REP
                 if os.path.isfile(os.path.join(src, name)):
                     data, _ = _sio().read_nofollow(src, name)
                     _sio().write_nofollow(rd, f"analysis/batch/{name}", data, atomic=True)
-            ledger.compute(q["id"], share, source)
-            t["engine"] = {"backend": source, "imported_from": os.path.abspath(src_root), "compute_usd": share}
             t["steps"]["engine"] = _now()
             t["build"] = build_step(dict(q, shadow_price=(t.get("shadow_price") or {}).get("value")), rd,
                                     anchor_ref if t.get("anchor") else None)
             t["steps"]["build"] = _now()
             write_belief_table(rd, q)                # what a chained question carries forward
+            if not ledger.computed(q["id"], source):   # charged after the build, once per job and question
+                ledger.compute(q["id"], share, source)
+            t["engine"] = {"backend": source, "imported_from": os.path.abspath(src_root), "compute_usd": share,
+                           "job_questions": len(held)}
             pq = ledger.by_question().get(q["id"]) or {}
             t.update(status="complete", spend_usd=round(pq.get("llm_usd", 0.0) + pq.get("compute_usd", 0.0), 6))
         except Exception as ex:  # noqa: BLE001
@@ -2595,7 +2621,7 @@ def _self_test() -> int:
                                      "test": {"kind": "effect_direction", "package": "a",
                                               "feature": "x (calibration scale)", "direction": "negligible",
                                               "equivalence": 0.2, "adjust_for": ["eff_a"]}})
-            got = circular_tests(rd, sd, 0.1)
+            got = {k for k, v in guard_reasons(rd, sd, 0.1).items() if v["class"] == "circular"}
             ok(set(got) == {"A1"}, f"WT13 only a test against its own effect parameter is circular, not one that "
                                    f"adjusts for it or restricts its region to it (or a band its range is not inside): "
                                    f"{sorted(got)}")

@@ -39,8 +39,9 @@ reordered or backdated line is refused). The ledger cannot attest itself, and no
 controls can prove when a registration happened, so the claim is narrow: a hypothesis is "remote-anchored" only
 when its current canonical test sha256 is in a ledger line covered by a ledger commit reachable from a fetched
 remote-tracking ref (--anchor-ref refs/remotes/<remote>/<branch>; HEAD, local branches and commit ids are refused)
-whose commit time is before its evidence existed, recorded as "anchored in remote git (commit <sha>); the commit
-time is the committer's clock". Everything else is "post hoc": reported separately and never in the share
+whose remote reachability (the first reflog entry of that ref holding the commit, never before the commit time)
+is before its evidence existed, recorded as "anchored in remote git (commit <sha>), at the first reflog entry of
+<ref> holding it". Everything else is "post hoc": reported separately and never in the share
 confirmed. A ledger that does not extend every such head (rewritten or truncated) is refused. run_state.json
 heads are not used (v2 does not yet hash-protect run_state.json). The track record is not tamper-proof: whoever
 controls the machine and can push to the remote can rewrite both.
@@ -978,9 +979,11 @@ def cli_anchors(run_dir, reg_path, ref):
 
 def git_anchors(path, ref):
     """Recorded heads from git: each commit of the ledger file that is an ancestor of the fetched remote `ref`, with
-    the verified ledger it held and its commit time. `ref` must resolve to refs/remotes/... (refused otherwise).
-    Residual trust: the commit time is the committer's clock; the remote shows the commit was pushed by the time it
-    was fetched. Fetch before use; git unavailable: none."""
+    the verified ledger it held, anchored at the time the remote was first seen to hold it: the first entry of the
+    ref's reflog (a fetch, or the push that updated it) whose value contains the commit, or the commit time if later.
+    A commit's time alone is not enough (Codex review of #225: committed at 11:00, evidence at 12:00, pushed at 13:00
+    must be post hoc). A commit no reflog entry shows reachable is no anchor. `ref` must resolve to refs/remotes/...
+    (refused otherwise). Residual trust: the local reflog and the clocks. Fetch before use; git unavailable: none."""
     import subprocess
     d, name = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
     out = []
@@ -990,11 +993,25 @@ def git_anchors(path, ref):
         if not full.startswith("refs/remotes/"):
             raise WorldModelError(f"--anchor-ref {ref!r} resolves to {full or 'no symbolic ref'}: a fetched "
                                   "remote-tracking ref (refs/remotes/<remote>/<branch>) is required")
+        rl = run("log", "-g", "--date=iso-strict", "--format=%H %gd", full)
+        reflog = []                                       # (time, value), oldest first
+        for row in (rl.stdout.splitlines() if rl.returncode == 0 else []):
+            v, _, sel = row.partition(" ")
+            when = _when(sel[sel.find("@{") + 2:-1]) if "@{" in sel and sel.endswith("}") else None
+            if when is not None:
+                reflog.append((when, v))
+        reflog.sort(key=lambda x: x[0])
         log = run("log", "--format=%H %cI", full, "--", name)
         for row in (log.stdout.splitlines() if log.returncode == 0 else []):
-            c, at = row.split()
+            c, cat = row.split()
             if run("merge-base", "--is-ancestor", c, full).returncode != 0:
                 continue
+            ct = _when(cat)
+            seen = next((w for w, v in reflog if (ct is None or w >= ct) and
+                         run("merge-base", "--is-ancestor", c, v).returncode == 0), None)
+            if seen is None:                              # no record of when the remote first held it
+                continue
+            at = seen.isoformat()
             show = run("show", f"{c}:./{name}")
             try:
                 lines = verify_ledger([json.loads(x) for x in show.stdout.splitlines() if x.strip()])
@@ -1002,8 +1019,8 @@ def git_anchors(path, ref):
                 continue
             if show.returncode == 0 and lines:
                 out.append({"at": at, "lines": len(lines), "head": lines[-1]["line_sha"], "commit": c,
-                            "source": f"anchored in remote git (commit {c}); the commit time is the committer's "
-                                      "clock", "ref": full})
+                            "committed_at": cat, "source": f"anchored in remote git (commit {c}), at the first "
+                                                           f"reflog entry of {full} holding it", "ref": full})
     except WorldModelError:
         raise
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -1069,7 +1086,7 @@ def _record(hist, seed_tr, n_imported=0):
     return tr
 
 
-SET_ASIDE = ("circular", "prior_echo", "engine_blind")
+SET_ASIDE = ("circular", "prior_echo", "engine_blind", "input_determined", "confounded_independence")
 
 
 def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_time=None, registry=None,
@@ -1078,11 +1095,13 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
     simulation beliefs, conflicts, every hypothesis checked, the confrontations identified and recorded, confidence
     moved only by new pre-registered ones, contradictions as open questions, and where to look next. `circular`:
     {hypothesis id: why its verdict is fixed by a spec input} (the caller's classification, e.g.
-    scripts/world_model_trials.py circular_tests): those verdicts are reported (confrontation.circular), counted
+    scripts/world_model_trials.py guard_reasons): those verdicts are reported (confrontation.circular), counted
     apart in the track record (track_record.circular) and never move a belief's confidence. `set_aside`: {hypothesis
     id: {class, why}} with class circular, prior_echo (its claimed quantity is a declared engine prior, so its verdict
-    measures agreement with that prior, not skill) or engine_blind (a direction test on a feature the engine never
-    reads: untestable by this engine, its status set to untestable); each is reported (confrontation.set_aside),
+    measures agreement with that prior, not skill), engine_blind (a direction test on a feature the engine never
+    reads: untestable by this engine, its status set to untestable), input_determined (a paired comparison its
+    declared inputs decide) or confounded_independence (a conditional claim on a declared-independent feature the
+    realized table correlates with another); each is reported (confrontation.set_aside),
     counted apart (track_record.<class>) and never moves confidence."""
     aside = {str(k): {"class": "circular", "why": str(v)} for k, v in (circular or {}).items()}
     for k, v in (set_aside or {}).items():
@@ -1156,7 +1175,7 @@ def build(seed, sw, plan=None, units=None, inputs=None, hypotheses=None, plan_ti
             b["confidence"] = CONFIDENCE[min(max(j, 0), 2)]
     tr = dict(_record(hist, seed.get("track_record"), n_imported), tamper_proof=False,
               note="pre-registration is remote-anchored (a ledger commit reachable from a fetched remote-tracking "
-                   "ref, whose commit time is the committer's clock) or post hoc; the track record is not "
+                   "ref, dated by the first reflog entry holding it) or post hoc; the track record is not "
                    "tamper-proof: whoever controls the machine and can push to the remote can rewrite both",
               registry={"lines": len(led), "head": led[-1]["line_sha"] if led else None,
                         "anchors": [{k: a.get(k) for k in ("at", "lines", "source")} for a in anchors or []]})
@@ -2798,7 +2817,7 @@ def _self_test() -> int:
                     ok(True, f"WM77 --anchor-ref {ref[:12]} (not a remote-tracking ref) is refused")
             an = git_anchors(path, "origin/main")
             ok(an and an[0]["source"].startswith("anchored in remote git (commit ") and
-               "the commit time is the committer's clock" in an[0]["source"],
+               "first reflog entry" in an[0]["source"],
                f"WM77b a fetched remote-tracking ref anchors, labelled as remote git: {an[:1]}")
     tryit("WM77 remote anchors only", wm77)
 

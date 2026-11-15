@@ -141,7 +141,8 @@ def independent_features(spec) -> tuple[list, dict]:
         sha = hashlib.sha256(f.read()).hexdigest()
     # A generator that draws columns independently can still realize a correlated table on a few units (a world-model
     # trial's 24 units gave rank correlation 0.82 between two separately drawn columns): the declaration holds only
-    # when the realized table's declared features are also uncorrelated (|Spearman| <= INDEPENDENCE_RHO_MAX pairwise).
+    # when the realized table's declared features are also uncorrelated with every design feature (|Spearman| <=
+    # INDEPENDENCE_RHO_MAX).
     rho = realized_rank_correlations(spec, list(dec["features"]))
     big = {k: v for k, v in rho.items() if abs(v) > INDEPENDENCE_RHO_MAX}
     if big:
@@ -156,16 +157,19 @@ INDEPENDENCE_RHO_MAX = 0.3
 
 
 def realized_rank_correlations(spec, features) -> dict:
-    """{"a|b": Spearman rho} between each pair of declared features over the units table (as features.vector reads
-    them)."""
+    """{"a|b": Spearman rho} over the units table (as features.vector reads them) between each of `features` (the
+    declared-independent ones) and every other declared design feature, each pair once: a feature drawn independently
+    must be uncorrelated with every other column the design varies, not only with the other declared ones (Codex
+    review of #225: pop declared alone passed with Spearman 1 against seed_share)."""
     from scipy.stats import spearmanr
     from toolkit.analysis import features as FT
     names = [FT.name(x) for x in FT.declared(spec.raw)]
     rows = [FT.vector(spec, u) for u in spec.units()]
-    col = {f: [r[names.index(f)] for r in rows] for f in features}
+    col = {f: [r[names.index(f)] for r in rows] for f in names}
+    feats = [f for f in features if f in col]
     out = {}
-    for i, a in enumerate(features):
-        for b in features[i + 1:]:
+    for i, a in enumerate(feats):
+        for b in feats[i + 1:] + [x for x in names if x not in feats]:
             if len(set(col[a])) > 1 and len(set(col[b])) > 1:
                 out[f"{a}|{b}"] = float(spearmanr(col[a], col[b])[0])
     return out
