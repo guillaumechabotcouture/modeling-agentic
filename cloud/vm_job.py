@@ -2145,7 +2145,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                 import budget
 
                 def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False):
-                    jid, seen, lbo_calls = f"r32{label}", [], []
+                    jid, seen, lbo_calls, built = f"r32{label}", [], [], []
 
                     def meter(cid):
                         seen.append(cid)
@@ -2161,7 +2161,8 @@ def _self_test_run(ok, real_gate=None) -> None:
                         return lbo_ok, "f6: ok" if lbo_ok else "f6: over"
 
                     def lifetime(s_):
-                        if meter_fails:
+                        built.append(s_)           # meter_fails: True always fails, an int n fails the first n builds
+                        if meter_fails is True or (meter_fails and len(built) <= meter_fails):
                             raise RuntimeError("details unavailable")
                         return meter
                     wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
@@ -2210,6 +2211,19 @@ def _self_test_run(ok, real_gate=None) -> None:
                 ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("attach_id", 100) in ev
                    and ("delete", 100) in ev and W["stops"] == 1,
                    f"RN32g three failed readings while waiting stop the cluster by id (fail closed): {res!r}")
+                # Codex re-review of #232 (P1): the gate accepted a $5 cap at $2 spent and replaced the reservation;
+                # the meter's construction then failed once, and the retry re-ran the gate, read $6 and refused, so
+                # the cluster was left running above its accepted cap with no meter.
+                W, ev, res, seen, lbo_calls, killed = rewait("i", [2.0, 6.0, 6.0], meter_fails=1)
+                ok(isinstance(res, SystemExit) and ("delete", 100) in ev and W["stops"] == 1
+                   and lbo_calls == [("f6", 5.0, 100, "reattach_clusters.json")],
+                   f"RN32i once the cap is accepted the gate is not re-run, and whatever ends the wait after it (here "
+                   f"the cap, read on the first reading) stops the cluster by id: {res!r} {lbo_calls} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("j", [1.0], meter_fails=3)
+                ok(isinstance(res, SystemExit) and "fail closed" in str(res.code) and ("delete", 100) in ev
+                   and W["stops"] == 1 and len(lbo_calls) == 1 and ("attach_id", 100) not in ev,
+                   f"RN32j after the cap is accepted, a meter that cannot be built three times stops the cluster, "
+                   f"and the budget gate ran once: {res!r} {lbo_calls}")
             case("RN32", rn32)
         finally:
             ws.JOBS = old

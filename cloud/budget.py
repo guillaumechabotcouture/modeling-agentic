@@ -1659,6 +1659,46 @@ def _self_test() -> int:
             ok(refused(lambda: reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)) is not None
                and refused(lambda: lifetime_meter("f6")(40)) is not None,
                "BR22d an unreadable cluster cost raises (the caller retries, then stops the cluster), never returns")
+            # Codex re-review of #232, P1: the windowed cost and the lifetime cost came from two details requests;
+            # billing advanced from $10 to $20 between them, the $50 cap reserved only $40, and a later $10 launch
+            # passed a $50 budget although the cluster could still spend to $50.
+            r, src, ok1, cf = world("e", 50.0, 20, 10.0)
+            first, n = src.details, [0]
+
+            def advancing(cid):
+                rec = first(cid)
+                n[0] += 1
+                if n[0] > 1:
+                    rec["cloud_total_cost"] = 20.0
+                return rec
+            src.details = advancing
+            g = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)
+            more = launch_budget_ok("f6", 10, "lw-smoke-z", reserve=False)
+            s = spend("f6")
+            ok(g[0] and not more[0] and abs(s["used_usd"] + s["reserved_usd"] - 50.0) < 1e-6,
+               f"BR22e the windowed and lifetime costs come from one snapshot: billing that advances during the gate "
+               f"leaves the cap's whole $50 held (used + reserved), so a later $10 launch is refused: {g[1]} / "
+               f"{more[1]}")
+            # P2: a cluster created before the window counts only its window estimate in the scope, while its cap is
+            # on max(billed, lifetime estimate). Billed $100, lifetime estimate $60, window estimate $20, at $2/h: a
+            # $150 cap reserved $50, and the window spend then passed the budget while the meter stayed under $150.
+            for label, budget_usd in (("f", 100.0), ("g", 140.0)):
+                r, src, ok1, cf = world(label, budget_usd, 20, 100.0, created=t - 30 * H)
+                g, worst, t_save = reattach_budget_ok("f6", 150, "lw-smoke-w", 40, cf), [], clock[0]
+                try:
+                    m = lifetime_meter("f6") if g[0] else None
+                    for h in range(0, 61):
+                        clock[0] = t_save + h * H
+                        s = spend("f6")
+                        worst.append(round(s["used_usd"] + s["reserved_usd"] - budget_usd, 6))
+                        if m is None or m(40) >= 150:
+                            break
+                finally:
+                    clock[0] = t_save
+                ok(max(worst) <= 0 and (g[0] if label == "g" else True),
+                   f"BR22{label} a cluster created before the window, re-capped at $150 under a ${budget_usd:.0f} "
+                   f"budget: until its lifetime meter reaches the cap, the window's used + reserved never passes the "
+                   f"budget (accepted: {g[0]}; worst excess ${max(worst):.2f}): {g[1]}")
         case("BR22", bg22)
     _ENV = real_env
     if fails:
