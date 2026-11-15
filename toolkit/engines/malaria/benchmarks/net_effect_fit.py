@@ -742,6 +742,8 @@ def declared_seeds(seeds) -> list:
 def seed_interval(values, n_seeds: int) -> tuple[float, float] | None:
     """(lo, hi) of the seed geometric mean's 95% interval, exp(mean(log v) +- Z95 sd(log v)/sqrt(n)); None unless
     there are exactly `n_seeds` (>= 2) values, all finite and positive."""
+    if not isinstance(values, (list, tuple)):
+        return None
     try:
         v = [float(x) for x in values]
         n_seeds = int(n_seeds)
@@ -956,9 +958,14 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             not isinstance(p, dict) or p.get("point") not in rows for p in pts):
         no("the fit's acceptance gate cannot be replayed: a calibration_grid.at_grid_edge record and verified points "
            "that are rows of the sample are needed")
-    seeds = pack_seeds()
-    if (doc.get("fit_rule") or {}).get("seeds") != seeds:
-        no(f"the run's recorded seeds {(doc.get('fit_rule') or {}).get('seeds')} are not pack.yaml's {seeds}")
+    seeds, fr = pack_seeds(), doc.get("fit_rule")
+    rec = fr.get("seeds") if isinstance(fr, dict) else None
+    try:
+        declared_seeds(rec)
+    except ValueError as ex:
+        no(f"the run's recorded seeds (fit_rule.seeds) are not a valid declaration: {ex}")
+    if rec != seeds:
+        no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
     try:
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
                            edge, seeds=seeds)
@@ -1410,6 +1417,9 @@ def _self_test() -> int:
                     lambda x: jr(x)["verified"]["points"][0]["per_seed"].update(B11=[0.5, 0.6]))
             variant("recorded seeds other than the pack's", lambda x: x["fit_rule"].update(seeds=[11, 12]))
             variant("no recorded seeds", lambda x: x.pop("fit_rule"))
+            # Codex r1 P2 (this PR): the recorded declaration is validated, and a malformed one is a refusal
+            variant("recorded seeds as floats", lambda x: x["fit_rule"].update(seeds=[float(v) for v in pack_seeds()]))
+            variant("fit_rule not a mapping", lambda x: x.update(fit_rule=["seeds"]))
             variant("a clamped calibration grid", lambda x: x["calibration_grid"].update(at_grid_edge=["muleba"]))
             variant("no calibration grid record", lambda x: x.pop("calibration_grid"))
             variant("a verified point not in the sample",
@@ -1451,7 +1461,8 @@ def _self_test() -> int:
                "a row lacks a parameter": "the fit's parameters", "a non-finite value": "non-finite",
                "a non-numeric value": "non-numeric", "a column the fit did not fit": "the fit's parameters",
                "a parameter these draws do not vary": "not varied", "a value outside its draw range": "draw range",
-               "recorded seeds other than the pack's": "seeds", "no recorded seeds": "seeds"}
+               "recorded seeds other than the pack's": "seeds", "no recorded seeds": "seeds",
+               "recorded seeds as floats": "seeds", "fit_rule not a mapping": "seeds"}
         wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
         ok(not wrong and set(got) == set(why) and sha2 != P["sha256"],
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
@@ -1710,7 +1721,8 @@ def _self_test() -> int:
                  "no declared seeds": (good, [], False),
                  "declared seeds missing": (good, None, False),
                  "a non-integer declared seed": (good, s8[:7] + ["x"], False),
-                 "a boolean declared seed": (good, s8[:7] + [True], False)}
+                 "a boolean declared seed": (good, s8[:7] + [True], False),
+                 "values as a mapping (Codex r1 P2)": ({0.5 + i / 100: None for i in range(8)}, s8, False)}
         got = {k: point_in_band({"per_seed": {"B11": v}}, bd, sd)[0] for k, (v, sd, _) in cases.items()}
         wrong = sorted(k for k, (_, _, w) in cases.items() if got[k] is not w)
         ok(not wrong, f"F26b exactly one seed value per declared seed; a missing, extra or duplicate seed, or no valid "
