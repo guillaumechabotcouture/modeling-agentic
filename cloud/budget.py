@@ -1711,6 +1711,18 @@ def _self_test() -> int:
                    f"BR22{label} a cluster created before the window, re-capped at $150 under a ${budget_usd:.0f} "
                    f"budget: until its lifetime meter reaches the cap, the window's used + reserved never passes the "
                    f"budget (accepted: {g[0]}; worst excess ${max(worst):.2f}): {g[1]}")
+            # Codex review of this fix (P2): a pre-window cluster whose processes have all stopped while the listing
+            # still says running bills its final $10 (below its $60 lifetime estimate); the rest of a $30 cap was
+            # taken as $30 - $60 and wrote a negative reservation, and the malformed ledger refused every later launch.
+            r = signed("k22h", usd=100.0)
+            src = _FakeSource([_item(40, "lw-smoke-w", t - 30 * H, "running", t + 20)],
+                              {40: _det(40, "lw-smoke-w", t - 30 * H, 0, 10.0, "running", insts=[(t - 30 * H, t, "vmA")])})
+            with_env(env(r, source=src))
+            g = reattach_budget_ok("f6", 30, "lw-smoke-w", 40, os.path.join(r, "reattach_clusters.json"))
+            nxt = launch_budget_ok("f6", 10, "lw-smoke-z", reserve=False)
+            ok(g[0] and nxt[0] and all(x["cap_usd"] > 0 for x in json.load(open(_ENV.reservations))),
+               f"BR22h a pre-window cluster that has finished (final bill under its lifetime estimate) reserves the cap "
+               f"less what it billed, the ledger stays valid, and a later launch fits: {g[1]} / {nxt[1]}")
         case("BR22", bg22)
     _ENV = real_env
     if fails:
