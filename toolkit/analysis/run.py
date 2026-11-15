@@ -2475,6 +2475,7 @@ def _self_test_unit_attr(ok, q):
         ok((on_disk.get("unit_attribute") or {}).get("cases", [{}])[0].get("table_sha256") == want,
            f"UA15 the result file names the column, units and modified-table sha256 ({str(on_disk)[:160]})")
     _self_test_unit_attr_r1(ok, q)
+    _self_test_unit_attr_r2(ok, q)
     with tempfile.TemporaryDirectory() as d:     # end to end: the manifest binds the record and the set_from table
         r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
         with open(os.path.join(d, "override.csv"), "w") as f:
@@ -2496,6 +2497,73 @@ def _self_test_unit_attr(ok, q):
            and "models/decision_tests/DTu.yaml" in (man.get("deliverables") or {}) and contract.gate_findings(d) == [],
            f"UA16 a run records the test in analysis/decision_tests.yaml with the set_from table among its hashed "
            f"inputs, its record file is a manifest deliverable, and the contract checks pass ({str(art)[:200]})")
+
+
+def _self_test_unit_attr_r2(ok, q):
+    """#228 re-review (the reviewer's probes): a changed cell is written in its column's own format; identity compares
+    everything the arm's analysis reads (not the feature vector alone); the 'provably unchanged' proof needs the
+    feasible packages and constraints unchanged too."""
+    import tempfile
+    import types
+    import yaml
+    from toolkit.analysis import variants as V
+
+    def toy(d, n, mut):
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=n))))
+        mut(r)
+        return schema.Spec(r, d)
+
+    def one(sp, ua):
+        try:
+            A = Analysis(sp, DirectModel(sp, log=q))
+            V.apply_headline(A)
+            z0 = {i: None for i in A.ids}
+            out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+            plan = A.solve(ben0, cost0)["choice"]
+            return DT.run_one(A, {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua},
+                              z0, ben0, cost0, plan, {}, out0)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return {"status": "error", "reason": f"{type(e).__name__}: {e}", "results": [{}]}
+
+    def bind_elig(r):
+        r["decision_units"]["engine_attributes"] = {"x": {"column": "elig"}}
+    with tempfile.TemporaryDirectory() as d:     # P2-1: a binary eligibility column keeps its integer format
+        rec = one(toy(d, 6, bind_elig), {"column": "elig", "values": [1]})
+        ok(rec.get("status") == "run",
+           f"UA-R7 a value written into a binary eligibility column is read back by the eligibility reader "
+           f"({rec.get('status')}, {rec.get('reason')})")
+        rec = one(toy(d, 6, bind_elig), {"column": "elig", "values": [0.5]})
+        ok(rec.get("status") == "not_run" and "is not a boolean" in str(rec.get("rejected_values")),
+           f"UA-R7b a value the units reader rejects is refused with the reader's reason, not a crash "
+           f"({rec.get('status')}, {rec.get('reason')})")
+
+    def threshold(r):
+        bind_elig(r)
+        r["constraints"]["eligibility"] = {"b": {"column": "elig", "min": 0.5}}
+        r["engine_parameters"] = {"k": {"value": 0.0, "source": "probe", "reason": "constant burden",
+                                        "basis": "owner_judgement"}}
+    for label, ua in (("unlocks", {"column": "elig", "units": ["0"], "values": [1]}),
+                      ("locks", {"column": "elig", "units": ["1"], "values": [0]})):
+        with tempfile.TemporaryDirectory() as d:     # P2-3: feasibility moves while benefits and costs do not
+            rec = one(toy(d, 2, threshold), ua)
+            ok(rec.get("status") == "run" and rec.get("can_move_plan") is True
+               and not any(x.get("provably_unchanged") for x in rec.get("results") or [{}])
+               and "cannot move the plan" not in str(rec.get("statement")),
+               f"UA-R9 a change that {label} a package through eligibility is never 'provably unchanged' "
+               f"({rec.get('status')}, {rec.get('can_move_plan')}, {rec.get('decision_changes')}, "
+               f"{rec.get('reason') or rec.get('statement')})")
+    with tempfile.TemporaryDirectory() as d:     # P2-2: a population change no emulator feature sees is no identity
+        sp = toy(d, 6, lambda r: None)
+        for u in sp.units():
+            u["pop"] = "1"
+        sp.raw["decision_units"]["engine_attributes"] = {"group": {"columns": ["pop"]}}
+        sp.raw["analysis"]["emulator"] = {"features": [{"attribute": "group", "encoding": "count"}]}
+        card = types.SimpleNamespace(valid_ranges={"group": [0, 2]})
+        pl = DT.plan_unit_attribute(sp, {"unit_attribute": {"column": "pop", "values": [0.1]}}, card, "emulator",
+                                    {"group.count": (1.0, 1.0)})
+        ok(pl["status"] == "runs" and len((pl.get("perturbations") or [{}])[0].get("units_changed") or []) == 6,
+           f"UA-R8 a population change the emulator features do not see is not an identity: populations, costs and "
+           f"caps read it ({pl['status']}, {pl.get('why')})")
 
 
 def _self_test_unit_attr_r1(ok, q):
