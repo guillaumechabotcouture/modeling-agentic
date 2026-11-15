@@ -1,0 +1,165 @@
+# F6 outcome map: for each pre-registered belief in world_model_seed.yaml, the F6 output that decides it and the
+# rule per claim. Written by the modeller before F6 runs; the beliefs themselves are the seed task's.
+decision: f6
+run: the signed F6 run directory (Nigeria GF13, harness v2, engine malaria-starsim v0.17), read after it finishes
+conventions:
+  plan: >-
+    the headline plan: analysis/point.yaml plan (one package id per unit; a package id joins its components with
+    a plus sign, e.g. net_pbo+smc). A unit "gets" a component when its package id contains it.
+  regions: >-
+    northern units are those whose units-table zone is North West, North East or North Central; southern units are
+    South West or South South. Units-table columns are read from the run's own data/derived/units.csv at scoring time.
+  resistance: >-
+    the units-table resistance column is bioassay mortality: a lower value is a more resistant unit.
+  words: >-
+    most = more than half; nearly all or nearly every = at least nine in ten; few = at most one in ten;
+    minority = more than one in ten and at most half; substantial minority = more than a fifth and at most half;
+    many = at least one in ten (the run's own share threshold for a plan change).
+  decision_tests: >-
+    analysis/decision_tests.yaml tests, by test_id: verdict CHANGES_PLAN or NO_CHANGE; NOT_RUN or a missing test makes
+    the belief undecided. Each test's own record (its path field) holds the units that move and their packages.
+  scoring: >-
+    the outcome is the claim whose rule holds. The belief table scores the leading (heaviest) claim confirmed when it
+    holds and refuted otherwise; the weight given to the claim that held gives the multi-claim log score. When no
+    claim's rule holds the outcome is "outside the set": the leading claim is refuted, the case is listed apart, and no
+    multi-claim log score is computed for it. A missing output field makes the belief undecided, never scored.
+  guard: >-
+    the one guard (docs/design/v2-progressive-steps.md section 5) was applied to every belief. No belief is set aside:
+    none tests an effect against its own declared parameter, and none is a comparison fixed by declared effects, prices
+    and burden alone, because every outcome here goes through the engine's emulated dynamics and the solver. The
+    resistance and zone features the beliefs condition on are unit attributes the engine reads. D8 (no IRS) comes
+    closest: the spec states a cost argument for it, but IRS's benefit is an engine output and some units are IRS
+    eligible, so it stays scored. It should be read as a near-certain claim.
+entries:
+  - belief: D1
+    output: analysis/point.yaml
+    field: plan (share of units by net component)
+    rules:
+      0: more than half of units get net_pbo
+      1: more than half of units get net_dual
+      2: more than half of units get net_pyr
+      3: no net component reaches more than half of units
+  - belief: D2
+    output: analysis/point.yaml
+    field: plan, with units-table zone and resistance
+    rules:
+      0: >-
+        more than one in ten units get net_dual; more than three quarters of those are northern; at most one in ten
+        southern units get net_dual; and the median resistance of net_dual units is below the median of northern units
+      1: at most one in ten units get net_dual
+      2: more than one in ten units get net_dual and more than one in ten southern units get net_dual
+  - belief: D3
+    output: analysis/point.yaml
+    field: plan (share of units with any net component)
+    rules:
+      0: at least nine in ten units get a net component
+      1: more than one in ten units get no net component
+  - belief: D4
+    output: analysis/point.yaml
+    field: plan, among units whose units-table smc_eligible is true
+    rules:
+      0: at least nine in ten eligible units get smc
+      1: more than half and fewer than nine in ten eligible units get smc
+      2: at most one in ten eligible units get smc
+  - belief: D5
+    output: analysis/point.yaml
+    field: plan (share of units with cm)
+    rules:
+      0: at most one in ten units get cm
+      1: more than one in ten and at most half of units get cm
+      2: more than half of units get cm
+  - belief: D6
+    output: analysis/decision_tests.yaml
+    field: tests[DT4].verdict
+    rules:
+      0: CHANGES_PLAN (the test record's moves toward cm are noted, not scored)
+      1: NO_CHANGE
+  - belief: D7
+    output: analysis/decision_tests.yaml
+    field: tests[DT5].verdict
+    rules:
+      0: NO_CHANGE
+      1: CHANGES_PLAN
+  - belief: D8
+    output: analysis/point.yaml
+    field: plan (units with irs)
+    rules:
+      0: no unit gets irs
+      1: at least one unit gets irs
+  - belief: D9
+    output: analysis/decision_tests.yaml
+    field: tests[DT1].verdict
+    rules:
+      0: NO_CHANGE
+      1: CHANGES_PLAN
+  - belief: D10
+    output: analysis/decision_tests.yaml
+    field: tests[DT10].verdict, and the DT10 record's re-optimised plan against the headline
+    rules:
+      0: >-
+        CHANGES_PLAN, and among units whose net component changes, most northern ones move to net_pbo or net_dual and
+        most southern ones move to net_pyr or no net
+      1: NO_CHANGE
+  - belief: D11
+    output: analysis/decision_tests.yaml
+    field: tests[DT6].verdict, and the DT6 record's re-optimised plan against the headline
+    rules:
+      0: CHANGES_PLAN, and at least one in ten units move from net_pbo to net_dual
+      1: NO_CHANGE
+  - belief: D12
+    output: analysis/decision_tests.yaml
+    field: tests[DT7].verdict and tests[DT8].verdict
+    rules:
+      0: DT7 and DT8 both NO_CHANGE
+      1: DT8 CHANGES_PLAN and DT7 NO_CHANGE
+      2: DT7 and DT8 both CHANGES_PLAN
+  - belief: D13
+    output: analysis/decision_tests.yaml
+    field: tests[DT9].verdict
+    rules:
+      0: CHANGES_PLAN
+      1: NO_CHANGE
+  - belief: D14
+    output: analysis/plan_variants.yaml
+    field: >-
+      variants[gc7_as_funded].share_units_changed, and analysis/point.yaml plan against the units-table gc7_package
+      (units whose net component differs against units whose smc differs)
+    rules:
+      0: >-
+        the share is more than a fifth and at most half, and at least as many units differ in net component as differ
+        in smc
+      1: the share is more than half
+      2: the share is at most a fifth
+  - belief: D15
+    output: analysis/point.yaml
+    field: plan, in the states whose units-table gc7_package has net_pbo (every state but Kaduna)
+    rules:
+      0: in more than half of those states, more than half of the state's units get net_pbo
+      1: in at most half of those states, more than half of the state's units get net_pbo
+  - belief: D16
+    output: analysis/plan_variants.yaml
+    field: >-
+      headline objective (DALYs averted, undiscounted) over variants[gc7_as_funded].objective, minus one; the gc7
+      plan's cost against the allocatable budget is reported beside it
+    rules:
+      0: the ratio minus one is at least one twentieth and at most one third
+      1: the ratio minus one is below one twentieth (including a negative gain)
+      2: the ratio minus one is above one third
+  - belief: D17
+    output: analysis/plan_variants.yaml
+    field: >-
+      the headline's and variants[gc7_as_funded]'s DALYs averted paired by uncertainty draw, where an output holds
+      them per draw (the variant's uncertainty block or the value-of-information candidates)
+    rules:
+      0: the headline averts more DALYs than the gc7 plan in more than half of the draws
+      1: the headline averts more in at most half of the draws
+    note: if no output holds per-draw values for both plans, the belief is undecided (quantiles alone are not paired)
+  - belief: D18
+    output: analysis/value_of_information.yaml
+    field: inputs, the input or group with the largest evppi among those with above_noise_floor true
+    rules:
+      0: a net-killing input (net_kill_shift, cfp_kill or cfp_half, or a group holding one of them)
+      1: cm_add (or a group holding it and no net-killing input)
+      2: an SMC effect parameter or the smc cost item
+      3: no input or group is above its noise floor
+    note: any other top input (an emulator term, another cost item) is outside the set
