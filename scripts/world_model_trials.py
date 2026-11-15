@@ -2574,9 +2574,13 @@ def _self_test() -> int:
             ok(q["hypotheses"]["circular"] == 4 and sorted(q["failure_modes"].get("circular") or []) == sorted(circ)
                and S["overall"]["hypotheses"]["circular"] == 4,
                f"WT11d the summary counts circular tests ({q['hypotheses']}) and lists them as a failure mode")
-            dec = [h["id"] for h in hy["hypotheses"] if h["id"] not in circ and h["status"] in ("supported", "refuted")]
-            ok(sum(v["supported"] + v["refuted"] for v in q["confidence"].values()) == len(dec),
-               f"WT11e the confirmation-by-confidence table leaves circular verdicts out: {q['confidence']}")
+            dec = [h["id"] for h in hy["hypotheses"] if h["id"] not in circ and h["status"] in ("supported", "refuted")
+                   and not (h.get("confrontation") or {}).get("set_aside")]     # the one guard's classes (θ)
+            h4 = {h["id"]: h for h in hy["hypotheses"]}["H4"]     # refuted, and set aside as input_determined
+            ok(sum(v["supported"] + v["refuted"] for v in q["confidence"].values()) == len(dec)
+               and h4["status"] in ("supported", "refuted") and _aside(h4) == "input_determined" and "H4" not in dec,
+               f"WT11e the confirmation-by-confidence table leaves circular (and every other set-aside) verdicts out: "
+               f"{q['confidence']}")
     tryit("WT11 circular", wt11)
 
     def wt12():
@@ -2921,7 +2925,10 @@ def _self_test() -> int:
                 print("WT19 run:", res["toy0"].get("status"), res["toy0"].get("error"), res["toy0"].get("seed"))
             hy = {h["id"]: h for h in yaml.safe_load(open(os.path.join(rd, "analysis", "hypotheses.yaml")))["hypotheses"]}
             cls = {k: (h["confrontation"].get("set_aside") or {}).get("class") for k, h in hy.items()}
-            ok(res["toy0"]["status"] == "complete" and cls == {"H1": "circular", "H4": None, "E1": "prior_echo",
+            # H4 (a vs b, each reducing by its declared effect alone) is input_determined: the build now uses
+            # guard_reasons, the one guard (θ), as WT23 already expected of it
+            ok(res["toy0"]["status"] == "complete" and cls == {"H1": "circular", "H4": "input_determined",
+                                                               "E1": "prior_echo",
                                                                "E2": "engine_blind", "E3": None},
                f"WT19 a band on a reduction its declared effect prior fixes is prior echo (circular when its range lies "
                f"inside the band); a direction test on a feature the engine never reads is engine-blind: {cls}")
