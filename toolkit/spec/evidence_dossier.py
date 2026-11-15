@@ -326,6 +326,12 @@ def _exec_context(ref: str, cfg: dict, memo: dict, run: dict | None = None, run_
             from toolkit.spec import priors as PRI
             s = _spec_obj(dict(run, engine={"ref": ref, **({"config": dict(cfg)} if cfg else {})}), run_dir)
             pr = PRI.drawn(s)
+            # f6-posterior-ranges: a declared net-effect posterior's hull is its columns' range in execution
+            from toolkit.analysis import uncertainty as UQ
+            ne = UQ.net_effect_sample(s, eng, fitted=out["fitted"], priors=pr)
+            out["fitted"], pr = UQ.with_posterior_ranges(ne, out["fitted"], pr)
+            out["posterior"] = UQ.posterior_range_record(ne) if ne is not None else None
+            out["ranges"].update({k: v for k, v in out["fitted"].items()})
             out["drawn"] = {k: (float(p.lo), float(p.hi)) for k, p in pr.items()}
             import types
             from toolkit.analysis import decision_tests as DT
@@ -431,6 +437,12 @@ def _execution_view(r: dict, run: dict, run_dir: str | None, memo: dict):
                 return {"sha256": hashlib.sha256(_canon(vals).encode()).hexdigest()}, f"the per-unit {how} values"
             ex = _exec_context(ref, cfg, memo, run, run_dir)
             varied = ex["drawn"].get(r["name"]) or ex["fitted"].get(r["name"])
+            post = ex.get("posterior")
+            if varied is not None and post and r["name"] in post["ranges"]:
+                # the posterior first: the sheet's table cell keeps about 50 characters
+                return list(varied), (f"net-effect posterior hull (sha256 {post['sha256'][:12]})"
+                                      f"{', margin ' + str(post['margin']) if post['margin'] else ''}: the range the "
+                                      f"uncertainty draws vary it over, not the card's or the spec's range")
             if varied is not None:
                 return list(varied), "the range the uncertainty draws vary it over"
             if r["name"] in ex["values"]:
@@ -1267,6 +1279,35 @@ def _self_test_round5(ok, T) -> None:
            f"engine files from the tree: {sorted(cl)[:8]}")
 
 
+def _self_test_posterior_ranges(ok) -> None:
+    """ED-NP1-2 (f6-posterior-ranges): with a declared net-effect posterior, the sign-off sheet shows the range the
+    draws vary a posterior column over as the posterior's hull, and says so with its sha256; other columns as before."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.spec import schema
+    toy = "toolkit.engines.contract:ToyEngine"
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+        rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+        raw = yaml.safe_load(open(p))
+        r = lambda n: {"kind": "parameter", "name": n, "engines": [(toy, {})], "used_by": ["x"]}  # noqa: E731
+        before = _execution_view(r("eff_a"), raw, d, {})
+        sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+        raw["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        x, how = _execution_view(r("eff_a"), raw, d, {})
+        hull = [min(q["eff_a"] for q in rows), max(q["eff_a"] for q in rows)]
+        ok(x == hull and "net-effect posterior" in how and sha[:12] in how,
+           f"ED-NP1 the sheet shows a posterior column's draw range as the posterior's hull and says so: {x} ({how})")
+        ok(before == ([0.3, 0.7], "the range the uncertainty draws vary it over"),
+           f"ED-NP2 without the field the sheet shows the fitted range as before: {before}")
+
+
 def _self_test_round4(ok, T) -> None:
     """#218 review round 4: execution's own values, card tables by content, calibrated parameters, the signed
     superset, no caches across calls."""
@@ -1652,6 +1693,10 @@ def _self_test() -> int:
         _self_test_round4(ok, T)
     except NameError as e:          # before the round-4 functions exist (the tests-first commit)
         ok(False, f"ED-X round 4: {e}")
+    try:                            # after round 4: it imports the net-effect fit module
+        _self_test_posterior_ranges(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"ED-NP posterior ranges on the sheet: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
