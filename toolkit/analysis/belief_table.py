@@ -312,8 +312,11 @@ def _self_test() -> int:
                                                    "p": 0.19})
         ok(f == "increases" and 1.0 < lr <= 2.0 and s == "weak",
            f"BT7c an undecided direction test leans weakly toward the sign of rho: {(f, lr, s)}")
-        ok(evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.007, "ci": [-0.25, 0.24],
-                                           "p": 0.96})[1] == 1.0, "BT7d a point estimate near 0 carries no lean")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.007, "ci": [-0.25, 0.24],
+                                                   "p": 0.96})
+        ok(f == "no material effect" and lr > 1.0,
+           f"BT7d a point estimate near 0 with a tight interval favours no material effect, not a direction: "
+           f"{(f, lr, s)}")
         f, lr, s = evidence_lr(t, "inconclusive", {"direction": "increases", "rho": 0.44, "ci": [0.22, 0.62],
                                                    "p": 2e-4, "marginal_only": {"marginal_result": "refuted"}})
         ok(f == "increases" and lr == 2.0, f"BT7e a marginal-only result is weak evidence, at most 2: {(f, lr, s)}")
@@ -339,8 +342,38 @@ def _self_test() -> int:
         ok(check_items("H2", {"holds": 0.9, "does not hold": 0.1}, {"holds": 0.5, "does not hold": 0.5}) == [],
            "BT8e no check item when the world layer has no leading claim (a tie)")
 
+    def bt9():
+        # Chain b (2026-11-14): near-null undecided results were carried as weak support for a direction.
+        t = {"kind": "effect_direction", "direction": "decreases"}
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.0727,
+                                                   "ci": [-0.243, 0.102], "p": 0.416})
+        ok(f == "no material effect" and 1.0 < lr <= LR_WEAK,
+           f"BT9 chainb2 H2 (rho -0.07, CI [-0.24, 0.10]) favours no material effect, not 'decreases': {(f, lr, s)}")
+        prior = {"decreases": 0.4, "increases": 0.1, "no material effect": 0.5}
+        fav, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.0979,
+                                                     "ci": [-0.267, 0.077], "p": 0.272})
+        e = posterior(prior, [{"favours": fav, "lr": lr, "group": "g", "layer": "engine"}], "engine")
+        ok(fav == "no material effect" and check_items("H3", e, prior) == [],
+           f"BT9b chainb4 H3 (rho -0.10, CI [-0.27, 0.08]) raises no check item: {fav, lr, e}")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.157,
+                                                   "ci": [-0.322, 0.0166], "p": 0.076})
+        ok(f == "decreases" and lr == LR_WEAK,
+           f"BT9c an interval that leans clearly one way keeps its directional lean: {(f, lr, s)}")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.09,
+                                                   "ci": [-0.42, 0.26], "p": 0.6})
+        ok(f is None and lr == 1.0,
+           f"BT9d a wide interval that neither excludes a material effect nor leans clearly is no evidence: "
+           f"{(f, lr, s)}")
+        f, lr, s = evidence_lr(t, "inconclusive", {"direction": "inconclusive", "rho": -0.12, "ci": None, "p": 0.5})
+        ok(f is None and lr == 1.0, f"BT9e without an interval there is no near-null judgement: {(f, lr, s)}")
+        tn = {"kind": "effect_direction", "direction": "negligible", "equivalence": 0.15}
+        f, lr, s = evidence_lr(tn, "inconclusive", {"direction": "inconclusive", "rho": -0.05,
+                                                    "ci": [-0.22, 0.12], "p": 0.57})
+        ok(f is None, f"BT9f a test's own equivalence bound is the near-null bound (CI not inside +/-0.15): "
+                      f"{(f, lr, s)}")
+
     for n, f in (("BT1", bt1), ("BT2", bt2), ("BT3", bt3), ("BT4", bt4), ("BT5", bt5), ("BT6", bt6), ("BT7", bt7),
-                 ("BT8", bt8)):
+                 ("BT8", bt8), ("BT9", bt9)):
         tryit(n, f)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
