@@ -91,8 +91,13 @@ def design_box(spec, eng) -> tuple:
     snames = list(sbox)
     sval = PV.values(spec)
     fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
+    # owner, 14 Nov (f6-posterior-ranges): a declared net-effect posterior's hull is its columns' box (the ranges the
+    # draws use, toolkit/analysis/uncertainty.py net_effect_sample); listed in `ext` so the emulator's domain is it too
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, eng)
+    fr, _ = UQ.with_posterior_ranges(ne, fr)
+    ext = {k: list(fr[k][:2]) for k in (ne or {}).get("ranges", {}) if k in fr}
     tv = test_value_ranges(spec, set(fr))
-    ext = {}
     for nm, (tlo, thi) in tv.items():
         lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
         if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
@@ -158,7 +163,12 @@ def design(spec) -> tuple[dict, list[dict]]:
     if pnames:
         d["prior_names"] = pnames
     if ext:
-        d["design_ranges"] = ext          # parameters whose design box was widened to span decision-test values
+        d["design_ranges"] = ext          # parameters whose design box is not their declared range (decision-test
+        #                                   values, a net-effect posterior's hull)
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, eng)    # cached: the sample design_box read
+    if ne is not None:                      # only with the field, so other designs stay
+        d["posterior_ranges"] = UQ.posterior_range_record(ne)
     if snames:                            # only with spec values a decision test varies, so other designs stay
         d["spec_value_names"], d["spec_value_ranges"] = snames, {k: list(sbox[k]) for k in snames}
     return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
@@ -840,6 +850,46 @@ def _self_test() -> int:
                     g["_E"][key] = old_e
             ok(seen == [(0.0, 2.0), None], f"BA-D1c run_job hands the engine the delivery period (or none): {seen}")
         case("BA-D1", bd1)
+
+    def bnp():
+        """owner, 14 Nov (f6-posterior-ranges): a net-effect posterior's hull sets its columns' design box."""
+        import hashlib
+        import json
+        import yaml
+        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d:
+            s0 = schema.load(schema.toy_spec(d))
+            got0 = hashlib.sha256(json.dumps([design(s0), list(design_box(s0, s0.engine()))], sort_keys=True,
+                                             default=str).encode()).hexdigest()
+            # recorded on origin/v2 at d7b940d, before this change
+            ok(got0 == "6827c1f3a493b5e268c18626a12c59cef49106e2b9cdd9f4b4ab8ca1f4ee90a7",
+               f"BA-NP1 a spec without a net-effect posterior has the same design and design box as before ({got0[:12]})")
+            u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+            rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), s0.engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+            hull = {k: (min(r[k] for r in rows), max(r[k] for r in rows)) for k in ("eff_a", "eff_b")}
+            raw = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+            raw["uncertainty"]["net_effect_posterior"] = {
+                "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+            yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            s1 = schema.load(os.path.join(d, "decision_spec.yaml"))
+            fr, names, _p, _s, ext = design_box(s1, s1.engine())
+            dd, _jobs = design(s1)
+            th = np.array([[p["theta"][k] for k in ("eff_a", "eff_b")] for p in dd["points"]])
+            ok(all(tuple(fr[k][:2]) == hull[k] and ext[k] == list(hull[k]) for k in hull)
+               and fitted_ranges(s1.engine())["eff_a"][:2] == (0.3, 0.7)
+               and dd["posterior_ranges"]["ranges"] == {k: list(v) for k, v in hull.items()}
+               and dd["posterior_ranges"]["sha256"] == raw["uncertainty"]["net_effect_posterior"]["sha256"]
+               and dd["design_ranges"] == ext,
+               f"BA-NP2 the posterior's hull is its columns' design box ({ {k: fr[k][:2] for k in hull} }; fitted "
+               f"eff_a 0.3-0.7), recorded in the design with the sample's sha256")
+            ok(all(hull[k][0] - 1e-12 <= th[:, j].min() and th[:, j].max() <= hull[k][1] + 1e-12
+                   for j, k in enumerate(("eff_a", "eff_b")))
+               and th[:, 0].min() < 0.3 and th[:, 0].max() > 0.7,
+               f"BA-NP3 the design points cover the posterior's hull (eff_a {th[:, 0].min():.3f}-{th[:, 0].max():.3f}, "
+               f"beyond the fitted 0.3-0.7) and stay inside it")
+    case("BA-NP", bnp)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

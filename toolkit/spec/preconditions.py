@@ -7,6 +7,9 @@
 none). Callers: toolkit/spec/signoff.py sign, scripts/decision_brief.py sign, agents/stage_machine.py sign (with the
 signer), and toolkit/spec/schema.py validate, which the analysis calls before a run (signer None: the run's
 recorded sign-off decides). A check is registered by name in CHECKS: fn(run_dir, spec, signer) -> [str].
+`net_effect_posterior` (f6-posterior-ranges): a declared uncertainty.net_effect_posterior loads through the run's own
+path (toolkit/analysis/uncertainty.py net_effect_sample) and the run's design box covers its columns' ranges; signing,
+the signed status that launch and resume read, and the analysis's validation all run it.
 
 The evidence dossier (#218) registers a check that also takes the call's context (CONTEXT_CHECKS): `mode` (sign: a
 signer, before the record exists; status, launch, resume: a signed run, its record compared; unsigned: a run
@@ -51,7 +54,30 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
         f"engine benchmarks: [{r.get('ref')}] {w}" for r in rows for w in (r.get("why_not") or [])][:40]
 
 
-CHECKS = {"benchmark_eligibility": _benchmark_eligibility}
+def _net_effect_posterior(run_dir, spec, signer) -> list:
+    """A declared uncertainty.net_effect_posterior must load through the run's own path (uncertainty.net_effect_sample:
+    load_posterior's sha256, finalize() replay, seeds, engine identity and hard bounds), its columns' ranges from
+    posterior_ranges, and the run's design box (batch.design_box) must cover them. Without it the owner could sign a
+    spec whose posterior the analysis refuses only at its start (f6-posterior-ranges)."""
+    if (spec.raw.get("uncertainty") or {}).get("net_effect_posterior") is None:
+        return []
+    if getattr(spec, "engine_pending", False):
+        return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
+                "is checked once the engine is chosen"]
+    from toolkit.analysis import batch as BA, uncertainty as UQ
+    try:
+        eng = spec.engine()
+        ne = UQ.net_effect_sample(spec, eng)
+        box = BA.design_box(spec, eng)[0]
+    except (ValueError, OSError) as e:          # PosteriorRefused is a ValueError
+        return [f"net_effect_posterior: the run would refuse it: {e}"]
+    out = [f"net_effect_posterior: the design box of {k} {list(box.get(k, ())[:2])} does not cover the posterior's "
+           f"range {list(r)}" for k, r in ne["ranges"].items()
+           if k not in box or not (box[k][0] <= r[0] and r[1] <= box[k][1])]
+    return out
+
+
+CHECKS = {"benchmark_eligibility": _benchmark_eligibility, "net_effect_posterior": _net_effect_posterior}
 CONTEXT_CHECKS: set = set()          # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, mode=, ...)
 
 
@@ -234,6 +260,77 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _self_test_posterior(ok) -> None:
+    """PC12-PC15 (f6-posterior-ranges): a declared net-effect posterior must load through the run's own path, with the
+    run's own draw ranges and design box, before the spec is signed, launched or resumed."""
+    import hashlib
+    import tempfile
+    import yaml
+    import numpy as np
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines.malaria.engine import MalariaEngine
+    from toolkit.spec import schema, signoff as SO
+    u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+    rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+
+    def run_dir(d, eng=None, post=None, sources=None):
+        p = schema.toy_spec(d)
+        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), eng or schema.load(p).engine(), rows,
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+        raw = yaml.safe_load(open(p))
+        raw["uncertainty"]["net_effect_posterior"] = post or {
+            "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+        if sources is not None:
+            raw["uncertainty"]["sources"] = [{"kind": k} for k in sources]
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        return p
+
+    def sign(d):
+        try:
+            SO.write_sheet(d)
+            SO.sign(d, "owner", note="n")
+            return SO.status(d)
+        except ValueError as e:
+            return f"refused: {e}"
+    with tempfile.TemporaryDirectory() as d:
+        run_dir(d)
+        got = problems(d, None, None)
+        st = sign(d)
+        ok(got == [] and st == "signed",
+           f"PC12 a spec whose net-effect posterior loads through the run's path (its hull beyond the fitted range) "
+           f"has no precondition problem and signs: {got[:2]} {st}")
+        open(os.path.join(d, "nef.yaml"), "a").write("# edited after signing\n")
+        st2 = SO.status(d)
+        _, why = SO.preconditions_state(d)
+        ok(st2 == "preconditions_failed" and any("net_effect_posterior" in w for w in why),
+           f"PC13 a signed run whose posterior the run would now refuse cannot launch or resume (status {st2}): "
+           f"{[w[:90] for w in why][:1]}")
+    refused = {}
+    for label, kw, reason in (("another engine's fit", {"eng": MalariaEngine()}, "fitted under engine"),
+                              ("bytes that are not the signed ones", {"post": {"path": "nef.yaml", "sha256": "0" * 64}},
+                               "signed"),
+                              ("a column the draws do not vary", {"sources": ["calibration"]}, "not varied"),
+                              ("a negative margin", {"post": "margin"}, "margin")):
+        with tempfile.TemporaryDirectory() as d:
+            if kw.get("post") == "margin":
+                run_dir(d)
+                raw = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+                raw["uncertainty"]["net_effect_posterior"]["margin"] = -0.1
+                yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            else:
+                run_dir(d, **kw)
+            got = problems(d, None, None)
+            st = sign(d)
+            refused[label] = any("net_effect_posterior" in g and reason in g for g in got) \
+                and st.startswith("refused") and "net_effect_posterior" in st
+    ok(all(refused.values()), f"PC14 a spec whose posterior the run would refuse cannot be signed, each for its "
+                              f"reason: {refused}")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        ok(problems(d, None, None) == [] and _net_effect_posterior(d, schema.load(p), None) == [],
+           "PC15 a spec without a net-effect posterior is unaffected")
+
+
 def _self_test() -> int:
     fails = []
 
@@ -269,6 +366,7 @@ def _self_test() -> int:
         finally:
             CHECKS.pop("ctx", None)
             CONTEXT_CHECKS.discard("ctx")
+    _self_test_posterior(ok)
     sp_ = {"analysis": {"evaluation": "emulator", "decision_tests": [
         {"id": "P", "type": "parameter_value", "parameter": "p", "values": [1, 2]}]}}
     ok(chosen_range_test_runs(sp_, "P", "parameter:p", {"p": (0, 3)})[0]

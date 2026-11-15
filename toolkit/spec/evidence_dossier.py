@@ -326,6 +326,11 @@ def _exec_context(ref: str, cfg: dict, memo: dict, run: dict | None = None, run_
             from toolkit.spec import priors as PRI
             s = _spec_obj(dict(run, engine={"ref": ref, **({"config": dict(cfg)} if cfg else {})}), run_dir)
             pr = PRI.drawn(s)
+            # f6-posterior-ranges: a declared net-effect posterior's hull is its columns' range in execution
+            from toolkit.analysis import uncertainty as UQ
+            ne = UQ.net_effect_sample(s, eng, fitted=out["fitted"], priors=pr)
+            out["fitted"], pr = UQ.with_posterior_ranges(ne, out["fitted"], pr)
+            out["ranges"].update({k: v for k, v in out["fitted"].items()})
             out["drawn"] = {k: (float(p.lo), float(p.hi)) for k, p in pr.items()}
             import types
             from toolkit.analysis import decision_tests as DT

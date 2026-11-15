@@ -50,21 +50,81 @@ def posterior_input(spec) -> dict | None:
     """{path, sha256, data} of the spec's uncertainty.net_effect_posterior {path, sha256}: the path resolved against
     the spec, the owner-signed sha256 and the file's bytes, read once per spec and refused unless their sha256 is the
     signed one (Codex r1 P1-1, P2-4). The manifest, the engine artifact's input and the Drawer all use these bytes.
-    None without the field."""
+    Optional `margin` (default 0): the share of the sample's hull width each side of its columns' ranges is widened by
+    (net_effect_sample). None without the field."""
     p = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
     if p is None:
         return None
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
-            or not isinstance(p.get("sha256"), str):
+            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
-                         "signed digest}")
+                         "signed digest, margin (optional): a share of the sample's hull width >= 0}")
+    m = p.get("margin", 0.0)
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or m < 0:
+        raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width >= 0")
     path, dig = spec.resolve(p["path"]), p["sha256"].lower()
     got = getattr(spec, "_net_effect_posterior", None)
     if got is None or (got["path"], got["sha256"]) != (path, dig):
         from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
         got = {"path": path, "sha256": dig, "data": NEF.read_signed(path, dig)}
         spec._net_effect_posterior = got
-    return got
+    return dict(got, margin=float(m))
+
+
+def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None = None, held=()) -> dict | None:
+    """The spec's net-effect posterior loaded and verified (net_effect_fit.load_posterior: sha256, finalize() replay,
+    seeds, engine identity, hard bounds) with `ranges` {name: (lo, hi)}: its columns' draw ranges and emulator design
+    box, from net_effect_fit.posterior_ranges (the sample's hull, the spec's margin, within hard bounds; owner, 14 Nov).
+    The Drawer, the analysis (core), batch.design_box and the sign-off precondition all read them here. The columns
+    must be parameters the draws vary: drawn priors (`priors`, default toolkit/spec/priors.py drawn) and, under the
+    engine_parameters source, fitted parameters (`fitted`, default batch.fitted_ranges), less calibrated and jointly
+    calibrated ones and `held`. Cached on the spec per (sha256, margin, varied names). None without the field."""
+    post = posterior_input(spec)
+    if post is None:
+        return None
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    if fitted is None:
+        from toolkit.analysis.batch import fitted_ranges
+        fitted = fitted_ranges(eng)
+    if priors is None:
+        from toolkit.spec import priors as PRI
+        priors = PRI.drawn(spec)
+    src = {s.get("kind") for s in (spec["uncertainty"].get("sources") or []) if isinstance(s, dict)}
+    cal = spec["calibration"]
+    held = set(held) | set(cal.get("parameters") or []) | set((cal.get("joint") or {}).get("shared") or [])
+    varied = {k: (p.lo, p.hi) for k, p in priors.items()}
+    if "engine_parameters" in src:
+        varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
+    varied = {k: v for k, v in varied.items() if k not in held}
+    key = (post["sha256"], post["margin"], tuple(sorted(varied)))
+    cache = getattr(spec, "_net_effect_sample", None)
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"])
+    ne["margin"] = post["margin"]
+    ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
+    spec._net_effect_sample = (key, ne)
+    return ne
+
+
+def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:
+    """(fitted, priors) copies with each posterior column's range replaced by net_effect_sample's `ranges`: fitted
+    {name: (lo, hi, value, ...)} keeps its value, priors {name: Prior} keep everything but lo and hi. Unchanged objects
+    without a posterior; columns not in the sample are untouched."""
+    if ne is None:
+        return fitted, priors
+    import dataclasses
+    rg = ne["ranges"]
+    fr = {k: ((*rg[k], *v[2:]) if k in rg else v) for k, v in fitted.items()}
+    pr = None if priors is None else {k: (dataclasses.replace(p, lo=rg[k][0], hi=rg[k][1]) if k in rg else p)
+                                      for k, p in priors.items()}
+    return fr, pr
+
+
+def posterior_range_record(ne: dict) -> dict:
+    """What the manifest and the uncertainty report record of the ranges the sample set."""
+    return {"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
+            "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}}
 
 
 def _pu():
@@ -106,25 +166,22 @@ class Drawer:
             raise ValueError(f"uncertainty: source {BU.ANCHOR_SOURCE} is declared but the analysis has no anchor")
         # uncertainty.net_effect_posterior (opt-in): every draw takes one whole row of the net-effect fit's accepted
         # joint sample for the sample's parameters, on its own stream, after the priors and fitted ranges are drawn
-        # (so the other values are those drawn without it); the sample must lie inside the ranges these draws use
+        # (so the other values are those drawn without it). Owner, 14 Nov (f6-posterior-ranges): the sample's hull
+        # (net_effect_sample) sets its columns' draw ranges; the other ranges are the priors' and the fitted ones
         self.ne, self.ne_rows = None, []
-        post = posterior_input(A.spec)
-        if post is not None:
-            from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
-            rng_ = {k: (p.lo, p.hi) for k, p in A.pr.items()}
-            if "engine_parameters" in self.src:
-                rng_.update({k: tuple(v[:2]) for k, v in A.fr.items()})
-            held = self.jc_names | set(A.spec["calibration"].get("parameters") or [])
-            self.ne = NEF.load_posterior(post["path"], A.eng, {k: v for k, v in rng_.items() if k not in held},
-                                         post["sha256"], post["data"])
+        self.ne = net_effect_sample(A.spec, A.eng, fitted=A.fr, priors=A.pr, held=self.jc_names)
+        fr_, pr_ = with_posterior_ranges(self.ne, A.fr, A.pr)
+        self.ranges = dict({k: (p.lo, p.hi) for k, p in pr_.items()},
+                           **({k: tuple(v[:2]) for k, v in fr_.items()} if "engine_parameters" in self.src else {}))
+        if self.ne is not None:
             self.ne_rng = np.random.default_rng([int(seed), NE_STREAM])
 
     def posterior_provenance(self) -> dict | None:
         """The sample's path, sha256 and names, and the row index each draw took (None without the field)."""
         if self.ne is None:
             return None
-        return {"path": self.ne["path"], "sha256": self.ne["sha256"], "names": list(self.ne["names"]),
-                "rows": list(self.ne_rows)}
+        return dict({"path": self.ne["path"], "sha256": self.ne["sha256"], "names": list(self.ne["names"]),
+                     "rows": list(self.ne_rows)}, **posterior_range_record(self.ne))
 
     def prepare(self, nd):
         from toolkit.analysis import calibration as C
@@ -156,8 +213,8 @@ class Drawer:
             if kind not in self.src:
                 continue
             if kind == "engine_parameters":
-                for k, v in A.fr.items():
-                    x = float(self.rng.uniform(v[0], v[1]))     # drawn either way: the stream is unchanged
+                for k in A.fr:
+                    x = float(self.rng.uniform(*self.ranges[k]))     # drawn either way: the stream is unchanged
                     if k in self.jc_names and self.jc_draws is not None:
                         continue                                # jointly calibrated: the region row's value
                     theta[k] = x
@@ -487,6 +544,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         report["low_confidence_note"] = (f"{len(flagged)} units did not match the joint calibration and proceed "
                                          "flagged (calibration.joint.unmatched: flag); their outcomes rest on an "
                                          "unmatched calibration")
+    if D.ne is not None:        # f6-posterior-ranges: these columns' ranges came from the posterior, with its sha256
+        report["net_effect_posterior_ranges"] = posterior_range_record(D.ne)
     return {"data": data, "report": report}
 
 
@@ -683,6 +742,29 @@ def _self_test_posterior(ok):
             except NEF.PosteriorRefused as ex:
                 refused += [label] if why in str(ex) else []
         ok(len(refused) == 3, f"NP4 the draws refuse the sample, each for its reason, for {refused} (fail closed)")
+        # NP5 (owner, 14 Nov, f6-posterior-ranges): a sample whose hull exceeds the draw ranges (cfp_kill 0.2-0.8 against
+        # the fitted 0.3-0.7) loads; its hull sets its columns' draw ranges, the other parameters keep theirs
+        wide = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.2 + 0.6 * v, 6)} for v in x]
+        NEF._fixture_placeholder(os.path.join(d, "wide.yaml"), e, wide, box)
+        hull = {k: (min(r[k] for r in wide), max(r[k] for r in wide)) for k in box}
+        D6 = Drawer(fake(d, "wide.yaml"), 9)
+        t6 = [D6.draw()[0] for _ in range(40)]
+        pv6 = D6.posterior_provenance()
+        ok(D6.ranges["cfp_kill"] == hull["cfp_kill"] and D6.ranges["net_kill_shift"] == hull["net_kill_shift"]
+           and D6.ranges["use_rate"] == (card["use_rate"].lo, card["use_rate"].hi)
+           and all(hull[k][0] <= t[k] <= hull[k][1] for t in t6 for k in hull)
+           and pv6["ranges"] == {k: list(v) for k, v in hull.items()} and pv6["range_source"] == "posterior_hull"
+           and pv6["sha256"] == signed(d, "wide.yaml")["sha256"] and pv6["margin"] == 0.0,
+           f"NP5 a sample whose hull exceeds the fitted range loads; its hull sets its columns' draw ranges "
+           f"({ {k: D6.ranges[k] for k in hull} }), recorded with its sha256 in the uncertainty report")
+        D7 = Drawer(fake(d, dict(signed(d, "wide.yaml"), margin=0.1)), 9)
+        w7 = {k: hull[k][1] - hull[k][0] for k in hull}
+        ok(all(abs(D7.ranges[k][0] - max(hull[k][0] - 0.1 * w7[k], card[k].lo if k in card else 0.0)) < 1e-12
+               for k in hull) and D7.posterior_provenance()["margin"] == 0.1,
+           f"NP6 a stated margin widens the hull (within hard bounds): { {k: D7.ranges[k] for k in hull} }")
+        ok(D0.ranges == {"cfp_kill": (0.3, 0.7), "net_kill_shift": (card["net_kill_shift"].lo, card["net_kill_shift"].hi),
+                         "use_rate": (card["use_rate"].lo, card["use_rate"].hi)},
+           f"NP7 without the field every draw range is the fitted or prior range, as before: {D0.ranges}")
 
 
 def _self_test_reserve(ok):

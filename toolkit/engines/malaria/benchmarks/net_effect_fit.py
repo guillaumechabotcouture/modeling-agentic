@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 import time
@@ -915,13 +916,13 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     the engine name or code differs from `engine`; the sample is empty, or a row lacks a fitted parameter or holds a
     non-finite or non-numeric value; the acceptance gate fails when finalize() is replayed on the file's own evidence
     (verified points, which must be sample rows, the chosen point, the calibration grid's edge record), whatever its
-    summary fields say (Codex r1 P1-2); a column is not in `ranges`; a value is outside its priors.yaml card range
-    (whatever `ranges` says, Codex r1 P2-3) or its draw range."""
+    summary fields say (Codex r1 P1-2); a column is not in `ranges`; a value is outside its hard bounds (hard_bounds:
+    the priors.yaml range, whatever `ranges` says, Codex r1 P2-3, and the bounds the card's units imply). The values
+    of `ranges` are not a bound (owner, 14 Nov, f6-posterior-ranges): the sample's hull sets its columns' draw ranges
+    and design box (posterior_ranges)."""
     import copy as _copy
     import hashlib
-    import math
     from toolkit.engines.contract import engine_identity
-    from toolkit.spec import priors as PR
 
     def no(why):
         raise PosteriorRefused(f"net-effect posterior {path}: {why}")
@@ -979,15 +980,57 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
         no(f"{miss} are not varied by these draws (an engine-card or spec prior, or a fitted parameter under the "
            f"engine_parameters source, and not calibrated); the draws vary {sorted(ranges)}")
     X = np.asarray(X, float)
-    card = PR.load_card(engine)["priors"]
     for j, k in enumerate(names):
-        for lo, hi, what in ([(card[k].lo, card[k].hi, "priors.yaml range")] if k in card else []) + [
-                (*ranges[k], "draw range")]:
-            lo, hi = float(lo), float(hi)
-            tol = 1e-6 * max(1.0, hi - lo)          # the sample is rounded to 6 decimals
+        for lo, hi, what in hard_bounds(engine, [k], both=True).get(k, []):
+            tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
-                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its {what} [{lo}, {hi}]")
+                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
     return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
+
+
+# hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
+UNIT_BOUNDS = {"probability": (0.0, 1.0), "share": (0.0, 1.0), "days": (0.0, math.inf), "months": (0.0, math.inf),
+               "years": (0.0, math.inf)}
+
+
+def hard_bounds(engine, names, both: bool = False) -> dict:
+    """{name: (lo, hi, what)}: each parameter's hard bounds from the engine, never a fitted or spec range. Two sources:
+    the bounds its card units imply (UNIT_BOUNDS: a probability or share in [0, 1], a duration >= 0) and its
+    priors.yaml range, the support of the engine's prior (Codex r1 P2-3: a spec prior wider than the card does not
+    widen it). A parameter with neither has no entry. `both`: {name: [every bound]} for load_posterior's check;
+    otherwise the intersection."""
+    from toolkit.spec import priors as PR
+    card = PR.load_card(engine)["priors"]
+    units = {q.name: q.units for q in engine.parameters()}
+    out = {}
+    for k in names:
+        b = ([(*UNIT_BOUNDS[units[k]], f"card units {units[k]}")] if units.get(k) in UNIT_BOUNDS else []) + (
+            [(float(card[k].lo), float(card[k].hi), "priors.yaml range")] if k in card else [])
+        if b:
+            out[k] = b if both else (max(x[0] for x in b), min(x[1] for x in b), "; ".join(x[2] for x in b))
+    return out
+
+
+def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
+    """{name: (lo, hi)} of each column of a loaded, verified sample (load_posterior): its hull, each side widened by
+    `margin` x the hull's width and never past the column's hard bounds (`bounds`, hard_bounds). The single source of
+    the draw ranges and the emulator design box of the sample's columns (toolkit/analysis/uncertainty.py
+    net_effect_sample; owner, 14 Nov). Refused: a negative or non-numeric margin; a column without spread (a zero-width
+    design box cannot be emulated)."""
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or margin < 0:
+        raise ValueError(f"net-effect posterior margin {margin!r}: a share of the hull's width >= 0")
+    X = np.asarray(ne["rows"], float)
+    out = {}
+    for j, k in enumerate(ne["names"]):
+        lo, hi = float(X[:, j].min()), float(X[:, j].max())
+        if not hi > lo:
+            raise PosteriorRefused(f"net-effect posterior: column {k} has no spread ({lo}): it cannot set a range")
+        if margin:
+            w = hi - lo
+            blo, bhi = (bounds or {}).get(k, (-math.inf, math.inf, ""))[:2]
+            lo, hi = max(lo - margin * w, blo), min(hi + margin * w, bhi)
+        out[k] = (lo, hi)
+    return out
 
 
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
@@ -1443,7 +1486,10 @@ def _self_test() -> int:
             variant("a non-numeric value", lambda x: x["joint_region"]["sample"][3].update(cfp_kill="high"))
             variant("a column the fit did not fit", lambda x: x["plan"]["params"].pop("irs_kill"))
             refuse("a parameter these draws do not vary", good, {k: v for k, v in rg.items() if k != "cfp_half"})
-            refuse("a value outside its draw range", good, dict(rg, net_kill_shift=(0.0, pr.hi)))
+            # owner, 14 Nov (f6-posterior-ranges): the sample's hull sets the draw ranges of its columns, so a narrower
+            # draw range no longer refuses it; a value outside the engine's hard bounds still does
+            variant("a probability above 1", lambda x: jr(x)["sample"][7].update(cfp_kill=1.2))
+            variant("a negative half-life", lambda x: jr(x)["sample"][7].update(cfp_half=-5.0))
             rows2 = [dict(r) for r in rows]
             rows2[1]["cfp_half"] = 701.0
             other = os.path.join(d, "other.yaml")
@@ -1460,7 +1506,8 @@ def _self_test() -> int:
                "other engine code": "code_sha256", "empty sample": "empty sample",
                "a row lacks a parameter": "the fit's parameters", "a non-finite value": "non-finite",
                "a non-numeric value": "non-numeric", "a column the fit did not fit": "the fit's parameters",
-               "a parameter these draws do not vary": "not varied", "a value outside its draw range": "draw range",
+               "a parameter these draws do not vary": "not varied", "a probability above 1": "hard bound",
+               "a negative half-life": "hard bound",
                "recorded seeds other than the pack's": "seeds", "no recorded seeds": "seeds",
                "recorded seeds as floats": "seeds", "fit_rule not a mapping": "seeds"}
         wrong = sorted(k for k in why if why[k] not in got.get(k, ""))
@@ -1468,6 +1515,54 @@ def _self_test() -> int:
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
            f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
+
+    def f28():
+        """owner, 14 Nov (f6-posterior-ranges): the sample's own hull sets its columns' draw ranges and design box."""
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [270.0, 1650.0]}
+        u = [float(v) for v in np.random.default_rng(8).uniform(0, 1, 30)]
+        rows = [{"net_kill_shift": round(-0.3 + 0.9 * x, 6), "cfp_kill": round(0.45 + 0.33 * x, 6),
+                 "irs_kill": round(0.40 + 0.06 * (1 - x), 6), "cfp_half": round(490 + 960 * x, 6)} for x in u]
+        narrow = {"net_kill_shift": (pr.lo, pr.hi), "cfp_kill": (0.465, 0.585), "irs_kill": (0.38, 0.45125),
+                  "cfp_half": (547.5, 1277.5)}          # the fitted.yaml and spec ranges the F6 sample fell outside
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "net_effect_fit.yaml")
+            _fixture_placeholder(good, e, rows, box)
+            P = load_posterior(good, e, narrow, hashlib.sha256(open(good, "rb").read()).hexdigest())
+            X = np.asarray([[r[k] for k in P["names"]] for r in rows])
+            hull = {k: (float(X[:, j].min()), float(X[:, j].max())) for j, k in enumerate(P["names"])}
+            hb = hard_bounds(e, P["names"])
+            got = posterior_ranges(P, bounds=hb)
+            ok(P["rows"].shape == (30, 4) and got == hull,
+               f"F28 a sample whose hull exceeds its fitted and spec draw ranges loads; its ranges are its hull {got}")
+            ok(hb["cfp_kill"][:2] == (0.0, 1.0) and hb["irs_kill"][:2] == (0.0, 1.0)
+               and hb["cfp_half"][:2] == (0.0, float("inf")) and hb["net_kill_shift"][:2] == (pr.lo, pr.hi),
+               f"F28b the hard bounds: a probability in [0, 1], a half-life in days >= 0 (card units), a priors.yaml "
+               f"range as the prior's support: {hb}")
+            m = posterior_ranges(P, margin=0.1, bounds=hb)
+            w = {k: hull[k][1] - hull[k][0] for k in hull}
+            ok(all(abs(m[k][0] - (hull[k][0] - 0.1 * w[k])) < 1e-12 and abs(m[k][1] - (hull[k][1] + 0.1 * w[k])) < 1e-12
+                   for k in ("cfp_kill", "irs_kill", "cfp_half")),
+               f"F28c a stated margin widens each side by that share of the hull's width: {m}")
+            near = {"names": ["cfp_kill"], "rows": np.array([[0.9], [0.98]])}
+            c = posterior_ranges(near, margin=0.5, bounds=hard_bounds(e, ["cfp_kill"]))
+            ok(abs(c["cfp_kill"][0] - 0.86) < 1e-12 and c["cfp_kill"][1] == 1.0,
+               f"F28d a margin never crosses a hard bound: {c}")
+            why = {}
+            for label, arg, kw in (("a column without spread", {"names": ["irs_kill"], "rows": np.array([[0.4], [0.4]])},
+                                    {}),
+                                   ("a negative margin", P, {"margin": -0.1}),
+                                   ("a margin that is not a number", P, {"margin": "wide"})):
+                try:
+                    posterior_ranges(arg, bounds=hb, **kw)
+                    why[label] = ""
+                except (PosteriorRefused, ValueError) as ex:
+                    why[label] = str(ex)
+            ok(all(why.values()), f"F28e refused (fail closed): {sorted(k for k, v in why.items() if v)}; accepted: "
+                                  f"{sorted(k for k, v in why.items() if not v) or 'none'}")
+    case("F28", f28)
 
     def f19():
         import hashlib
