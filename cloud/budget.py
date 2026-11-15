@@ -838,14 +838,16 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
         # One created before the window counts only its window estimate, which grows exactly as its lifetime estimate
         # does; billed cost above that estimate does not bound the window's growth, so the rest is cap - the lifetime
         # estimate (Codex re-review of #232, P2). Either way the window's spend cannot pass budget + reservation
-        # before the cap stops the cluster (both at the rate measured now, as every launch's meter is).
-        remaining = cap - (life_row["estimate_usd"] if row["created"] < m["start"] else life)
+        # before the cap stops the cluster (both at the rate measured now, as every launch's meter is). A cluster with
+        # no live instance adds nothing more: the rest is cap - life (its final bill may be under its estimate).
+        older = row["created"] < m["start"] and life_row["live_instances"]
+        remaining = cap - (life_row["estimate_usd"] if older else life)
         own = [r for r in s["reservations"] if cluster_id in r["cluster_ids"]]
         others = s["reserved_usd"] - sum(r["outstanding_usd"] for r in own)
         fits = round(s["used_usd"] + others + remaining, 6) <= round(s["budget_usd"], 6)
         why = (f"{scope}: used ${s['used_usd']:.2f} + other reservations ${others:.2f} + the rest of this cap "
                f"${remaining:.2f} (cap ${cap:.2f} - ${cap - remaining:.2f} "
-               f"{'spent' if remaining == cap - life else 'lifetime estimate: created before the window'}) "
+               f"{'lifetime estimate: created before the window' if older else 'spent'}) "
                f"{'<=' if fits else '>'} budget ${s['budget_usd']:.2f}")
         if fits:
             fields = ("scope", "cap_usd", "name", "invocation", "time", "clusters_file")
@@ -854,8 +856,9 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
             inv = invocation or os.urandom(6).hex()
             _write_json_atomic(clusters_file, {"invocation": inv, "run": {"id": cluster_id, "name": name}})
             # outstanding = max(0, cap - the cluster's windowed spend), so the entry's cap is the remaining plus that
-            keep.append({"scope": scope, "cap_usd": remaining + row["usd"], "name": name, "invocation": inv,
-                         "time": now, "clusters_file": os.path.abspath(str(clusters_file))})
+            if remaining + row["usd"] > 0:     # the ledger holds positive caps only; nothing left holds nothing
+                keep.append({"scope": scope, "cap_usd": remaining + row["usd"], "name": name, "invocation": inv,
+                             "time": now, "clusters_file": os.path.abspath(str(clusters_file))})
             _write_json_atomic(env.reservations, keep)
     return fits, why
 
