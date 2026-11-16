@@ -386,14 +386,13 @@ def _declared_problems(spec, j, w) -> list:
         if key in seen:
             bad.append(f"{ww}[{n}]: {key} declared twice")
         seen.add(key)
-        if sel[0] == "target":
-            tid, _, g = key.partition(":")
-            if tid not in gt or not g or (gt[tid] and g not in gt[tid]):
-                bad.append(f"{ww}[{n}].target: {key!r} is not <group target id>:<group> of a declared group target")
-        else:
-            sid, _, g = key.partition("|")
-            if sid not in src or not g or (src[sid] and g not in src[sid]):
-                bad.append(f"{ww}[{n}].offset: {key!r} is not <bias_source>|<group> of a unit target with bias_by")
+        # Codex review of #242 P2-4: matched against the exact identities the targets generate, never parsed
+        ids = ({f"{t}:{g}" for t, gs in gt.items() for g in gs}, [t + ":" for t, gs in gt.items() if not gs]) \
+            if sel[0] == "target" else ({f"{t}|{g}" for t, gs in src.items() for g in gs},
+                                        [t + "|" for t, gs in src.items() if not gs])
+        if not (key in ids[0] or any(key.startswith(pf) and len(key) > len(pf) for pf in ids[1])):
+            bad.append(f"{ww}[{n}].{sel[0]}: {key!r} is not " + ("<group target id>:<group> of a declared group target"
+                       if sel[0] == "target" else "<bias_source>|<group> of a unit target with bias_by"))
     return bad
 
 
@@ -477,16 +476,20 @@ def unmatched_decision(spec, rep) -> dict:
         if b["code"] != "offset_sampling_low_acceptance":
             continue
         d = b.get("detail") or {}
-        bc, fl = d.get("by_component"), d.get("failed")
-        if not (isinstance(bc, dict) and bc and isinstance(fl, int) and fl > 0
-                and all(isinstance(v, int) and v > 0 for v in bc.values()) and sum(bc.values()) >= fl):
-            off_ok = False          # no breakdown, or one that does not account for every failed row
+        bc, fl, fr = d.get("by_component"), d.get("failed"), d.get("failed_rows")
+        # Codex review of #242: components by their exact block keys (P1), and every failed row covered (P2-1)
+        if not (isinstance(bc, list) and bc and isinstance(fl, int) and fl > 0 and isinstance(fr, list)
+                and len(set(fr)) == fl == len(fr)
+                and all(isinstance(c, dict) and isinstance(c.get("blocks"), list) and c["blocks"]
+                        and isinstance(c.get("rows"), list) and c["rows"] for c in bc)
+                and set(fr) <= {x for c in bc for x in c["rows"]}):
+            off_ok = False
             continue
-        for comp, n in bc.items():
-            ks = str(comp).split("+")
+        for c in bc:
+            ks = [str(k) for k in c["blocks"]]
             if not all(k in do_ for k in ks):
                 off_ok = False
-            used += [dict(do_[k], failed_rows=n) for k in ks if k in do_]
+            used += [dict(do_[k], failed_rows=len(c["rows"])) for k in ks if k in do_]
     reg = spec.raw["decision_units"].get("region")
     rows = {str(r[spec.uid]): r for r in spec.units()}
     by_unit = {str(r["unit"]): r["reason"] for r in u.get("reasons") or [] if r.get("unit")}
@@ -502,10 +505,11 @@ def unmatched_decision(spec, rep) -> dict:
     undeclared = [t for t in target_fail if t not in dt_]
     ok = (u.get("mode") == "flag" and codes <= allowed and not undeclared and off_ok and not rep.get("conflicting")
           and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed, bool(used)))
-    return {"proceed": bool(ok) if rep.get("blocked") else True, "mode": u.get("mode", "block"),
-            "flagged": flagged if ok or not rep.get("blocked") else [], "missed": flagged,
-            "declared": used if ok and rep.get("blocked") else [],
-            "why_not": None if ok or not rep.get("blocked") else
+    blocked = bool(rep.get("blocked") or rep.get("blocks"))     # Codex review of #242 P2-3: the blocks decide
+    return {"proceed": bool(ok) if blocked else True, "mode": u.get("mode", "block"),
+            "flagged": flagged if ok or not blocked else [], "missed": flagged,
+            "declared": used if ok and blocked else [],
+            "why_not": None if ok or not blocked else
             ("no flag option" if u.get("mode") != "flag" else f"blocks {sorted(codes)}; {len(flagged)} misses, max "
              f"{u.get('max_units')}; target failures {target_fail} (undeclared {undeclared}); offset components "
              f"{'declared' if off_ok else 'undeclared or without a breakdown'}; conflicting {rep.get('conflicting')}")}
@@ -535,7 +539,7 @@ def _blocks_consistent(rep, missed, declared_any=False) -> bool:
                 return False
             named |= {str(x) for x in d["units"]}
         elif b["code"] == "offset_sampling_low_acceptance":
-            if not (declared_any and isinstance(d.get("by_component"), dict)):
+            if not (declared_any and isinstance(d.get("by_component"), list)):
                 return False
         else:
             return False

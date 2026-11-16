@@ -1275,7 +1275,7 @@ class HistoryMatch:
         st, n, G = self.state, len(pick), len(self.zg)
         S, T = np.tile(self.zg, n), np.repeat(st["C"][pick], G, axis=0)
         out, failed, worst = {}, np.zeros(n, bool), np.zeros(n)
-        self._offset_failed = {}     # F6 run 1: failed rows per component ("+"-joined block keys), for the report
+        self._offset_failed = []     # F6 run 1: per component with failed rows, its block keys and those rows
         for comp in self.bcomp:
             pl, ivs, gp = self._comp_preds(self.em, comp, S, T, n)
             bo = {k: np.zeros(n) for k in comp["blocks"]}
@@ -1304,8 +1304,9 @@ class HistoryMatch:
                     bo[k][rows[hit]] = b[k][j]
                 done[rows[hit]] = True
             failed |= ~done
-            if (~done).any():
-                self._offset_failed["+".join(comp["blocks"])] = int((~done).sum())
+            if (~done).any():           # Codex review of #242 P1/P2-1: exact block keys and the failed rows
+                self._offset_failed.append({"blocks": list(comp["blocks"]),
+                                            "rows": [int(x) for x in np.flatnonzero(~done)]})
             out.update({u: (mk[u], gi[u]) for u in comp["units"]})
             ar = np.arange(n)
             for u in comp["units"]:      # each draw's worst unit misfit at its own offset (the verification's choice)
@@ -2184,7 +2185,8 @@ class HistoryMatch:
                               ("; each shared offset drawn from its prior over the feasible set, the units of its "
                                "component given it" if self.bcomp else "")),
                 **({"offset_draws": {"rows": int(len(pick)), "failed": int(failed.sum()),
-                                     "by_component": dict(getattr(self, "_offset_failed", {}))}} if self.bcomp else {})}
+                                     "failed_rows": [int(x) for x in np.flatnonzero(failed)],
+                                     "by_component": list(getattr(self, "_offset_failed", []))}} if self.bcomp else {})}
 
     def _group_draw(self, gts, own, c, rng) -> dict:
         """{unit: grid index} for the group members at candidate c, kept only when every group target holds at the
