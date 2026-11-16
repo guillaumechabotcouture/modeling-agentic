@@ -269,7 +269,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model/*")
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []

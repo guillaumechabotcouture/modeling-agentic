@@ -447,6 +447,16 @@ stages, byte for byte, after normalising wall-clock fields and worker row order.
 - The read guard refuses every run, not only the seed's own run, and refuses searches that reach one.
 - `world_model/` is reserved from deliverables and from the tasks' write guard.
 
+**After the narrow re-review (1 P1, 5 P2s).**
+- `world_model` itself is reserved, as well as everything under it.
+- The charge and the journal's completion are recorded together, after every read that can fail.
+- A seed killed before promotion is promoted on resume.
+- The registration's hash is carried in the anchored outcome map and checked by `standing`.
+- The refresh key covers engine rows, reuse summaries, their timestamps and the standing.
+- v1 runs, which are marked by `metadata.json`, are unreadable to the seed.
+
+Each fix has a test: W8c, W8d (this one reproduced the $4.25 double charge first), W17, W18, W19 and W20.
+
 **Not computed yet (declared).**
 - The guard (v2-progressive-steps §5) covers sweeps only. As in F6, no decision-run belief is set aside.
 - A seed that types a number, such as a citation volume, is anchored locally rather than repaired.

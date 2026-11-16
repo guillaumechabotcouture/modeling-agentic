@@ -277,15 +277,17 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
 def _in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
     """Is `base` inside a run (an ancestor holds run_state.json), or does a search from it reach one? Fail closed
     past `limit` entries (Codex review: another run under the repository's docs/ or .claude/ was readable)."""
+    RUN_MARKERS = _sio().RUN_MARKERS               # v1 runs carry only metadata.json (Codex re-review)
+    marks = ("run_state.json",) + tuple(RUN_MARKERS)
     up = base
     while up != os.path.dirname(up):
-        if os.path.isfile(os.path.join(up, "run_state.json")):
+        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
             return True
         up = os.path.dirname(up)
     n = 0
     for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
         n += len(dirs) + len(files)
-        if "run_state.json" in files or n > limit:
+        if any(x in files for x in marks) or n > limit:
             return True
     return False
 

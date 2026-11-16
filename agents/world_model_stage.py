@@ -221,6 +221,7 @@ def _seed(m, ctx, did) -> dict:
     """The seed session and its one repair. The run's journal is the one accounting owner: it charges what the
     sessions reported, and an interrupted attempt its allowance (Machine._settle_interrupted); the per-attempt
     SpendLedger only enforces the cap. A completed seed is reused only when its bytes match the journal's sha256."""
+    import yaml
     rd, st = m.run_dir, m.st
     j = st.journal.get(JOURNAL_KEY) or {}
     if j.get("status") == "completed":
@@ -229,10 +230,17 @@ def _seed(m, ctx, did) -> dict:
             _seed_sha(rd) == out.get("seed_sha256")
         return {"status": "ok" if same else out.get("status") if not j.get("ok") else "seed_changed", "usd": 0.0,
                 "reused": True}
-    kept = os.path.join(rd, SEED_DIR, WMT.SEED)
-    if j.get("status") == "interrupted" and os.path.isfile(kept):     # paid (charged its allowance at settle): keep it
-        if not WMT.seed_problems(_yaml(kept), ctx):
-            j.update(status="completed", ok=True, output={"status": "ok", "seed_sha256": _seed_sha(rd)})
+    sd = os.path.join(rd, SEED_DIR)
+    if j.get("status") == "interrupted":       # paid (charged its allowance at settle): keep a valid seed it wrote
+        for rel in (WMT.SEED, WMT.SEED_FILE):  # promoted, or the session's own file before promotion
+            try:
+                raw = WMT._sio().read_nofollow(sd, rel)[0]
+                if WMT.seed_problems(yaml.safe_load(raw), ctx):
+                    continue
+                WMT._sio().write_nofollow(sd, WMT.SEED, raw, atomic=True)
+            except Exception:  # noqa: BLE001 -- not readable or not valid: buy a new seed below
+                continue
+            j.update(status="completed", ok=True, output={"status": "ok", "seed_sha256": _sha(raw)})
             m.persist()
             return {"status": "ok", "usd": 0.0, "reused": True}
     a = m._allowance()
@@ -249,9 +257,15 @@ def _seed(m, ctx, did) -> dict:
     usd = float(r.get("usd") or 0.0)
     if r.get("status") == "ledger_failed":         # a session may have run without its charge recorded: the whole cap
         usd = max(usd, 2 * cap)
-    st.spent_usd += usd
-    st.journal[JOURNAL_KEY].update(status="completed", completed=_now(), ok=r.get("status") == "ok", usd=usd, output={
-        "status": r.get("status"), "seed_sha256": _seed_sha(rd) if r.get("status") == "ok" else None})
+    sha = None
+    if r.get("status") == "ok":                    # everything that can fail comes before the charge is recorded
+        try:
+            sha = _seed_sha(rd)
+        except Exception as e:  # noqa: BLE001
+            r = dict(r, status="seed_unreadable", error=f"{type(e).__name__}: {e}"[:300])
+    st.spent_usd += usd                            # the charge and the journal's completion together, then persisted
+    st.journal[JOURNAL_KEY].update(status="completed", completed=_now(), ok=sha is not None, usd=usd,
+                                   output={"status": r.get("status"), "seed_sha256": sha})
     m.persist()
     return r
 
@@ -288,9 +302,13 @@ def _preregister(m) -> dict:
         return dict(out, status=r.get("status") or "seed_refused", why=r.get("why") or r.get("error") or "seed refused")
     seed_b = WMT.canonical_yaml(WMT._sio().read_nofollow(os.path.join(rd, SEED_DIR), WMT.SEED)[0])
     seed = yaml.safe_load(seed_b)
-    map_b = WMT.canonical_yaml(yaml.safe_dump(outcome_map(seed, obs, did, f"{did} {tag}")))
+    reg_b = json.dumps({"topics": obs, "packages": packages(spec)}, indent=1).encode()
+    reg_tag = "reg" + _letters(_sha(reg_b)[:16])          # the registration's hash rides in the anchored map
+    tok = tok | {reg_tag}
+    map_b = WMT.canonical_yaml(yaml.safe_dump(outcome_map(seed, obs, did, f"{did} {tag} {reg_tag}")))
     files = {DB.SEED_REL: seed_b, DB.MAP_REL: map_b}
-    _put(rd, REGISTRATION, json.dumps({"topics": obs, "packages": packages(spec)}, indent=1))
+    _put(rd, REGISTRATION, reg_b)
+    out["registration_sha256"] = _sha(reg_b)
     for name, data in files.items():
         _put(rd, os.path.join(WM, name), data)
 
@@ -322,7 +340,7 @@ def preregister(m) -> str:
     anc = rec.get("anchor") or {}
     wm.update(status=rec["status"], decision_id=rec.get("decision_id"), anchor=anc.get("kind"),
               preregistered=bool(anc.get("preregistered")), why=rec.get("why"), anchored_at=anc.get("anchored_at"),
-              sha256=anc.get("sha256"), binding={k: (rec.get("binding") or {}).get(k) for k in ("spec_sha256", "engine")})
+              sha256=anc.get("sha256"), registration_sha256=rec.get("registration_sha256"), binding={k: (rec.get("binding") or {}).get(k) for k in ("spec_sha256", "engine")})
     return f"world model: {rec['status']}" + (f", anchor {anc.get('kind')}" if anc else "")
 
 
@@ -368,6 +386,18 @@ def _analysis_hashes(run_dir) -> dict:
             SCORED + ("decision_spec.yaml", "engine_choice.json") if os.path.isfile(os.path.join(run_dir, rel))}
 
 
+def dependencies(run_dir, wm) -> dict:
+    """What a score depends on, for the refresh: the analysis hashes, every engine-row and summary file (sha256 and
+    mtime) and the standing itself (Codex re-review: a refresh kept a standing its own check rejected)."""
+    import glob
+    out = dict(_analysis_hashes(run_dir))
+    for p in sorted(set(glob.glob(os.path.join(run_dir, "analysis", "**", "*summary.json"), recursive=True))
+                    | {os.path.join(run_dir, r) for r in ENGINE_ROWS if os.path.isfile(os.path.join(run_dir, r))}):
+        out[os.path.relpath(p, run_dir)] = [_sha(open(p, "rb").read()), os.path.getmtime(p)]
+    out["standing"] = list(standing(run_dir, wm))
+    return out
+
+
 def _reused_rows(run_dir) -> bool:
     """Did the analysis reuse engine rows computed before this run's batch (scripts/compute.py `reused`, the spike
     batch's `already_done`)? Such rows cannot be dated against the anchor."""
@@ -392,6 +422,11 @@ def standing(run_dir, wm) -> tuple[bool, list]:
                 why.append(f"{rel} changed since the anchor")
         except OSError:
             why.append(f"{rel} is missing")
+    try:
+        if _sha(open(os.path.join(run_dir, REGISTRATION), "rb").read()) != wm.get("registration_sha256"):
+            why.append("registration.json differs from the registered one")
+    except OSError:
+        why.append("registration.json is missing")
     if wm.get("outside_registration"):
         why.append(wm["outside_registration"])
     if {k: binding(run_dir)[k] for k in ("spec_sha256", "engine")} != wm.get("binding"):
@@ -434,7 +469,7 @@ def score(run_dir, wm) -> dict:
     dec = [r["surprise_bits"] for r in rows if r["surprise_bits"] is not None]
     pre, why = standing(run_dir, wm)
     rec = {"status": "scored", "at": at, "preregistered": pre, "not_preregistered_because": why, "plan_source": src,
-           "analysis_sha256": _analysis_hashes(run_dir), "rows": rows, "scores": BT.scores(rows),
+           "analysis_sha256": _analysis_hashes(run_dir), "depends": dependencies(run_dir, wm), "rows": rows, "scores": BT.scores(rows),
            "categorical_log2": -sum(dec) / len(dec) if dec else None, "calibration": BT.calibration(rows),
            "where_to_look": {"refuted": [r["id"] for r in refuted],
                              "nearest_even": [b["id"] for b in BT.next_simulation(table)][:3]},
@@ -489,8 +524,8 @@ def refresh(m) -> str | None:
     if m.st.world_model.get("status") != "ok":
         return None
     p = os.path.join(m.run_dir, SCORE)
-    old = json.load(open(p)).get("analysis_sha256") if os.path.isfile(p) else None
-    return None if old == _analysis_hashes(m.run_dir) else score_run(m)
+    old = json.load(open(p)).get("depends") if os.path.isfile(p) else None
+    return None if old == json.loads(json.dumps(dependencies(m.run_dir, m.st.world_model))) else score_run(m)
 
 
 # ------------------------------------------------------------------ self-test
@@ -514,6 +549,8 @@ def _toy_seed(log, bad=None):
             bs[0]["why_decides"] = "about 1050 people"
         with open(os.path.join(run_dir, WMT.SEED_FILE), "w") as f:
             yaml.safe_dump({"decision_beliefs": bs, "notes": "toy"}, f)
+        if bad == "exit_pre":   # the process dies after the session wrote its seed, before the harness promotes it
+            raise SystemExit("killed")
         if bad == "exit":       # the process dies after the seed is written and promoted, before the journal completes
             os.makedirs(os.path.join(run_dir, "analysis"), exist_ok=True)
             shutil.copy(os.path.join(run_dir, WMT.SEED_FILE), os.path.join(run_dir, WMT.SEED))
@@ -609,6 +646,7 @@ def _self_test() -> int:
            and "## World model" in rep and "pre-registered: anchored" in rep and "Where to look" in rep,
            f"W3 scored, belief table written, section in the report ({sc.get('counts')})")
         ok(st1.journal[JOURNAL_KEY]["usd"] == 0.25 and st1.spent_usd >= 0.25, "W4 the seed's cost is in the run's spend")
+        t1 = _tree(d1)                     # before the probes below edit d1
 
         d2, s2, _ = run("noremote_run", _toy_seed([]), repo_=bare)
         pr2 = j(d2, PREREG)
@@ -632,8 +670,44 @@ def _self_test() -> int:
         ok(s8 == "completed" and not calls8 and j(d8, PREREG)["status"] == "ok"
            and st8.journal[JOURNAL_KEY].get("interrupted_charged") == 1,
            f"W8b a seed killed after it was written is kept on resume, charged once, not bought again ({len(calls8)})")
+        calls8c = []
+        d8c, s8c, st8c = run("killed_pre", _toy_seed([], bad="exit_pre"), then=_toy_seed(calls8c))
+        ok(s8c == "completed" and not calls8c and j(d8c, PREREG)["status"] == "ok",
+           f"W8c a seed killed before promotion is promoted on resume, not bought again ({len(calls8c)} new sessions)")
+        import world_model_stage as WMS          # the module the machine imports (this file may run as __main__)
+        real_sha, n_sha = WMS._seed_sha, []
+
+        def flaky_sha(rd_):         # the first read after the charge fails
+            n_sha.append(1)
+            if len(n_sha) == 1:
+                raise OSError("probe: read failed after the charge")
+            return real_sha(rd_)
+        WMS._seed_sha = flaky_sha
+        try:
+            d9, s9, st9 = run("hashfail", _toy_seed([]), stop_after="PREREGISTER")
+        finally:
+            WMS._seed_sha = real_sha
+        ok(s9 == "completed" and abs(st9.spent_usd - 0.25) < 1e-9 and "interrupted_charged" not in st9.journal[JOURNAL_KEY],
+           f"W8d a read failing after the charge records the charge once and the journal completed ({st9.spent_usd})")
+        m1 = SM.Machine(d1, StubTasks({}), None, backend=AB.backend("spike"), log=lambda *a: None)
+        reg = j(d1, REGISTRATION)
+        reg["topics"][-1]["key"] = "none"
+        _put(d1, REGISTRATION, json.dumps(reg))
+        sc17 = score(d1, m1.st.world_model)
+        ok(sc17["preregistered"] is False and any("registration" in w for w in sc17["not_preregistered_because"]),
+           f"W17 an edited registration.json loses pre-registered standing ({sc17['not_preregistered_because']})")
+        _put(d1, "analysis/x.summary.json", json.dumps({"already_done": 24}))
+        why18 = refresh(m1)
+        ok(why18 is not None and j(d1, SCORE)["preregistered"] is False,
+           f"W18 a reused-rows summary added after scoring triggers a re-score that drops standing ({why18})")
+        import yaml
+        sp19 = dict(_yaml(os.path.join(d1, "decision_spec.yaml")), deliverable_file={"path": "world_model",
+                                                                                      "columns": {"unit": "id"}})
+        _put(d1, "decision_spec.yaml", yaml.safe_dump(sp19))
+        ok(any("world_model" in x for x in SM.deliverable_problems(d1)),
+           f"W19 a deliverable named world_model itself is refused ({SM.deliverable_problems(d1)})")
         d6, s6, st6 = run("off", None, wm_on=False)
-        t1, t6 = _tree(d1), _tree(d6)
+        t6 = _tree(d6)
         ok(s6 == "completed" and "PREREGISTER" not in [h.get("to") for h in st6.history] and t1 and t1 == t6,
            f"W9 every analysis file is identical with and without the stages, byte for byte after normalising "
            f"wall-clock fields and worker row order ({len(t1)} files; differing "
@@ -673,6 +747,12 @@ def _self_test() -> int:
            and den("Grep", {"pattern": "x", "path": os.path.dirname(other)}) is not None
            and den("Read", {"file_path": os.path.join(sd, "_task_input.json")}) is None,
            "W13 the seed task reads no run, its own or another, even under the repository's .claude/")
+        v1 = rd + "_v1"                                                 # a v1 run: metadata.json, no run_state.json
+        os.makedirs(os.path.join(v1, "analysis"))
+        open(os.path.join(v1, "metadata.json"), "w").write("{}")
+        ok(den("Read", {"file_path": os.path.join(v1, "analysis", "point.yaml")}) is not None
+           and den("Grep", {"pattern": "x", "path": v1}) is not None,
+           "W20 a v1 run (metadata.json marker) is unreadable to the seed too")
         open(os.path.join(rd, "metadata.json"), "w").write("{}")       # a run marker, as main.py writes
         out = os.path.join(sd, "_task_output.json")
         open(out, "w").write("{}")
@@ -688,6 +768,7 @@ def _self_test() -> int:
     finally:
         shutil.rmtree(rd)
         shutil.rmtree(rd + "_other", ignore_errors=True)
+        shutil.rmtree(rd + "_v1", ignore_errors=True)
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
