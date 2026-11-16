@@ -2748,20 +2748,45 @@ def _self_test() -> int:
                 ok(any("declared" in x for x in spec_problems(schema.load(p2))), f"JA27b refused: {why}")
             units = {"1": {"status": "matched"}, "2": {"status": "matched"}}
             vf = {"code": "verification_failed", "detail": {"units": [], "targets": ["region_t:r1"]}}
-            off = {"code": "offset_sampling_low_acceptance", "detail": {"rows": 10, "failed": 3, "by_component": {"S|r2": 3}}}
+            off = {"code": "offset_sampling_low_acceptance", "detail": {"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                                                    "by_component": [{"blocks": ["S|r2"], "rows": [0, 1, 2]}]}}
             rep = {"blocked": True, "conflicting": [], "units": units, "blocks": [vf, off]}
             dec = unmatched_decision(spec, rep)
             ok(dec["proceed"] and {(x.get("target") or x.get("offset")) for x in dec["declared"]} == {"region_t:r1", "S|r2"}
                and all(x["decision_test"] == "DT1" for x in dec["declared"]),
                f"JA27c declared target and offset misses proceed, each recorded with its decision test ({dec})")
+            od = lambda comps, failed=(0, 1, 2): dict(off, detail={"rows": 10, "failed": len(failed),  # noqa: E731
+                                                                   "failed_rows": list(failed), "by_component": comps})
             for blks, why in (([dict(vf, detail={"units": [], "targets": ["region_t:r0"]}), off], "an undeclared target"),
-                              ([vf, dict(off, detail={"rows": 10, "failed": 3, "by_component": {"S|r0": 3}})],
-                               "an undeclared offset component"),
+                              ([vf, od([{"blocks": ["S|r0"], "rows": [0, 1, 2]}])], "an undeclared offset component"),
                               ([vf, dict(off, detail={"rows": 10, "failed": 3})], "no component breakdown"),
-                              ([vf, dict(off, detail={"rows": 10, "failed": 3, "by_component": {"S|r2": 2}})],
-                               "a breakdown that does not add up"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1]}])], "a breakdown that misses a failed row"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}], failed=(0, 1, 2, 3, 4))],
+                               "overlapping components that leave rows uncovered (Codex P2-1)"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}, {"blocks": ["S|r0"], "rows": [3]}],
+                                       failed=(0, 1, 2, 3))], "one undeclared component among declared ones"),
                               ([vf, off, {"code": "emulator_inadequate", "detail": {}}], "another block")):
                 ok(not unmatched_decision(spec, dict(rep, blocks=blks))["proceed"], f"JA27d never proceeds: {why}")
+            ok(not unmatched_decision(spec, dict(rep, blocked=False, blocks=[
+                dict(vf, detail={"units": [], "targets": ["region_t:r0"]})]))["proceed"]
+               and unmatched_decision(spec, dict(rep, blocked=False))["declared"],
+               "JA27g a report whose blocks contradict blocked=False is judged by its blocks (Codex P2-3)")
+            p3 = os.path.join(d, "sep.yaml")       # identifiers holding the separators (Codex P1, P2-4)
+            r3 = yaml.safe_load(open(p))
+            r3["calibration"]["joint"]["targets"][0]["bias_source"] = "S|v"
+            r3["calibration"]["joint"]["targets"][1]["id"] = "region:t"
+            r3["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                       "declared": [{"target": "region:t:r1", "reason": "x",
+                                                                     "decision_test": "DT1"},
+                                                                    {"offset": "S|v|r2", "reason": "x",
+                                                                     "decision_test": "DT1"}]}
+            yaml.safe_dump(r3, open(p3, "w"), sort_keys=False)
+            s3 = schema.load(p3)
+            ok(spec_problems(s3) == [], f"JA27h exact identifiers holding ':' or '|' are declarable ({spec_problems(s3)})")
+            amb = dict(off, detail={"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                    "by_component": [{"blocks": ["S|v|r1+S|v|r2"], "rows": [0, 1, 2]}]})
+            ok(not unmatched_decision(s3, dict(rep, blocks=[amb]))["proceed"],
+               "JA27i a component is matched by its exact block keys, never by splitting a string (Codex P1)")
             raw["calibration"]["joint"]["unmatched"].pop("declared")
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             ok(not unmatched_decision(schema.load(p), rep)["proceed"], "JA27e without declarations the block stands")

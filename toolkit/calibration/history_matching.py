@@ -2959,7 +2959,9 @@ def _self_test() -> int:
         hm.run(1)
         hm.th["bias_draws_max"] = 1          # one round of proposals per row: many region-sample rows fail
         od = hm.sample(200)["offset_draws"]
-        ok(od["failed"] > 0 and od.get("by_component") == {"s|g": od["failed"]},
+        bc = od.get("by_component") or []
+        ok(od["failed"] > 0 and len(bc) == 1 and bc[0]["blocks"] == ["s|g"] and sorted(bc[0]["rows"]) ==
+           sorted(od.get("failed_rows") or []) and len(od["failed_rows"]) == od["failed"],
            f"HM34c (F6 run 1) failed region-sample rows are broken down by offset component ({od})")
         agg.value = 5.0
         ok(r["blocked"] and comp.get("no_accepted") and comp.get("draws_max") == 256,
