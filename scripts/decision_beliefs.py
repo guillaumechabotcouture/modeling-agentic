@@ -183,6 +183,16 @@ def licensed_problems(data, lic, allow=()) -> list:
 
 
 DIGIT_TOKENS = {"v0.17", "GC7"} | {f"DT{k}" for k in range(1, 11)}
+# Per decision id: the run, harness and spec identifiers its published files may hold, declared here so the rule that
+# admitted them is versioned with the anchor (lead, 2026-11-15). f6: anchored at cf3480c.
+DECISION_DIGIT_TOKENS = {
+    "f6": frozenset({"F6", "f6", "GF13", "v2", "gc7", "gc7_as_funded", "gc7_package", "v2-progressive-steps.md"}),
+}
+
+
+def decision_tokens(decision_id) -> frozenset:
+    """The identifier tokens declared for this decision (none for an undeclared id)."""
+    return DECISION_DIGIT_TOKENS.get(decision_id, frozenset())
 PUBLISH_YEARS = (2000, 2035)
 CITATION_YEARS = (1950, 2035)
 LOCATION_INTS = (1, 20)              # a table or figure number in a basis location
@@ -194,8 +204,7 @@ MAP_ENTRY_KEYS = {"belief", "output", "field", "rules", "note", "set_aside"}
 def digit_problems(obj, kind, ids=(), tokens=()) -> list:
     """The allowlist (Codex re-review of e9243e4): in a canonical decision file a number may stand only at a declared
     path (a claim weight in a seed, a rule's claim index in an outcome map), and a string may hold a digit only as a
-    whole token from the public list: DIGIT_TOKENS, the files' own belief and question ids, `tokens` (the public
-    file's public_tokens), a year in PUBLISH_YEARS (CITATION_YEARS in a citation) or a table number in a location.
+    whole token from the public list: DIGIT_TOKENS, the files' own belief and question ids, `tokens` (the decision's DECISION_DIGIT_TOKENS), a year in PUBLISH_YEARS (CITATION_YEARS in a citation) or a table number in a location.
     Everything else with a digit is refused."""
     ok_tok = DIGIT_TOKENS | set(ids) | set(tokens)
     bad = []
@@ -529,7 +538,7 @@ def main(argv=None) -> int:
                               committed_usd=round(led.committed(), 4)), default=str))
         return 0 if r.get("status") == "ok" else 1
     import world_model_trials as WMT
-    tokens = list(pub.get("public_tokens") or [])
+    tokens = decision_tokens(a.id)          # declared in code only (DECISION_DIGIT_TOKENS), never in a local file
     canon = {}
     for p in (seed_p, map_p):
         try:
@@ -784,7 +793,17 @@ def _self_test() -> int:
             ok(r.get("status") == "seed_refused" and abs(led.spent() - 0.25) < 1e-9,
                f"DB12 a promotion that fails after the charge (read-only analysis/) is a recorded refusal: {r}")
 
-    for n, f in (("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
+
+    def db13():
+        ok(decision_tokens("f6") >= {"F6", "f6", "GF13", "v2", "gc7", "gc7_as_funded", "gc7_package",
+                                     "v2-progressive-steps.md"} and decision_tokens("other") == frozenset(),
+           "DB13 the public tokens admitted for a decision are declared in code, per decision id")
+        obj = {"decision": "f6", "run": "Nigeria GF13, harness v2", "entries": []}
+        ok(digit_problems(obj, "map", (), decision_tokens("f6")) == []
+           and len(digit_problems(obj, "map", (), decision_tokens("other"))) == 3,
+           "DB13b a decision's tokens admit its identifiers only: another decision id refuses them")
+
+    for n, f in (("DB13", db13), ("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
                  ("DB8", db8), ("DB9", db9), ("DB10", db10), ("DB11", db11), ("DB12", db12)):
         tryit(n, f)
     if fails:
