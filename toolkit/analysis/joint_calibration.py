@@ -1161,13 +1161,19 @@ class Simulator:
         _ = ThreadPoolExecutor
         return out
 
-    def _call_dir(self) -> tuple:
-        """(call number, out_rel) for this call's files: call<N>, or, when that directory already holds files (an
-        earlier launch's, or a continuation whose call numbers restart), the first free call<N + 100000 m>, so no
-        stored row file is overwritten (Codex review of #241, P2-2/P2-3). The number stays an integer for load_prior."""
+    def _call_dir(self, after=None) -> tuple:
+        """(call number, out_rel) for this call's files: call<N>, or, when that directory already holds a finished
+        row file (an earlier launch's, or a continuation whose call numbers restart), the first free
+        call<N + 100000 m>, so no stored row file is overwritten (Codex review of #241, P2-2/P2-3). A directory with
+        only a killed batch's journal (compute.py's partial rows, its lock, adapter.json) is resumed in place, so
+        compute's own resume keeps those rows (re-review P2-1). `after`: a number already taken by this call. The
+        number stays an integer for load_prior."""
+        def finished(n):
+            d = os.path.join(self.run_dir, OUT_REL, f"call{n}")
+            return os.path.isdir(d) and any(f in ("results.jsonl", "points.jsonl") or f.endswith(".summary.json")
+                                            or f.endswith(REUSE_SIDECAR) for f in os.listdir(d))
         n, m = self.calls, 0
-        while os.path.isdir(os.path.join(self.run_dir, OUT_REL, f"call{n}")) and \
-                os.listdir(os.path.join(self.run_dir, OUT_REL, f"call{n}")):
+        while finished(n) or n == after:
             m += 1
             n = self.calls + 100000 * m
         return n, f"{OUT_REL}/call{n}/results.jsonl"
@@ -1198,7 +1204,10 @@ class Simulator:
                 self.legacy = getattr(self, "legacy", 0) + sum(1 for _, lg in hit.values() if lg)
                 self.log(f"joint calibration batch: {len(hit)} of {len(jobs)} unit runs reused from stored rows "
                          f"(job_sha, engine identity and adapter match); {len(todo)} computed")
-                self._publish(out_rel, jobs, hit, todo, adapter)
+                comp_rel = out_rel
+                if todo:            # the merge goes to a directory of its own: the computed file stays as compute
+                    cn, out_rel = self._call_dir(after=cn)     # wrote and authenticated it (re-review P2-2)
+                self._publish(out_rel, jobs, hit, todo, adapter, comp_rel)
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
@@ -1222,7 +1231,7 @@ class Simulator:
         except OSError as e:
             self.log(f"joint calibration: adapter record not written ({e}); this call's rows are legacy")
 
-    def _publish(self, out_rel, jobs, hit, todo, adapter):
+    def _publish(self, out_rel, jobs, hit, todo, adapter, comp_rel=None):
         """This call's results file in job order (the refs load_prior follows), every row with its provenance: the
         reused rows as stored, the computed ones as the batch wrote them (matched by job_sha, never a stale row),
         with its digest, adapter and runtime beside it (REUSE_SIDECAR) so it is itself a trusted source. It is
@@ -1232,9 +1241,10 @@ class Simulator:
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import compute
         path = os.path.join(self.run_dir, out_rel)
+        src = os.path.join(self.run_dir, comp_rel or out_rel)
         new = {}
-        if todo and os.path.exists(path):
-            for x in open(path):
+        if todo and os.path.exists(src):
+            for x in open(src):
                 r = json.loads(x) if x.strip() else {}
                 j = todo[r["i"]] if r.get("ok") and isinstance(r.get("i"), int) and 0 <= r["i"] < len(todo) else None
                 pv = ((r.get("result") or {}).get("provenance") or {}) if j is not None else {}
@@ -1248,8 +1258,7 @@ class Simulator:
         _safe_io().publish(path + REUSE_SIDECAR, json.dumps({
             "out_sha256": hashlib.sha256(text.encode()).hexdigest(), "rows": text.count("\n"),
             "reused": len(hit), "computed": len(new), "runtime": compute.runtime_versions()}), self.run_dir)
-        if not todo:
-            self._write_adapter(out_rel, adapter)
+        self._write_adapter(out_rel, adapter)
 
 
 # --------------------------------------------------------------------------- the step
