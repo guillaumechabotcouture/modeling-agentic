@@ -905,6 +905,10 @@ class Machine:
         self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
     def persist(self) -> None:
+        # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
+        # image save (a false positive): this writes run_state.json through save_state -> lib.safe_io.write_nofollow,
+        # atomic. The heuristic's own-module exemption cannot see a method defined in another module (the caller is
+        # agents/world_model_stage.py), so it was not changed.
         save_state(self.run_dir, self.st)
 
     def _settle_interrupted(self) -> None:
