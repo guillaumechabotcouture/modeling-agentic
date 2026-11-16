@@ -2950,6 +2950,14 @@ def _self_test() -> int:
         agg.value = 5.0                     # beyond any unit value: no offset makes the aggregate reachable
         r = calibrate(P, sim, seed=6, waves=1, log=q, points_per_unit=20, bias_draws_max=256)
         comp = (r.get("bias_components") or [{}])[0]
+        agg.value = 2.55
+        hm = HistoryMatch(P, sim, 6, q, points_per_unit=20, bias_draws_max=256)
+        hm.run(1)
+        hm.th["bias_draws_max"] = 1          # one round of proposals per row: many region-sample rows fail
+        od = hm.sample(200)["offset_draws"]
+        ok(od["failed"] > 0 and od.get("by_component") == {"s|g": od["failed"]},
+           f"HM34c (F6 run 1) failed region-sample rows are broken down by offset component ({od})")
+        agg.value = 5.0
         ok(r["blocked"] and comp.get("no_accepted") and comp.get("draws_max") == 256,
            f"HM34b no proposal accepted up to the maximum: infeasible, with the reason and the count reached "
            f"({r['status']}, {comp})")

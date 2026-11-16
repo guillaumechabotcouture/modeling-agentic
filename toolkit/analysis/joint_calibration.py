@@ -2625,6 +2625,56 @@ def _self_test() -> int:
             ok(stored_rows(d) == {}, "JA26m no stored rows: an empty pool")
     safe(ja26, "JA26")
 
+    def ja27():          # F6 run 1, owner decision R1 (2026-11-16): a declared group-target or offset miss, tied to a test
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["targets"][0].update(bias_by="region", bias_sd=0.1, bias_source="S")
+            decl = [{"target": "region_t:r1", "reason": "trend misfit", "decision_test": "DT1"},
+                    {"offset": "S|r2", "reason": "nets outside the model", "decision_test": "DT1"}]
+            raw["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                        "declared": decl}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            ok(spec_problems(spec) == [], f"JA27a declared misses are accepted ({spec_problems(spec)})")
+            for bad_, why in (({"target": "region_t:r1", "reason": "x", "decision_test": "DT9"}, "an unknown test"),
+                              ({"target": "region_t:r1", "reason": "x"}, "no decision test"),
+                              ({"target": "region_t:r1", "offset": "S|r2", "reason": "x", "decision_test": "DT1"},
+                               "two selectors"),
+                              ({"target": "nope:r1", "reason": "x", "decision_test": "DT1"}, "not a group target"),
+                              ({"offset": "Z|r2", "reason": "x", "decision_test": "DT1"}, "not an offset source"),
+                              ({"target": "region_t:r1", "reason": "", "decision_test": "DT1"}, "no reason")):
+                r2 = yaml.safe_load(open(p))
+                r2["calibration"]["joint"]["unmatched"]["declared"] = [bad_]
+                p2 = os.path.join(d, "bad.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                ok(any("declared" in x for x in spec_problems(schema.load(p2))), f"JA27b refused: {why}")
+            units = {"1": {"status": "matched"}, "2": {"status": "matched"}}
+            vf = {"code": "verification_failed", "detail": {"units": [], "targets": ["region_t:r1"]}}
+            off = {"code": "offset_sampling_low_acceptance", "detail": {"rows": 10, "failed": 3, "by_component": {"S|r2": 3}}}
+            rep = {"blocked": True, "conflicting": [], "units": units, "blocks": [vf, off]}
+            dec = unmatched_decision(spec, rep)
+            ok(dec["proceed"] and {(x.get("target") or x.get("offset")) for x in dec["declared"]} == {"region_t:r1", "S|r2"}
+               and all(x["decision_test"] == "DT1" for x in dec["declared"]),
+               f"JA27c declared target and offset misses proceed, each recorded with its decision test ({dec})")
+            for blks, why in (([dict(vf, detail={"units": [], "targets": ["region_t:r0"]}), off], "an undeclared target"),
+                              ([vf, dict(off, detail={"rows": 10, "failed": 3, "by_component": {"S|r0": 3}})],
+                               "an undeclared offset component"),
+                              ([vf, dict(off, detail={"rows": 10, "failed": 3})], "no component breakdown"),
+                              ([vf, dict(off, detail={"rows": 10, "failed": 3, "by_component": {"S|r2": 2}})],
+                               "a breakdown that does not add up"),
+                              ([vf, off, {"code": "emulator_inadequate", "detail": {}}], "another block")):
+                ok(not unmatched_decision(spec, dict(rep, blocks=blks))["proceed"], f"JA27d never proceeds: {why}")
+            raw["calibration"]["joint"]["unmatched"].pop("declared")
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            ok(not unmatched_decision(schema.load(p), rep)["proceed"], "JA27e without declarations the block stands")
+            ok(declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "run"}]) == []
+               and declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "not_run"}])
+               and declared_test_problems({"declared": decl}, []),
+               "JA27f a declared miss whose decision test did not run blocks the analysis (fail closed)")
+    safe(ja27, "JA27")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
