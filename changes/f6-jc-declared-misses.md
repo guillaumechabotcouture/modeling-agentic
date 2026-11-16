@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "JD α"
+---
+
+## Changelog
+
+**Declared calibration misses, each tied to a decision test (owner decision R1, F6 run 1).** F6 run 1 stopped in joint calibration on the verification of `state_2018:Katsina` and on the Yobe shared offset's region-sample shortfall. The diagnosis (2018→2021 trend and campaign-only nets) is in the F6 amendment notes. `unmatched_decision` let only unit misses proceed. `calibration.joint.unmatched.declared` now lists known misses the run proceeds with, under mode flag. Each entry is `{target: <group target id>:<group>, reason, decision_test}`, for a group target the verification fails, or `{offset: <bias_source>|<group>, reason, decision_test}`, for a shared offset whose region-sample rows fail. `_declared_problems` refuses at spec time anything but exactly one selector, a reason, a decision test declared in `analysis.decision_tests`, and a group or offset the spec's targets define. At run time, a verification target failure proceeds only when it is declared. An `offset_sampling_low_acceptance` block proceeds only when its new `by_component` breakdown (`history_matching._offset_draws` now counts failed rows per component, `"+"`-joined block keys) accounts for every failed row and names only declared offsets. Any other block still blocks, and a report without the breakdown fails closed. The decision records `declared` (with the target's verified implausibility or the component's failed rows). `toolkit/analysis/run.py` then blocks the analysis (`declared_miss_untested`) unless every declared miss's decision test ran (`declared_test_problems`). Self-tests JA27a-f and HM34c failed first.
