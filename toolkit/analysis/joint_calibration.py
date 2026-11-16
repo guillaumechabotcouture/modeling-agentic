@@ -897,58 +897,140 @@ def _CachedRunner(*a, **k):
     return _runner_cls()(*a, **k)
 
 
-def stored_rows(run_dir) -> dict:
-    """{job_sha: row} of every unit-batch row already stored under the run's analysis/joint_calibration/call*/
-    (results.jsonl, compute.py format with harness provenance). F6 run 1 (2026-11-16): compute.py reuses a row only
-    under the same whole-repo code fingerprint, so any harness edit recomputed every stored calibration run (3,088 in
-    F6, about $114). A row is reused here only when its job_sha equals the job's (every input: engine reference and
-    config, horizon, windows, unit, package, params, seed) and its engine identity (code, parameters, configuration)
-    equals the current engine's: batch.verify_rows, the check load_prior applies to earlier runs."""
-    import glob
-    out = {}
-    for f in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*", "results.jsonl"))):
-        for sha, body in stored_rows_file(f).items():
-            out.setdefault(sha, body)
+ADAPTER_FILES = ("toolkit/analysis/batch.py", "toolkit/engines/horizon.py")   # job -> engine call, outside the
+LEGACY_ADAPTER_ENV = "MA_JC_LEGACY_ADAPTER_SHA256"    # engine identity (Codex review of #241, P2-4)
+REUSE_SIDECAR = ".reuse.json"      # a merged results file's digest, adapter and runtime (written by this module)
+
+
+def adapter_digest(root=None) -> str:
+    """sha256 over the code that turns a batch job into an engine call (ADAPTER_FILES, under the repo `root`)."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in ADAPTER_FILES:
+        h.update(f.encode() + b"\0")
+        with open(os.path.join(root or ROOT, f), "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
+
+
+def _sha_file(path) -> str | None:
+    import hashlib
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _trusted_sources(call_dir) -> list:
+    """[(file, kind, sidecar)] of a call directory's row files whose recorded digest equals the file's (Codex review
+    of #241, P1): compute.py's `<out>.summary.json` (out_sha256) for points.jsonl / results.jsonl, or this module's
+    `<out>.reuse.json` for a merged results file. A file with no matching digest is never a source."""
+    out = []
+    for name, kind in (("points.jsonl", "points"), ("results.jsonl", "results")):
+        f = os.path.join(call_dir, name)
+        if not os.path.isfile(f):
+            continue
+        h = _sha_file(f)
+        for side in (f + ".summary.json", f + REUSE_SIDECAR):
+            try:
+                meta = json.load(open(side))
+            except (OSError, ValueError):
+                continue
+            if isinstance(meta, dict) and h and meta.get("out_sha256") == h:
+                out.append((f, kind, meta))
+                break
     return out
 
 
-def stored_rows_file(path) -> dict:
-    """{job_sha: row} of one results file: ok rows carrying a job_sha and a result; anything else is skipped."""
-    out = {}
+def _source_rows(path, kind) -> list:
+    """The rows {result, provenance} of one trusted file (points: each task's rows; results: one per line)."""
+    rows = []
     try:
         lines = open(path).read().splitlines()
     except OSError:
-        return out
+        return rows
     for x in lines:
         try:
             r = json.loads(x)
         except ValueError:
             continue
-        body = r.get("result") if isinstance(r, dict) and r.get("ok") else None
-        sha = ((body or {}).get("provenance") or {}).get("job_sha") if isinstance(body, dict) else None
-        if isinstance(sha, str) and sha and isinstance(body.get("result"), dict):
-            out.setdefault(sha, body)
+        if not (isinstance(r, dict) and r.get("ok") and isinstance(r.get("result"), dict)):
+            continue
+        for body in (r["result"].get("rows") or []) if kind == "points" else [r["result"]]:
+            sha = ((body or {}).get("provenance") or {}).get("job_sha") if isinstance(body, dict) else None
+            if isinstance(sha, str) and sha and isinstance(body.get("result"), dict):
+                rows.append((sha, body))
+    return rows
+
+
+def stored_rows(run_dir) -> dict:
+    """{job_sha: [(row, adapter digest or None)]} of every unit-batch row stored under the run's
+    analysis/joint_calibration/call*/, from trusted files only (_trusted_sources). F6 run 1 (2026-11-16): compute.py
+    reuses a row only under the same whole-repo code fingerprint, so any harness edit recomputed every stored
+    calibration run (3,088 in F6, about $114). A row is reused (Simulator._units) only when its job_sha equals the
+    job's (every input: engine reference and config, horizon, windows, unit, package, params, seed), its engine
+    identity (code, parameters, configuration) equals the current engine's (batch.verify_rows, the check load_prior
+    applies), and the code between job and engine (adapter_digest) is the current one: recorded with the rows this
+    module wrote (`adapter.json`), or attested for older rows by $MA_JC_LEGACY_ADAPTER_SHA256. Every candidate is
+    kept (Codex P3: an old engine's row never masks a current one)."""
+    import glob
+    out = {}
+    for d in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*"))):
+        try:
+            ad = json.load(open(os.path.join(d, "adapter.json"))).get("adapter_sha256")
+        except (OSError, ValueError, AttributeError):
+            ad = None
+        for f, kind, _ in _trusted_sources(d):
+            for sha, body in _source_rows(f, kind):
+                out.setdefault(sha, []).append((body, ad))
+    return out
+
+
+def _admit(pool, jobs, engine, adapter, legacy_ok) -> dict:
+    """{job id: (stored row, legacy)} for jobs a stored row answers (job_sha + engine identity + adapter)."""
+    from toolkit.analysis import batch as B
+    out = {}
+    for j in jobs:
+        for body, ad in pool.get(B.job_sha(j), []):
+            if not (ad == adapter or (ad is None and legacy_ok)):
+                continue
+            if B.verify_rows([{"id": j["id"], "result": body}], [j], engine)[0]:
+                out[j["id"]] = (body, ad is None)
+                break
     return out
 
 
 def reuse_check(spec, run_dir) -> dict:
-    """Read-only: the stored unit rows under the run (stored_rows) whose engine identity equals the current
-    engine's, by call. Such a row is reused when the calibration asks for its job (same job_sha); this check does
-    not generate the jobs (compute.py reuse-check's caveat)."""
+    """Read-only: by call directory, the stored rows from trusted files and those whose engine identity is the
+    current engine's; the current adapter digest, whether older rows are attested, and the runtime each source
+    recorded (reported, not gated, as compute.py's reuse-check). A row is reused only when the calibration asks
+    for its job (same job_sha); this check does not generate the jobs."""
     import glob
     from toolkit.engines.contract import engine_identity
-    ident = engine_identity(spec.engine())
+    ident, adapter = engine_identity(spec.engine()), adapter_digest()
+    legacy = os.environ.get(LEGACY_ADAPTER_ENV)
     calls, seen = {}, set()
-    for f in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*", "results.jsonl"))):
-        c = {"stored": 0, "engine_match": 0}
-        for sha, body in stored_rows_file(f).items():
-            c["stored"] += 1
-            if sha not in seen and body.get("provenance", {}).get("engine") == ident:
-                c["engine_match"] += 1
-            seen.add(sha)
-        calls[os.path.basename(os.path.dirname(f))] = c
+    for d in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*"))):
+        try:
+            ad = json.load(open(os.path.join(d, "adapter.json"))).get("adapter_sha256")
+        except (OSError, ValueError, AttributeError):
+            ad = None
+        c = {"trusted_files": [], "stored": 0, "engine_match": 0, "adapter": ad or "legacy (not recorded)",
+             "runtime": None}
+        for f, kind, meta in _trusted_sources(d):
+            c["trusted_files"].append(os.path.basename(f))
+            c["runtime"] = c["runtime"] or meta.get("runtime")
+            for sha, body in _source_rows(f, kind):
+                c["stored"] += 1
+                if sha not in seen and body.get("provenance", {}).get("engine") == ident and (
+                        ad == adapter or (ad is None and legacy == adapter)):
+                    c["engine_match"] += 1
+                    seen.add(sha)
+        calls[os.path.basename(d)] = c
     return {"calls": calls, "stored": sum(c["stored"] for c in calls.values()),
-            "eligible": sum(c["engine_match"] for c in calls.values()), "engine": ident}
+            "eligible": sum(c["engine_match"] for c in calls.values()), "adapter_sha256": adapter,
+            "legacy_attested": legacy == adapter, "engine": ident}
 
 
 class Simulator:
@@ -972,7 +1054,7 @@ class Simulator:
         if spec.raw["objective"].get("delivery") is not None:
             self.horizon["delivery"] = [float(x) for x in spec.raw["objective"]["delivery"]]
         self.bench = None
-        self.stored = stored_rows(run_dir)      # read before this run rewrites any results file
+        self.stored = stored_rows(run_dir)      # read once; no stored file is ever rewritten (_call_dir)
         self.reused = 0
 
     def job(self, p, k, windows=None, call=None) -> dict:
@@ -1079,51 +1161,76 @@ class Simulator:
         _ = ThreadPoolExecutor
         return out
 
+    def _call_dir(self) -> tuple:
+        """(call number, out_rel) for this call's files: call<N>, or, when that directory already holds files (an
+        earlier launch's, or a continuation whose call numbers restart), the first free call<N + 100000 m>, so no
+        stored row file is overwritten (Codex review of #241, P2-2/P2-3). The number stays an integer for load_prior."""
+        n, m = self.calls, 0
+        while os.path.isdir(os.path.join(self.run_dir, OUT_REL, f"call{n}")) and \
+                os.listdir(os.path.join(self.run_dir, OUT_REL, f"call{n}")):
+            m += 1
+            n = self.calls + 100000 * m
+        return n, f"{OUT_REL}/call{n}/results.jsonl"
+
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
-            from toolkit.analysis import batch as B
             jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
-            out_rel = f"{OUT_REL}/call{self.calls}/results.jsonl"
+            cn, out_rel = self._call_dir()
+            adapter = adapter_digest()
+            legacy_ok = os.environ.get(LEGACY_ADAPTER_ENV) == adapter
             pool = getattr(self, "stored", None) or {}
-            sha = [B.job_sha(j) for j in jobs]
-            cand = [{"id": j["id"], "result": pool[h]} for j, h in zip(jobs, sha) if h in pool]
-            reused = B.verify_rows(cand, jobs, self.eng)[0] if cand else {}     # job_sha + engine identity
-            todo = [j for j in jobs if j["id"] not in reused]
+            hit = _admit(pool, jobs, self.eng, adapter, legacy_ok) if pool else {}
+            todo = [j for j in jobs if j["id"] not in hit]
 
             def run_once():
                 return Bt.run(self.run_dir, todo, self.eng, out_rel=out_rel,
                               **{k: v for k, v in self.kw.items() if k != "bench_workers"})
             b = {"results": {}, "problems": []}
             if todo:
+                self._write_adapter(out_rel, adapter)      # before any row of this call exists
                 b = run_once()
                 kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
                 if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
                     self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
                     b = run_once()
-            if reused:      # first, so a failing batch below never leaves the stored rows off disk
-                self.reused = getattr(self, "reused", 0) + len(reused)
-                self.log(f"joint calibration batch: {len(reused)} of {len(jobs)} unit runs reused from stored rows "
-                         f"(job_sha and engine identity match); {len(todo)} computed")
-                self._publish(out_rel, jobs, sha, pool, reused, todo)
+            if hit:
+                self.reused = getattr(self, "reused", 0) + len(hit)
+                self.legacy = getattr(self, "legacy", 0) + sum(1 for _, lg in hit.values() if lg)
+                self.log(f"joint calibration batch: {len(hit)} of {len(jobs)} unit runs reused from stored rows "
+                         f"(job_sha, engine identity and adapter match); {len(todo)} computed")
+                self._publish(out_rel, jobs, hit, todo, adapter)
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
-            res = dict(b["results"], **reused)
+            res = dict(b["results"], **{k: v[0]["result"] for k, v in hit.items()})
             for k, n in enumerate(uix):
                 r = res.get(jobs[k]["id"])
-                ref = f"call{self.calls}:{k}"
+                ref = f"call{cn}:{k}"
                 if r is None:
                     raise HM.CalibrationInputError([f"joint calibration batch: job {jobs[k]['id']} (unit "
                                                     f"{pts[n]['unit']}) did not complete"])
                 out[n] = {f"{w}.{m}": v for w, d in (r.get("windows") or {}).items() for m, v in d.items()}
                 out[n]["_ref"] = ref
 
-    def _publish(self, out_rel, jobs, sha, pool, reused, todo):
-        """The call's results file in job order, every row with its provenance: the reused rows as stored, the
-        computed ones as the batch wrote them (its file then held only those), so the file stays a valid --prior
-        source and the next run's pool."""
+    def _write_adapter(self, out_rel, adapter):
+        from toolkit.analysis.artifacts import _safe_io
+        path = os.path.join(self.run_dir, os.path.dirname(out_rel), "adapter.json")
+        try:        # unrecorded, the call's rows are only reusable when attested (the safe direction)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _safe_io().publish(path, json.dumps({"adapter_sha256": adapter, "files": list(ADAPTER_FILES)}),
+                               self.run_dir)
+        except OSError as e:
+            self.log(f"joint calibration: adapter record not written ({e}); this call's rows are legacy")
+
+    def _publish(self, out_rel, jobs, hit, todo, adapter):
+        """This call's results file in job order (the refs load_prior follows), every row with its provenance: the
+        reused rows as stored, the computed ones as the batch wrote them (matched by job_sha, never a stale row),
+        with its digest, adapter and runtime beside it (REUSE_SIDECAR) so it is itself a trusted source. It is
+        written in this call's own directory: the stored files it read stay untouched."""
         from toolkit.analysis import batch as B
         from toolkit.analysis.artifacts import _safe_io
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
         path = os.path.join(self.run_dir, out_rel)
         new = {}
         if todo and os.path.exists(path):
@@ -1133,10 +1240,16 @@ class Simulator:
                 pv = ((r.get("result") or {}).get("provenance") or {}) if j is not None else {}
                 if j is not None and pv.get("job_sha") == B.job_sha(j):     # never a stale row of an earlier file
                     new[j["id"]] = r["result"]
-        text = "".join(json.dumps({"i": n, "ok": True, "result": pool[h] if j["id"] in reused else new[j["id"]]})
-                       + "\n" for n, (j, h) in enumerate(zip(jobs, sha)) if j["id"] in reused or j["id"] in new)
+        text = "".join(json.dumps({"i": n, "ok": True, "result": hit[j["id"]][0] if j["id"] in hit else new[j["id"]]})
+                       + "\n" for n, j in enumerate(jobs) if j["id"] in hit or j["id"] in new)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        import hashlib
         _safe_io().publish(path, text, self.run_dir)
+        _safe_io().publish(path + REUSE_SIDECAR, json.dumps({
+            "out_sha256": hashlib.sha256(text.encode()).hexdigest(), "rows": text.count("\n"),
+            "reused": len(hit), "computed": len(new), "runtime": compute.runtime_versions()}), self.run_dir)
+        if not todo:
+            self._write_adapter(out_rel, adapter)
 
 
 # --------------------------------------------------------------------------- the step
@@ -1293,7 +1406,7 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, w
     rep["prior_runs"] = pinfo
     rep["adapter"] = {"windows": meta["windows"], "dropped_targets": meta["dropped"], "units": len(meta["units"]),
                       "shared": list(j["shared"]), "simulator_calls": sim.calls,
-                      "stored_rows_reused": sim.reused,
+                      "stored_rows_reused": sim.reused, "stored_rows_reused_legacy": getattr(sim, "legacy", 0),
                       "theta_held": {k: v for k, v in sim.th0.items() if k not in j["shared"]}}
     rep["primary"] = {"targets": {t["id"]: {k: t[k] for k in SENS_KEYS if k in t} for t in j["targets"]
                                   if t["kind"] != "benchmark"},
@@ -1425,7 +1538,7 @@ def main(argv=None) -> int:
     spec = schema.load(os.path.join(rd, a.spec))
     if a.reuse_check:
         r = reuse_check(spec, rd)
-        print(json.dumps({k: v for k, v in r.items() if k != "engine"}, indent=1))
+        print(json.dumps({k: v for k, v in r.items() if k != "engine"}, indent=1, default=str))
         return 0
     units = [x.strip() for x in open(a.units) if x.strip()] if a.units else None
     kw = {"max_workers": a.workers, "bench_workers": a.bench_workers or a.workers}
