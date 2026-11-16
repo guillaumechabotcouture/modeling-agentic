@@ -2365,63 +2365,116 @@ def _self_test() -> int:
 
     def ja26():          # F6 run 1 (2026-11-16): a harness-only change must not recompute the stored calibration rows
         import glob
+        import hashlib
+        import shutil
         from unittest import mock
         from toolkit.analysis import batch as Bt_
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import compute
-        with tempfile.TemporaryDirectory() as d:
-            spec = schema.load(_toy_joint(d, group=False))
-            rep1 = run(spec, d, {"max_workers": 2}, log=q, **fast)
-            n1 = sum(1 for c in glob.glob(os.path.join(d, OUT_REL, "call*", "results.jsonl")) for _ in open(c))
-            sent, real_run, real_fp = [], Bt_.run, compute.code_fingerprint
+        real_run, real_fp = Bt_.run, compute.code_fingerprint
+        sent = []
 
-            def spy(run_dir, jobs, eng, **kw):
-                sent.append(len(jobs))
-                return real_run(run_dir, jobs, eng, **kw)
-            # a harness edit: every stored batch's code fingerprint differs, the jobs and the engine do not
-            with mock.patch.object(Bt_, "run", spy), \
-                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited"):
-                rep2 = run(spec, d, {"max_workers": 2}, log=q, **fast)
-            ok(n1 > 0 and sum(sent) == 0, f"JA26a after a harness-only change no stored unit run is recomputed: "
-                                          f"{sum(sent)} of {n1} sent to the engine")
-            rc = reuse_check(spec, d)
-            ok(rc["stored"] == n1 and rc["eligible"] == n1, f"JA26h reuse_check counts the stored rows the engine "
-                                                            f"identity admits ({rc['eligible']} of {rc['stored']})")
-            ok(rep2["adapter"].get("stored_rows_reused") == n1,
-               f"JA26b the reuse is recorded in the report: {rep2['adapter'].get('stored_rows_reused')} of {n1}")
-            v1 = {u: x["implausibility"] for u, x in (rep1.get("verification") or {}).get("units", {}).items()}
-            v2 = {u: x["implausibility"] for u, x in (rep2.get("verification") or {}).get("units", {}).items()}
-            ok(v1 and v1 == v2 and rep1["status"] == rep2["status"],
-               "JA26c the calibration from reused rows equals the original")
-            f1 = sorted(glob.glob(os.path.join(d, OUT_REL, "call*", "results.jsonl")))[0]
-            rows = [json.loads(x) for x in open(f1)]
-            ok(all(r.get("ok") and r["result"]["provenance"]["job_sha"] for r in rows),
-               "JA26d each results file still holds every job's row with its provenance")
-            rows[0]["result"]["provenance"]["engine"] = dict(rows[0]["result"]["provenance"]["engine"], code_sha256="x")
-            rows[1]["result"]["provenance"]["job_sha"] = "0" * 64
-            open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+        def spy(run_dir, jobs, eng, **kw):
+            sent.append(len(jobs))
+            return real_run(run_dir, jobs, eng, **kw)
+
+        def again(spec, d, tag, **extra):      # a harness edit: every stored batch's code fingerprint differs
             sent.clear()
             with mock.patch.object(Bt_, "run", spy), \
-                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited2"):
-                rep3 = run(spec, d, {"max_workers": 2}, log=q, **fast)
-            ok(sum(sent) == 2 and rep3["adapter"].get("stored_rows_reused") == n1 - 2,
-               f"JA26e a row from another engine identity or with another job_sha is recomputed, never reused "
-               f"({sum(sent)} sent, {rep3['adapter'].get('stored_rows_reused')} reused)")
-            rows = [json.loads(x) for x in open(f1)]
-            rows[0]["result"]["provenance"]["job_sha"] = "1" * 64
-            open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
-            with mock.patch.object(Bt_, "run", lambda *a, **k: {"results": {}, "problems": ["bad row"], "summary": {}}), \
-                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited3"):
-                try:
-                    run(spec, d, {"max_workers": 2}, log=q, **fast)
-                    got = "ran"
-                except HM.CalibrationInputError:
-                    got = "raised"
-            kept = sum(1 for x in open(f1) if x.strip())
-            ok(got == "raised" and kept == len(rows) - 1,
-               f"JA26g a failing batch still leaves the reused rows on disk ({got}; {kept} of {len(rows) - 1} kept)")
+                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + tag):
+                return run(spec, d, {"max_workers": 2}, log=q, **fast, **extra)
+
+        def digests(d):
+            return {f: hashlib.sha256(open(f, "rb").read()).hexdigest()
+                    for f in glob.glob(os.path.join(d, OUT_REL, "call*", "*")) if os.path.isfile(f)}
+        with tempfile.TemporaryDirectory() as d0:
+            spec0 = schema.load(_toy_joint(d0, group=False))
+            rep1 = run(spec0, d0, {"max_workers": 2}, log=q, **fast)
+            n1 = sum(len(v) for v in stored_rows(d0).values())
+            base = os.path.join(os.path.dirname(d0), os.path.basename(d0) + "_base")
+            shutil.copytree(d0, base)
+
+            def fresh():
+                dd = tempfile.mkdtemp()
+                shutil.rmtree(dd)
+                shutil.copytree(base, dd)
+                return dd, schema.load(os.path.join(dd, os.path.basename(spec0.path)))
+            try:
+                d, spec = fresh()
+                before = digests(d)
+                rep2 = again(spec, d, "-edited")
+                ok(n1 > 0 and sum(sent) == 0, f"JA26a after a harness-only change no stored unit run is recomputed: "
+                                              f"{sum(sent)} of {n1} sent to the engine")
+                ok(rep2["adapter"].get("stored_rows_reused") == n1,
+                   f"JA26b the reuse is recorded in the report: {rep2['adapter'].get('stored_rows_reused')} of {n1}")
+                v1 = {u: x["implausibility"] for u, x in (rep1.get("verification") or {}).get("units", {}).items()}
+                v2 = {u: x["implausibility"] for u, x in (rep2.get("verification") or {}).get("units", {}).items()}
+                ok(v1 and v1 == v2 and rep1["status"] == rep2["status"],
+                   "JA26c the calibration from reused rows equals the original")
+                aft = digests(d)
+                ok(all(aft.get(f) == h for f, h in before.items()) and len(aft) > len(before),
+                   "JA26d no stored file is rewritten: the reuse writes its own call directories (Codex P2-2/P2-3)")
+                _, meta = build(spec)
+                pd_ = tempfile.mkdtemp()
+                shutil.copytree(os.path.join(d, OUT_REL), os.path.join(pd_, "jc_rows"))
+                json.dump(rep2["runs"], open(os.path.join(pd_, "runs.json"), "w"))
+                import yaml as _y
+                _y.safe_dump(HM_plain(artifact(rep2)), open(os.path.join(pd_, "joint_calibration.yaml"), "w"))
+                ok(load_prior(spec, pd_, meta, log=q)[1]["reused"] == len(rep2["runs"]["unit"]),
+                   "JA26e the reusing run's own files are a valid --prior source (refs follow its call directories)")
+                rc = reuse_check(spec, d)
+                ok(rc["eligible"] == n1, f"JA26h reuse_check counts the admitted stored rows ({rc['eligible']} of {n1})")
+                d, spec = fresh()        # a result payload altered with its provenance intact (Codex P1)
+                f1 = sorted(glob.glob(os.path.join(d, OUT_REL, "call1", "results.jsonl")))[0]
+                rows = [json.loads(x) for x in open(f1)]
+                w = rows[0]["result"]["result"]["windows"]
+                k0 = next(iter(w))
+                w[k0] = {m: 0.999 for m in w[k0]}
+                open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+                rep3 = again(spec, d, "-edited2")
+                ok(sum(sent) == len(rows) and rep3["adapter"].get("stored_rows_reused") == n1 - len(rows),
+                   f"JA26f a file whose rows no longer match its recorded digest is no source: its {len(rows)} jobs "
+                   f"are recomputed ({sum(sent)} sent)")
+                d, spec = fresh()        # rows with no recorded adapter: reused only when attested
+                for a in glob.glob(os.path.join(d, OUT_REL, "call*", "adapter.json")):
+                    os.remove(a)
+                again(spec, d, "-edited3")
+                ok(sum(sent) == n1, f"JA26g rows of an unrecorded adapter are not reused unattested ({sum(sent)} sent)")
+                d, spec = fresh()
+                for a in glob.glob(os.path.join(d, OUT_REL, "call*", "adapter.json")):
+                    os.remove(a)
+                with mock.patch.dict(os.environ, {LEGACY_ADAPTER_ENV: adapter_digest()}):
+                    rep4 = again(spec, d, "-edited4")
+                ok(sum(sent) == 0 and rep4["adapter"].get("stored_rows_reused_legacy") == n1,
+                   f"JA26i attested to the current adapter, they are reused and counted as legacy ({sum(sent)} sent)")
+                with mock.patch.dict(os.environ, {LEGACY_ADAPTER_ENV: "0" * 64}):
+                    again(spec, d, "-edited5")
+                ok(sum(sent) == 0, "JA26j once reused under the current adapter, the new files record it themselves")
+                d, spec = fresh()        # another adapter: recorded digest differs
+                with mock.patch.object(sys.modules[__name__] if __name__ in sys.modules else
+                                       sys.modules["toolkit.analysis.joint_calibration"], "adapter_digest",
+                                       lambda root=None: "f" * 64):
+                    again(spec, d, "-edited6")
+                ok(sum(sent) == n1, f"JA26k a changed adapter (job to engine call) recomputes ({sum(sent)} sent)")
+                d, spec = fresh()        # an old engine's row first for a job_sha must not mask the current one (P3)
+                pool = stored_rows(d)
+                sha0, (body0, ad0) = next(iter(pool.items()))[0], next(iter(pool.values()))[0]
+                bad = json.loads(json.dumps(body0))
+                bad["provenance"]["engine"] = dict(bad["provenance"]["engine"], code_sha256="old")
+                pool[sha0].insert(0, (bad, ad0))
+                sim = Simulator(spec, d, build(spec)[1])
+                sim.stored = pool
+                jobs = []
+                for x in rep1["runs"]["unit"]:
+                    jb = sim.job({"unit": x["unit"], "z": x["z"], "theta": x["theta"], "seed": x["seed"]}, 0)
+                    if Bt_.job_sha(jb) == sha0:
+                        jobs.append(jb)
+                got = _admit(pool, jobs, sim.eng, adapter_digest(), False)
+                ok(jobs and len(got) == len(jobs), "JA26l an old engine's duplicate never masks a current row (Codex P3)")
+            finally:
+                shutil.rmtree(base, ignore_errors=True)
         with tempfile.TemporaryDirectory() as d:
-            ok(stored_rows(d) == {}, "JA26f no stored rows: an empty pool")
+            ok(stored_rows(d) == {}, "JA26m no stored rows: an empty pool")
     safe(ja26, "JA26")
 
     if fails:
