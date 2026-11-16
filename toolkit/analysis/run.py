@@ -402,6 +402,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
     # ---- decision tests
     dts = DT.run_all(A, z0, out0, ben0, cost0, plan, u["data"], run_dir)
+    if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
+        from toolkit.analysis import joint_calibration as JC
+        dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
+        if dp:
+            raise AnalysisBlocked("calibration", [{"unit": "*", "package": "*", "kind": "declared_miss_untested"}],
+                                  reason="; ".join(dp))
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),

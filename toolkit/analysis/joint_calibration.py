@@ -194,6 +194,7 @@ def spec_problems(spec) -> list[str]:
     else:
         eng, wins = None, None
     bad += _unmatched_problems(j.get("unmatched"), w)
+    bad += _declared_problems(spec, j, w)
     bad += _sensitivity_problems(j.get("sensitivity"), j.get("targets"), w)
     for n, r in enumerate(j.get("record") or []):
         if not (isinstance(r, dict) and _window(r.get("window")) and (wins is None or r.get("metric") in wins)):
@@ -322,7 +323,7 @@ def _unmatched_problems(u, w) -> list:
     if not isinstance(u, dict):
         return [f"{ww}: a mapping {{mode: block | flag, default_reason, max_units, reasons}}"]
     bad = []
-    unk = sorted(set(u) - {"mode", "default_reason", "max_units", "reasons"})
+    unk = sorted(set(u) - {"mode", "default_reason", "max_units", "reasons", "declared"})
     if unk:
         bad.append(f"{ww}: unknown keys {unk}")
     if u.get("mode") not in UNMATCHED_MODES:
@@ -343,6 +344,65 @@ def _unmatched_problems(u, w) -> list:
                 and set(r) == {sel[0], "reason"}):
             bad.append(f"{ww}.reasons[{n}]: {{unit: <id>, reason}} or {{region: <name>, reason}}")
     return bad
+
+
+def _declared_problems(spec, j, w) -> list:
+    """calibration.joint.unmatched.declared (owner decision R1, F6 run 1, 2026-11-16): known calibration misses the
+    run proceeds with, each tied to a decision test that must run: [{target: <group target id>:<group>, reason,
+    decision_test}] for a group target the verification fails, or [{offset: <bias_source>|<group>, reason,
+    decision_test}] for a shared offset whose region-sample rows fail. Needs mode flag. Fail closed: exactly one
+    selector, a reason (text), a decision test declared in analysis.decision_tests, and a group or offset the
+    spec's targets define."""
+    u = j.get("unmatched")
+    dl = u.get("declared") if isinstance(u, dict) else None
+    if dl is None:
+        return []
+    ww = f"{w}.unmatched.declared"
+    if not isinstance(dl, list) or not dl:
+        return [f"{ww}: a non-empty list of {{target | offset, reason, decision_test}}"]
+    bad = [] if u.get("mode") == "flag" else [f"{ww}: needs unmatched.mode flag"]
+    dts = {str(t.get("id")) for t in (spec.raw.get("analysis") or {}).get("decision_tests") or [] if isinstance(t, dict)}
+    try:
+        rows = list(spec.units())
+    except Exception:  # noqa: BLE001 — the units table is checked elsewhere; groups are then unknown
+        rows = []
+    col = lambda c: {str(r.get(c)) for r in rows if c and r.get(c) is not None}  # noqa: E731
+    gt = {t["id"]: col((t.get("key") or {}).get("units")) for t in j.get("targets") or []
+          if isinstance(t, dict) and t.get("kind") == "group"}
+    src = {}
+    for t in j.get("targets") or []:
+        if isinstance(t, dict) and t.get("kind") == "unit" and t.get("bias_by"):
+            src.setdefault(str(t.get("bias_source", t.get("id"))), set()).update(col(t["bias_by"]))
+    seen = set()
+    for n, x in enumerate(dl):
+        sel = [k for k in ("target", "offset") if isinstance(x, dict) and k in x]
+        if not (isinstance(x, dict) and len(sel) == 1 and set(x) == {sel[0], "reason", "decision_test"}
+                and _text(x.get(sel[0])) and _text(x.get("reason"))):
+            bad.append(f"{ww}[{n}]: {{target | offset, reason, decision_test}} with a reason (text)")
+            continue
+        if str(x["decision_test"]) not in dts:
+            bad.append(f"{ww}[{n}].decision_test: {x['decision_test']!r} is not in analysis.decision_tests")
+        key = str(x[sel[0]])
+        if key in seen:
+            bad.append(f"{ww}[{n}]: {key} declared twice")
+        seen.add(key)
+        # Codex review of #242 P2-4: matched against the exact identities the targets generate, never parsed
+        ids = ({f"{t}:{g}" for t, gs in gt.items() for g in gs}, [t + ":" for t, gs in gt.items() if not gs]) \
+            if sel[0] == "target" else ({f"{t}|{g}" for t, gs in src.items() for g in gs},
+                                        [t + "|" for t, gs in src.items() if not gs])
+        if not (key in ids[0] or any(key.startswith(pf) and len(key) > len(pf) for pf in ids[1])):
+            bad.append(f"{ww}[{n}].{sel[0]}: {key!r} is not " + ("<group target id>:<group> of a declared group target"
+                       if sel[0] == "target" else "<bias_source>|<group> of a unit target with bias_by"))
+    return bad
+
+
+def declared_test_problems(dec, dts) -> list:
+    """Each declared miss the calibration proceeded with names a decision test that ran (status run); otherwise
+    the analysis blocks (fail closed): a miss without its test is not declared."""
+    ran = {str(t.get("test_id")) for t in dts or [] if isinstance(t, dict) and t.get("status") == "run"}
+    return [f"declared calibration miss {x.get('target') or x.get('offset')}: its decision test "
+            f"{x.get('decision_test')} did not run" for x in (dec or {}).get("declared") or []
+            if str(x.get("decision_test")) not in ran]
 
 
 def _sensitivity_problems(s, targets, w) -> list:
@@ -391,16 +451,45 @@ def _sensitivity_problems(s, targets, w) -> list:
 
 def unmatched_decision(spec, rep) -> dict:
     """Whether a blocked joint calibration may proceed under calibration.joint.unmatched (fail closed: without the
-    option, with mode block, with any block that is not a unit's miss, or with more misses than max_units, it may
-    not). {proceed, mode, flagged: [{unit, status, reason, implausibility, direction}]}."""
+    option, with mode block, with any block that is neither a unit's miss nor a declared miss, or with more unit
+    misses than max_units, it may not). Declared misses (owner decision R1, 2026-11-16): a group target the
+    verification fails, or a shared offset whose region-sample rows fail (by_component), proceeds only when
+    `unmatched.declared` names it with its decision test; run.py then blocks unless that test ran.
+    {proceed, mode, flagged: [{unit, status, reason, implausibility, direction}], declared: [...]}."""
     j = declared(spec) or {}
     u = j.get("unmatched") or {"mode": "block"}
     units = rep.get("units") or {}
     missed = [k for k, v in units.items() if v.get("status") != "matched"]
-    unit_codes = {"unmatched_units", "verification_failed"}
+    dl = [x for x in (u.get("declared") or []) if isinstance(x, dict)]
+    dt_ = {str(x["target"]): x for x in dl if "target" in x}
+    do_ = {str(x["offset"]): x for x in dl if "offset" in x}
+    allowed = {"unmatched_units", "verification_failed"} | ({"offset_sampling_low_acceptance"} if do_ else set())
     codes = {b["code"] for b in rep.get("blocks") or []}
     target_fail = [x for b in rep.get("blocks") or [] if b["code"] == "verification_failed"
                    for x in ((b.get("detail") or {}).get("targets") or [])]
+    used, off_ok = [], True
+    for t in target_fail:
+        if t in dt_:
+            used.append(dict(dt_[t], implausibility=((rep.get("verification") or {}).get("targets") or {}).get(
+                t, {}).get("implausibility")))
+    for b in rep.get("blocks") or []:
+        if b["code"] != "offset_sampling_low_acceptance":
+            continue
+        d = b.get("detail") or {}
+        bc, fl, fr = d.get("by_component"), d.get("failed"), d.get("failed_rows")
+        # Codex review of #242: components by their exact block keys (P1), and every failed row covered (P2-1)
+        if not (isinstance(bc, list) and bc and isinstance(fl, int) and fl > 0 and isinstance(fr, list)
+                and len(set(fr)) == fl == len(fr)
+                and all(isinstance(c, dict) and isinstance(c.get("blocks"), list) and c["blocks"]
+                        and isinstance(c.get("rows"), list) and c["rows"] for c in bc)
+                and set(fr) <= {x for c in bc for x in c["rows"]}):
+            off_ok = False
+            continue
+        for c in bc:
+            ks = [str(k) for k in c["blocks"]]
+            if not all(k in do_ for k in ks):
+                off_ok = False
+            used += [dict(do_[k], failed_rows=len(c["rows"])) for k in ks if k in do_]
     reg = spec.raw["decision_units"].get("region")
     rows = {str(r[spec.uid]): r for r in spec.units()}
     by_unit = {str(r["unit"]): r["reason"] for r in u.get("reasons") or [] if r.get("unit")}
@@ -413,18 +502,23 @@ def unmatched_decision(spec, rep) -> dict:
                         "reason": by_unit.get(k) or by_reg.get(region) or u.get("default_reason"),
                         "implausibility": v.get("implausibility_verified", v.get("best_implausibility")),
                         "direction": v.get("direction")})
-    ok = (u.get("mode") == "flag" and codes <= unit_codes and not target_fail and not rep.get("conflicting")
-          and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed))
-    return {"proceed": bool(ok) if rep.get("blocked") else True, "mode": u.get("mode", "block"),
-            "flagged": flagged if ok or not rep.get("blocked") else [], "missed": flagged,
-            "why_not": None if ok or not rep.get("blocked") else
+    undeclared = [t for t in target_fail if t not in dt_]
+    ok = (u.get("mode") == "flag" and codes <= allowed and not undeclared and off_ok and not rep.get("conflicting")
+          and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed, bool(used)))
+    blocked = bool(rep.get("blocked") or rep.get("blocks"))     # Codex review of #242 P2-3: the blocks decide
+    return {"proceed": bool(ok) if blocked else True, "mode": u.get("mode", "block"),
+            "flagged": flagged if ok or not blocked else [], "missed": flagged,
+            "declared": used if ok and blocked else [],
+            "why_not": None if ok or not blocked else
             ("no flag option" if u.get("mode") != "flag" else f"blocks {sorted(codes)}; {len(flagged)} misses, max "
-             f"{u.get('max_units')}; target failures {target_fail}; conflicting {rep.get('conflicting')}")}
+             f"{u.get('max_units')}; target failures {target_fail} (undeclared {undeclared}); offset components "
+             f"{'declared' if off_ok else 'undeclared or without a breakdown'}; conflicting {rep.get('conflicting')}")}
 
 
-def _blocks_consistent(rep, missed) -> bool:
-    """Codex r6 P1-4: a blocked report may let unit misses proceed only when its blocks are complete and name
-    exactly the units whose status is not matched (fail closed on a partial or malformed report)."""
+def _blocks_consistent(rep, missed, declared_any=False) -> bool:
+    """Codex r6 P1-4: a blocked report may let misses proceed only when its blocks are complete and name exactly
+    the units whose status is not matched (fail closed on a partial or malformed report). A report whose only
+    misses are declared ones (a group target, an offset component) needs no unit named."""
     named = set()
     blocks = rep.get("blocks")
     if not (isinstance(blocks, list) and blocks):
@@ -438,13 +532,19 @@ def _blocks_consistent(rep, missed) -> bool:
                 return False
             named |= {str(x) for x in d["unmatched"]}
         elif b["code"] == "verification_failed":
-            if not (isinstance(d.get("units"), list) and d.get("targets") == []):
+            if not (isinstance(d.get("units"), list) and isinstance(d.get("targets"), list)
+                    and (d["units"] or d["targets"])):
+                return False
+            if d["targets"] and not declared_any:
                 return False
             named |= {str(x) for x in d["units"]}
+        elif b["code"] == "offset_sampling_low_acceptance":
+            if not (declared_any and isinstance(d.get("by_component"), list)):
+                return False
         else:
             return False
     units = rep.get("units") or {}
-    return bool(named) and named == {str(k) for k in missed} and named <= {str(k) for k in units}
+    return (bool(named) or declared_any) and named == {str(k) for k in missed} and named <= {str(k) for k in units}
 
 
 def _with_overrides(raw, overrides) -> dict:
@@ -2624,6 +2724,81 @@ def _self_test() -> int:
         with tempfile.TemporaryDirectory() as d:
             ok(stored_rows(d) == {}, "JA26m no stored rows: an empty pool")
     safe(ja26, "JA26")
+
+    def ja27():          # F6 run 1, owner decision R1 (2026-11-16): a declared group-target or offset miss, tied to a test
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["targets"][0].update(bias_by="region", bias_sd=0.1, bias_source="S")
+            decl = [{"target": "region_t:r1", "reason": "trend misfit", "decision_test": "DT1"},
+                    {"offset": "S|r2", "reason": "nets outside the model", "decision_test": "DT1"}]
+            raw["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                        "declared": decl}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            ok(spec_problems(spec) == [], f"JA27a declared misses are accepted ({spec_problems(spec)})")
+            for bad_, why in (({"target": "region_t:r1", "reason": "x", "decision_test": "DT9"}, "an unknown test"),
+                              ({"target": "region_t:r1", "reason": "x"}, "no decision test"),
+                              ({"target": "region_t:r1", "offset": "S|r2", "reason": "x", "decision_test": "DT1"},
+                               "two selectors"),
+                              ({"target": "nope:r1", "reason": "x", "decision_test": "DT1"}, "not a group target"),
+                              ({"offset": "Z|r2", "reason": "x", "decision_test": "DT1"}, "not an offset source"),
+                              ({"target": "region_t:r1", "reason": "", "decision_test": "DT1"}, "no reason")):
+                r2 = yaml.safe_load(open(p))
+                r2["calibration"]["joint"]["unmatched"]["declared"] = [bad_]
+                p2 = os.path.join(d, "bad.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                ok(any("declared" in x for x in spec_problems(schema.load(p2))), f"JA27b refused: {why}")
+            units = {"1": {"status": "matched"}, "2": {"status": "matched"}}
+            vf = {"code": "verification_failed", "detail": {"units": [], "targets": ["region_t:r1"]}}
+            off = {"code": "offset_sampling_low_acceptance", "detail": {"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                                                    "by_component": [{"blocks": ["S|r2"], "rows": [0, 1, 2]}]}}
+            rep = {"blocked": True, "conflicting": [], "units": units, "blocks": [vf, off]}
+            dec = unmatched_decision(spec, rep)
+            ok(dec["proceed"] and {(x.get("target") or x.get("offset")) for x in dec["declared"]} == {"region_t:r1", "S|r2"}
+               and all(x["decision_test"] == "DT1" for x in dec["declared"]),
+               f"JA27c declared target and offset misses proceed, each recorded with its decision test ({dec})")
+            od = lambda comps, failed=(0, 1, 2): dict(off, detail={"rows": 10, "failed": len(failed),  # noqa: E731
+                                                                   "failed_rows": list(failed), "by_component": comps})
+            for blks, why in (([dict(vf, detail={"units": [], "targets": ["region_t:r0"]}), off], "an undeclared target"),
+                              ([vf, od([{"blocks": ["S|r0"], "rows": [0, 1, 2]}])], "an undeclared offset component"),
+                              ([vf, dict(off, detail={"rows": 10, "failed": 3})], "no component breakdown"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1]}])], "a breakdown that misses a failed row"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}], failed=(0, 1, 2, 3, 4))],
+                               "overlapping components that leave rows uncovered (Codex P2-1)"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}, {"blocks": ["S|r0"], "rows": [3]}],
+                                       failed=(0, 1, 2, 3))], "one undeclared component among declared ones"),
+                              ([vf, off, {"code": "emulator_inadequate", "detail": {}}], "another block")):
+                ok(not unmatched_decision(spec, dict(rep, blocks=blks))["proceed"], f"JA27d never proceeds: {why}")
+            ok(not unmatched_decision(spec, dict(rep, blocked=False, blocks=[
+                dict(vf, detail={"units": [], "targets": ["region_t:r0"]})]))["proceed"]
+               and unmatched_decision(spec, dict(rep, blocked=False))["declared"],
+               "JA27g a report whose blocks contradict blocked=False is judged by its blocks (Codex P2-3)")
+            p3 = os.path.join(d, "sep.yaml")       # identifiers holding the separators (Codex P1, P2-4)
+            r3 = yaml.safe_load(open(p))
+            r3["calibration"]["joint"]["targets"][0]["bias_source"] = "S|v"
+            r3["calibration"]["joint"]["targets"][1]["id"] = "region:t"
+            r3["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                       "declared": [{"target": "region:t:r1", "reason": "x",
+                                                                     "decision_test": "DT1"},
+                                                                    {"offset": "S|v|r2", "reason": "x",
+                                                                     "decision_test": "DT1"}]}
+            yaml.safe_dump(r3, open(p3, "w"), sort_keys=False)
+            s3 = schema.load(p3)
+            ok(spec_problems(s3) == [], f"JA27h exact identifiers holding ':' or '|' are declarable ({spec_problems(s3)})")
+            amb = dict(off, detail={"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                    "by_component": [{"blocks": ["S|v|r1+S|v|r2"], "rows": [0, 1, 2]}]})
+            ok(not unmatched_decision(s3, dict(rep, blocks=[amb]))["proceed"],
+               "JA27i a component is matched by its exact block keys, never by splitting a string (Codex P1)")
+            raw["calibration"]["joint"]["unmatched"].pop("declared")
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            ok(not unmatched_decision(schema.load(p), rep)["proceed"], "JA27e without declarations the block stands")
+            ok(declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "run"}]) == []
+               and declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "not_run"}])
+               and declared_test_problems({"declared": decl}, []),
+               "JA27f a declared miss whose decision test did not run blocks the analysis (fail closed)")
+    safe(ja27, "JA27")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

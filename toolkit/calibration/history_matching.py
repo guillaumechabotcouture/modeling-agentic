@@ -1275,6 +1275,7 @@ class HistoryMatch:
         st, n, G = self.state, len(pick), len(self.zg)
         S, T = np.tile(self.zg, n), np.repeat(st["C"][pick], G, axis=0)
         out, failed, worst = {}, np.zeros(n, bool), np.zeros(n)
+        self._offset_failed = []     # F6 run 1: per component with failed rows, its block keys and those rows
         for comp in self.bcomp:
             pl, ivs, gp = self._comp_preds(self.em, comp, S, T, n)
             bo = {k: np.zeros(n) for k in comp["blocks"]}
@@ -1303,6 +1304,9 @@ class HistoryMatch:
                     bo[k][rows[hit]] = b[k][j]
                 done[rows[hit]] = True
             failed |= ~done
+            if (~done).any():           # Codex review of #242 P1/P2-1: exact block keys and the failed rows
+                self._offset_failed.append({"blocks": list(comp["blocks"]),
+                                            "rows": [int(x) for x in np.flatnonzero(~done)]})
             out.update({u: (mk[u], gi[u]) for u in comp["units"]})
             ar = np.arange(n)
             for u in comp["units"]:      # each draw's worst unit misfit at its own offset (the verification's choice)
@@ -2180,7 +2184,9 @@ class HistoryMatch:
                               "target at a joint draw that holds every group target" +
                               ("; each shared offset drawn from its prior over the feasible set, the units of its "
                                "component given it" if self.bcomp else "")),
-                **({"offset_draws": {"rows": int(len(pick)), "failed": int(failed.sum())}} if self.bcomp else {})}
+                **({"offset_draws": {"rows": int(len(pick)), "failed": int(failed.sum()),
+                                     "failed_rows": [int(x) for x in np.flatnonzero(failed)],
+                                     "by_component": list(getattr(self, "_offset_failed", []))}} if self.bcomp else {})}
 
     def _group_draw(self, gts, own, c, rng) -> dict:
         """{unit: grid index} for the group members at candidate c, kept only when every group target holds at the
@@ -2950,6 +2956,16 @@ def _self_test() -> int:
         agg.value = 5.0                     # beyond any unit value: no offset makes the aggregate reachable
         r = calibrate(P, sim, seed=6, waves=1, log=q, points_per_unit=20, bias_draws_max=256)
         comp = (r.get("bias_components") or [{}])[0]
+        agg.value = 2.55
+        hm = HistoryMatch(P, sim, 6, q, points_per_unit=20, bias_draws_max=256)
+        hm.run(1)
+        hm.th["bias_draws_max"] = 1          # one round of proposals per row: many region-sample rows fail
+        od = hm.sample(200)["offset_draws"]
+        bc = od.get("by_component") or []
+        ok(od["failed"] > 0 and len(bc) == 1 and bc[0]["blocks"] == ["s|g"] and sorted(bc[0]["rows"]) ==
+           sorted(od.get("failed_rows") or []) and len(od["failed_rows"]) == od["failed"],
+           f"HM34c (F6 run 1) failed region-sample rows are broken down by offset component ({od})")
+        agg.value = 5.0
         ok(r["blocked"] and comp.get("no_accepted") and comp.get("draws_max") == 256,
            f"HM34b no proposal accepted up to the maximum: infeasible, with the reason and the count reached "
            f"({r['status']}, {comp})")
