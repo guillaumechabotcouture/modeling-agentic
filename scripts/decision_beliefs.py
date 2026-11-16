@@ -182,6 +182,90 @@ def licensed_problems(data, lic, allow=()) -> list:
     return hits
 
 
+DIGIT_TOKENS = {"v0.17", "GC7"} | {f"DT{k}" for k in range(1, 11)}
+PUBLISH_YEARS = (2000, 2035)
+CITATION_YEARS = (1950, 2035)
+LOCATION_INTS = (1, 20)              # a table or figure number in a basis location
+TOKEN_RE = re.compile(r"""[^\s/,;:()\[\]{}<>"'`|=]+""")
+MAP_TOP_KEYS = {"decision", "run", "conventions", "entries"}
+MAP_ENTRY_KEYS = {"belief", "output", "field", "rules", "note", "set_aside"}
+
+
+def digit_problems(obj, kind, ids=(), tokens=()) -> list:
+    """The allowlist (Codex re-review of e9243e4): in a canonical decision file a number may stand only at a declared
+    path (a claim weight in a seed, a rule's claim index in an outcome map), and a string may hold a digit only as a
+    whole token from the public list: DIGIT_TOKENS, the files' own belief and question ids, `tokens` (the public
+    file's public_tokens), a year in PUBLISH_YEARS (CITATION_YEARS in a citation) or a table number in a location.
+    Everything else with a digit is refused."""
+    ok_tok = DIGIT_TOKENS | set(ids) | set(tokens)
+    bad = []
+
+    def year(t, lo_hi):
+        return t.isdigit() and lo_hi[0] <= int(t) <= lo_hi[1]
+
+    def string(x, where, field):
+        for t in TOKEN_RE.findall(x):
+            t = t.strip(".!?*-+")
+            if not any(ch.isdigit() for ch in t) or t in ok_tok or year(t, PUBLISH_YEARS):
+                continue
+            if field == "citation" and year(t, CITATION_YEARS):
+                continue
+            if field == "location" and t.isdigit() and LOCATION_INTS[0] <= int(t) <= LOCATION_INTS[1]:
+                continue
+            bad.append(f"{where}: {t!r} holds a digit outside the public list")
+
+    def walk(x, path, field=None):
+        where = "/".join(map(str, path))
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if kind == "map" and len(path) == 3 and path[0] == "entries" and path[2] == "rules":
+                    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= 3:
+                        bad.append(f"{where}: rule key {k!r}: a claim index 0 to 3")
+                elif isinstance(k, str):
+                    string(k, where + "/<key>", None)
+                else:
+                    bad.append(f"{where}: key {k!r} is not a string")
+                walk(v, path + [k], k if isinstance(k, str) else field)
+        elif isinstance(x, list):
+            for i, v in enumerate(x):
+                walk(v, path + [i], field)
+        elif isinstance(x, bool) or x is None:
+            return
+        elif isinstance(x, (int, float)):
+            if not (kind == "seed" and len(path) == 5 and path[0] == "decision_beliefs" and path[2] == "claims"
+                    and path[4] == "weight" and _BT._on_grid(x)):
+                bad.append(f"{where}: a number outside the declared weight paths")
+        elif isinstance(x, str):
+            string(x, where, field)
+        else:
+            bad.append(f"{where}: a {type(x).__name__} value")
+    walk(obj, [])
+    return bad
+
+
+def publish_problems(kind, canon_bytes, lic, allow=(), topics=TOPICS, seed=None, tokens=()) -> list:
+    """Why a canonical decision file may not be published: the strict schema (seed: the belief table's decision-run
+    rule; map: outcome_map_problems against `seed` and its declared keys), the digit allowlist, then the licensed-value
+    scan of the canonical text as a second line."""
+    import yaml
+    obj = yaml.safe_load(canon_bytes.decode("utf-8"))
+    if not isinstance(obj, dict):
+        return ["not a mapping"]
+    if kind == "seed":
+        bad = _BT.decision_seed_problems(obj, {"topics": list(topics), "beliefs": {"min": 1}})
+        ids = [b.get("id") for b in obj.get("decision_beliefs") or [] if isinstance(b, dict)]
+        ids += [q.get("id") for q in obj.get("open_questions") or [] if isinstance(q, dict)]
+    else:
+        bad = outcome_map_problems(seed or {}, obj)
+        bad += [f"undeclared top-level keys {sorted(set(obj) - MAP_TOP_KEYS)}"] if set(obj) - MAP_TOP_KEYS else []
+        for e in obj.get("entries") or []:
+            if isinstance(e, dict) and set(e) - MAP_ENTRY_KEYS:
+                bad.append(f"entry {e.get('belief')}: undeclared keys {sorted(set(e) - MAP_ENTRY_KEYS)}")
+        ids = [b.get("id") for b in (seed or {}).get("decision_beliefs") or [] if isinstance(b, dict)]
+    ids = [i for i in ids if isinstance(i, str)]
+    return bad + digit_problems(obj, kind, ids, tokens) + licensed_problems(canon_bytes, lic, allow)
+
+
 def mask_numbers(text, allow=()) -> str:
     """`text` with every number replaced by <value> except the allowed public ones (and calendar years)."""
     allow = {canon(a) for a in allow} - {None}
@@ -364,18 +448,17 @@ def licensed_repair(rd, ctx, hits, lic, allow, fn, led, qid, cap, r) -> dict:
                     licensed_repair={"hits": hits, "usd": cap, "after": [f"{type(e).__name__}: {e}"[:300]]})
     usd = float(rr.usd) if rr is not None and isinstance(rr.usd, (int, float)) else cap
     led.charge(rid, usd, "sdk reported" if rr is not None else "no result: whole cap")
-    try:
+    try:                    # everything after the charge, the promotion included: a refusal, never a crash
         raw, _ = WMT._sio().read_nofollow(rd, WMT.SEED_FILE)
         sd = yaml.safe_load(raw.decode("utf-8"))
         again = (WMT.seed_problems(sd, ctx) if isinstance(sd, dict) else [f"{WMT.SEED_FILE}: a mapping"]) \
             + licensed_problems(raw, lic, allow)
-    except Exception as e:  # noqa: BLE001 -- after the charge: a refusal, never a crash
-        raw, again = None, [f"{WMT.SEED_FILE} unreadable after the repair: {type(e).__name__}: {e}"[:300]]
-    out = dict(r, licensed_repair={"hits": hits, "usd": usd, "after": again}, usd=r.get("usd", 0) + usd,
-               status="ok" if not again else "seed_refused")
-    if not again:
-        WMT._sio().write_nofollow(rd, WMT.SEED, raw, atomic=True)       # the bytes that were checked
-    return out
+        if not again:
+            WMT._sio().write_nofollow(rd, WMT.SEED, raw, atomic=True)   # the bytes that were checked
+    except Exception as e:  # noqa: BLE001
+        again = [f"{WMT.SEED_FILE} after the repair: {type(e).__name__}: {e}"[:300]]
+    return dict(r, licensed_repair={"hits": hits, "usd": usd, "after": again}, usd=r.get("usd", 0) + usd,
+                status="ok" if not again else "seed_refused")
 
 
 def _paths(a):
@@ -445,13 +528,23 @@ def main(argv=None) -> int:
         print(json.dumps(dict(r, seed=seed_p if r.get("status") == "ok" else None,
                               committed_usd=round(led.committed(), 4)), default=str))
         return 0 if r.get("status") == "ok" else 1
-    seed = yaml.safe_load(open(seed_p))
-    problems = {"seed": _BT.decision_seed_problems(seed, {"topics": list(TOPICS), "beliefs": {"min": 1}}),
-                "outcome_map": outcome_map_problems(seed, yaml.safe_load(open(map_p))) if os.path.isfile(map_p)
-                else ["missing"],
-                "licensed": {os.path.basename(p): licensed_problems(open(p, "rb").read(), lic, allow)
-                             for p in (seed_p, map_p) if os.path.isfile(p)}}
-    clean = not problems["seed"] and not problems["outcome_map"] and not any(problems["licensed"].values())
+    import world_model_trials as WMT
+    tokens = list(pub.get("public_tokens") or [])
+    canon = {}
+    for p in (seed_p, map_p):
+        try:
+            canon[p] = WMT.canonical_yaml(WMT._sio().read_nofollow(os.path.dirname(p), os.path.basename(p))[0])
+        except (OSError, WMT.TrialError) as e:
+            canon[p] = e
+    seed = yaml.safe_load(canon[seed_p].decode()) if isinstance(canon[seed_p], bytes) else None
+
+    def check_one(path, data):
+        if path.endswith(SEED_REL):
+            return publish_problems("seed", data, lic, allow, TOPICS, tokens=tokens)
+        return publish_problems("map", data, lic, allow, TOPICS, seed=seed, tokens=tokens)
+    problems = {os.path.basename(p): ([f"unreadable: {c}"] if not isinstance(c, bytes) else check_one(p, c))
+                for p, c in canon.items()}
+    clean = not any(problems.values())
     print(json.dumps(dict(problems, ok=clean), indent=1))
     if a.cmd == "check" or not clean:
         return 0 if clean else 1
@@ -459,7 +552,7 @@ def main(argv=None) -> int:
     rel_root = os.path.relpath(os.path.realpath(a.trials_dir), os.path.realpath(REPO)).replace(os.sep, "/")
     anchor = WMT.GitAnchor(REPO, os.path.join(a.trials_dir, ".wm-trials"), trials_rel=rel_root)
     rels = [os.path.relpath(p, REPO).replace(os.sep, "/") for p in (seed_p, map_p)]
-    r = anchor.publish(rels, f"decision {a.id}", check=lambda rel, data: licensed_problems(data, lic, allow))
+    r = anchor.publish(rels, f"decision {a.id}", check=lambda rel, data: check_one(rel, data))
     at = reachable_at(anchor.wt, anchor.ref, r["commit"])
     if at is None:
         print(json.dumps({"error": "no reflog entry shows the remote holding the commit", **r}))
@@ -635,8 +728,64 @@ def _self_test() -> int:
                 ok(r.get("status") == "seed_refused" and abs(led.spent() - 0.25) < 1e-9 and r["licensed_repair"]["after"],
                    f"DB10 a licensed repair that returns {why} is a recorded refusal after its charge: {r}")
 
+
+    # Codex re-review of e9243e4: stop racing spellings; publish a canonical dump, allow digits only where declared
+    def db11():
+        import world_model_trials as WMT
+        lic = {"exact": {"0.85", "183456", "0.41237"}, "rounded": {2: set(), 3: set()}}
+        base = ("decision_beliefs:\n- id: D1\n  topic: net_type\n  question: In 2026, which net under GC7 and DT10?\n"
+                "  claims:\n  - {claim: PBO in most LGAs at v0.17, weight: 0.6}\n  - {claim: not, weight: 0.4}\n"
+                "  basis:\n  - {citation: Mosha JF et al. 2022 Lancet, location: Table 2}\n  decides: true\n"
+                "  why_decides: w\n  layer: world\nnotes: n\n")
+        pr = publish_problems("seed", WMT.canonical_yaml(base.encode()), lic, (), TOPICS[:1])
+        ok(pr == [], f"DB11 a valid seed's canonical dump passes (years, GC7, DT10, v0.17, ids, a table number): {pr}")
+        probes = {
+            "underweight key": base.replace("  layer: world\n", "  layer: world\n  underweight: 0.85\n"),
+            "block scalar": base.replace("notes: n\n", "notes: |\n  survey\n  weight: 0.85\n"),
+            "183_456": base.replace("notes: n", "notes: 183_456"),
+            "0x2cca0": base.replace("notes: n", "notes: 0x2cca0"),
+            "unicode escape": base.replace("notes: n", 'notes: "\\u0030.41237"'),
+            "a digit in a claim": base.replace("claim: not,", "claim: not in 37 LGAs,"),
+            "a weight off the grid": base.replace("weight: 0.4}", "weight: 0.41237}"),
+        }
+        for why, raw in probes.items():
+            try:
+                pr = publish_problems("seed", WMT.canonical_yaml(raw.encode()), lic, (), TOPICS[:1])
+            except Exception as e:  # noqa: BLE001
+                pr = [f"raised {type(e).__name__}"]
+            ok(bool(pr) and not any(x.startswith("raised") for x in pr), f"DB11b refused: {why}: {pr[:2]}")
+        c = WMT.canonical_yaml((base + "# survey weight: 0.85\n").encode())
+        ok(b"#" not in c and b"0.85" not in c and publish_problems("seed", c, lic, (), TOPICS[:1]) == [],
+           "DB11c a comment never reaches the published bytes: the canonical dump holds none")
+
+    def db12():
+        from types import SimpleNamespace
+        import stat
+        import world_model_trials as WMT
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        good = ("decision_beliefs:\n- id: D1\n  topic: net_type\n  question: q\n  claims:\n"
+                "  - {claim: a, weight: 0.6}\n  - {claim: b, weight: 0.4}\n  basis:\n  - {mechanism: m}\n"
+                "  decides: true\n  why_decides: w\n  layer: world\n")
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            os.chmod(os.path.join(d, "analysis"), stat.S_IRUSR | stat.S_IXUSR)
+
+            def fn(rd, c, fb, cap):
+                open(os.path.join(rd, WMT.SEED_FILE), "w").write(good)
+                return SimpleNamespace(usd=0.25, note="n")
+            led = WMT.SpendLedger(os.path.join(d, "s.jsonl"), 5.0)
+            try:
+                r = licensed_repair(d, ctx, ["line 1: x"], {"exact": set(), "rounded": {2: set(), 3: set()}}, [], fn,
+                                    led, "decision_t", 1.0, {"usd": 0.0})
+            except Exception as e:  # noqa: BLE001
+                r = {"raised": f"{type(e).__name__}: {e}"}
+            finally:
+                os.chmod(os.path.join(d, "analysis"), stat.S_IRWXU)
+            ok(r.get("status") == "seed_refused" and abs(led.spent() - 0.25) < 1e-9,
+               f"DB12 a promotion that fails after the charge (read-only analysis/) is a recorded refusal: {r}")
+
     for n, f in (("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
-                 ("DB8", db8), ("DB9", db9), ("DB10", db10)):
+                 ("DB8", db8), ("DB9", db9), ("DB10", db10), ("DB11", db11), ("DB12", db12)):
         tryit(n, f)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

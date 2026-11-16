@@ -330,6 +330,25 @@ class SpendLedger:
 
 
 # ---------------------------------------------------------------- the wm-trials branch
+def canonical_yaml(raw) -> bytes:
+    """The canonical text of a YAML mapping: parsed, then dumped sorted with no comments, aliases or alternative
+    number spellings. A decision file is published only as this text, never as the bytes an agent wrote (Codex
+    re-review of e9243e4). Refused (TrialError) when it does not parse to a mapping."""
+    import yaml
+    try:
+        obj = yaml.safe_load(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise TrialError(f"not YAML: {e}"[:300])
+    if not isinstance(obj, dict):
+        raise TrialError("not a YAML mapping")
+
+    class _NoAlias(yaml.SafeDumper):
+        def ignore_aliases(self, data):
+            return True
+    return yaml.dump(obj, Dumper=_NoAlias, sort_keys=True, allow_unicode=True, default_flow_style=False,
+                     width=100000).encode("utf-8")
+
+
 class GitAnchor:
     """The wm-trials branch in its own git worktree: commits the registration ledger and the seed of a question (only
     those, at their paths in the main working tree, which is where world_model.git_anchors looks them up), pushes
@@ -390,6 +409,7 @@ class GitAnchor:
             data = {rel: _sio().read_nofollow(self.repo, rel)[0] for rel in rels}
             for rel in rels:
                 if self.decision.match(rel):
+                    data[rel] = canonical_yaml(data[rel])        # the canonical dump is what is checked and pushed
                     bad = check(rel, data[rel])
                     if bad:
                         raise TrialError(f"{rel}: the licensed-number check refused it: {list(bad)[:5]}")
@@ -3621,8 +3641,10 @@ def _self_test() -> int:
             return SimpleNamespace(usd=0.5, note="n")
         with tempfile.TemporaryDirectory() as d:
             r = seed_step({"id": "decision_t"}, d, ctx, fn, SpendLedger(os.path.join(d, "s.jsonl"), 5.0), 1.0)
-            ok(r.get("status") == "ok" and r.get("hypotheses") == 1,
-               f"WT29h a decision seed's count is its beliefs, whatever a stray hypotheses field holds: {r}")
+            # since the strict decision schema (re-review of e9243e4) a stray hypotheses key is refused outright: a
+            # recorded refusal after both charges, never a crash on its value
+            ok(r.get("status") == "seed_refused" and any("hypotheses" in x for x in r["refusals"][0]),
+               f"WT29h a decision seed with a stray hypotheses field is refused, not crashed on: {r}")
         with tempfile.TemporaryDirectory() as d:
             repo = _toy_repo(d)
             A = GitAnchor(repo, os.path.join(repo, "trials", ".wm-trials"))
@@ -3641,6 +3663,29 @@ def _self_test() -> int:
             ok(checked == [b"notes: clean\n"] and pushed == "notes: clean\n",
                f"WT29i the bytes pushed are the bytes checked, read once: {checked}, {pushed!r}")
     tryit("WT29 reviewed", wt29_reviewed)
+
+    def wt29_canonical():
+        # Codex re-review of e9243e4: agent-written bytes are never published; the canonical dump of the parsed
+        # object is, and the check sees exactly that dump
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            A = GitAnchor(repo, os.path.join(repo, "trials", ".wm-trials"))
+            rel = "trials/decisions/f6/world_model_seed.yaml"
+            src = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(src))
+            open(src, "w").write("notes: clean   # survey weight: 0.85\nnotes: clean\nb: 1\n")
+            seen = []
+            res = A.publish([rel], "f6", check=lambda r_, b: seen.append(b) or [])
+            pushed = (_git("show", f"{res['commit']}:{rel}", cwd=repo) + "\n").encode()
+            ok(seen == [pushed] and pushed == canonical_yaml(b"b: 1\nnotes: clean\n") and b"#" not in pushed,
+               f"WT29j the pushed bytes are the canonical dump the check saw, no comment: {seen}, {pushed!r}")
+            open(src, "w").write("notes: [\n")
+            try:
+                A.publish([rel], "f6", check=lambda r_, b: [])
+                ok(False, "WT29k a decision file that does not parse is refused")
+            except TrialError:
+                ok(True, "WT29k a decision file that does not parse is refused")
+    tryit("WT29 canonical", wt29_canonical)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

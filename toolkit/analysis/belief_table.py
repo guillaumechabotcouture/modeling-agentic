@@ -268,6 +268,8 @@ weights, citation years, and ids such as DT10 or B8 only; cite authors, journal 
 with a table, figure or section as the location; a ratio band is written in words ("between a tenth and a third
 more"). The harness refuses a file holding a number that matches a withheld input."""
 DECISION_LAYERS = ("world", "engine")
+DECISION_TOP_KEYS = {"decision_beliefs", "open_questions", "notes"}
+DECISION_BELIEF_KEYS = {"id", "topic", "question", "claims", "basis", "decides", "why_decides", "layer"}
 WEIGHT_GRID = 0.05
 _DID = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -284,6 +286,13 @@ def decision_seed_problems(seed, run) -> list:
         return ["decision_beliefs: a list of beliefs (the seed is not a mapping holding one)"]
     topics, lim = list(run.get("topics") or []), run.get("beliefs") or {}
     bs, bad, seen = seed["decision_beliefs"], [], set()
+    # strict schema (Codex re-review of e9243e4): an undeclared key anywhere is refused, so nothing rides along
+    extra = sorted(set(seed) - DECISION_TOP_KEYS)
+    if extra:
+        bad.append(f"undeclared top-level keys {extra}: only {sorted(DECISION_TOP_KEYS)}")
+    for q in seed.get("open_questions") or []:
+        if not isinstance(q, dict) or set(q) - {"id", "question", "beliefs"}:
+            bad.append(f"open question {q!r}: only id, question, beliefs")
     lo, hi = int(lim.get("min", 1)), int(lim.get("max", 10 ** 6))
     if not lo <= len(bs) <= hi:
         bad.append(f"{len(bs)} beliefs: write {lo} to {hi}")
@@ -297,6 +306,14 @@ def decision_seed_problems(seed, run) -> list:
         if i in seen:
             bad.append(f"belief {i}: duplicate id")
         seen.add(i)
+        if set(b) - DECISION_BELIEF_KEYS:
+            bad.append(f"belief {i}: undeclared keys {sorted(set(b) - DECISION_BELIEF_KEYS)}")
+        for c in b.get("claims") if isinstance(b.get("claims"), list) else []:
+            if isinstance(c, dict) and set(c) - {"claim", "weight"}:
+                bad.append(f"belief {i}: a claim holds undeclared keys {sorted(set(c) - {'claim', 'weight'})}")
+        for e in b.get("basis") if isinstance(b.get("basis"), list) else []:
+            if isinstance(e, dict) and set(e) - {"citation", "location", "mechanism"}:
+                bad.append(f"belief {i}: a basis entry holds undeclared keys")
         if b.get("topic") not in topics:
             bad.append(f"belief {i}: topic {b.get('topic')!r} is not one of {topics}")
         if not isinstance(b.get("question"), str) or not b["question"].strip():
@@ -540,6 +557,12 @@ def _self_test() -> int:
             "a missing id": {"decision_beliefs": [{k: v for k, v in bel("D1").items() if k != "id"},
                                                   bel("D2", "smc")]},
             "a non-string id": {"decision_beliefs": [bel(7), bel("D2", "smc")]},
+            "an undeclared belief key (strict schema)": {"decision_beliefs": [bel("D1", underweight=0.85),
+                                                                              bel("D2", "smc")]},
+            "an undeclared top-level key": {"decision_beliefs": [bel("D1"), bel("D2", "smc")], "extra": "x"},
+            "an undeclared claim key": {"decision_beliefs": [bel("D1", claims=[{"claim": "a", "weight": 0.5, "n": 1},
+                                                                               {"claim": "b", "weight": 0.5}]),
+                                                             bel("D2", "smc")]},
         }
         for why, seed in cases.items():
             pr = decision_seed_problems(seed, run)
