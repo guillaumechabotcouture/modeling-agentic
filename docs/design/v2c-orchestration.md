@@ -436,6 +436,17 @@ is the one accounting owner.
 analysis. Every failure is recorded with its reason. A test compares every analysis file with and without the
 stages, byte for byte, after normalising wall-clock fields and worker row order.
 
+**After the Codex code review.** Ten findings were raised; all ten were fixed.
+- Scoring reads the topics and package definitions frozen in `world_model/registration.json`. Named packages are
+  scored by their components.
+- `standing` re-checks the binding at every score. Any engine rows reused from an earlier batch (`reused`,
+  `already_done`) cannot be dated, so they make a score not pre-registered.
+- A seed that was killed after it was written is kept on resume, and is not bought again. A ledger failure is
+  charged the whole cap.
+- A failed re-score withdraws the earlier section.
+- The read guard refuses every run, not only the seed's own run, and refuses searches that reach one.
+- `world_model/` is reserved from deliverables and from the tasks' write guard.
+
 **Not computed yet (declared).**
 - The guard (v2-progressive-steps §5) covers sweeps only. As in F6, no decision-run belief is set aside.
 - A seed that types a number, such as a citation volume, is anchored locally rather than repaired.

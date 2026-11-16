@@ -269,7 +269,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*")
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model/*")
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []
@@ -1745,8 +1745,11 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
     wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
-    if os.path.isfile(wmp) and not os.path.islink(wmp):
-        lines += ["", open(wmp).read().rstrip()]
+    try:
+        if os.path.isfile(wmp) and not os.path.islink(wmp):
+            lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
+    except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
+        lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
     head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
     full = head + body + "\n".join(lines) + "\n"
     _put(run_dir, "report.md", full)

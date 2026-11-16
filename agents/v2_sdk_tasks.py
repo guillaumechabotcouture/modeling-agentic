@@ -30,7 +30,8 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "data/derivations_record.json", "decision_spec.signoff_sheet.md",
                  "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
+                    "world_model/")
 
 # The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
@@ -254,13 +255,8 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
     analysis = os.path.join(root, "analysis")
     if _within(base, analysis):
         return "the world-model seed is written before any result: analysis/ is not readable"
-    up = os.path.dirname(root)
-    while up != os.path.dirname(up):        # a v2 run's seed (world_model/seed/): the run itself is withheld, also
-        if os.path.exists(os.path.join(up, "run_state.json")):      # when it lies under the repository's docs or .claude
-            if _within(base, up) and not _within(base, root):
-                return "the seed task may not read the run it belongs to: its inputs and outputs are withheld"
-            break
-        up = os.path.dirname(up)
+    if not _within(base, root) and _in_or_reaches_run(base, tool):     # v2 runs' seeds sit in world_model/seed/
+        return "the seed task may not read any run directory: runs' inputs and outputs are withheld"
     repo = os.path.realpath(_REPO)
     if not _within(base, root) and _within(base, repo) and not _within(root, base):
         # the repository's code and documentation only: no run, no template, no input data, no driver files
@@ -276,6 +272,22 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
         return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
                 "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
     return None
+
+
+def _in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
+    """Is `base` inside a run (an ancestor holds run_state.json), or does a search from it reach one? Fail closed
+    past `limit` entries (Codex review: another run under the repository's docs/ or .claude/ was readable)."""
+    up = base
+    while up != os.path.dirname(up):
+        if os.path.isfile(os.path.join(up, "run_state.json")):
+            return True
+        up = os.path.dirname(up)
+    n = 0
+    for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
+        n += len(dirs) + len(files)
+        if "run_state.json" in files or n > limit:
+            return True
+    return False
 
 
 def _answer_key(target: str, run_dir: str) -> bool:
