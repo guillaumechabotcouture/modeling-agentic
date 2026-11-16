@@ -274,9 +274,20 @@ WEIGHT_GRID = 0.05
 _DID = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
+GRID_TOL = 1e-9          # a weight is a grid value up to float representation, never a hair off it (final review)
+
+
 def _on_grid(w) -> bool:
-    return isinstance(w, (int, float)) and not isinstance(w, bool) and WEIGHT_GRID - 1e-9 <= w <= 1 - WEIGHT_GRID \
-        + 1e-9 and abs(w / WEIGHT_GRID - round(w / WEIGHT_GRID)) < 1e-6
+    """Is w within GRID_TOL of a grid value k/20, 1 <= k <= 19?"""
+    if not isinstance(w, (int, float)) or isinstance(w, bool) or w != w:
+        return False
+    k = round(w / WEIGHT_GRID)
+    return 1 <= k <= round(1 / WEIGHT_GRID) - 1 and abs(w - k * WEIGHT_GRID) <= GRID_TOL
+
+
+def grid_value(w) -> float:
+    """The exact grid value of an on-grid weight: round(w * 20) / 20."""
+    return round(w / WEIGHT_GRID) / round(1 / WEIGHT_GRID)
 
 
 def decision_seed_problems(seed, run) -> list:
@@ -290,9 +301,18 @@ def decision_seed_problems(seed, run) -> list:
     extra = sorted(set(seed) - DECISION_TOP_KEYS)
     if extra:
         bad.append(f"undeclared top-level keys {extra}: only {sorted(DECISION_TOP_KEYS)}")
-    for q in seed.get("open_questions") or []:
+    oq = seed.get("open_questions", [])
+    if not isinstance(oq, list):
+        bad.append("open_questions: a list")
+        oq = []
+    for q in oq:                 # declared field types (final review): id and question strings, beliefs a list of ids
         if not isinstance(q, dict) or set(q) - {"id", "question", "beliefs"}:
             bad.append(f"open question {q!r}: only id, question, beliefs")
+        elif not isinstance(q.get("id"), str) or not _DID.fullmatch(q["id"]) or not isinstance(q.get("question"), str) \
+                or not isinstance(q.get("beliefs", []), list) or not all(isinstance(x, str) for x in q.get("beliefs", [])):
+            bad.append(f"open question {q.get('id')!r}: id and question are strings, beliefs a list of belief ids")
+    if "notes" in seed and not isinstance(seed["notes"], str):
+        bad.append("notes: a string")
     lo, hi = int(lim.get("min", 1)), int(lim.get("max", 10 ** 6))
     if not lo <= len(bs) <= hi:
         bad.append(f"{len(bs)} beliefs: write {lo} to {hi}")
@@ -301,7 +321,7 @@ def decision_seed_problems(seed, run) -> list:
             bad.append(f"belief {k + 1}: a mapping")
             continue
         i = b.get("id")
-        if not isinstance(i, str) or not _DID.match(i):      # Codex P2: a missing id is not the string "None"
+        if not isinstance(i, str) or not _DID.fullmatch(i):      # Codex P2: a missing id is not the string "None"
             bad.append(f"belief {k + 1}: id {b.get('id')!r}: letters, digits, . _ -")
         if i in seen:
             bad.append(f"belief {i}: duplicate id")
@@ -330,8 +350,8 @@ def decision_seed_problems(seed, run) -> list:
             if not all(_on_grid(w) for w in ws):
                 bad.append(f"belief {i}: weights {ws}: multiples of {WEIGHT_GRID} between {WEIGHT_GRID} and "
                            f"{1 - WEIGHT_GRID}")
-            elif abs(sum(ws) - 1) > 1e-6:
-                bad.append(f"belief {i}: weights {ws} sum to {sum(ws):.2f}, not 1")
+            elif sum(round(w / WEIGHT_GRID) for w in ws) != round(1 / WEIGHT_GRID):
+                bad.append(f"belief {i}: weights {ws} do not sum to exactly 1 on the grid")
         basis = b.get("basis")
         if not isinstance(basis, list) or not basis:
             bad.append(f"belief {i}: basis: at least one paper or mechanism")

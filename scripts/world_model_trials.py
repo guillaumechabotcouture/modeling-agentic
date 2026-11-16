@@ -341,6 +341,13 @@ def canonical_yaml(raw) -> bytes:
         raise TrialError(f"not YAML: {e}"[:300])
     if not isinstance(obj, dict):
         raise TrialError("not a YAML mapping")
+    for b in obj.get("decision_beliefs") or [] if isinstance(obj.get("decision_beliefs"), list) else []:
+        for c in (b.get("claims") or []) if isinstance(b, dict) and isinstance(b.get("claims"), list) else []:
+            # a weight within GRID_TOL of the grid is published as its exact grid value (final review): no trailing
+            # digits can ride on it; anything further off is left for the validator to refuse
+            from toolkit.analysis import belief_table as BT
+            if isinstance(c, dict) and BT._on_grid(c.get("weight")):
+                c["weight"] = BT.grid_value(c["weight"])
 
     class _NoAlias(yaml.SafeDumper):
         def ignore_aliases(self, data):
@@ -842,16 +849,25 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
     out = {"sessions": 0, "repairs": 0, "usd": 0.0, "notes": []}
     feedback = None
     for attempt in range(2):
-        rid = ledger.reserve(q["id"], "seed" if attempt == 0 else "seed repair", task_cap_usd)
+        try:                # a ledger failure (before or after an earlier charge) is a refusal, never a raise
+            rid = ledger.reserve(q["id"], "seed" if attempt == 0 else "seed repair", task_cap_usd)
+        except Exception as e:  # noqa: BLE001
+            return dict(out, status="ledger_failed", error=f"reserve: {type(e).__name__}: {e}"[:300])
         if rid is None:
             return dict(out, status="budget_refused")
         try:
             r = seed_fn(run_dir, ctx, feedback, task_cap_usd)
         except Exception as e:  # noqa: BLE001 -- the reservation is charged in full, then the question stops
-            ledger.charge(rid, task_cap_usd, f"crashed: {type(e).__name__}: whole cap")
+            try:
+                ledger.charge(rid, task_cap_usd, f"crashed: {type(e).__name__}: whole cap")
+            except Exception as e2:  # noqa: BLE001 -- the open reservation still counts at its whole cap
+                return dict(out, status="ledger_failed", error=f"charge: {type(e2).__name__}: {e2}"[:300])
             return dict(out, status="seed_failed", error=f"{type(e).__name__}: {e}"[:300], usd=out["usd"] + task_cap_usd)
         usd = float(r.usd) if r is not None and isinstance(r.usd, (int, float)) else task_cap_usd
-        ledger.charge(rid, usd, "sdk reported" if r is not None else "no result: whole cap")
+        try:
+            ledger.charge(rid, usd, "sdk reported" if r is not None else "no result: whole cap")
+        except Exception as e:  # noqa: BLE001 -- the open reservation still counts at its whole cap
+            return dict(out, status="ledger_failed", error=f"charge: {type(e).__name__}: {e}"[:300])
         out["sessions"] += 1
         out["usd"] += usd
         out["notes"].append(getattr(r, "note", ""))
@@ -3716,6 +3732,30 @@ def _self_test() -> int:
             ok(r.get("status") == "seed_refused" and led.spent() > 0,
                f"WT29l a promotion that fails after the charge is a recorded refusal, never raised: {r}")
     tryit("WT29 promotion", wt29_promotion)
+
+    def wt29_reserve():
+        # Final review of 079a5f2: the repair's reservation raises after the first session's charge: a refusal
+        from types import SimpleNamespace
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+
+        class Flaky(SpendLedger):
+            n = 0
+
+            def reserve(self, *a, **k):
+                Flaky.n += 1
+                if Flaky.n > 1:
+                    raise PermissionError("ledger unwritable")
+                return super().reserve(*a, **k)
+        with tempfile.TemporaryDirectory() as d:
+            led = Flaky(os.path.join(d, "s.jsonl"), 5.0)
+            try:
+                r = seed_step({"id": "decision_t"}, d, ctx, lambda rd, c, fb, cap: SimpleNamespace(usd=0.25, note=""),
+                              led, 1.0)
+            except Exception as e:  # noqa: BLE001
+                r = {"raised": f"{type(e).__name__}: {e}"}
+            ok(r.get("status") in ("seed_refused", "ledger_failed") and abs(led.spent() - 0.25) < 1e-9,
+               f"WT29m a reservation that raises after a recorded charge is a refusal, never raised: {r}")
+    tryit("WT29 reserve", wt29_reserve)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

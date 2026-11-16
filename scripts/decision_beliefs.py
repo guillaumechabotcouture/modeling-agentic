@@ -125,12 +125,12 @@ def _tokens(text) -> list:
     return toks + [(m.start(), m.group(0)) for m in GROUPED_RE.finditer(text)]
 
 
+GRID_STRINGS = frozenset(canon(str(Decimal(k) / 20)) for k in range(1, 20))
+
+
 def _on_weight_grid(c) -> bool:
-    try:
-        x = float(c)
-    except ValueError:
-        return False
-    return _BT.WEIGHT_GRID - 1e-9 <= x <= 1 and abs(x / _BT.WEIGHT_GRID - round(x / _BT.WEIGHT_GRID)) < 1e-6
+    """An exact grid value only ('0.6', '0.05'): the licensed weight exemption never covers a value a hair off it."""
+    return canon(c) in GRID_STRINGS
 
 
 def licensed_problems(data, lic, allow=()) -> list:
@@ -195,7 +195,6 @@ def decision_tokens(decision_id) -> frozenset:
     return DECISION_DIGIT_TOKENS.get(decision_id, frozenset())
 PUBLISH_YEARS = (2000, 2035)
 CITATION_YEARS = (1950, 2035)
-LOCATION_INTS = (1, 20)              # a table or figure number in a basis location
 TOKEN_RE = re.compile(r"""[^\s/,;:()\[\]{}<>"'`|=]+""")
 MAP_TOP_KEYS = {"decision", "run", "conventions", "entries"}
 MAP_ENTRY_KEYS = {"belief", "output", "field", "rules", "note", "set_aside"}
@@ -205,6 +204,8 @@ BELIEF_ID = re.compile(r"^D[0-9]{1,2}$")
 QUESTION_ID = re.compile(r"^Q[0-9]{1,2}$")
 TEST_ID = re.compile(r"^DT(10|[1-9])$")
 DECIMAL_RE = re.compile(r"\d\.\d|(?<![\w])\.\d")
+GROUPED_DIGITS = re.compile(r"\d[,_']\d")           # refused anywhere before any tokenising (final review)
+LOCATION_RE = re.compile(r"[A-Za-z ]*(?:Table (?:[1-9]|1[0-9]|20))?[A-Za-z ]*")    # letters, spaces, one Table N
 
 
 def _id_paths(kind, path) -> re.Pattern | None:
@@ -236,7 +237,8 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
     - no decimal point anywhere in text except the literal v0.17;
     - a string may hold a digit only as a whole token: DIGIT_TOKENS, a token of the fixed id patterns (D<n>, Q<n>,
       DT1-DT10), `tokens` (the decision's DECISION_DIGIT_TOKENS) or a year in PUBLISH_YEARS; a citation year in
-      CITATION_YEARS and a table number in LOCATION_INTS only at decision_beliefs[*].basis[*].citation / .location.
+      CITATION_YEARS only at decision_beliefs[*].basis[*].citation; a location fullmatches LOCATION_RE (letters and
+      spaces, at most one "Table N" with N up to 20); a grouped number (digit, comma or underscore, digit) nowhere.
     Everything else with a digit is refused."""
     ok_tok = DIGIT_TOKENS | set(tokens)
     bad = []
@@ -247,8 +249,15 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
     def string(x, where, path):
         pat = _id_paths(kind, path)
         if pat is not None:
-            if not pat.match(x):
+            if not pat.fullmatch(x):
                 bad.append(f"{where}: id {x!r} does not match {pat.pattern}")
+            return
+        if GROUPED_DIGITS.search(x):
+            bad.append(f"{where}: a grouped number")
+            return
+        if _basis_field(kind, path) == "location":
+            if not LOCATION_RE.fullmatch(x) or "Table" not in x and any(ch.isdigit() for ch in x):
+                bad.append(f"{where}: location {x!r}: letters and spaces, with at most one 'Table N' (N up to 20)")
             return
         if DECIMAL_RE.search(x.replace("v0.17", "")):
             bad.append(f"{where}: a decimal point in text (only weights and v0.17 may hold one)")
@@ -256,11 +265,9 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
         for t in TOKEN_RE.findall(x):
             t = t.strip(".!?*-+")
             if not any(ch.isdigit() for ch in t) or t in ok_tok or year(t, PUBLISH_YEARS) \
-                    or BELIEF_ID.match(t) or QUESTION_ID.match(t) or TEST_ID.match(t):
+                    or BELIEF_ID.fullmatch(t) or QUESTION_ID.fullmatch(t) or TEST_ID.fullmatch(t):
                 continue
             if field == "citation" and year(t, CITATION_YEARS):
-                continue
-            if field == "location" and t.isdigit() and LOCATION_INTS[0] <= int(t) <= LOCATION_INTS[1]:
                 continue
             bad.append(f"{where}: {t!r} holds a digit outside the public list")
 
@@ -279,6 +286,8 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
         elif isinstance(x, list):
             for i, v in enumerate(x):
                 walk(v, path + [i])
+        elif _id_paths(kind, path) is not None and not isinstance(x, str):
+            bad.append(f"{where}: an id must be a string, not {type(x).__name__}")
         elif isinstance(x, bool) or x is None:
             return
         elif isinstance(x, (int, float)):
@@ -485,7 +494,11 @@ def licensed_repair(rd, ctx, hits, lic, allow, fn, led, qid, cap, r) -> dict:
     repaired seed is checked on its raw bytes and kept only when it passes both checks."""
     import yaml
     import world_model_trials as WMT
-    rid = led.reserve(qid, "seed licensed repair", cap)
+    try:                    # after the first session's charge: a ledger failure is a refusal, never a raise
+        rid = led.reserve(qid, "seed licensed repair", cap)
+    except Exception as e:  # noqa: BLE001
+        return dict(r, status="seed_refused", licensed_repair={"hits": hits, "usd": 0.0,
+                                                               "after": [f"reserve: {type(e).__name__}: {e}"[:300]]})
     if rid is None:
         return dict(r, status="budget_refused")
     fb = [f"remove every number at {h.split(':')[0]} (it matches a withheld input value); state it in words or drop "
@@ -493,11 +506,18 @@ def licensed_repair(rd, ctx, hits, lic, allow, fn, led, qid, cap, r) -> dict:
     try:
         rr = fn(rd, ctx, fb, cap)
     except Exception as e:  # noqa: BLE001 -- the reservation is charged in full and the repair is refused
-        led.charge(rid, cap, f"crashed: {type(e).__name__}: whole cap")
+        try:
+            led.charge(rid, cap, f"crashed: {type(e).__name__}: whole cap")
+        except Exception:  # noqa: BLE001 -- the open reservation still counts at its whole cap
+            pass
         return dict(r, status="seed_refused", usd=r.get("usd", 0) + cap,
                     licensed_repair={"hits": hits, "usd": cap, "after": [f"{type(e).__name__}: {e}"[:300]]})
     usd = float(rr.usd) if rr is not None and isinstance(rr.usd, (int, float)) else cap
-    led.charge(rid, usd, "sdk reported" if rr is not None else "no result: whole cap")
+    try:
+        led.charge(rid, usd, "sdk reported" if rr is not None else "no result: whole cap")
+    except Exception as e:  # noqa: BLE001 -- the open reservation still counts at its whole cap
+        return dict(r, status="seed_refused", licensed_repair={"hits": hits, "usd": usd,
+                                                               "after": [f"charge: {type(e).__name__}: {e}"[:300]]})
     try:                    # everything after the charge, the promotion included: a refusal, never a crash
         raw, _ = WMT._sio().read_nofollow(rd, WMT.SEED_FILE)
         sd = yaml.safe_load(raw.decode("utf-8"))
@@ -908,7 +928,40 @@ def _self_test() -> int:
             ok(r.get("status") == "seed_refused" and r.get("usd") == 0.25,
                f"DB15 the final copy failing after a charged seed is a recorded refusal: {r}")
 
-    for n, f in (("DB14", db14), ("DB15", db15), ("DB13", db13), ("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
+
+    # Final review of 079a5f2: exact grid weights, a fixed location form, field types, fullmatch ids
+    def db16():
+        import world_model_trials as WMT
+        lic = {"exact": {"0.60000001", "0.39999999", "20001"}, "rounded": {2: set(), 3: set()}}
+        base = ("decision_beliefs:\n- id: D1\n  topic: net_type\n  question: q\n  claims:\n"
+                "  - {claim: a, weight: 0.6}\n  - {claim: b, weight: 0.4}\n  basis:\n"
+                "  - {citation: Mosha JF et al. 2022 Lancet, location: Table 2}\n"
+                "  - {citation: Pryce J et al. 2018 Cochrane, location: Summary of findings table}\n"
+                "  decides: true\n  why_decides: w\n  layer: world\n")
+        run = lambda raw: publish_problems("seed", WMT.canonical_yaml(raw.encode()), lic, (), TOPICS[:1])  # noqa
+        ok(run(base) == [], f"DB16 Table 2 and a digit-free location pass: {run(base)}")
+        probes = {
+            "off-grid weights within the old tolerance": base.replace("weight: 0.6}", "weight: 0.60000001}")
+                                                             .replace("weight: 0.4}", "weight: 0.39999999}"),
+            "Table 20,001": base.replace("location: Table 2}", "location: 'Table 20,001'}"),
+            "Table 21": base.replace("location: Table 2}", "location: Table 21}"),
+            "Table 2, panel A": base.replace("location: Table 2}", "location: 'Table 2, panel A'}"),
+            "a page number": base.replace("location: Table 2}", "location: p 7}"),
+            "a boolean question id and a mapping of beliefs": base + "open_questions:\n- {id: true, question: Q, "
+                                                                     "beliefs: {D1: D1}}\n",
+            "a belief id with a trailing newline": base.replace("- id: D1", '- id: "D1\\n"'),
+            "a grouped number in text": base.replace("question: q", "question: 'q 20,001'"),
+        }
+        for why, raw in probes.items():
+            pr = run(raw)
+            ok(bool(pr), f"DB16b refused: {why}: {pr[:2]}")
+        c = WMT.canonical_yaml(base.replace("weight: 0.6}", "weight: 0.6000000000001}").encode())
+        ok(b"weight: 0.6\n" in c and b"0000000" not in c and run(c.decode()) == [],
+           f"DB16c a weight within 1e-9 of the grid is published as its exact grid value: {c[:200]}")
+        ok(licensed_problems({"claims": [{"weight": 0.60000001}]}, lic) != [],
+           "DB16d the licensed weight exemption holds for exact grid values only")
+
+    for n, f in (("DB16", db16), ("DB14", db14), ("DB15", db15), ("DB13", db13), ("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
                  ("DB8", db8), ("DB9", db9), ("DB10", db10), ("DB11", db11), ("DB12", db12)):
         tryit(n, f)
     if fails:
