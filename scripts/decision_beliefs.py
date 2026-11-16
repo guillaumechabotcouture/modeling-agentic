@@ -201,21 +201,62 @@ MAP_TOP_KEYS = {"decision", "run", "conventions", "entries"}
 MAP_ENTRY_KEYS = {"belief", "output", "field", "rules", "note", "set_aside"}
 
 
+BELIEF_ID = re.compile(r"^D[0-9]{1,2}$")
+QUESTION_ID = re.compile(r"^Q[0-9]{1,2}$")
+TEST_ID = re.compile(r"^DT(10|[1-9])$")
+DECIMAL_RE = re.compile(r"\d\.\d|(?<![\w])\.\d")
+
+
+def _id_paths(kind, path) -> re.Pattern | None:
+    """The id pattern a value must match at this schema path (None: not an id path)."""
+    if kind == "seed" and len(path) == 3 and path[0] == "decision_beliefs" and path[2] == "id":
+        return BELIEF_ID
+    if kind == "seed" and len(path) == 3 and path[0] == "open_questions" and path[2] == "id":
+        return QUESTION_ID
+    if kind == "seed" and len(path) == 4 and path[0] == "open_questions" and path[2] == "beliefs":
+        return BELIEF_ID
+    if kind == "map" and len(path) == 3 and path[0] == "entries" and path[2] == "belief":
+        return BELIEF_ID
+    return None
+
+
+def _basis_field(kind, path) -> str | None:
+    """'citation' or 'location' only at decision_beliefs[*].basis[*].<field> of a seed."""
+    if kind == "seed" and len(path) == 5 and path[0] == "decision_beliefs" and path[2] == "basis" \
+            and path[4] in ("citation", "location"):
+        return path[4]
+    return None
+
+
 def digit_problems(obj, kind, ids=(), tokens=()) -> list:
-    """The allowlist (Codex re-review of e9243e4): in a canonical decision file a number may stand only at a declared
-    path (a claim weight in a seed, a rule's claim index in an outcome map), and a string may hold a digit only as a
-    whole token from the public list: DIGIT_TOKENS, the files' own belief and question ids, `tokens` (the decision's DECISION_DIGIT_TOKENS), a year in PUBLISH_YEARS (CITATION_YEARS in a citation) or a table number in a location.
+    """The allowlist, narrowed (Codex re-reviews of e9243e4 and ee46803). In a canonical decision file:
+    - an id is valid only by its fixed pattern at its schema path (belief D<n>, question Q<n>, a question's and an
+      outcome-map entry's belief reference D<n>); ids never extend the allowlist (`ids` is ignored);
+    - a number may stand only at a claim weight on the 0.05 grid (seed) or as a rule's claim index 0-3 (map);
+    - no decimal point anywhere in text except the literal v0.17;
+    - a string may hold a digit only as a whole token: DIGIT_TOKENS, a token of the fixed id patterns (D<n>, Q<n>,
+      DT1-DT10), `tokens` (the decision's DECISION_DIGIT_TOKENS) or a year in PUBLISH_YEARS; a citation year in
+      CITATION_YEARS and a table number in LOCATION_INTS only at decision_beliefs[*].basis[*].citation / .location.
     Everything else with a digit is refused."""
-    ok_tok = DIGIT_TOKENS | set(ids) | set(tokens)
+    ok_tok = DIGIT_TOKENS | set(tokens)
     bad = []
 
     def year(t, lo_hi):
         return t.isdigit() and lo_hi[0] <= int(t) <= lo_hi[1]
 
-    def string(x, where, field):
+    def string(x, where, path):
+        pat = _id_paths(kind, path)
+        if pat is not None:
+            if not pat.match(x):
+                bad.append(f"{where}: id {x!r} does not match {pat.pattern}")
+            return
+        if DECIMAL_RE.search(x.replace("v0.17", "")):
+            bad.append(f"{where}: a decimal point in text (only weights and v0.17 may hold one)")
+        field = _basis_field(kind, path)
         for t in TOKEN_RE.findall(x):
             t = t.strip(".!?*-+")
-            if not any(ch.isdigit() for ch in t) or t in ok_tok or year(t, PUBLISH_YEARS):
+            if not any(ch.isdigit() for ch in t) or t in ok_tok or year(t, PUBLISH_YEARS) \
+                    or BELIEF_ID.match(t) or QUESTION_ID.match(t) or TEST_ID.match(t):
                 continue
             if field == "citation" and year(t, CITATION_YEARS):
                 continue
@@ -223,7 +264,7 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
                 continue
             bad.append(f"{where}: {t!r} holds a digit outside the public list")
 
-    def walk(x, path, field=None):
+    def walk(x, path):
         where = "/".join(map(str, path))
         if isinstance(x, dict):
             for k, v in x.items():
@@ -231,13 +272,13 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
                     if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= 3:
                         bad.append(f"{where}: rule key {k!r}: a claim index 0 to 3")
                 elif isinstance(k, str):
-                    string(k, where + "/<key>", None)
+                    string(k, where + "/<key>", path + ["<key>"])
                 else:
                     bad.append(f"{where}: key {k!r} is not a string")
-                walk(v, path + [k], k if isinstance(k, str) else field)
+                walk(v, path + [k])
         elif isinstance(x, list):
             for i, v in enumerate(x):
-                walk(v, path + [i], field)
+                walk(v, path + [i])
         elif isinstance(x, bool) or x is None:
             return
         elif isinstance(x, (int, float)):
@@ -245,7 +286,7 @@ def digit_problems(obj, kind, ids=(), tokens=()) -> list:
                     and path[4] == "weight" and _BT._on_grid(x)):
                 bad.append(f"{where}: a number outside the declared weight paths")
         elif isinstance(x, str):
-            string(x, where, field)
+            string(x, where, path)
         else:
             bad.append(f"{where}: a {type(x).__name__} value")
     walk(obj, [])
@@ -470,6 +511,18 @@ def licensed_repair(rd, ctx, hits, lic, allow, fn, led, qid, cap, r) -> dict:
                 status="ok" if not again else "seed_refused")
 
 
+def finish_seed(r, d) -> dict:
+    """Copy the accepted seed to <d>/world_model_seed.yaml. After a charge, so a failure is a recorded refusal."""
+    import world_model_trials as WMT
+    if r.get("status") != "ok":
+        return r
+    try:
+        WMT._sio().copy_nofollow(d, os.path.join("seed_run", WMT.SEED), SEED_REL)
+        return r
+    except Exception as e:  # noqa: BLE001
+        return dict(r, status="seed_refused", error=f"final copy: {type(e).__name__}: {e}"[:300])
+
+
 def _paths(a):
     d = os.path.join(a.trials_dir, "decisions", a.id)
     return d, os.path.join(d, SEED_REL), os.path.join(d, MAP_REL)
@@ -528,12 +581,14 @@ def main(argv=None) -> int:
             r = {"status": "ok", "reused": kept, "usd": 0.0}     # a validated seed is never paid for twice
         else:
             r = WMT.seed_step({"id": f"decision_{a.id}"}, rd, ctx, fn, led, a.task_cap_usd)
-        hits = licensed_problems(open(os.path.join(rd, WMT.SEED), "rb").read(), lic, allow) \
-            if r.get("status") == "ok" else []
+        try:                # after a charge: a failure is a recorded refusal, never a raise
+            hits = licensed_problems(WMT._sio().read_nofollow(rd, WMT.SEED)[0], lic, allow) \
+                if r.get("status") == "ok" else []
+        except Exception as e:  # noqa: BLE001
+            r, hits = dict(r, status="seed_refused", error=f"{type(e).__name__}: {e}"[:300]), []
         if hits:                    # one repair of the same seed task, told only where its numbers are refused
             r = licensed_repair(rd, ctx, hits, lic, allow, fn, led, f"decision_{a.id}", a.task_cap_usd, r)
-        if r.get("status") == "ok":
-            WMT._sio().copy_nofollow(d, os.path.join("seed_run", WMT.SEED), SEED_REL)
+        r = finish_seed(r, d)
         print(json.dumps(dict(r, seed=seed_p if r.get("status") == "ok" else None,
                               committed_usd=round(led.committed(), 4)), default=str))
         return 0 if r.get("status") == "ok" else 1
@@ -803,7 +858,57 @@ def _self_test() -> int:
            and len(digit_problems(obj, "map", (), decision_tokens("other"))) == 3,
            "DB13b a decision's tokens admit its identifiers only: another decision id refuses them")
 
-    for n, f in (("DB13", db13), ("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
+
+    # Codex re-review of e9243e4..ee46803 (last round): ids by fixed pattern, exemptions by schema path, no decimals
+    def db14():
+        import world_model_trials as WMT
+        lic = {"exact": {"0.41237", "183456"}, "rounded": {2: set(), 3: set()}}
+        base = ("decision_beliefs:\n- id: D1\n  topic: net_type\n  question: In 2026, which net under GC7 and DT10?\n"
+                "  claims:\n  - {claim: PBO in most LGAs at v0.17 by D1, weight: 0.6}\n  - {claim: not, weight: 0.4}\n"
+                "  basis:\n  - {citation: Pluess B et al. 1998 Cochrane, location: Table 19}\n  decides: true\n"
+                "  why_decides: w\n  layer: world\nopen_questions:\n- {id: Q1, question: q, beliefs: [D1]}\nnotes: n\n")
+        run = lambda raw: publish_problems("seed", WMT.canonical_yaml(raw.encode()), lic, (), TOPICS[:1])  # noqa
+        ok(run(base) == [], f"DB14 ids D1 and Q1, a citation year and a table number at their paths pass: {run(base)}")
+        probes = {
+            "a self-whitelisting question id": base.replace("{id: Q1,", "{id: x0.41237,").replace("notes: n",
+                                                                                                  "notes: x0.41237"),
+            "a belief id carrying digits": base.replace("- id: D1", "- id: B183456").replace("[D1]", "[B183456]"),
+            "a question referring to a malformed belief id": base.replace("beliefs: [D1]", "beliefs: [D183456]"),
+            "a location exemption outside basis": base.replace("notes: n", "notes: {location: '19', citation: '1951'}"),
+            "a citation year outside basis": base.replace("notes: n", "notes: 'since 1951'"),
+            "a decimal in text": base.replace("notes: n", "notes: about 1.5 times"),
+            "a leading-dot decimal in text": base.replace("notes: n", "notes: about .5 of them"),
+            "an integer in text": base.replace("notes: n", "notes: in 37 LGAs"),
+        }
+        for why, raw in probes.items():
+            pr = run(raw)
+            ok(bool(pr), f"DB14b refused: {why}: {pr[:2]}")
+        seed = yaml.safe_load(base)
+        om = {"decision": "f6", "entries": [{"belief": "D1", "output": "analysis/point.yaml", "field": "plan",
+                                             "rules": {0: {"location": "19"}, 1: "no"}}]}
+        pr = publish_problems("map", WMT.canonical_yaml(yaml.safe_dump(om).encode()), lic, (), TOPICS[:1], seed=seed,
+                              tokens=decision_tokens("f6"))
+        ok(bool(pr), f"DB14c a location key inside an outcome-map rule gets no exemption: {pr[:2]}")
+        om["entries"][0]["belief"] = "B183456"
+        pr = publish_problems("map", WMT.canonical_yaml(yaml.safe_dump(om).encode()), lic, (), TOPICS[:1], seed=seed)
+        ok(any("B183456" in x for x in pr), f"DB14d a malformed belief id in the outcome map is refused: {pr[:2]}")
+
+    def db15():
+        import stat
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "seed_run", "analysis"))
+            open(os.path.join(d, "seed_run", "analysis", SEED_REL), "w").write("decision_beliefs: []\n")
+            os.chmod(d, stat.S_IRUSR | stat.S_IXUSR)
+            try:
+                r = finish_seed({"status": "ok", "usd": 0.25}, d)
+            except Exception as e:  # noqa: BLE001
+                r = {"raised": f"{type(e).__name__}: {e}"}
+            finally:
+                os.chmod(d, stat.S_IRWXU)
+            ok(r.get("status") == "seed_refused" and r.get("usd") == 0.25,
+               f"DB15 the final copy failing after a charged seed is a recorded refusal: {r}")
+
+    for n, f in (("DB14", db14), ("DB15", db15), ("DB13", db13), ("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
                  ("DB8", db8), ("DB9", db9), ("DB10", db10), ("DB11", db11), ("DB12", db12)):
         tryit(n, f)
     if fails:

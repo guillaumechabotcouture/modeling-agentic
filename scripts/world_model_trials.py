@@ -872,8 +872,12 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
                 # read is a refusal with feedback (repaired once), never a crash that loses the charged seed
                 feedback = [f"{SEED_FILE} has a shape the validator cannot read: {type(e).__name__}: {e}"[:300]]
         if not feedback:
-            data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
-            _sio().write_nofollow(run_dir, SEED, data, atomic=True)
+            try:            # the promotion is after the charge: a failure is a recorded refusal, never a raise
+                data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
+                _sio().write_nofollow(run_dir, SEED, data, atomic=True)
+            except Exception as e:  # noqa: BLE001
+                return dict(out, status="seed_refused", refusals=out.get("refusals", []) + [[
+                    f"promotion to {SEED} failed after the charge: {type(e).__name__}: {e}"[:300]]])
             return dict(out, status="ok", hypotheses=len(seed["decision_beliefs"] if ctx.get("decision_run")
                                        else seed["hypotheses"]),
                         refusals=out.get("refusals", []))
@@ -3686,6 +3690,32 @@ def _self_test() -> int:
             except TrialError:
                 ok(True, "WT29k a decision file that does not parse is refused")
     tryit("WT29 canonical", wt29_canonical)
+
+    def wt29_promotion():
+        # Codex re-review of e9243e4..ee46803: the promotion after a charge fails (unwritable analysis/): a refusal
+        import stat
+        from types import SimpleNamespace
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        seed = {"decision_beliefs": [{"id": "D1", "topic": "net_type", "question": "q", "decides": True,
+                                      "why_decides": "w", "layer": "world", "basis": [{"mechanism": "m"}],
+                                      "claims": [{"claim": "a", "weight": 0.6}, {"claim": "b", "weight": 0.4}]}]}
+
+        def fn(rd, c, fb, cap):
+            open(os.path.join(rd, SEED_FILE), "w").write(yaml.safe_dump(seed))
+            return SimpleNamespace(usd=0.25, note="n")
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "analysis"))
+            os.chmod(os.path.join(d, "analysis"), stat.S_IRUSR | stat.S_IXUSR)
+            led = SpendLedger(os.path.join(d, "s.jsonl"), 5.0)
+            try:
+                r = seed_step({"id": "decision_t"}, d, ctx, fn, led, 1.0)
+            except Exception as e:  # noqa: BLE001
+                r = {"raised": f"{type(e).__name__}: {e}"}
+            finally:
+                os.chmod(os.path.join(d, "analysis"), stat.S_IRWXU)
+            ok(r.get("status") == "seed_refused" and led.spent() > 0,
+               f"WT29l a promotion that fails after the charge is a recorded refusal, never raised: {r}")
+    tryit("WT29 promotion", wt29_promotion)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
