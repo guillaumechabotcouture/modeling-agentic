@@ -1338,6 +1338,27 @@ def _self_test_joint(ok, q):
            f"model tier): {sorted(n for n in names_ if n.startswith('calibration_'))}")
         ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
            f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
+        # F6 run 1, owner decision R1: a calibration-target test on the joint path moves the listed units' values
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = R["point"]["plan"]
+        listed = [i for i in A.ids if A.spec.unit_ids() and i in ("0", "3", "6")]
+        dt = {"id": "DTt", "type": "calibration_target", "text": "t",
+              "calibration_target": {"units": listed, "scale": 0.5}}
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        zc = (rec.get("calibration_target") or {}).get("units") or {}
+        moved = {i: zc[i]["z"] - z0[i] for i in listed if i in zc}
+        ok(rec.get("status") == "run" and len(moved) == len(listed) and all(v < -1e-6 for v in moved.values())
+           and set(zc) == set(listed) and rec["results"] and "objective" in rec["results"][0],
+           f"JR9 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
+           f"targets are halved, and re-solves the plan ({rec.get('status')}, {moved})")
+        saved_z = A.joint["z"].pop(listed[0])
+        try:
+            rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.joint["z"][listed[0]] = saved_z
+        ok(rec2.get("status") == "not_run" and "joint calibration" in (rec2.get("why") or rec2.get("statement") or ""),
+           f"JR9b a listed unit the joint calibration did not fit fails closed (not run): {rec2.get('status')}")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d, n=24)
         rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))

@@ -1801,6 +1801,25 @@ def _self_test() -> int:
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
         _self_test_unit_attribute(ok, s, d, bad)
+        # F6 run 1, owner decision R1: a calibration-target test (the listed units' targets scaled, the calibration redone)
+        dct = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTt", "type": "calibration_target", "text": "t"}, **kw)))
+        bad(dct(), "give calibration_target", "SP-CT1 a calibration_target test without its mapping is refused")
+        bad(dct(calibration_target={"units": ["0", "zz"], "scale": 0.8}), "'zz'",
+            "SP-CT2 a calibration_target test naming an unknown unit is refused")
+        bad(dct(calibration_target={"units": ["5"], "scale": 1.5}), "inside (0, 1)",
+            "SP-CT3 a scale that takes a target outside (0, 1) is refused")
+        bad(dct(calibration_target={"units": ["0"], "scale": 1.0}), "changes no target",
+            "SP-CT4 a scale of 1 (an identity) is refused")
+        bad(dct(calibration_target={"units": [], "scale": 0.8}), "a non-empty list",
+            "SP-CT5 an empty unit list is refused")
+        bad(lambda r: (r["calibration"].update(method="none"),
+                       dct(calibration_target={"units": ["0"], "scale": 0.8})(r)), "emulator_inversion",
+            "SP-CT6 a calibration_target test without an emulator-inversion calibration is refused")
+        r_t = copy.deepcopy(s.raw)
+        dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
+        ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
+                                         f"{validate(Spec(r_t, d))[:3]}")
         bad(lambda r: r["analysis"].update(regret_threshold=2), "analysis.regret_threshold",
             "SP11c F6 S1-5: a regret threshold outside [0, 1] is refused")
         bad(lambda r: r["analysis"].update(dollars_threshold="x"), "analysis.dollars_threshold",
