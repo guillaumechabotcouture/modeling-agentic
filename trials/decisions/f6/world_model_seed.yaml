@@ -1,224 +1,292 @@
 decision_beliefs:
-  - id: D1
-    topic: net_type
-    question: "Which net type does the recommended plan choose in most LGAs at the base (2026) price list?"
-    claims:
-      - {claim: "PBO nets are chosen in most LGAs", weight: 0.5}
-      - {claim: "dual-AI nets are chosen in most LGAs", weight: 0.25}
-      - {claim: "pyrethroid-only nets are chosen in most LGAs", weight: 0.15}
-      - {claim: "no single net type is chosen in most LGAs, or most LGAs get no net", weight: 0.1}
-    basis:
-      - {citation: "Protopopoff N et al. 2018 Lancet", location: "Table 2"}
-      - {citation: "Staedke SG et al. 2020 Lancet", location: "Table 2"}
-      - {mechanism: "PBO restores much of the killing lost to pyrethroid resistance at a small premium over pyrethroid-only nets, while dual-AI costs clearly more at the base list; with the engine's nets weaker than trials, the cheaper effective net wins most units"}
-    decides: true
-    why_decides: "net procurement is the largest budget line, so the type chosen sets most of the cost and benefit"
-    layer: engine
-  - id: D2
-    topic: net_type
-    question: "Where are dual-AI nets chosen?"
-    claims:
-      - {claim: "dual-AI nets are chosen mainly in the most pyrethroid-resistant northern LGAs and rarely in the south", weight: 0.45}
-      - {claim: "dual-AI nets are chosen in few or no LGAs", weight: 0.35}
-      - {claim: "dual-AI nets are chosen broadly across north and south", weight: 0.2}
-    basis:
-      - {citation: "Mosha JF et al. 2022 Lancet", location: "Table 2"}
-      - {citation: "Accrombessi M et al. 2023 Lancet", location: "Table 2"}
-      - {mechanism: "chlorfenapyr kills pyrethroid-resistant mosquitoes the pyrethroid no longer kills, so its advantage grows with resistance and burden"}
-    decides: true
-    why_decides: "dual-AI versus PBO is the main price-sensitive choice in the grant"
-    layer: world
-  - id: D3
-    topic: net_type
-    question: "Does the plan keep a net campaign in nearly every LGA, as the funded plan does?"
-    claims:
-      - {claim: "nearly every LGA keeps a net campaign of some type", weight: 0.6}
-      - {claim: "a noticeable minority of LGAs, mostly low-burden southern or urban ones, get no net campaign", weight: 0.4}
-    basis:
-      - {citation: "Pryce J et al. 2018 Cochrane Database Syst Rev", location: "Summary of findings table"}
-      - {mechanism: "nets are cheap per person protected; dropping them only pays where burden is low and the money buys SMC elsewhere"}
-    decides: true
-    why_decides: "dropping nets in some LGAs is the largest possible departure from the funded plan"
-    layer: engine
-  - id: D4
-    topic: smc_vs_cm
-    question: "Is SMC chosen in the SMC-eligible LGAs?"
-    claims:
-      - {claim: "SMC is chosen in nearly all SMC-eligible LGAs", weight: 0.75}
-      - {claim: "SMC is chosen in most but clearly not all eligible LGAs", weight: 0.2}
-      - {claim: "SMC is chosen in few eligible LGAs", weight: 0.05}
-    basis:
-      - {citation: "ACCESS-SMC Partnership 2020 Lancet", location: "Results section"}
-      - {citation: "Meremikwu MM et al. 2012 Cochrane Database Syst Rev", location: "Summary of findings table"}
-      - {mechanism: "SMC averts a large share of under-five clinical malaria in the strongly seasonal north at a low cost per child"}
-    decides: true
-    why_decides: "SMC is the second largest line and the most cost-effective in the north"
-    layer: world
-  - id: D5
-    topic: smc_vs_cm
-    question: "Where is the case-management add-on chosen at the base cm_add value?"
-    claims:
-      - {claim: "the case-management add-on is chosen in few or no LGAs", weight: 0.55}
-      - {claim: "it is chosen in a minority of high-burden LGAs alongside SMC and nets", weight: 0.3}
-      - {claim: "it is chosen in most LGAs", weight: 0.15}
-    basis:
-      - {mechanism: "the add-on's gain is a sourced range starting at no gain; facility treatment already runs in every arm, so the marginal effect per dollar is small beside nets and SMC"}
-    decides: false
-    why_decides: "iCCM is a small line, so its placement moves little budget"
-    layer: engine
-  - id: D6
-    topic: smc_vs_cm
-    question: "Does DT4 (case-management effect from no gain to the top of the iCCM range) change the plan?"
-    claims:
-      - {claim: "DT4 changes the plan, adding the add-on in many LGAs at the top of the range", weight: 0.45}
-      - {claim: "DT4 does not change the plan", weight: 0.55}
-    basis:
-      - {mechanism: "at the top of the range the add-on can compete with nets in high-burden LGAs; at no gain it is never chosen"}
-    decides: false
-    why_decides: "a change would move only a small line unless the add-on displaces nets"
-    layer: engine
-  - id: D7
-    topic: smc_vs_cm
-    question: "Does DT5 (case-management gain raising access to severe-malaria care) change the plan?"
-    claims:
-      - {claim: "DT5 does not change the plan", weight: 0.6}
-      - {claim: "DT5 changes the plan by adding the case-management add-on in more LGAs", weight: 0.4}
-    basis:
-      - {mechanism: "linking the add-on to severe care raises its deaths averted, and DALYs are mostly deaths in children, so the add-on gains value"}
-    decides: false
-    why_decides: "it moves the small iCCM line"
-    layer: engine
-  - id: D8
-    topic: irs
-    question: "Is IRS chosen anywhere?"
-    claims:
-      - {claim: "IRS is chosen in no LGA", weight: 0.85}
-      - {claim: "IRS is chosen in a few LGAs", weight: 0.15}
-    basis:
-      - {citation: "Pluess B et al. 2010 Cochrane Database Syst Rev", location: "Summary of findings table"}
-      - {mechanism: "IRS costs roughly ten times a net campaign per person covered and overlaps with nets on the same indoor target"}
-    decides: false
-    why_decides: "IRS is absent from the funded plan and very unlikely to enter"
-    layer: world
-  - id: D9
-    topic: irs
-    question: "Does DT1 (ITN x IRS interaction at the trial value and its CI ends) change the plan?"
-    claims:
-      - {claim: "DT1 does not change the plan", weight: 0.85}
-      - {claim: "DT1 changes the plan", weight: 0.15}
-    basis:
-      - {mechanism: "if IRS is never chosen, rescaling its interaction with nets cannot change the plan"}
-    decides: false
-    why_decides: "it only matters if IRS is near the margin"
-    layer: engine
-  - id: D10
-    topic: resistance_field_values
-    question: "Does DT10 (field bioassay resistance) change the plan?"
-    claims:
-      - {claim: "DT10 changes the plan, moving northern LGAs toward dual-AI or PBO and southern LGAs toward cheaper nets", weight: 0.6}
-      - {claim: "DT10 does not change the plan", weight: 0.4}
-    basis:
-      - {mechanism: "the hut-trial relationship makes pyrethroid-only killing fall steeply with bioassay survival, so a more resistant north raises the value of PBO and dual-AI there"}
-    decides: true
-    why_decides: "resistance sets the net type, the most expensive choice"
-    layer: engine
-  - id: D11
-    topic: price_brackets
-    question: "Does DT6 (October 2023 net prices, dual-AI and PBO almost equal) change the plan?"
-    claims:
-      - {claim: "DT6 changes the plan, with dual-AI replacing PBO in many LGAs", weight: 0.6}
-      - {claim: "DT6 does not change the plan", weight: 0.4}
-    basis:
-      - {mechanism: "when dual-AI costs about as much as PBO, its extra killing in resistant settings makes it the better buy"}
-    decides: true
-    why_decides: "it decides whether dual-AI or PBO is procured"
-    layer: engine
-  - id: D12
-    topic: price_brackets
-    question: "Do DT7 and DT8 (higher SMC price per child) change the plan?"
-    claims:
-      - {claim: "neither changes the plan; SMC stays in nearly all eligible LGAs", weight: 0.5}
-      - {claim: "DT8 changes the plan but DT7 does not", weight: 0.3}
-      - {claim: "both change the plan", weight: 0.2}
-    basis:
-      - {citation: "Gilmartin C et al. 2021 Lancet Glob Health", location: "Results section"}
-      - {mechanism: "SMC remains highly cost-effective in the seasonal north even at a much higher price, but a higher price moves budget out of nets and can exceed the change thresholds"}
-    decides: true
-    why_decides: "a higher SMC price shrinks what is left for nets"
-    layer: engine
-  - id: D13
-    topic: weak_nets
-    question: "Does DT9 (every net type's killing shifted across the net_kill_shift prior) change the plan?"
-    claims:
-      - {claim: "DT9 changes the plan", weight: 0.7}
-      - {claim: "DT9 does not change the plan", weight: 0.3}
-    basis:
-      - {citation: "Churcher TS et al. 2016 eLife", location: "Results section"}
-      - {mechanism: "net killing sets both the value of nets against SMC and the gap between net types; the engine's nets already avert less than the trials"}
-    decides: true
-    why_decides: "net effect is the declared out-of-band engine quantity the decision turns on"
-    layer: engine
-  - id: D14
-    topic: departure_from_funded_plan
-    question: "How far does the recommended plan depart from the funded grant plan?"
-    claims:
-      - {claim: "it differs in a substantial minority of LGAs, mostly through net type, with SMC placement largely as funded", weight: 0.5}
-      - {claim: "it differs in most LGAs", weight: 0.3}
-      - {claim: "it differs in few LGAs", weight: 0.2}
-    basis:
-      - {mechanism: "the funded plan already puts nets everywhere and SMC in the north; the optimiser mainly re-chooses net type by resistance and burden and may drop nets in low-burden LGAs"}
-    decides: true
-    why_decides: "the headline is the comparison with the funded plan"
-    layer: engine
-  - id: D15
-    topic: departure_from_funded_plan
-    question: "Does the plan keep PBO in the states where the funded plan buys PBO?"
-    claims:
-      - {claim: "PBO is kept in most of those states", weight: 0.5}
-      - {claim: "PBO is replaced in most of them, by dual-AI in the north or pyrethroid-only or no net in the south", weight: 0.5}
-    basis:
-      - {mechanism: "the funded choice of PBO is close to the price-effect margin, so modest differences in resistance or burden tip each state either way"}
-    decides: true
-    why_decides: "it sets the net-type departure from the funded plan"
-    layer: engine
-  - id: D16
-    topic: dalys_vs_funded_plan
-    question: "DALYs averted by the recommended plan relative to the funded grant plan at the same envelope"
-    claims:
-      - {claim: "the recommended plan averts between a twentieth and a third more DALYs than the funded plan", weight: 0.5}
-      - {claim: "it averts less than a twentieth more", weight: 0.35}
-      - {claim: "it averts more than a third more", weight: 0.15}
-    basis:
-      - {mechanism: "the funded plan already targets the high-value SMC areas and nets everywhere, so reoptimisation gains come mainly from net type and marginal low-burden LGAs"}
-    decides: false
-    why_decides: "the size of gain affects the case for change but not its direction"
-    layer: engine
-  - id: D17
-    topic: dalys_vs_funded_plan
-    question: "Is the gain over the funded plan robust across uncertainty draws?"
-    claims:
-      - {claim: "the recommended plan beats the funded plan in most draws", weight: 0.65}
-      - {claim: "it does not beat the funded plan reliably", weight: 0.35}
-    basis:
-      - {mechanism: "shared uncertainty in net and SMC effects moves both plans together, so the paired difference is tighter than either plan's interval"}
-    decides: false
-    why_decides: "robustness qualifies the headline"
-    layer: engine
-  - id: D18
-    topic: value_of_information
-    question: "Which uncertain input carries the most decision-relevant value of information?"
-    claims:
-      - {claim: "net killing (net_kill_shift) or pyrethroid resistance carries the most", weight: 0.6}
-      - {claim: "the case-management effect (cm_add) carries the most", weight: 0.2}
-      - {claim: "SMC effect or price carries the most", weight: 0.1}
-      - {claim: "no input carries value above its noise floor", weight: 0.1}
-    basis:
-      - {mechanism: "the net-type choice covers most of the budget and turns on net killing under resistance, so uncertainty there moves the most units"}
-    decides: false
-    why_decides: "it directs evidence gathering rather than the allocation itself"
-    layer: engine
+- basis:
+  - citation: Protopopoff N et al. 2018 Lancet
+    location: Table 2
+  - citation: Staedke SG et al. 2020 Lancet
+    location: Table 2
+  - mechanism: PBO restores much of the killing lost to pyrethroid resistance at a small premium over pyrethroid-only nets, while dual-AI costs clearly more at the base list; with the engine's nets weaker than trials, the cheaper effective net wins most units
+  claims:
+  - claim: PBO nets are chosen in most LGAs
+    weight: 0.5
+  - claim: dual-AI nets are chosen in most LGAs
+    weight: 0.25
+  - claim: pyrethroid-only nets are chosen in most LGAs
+    weight: 0.15
+  - claim: no single net type is chosen in most LGAs, or most LGAs get no net
+    weight: 0.1
+  decides: true
+  id: D1
+  layer: engine
+  question: Which net type does the recommended plan choose in most LGAs at the base (2026) price list?
+  topic: net_type
+  why_decides: net procurement is the largest budget line, so the type chosen sets most of the cost and benefit
+- basis:
+  - citation: Mosha JF et al. 2022 Lancet
+    location: Table 2
+  - citation: Accrombessi M et al. 2023 Lancet
+    location: Table 2
+  - mechanism: chlorfenapyr kills pyrethroid-resistant mosquitoes the pyrethroid no longer kills, so its advantage grows with resistance and burden
+  claims:
+  - claim: dual-AI nets are chosen mainly in the most pyrethroid-resistant northern LGAs and rarely in the south
+    weight: 0.45
+  - claim: dual-AI nets are chosen in few or no LGAs
+    weight: 0.35
+  - claim: dual-AI nets are chosen broadly across north and south
+    weight: 0.2
+  decides: true
+  id: D2
+  layer: world
+  question: Where are dual-AI nets chosen?
+  topic: net_type
+  why_decides: dual-AI versus PBO is the main price-sensitive choice in the grant
+- basis:
+  - citation: Pryce J et al. 2018 Cochrane Database Syst Rev
+    location: Summary of findings table
+  - mechanism: nets are cheap per person protected; dropping them only pays where burden is low and the money buys SMC elsewhere
+  claims:
+  - claim: nearly every LGA keeps a net campaign of some type
+    weight: 0.6
+  - claim: a noticeable minority of LGAs, mostly low-burden southern or urban ones, get no net campaign
+    weight: 0.4
+  decides: true
+  id: D3
+  layer: engine
+  question: Does the plan keep a net campaign in nearly every LGA, as the funded plan does?
+  topic: net_type
+  why_decides: dropping nets in some LGAs is the largest possible departure from the funded plan
+- basis:
+  - citation: ACCESS-SMC Partnership 2020 Lancet
+    location: Results section
+  - citation: Meremikwu MM et al. 2012 Cochrane Database Syst Rev
+    location: Summary of findings table
+  - mechanism: SMC averts a large share of under-five clinical malaria in the strongly seasonal north at a low cost per child
+  claims:
+  - claim: SMC is chosen in nearly all SMC-eligible LGAs
+    weight: 0.75
+  - claim: SMC is chosen in most but clearly not all eligible LGAs
+    weight: 0.2
+  - claim: SMC is chosen in few eligible LGAs
+    weight: 0.05
+  decides: true
+  id: D4
+  layer: world
+  question: Is SMC chosen in the SMC-eligible LGAs?
+  topic: smc_vs_cm
+  why_decides: SMC is the second largest line and the most cost-effective in the north
+- basis:
+  - mechanism: the add-on's gain is a sourced range starting at no gain; facility treatment already runs in every arm, so the marginal effect per dollar is small beside nets and SMC
+  claims:
+  - claim: the case-management add-on is chosen in few or no LGAs
+    weight: 0.55
+  - claim: it is chosen in a minority of high-burden LGAs alongside SMC and nets
+    weight: 0.3
+  - claim: it is chosen in most LGAs
+    weight: 0.15
+  decides: false
+  id: D5
+  layer: engine
+  question: Where is the case-management add-on chosen at the base cm_add value?
+  topic: smc_vs_cm
+  why_decides: iCCM is a small line, so its placement moves little budget
+- basis:
+  - mechanism: at the top of the range the add-on can compete with nets in high-burden LGAs; at no gain it is never chosen
+  claims:
+  - claim: DT4 changes the plan, adding the add-on in many LGAs at the top of the range
+    weight: 0.45
+  - claim: DT4 does not change the plan
+    weight: 0.55
+  decides: false
+  id: D6
+  layer: engine
+  question: Does DT4 (case-management effect from no gain to the top of the iCCM range) change the plan?
+  topic: smc_vs_cm
+  why_decides: a change would move only a small line unless the add-on displaces nets
+- basis:
+  - mechanism: linking the add-on to severe care raises its deaths averted, and DALYs are mostly deaths in children, so the add-on gains value
+  claims:
+  - claim: DT5 does not change the plan
+    weight: 0.6
+  - claim: DT5 changes the plan by adding the case-management add-on in more LGAs
+    weight: 0.4
+  decides: false
+  id: D7
+  layer: engine
+  question: Does DT5 (case-management gain raising access to severe-malaria care) change the plan?
+  topic: smc_vs_cm
+  why_decides: it moves the small iCCM line
+- basis:
+  - citation: Pluess B et al. 2010 Cochrane Database Syst Rev
+    location: Summary of findings table
+  - mechanism: IRS costs roughly ten times a net campaign per person covered and overlaps with nets on the same indoor target
+  claims:
+  - claim: IRS is chosen in no LGA
+    weight: 0.85
+  - claim: IRS is chosen in a few LGAs
+    weight: 0.15
+  decides: false
+  id: D8
+  layer: world
+  question: Is IRS chosen anywhere?
+  topic: irs
+  why_decides: IRS is absent from the funded plan and very unlikely to enter
+- basis:
+  - mechanism: if IRS is never chosen, rescaling its interaction with nets cannot change the plan
+  claims:
+  - claim: DT1 does not change the plan
+    weight: 0.85
+  - claim: DT1 changes the plan
+    weight: 0.15
+  decides: false
+  id: D9
+  layer: engine
+  question: Does DT1 (ITN x IRS interaction at the trial value and its CI ends) change the plan?
+  topic: irs
+  why_decides: it only matters if IRS is near the margin
+- basis:
+  - mechanism: the hut-trial relationship makes pyrethroid-only killing fall steeply with bioassay survival, so a more resistant north raises the value of PBO and dual-AI there
+  claims:
+  - claim: DT10 changes the plan, moving northern LGAs toward dual-AI or PBO and southern LGAs toward cheaper nets
+    weight: 0.6
+  - claim: DT10 does not change the plan
+    weight: 0.4
+  decides: true
+  id: D10
+  layer: engine
+  question: Does DT10 (field bioassay resistance) change the plan?
+  topic: resistance_field_values
+  why_decides: resistance sets the net type, the most expensive choice
+- basis:
+  - mechanism: when dual-AI costs about as much as PBO, its extra killing in resistant settings makes it the better buy
+  claims:
+  - claim: DT6 changes the plan, with dual-AI replacing PBO in many LGAs
+    weight: 0.6
+  - claim: DT6 does not change the plan
+    weight: 0.4
+  decides: true
+  id: D11
+  layer: engine
+  question: Does DT6 (October 2023 net prices, dual-AI and PBO almost equal) change the plan?
+  topic: price_brackets
+  why_decides: it decides whether dual-AI or PBO is procured
+- basis:
+  - citation: Gilmartin C et al. 2021 Lancet Glob Health
+    location: Results section
+  - mechanism: SMC remains highly cost-effective in the seasonal north even at a much higher price, but a higher price moves budget out of nets and can exceed the change thresholds
+  claims:
+  - claim: neither changes the plan; SMC stays in nearly all eligible LGAs
+    weight: 0.5
+  - claim: DT8 changes the plan but DT7 does not
+    weight: 0.3
+  - claim: both change the plan
+    weight: 0.2
+  decides: true
+  id: D12
+  layer: engine
+  question: Do DT7 and DT8 (higher SMC price per child) change the plan?
+  topic: price_brackets
+  why_decides: a higher SMC price shrinks what is left for nets
+- basis:
+  - citation: Churcher TS et al. 2016 eLife
+    location: Results section
+  - mechanism: net killing sets both the value of nets against SMC and the gap between net types; the engine's nets already avert less than the trials
+  claims:
+  - claim: DT9 changes the plan
+    weight: 0.7
+  - claim: DT9 does not change the plan
+    weight: 0.3
+  decides: true
+  id: D13
+  layer: engine
+  question: Does DT9 (every net type's killing shifted across the net_kill_shift prior) change the plan?
+  topic: weak_nets
+  why_decides: net effect is the declared out-of-band engine quantity the decision turns on
+- basis:
+  - mechanism: the funded plan already puts nets everywhere and SMC in the north; the optimiser mainly re-chooses net type by resistance and burden and may drop nets in low-burden LGAs
+  claims:
+  - claim: it differs in a substantial minority of LGAs, mostly through net type, with SMC placement largely as funded
+    weight: 0.5
+  - claim: it differs in most LGAs
+    weight: 0.3
+  - claim: it differs in few LGAs
+    weight: 0.2
+  decides: true
+  id: D14
+  layer: engine
+  question: How far does the recommended plan depart from the funded grant plan?
+  topic: departure_from_funded_plan
+  why_decides: the headline is the comparison with the funded plan
+- basis:
+  - mechanism: the funded choice of PBO is close to the price-effect margin, so modest differences in resistance or burden tip each state either way
+  claims:
+  - claim: PBO is kept in most of those states
+    weight: 0.5
+  - claim: PBO is replaced in most of them, by dual-AI in the north or pyrethroid-only or no net in the south
+    weight: 0.5
+  decides: true
+  id: D15
+  layer: engine
+  question: Does the plan keep PBO in the states where the funded plan buys PBO?
+  topic: departure_from_funded_plan
+  why_decides: it sets the net-type departure from the funded plan
+- basis:
+  - mechanism: the funded plan already targets the high-value SMC areas and nets everywhere, so reoptimisation gains come mainly from net type and marginal low-burden LGAs
+  claims:
+  - claim: the recommended plan averts between a twentieth and a third more DALYs than the funded plan
+    weight: 0.5
+  - claim: it averts less than a twentieth more
+    weight: 0.35
+  - claim: it averts more than a third more
+    weight: 0.15
+  decides: false
+  id: D16
+  layer: engine
+  question: DALYs averted by the recommended plan relative to the funded grant plan at the same envelope
+  topic: dalys_vs_funded_plan
+  why_decides: the size of gain affects the case for change but not its direction
+- basis:
+  - mechanism: shared uncertainty in net and SMC effects moves both plans together, so the paired difference is tighter than either plan's interval
+  claims:
+  - claim: the recommended plan beats the funded plan in most draws
+    weight: 0.65
+  - claim: it does not beat the funded plan reliably
+    weight: 0.35
+  decides: false
+  id: D17
+  layer: engine
+  question: Is the gain over the funded plan robust across uncertainty draws?
+  topic: dalys_vs_funded_plan
+  why_decides: robustness qualifies the headline
+- basis:
+  - mechanism: the net-type choice covers most of the budget and turns on net killing under resistance, so uncertainty there moves the most units
+  claims:
+  - claim: net killing (net_kill_shift) or pyrethroid resistance carries the most
+    weight: 0.6
+  - claim: the case-management effect (cm_add) carries the most
+    weight: 0.2
+  - claim: SMC effect or price carries the most
+    weight: 0.1
+  - claim: no input carries value above its noise floor
+    weight: 0.1
+  decides: false
+  id: D18
+  layer: engine
+  question: Which uncertain input carries the most decision-relevant value of information?
+  topic: value_of_information
+  why_decides: it directs evidence gathering rather than the allocation itself
+notes: Net type under resistance and price (PBO vs dual-AI) drives the choice; SMC in the north is near-certain and IRS is out.
 open_questions:
-  - {id: Q1, question: "How much of the gap between engine and trial net effects comes from net durability and use rather than killing?", beliefs: [D3, D13]}
-  - {id: Q2, question: "Are field bioassay resistance values in the north comparable to the modelled surface on the same estimand?", beliefs: [D2, D10]}
-  - {id: Q3, question: "Which procurement price list applies to the GC7 campaigns actually delivered?", beliefs: [D1, D11]}
-notes: "Net type under resistance and price (PBO vs dual-AI) drives the choice; SMC in the north is near-certain and IRS is out."
+- beliefs:
+  - D3
+  - D13
+  id: Q1
+  question: How much of the gap between engine and trial net effects comes from net durability and use rather than killing?
+- beliefs:
+  - D2
+  - D10
+  id: Q2
+  question: Are field bioassay resistance values in the north comparable to the modelled surface on the same estimand?
+- beliefs:
+  - D1
+  - D11
+  id: Q3
+  question: Which procurement price list applies to the GC7 campaigns actually delivered?
