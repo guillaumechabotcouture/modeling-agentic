@@ -39,7 +39,12 @@ for _p in (REPO, os.path.join(REPO, "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-NUMBER_RE = re.compile(r"(?<![A-Za-z_\d.])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?%?")
+# a standalone number: 12, -3, 0.4, .41 (leading dot), 4.1e-1, 41.2% (Codex re-review: leading-dot decimals)
+NUMBER_RE = re.compile(r"(?<![A-Za-z_\d.])[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?%?")
+# a thousands-grouped number (183,456): read in checked and masked text only, never in a licensed CSV (where a comma
+# separates two values)
+GROUPED_RE = re.compile(r"(?<![A-Za-z_\d.,])\d{1,3}(?:,\d{3})+(?![\d,])(?:\.\d+)?%?")
+WEIGHT_CTX = re.compile(r"""weight["']?\s*:\s*$""")
 TEXT_EXT = (".csv", ".tsv", ".yaml", ".yml", ".json", ".jsonl", ".md", ".txt", ".log")
 ROUND_DECIMALS = (2, 3)
 SMALL_INT = 20
@@ -101,29 +106,62 @@ def licensed_values(paths) -> dict:
     return out
 
 
+def _candidates(tok) -> list:
+    """The canonical forms a token can stand for: itself, and for a percentage also its fraction (41.2% -> 0.412)."""
+    c = canon(tok.replace(",", ""))
+    if c is None:
+        return []
+    out = [c]
+    if tok.endswith("%"):
+        f = canon(str(Decimal(c) / 100))
+        if f is not None:
+            out.append(f)
+    return out
+
+
+def _tokens(text) -> list:
+    """(start, token) for every number in `text`, thousands-grouped spellings included."""
+    toks = [(m.start(), m.group(0)) for m in NUMBER_RE.finditer(text)]
+    return toks + [(m.start(), m.group(0)) for m in GROUPED_RE.finditer(text)]
+
+
+def _on_weight_grid(c) -> bool:
+    try:
+        x = float(c)
+    except ValueError:
+        return False
+    return _BT.WEIGHT_GRID - 1e-9 <= x <= 1 and abs(x / _BT.WEIGHT_GRID - round(x / _BT.WEIGHT_GRID)) < 1e-6
+
+
 def licensed_problems(data, lic, allow=()) -> list:
-    """Every number in `data` (YAML bytes or text, or a parsed object) that matches a licensed value, apart from the
-    exemptions in the module docstring. Unreadable YAML is checked as text."""
-    import yaml
+    """Every number in `data` that matches a licensed value, apart from the exemptions in the module docstring.
+    Bytes or text are checked as the exact raw text that is published: comments, overwritten duplicate keys and
+    unparseable YAML included, never a parsed view (Codex re-review). A weight is exempt only as the value of a
+    `weight:` key on the 0.05 grid. A parsed object (the seed input) is walked."""
     allow = {canon(a) for a in allow} - {None}
-    if isinstance(data, (bytes, bytearray)):
-        data = data.decode("utf-8", errors="replace")
-    if isinstance(data, str):
-        try:
-            data = yaml.safe_load(data)
-        except yaml.YAMLError:
-            pass
     hits = []
 
-    def tok_hit(tok, where):
-        c = canon(tok)
-        if c is None or c in allow:
+    def tok_hit(tok, where, weight=False):
+        cs = _candidates(tok)
+        if not cs or any(c in allow for c in cs):
             return
-        if "." not in c and (int(c) <= SMALL_INT or YEARS[0] <= int(c) <= YEARS[1]):
+        c = cs[0]
+        if weight and _on_weight_grid(c):
             return
-        dec = len(c.split(".")[1]) if "." in c else 0
-        if c in lic["exact"] or (dec in ROUND_DECIMALS and c in lic["rounded"][dec]):
-            hits.append(f"{where}: {tok}")
+        if "." not in c and not tok.endswith("%") and (int(c) <= SMALL_INT or YEARS[0] <= int(c) <= YEARS[1]):
+            return
+        for x in cs:
+            dec = len(x.split(".")[1]) if "." in x else 0
+            if x in lic["exact"] or (dec in ROUND_DECIMALS and x in lic["rounded"][dec]):
+                hits.append(f"{where}: {tok}")
+                return
+
+    if isinstance(data, (bytes, bytearray, str)):
+        text = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else data
+        for k, line in enumerate(text.splitlines()):
+            for at, tok in _tokens(line):
+                tok_hit(tok, f"line {k + 1}", weight=bool(WEIGHT_CTX.search(line[:at])))
+        return hits
 
     def walk(x, where, key=None):
         if isinstance(x, dict):
@@ -136,12 +174,9 @@ def licensed_problems(data, lic, allow=()) -> list:
         elif isinstance(x, bool) or x is None:
             return
         elif isinstance(x, (int, float)):
-            if key == "weight" and _BT.WEIGHT_GRID - 1e-9 <= x <= 1 and \
-                    abs(x / _BT.WEIGHT_GRID - round(x / _BT.WEIGHT_GRID)) < 1e-6:
-                return
-            tok_hit(repr(x), where)
+            tok_hit(repr(x), where, weight=key == "weight")
         else:
-            for tok in NUMBER_RE.findall(str(x)):
+            for _, tok in _tokens(str(x)):
                 tok_hit(tok, where)
     walk(data, "")
     return hits
@@ -152,11 +187,26 @@ def mask_numbers(text, allow=()) -> str:
     allow = {canon(a) for a in allow} - {None}
 
     def sub(m):
-        c = canon(m.group(0))
-        if c in allow or (c is not None and "." not in c and YEARS[0] <= int(c) <= YEARS[1]):
+        c = canon(m.group(0).replace(",", ""))
+        if c in allow or (c is not None and "." not in c and not m.group(0).endswith("%")
+                          and YEARS[0] <= int(c) <= YEARS[1]):
             return m.group(0)
         return "<value>"
-    return NUMBER_RE.sub(sub, str(text))
+    return NUMBER_RE.sub(sub, GROUPED_RE.sub(sub, str(text)))
+
+
+def mask_obj(x, allow=()):
+    """A copy of `x` with every number masked except the public ones: numeric values become <value>, strings are
+    masked by mask_numbers (Codex re-review: component parameters entered the seed input unmasked)."""
+    if isinstance(x, dict):
+        return {k: mask_obj(v, allow) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [mask_obj(v, allow) for v in x]
+    if isinstance(x, bool) or x is None:
+        return x
+    if isinstance(x, (int, float)):
+        return x if canon(repr(x)) in ({canon(a) for a in allow} - {None}) else "<value>"
+    return mask_numbers(str(x), allow)
 
 
 def outcome_map_problems(seed, omap) -> list:
@@ -269,7 +319,7 @@ def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
         "decision_run": {"topics": list(TOPICS), "topic_help": TOPIC_HELP,
                          "beliefs": {"min": beliefs[0], "max": beliefs[1]}, "outputs": OUTPUTS},
         "decision_maker": m(spec.get("decision_maker")), "decision_date": spec.get("decision_date"),
-        "components": {k: {kk: vv for kk, vv in (v or {}).items()} for k, v in (o.get("components") or {}).items()},
+        "components": mask_obj(o.get("components") or {}, allow),
         "packages": "every combination of the components with at most one net type (generated)",
         "comparator": m((spec.get("comparator") or {}).get("text")),
         "objective": {"outcome": (spec.get("objective") or {}).get("outcome"), "sense": "avert",
@@ -293,6 +343,39 @@ def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
                    "unit_attributes": sorted(card.get("unit_attributes") or {})},
         "public": {k: v for k, v in public.items()},
     }
+
+
+def licensed_repair(rd, ctx, hits, lic, allow, fn, led, qid, cap, r) -> dict:
+    """One repair of the seed task, told only where its numbers are refused. Reserved before, charged after; every
+    parse or validation failure after the charge is a recorded refusal, never an exception (Codex re-review). The
+    repaired seed is checked on its raw bytes and kept only when it passes both checks."""
+    import yaml
+    import world_model_trials as WMT
+    rid = led.reserve(qid, "seed licensed repair", cap)
+    if rid is None:
+        return dict(r, status="budget_refused")
+    fb = [f"remove every number at {h.split(':')[0]} (it matches a withheld input value); state it in words or drop "
+          "it, and keep the beliefs and weights" for h in hits]
+    try:
+        rr = fn(rd, ctx, fb, cap)
+    except Exception as e:  # noqa: BLE001 -- the reservation is charged in full and the repair is refused
+        led.charge(rid, cap, f"crashed: {type(e).__name__}: whole cap")
+        return dict(r, status="seed_refused", usd=r.get("usd", 0) + cap,
+                    licensed_repair={"hits": hits, "usd": cap, "after": [f"{type(e).__name__}: {e}"[:300]]})
+    usd = float(rr.usd) if rr is not None and isinstance(rr.usd, (int, float)) else cap
+    led.charge(rid, usd, "sdk reported" if rr is not None else "no result: whole cap")
+    try:
+        raw, _ = WMT._sio().read_nofollow(rd, WMT.SEED_FILE)
+        sd = yaml.safe_load(raw.decode("utf-8"))
+        again = (WMT.seed_problems(sd, ctx) if isinstance(sd, dict) else [f"{WMT.SEED_FILE}: a mapping"]) \
+            + licensed_problems(raw, lic, allow)
+    except Exception as e:  # noqa: BLE001 -- after the charge: a refusal, never a crash
+        raw, again = None, [f"{WMT.SEED_FILE} unreadable after the repair: {type(e).__name__}: {e}"[:300]]
+    out = dict(r, licensed_repair={"hits": hits, "usd": usd, "after": again}, usd=r.get("usd", 0) + usd,
+               status="ok" if not again else "seed_refused")
+    if not again:
+        WMT._sio().write_nofollow(rd, WMT.SEED, raw, atomic=True)       # the bytes that were checked
+    return out
 
 
 def _paths(a):
@@ -356,21 +439,7 @@ def main(argv=None) -> int:
         hits = licensed_problems(open(os.path.join(rd, WMT.SEED), "rb").read(), lic, allow) \
             if r.get("status") == "ok" else []
         if hits:                    # one repair of the same seed task, told only where its numbers are refused
-            rid = led.reserve(f"decision_{a.id}", "seed licensed repair", a.task_cap_usd)
-            if rid is None:
-                r = dict(r, status="budget_refused")
-            else:
-                fb = [f"remove every number at {h.split(':')[0]} (it matches a withheld input value); state it in "
-                      "words or drop it, and keep the beliefs and weights" for h in hits]
-                rr = fn(rd, ctx, fb, a.task_cap_usd)
-                usd = float(rr.usd) if rr is not None and isinstance(rr.usd, (int, float)) else a.task_cap_usd
-                led.charge(rid, usd, "sdk reported" if rr is not None else "no result: whole cap")
-                sd = yaml.safe_load(open(os.path.join(rd, WMT.SEED_FILE)))
-                again = WMT.seed_problems(sd, ctx) + licensed_problems(sd, lic, allow)
-                r = dict(r, licensed_repair={"hits": hits, "usd": usd, "after": again},
-                         usd=r.get("usd", 0) + usd, status="ok" if not again else "seed_refused")
-                if not again:
-                    WMT._sio().copy_nofollow(rd, WMT.SEED_FILE, WMT.SEED)
+            r = licensed_repair(rd, ctx, hits, lic, allow, fn, led, f"decision_{a.id}", a.task_cap_usd, r)
         if r.get("status") == "ok":
             WMT._sio().copy_nofollow(d, os.path.join("seed_run", WMT.SEED), SEED_REL)
         print(json.dumps(dict(r, seed=seed_p if r.get("status") == "ok" else None,
@@ -516,7 +585,58 @@ def _self_test() -> int:
            and ctx["decision_run"]["topics"] == list(TOPICS) and ctx["decision_tests"][0]["id"] == "DT10",
            f"DB6 the decision-run input masks every number but the public ones: {txt[:300]}")
 
-    for n, f in (("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6)):
+
+    # Codex re-review of 306ab98..dbdca9f (2026-11-15): the reviewer's probes
+    def db7():
+        lic = {"exact": {"0.41237", "183456", "0.83"}, "rounded": {2: {"0.41"}, 3: {"0.412"}}}
+        seed = ("decision_beliefs:\n  - id: D1\n    claims:\n      - {claim: a, weight: 0.4}\n"
+                "      - {claim: b, weight: 0.6}\n")
+        ok(licensed_problems(seed.encode(), lic) == [], f"DB7 raw bytes: weights on the grid pass: "
+                                                        f"{licensed_problems(seed.encode(), lic)}")
+        for why, raw in (("a YAML comment", seed + "# measured prevalence 0.41237\n"),
+                         ("an overwritten duplicate key", "notes: 0.41237\nnotes: clean\n" + seed),
+                         ("a weight off the grid", seed.replace("weight: 0.4}", "weight: 0.41237}")),
+                         ("unparseable YAML", "decision_beliefs: [ 0.412\n")):
+            ok(bool(licensed_problems(raw.encode(), lic)), f"DB7b the raw bytes are checked: {why}")
+
+    def db8():
+        lic = {"exact": {"0.41237", "183456"}, "rounded": {2: {"0.41"}, 3: {"0.412"}}}
+        for sp in ("prevalence .41237", "4.1237e-1", "41.237%", "population 183,456", "0.41237", ".41 share"):
+            ok(bool(licensed_problems({"notes": sp}, lic)) and bool(licensed_problems(sp.encode(), lic)),
+               f"DB8 another spelling of a licensed number is refused: {sp!r}")
+        m = mask_numbers("prevalence .41237, 4.1237e-1, 41.237% and 183,456; version v0.17", [])
+        ok(m == "prevalence <value>, <value>, <value> and <value>; version v0.17",
+           f"DB8b masking recognises the same spellings: {m}")
+
+    def db9():
+        spec = {"options": {"components": {"smc": {"reach_share": 0.83, "eligible": "smc_eligible",
+                                                    "nested": {"k": [0.77, "x 0.66"]}}}}}
+        ctx = decision_context(spec, {}, {"public_numbers": []})
+        txt = json.dumps(ctx["components"])
+        ok(not any(x in txt for x in ("0.83", "0.77", "0.66")) and "smc_eligible" in txt,
+           f"DB9 component parameter values are masked unless public: {txt}")
+        ctx2 = decision_context(spec, {}, {"public_numbers": [{"value": 0.83, "source": "s"}]})
+        ok("0.83" in json.dumps(ctx2["components"]), "DB9b a public component value is kept")
+
+    def db10():
+        from types import SimpleNamespace
+        import world_model_trials as WMT
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        lic = {"exact": {"0.41237"}, "rounded": {2: set(), 3: set()}}
+        for why, body in (("unparseable YAML", "decision_beliefs: [\n"),
+                          ("a list-valued id", "decision_beliefs:\n  - {id: [D1], topic: net_type}\n"),
+                          ("not a mapping", "- 1\n")):
+            with tempfile.TemporaryDirectory() as d:
+                def fn(rd, c, fb, cap, body=body):
+                    open(os.path.join(rd, WMT.SEED_FILE), "w").write(body)
+                    return SimpleNamespace(usd=0.25, note="n")
+                led = WMT.SpendLedger(os.path.join(d, "s.jsonl"), 5.0)
+                r = licensed_repair(d, ctx, ["/notes: 0.41237"], lic, [], fn, led, "decision_t", 1.0, {"usd": 0.0})
+                ok(r.get("status") == "seed_refused" and abs(led.spent() - 0.25) < 1e-9 and r["licensed_repair"]["after"],
+                   f"DB10 a licensed repair that returns {why} is a recorded refusal after its charge: {r}")
+
+    for n, f in (("DB1", db1), ("DB2", db2), ("DB3", db3), ("DB4", db4), ("DB5", db5), ("DB6", db6), ("DB7", db7),
+                 ("DB8", db8), ("DB9", db9), ("DB10", db10)):
         tryit(n, f)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

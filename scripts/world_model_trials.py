@@ -382,18 +382,20 @@ class GitAnchor:
         for rel in rels:
             self._check(rel)
         for rel in rels:
-            if self.decision.match(rel):
-                if check is None:
-                    raise TrialError(f"{rel}: a decision file is published only through a licensed-number check")
-                data, _ = _sio().read_nofollow(self.repo, rel)
-                bad = check(rel, data)
-                if bad:
-                    raise TrialError(f"{rel}: the licensed-number check refused it: {list(bad)[:5]}")
+            if self.decision.match(rel) and check is None:
+                raise TrialError(f"{rel}: a decision file is published only through a licensed-number check")
         with self._lock:
+            # each file is read once; those bytes are checked and those bytes are written (Codex re-review: a
+            # re-read after the check could publish content that was never checked)
+            data = {rel: _sio().read_nofollow(self.repo, rel)[0] for rel in rels}
+            for rel in rels:
+                if self.decision.match(rel):
+                    bad = check(rel, data[rel])
+                    if bad:
+                        raise TrialError(f"{rel}: the licensed-number check refused it: {list(bad)[:5]}")
             self.ensure()
             for rel in rels:
-                data, _ = _sio().read_nofollow(self.repo, rel)
-                _sio().write_nofollow(self.wt, rel, data, atomic=True)
+                _sio().write_nofollow(self.wt, rel, data[rel], atomic=True)
             self._git("add", "--", *rels, cwd=self.wt)
             staged = [x for x in self._git("diff", "--cached", "--name-only", cwd=self.wt).stdout.splitlines() if x]
             held = [x for x in self._git("ls-files", cwd=self.wt).stdout.splitlines() if x]
@@ -852,7 +854,8 @@ def seed_step(q, run_dir, ctx, seed_fn, ledger, task_cap_usd) -> dict:
         if not feedback:
             data, _ = _sio().read_nofollow(run_dir, SEED_FILE)
             _sio().write_nofollow(run_dir, SEED, data, atomic=True)
-            return dict(out, status="ok", hypotheses=len(seed.get("hypotheses") or seed.get("decision_beliefs") or []),
+            return dict(out, status="ok", hypotheses=len(seed["decision_beliefs"] if ctx.get("decision_run")
+                                       else seed["hypotheses"]),
                         refusals=out.get("refusals", []))
         out.setdefault("refusals", []).append(feedback)
         if attempt == 0:
@@ -3604,6 +3607,40 @@ def _self_test() -> int:
             ok(r.get("status") == "seed_refused" and len(calls) == 2 and abs(led.spent() - 0.5) < 1e-9,
                f"WT29g a seed that breaks the validator is refused after both charges, not raised: {r}")
     tryit("WT29 decision seed step", wt29_seed_step)
+
+    def wt29_reviewed():
+        # Codex re-review of 306ab98..dbdca9f: a stray hypotheses field; checked bytes are the pushed bytes
+        from types import SimpleNamespace
+        ctx = {"decision_run": {"topics": ["net_type"], "beliefs": {"min": 1, "max": 3}}}
+        seed = {"hypotheses": 7, "decision_beliefs": [
+            {"id": "D1", "topic": "net_type", "question": "q", "decides": True, "why_decides": "w", "layer": "world",
+             "claims": [{"claim": "a", "weight": 0.6}, {"claim": "b", "weight": 0.4}], "basis": [{"mechanism": "m"}]}]}
+
+        def fn(rd, c, fb, cap):
+            open(os.path.join(rd, SEED_FILE), "w").write(yaml.safe_dump(seed))
+            return SimpleNamespace(usd=0.5, note="n")
+        with tempfile.TemporaryDirectory() as d:
+            r = seed_step({"id": "decision_t"}, d, ctx, fn, SpendLedger(os.path.join(d, "s.jsonl"), 5.0), 1.0)
+            ok(r.get("status") == "ok" and r.get("hypotheses") == 1,
+               f"WT29h a decision seed's count is its beliefs, whatever a stray hypotheses field holds: {r}")
+        with tempfile.TemporaryDirectory() as d:
+            repo = _toy_repo(d)
+            A = GitAnchor(repo, os.path.join(repo, "trials", ".wm-trials"))
+            rel = "trials/decisions/f6/world_model_seed.yaml"
+            src = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(src))
+            open(src, "w").write("notes: clean\n")
+            checked = []
+
+            def chk(r_, b):          # a concurrent edit lands while the check runs
+                checked.append(b)
+                open(src, "w").write("notes: leaked 0.41237\n")
+                return []
+            res = A.publish([rel], "f6", check=chk)
+            pushed = _git("show", f"{res['commit']}:{rel}", cwd=repo) + "\n"
+            ok(checked == [b"notes: clean\n"] and pushed == "notes: clean\n",
+               f"WT29i the bytes pushed are the bytes checked, read once: {checked}, {pushed!r}")
+    tryit("WT29 reviewed", wt29_reviewed)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
