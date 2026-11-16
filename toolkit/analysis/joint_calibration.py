@@ -897,6 +897,60 @@ def _CachedRunner(*a, **k):
     return _runner_cls()(*a, **k)
 
 
+def stored_rows(run_dir) -> dict:
+    """{job_sha: row} of every unit-batch row already stored under the run's analysis/joint_calibration/call*/
+    (results.jsonl, compute.py format with harness provenance). F6 run 1 (2026-11-16): compute.py reuses a row only
+    under the same whole-repo code fingerprint, so any harness edit recomputed every stored calibration run (3,088 in
+    F6, about $114). A row is reused here only when its job_sha equals the job's (every input: engine reference and
+    config, horizon, windows, unit, package, params, seed) and its engine identity (code, parameters, configuration)
+    equals the current engine's: batch.verify_rows, the check load_prior applies to earlier runs."""
+    import glob
+    out = {}
+    for f in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*", "results.jsonl"))):
+        for sha, body in stored_rows_file(f).items():
+            out.setdefault(sha, body)
+    return out
+
+
+def stored_rows_file(path) -> dict:
+    """{job_sha: row} of one results file: ok rows carrying a job_sha and a result; anything else is skipped."""
+    out = {}
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return out
+    for x in lines:
+        try:
+            r = json.loads(x)
+        except ValueError:
+            continue
+        body = r.get("result") if isinstance(r, dict) and r.get("ok") else None
+        sha = ((body or {}).get("provenance") or {}).get("job_sha") if isinstance(body, dict) else None
+        if isinstance(sha, str) and sha and isinstance(body.get("result"), dict):
+            out.setdefault(sha, body)
+    return out
+
+
+def reuse_check(spec, run_dir) -> dict:
+    """Read-only: the stored unit rows under the run (stored_rows) whose engine identity equals the current
+    engine's, by call. Such a row is reused when the calibration asks for its job (same job_sha); this check does
+    not generate the jobs (compute.py reuse-check's caveat)."""
+    import glob
+    from toolkit.engines.contract import engine_identity
+    ident = engine_identity(spec.engine())
+    calls, seen = {}, set()
+    for f in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*", "results.jsonl"))):
+        c = {"stored": 0, "engine_match": 0}
+        for sha, body in stored_rows_file(f).items():
+            c["stored"] += 1
+            if sha not in seen and body.get("provenance", {}).get("engine") == ident:
+                c["engine_match"] += 1
+            seen.add(sha)
+        calls[os.path.basename(os.path.dirname(f))] = c
+    return {"calls": calls, "stored": sum(c["stored"] for c in calls.values()),
+            "eligible": sum(c["engine_match"] for c in calls.values()), "engine": ident}
+
+
 class Simulator:
     """HistoryMatch's simulate(): unit points through the analysis batch (comparator package), shared points through
     the benchmark runner. Every call writes its own results file under analysis/joint_calibration/."""
@@ -918,6 +972,8 @@ class Simulator:
         if spec.raw["objective"].get("delivery") is not None:
             self.horizon["delivery"] = [float(x) for x in spec.raw["objective"]["delivery"]]
         self.bench = None
+        self.stored = stored_rows(run_dir)      # read before this run rewrites any results file
+        self.reused = 0
 
     def job(self, p, k, windows=None, call=None) -> dict:
         """The batch job of unit point p at position k of a call (the batch's job_sha covers every field but id)."""
@@ -1025,26 +1081,62 @@ class Simulator:
 
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
+            from toolkit.analysis import batch as B
             jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
+            out_rel = f"{OUT_REL}/call{self.calls}/results.jsonl"
+            pool = getattr(self, "stored", None) or {}
+            sha = [B.job_sha(j) for j in jobs]
+            cand = [{"id": j["id"], "result": pool[h]} for j, h in zip(jobs, sha) if h in pool]
+            reused = B.verify_rows(cand, jobs, self.eng)[0] if cand else {}     # job_sha + engine identity
+            todo = [j for j in jobs if j["id"] not in reused]
+
             def run_once():
-                return Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
+                return Bt.run(self.run_dir, todo, self.eng, out_rel=out_rel,
                               **{k: v for k, v in self.kw.items() if k != "bench_workers"})
-            b = run_once()
-            kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
-            if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
-                self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
+            b = {"results": {}, "problems": []}
+            if todo:
                 b = run_once()
+                kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
+                if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
+                    self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
+                    b = run_once()
+            if reused:      # first, so a failing batch below never leaves the stored rows off disk
+                self.reused = getattr(self, "reused", 0) + len(reused)
+                self.log(f"joint calibration batch: {len(reused)} of {len(jobs)} unit runs reused from stored rows "
+                         f"(job_sha and engine identity match); {len(todo)} computed")
+                self._publish(out_rel, jobs, sha, pool, reused, todo)
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
+            res = dict(b["results"], **reused)
             for k, n in enumerate(uix):
-                r = b["results"].get(jobs[k]["id"])
+                r = res.get(jobs[k]["id"])
                 ref = f"call{self.calls}:{k}"
                 if r is None:
                     raise HM.CalibrationInputError([f"joint calibration batch: job {jobs[k]['id']} (unit "
                                                     f"{pts[n]['unit']}) did not complete"])
                 out[n] = {f"{w}.{m}": v for w, d in (r.get("windows") or {}).items() for m, v in d.items()}
                 out[n]["_ref"] = ref
+
+    def _publish(self, out_rel, jobs, sha, pool, reused, todo):
+        """The call's results file in job order, every row with its provenance: the reused rows as stored, the
+        computed ones as the batch wrote them (its file then held only those), so the file stays a valid --prior
+        source and the next run's pool."""
+        from toolkit.analysis import batch as B
+        from toolkit.analysis.artifacts import _safe_io
+        path = os.path.join(self.run_dir, out_rel)
+        new = {}
+        if todo and os.path.exists(path):
+            for x in open(path):
+                r = json.loads(x) if x.strip() else {}
+                j = todo[r["i"]] if r.get("ok") and isinstance(r.get("i"), int) and 0 <= r["i"] < len(todo) else None
+                pv = ((r.get("result") or {}).get("provenance") or {}) if j is not None else {}
+                if j is not None and pv.get("job_sha") == B.job_sha(j):     # never a stale row of an earlier file
+                    new[j["id"]] = r["result"]
+        text = "".join(json.dumps({"i": n, "ok": True, "result": pool[h] if j["id"] in reused else new[j["id"]]})
+                       + "\n" for n, (j, h) in enumerate(zip(jobs, sha)) if j["id"] in reused or j["id"] in new)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _safe_io().publish(path, text, self.run_dir)
 
 
 # --------------------------------------------------------------------------- the step
@@ -1201,6 +1293,7 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, w
     rep["prior_runs"] = pinfo
     rep["adapter"] = {"windows": meta["windows"], "dropped_targets": meta["dropped"], "units": len(meta["units"]),
                       "shared": list(j["shared"]), "simulator_calls": sim.calls,
+                      "stored_rows_reused": sim.reused,
                       "theta_held": {k: v for k, v in sim.th0.items() if k not in j["shared"]}}
     rep["primary"] = {"targets": {t["id"]: {k: t[k] for k in SENS_KEYS if k in t} for t in j["targets"]
                                   if t["kind"] != "benchmark"},
@@ -1318,6 +1411,8 @@ def main(argv=None) -> int:
     ap.add_argument("--then-waves", type=int, default=0, help="new waves of the second setting (default 0)")
     ap.add_argument("--waves", type=int)
     ap.add_argument("--points-per-unit", type=int)
+    ap.add_argument("--reuse-check", action="store_true",
+                    help="read-only: stored unit rows the current engine identity would reuse, by call")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -1328,6 +1423,10 @@ def main(argv=None) -> int:
     from toolkit.spec import schema
     rd = os.path.abspath(a.run_dir)
     spec = schema.load(os.path.join(rd, a.spec))
+    if a.reuse_check:
+        r = reuse_check(spec, rd)
+        print(json.dumps({k: v for k, v in r.items() if k != "engine"}, indent=1))
+        return 0
     units = [x.strip() for x in open(a.units) if x.strip()] if a.units else None
     kw = {"max_workers": a.workers, "bench_workers": a.bench_workers or a.workers}
     if a.max_core_hours:
