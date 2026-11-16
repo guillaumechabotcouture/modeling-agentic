@@ -1,0 +1,215 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Susceptible children
+  have accumulated unevenly across 24 districts since the last measles campaign; one importation in 2026 will start
+  an outbreak in each district (R0 12-18, homogeneous mixing; everyone aged 15 or older immune; infants under one
+  susceptible). For each district choose one option: none; ROUTINE (a strengthening drive before any outbreak, day
+  0, that vaccinates 60% of children under five, US$0.50 per resident); RESPONSE (an outbreak-response campaign
+  completed 42 days after the importation, reaching 85% of children aged 1-9, US$1.30 per resident). The budget
+  is US$5 million. Input file: units.csv (population; the susceptible share of children aged 1-4, 5-9 and 10-14
+  from a synthetic serosurvey). Choose the options that maximise measles infections averted within the budget, report
+  the total with a 95% uncertainty interval, and state the rule (when is the immunity gap too large for prevention
+  in the youngest alone?).'
+decision_maker: measles programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - u1
+    - a1_4
+    - a5_9
+    - a10_14
+    - a15p
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    components:
+      routine:
+        kind: campaign
+        targets:
+        - u1
+        - a1_4
+        reach: 0.6
+        day: 0
+      response:
+        kind: campaign
+        targets:
+        - a1_4
+        - a5_9
+        reach: 0.85
+        day: 42
+    tol: 1.0e-09
+    generation_interval:
+    - 0.1
+    - 0.55
+    - 0.3
+    - 0.05
+horizon:
+  start: 0
+  stop: 3650
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    seed:
+      value: 1.0e-06
+      source: one importation in a district of about a million
+    intro:
+      value: a1_4
+      source: importation into the youngest susceptible-rich band
+  defaults_accepted:
+    reach:routine: the configured reach (question text)
+    reach:response: the configured reach (question text)
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    routine:
+      group: option
+    response:
+      group: option
+  packages:
+    none: []
+    routine:
+    - routine
+    response:
+    - response
+  engine_map:
+    routine:
+      routine: 1
+    response:
+      response: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: routine_cost
+    component: routine
+    value: 0.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - routine
+  - id: response_cost
+    component: response
+    value: 1.3
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - response
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 3650
+  discounting: none
+constraints:
+  envelope_usd: 5000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:routine:
+    value: 0.88
+    range:
+    - 0.8
+    - 0.95
+    dist: triangular
+    basis: literature
+    source: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011;204 Suppl 1:S133-S148 (one dose about 0.84 at 9-11 months and 0.92
+      at 12 months or later)'
+    reason: protection of the susceptibles reached
+  efficacy:response:
+    value: 0.9
+    range:
+    - 0.84
+    - 0.95
+    dist: triangular
+    basis: literature
+    source: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011;204 Suppl 1:S133-S148 (one dose about 0.84 at 9-11 months and 0.92
+      at 12 months or later)'
+    reason: protection of the susceptibles reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 60.0
+  - 90.0
+  target_column: r0_target
+  window:
+  - 0
+  - 3650
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); with homogeneous mixing R0
+    = q x contact_rate, so contact_rate over [60.0, 90.0] spans R0 12-18
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 128
+    holdout_share: 0.0
+    seed: 7
+    features: &id002
+    - gap_1_4
+    - gap_5_9
+    - gap_10_14
+    - pop
+    independent_features:
+      features: *id002
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table) Seed 35791 chosen by a deterministic search so the realized table's declared features have max |Spearman| 0.151 <= 0.2 (chain b copy, 128 design points).
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

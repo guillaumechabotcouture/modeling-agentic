@@ -122,6 +122,67 @@ def windows(spec) -> dict:
     return dict(out, **({BV.WINDOW: mw["window"]} if mw else {}))
 
 
+def independent_features(spec) -> tuple[list, dict]:
+    """(features, basis) of the signed spec's `analysis.emulator.independent_features: {features, basis, generator}`:
+    declared unit features of a synthetic units table that its generator draws independently of the table's other
+    columns. A declared fact about the data-generating process, never a statistical claim and never for measured
+    data: the generator (a file beside the spec) is named and fingerprinted. toolkit/analysis/world_model.py reads the
+    design's independent_features to settle conditional claims. A feature that is not a declared design feature, a
+    missing basis or a missing generator is refused (ValueError)."""
+    import hashlib
+    from toolkit.analysis import features as FT
+    dec = (spec["analysis"].get("emulator") or {}).get("independent_features")
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    if not isinstance(dec, dict) or not isinstance(dec.get("features"), list) or not dec["features"]:
+        raise ValueError("analysis.emulator.independent_features: {features: [...], basis, generator}")
+    bad = [f for f in dec["features"] if f not in names]
+    if bad:
+        raise ValueError(f"analysis.emulator.independent_features: {bad} are not declared design features {names}")
+    if not str(dec.get("basis") or "").strip():
+        raise ValueError("analysis.emulator.independent_features.basis: how the generator draws them independently")
+    gen = str(dec.get("generator") or "").strip()
+    path = spec.resolve(gen) if gen else None
+    if not path or not os.path.isfile(path):
+        raise ValueError(f"analysis.emulator.independent_features.generator: {gen!r} is not a file beside the spec "
+                         "(the synthetic table's generator)")
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    # A generator that draws columns independently can still realize a correlated table on a few units (a world-model
+    # trial's 24 units gave rank correlation 0.82 between two separately drawn columns): the declaration holds only
+    # when the realized table's declared features are also uncorrelated with every design feature (|Spearman| <=
+    # INDEPENDENCE_RHO_MAX).
+    rho = realized_rank_correlations(spec, list(dec["features"]))
+    big = {k: v for k, v in rho.items() if abs(v) > INDEPENDENCE_RHO_MAX}
+    if big:
+        raise ValueError(f"analysis.emulator.independent_features: the realized units table correlates declared features "
+                         f"{ {k: round(v, 3) for k, v in big.items()} } (|Spearman| > {INDEPENDENCE_RHO_MAX}): draw a "
+                         "table whose declared columns are uncorrelated, or do not declare them independent")
+    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha,
+                                   "realized_max_abs_spearman": max((abs(v) for v in rho.values()), default=0.0)}
+
+
+INDEPENDENCE_RHO_MAX = 0.3
+
+
+def realized_rank_correlations(spec, features) -> dict:
+    """{"a|b": Spearman rho} over the units table (as features.vector reads them) between each of `features` (the
+    declared-independent ones) and every other declared design feature, each pair once: a feature drawn independently
+    must be uncorrelated with every other column the design varies, not only with the other declared ones (Codex
+    review of #225: pop declared alone passed with Spearman 1 against seed_share)."""
+    from scipy.stats import spearmanr
+    from toolkit.analysis import features as FT
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    rows = [FT.vector(spec, u) for u in spec.units()]
+    col = {f: [r[names.index(f)] for r in rows] for f in names}
+    feats = [f for f in features if f in col]
+    out = {}
+    for i, a in enumerate(feats):
+        for b in feats[i + 1:] + [x for x in names if x not in feats]:
+            if len(set(col[a])) > 1 and len(set(col[b])) > 1:
+                out[f"{a}|{b}"] = float(spearmanr(col[a], col[b])[0])
+    return out
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -168,6 +229,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     if ext:
         d["design_ranges"] = ext          # parameters whose design box is not their declared range (decision-test
         #                                   values, a net-effect posterior's hull)
+    if em.get("independent_features") is not None:     # only when declared, so other designs stay
+        d["independent_features"], d["independent_features_basis"] = independent_features(spec)
     from toolkit.analysis import uncertainty as UQ
     ne = UQ.net_effect_sample(spec, eng)    # cached: the sample design_box read
     if ne is not None:                      # only with the field, so other designs stay

@@ -1,0 +1,171 @@
+# World-model trial template (school_influenza_estimation, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Influenza-like illness
+  outbreaks occur in 20 closed boarding schools (600-2,400 pupils each) at the start of term in 2026. Using an SIR-type
+  model of a single well-mixed school population, estimate (1) the basic reproduction number R0 of the outbreak
+  strain in a school and (2) the share of pupils infected over the term, each with a 95% uncertainty interval, and
+  say how both depend on the pupils'' pre-term immunity and the number infected at the start. Also say whether a
+  pre-term vaccination day (about 50% of pupils vaccinated, US$12 per pupil, within a US$150,000 budget) is worth
+  it in which schools. Input file: units.csv (pupils, share susceptible at the start of term from a synthetic serosurvey,
+  share already infected on day 0).'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups:
+    - all
+    structure: single_group
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: day
+    time_unit: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 1.5
+        infectious_days: 2.5
+    components:
+      vaccinate:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.5
+    tol: 1.0e-09
+horizon:
+  start: 0
+  stop: 120
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+      split: ' '
+    s0:
+      column: s0
+      split: ' '
+    seed:
+      column: seed_share
+  defaults_accepted:
+    reach:vaccinate: the configured reach (question text)
+    intro: 'single group: the infection enters the only group'
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    vaccinate: {}
+  packages:
+    none: []
+    vaccinate:
+    - vaccinate
+  engine_map:
+    vaccinate:
+      vaccinate: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: vaccinate_cost
+    component: vaccinate
+    value: 12.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - vaccinate
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 120
+  discounting: none
+constraints:
+  envelope_usd: 150000
+comparator:
+  package: none
+  text: no response
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:vaccinate:
+    value: 0.59
+    range:
+    - 0.4
+    - 0.7
+    dist: triangular
+    basis: literature
+    source: 'pooled efficacy of inactivated influenza vaccine about 0.59 (95% CI 0.51-0.67) in adults (Osterholm
+      MT et al. Efficacy and effectiveness of influenza vaccines: a systematic review and meta-analysis. Lancet
+      Infect Dis 2012;12:36-44)'
+    reason: protection of the vaccinated susceptible pupils
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 6.0
+  - 14.0
+  target_column: r0_target
+  window:
+  - 0
+  - 120
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2; in one homogeneous group R0 = q x contact_rate, so contact_rate over
+    [6, 14] spans R0 1.2-2.8 (the estimation target)
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 80
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - s0
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

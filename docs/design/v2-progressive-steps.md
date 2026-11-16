@@ -88,94 +88,53 @@ What each step passes forward:
 - Step 3 gives the plan and its comparison with step 0. When the two agree, the report says the
   simulation added little for this decision.
 
-## 4. The world model: the modeller's working understanding
+## 4. The world model: one table of beliefs
 
-A good modeller carries a model of the world in their head: simpler than any simulation, and not
-meant to be precise, only mostly right. They build it from reading papers, analysing data and
-running simulations. They *run* it in their head to get expectations ("in the north, with this
-resistance, PBO nets should beat dual-AI on cost") and rough priors ("SMC should avert somewhere
-between a third and two thirds of cases in children it reaches"). They then confront it with
-papers, data and simulations, and refine it where it was wrong.
+The world model is the modeller's working understanding of the decision. It is meant to be mostly right, not precise, and it is kept as one table (owner, 2026-11-13). Each row is a belief:
 
-The harness makes this explicit as the **world model**: a short, readable file of beliefs about
-how the decision works, which every step reads and refines. Precision is not its job; the
-simulation and the analysis provide the numbers. Its job is to generate the right hypotheses
-and sensible priors, and to say where it is unsure.
+| Field | Meaning |
+|---|---|
+| claim | a direction or a threshold, in words: "the reactive campaign averts less as susceptibility rises"; "the choice flips where incidence passes about 0.005" |
+| p | the world model's probability that the claim holds |
+| basis | paper, simulation or data, with its reference (citation and table or page; artifact; dataset and column) |
+| decides | yes or no: would being wrong about this belief change the recommendation? |
+| history | dated outcomes: each test, its result and the p held before it |
 
-**What it holds** (`analysis/world_model.yaml`):
+The table carries no confidence labels, no multiple-testing correction and no equivalence bands. Each test is a pre-registered claim scored against its p. The engine's sweep supplies the evidence, and the decision's numbers still come from the analysis' claims.
 
-- **Mechanisms and their direction.** What causes what, and which way: "PBO restores net killing
-  where pyrethroid resistance is high; the advantage fades as the synergist decays".
-- **Rough magnitudes.** Bands, not point values: "about half", "small (under 10%)", "a factor of 2
-  to 5".
-- **Conditions and branching points.** Where the answer changes, roughly located: "dual-AI is
-  preferred where resistance is strong, somewhere below 20–40% bioassay mortality, at today's
-  price ratio".
-- **Each belief's basis and confidence.** Its source type (literature, data, simulation), the
-  evidence (citation and table, dossier entry, or the simulation artifact), how confident we are,
-  and any conflicting evidence kept side by side, never averaged.
-- **Open questions.** What is unknown and would change the choice if known.
-- **Track record.** How often its expectations have been confirmed when confronted. This is how
-  "mostly right" is measured, and it falls when the world model needs rethinking.
+## 5. Three rules and one guard
 
-**Running it.** For a setting or a question, the world model is read through to produce:
+**Rule 1: predict.** Before a simulation, every belief bearing on it states what it expects the simulation to show, as a machine-checkable test, together with its p. The registration ledger holds the test and is anchored in remote git before the evidence exists, as now (`toolkit/analysis/world_model.py`).
 
-- **Hypotheses**: testable expectations, each with what would refute it ("the plan puts
-  dual-AI nets in the northern states and PBO nets in the south"; refuted if a northern state
-  gets PBO in most draws).
-- **Priors**: ranges for inputs and effects, which go into the evidence dossier as proposals and
-  into the signed spec only after the dossier's checks and the owner's sign-off.
-- **Where to look**: which simulation runs or which evidence would most change a belief that
-  matters to the decision.
+**Rule 2: score.** The outcome is confirmed, refuted or undecided.
+- Surprise is −log₂ p(outcome) bits.
+- Calibration is the observed confirmation frequency in each p-bin.
+- Skill over time is the Brier score and the log score over decided claims, per batch of questions.
+- Undecided outcomes are counted, not scored.
 
-A bounded reasoning task can run it, because this is judgement, not arithmetic. What it produces
-must be testable: each hypothesis names the result that would refute it, so the harness can
-check it mechanically.
+**Rule 3: update and choose.** The update is a fixed, stated rule (`toolkit/analysis/belief_table.py`):
+- confirmed: p ← p + 0.1 (1 − p);
+- refuted: the belief is rewritten as the observed claim at p = 0.3, and its open question is kept;
+- undecided: no change.
 
-**Confronting it.** After a paper is read, a dataset analysed or a simulation step run, its
-hypotheses are compared with what was found. Confirmed beliefs gain confidence. A contradiction
-is the most informative event in a run: either the world model is missing a mechanism, or the
-source or the simulation is wrong. The contradiction is recorded, its likely cause stated as a new
-hypothesis, and the belief revised once the cause is tested. It is never resolved by adjusting
-the simulation's inputs until they agree.
+The next simulation goes to the belief with decides = yes whose p is nearest 0.5, where an outcome would teach the most about the choice.
 
-**It exists before any simulation.** Version 0 comes from literature, data and step 0's
-arithmetic, and states what the modeller expects the engine to show. A world model from one run is
-the starting point for the next run on a similar question.
+**The guard.** A claim cannot be tested by a simulation whose declared inputs determine its outcome without running the dynamics. The declared inputs are the priors, prices, λ and unit columns. The guard replaces the separate circular, prior-echo, engine-blind, leaked-price and threshold-arithmetic rules. It is checked mechanically from the run's own inputs and code (`scripts/world_model_trials.py` `guard_reasons`), and a claim is set aside when any of these holds:
+1. It tests an effect against that effect's own declared parameter.
+2. It bounds a package's relative reduction, and that reduction is explained by the package's own declared effect parameters alone (R² ≥ 0.99 over the design, which spans their declared ranges). An empirical engine in trial-prior mode has this property by construction.
+3. It compares two packages, or locates their flip, where each package's reduction is so explained. The winner is then arithmetic on the declared burden, priors, prices and λ.
+4. It is a direction claim on a feature the engine never reads: a units-table column bound to no engine attribute (unless declared as read through a derived attribute), or a calibration axis the card does not list.
+5. It is a conditional claim settled on a feature declared independent, but the realized units table correlates that feature with another declared one (|Spearman| > 0.3).
 
-**What it is not.** It is not a quantitative surrogate of the engine (the emulator does that),
-and its numbers are never decision numbers: the report's figures come from the analysis' claims.
-The report may use the world model to explain the result in plain terms, citing which beliefs the
-analysis confirmed.
+Checks 1, 4 and 5 read inputs only and run before any simulation. Checks 2 and 3 run after the sweep, on its stored results, unless the engine's declared structure already settles them. A claim the guard sets aside is reported with its reason and never scored.
 
-## 5. The learning loop
+**What the table cannot tell us.**
+- It measures agreement between the world model and the engine, not between the world model and the world. A confirmed claim means the simulation behaved as the modeller expected.
+- An initial p taken from a confidence label's past confirmation rate is calibrated only to the questions it was fitted on.
+- Undecided outcomes carry no score, so a world model that states only claims it cannot lose looks well calibrated. The count of undecided claims has to be read alongside the score.
+- The guard removes claims whose outcome is fixed by declared inputs, but not claims whose outcome is fixed by an engine structure the inputs do not reveal.
+- Choosing the next simulation by p nearest 0.5 says where a result is informative, not what it costs to run.
 
-After each step, the harness runs the same loop on the world model:
-
-1. **State hypotheses.** Each one is an edit to the world model: a term's form, a branching point
-   or a rule, with what would refute it and the test. Example: "in the north, the choice of net
-   type is driven by resistance and flips below about 0.3 bioassay mortality". Hypotheses are
-   recorded in `analysis/hypotheses.yaml` with their status (open, supported, refuted, untestable
-   with available data).
-2. **Rank inputs by value of information.** The inputs that both move the decision and have a weak
-   dossier entry come first. Example: northern resistance, where every value comes from one
-   irrigated-rice site.
-3. **Look for data.** A bounded evidence task searches for better sources for those inputs only,
-   with every value cited. When the data exist but are not public, it says so and the request goes
-   to the owner.
-4. **Test.** Each hypothesis gets a decision test or a targeted sweep. Only the steps an input
-   touches are re-run, using the incremental rebuild (`model-library.md` §5.4).
-5. **Update the world model.** Supported hypotheses change it; refuted ones are kept with their
-   evidence, so the next run does not repeat them.
-6. **Stop.** When neither any single input nor any declared group of inputs, nor all of them
-   together (the expected value of perfect information), has value above a threshold, since
-   inputs can matter only jointly; when the remaining
-   uncertainty cannot be reduced with available data, or when the budget is reached. The stopping
-   reason is recorded.
-
-**The owner's role.** New data changes the signed dossier. The loop proposes the changes and
-pauses; the owner re-signs. The loop never edits a signed input itself, so it cannot tune
-inputs toward an answer (principle 4).
 
 ## 6. Changes to the harness
 

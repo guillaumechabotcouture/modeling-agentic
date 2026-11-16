@@ -1,0 +1,218 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A second-dose measles
+  catch-up is planned in 24 districts, where an importation is expected early in the school year. Each district
+  can run it as SCHOOL (in schools during the first school term, before the importation: day 0, reaching 90% of
+  children aged 5-14, US$0.80 per resident) or COMMUNITY (a house-to-house campaign in the long holiday, 70 days
+  after the importation, reaching 75% of children aged 1-9, US$1.20 per resident), or not at all. R0 is between
+  12 and 18 with homogeneous mixing; everyone aged 15 or older is immune and infants under one are susceptible.
+  The budget is US$5 million. Input file: units.csv (population; susceptible shares of children aged 1-4, 5-9 and
+  10-14 from a synthetic serosurvey; the expected importation as a share of the population). Choose the option per
+  district that maximises measles infections averted, report the total with a 95% uncertainty interval, and state
+  when reaching school-age children early beats reaching the youngest late.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - u1
+    - a1_4
+    - a5_9
+    - a10_14
+    - a15p
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    components:
+      school:
+        kind: campaign
+        targets:
+        - a5_9
+        - a10_14
+        reach: 0.9
+        day: 0
+      community:
+        kind: campaign
+        targets:
+        - a1_4
+        - a5_9
+        reach: 0.75
+        day: 70
+    tol: 1.0e-09
+    generation_interval:
+    - 0.1
+    - 0.55
+    - 0.3
+    - 0.05
+horizon:
+  start: 0
+  stop: 3650
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    seed:
+      column: seed_share
+    intro:
+      value: a1_4
+      source: importation into the susceptible-rich band (assumption)
+  defaults_accepted:
+    reach:school: the configured reach (question text)
+    reach:community: the configured reach (question text)
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    school:
+      group: option
+    community:
+      group: option
+  packages:
+    none: []
+    school:
+    - school
+    community:
+    - community
+  engine_map:
+    school:
+      school: 1
+    community:
+      community: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: school_cost
+    component: school
+    value: 0.8
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - school
+  - id: community_cost
+    component: community
+    value: 1.2
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - community
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 3650
+  discounting: none
+constraints:
+  envelope_usd: 5000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:school:
+    value: 0.92
+    range:
+    - 0.85
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011;204 Suppl 1:S133-S148 (one dose about 0.92 at 12 months or later;
+      a second dose closes most of the remaining gap)'
+    reason: protection of the susceptibles reached
+  efficacy:community:
+    value: 0.92
+    range:
+    - 0.85
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: 'Uzicanin A, Zimmerman L. Field effectiveness of live attenuated measles-containing vaccines: a review
+      of published literature. J Infect Dis 2011;204 Suppl 1:S133-S148 (one dose about 0.92 at 12 months or later;
+      a second dose closes most of the remaining gap)'
+    reason: protection of the susceptibles reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 60.0
+  - 90.0
+  target_column: r0_target
+  window:
+  - 0
+  - 3650
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: 'birth cohorts with homogeneous mixing: R0 = q x contact_rate with q at the engine default 0.2, so contact_rate
+    over [60.0, 90.0] spans R0 12-18'
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 64
+    holdout_share: 0.0
+    seed: 5
+    features: &id002
+    - gap_1_4
+    - gap_5_9
+    - gap_10_14
+    - seed_share
+    - pop
+    independent_features:
+      features: *id002
+      generator: generate_units.py
+      basis: 'generate_units.py draws each of these columns from its own seeded random stream, independently of
+        every other column, and searches seeds until the realized table''s maximum pairwise |Spearman| among them
+        is at most 0.2 (seed 4567 (searched from 4330): max |Spearman| among [''pop'', ''gap_1_4'', ''gap_5_9'',
+        ''gap_10_14'', ''seed_share''] = 0.189) (synthetic units table) Seed 12249 chosen by a deterministic search
+        so the realized table''s declared features have max |Spearman| 0.181 <= 0.2 (chain copy).'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

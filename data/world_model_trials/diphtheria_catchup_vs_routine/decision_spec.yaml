@@ -1,0 +1,205 @@
+# World-model trial template (diphtheria_catchup_vs_routine, batch 3): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Diphtheria immunity
+  gaps have opened in 24 districts after years of low routine coverage; the susceptible share of the population
+  (synthetic serosurvey) differs between districts and an importation is expected in each in 2026-2027. For each
+  district choose one option: none; ROUTINE (strengthened routine immunisation and school-entry boosters, about
+  30% of the susceptible reached before an importation, US$1.50 per resident); CATCHUP (a catch-up campaign for
+  all ages under 15 and susceptible adults, about 75% of the susceptible reached, US$3.00 per resident). The budget
+  is US$7 million. R0 is between 5 and 8. Input file: units.csv (population, susceptible share, expected imported
+  infections as a share of the population). Choose the options that maximise diphtheria infections averted over
+  the outbreak, report the total with a 95% uncertainty interval, and state the rule (where is the cheaper option
+  enough to keep the effective reproduction number below one?).'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups:
+    - all
+    structure: single_group
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 3.0
+        infectious_days: 14.0
+    components:
+      routine:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.3
+      catchup:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.75
+    tol: 1.0e-09
+horizon:
+  start: 0
+  stop: 730
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+      split: ' '
+    s0:
+      column: s0
+      split: ' '
+    seed:
+      column: seed_share
+  defaults_accepted:
+    reach:routine: the configured reach (question text)
+    reach:catchup: the configured reach (question text)
+    intro: 'single group: the infection enters the only group'
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    routine:
+      group: option
+    catchup:
+      group: option
+  packages:
+    none: []
+    routine:
+    - routine
+    catchup:
+    - catchup
+  engine_map:
+    routine:
+      routine: 1
+    catchup:
+      catchup: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: routine_cost
+    component: routine
+    value: 1.5
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - routine
+  - id: catchup_cost
+    component: catchup
+    value: 3.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - catchup
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 0
+  - 730
+  discounting: none
+constraints:
+  envelope_usd: 7000000
+comparator:
+  package: none
+  text: no intervention
+outcomes_reported:
+- infections
+engine_parameters:
+  efficacy:routine:
+    value: 0.87
+    range:
+    - 0.68
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: 'three or more doses of diphtheria toxoid vaccine: effectiveness about 87% (95% CI 68-97%) against symptomatic
+      diphtheria (Truelove SA, Keegan LT, Moss WJ et al. Clinical and epidemiological aspects of diphtheria: a systematic
+      review and pooled analysis. Clin Infect Dis 2020;71:89-97)'
+    reason: protection of those reached
+  efficacy:catchup:
+    value: 0.87
+    range:
+    - 0.68
+    - 0.97
+    dist: triangular
+    basis: literature
+    source: 'three or more doses of diphtheria toxoid vaccine: effectiveness about 87% (95% CI 68-97%) against symptomatic
+      diphtheria (Truelove SA, Keegan LT, Moss WJ et al. Clinical and epidemiological aspects of diphtheria: a systematic
+      review and pooled analysis. Clin Infect Dis 2020;71:89-97)'
+    reason: protection of those reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 25.0
+  - 40.0
+  target_column: r0_target
+  window:
+  - 0
+  - 730
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2; in one homogeneous group R0 = q x contact_rate, so contact_rate over
+    [25, 40] spans R0 5-8; R_eff = R0 x s0 spans about 0.5-2.8
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 80
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - s0
+    - seed_share
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

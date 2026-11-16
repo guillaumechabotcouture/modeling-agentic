@@ -1,0 +1,174 @@
+# World-model trial template (pertussis_maternal_vs_cocooning, batch 3): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Infant pertussis hospitalisations
+  are rising in 24 districts. In 2026-2027 each district can choose one option: none; MATERNAL (Tdap vaccination
+  of pregnant women at antenatal visits, about 70% of births covered, US$4.00 per infant); COCOON (Tdap for parents
+  and household contacts after birth, US$6.00 per infant); or both. The budget is US$1.5 million. Input file: units.csv
+  (infants born per year, pertussis hospitalisations per infant-year in the first year of life, antenatal care coverage).
+  Choose the options that maximise infant pertussis hospitalisations averted within the budget, report the total
+  with a 95% uncertainty interval and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - maternal
+    - cocoon
+    outcome: infant_hosp
+    mode: trial_priors
+    outcomes:
+      infant_hosp:
+        baseline_source: synthetic hospital surveillance of infant pertussis, 2023-2025
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      maternal:
+        infant_hosp:
+          rr: 0.36
+          range:
+          - 0.3
+          - 0.5
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - coverage 0.7 x effectiveness 0.91 (95% CI 0.84-0.95) of maternal vaccination against
+            pertussis in infants under 3 months (Amirthalingam G, Andrews N, Campbell H et al. Effectiveness of
+            maternal pertussis vaccination in England: an observational study. Lancet 2014;384:1521-1528)'
+          verified: false
+      cocoon:
+        infant_hosp:
+          rr: 0.95
+          range:
+          - 0.8
+          - 1.0
+          dist: uniform
+          measure: rate_ratio
+          source: no measurable reduction in infant pertussis after a cocooning programme (Healy CM, Rench MA, Wootton
+            SH, Castagnini LA. Evaluation of the impact of a pertussis cocooning program on infant pertussis infection.
+            Pediatr Infect Dis J 2015;34:22-26); range up to a 20% reduction
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        infant_hosp: inc
+options:
+  populations:
+    total: pop
+  components:
+    maternal: {}
+    cocoon: {}
+  packages:
+    generate: true
+  engine_map:
+    maternal:
+      maternal: 1
+    cocoon:
+      cocoon: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: maternal_cost
+    component: maternal
+    value: 4.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - maternal
+  - id: cocoon_cost
+    component: cocoon
+    value: 6.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - cocoon
+objective:
+  outcome: infant_hosp
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 1500000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- infant_hosp
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - anc_coverage
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infant_hosp_averted
+  headline:
+    name: total_infant_hosp_averted
+    outcome: infant_hosp

@@ -1,0 +1,220 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (evaluation suite): every district, number and file below is synthetic, generated for this
+  test; none describes a real place. A malaria programme must choose one intervention package for each of 10 districts for
+  2026-2028, within a budget of US$17.0 million. Packages: none; ITN (one mass campaign of insecticide-treated nets); IRS
+  (annual indoor residual spraying); ITN+IRS; SMC (seasonal malaria chemoprevention, only in districts marked SMC-eligible);
+  ITN+SMC; ITN+IRS+SMC. The nets from the 2022 campaign have expired, so the counterfactual for 2026-2028 is no ITN, IRS or
+  SMC anywhere. Input files: data/evals/malaria_alloc/districts.csv (population and SMC eligibility), data/evals/malaria_alloc/programme_history.csv
+  (recorded clinical cases by district and year, 2015-2024, under the package each district had that year; assume complete
+  recording, stable populations and no trend other than the packages), data/evals/malaria_alloc/unit_costs.csv (cost per person
+  covered over the whole plan). Because the setting is synthetic, estimate the effect of each package from the programme history;
+  published effect sizes may be used as priors only. Choose the allocation that maximises clinical cases averted over 2026-2028
+  within the budget, report the total cases averted with a 95% uncertainty interval, and state the decision rule. Deliverables:
+  allocation_optimized.csv in the run directory with columns district, package (exactly one of the package names above) and
+  cases_averted; and the uncertainty analysis must report the total as an output named total_cases_averted.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - itn
+    - irs
+    - smc
+    outcome: cases
+    mode: trial_priors
+    outcomes:
+      cases:
+        baseline_source: 'derived: mean recorded cases per person in the district''s ''none'' years of data/evals/malaria_alloc/programme_history.csv
+          (complete recording assumed by the question)'
+    baseline:
+      measured_under: no_components
+      source: the baseline years are years with no ITN, IRS or SMC
+    effects:
+      itn:
+        cases:
+          rr: 0.55
+          range:
+          - 0.45
+          - 0.7
+          dist: triangular
+          measure: rate_ratio
+          source: Pryce, Richardson & Lengeler 2018, Cochrane Database Syst Rev CD000363 (ITN vs no nets, uncomplicated episodes,
+            rate ratio 0.55, 0.48-0.64); range widened for resistance
+          verified: false
+      irs:
+        cases:
+          rr: 0.7
+          range:
+          - 0.5
+          - 0.9
+          dist: triangular
+          measure: rate_ratio
+          source: Pluess et al. 2010, Cochrane Database Syst Rev CD006657 (IRS vs no IRS, stable transmission)
+          verified: false
+      smc:
+        cases:
+          rr: 0.8
+          range:
+          - 0.7
+          - 0.9
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: Meremikwu et al. 2012, Cochrane Database Syst Rev CD003756 (clinical malaria in children, rate
+            ratio 0.26, 0.17-0.38), applied to an assumed 25-35% share of all-age cases in children 3-59 months'
+          verified: false
+          note: 'an all-age rate ratio from a child-only trial effect: the share of cases in targeted children is an assumption'
+    combination:
+      rule: multiplicative
+      source: independent action, with a declared ITN x IRS interaction
+      interactions:
+      - components:
+        - irs
+        - itn
+        outcome: cases
+        ratio: 1.1
+        range:
+        - 0.9
+        - 1.4
+        dist: triangular
+        source: Pryce, Medley & Choi 2022, Cochrane Database Syst Rev CD012688 (IRS plus ITN vs ITN alone, incidence rate
+          ratio 0.78, 0.56-1.11), relative to the IRS-alone prior
+        verified: false
+horizon:
+  start: 2026.0
+  stop: 2029.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        cases: inc_none
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    itn: {}
+    irs: {}
+    smc: {}
+  packages:
+    none: []
+    itn:
+    - itn
+    irs:
+    - irs
+    itn+irs:
+    - itn
+    - irs
+    itn+smc:
+    - itn
+    - smc
+  engine_map:
+    itn:
+      itn: 1
+    irs:
+      irs: 1
+    smc:
+      smc: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: itn_campaign
+    component: itn
+    value: 5.1
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - itn_campaign
+  - id: irs_annual
+    component: irs
+    value: 12.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - irs_annual
+  - id: smc_rounds
+    component: smc
+    value: 2.295
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - smc_rounds
+objective:
+  outcome: cases
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2029.0
+  discounting: none
+constraints:
+  envelope_usd: 17000000
+  eligibility:
+    smc:
+      column: smc_eligible
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- cases
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 80
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - inc_none
+    - smc_eligible
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: cases_averted
+  headline:
+    name: total_cases_averted
+    outcome: cases

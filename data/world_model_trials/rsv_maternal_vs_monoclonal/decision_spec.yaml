@@ -1,0 +1,180 @@
+# World-model trial template (rsv_maternal_vs_monoclonal, batch 4): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A child health programme
+  has US$3 million for RSV prevention for infants born in 2026 in 24 districts. For each district choose one product:
+  none; MATERNAL (an RSV prefusion F vaccine in late pregnancy, US$30 per birth); MAB (one dose of a long-acting
+  monoclonal antibody at birth, US$50 per birth). Input file: units.csv (births expected in 2026, RSV hospitalisations
+  per infant in the first six months without prevention, antenatal care attendance). Choose the products that maximise
+  infant RSV hospitalisations averted within the budget, report the total with a 95% uncertainty interval, and state
+  the decision rule.'
+decision_maker: child health programme (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - maternal
+    - mab
+    outcome: rsv_hosp
+    mode: trial_priors
+    outcomes:
+      rsv_hosp:
+        baseline_source: 'synthetic hospital records: RSV hospitalisations per infant in the first six months'
+    baseline:
+      measured_under: no_components
+      source: no RSV prevention before 2026 (synthetic)
+    effects:
+      maternal:
+        rsv_hosp:
+          rr: 0.45
+          range:
+          - 0.3
+          - 0.7
+          dist: triangular
+          measure: rate_ratio
+          source: Kampmann B et al. Bivalent prefusion F vaccine in pregnancy to prevent RSV illness in infants.
+            N Engl J Med 2023;388:1451-64 (efficacy against medically attended severe lower respiratory tract illness
+            0.82 within 90 days and 0.69 within 180 days; hospitalisation rate ratio assumed 0.3-0.7)
+          verified: false
+      mab:
+        rsv_hosp:
+          rr: 0.38
+          range:
+          - 0.2
+          - 0.7
+          dist: triangular
+          measure: rate_ratio
+          source: Hammitt LL et al. Nirsevimab for prevention of RSV in healthy late-preterm and term infants. N
+            Engl J Med 2022;386:837-46 (efficacy against medically attended lower respiratory tract infection 0.75;
+            against hospitalisation 0.62 with a wide interval; rate ratio assumed 0.2-0.7)
+          verified: false
+    combination:
+      rule: strongest
+      source: 'alternatives: one product per district (the stronger effect applies if both were given)'
+horizon:
+  start: 2026.0
+  stop: 2027.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        rsv_hosp: inc
+options:
+  populations:
+    total: pop
+  components:
+    maternal:
+      group: product
+    mab:
+      group: product
+  packages:
+    none: []
+    maternal:
+    - maternal
+    mab:
+    - mab
+  engine_map:
+    maternal:
+      maternal: 1
+    mab:
+      mab: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: maternal_cost
+    component: maternal
+    value: 30.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - maternal_delivery
+  - id: mab_cost
+    component: mab
+    value: 50.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - mab_delivery
+objective:
+  outcome: rsv_hosp
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2027.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no programme
+outcomes_reported:
+- rsv_hosp
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - anc_attendance
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column, and keeps the first seed (here 4211) whose realized table has pairwise |Spearman| <= 0.2 among
+        them (realized maximum 0.119)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: rsv_hosp_averted
+  headline:
+    name: total_rsv_hosp_averted
+    outcome: rsv_hosp

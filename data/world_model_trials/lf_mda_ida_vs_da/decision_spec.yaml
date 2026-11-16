@@ -1,0 +1,180 @@
+# World-model trial template (lf_mda_ida_vs_da, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A lymphatic filariasis
+  elimination programme has US$6 million for mass drug administration (MDA) in 2026-2027 in 24 implementation units.
+  For each unit choose one regimen: none; DA (diethylcarbamazine plus albendazole, two annual rounds, US$0.80 per
+  person per round); IDA (ivermectin, diethylcarbamazine and albendazole, two annual rounds, US$1.40 per person
+  per round). About 65% of the population swallows the drugs each round. Input file: units.csv (population, microfilaraemia
+  prevalence from the last survey, past MDA rounds, past coverage). Choose the regimens that maximise microfilaraemic
+  person-years averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval and state
+  the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - da
+    - ida
+    outcome: mf_person_years
+    mode: trial_priors
+    outcomes:
+      mf_person_years:
+        baseline_source: synthetic microfilaraemia prevalence surveys (night blood films), no MDA in 2026
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      da:
+        mf_person_years:
+          rr: 0.62
+          range:
+          - 0.55
+          - 0.72
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - coverage 0.65 x 12-month microfilaria clearance about 0.59 with DA (King CL et al.
+            A trial of a triple-drug treatment for lymphatic filariasis. N Engl J Med 2018;379:1801-1810)'
+          verified: false
+      ida:
+        mf_person_years:
+          rr: 0.38
+          range:
+          - 0.3
+          - 0.46
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - coverage 0.65 x 12-month microfilaria clearance about 0.96 with IDA (King CL et
+            al. N Engl J Med 2018;379:1801-1810)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        mf_person_years: inc
+options:
+  populations:
+    total: pop
+  components:
+    da:
+      group: mda
+    ida:
+      group: mda
+  packages:
+    none: []
+    da:
+    - da
+    ida:
+    - ida
+  engine_map:
+    da:
+      da: 1
+    ida:
+      ida: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: da_cost
+    component: da
+    value: 1.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - da
+  - id: ida_cost
+    component: ida
+    value: 2.8
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - ida
+objective:
+  outcome: mf_person_years
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 6000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- mf_person_years
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - mda_rounds_past
+    - coverage_past
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: mf_person_years_averted
+  headline:
+    name: total_mf_person_years_averted
+    outcome: mf_person_years

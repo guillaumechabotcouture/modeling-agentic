@@ -1,0 +1,186 @@
+# World-model trial template (oncho_ivermectin_frequency, batch 4): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Onchocerciasis control
+  in 24 implementation units can give community-directed ivermectin in 2026-2027 either ANNUAL (one round a year,
+  about 75% therapeutic coverage, US$0.60 per resident per year) or BIANNUAL (two rounds a year, US$1.10 per resident
+  per year), or no treatment. The budget is US$3 million. Input file: units.csv (population; skin-microfilaria prevalence;
+  a vector-density index). Choose the option per unit that maximises microfilaridermic person-years averted in 2026-2027
+  within the budget, report the total with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - annual
+    - biannual
+    outcome: mf_person_years
+    mode: trial_priors
+    outcomes:
+      mf_person_years:
+        baseline_source: synthetic skin-snip surveys, 2024-2025
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      annual:
+        mf_person_years:
+          rr: 0.5
+          range:
+          - 0.38
+          - 0.65
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: microfilaridermic time between rounds with 75% coverage and repopulation within months;
+            Opoku NO, Bakajika DK, Kanza EM et al. Single dose moxidectin versus ivermectin for Onchocerca volvulus
+            infection in Ghana, Liberia, and the Democratic Republic of the Congo: a randomised, controlled, double-blind
+            phase 3 trial. Lancet 2018;392:1207-1216 (ivermectin clears skin microfilariae quickly, with repopulation
+            within months)'
+          verified: false
+      biannual:
+        mf_person_years:
+          rr: 0.65
+          range:
+          - 0.5
+          - 0.85
+          dist: triangular
+          measure: rate_ratio
+          source: 'relative to ANNUAL: a second round halves the time for skin repopulation (assumed range); Opoku
+            NO, Bakajika DK, Kanza EM et al. Single dose moxidectin versus ivermectin for Onchocerca volvulus infection
+            in Ghana, Liberia, and the Democratic Republic of the Congo: a randomised, controlled, double-blind
+            phase 3 trial. Lancet 2018;392:1207-1216 (ivermectin clears skin microfilariae quickly, with repopulation
+            within months)'
+          verified: false
+        relative_to: annual
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        mf_person_years: inc
+options:
+  populations:
+    total: pop
+  components:
+    annual:
+      group: frequency
+    biannual:
+      group: frequency
+  packages:
+    none: []
+    annual:
+    - annual
+    biannual:
+    - biannual
+  engine_map:
+    annual:
+      annual: 1
+    biannual:
+      biannual: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: annual_cost
+    component: annual
+    value: 0.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - annual
+  - id: biannual_cost
+    component: biannual
+    value: 1.1
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - biannual
+objective:
+  outcome: mf_person_years
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- mf_person_years
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - vector_density
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: 'generate_units.py draws each of these columns from its own seeded random stream, independently of
+        every other column, and searches seeds until the realized table''s maximum pairwise |Spearman| among them
+        is at most 0.2 (seed 4880 (searched from 4880): max |Spearman| among [''pop'', ''inc'', ''vector_density'']
+        = 0.171) (synthetic units table)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: mf_person_years_averted
+  headline:
+    name: total_mf_person_years_averted
+    outcome: mf_person_years

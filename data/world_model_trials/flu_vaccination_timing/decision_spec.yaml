@@ -1,0 +1,244 @@
+# World-model trial template (flu_vaccination_timing, batch 3): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. Seasonal influenza vaccine
+  arrives in 24 provinces in batches, and each province can complete its vaccination campaign (about 40% of the
+  population reached) at one of three dates relative to the start of its influenza season: ON_TIME (completed at
+  the start, US$3.00 per resident because of air freight), DAY21 (three weeks into the season, US$2.20) or DAY42
+  (six weeks in, US$1.80), or not at all. The budget is US$9 million. R0 of the season''s strain is between 1.2
+  and 1.8 and pre-season immunity differs between provinces. Input file: units.csv (population, susceptible share
+  before the season, infections at the start of the season as a share of the population, hospitalisations per infection).
+  Choose the option per province that maximises influenza hospitalisations averted in the season within the budget,
+  report the total with a 95% uncertainty interval, and state what decides whether paying for earlier vaccine is
+  worth it.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups:
+    - all
+    structure: single_group
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 1.5
+        infectious_days: 3.0
+    components:
+      on_time:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.4
+      day21:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.4
+        day: 21
+      day42:
+        kind: campaign
+        targets:
+        - all
+        reach: 0.4
+        day: 42
+    tol: 1.0e-09
+    outcomes:
+    - hosp
+horizon:
+  start: 0
+  stop: 365
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    N:
+      column: pop
+      split: ' '
+    s0:
+      column: s0
+      split: ' '
+    seed:
+      column: seed_share
+    ratio:hosp:
+      column: ratio_hosp
+      split: ' '
+  defaults_accepted:
+    reach:on_time: the configured reach (question text)
+    reach:day21: the configured reach (question text)
+    reach:day42: the configured reach (question text)
+    intro: 'single group: the infection enters the only group'
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    on_time:
+      group: date
+    day21:
+      group: date
+    day42:
+      group: date
+  packages:
+    none: []
+    on_time:
+    - on_time
+    day21:
+    - day21
+    day42:
+    - day42
+  engine_map:
+    on_time:
+      on_time: 1
+    day21:
+      day21: 1
+    day42:
+      day42: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: on_time_cost
+    component: on_time
+    value: 3.0
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - on_time
+  - id: day21_cost
+    component: day21
+    value: 2.2
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - day21
+  - id: day42_cost
+    component: day42
+    value: 1.8
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - day42
+objective:
+  outcome: hosp
+  sense: avert
+  horizon:
+  - 0
+  - 365
+  discounting: none
+constraints:
+  envelope_usd: 9000000
+comparator:
+  package: none
+  text: no intervention
+outcomes_reported:
+- hosp
+engine_parameters:
+  efficacy:on_time:
+    value: 0.59
+    range:
+    - 0.45
+    - 0.7
+    dist: triangular
+    basis: literature
+    source: 'pooled efficacy of inactivated influenza vaccine about 0.59 (95% CI 0.51-0.67) in adults (Osterholm
+      MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines: a systematic review
+      and meta-analysis. Lancet Infect Dis 2012;12:36-44)'
+    reason: protection of the vaccinated susceptibles
+  efficacy:day21:
+    value: 0.59
+    range:
+    - 0.45
+    - 0.7
+    dist: triangular
+    basis: literature
+    source: 'pooled efficacy of inactivated influenza vaccine about 0.59 (95% CI 0.51-0.67) in adults (Osterholm
+      MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines: a systematic review
+      and meta-analysis. Lancet Infect Dis 2012;12:36-44)'
+    reason: protection of the vaccinated susceptibles
+  efficacy:day42:
+    value: 0.59
+    range:
+    - 0.45
+    - 0.7
+    dist: triangular
+    basis: literature
+    source: 'pooled efficacy of inactivated influenza vaccine about 0.59 (95% CI 0.51-0.67) in adults (Osterholm
+      MT, Kelley NS, Sommer A, Belongia EA. Efficacy and effectiveness of influenza vaccines: a systematic review
+      and meta-analysis. Lancet Infect Dis 2012;12:36-44)'
+    reason: protection of the vaccinated susceptibles
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 6.0
+  - 9.0
+  target_column: r0_target
+  window:
+  - 0
+  - 180
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2; R0 = q x contact_rate spans 1.2-1.8, so R_eff = R0 x s0 spans about 0.6-1.7
+    across the threshold
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 60
+    holdout_share: 0.0
+    seed: 5
+    features: &id001
+    - s0
+    - seed_share
+    - ratio_hosp
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: hosp_averted
+  headline:
+    name: total_hosp_averted
+    outcome: hosp

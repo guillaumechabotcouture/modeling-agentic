@@ -1,0 +1,181 @@
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district, population and number is synthetic. An HIV programme
+  has US$8 million for pre-exposure prophylaxis (PrEP) in 2026-2027 for 24 population groups (adolescent girls and young women,
+  men who have sex with men, and HIV-negative partners in serodiscordant couples, in each of eight districts). For each group
+  choose one option: none; ORAL (daily oral TDF/FTC PrEP); CAB (long-acting injectable cabotegravir every two months). Costs
+  per person-year on PrEP: ORAL US$120, CAB US$300; the group sizes in units.csv are the people expected to start PrEP if
+  offered. Input file: units.csv (group, district, people expected to start, HIV incidence per person-year without PrEP, expected
+  adherence score). Choose the options that maximise HIV infections averted over 2026-2027 within the budget, report the total
+  with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - oral
+    - cab
+    outcome: infections
+    mode: trial_priors
+    outcomes:
+      infections:
+        baseline_source: synthetic incidence estimates per group (no PrEP)
+    baseline:
+      measured_under: no_components
+      source: no PrEP in these groups before 2026 (synthetic)
+    effects:
+      oral:
+        infections:
+          rr: 0.5
+          range:
+          - 0.25
+          - 0.95
+          dist: triangular
+          measure: hazard_ratio
+          source: 'oral TDF/FTC efficacy varies with adherence: Partners PrEP (Baeten et al. 2012, N Engl J Med 367:399; efficacy
+            75%), iPrEx (Grant et al. 2010, N Engl J Med 363:2587; 44%), FEM-PrEP (Van Damme et al. 2012, N Engl J Med 367:411;
+            no efficacy with low adherence)'
+          verified: false
+      cab:
+        relative_to: oral
+        infections:
+          rr: 0.3
+          range:
+          - 0.11
+          - 0.62
+          dist: triangular
+          measure: hazard_ratio
+          source: 'CAB-LA vs TDF/FTC: HPTN 083 (Landovitz et al. 2021, N Engl J Med 385:595; hazard ratio 0.34, 0.18-0.62)
+            and HPTN 084 (Delany-Moretlwe et al. 2022, Lancet 399:1779; hazard ratio 0.11, 0.04-0.32)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: 'alternatives: CAB''s effect is relative to oral PrEP; one option per group'
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        infections: inc
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    oral:
+      group: prep
+    cab:
+      group: prep
+  packages:
+    none: []
+    oral:
+    - oral
+    cab:
+    - cab
+  engine_map:
+    oral:
+      oral: 1
+    cab:
+      cab: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: oral_py
+    component: oral
+    value: 240.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - oral_py
+  - id: cab_py
+    component: cab
+    value: 600.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - cab_py
+objective:
+  outcome: infections
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 8000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- infections
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis is an
+    attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - inc
+    - adherence
+    - group_code
+    independent_features:
+      features:
+      - adherence
+      basis: 'generate_units.py draws adherence uniform independently of every other column; inc is drawn within each group''s
+        range (depends on group_code), so neither inc nor group_code is declared independent (24 synthetic units: 8 districts
+        x 3 groups)'
+      generator: generate_units.py
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: infections_averted
+  headline:
+    name: total_infections_averted
+    outcome: infections

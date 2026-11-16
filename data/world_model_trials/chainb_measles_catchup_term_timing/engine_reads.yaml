@@ -1,0 +1,6 @@
+# pop reaches the engine through n_groups (the group sizes N, derived from pop by the units table).
+features_read_via:
+  pop: n_groups
+  gap_10_14: s0_groups
+  gap_1_4: s0_groups
+  gap_5_9: s0_groups

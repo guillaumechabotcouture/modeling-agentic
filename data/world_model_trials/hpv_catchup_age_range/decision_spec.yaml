@@ -1,0 +1,256 @@
+# World-model trial template (hpv_catchup_age_range, batch 4): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A national HPV programme
+  in 2026 can run one multi-age vaccination campaign in each of 24 provinces. For each province choose the age range:
+  none; TO14 (ages 9-14 only, US$0.90 per resident); TO19 (ages 9-19, US$1.60 per resident); TO26 (ages 9-26, US$2.60
+  per resident). Each campaign reaches 80% of the targeted ages. Infection spreads through homogeneous mixing among
+  the age groups (basic reproduction number uncertain, 1.2-3.0); vaccination protects only those not yet infected.
+  About one infection in ten becomes persistent. The budget is US$20 million. Input file: units.csv (population;
+  the share of 9-14, 15-19 and 20-26 year olds not yet infected, from a synthetic serosurvey). Choose the age range
+  per province that maximises persistent HPV infections averted over the coming transmission cycle within the budget,
+  report the total with a 95% uncertainty interval, and state the rule (when does extending the catch-up past 14
+  still pay?).'
+decision_maker: national HPV programme (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    tol: 1.0e-09
+    generation_interval:
+      seir:
+        latent_days: 30.0
+        infectious_days: 180.0
+    outcomes:
+    - persistent
+    groups: &id001
+    - g9_14
+    - g15_19
+    - g20_26
+    - a27p
+    components:
+      to14:
+        kind: campaign
+        targets:
+        - g9_14
+        reach: 0.8
+        day: 0
+      to19:
+        kind: campaign
+        targets:
+        - g9_14
+        - g15_19
+        reach: 0.8
+        day: 0
+      to26:
+        kind: campaign
+        targets:
+        - g9_14
+        - g15_19
+        - g20_26
+        reach: 0.8
+        day: 0
+horizon:
+  start: 0
+  stop: 7300
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      column: n_groups
+      split: ' '
+    s0:
+      column: s0_groups
+      split: ' '
+    seed:
+      value: 0.0001
+      source: ongoing transmission seeded by a small infected share (assumption)
+    intro:
+      value: g15_19
+      source: infection enters through young adults (assumption)
+    ratio:persistent:
+      value:
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      source: about one infection in ten persists (assumption, order of magnitude)
+  defaults_accepted:
+    reach:to14: the configured 80% reach
+    reach:to19: the configured 80% reach
+    reach:to26: the configured 80% reach
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+  components:
+    to14:
+      group: range
+    to19:
+      group: range
+    to26:
+      group: range
+  packages:
+    none: []
+    to14:
+    - to14
+    to19:
+    - to19
+    to26:
+    - to26
+  engine_map:
+    to14:
+      to14: 1
+    to19:
+      to19: 1
+    to26:
+      to26: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: to14_cost
+    component: to14
+    value: 0.9
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - to14
+  - id: to19_cost
+    component: to19
+    value: 1.6
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - to19
+  - id: to26_cost
+    component: to26
+    value: 2.6
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - to26
+objective:
+  outcome: persistent
+  sense: avert
+  horizon:
+  - 0
+  - 7300
+  discounting: none
+constraints:
+  envelope_usd: 20000000
+comparator:
+  package: none
+  text: no added measure
+outcomes_reported:
+- persistent
+engine_parameters:
+  efficacy:to14:
+    value: 0.9
+    range:
+    - 0.8
+    - 0.98
+    dist: triangular
+    basis: literature
+    source: FUTURE II Study Group. Quadrivalent vaccine against human papillomavirus to prevent high-grade cervical
+      lesions. N Engl J Med 2007;356:1915-27 (efficacy against HPV16/18-related lesions about 0.98 in the per-protocol,
+      HPV-naive population; protection of the susceptibles reached assumed 0.8-0.98)
+    reason: protection of the susceptibles reached
+  efficacy:to19:
+    value: 0.9
+    range:
+    - 0.8
+    - 0.98
+    dist: triangular
+    basis: literature
+    source: FUTURE II Study Group. Quadrivalent vaccine against human papillomavirus to prevent high-grade cervical
+      lesions. N Engl J Med 2007;356:1915-27 (efficacy against HPV16/18-related lesions about 0.98 in the per-protocol,
+      HPV-naive population; protection of the susceptibles reached assumed 0.8-0.98)
+    reason: protection of the susceptibles reached
+  efficacy:to26:
+    value: 0.9
+    range:
+    - 0.8
+    - 0.98
+    dist: triangular
+    basis: literature
+    source: FUTURE II Study Group. Quadrivalent vaccine against human papillomavirus to prevent high-grade cervical
+      lesions. N Engl J Med 2007;356:1915-27 (efficacy against HPV16/18-related lesions about 0.98 in the per-protocol,
+      HPV-naive population; protection of the susceptibles reached assumed 0.8-0.98)
+    reason: protection of the susceptibles reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 6.0
+  - 15.0
+  target_column: r0_target
+  window:
+  - 0
+  - 7300
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: q stays at the engine default 0.2 (kind calibrated, not varied by the batch); with homogeneous mixing R0
+    = q x contact_rate, so contact_rate over [6.0, 15.0] spans R0 1.2-3.0
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 64
+    holdout_share: 0.0
+    seed: 5
+    features: &id002
+    - s0_9_14
+    - s0_15_19
+    - s0_20_26
+    independent_features:
+      features: *id002
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column, and keeps the first seed (here 4202) whose realized table has pairwise |Spearman| <= 0.2 among
+        them (realized maximum 0.063)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: persistent_averted
+  headline:
+    name: total_persistent_averted
+    outcome: persistent
