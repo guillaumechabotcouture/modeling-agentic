@@ -2584,6 +2584,32 @@ def _self_test() -> int:
                         jobs.append(jb)
                 got = _admit(pool, jobs, sim.eng, adapter_digest(), False)
                 ok(jobs and len(got) == len(jobs), "JA26l an old engine's duplicate never masks a current row (Codex P3)")
+                d, spec = fresh()        # a call directory holding only a killed batch's journal is resumed in place
+                part = os.path.join(d, OUT_REL, "call1")
+                os.makedirs(os.path.join(d, OUT_REL, "call9"))
+                open(os.path.join(d, OUT_REL, "call9", "points.jsonl.partial.jsonl"), "w").write("")
+                sim = Simulator(spec, d, build(spec)[1])
+                sim.calls = 9
+                ok(sim._call_dir()[0] == 9 and Simulator._call_dir(type("S", (), {"calls": 1, "run_dir": d})())[0]
+                   == 100001 and os.path.isfile(os.path.join(part, "results.jsonl")),
+                   "JA26n a directory with only compute's partial journal is resumed in place; a finished one is not "
+                   "(Codex re-review P2-1)")
+                d, spec = fresh()        # mixed call: the computed rows' own file is never replaced by the merge
+                f1 = os.path.join(d, OUT_REL, "call1", "results.jsonl")
+                txt = "".join(x for x in list(open(f1))[2:])     # a trusted source missing two rows: a mixed call
+                open(f1, "w").write(txt)
+                sm = json.load(open(f1 + ".summary.json"))
+                sm["out_sha256"] = hashlib.sha256(txt.encode()).hexdigest()
+                json.dump(sm, open(f1 + ".summary.json", "w"))
+                before = digests(d)
+                again(spec, d, "-edited7")
+                newd = sorted(set(os.path.dirname(f) for f in digests(d)) - set(os.path.dirname(f) for f in before))
+                comp = [x for x in newd if os.path.exists(os.path.join(x, "results.jsonl.summary.json"))
+                        or os.path.exists(os.path.join(x, "points.jsonl.summary.json"))]
+                ok(comp and all(_trusted_sources(x) for x in comp) and
+                   all(not os.path.exists(os.path.join(x, "results.jsonl" + REUSE_SIDECAR)) for x in comp),
+                   "JA26o the computed rows keep their own trusted file; the merged file is published apart "
+                   "(Codex re-review P2-2)")
             finally:
                 shutil.rmtree(base, ignore_errors=True)
         with tempfile.TemporaryDirectory() as d:
