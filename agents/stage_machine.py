@@ -904,7 +904,7 @@ class Machine:
         self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
         self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
-    def save(self) -> None:
+    def persist(self) -> None:
         save_state(self.run_dir, self.st)
 
     def _settle_interrupted(self) -> None:

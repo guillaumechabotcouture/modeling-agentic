@@ -233,7 +233,7 @@ def _seed(m, ctx, did) -> dict:
     if j.get("status") == "interrupted" and os.path.isfile(kept):     # paid (charged its allowance at settle): keep it
         if not WMT.seed_problems(_yaml(kept), ctx):
             j.update(status="completed", ok=True, output={"status": "ok", "seed_sha256": _seed_sha(rd)})
-            m.save()
+            m.persist()
             return {"status": "ok", "usd": 0.0, "reused": True}
     a = m._allowance()
     cap = SEED_CAP_USD if a is None else round(min(SEED_CAP_USD, a / 2), 4)
@@ -242,7 +242,7 @@ def _seed(m, ctx, did) -> dict:
     n = int(j.get("attempts", 0)) + 1
     st.journal[JOURNAL_KEY] = dict(j, task="seed_world_model", status="started", started=_now(), allowance_usd=2 * cap,
                                    attempts=n)
-    m.save()
+    m.persist()
     led = WMT.SpendLedger(os.path.join(rd, WM, f"seed_spend_{n}.jsonl"), 2 * cap)
     os.makedirs(os.path.join(rd, SEED_DIR), exist_ok=True)
     r = WMT.seed_step({"id": did}, os.path.join(rd, SEED_DIR), ctx, m.seed_fn, led, cap)
@@ -252,7 +252,7 @@ def _seed(m, ctx, did) -> dict:
     st.spent_usd += usd
     st.journal[JOURNAL_KEY].update(status="completed", completed=_now(), ok=r.get("status") == "ok", usd=usd, output={
         "status": r.get("status"), "seed_sha256": _seed_sha(rd) if r.get("status") == "ok" else None})
-    m.save()
+    m.persist()
     return r
 
 
@@ -478,7 +478,7 @@ def score_run(m) -> str:
         if os.path.exists(os.path.join(m.run_dir, SECTION)):          # never leave an earlier score standing
             _put(m.run_dir, SECTION, f"## World model\n\nScoring failed ({rec['why']}); earlier scores are withdrawn.\n")
             if os.path.exists(os.path.join(m.run_dir, TABLE)):
-                os.remove(os.path.join(m.run_dir, TABLE))
+                WMT._sio().remove_nofollow(m.run_dir, TABLE)
     wm.update(scored=rec["status"] == "scored", counts=rec.get("counts"), score_preregistered=rec.get("preregistered"))
     return f"world model: {rec['status']}" + (f" {rec['counts']}" if rec.get("counts") else "")
 
@@ -494,7 +494,7 @@ def refresh(m) -> str | None:
 
 
 # ------------------------------------------------------------------ self-test
-def _fake_seed(log, bad=None):
+def _toy_seed(log, bad=None):
     """A seed task: one belief per topic with the topic's claims, the first claim leading."""
     import shutil
     from v2_tasks import TaskResult
@@ -592,7 +592,7 @@ def _self_test() -> int:
             return json.load(open(os.path.join(d, rel)))
 
         calls = []
-        d1, s1, st1 = run("wm", _fake_seed(calls))
+        d1, s1, st1 = run("wm", _toy_seed(calls))
         hist = [h["to"] for h in st1.history if "to" in h]
         ok(s1 == "completed" and hist[2:8] == ["ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE",
                                                "CRITIQUE"], f"W1 PREREGISTER before CONFIGURE, SCORE before CRITIQUE {hist}")
@@ -610,25 +610,25 @@ def _self_test() -> int:
            f"W3 scored, belief table written, section in the report ({sc.get('counts')})")
         ok(st1.journal[JOURNAL_KEY]["usd"] == 0.25 and st1.spent_usd >= 0.25, "W4 the seed's cost is in the run's spend")
 
-        d2, s2, _ = run("noremote_run", _fake_seed([]), repo_=bare)
+        d2, s2, _ = run("noremote_run", _toy_seed([]), repo_=bare)
         pr2 = j(d2, PREREG)
         ok(s2 == "completed" and pr2["anchor"]["kind"] == "local_only" and pr2["preregistered"] is False
            and "NOT pre-registered" in open(os.path.join(d2, SECTION)).read() and j(d2, SCORE)["status"] == "scored",
            f"W5 no remote: a local anchor marked not pre-registered; scored; completes ({pr2['anchor'].get('why')})")
-        d3, s3, _ = run("crash", _fake_seed([], bad="crash"))
+        d3, s3, _ = run("crash", _toy_seed([], bad="crash"))
         ok(s3 == "completed" and j(d3, PREREG)["status"] == "seed_failed" and j(d3, SCORE)["status"] == "not_scored"
            and "## World model" not in open(os.path.join(d3, "report.md")).read(),
            f"W6 a seed failure is recorded and the run goes on ({s3})")
-        d4, s4, _ = run("digits", _fake_seed([], bad="digits"))
+        d4, s4, _ = run("digits", _toy_seed([], bad="digits"))
         a4 = j(d4, PREREG)["anchor"]
         ok(s4 == "completed" and a4["kind"] == "local_only" and "publish check" in a4["why"],
            "W7 a seed holding a number is never pushed: local anchor, recorded")
         calls5 = []
-        d5, s5, _ = run("resume", _fake_seed(calls5), stop_after="PREREGISTER")
+        d5, s5, _ = run("resume", _toy_seed(calls5), stop_after="PREREGISTER")
         ok(s5 == "completed" and len(calls5) == 1 and j(d5, SCORE)["status"] == "scored",
            f"W8 a run resumed after PREREGISTER does not pay for the seed twice ({len(calls5)} sessions)")
         calls8 = []
-        d8, s8, st8 = run("killed", _fake_seed([], bad="exit"), then=_fake_seed(calls8))
+        d8, s8, st8 = run("killed", _toy_seed([], bad="exit"), then=_toy_seed(calls8))
         ok(s8 == "completed" and not calls8 and j(d8, PREREG)["status"] == "ok"
            and st8.journal[JOURNAL_KEY].get("interrupted_charged") == 1,
            f"W8b a seed killed after it was written is kept on resume, charged once, not bought again ({len(calls8)})")
