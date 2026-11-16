@@ -47,17 +47,21 @@ STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
 SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
 SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
-STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE",
-          "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
+STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
+          "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
     "SPEC": {"SIGN", "SPEC", "FINAL"},
     "SIGN": {"EVIDENCE", "SIGN"},
     "EVIDENCE": {"ENGINE_CHOICE"},
-    "ENGINE_CHOICE": {"CONFIGURE", "FINAL"},
+    "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
+    # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
+    # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
+    "PREREGISTER": {"CONFIGURE", "FINAL"},
     "CONFIGURE": {"ANALYZE", "FINAL"},
-    "ANALYZE": {"CRITIQUE", "FINAL"},
+    "ANALYZE": {"SCORE", "CRITIQUE", "FINAL"},
+    "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "FINAL"},
@@ -113,6 +117,10 @@ class RunState:
     # started, completed, ok, output, note}. Written before and after each call, so a resumed run
     # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
     journal: dict = field(default_factory=dict)
+    # §14: the world-model stages run when true (init_run sets it for every new run; False for older states), and
+    # what they recorded: {status, decision_id, anchor, preregistered, scored, counts}.
+    world_model_stages: bool = False
+    world_model: dict = field(default_factory=dict)
     last_gate: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
 
@@ -261,7 +269,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*")
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []
@@ -861,8 +869,8 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     return rec
 
 
-POST_CHOICE_STATES = ("CONFIGURE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE",
-                      "PRESENTATION")
+POST_CHOICE_STATES = ("PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE", "GATE", "FIX_LOOP", "OWNER_DECISION",
+                      "WRITE", "PRESENTATION")
 
 
 def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
@@ -892,6 +900,15 @@ class Machine:
         if self.st is None:
             raise ValueError("no run_state.json and no initial state")
         self._settle_interrupted()
+        save_state(self.run_dir, self.st)
+        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
+        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
+
+    def persist(self) -> None:
+        # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
+        # image save (a false positive): this writes run_state.json through save_state -> lib.safe_io.write_nofollow,
+        # atomic. The heuristic's own-module exemption cannot see a method defined in another module (the caller is
+        # agents/world_model_stage.py), so it was not changed.
         save_state(self.run_dir, self.st)
 
     def _settle_interrupted(self) -> None:
@@ -1245,7 +1262,10 @@ class Machine:
                 rec["cross_check"] = {"error": f"{type(e).__name__}: {e}"}
         _write_json(self.run_dir, AB.ENGINE_CHOICE, rec)     # the spec stays as signed
         self.st.engine = pick
-        return self._go("CONFIGURE", f"engine {pick}")
+        return self._go("PREREGISTER" if self.st.world_model_stages else "CONFIGURE", f"engine {pick}")
+
+    def h_PREREGISTER(self):
+        return self._go("CONFIGURE", self._world_model("preregister"))
 
     def _write_pipeline(self) -> str | None:
         """models/pipeline.yaml from the backend's steps (their limits from the compute budget as it is now), or why
@@ -1301,9 +1321,27 @@ class Machine:
             cause = analysis_failure_cause(rep, self.run_dir)
             why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
             return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
-        return self._go("CRITIQUE", "analysis built")
+        return self._go("SCORE" if self.st.world_model_stages else "CRITIQUE", "analysis built")
+
+    def h_SCORE(self):
+        return self._go("CRITIQUE", self._world_model("score_run"))
+
+    def _world_model(self, fn: str) -> str:
+        """§14, fail soft: a world-model step never raises into the machine. `refresh` (before CRITIQUE and WRITE)
+        scores again when the fix loop has rebuilt the analysis since; it is recorded in the history."""
+        if not self.st.world_model_stages:
+            return ""
+        try:
+            import world_model_stage as WMS
+            why = getattr(WMS, fn)(self) or ""
+        except Exception as e:  # noqa: BLE001
+            why = f"world model: {fn} failed: {type(e).__name__}: {e}"[:300]
+        if why and fn == "refresh":
+            self.st.history.append({"at": _now(), "world_model": why})
+        return why
 
     def h_CRITIQUE(self):
+        self._world_model("refresh")
         if self.st.round_pending:
             self.st.round += 1
             self.st.round_pending = False
@@ -1437,6 +1475,7 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
+        self._world_model("refresh")
         fb = self.st.tries.pop("language_feedback", None)      # a language repair (F6 S1-7)
         res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
                          writeup=True)
@@ -1709,6 +1748,12 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
+    try:
+        if os.path.isfile(wmp) and not os.path.islink(wmp):
+            lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
+    except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
+        lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
     head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
     full = head + body + "\n".join(lines) + "\n"
     _put(run_dir, "report.md", full)
@@ -1742,13 +1787,14 @@ def _write_deliverable(run_dir: str) -> None:
 
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
-             budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False) -> RunState:
+             budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
+             world_model: bool = True) -> RunState:
     os.makedirs(run_dir, exist_ok=True)
     st = load_state(run_dir)
     if st is not None:
         return st
     st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
-                  derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed)
+                  derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed, world_model_stages=world_model)
     try:   # keep what main.py recorded first (run_dir, pipeline, commit, launcher: scripts/lib/pipeline_id.py)
         meta = json.load(open(os.path.join(run_dir, "metadata.json")))
     except (OSError, ValueError):
@@ -1842,7 +1888,8 @@ def _self_test() -> int:
         status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
-        ok(hist[:6] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE"] and "FIX_LOOP" in hist
+        ok(hist[:8] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
+           and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
         rows = FX.impact_rows(d)
         ok(rows and rows[0]["files_changed"] == ["analysis_settings.yaml"] and "analyze" in rows[0]["steps_rebuilt"]

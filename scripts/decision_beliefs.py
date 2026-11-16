@@ -447,10 +447,12 @@ OUTPUTS = {
 }
 
 
-def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
+def decision_context(spec, card, public, beliefs=(15, 30), topics=TOPICS, topic_help=None, outputs=None,
+                     claims=None) -> dict:
     """The seed task's input for a decision run: the spec's words (question, options, comparator, objective, plan
     variants, decision tests, departures) and the engine card, every number masked except the public ones and
-    years; the run's input values and any output are withheld."""
+    years; the run's input values and any output are withheld. The topics, their help and the outputs default to
+    F6's; a v2 run passes its own, from its signed spec, with each topic's fixed claims (agents/world_model_stage.py)."""
     allow = [str(x["value"]) for x in public.get("public_numbers") or []]
     m = lambda t: mask_numbers(t, allow) if isinstance(t, str) else t  # noqa: E731
     o, an = spec.get("options") or {}, spec.get("analysis") or {}
@@ -459,8 +461,9 @@ def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
         "withheld": "the run's input values (survey- and map-derived unit tables), the engine's fitted values and every "
                     "output are withheld: the beliefs come from the literature, the programme context and how the "
                     "engine works, and are scored against the run's outputs afterwards",
-        "decision_run": {"topics": list(TOPICS), "topic_help": TOPIC_HELP,
-                         "beliefs": {"min": beliefs[0], "max": beliefs[1]}, "outputs": OUTPUTS},
+        "decision_run": {"topics": list(topics), "topic_help": TOPIC_HELP if topic_help is None else topic_help,
+                         "beliefs": {"min": beliefs[0], "max": beliefs[1]},
+                         "outputs": OUTPUTS if outputs is None else outputs, **({"claims": claims} if claims else {})},
         "decision_maker": m(spec.get("decision_maker")), "decision_date": spec.get("decision_date"),
         "components": mask_obj(o.get("components") or {}, allow),
         "packages": "every combination of the components with at most one net type (generated)",
@@ -468,7 +471,7 @@ def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
         "objective": {"outcome": (spec.get("objective") or {}).get("outcome"), "sense": "avert",
                       "delivery_years": (spec.get("objective") or {}).get("delivery"),
                       "outcome_window": (spec.get("objective") or {}).get("horizon")},
-        "constraints": {"envelope": m(f"US${(spec.get('constraints') or {}).get('envelope_usd', 0) / 1e6:.2f}M"),
+        "constraints": {"envelope": m(f"US${((spec.get('constraints') or {}).get('envelope_usd') or 0) / 1e6:.2f}M"),
                         "eligibility": sorted(((spec.get("constraints") or {}).get("eligibility") or {})),
                         "affordability": "at most a small share of uncertainty draws may cost more than the "
                                          "allocatable budget; plans are enforced within the reserve that meets it"},
@@ -477,7 +480,7 @@ def decision_context(spec, card, public, beliefs=(15, 30)) -> dict:
         "decision_tests": [{"id": t.get("id"), "type": t.get("type"), "text": m(t.get("text")),
                             **({"parameter": t["parameter"]} if t.get("parameter") else {}),
                             **({"components": t["components"]} if t.get("components") else {})}
-                           for t in an.get("decision_tests") or []],
+                           for t in an.get("decision_tests") or spec.get("decision_tests") or []],
         "decision_thresholds": "a test changes the plan when more than a tenth of units change package, regret "
                                "exceeds a hundredth of the objective, or more than a twentieth of the budget moves",
         "engine_departures": [m(d.get("reason")) for d in spec.get("engine_departures") or []],

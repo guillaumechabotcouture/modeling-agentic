@@ -30,7 +30,8 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "data/derivations_record.json", "decision_spec.signoff_sheet.md",
                  "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
+                    "world_model/")
 
 # The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
@@ -78,7 +79,9 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
 analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
 the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
-and the draft (manuscript.md) if it exists. The presentation review also reads findings.jsonl:
+and the draft (manuscript.md) if it exists. Read world_model/world_model.md first when it exists: the beliefs written
+before the analysis, which ones its outputs refuted, and where to look. For each refuted decision-relevant belief,
+say whether the engine, an input or the belief is wrong. The presentation review also reads findings.jsonl:
 its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
@@ -123,7 +126,8 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+interpretation. The harness appends the world-model section (world_model/world_model.md) to the report: refer to
+it in words where it helps, never copy its numbers. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
@@ -204,7 +208,9 @@ hypotheses above and write """ + SEED_FILE + """ in the belief table's decision-
 belief_table.py), with as many beliefs as decision_run.beliefs states and at least one per topic in
 decision_run.topics. Each belief is your forecast of what that analysis will show, as competing claims with
 weights: be calibrated, reason from the literature and from how the engine works (its card and code are readable),
-and set the weights from that reasoning, never to hedge every belief toward an even split.
+and set the weights from that reasoning, never to hedge every belief toward an even split. When
+decision_run.claims lists each topic's claims (a v2 run), write exactly one belief per topic whose claims are exactly
+those sentences, and set their weights: never add, drop or reword a claim (the harness scores them by code).
 
 """ + _BT.DECISION_SEED_FORMAT + """""")
 
@@ -249,6 +255,8 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
     analysis = os.path.join(root, "analysis")
     if _within(base, analysis):
         return "the world-model seed is written before any result: analysis/ is not readable"
+    if not _within(base, root) and _in_or_reaches_run(base, tool):     # v2 runs' seeds sit in world_model/seed/
+        return "the seed task may not read any run directory: runs' inputs and outputs are withheld"
     repo = os.path.realpath(_REPO)
     if not _within(base, root) and _within(base, repo) and not _within(root, base):
         # the repository's code and documentation only: no run, no template, no input data, no driver files
@@ -264,6 +272,24 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
         return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
                 "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
     return None
+
+
+def _in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
+    """Is `base` inside a run (an ancestor holds run_state.json), or does a search from it reach one? Fail closed
+    past `limit` entries (Codex review: another run under the repository's docs/ or .claude/ was readable)."""
+    RUN_MARKERS = _sio().RUN_MARKERS               # v1 runs carry only metadata.json (Codex re-review)
+    marks = ("run_state.json",) + tuple(RUN_MARKERS)
+    up = base
+    while up != os.path.dirname(up):
+        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+            return True
+        up = os.path.dirname(up)
+    n = 0
+    for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
+        n += len(dirs) + len(files)
+        if any(x in files for x in marks) or n > limit:
+            return True
+    return False
 
 
 def _answer_key(target: str, run_dir: str) -> bool:
@@ -385,8 +411,11 @@ class SdkTasks:
     Every charge is also written to budget_ledger.json."""
 
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
-                 query_fn=None):
+                 query_fn=None, io_root: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
+        # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
+        # safe_io refuses a root inside a run dir (smoke4, 2026-11-16), so its root is the run dir itself.
+        self.io_root = os.path.abspath(io_root or run_dir)
         self.cloud = allow_cloud
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
@@ -419,7 +448,7 @@ class SdkTasks:
         if allowance is None or allowance <= 0:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
-        _sio().remove_path(out, self.run_dir)
+        _sio().remove_path(out, self.io_root)
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
@@ -493,7 +522,7 @@ class SdkTasks:
         except (OSError, ValueError):
             return TaskResult(False, None, usd, f"no valid {OUT}", seen["sid"])
         finally:
-            _sio().remove_path(out, self.run_dir)
+            _sio().remove_path(out, self.io_root)
         return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300], seen["sid"])
 
     def _input(self, obj) -> str:
@@ -562,6 +591,13 @@ class SdkTasks:
               "every one and keep the rest of your world model:\n- " + "\n- ".join(feedback)) if feedback else ""
         return self._session("seed_world_model", PROMPTS["seed_world_model"].format(out_in=inp, out=OUT) + fb,
                              "Write the world-model seed.", OWNS["seed_world_model"])
+
+    def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
+        """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
+        (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
+        t.set_allowance(cap_usd)
+        return t.seed_world_model(ctx, feedback)
 
 
 def _self_test() -> int:
