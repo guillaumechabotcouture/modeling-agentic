@@ -2264,6 +2264,67 @@ def _self_test() -> int:
             ok(got == want and bt.calls == calls, f"{cid}: {got}, {bt.calls} calls")
     safe(ja24, "JA24")
 
+    def ja26():          # F6 run 1 (2026-11-16): a harness-only change must not recompute the stored calibration rows
+        import glob
+        from unittest import mock
+        from toolkit.analysis import batch as Bt_
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        with tempfile.TemporaryDirectory() as d:
+            spec = schema.load(_toy_joint(d, group=False))
+            rep1 = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            n1 = sum(1 for c in glob.glob(os.path.join(d, OUT_REL, "call*", "results.jsonl")) for _ in open(c))
+            sent, real_run, real_fp = [], Bt_.run, compute.code_fingerprint
+
+            def spy(run_dir, jobs, eng, **kw):
+                sent.append(len(jobs))
+                return real_run(run_dir, jobs, eng, **kw)
+            # a harness edit: every stored batch's code fingerprint differs, the jobs and the engine do not
+            with mock.patch.object(Bt_, "run", spy), \
+                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited"):
+                rep2 = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            ok(n1 > 0 and sum(sent) == 0, f"JA26a after a harness-only change no stored unit run is recomputed: "
+                                          f"{sum(sent)} of {n1} sent to the engine")
+            rc = reuse_check(spec, d)
+            ok(rc["stored"] == n1 and rc["eligible"] == n1, f"JA26h reuse_check counts the stored rows the engine "
+                                                            f"identity admits ({rc['eligible']} of {rc['stored']})")
+            ok(rep2["adapter"].get("stored_rows_reused") == n1,
+               f"JA26b the reuse is recorded in the report: {rep2['adapter'].get('stored_rows_reused')} of {n1}")
+            v1 = {u: x["implausibility"] for u, x in (rep1.get("verification") or {}).get("units", {}).items()}
+            v2 = {u: x["implausibility"] for u, x in (rep2.get("verification") or {}).get("units", {}).items()}
+            ok(v1 and v1 == v2 and rep1["status"] == rep2["status"],
+               "JA26c the calibration from reused rows equals the original")
+            f1 = sorted(glob.glob(os.path.join(d, OUT_REL, "call*", "results.jsonl")))[0]
+            rows = [json.loads(x) for x in open(f1)]
+            ok(all(r.get("ok") and r["result"]["provenance"]["job_sha"] for r in rows),
+               "JA26d each results file still holds every job's row with its provenance")
+            rows[0]["result"]["provenance"]["engine"] = dict(rows[0]["result"]["provenance"]["engine"], code_sha256="x")
+            rows[1]["result"]["provenance"]["job_sha"] = "0" * 64
+            open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+            sent.clear()
+            with mock.patch.object(Bt_, "run", spy), \
+                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited2"):
+                rep3 = run(spec, d, {"max_workers": 2}, log=q, **fast)
+            ok(sum(sent) == 2 and rep3["adapter"].get("stored_rows_reused") == n1 - 2,
+               f"JA26e a row from another engine identity or with another job_sha is recomputed, never reused "
+               f"({sum(sent)} sent, {rep3['adapter'].get('stored_rows_reused')} reused)")
+            rows = [json.loads(x) for x in open(f1)]
+            rows[0]["result"]["provenance"]["job_sha"] = "1" * 64
+            open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+            with mock.patch.object(Bt_, "run", lambda *a, **k: {"results": {}, "problems": ["bad row"], "summary": {}}), \
+                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + "-edited3"):
+                try:
+                    run(spec, d, {"max_workers": 2}, log=q, **fast)
+                    got = "ran"
+                except HM.CalibrationInputError:
+                    got = "raised"
+            kept = sum(1 for x in open(f1) if x.strip())
+            ok(got == "raised" and kept == len(rows) - 1,
+               f"JA26g a failing batch still leaves the reused rows on disk ({got}; {kept} of {len(rows) - 1} kept)")
+        with tempfile.TemporaryDirectory() as d:
+            ok(stored_rows(d) == {}, "JA26f no stored rows: an empty pool")
+    safe(ja26, "JA26")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
