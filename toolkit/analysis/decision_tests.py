@@ -703,6 +703,60 @@ def _not_run(A, dt, why, extra=None) -> dict:
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
+def _calibration_target(A, dt, z0) -> dict:
+    """F6 run 1, owner decision R1: the listed units' calibration targets (calibration.target_column) multiplied by
+    `scale` and their calibrated values redone on the outcome emulator's calibration metric (model.cal_grid, as
+    calibration.invert), every other unit held. Without a joint calibration the new value is the inversion at the
+    scaled target. On the joint path the unit values come from the joint fit (offsets, group targets), which an
+    inversion of one target would drop (Codex r1 P1-2 of the joint path): each listed unit's joint value moves by the
+    difference between the inversions at the scaled and at the original target. Fail closed (not run): a listed unit
+    not in the analysis, or, on the joint path, not in the joint calibration; a unit whose inversion is clamped at
+    the range at either target (its move would be unknown); a test that moves no unit."""
+    ct = dt.get("calibration_target") or {}
+    us, sc = [str(u) for u in ct.get("units") or []], float(ct.get("scale", 1.0))
+    cal = A.spec["calibration"]
+    if cal.get("method") != "emulator_inversion" or not hasattr(A.model, "cal_grid"):
+        return {"not_run": "a calibration_target test needs an emulator-inversion calibration and its emulator"}
+    miss = [u for u in us if u not in A.ids]
+    if miss:
+        return {"not_run": f"listed units are not in the analysis: {miss[:5]}"}
+    if A.joint is not None:
+        miss = [u for u in us if u not in A.joint["z"]]
+        if miss:
+            return {"not_run": f"listed units are not in the joint calibration: {miss[:5]}"}
+    lo, hi = (float(x) for x in cal["range"])
+    from toolkit.analysis import calibration as C
+    zgrid = np.linspace(lo, hi, C.GRID)
+    pred = np.maximum.accumulate(A.model.cal_grid(us, A.theta0, zgrid), axis=1)
+    tc = cal["target_column"]
+    zs, units, clamped = dict(z0), {}, []
+    for j, u in enumerate(us):
+        y0 = float(A.model.by_id[u][tc])
+        y1 = y0 * sc
+        if not 0.0 < y1 < 1.0:
+            return {"not_run": f"unit {u}'s scaled target {y1:g} is not inside (0, 1)"}
+        t0, t1 = (math.log(y / (1.0 - y)) for y in (y0, y1))
+        if not (pred[j, 0] <= min(t0, t1) and max(t0, t1) <= pred[j, -1]):
+            clamped.append(u)
+            continue
+        i0, i1 = float(np.interp(t0, pred[j], zgrid)), float(np.interp(t1, pred[j], zgrid))
+        new = float(z0[u]) + (i1 - i0) if A.joint is not None else i1
+        if not lo <= new <= hi:
+            clamped.append(u)
+            continue
+        zs[u] = new
+        units[u] = {"target": y0, "target_scaled": y1, "z_before": float(z0[u]), "z": new,
+                    "inversion": [i0, i1]}
+    if clamped:
+        return {"not_run": f"the emulator's calibration metric cannot reach the original or scaled target of "
+                           f"{len(clamped)} listed unit(s) inside the calibration range (e.g. {clamped[:3]}), so their "
+                           "moved values are unknown"}
+    if not any(abs(v["z"] - v["z_before"]) > 1e-9 for v in units.values()):
+        return {"not_run": "the scaled targets move no listed unit's calibrated value"}
+    return {"z": zs, "scale": sc, "clamped": len(clamped),
+            "record": {"scale": sc, "column": tc, "joint": A.joint is not None, "units": units}}
+
+
 def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     t = dt["type"]
     thr = _threshold(A)
@@ -722,6 +776,17 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                                                                        "evs"))
         extra["_ua"] = ur["record"]
         arms = ur["arms"]          # each case's own analysis (arm_analysis): its solve, feasibility and reading
+    elif t == "calibration_target":
+        cr = _calibration_target(A, dt, z0)
+        if cr.get("not_run"):
+            return _not_run(A, dt, cr["not_run"])
+        varied = (f"the calibration targets of the listed units multiplied by {cr['scale']:g}, their calibrated values "
+                  "redone on the emulator (on the joint path, each moved by the change the target change implies)")
+        _, ben, cost = A.evaluate(A.theta0, cr["z"])
+        evs["case"] = list(A.last_events)
+        extra["case"] = {"calibration_clamped_units": cr["clamped"]}
+        extra["_ct"] = cr["record"]
+        cases, lowers = [("case", ben, cost, None, None)], [False]
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
@@ -890,6 +955,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         rec["cost_multipliers"] = dict(extra["case"]["cost_multipliers"])
     if t == "unit_attribute":       # the column, the units changed and each modified table's sha256
         rec["unit_attribute"] = extra["_ua"]
+    if t == "calibration_target":   # each listed unit's target and calibrated value, before and after
+        rec["calibration_target"] = extra["_ct"]
     if comps:
         rec["relevance"] = {"components": sorted(comps), "units_with_component_point_plan": in_plan,
                             "components_in_any_draw_plan": in_draws}

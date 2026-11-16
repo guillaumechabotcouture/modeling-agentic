@@ -106,7 +106,9 @@ docs/design/v2-spec-and-analysis.md §1):
       decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
                                            # price case in which the listed unit costs change together;
                                            # type unit_attribute: unit_attribute {column, units: [ids] | all,
-                                           # values | scale | set_from} (a units-table column, F6)
+                                           # values | scale | set_from} (a units-table column, F6);
+                                           # type calibration_target: calibration_target {units: [ids], scale}
+                                           # (the listed units' calibration targets scaled, F6 run 1)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     evidence:                              # F6: required when the options use a component whose engine card declares
@@ -175,7 +177,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute")
+                       "unit_attribute", "calibration_target")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1423,6 +1425,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"), DT.design_features_box(s) if emu else None)
             if pl["status"] != "runs":
                 bad.append(f"decision test {i}: {pl['why']}")
+        elif t == "calibration_target":      # F6 run 1, owner decision R1 (toolkit/analysis/decision_tests.py)
+            bad += _calibration_target_problems(s, dt, i)
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
@@ -1434,6 +1438,46 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                     bad.append(f"decision test {i}: unknown cost item {it_id}")
                 elif not (_isnum(v) and 0 < v < float("inf")):
                     bad.append(f"decision test {i}: multipliers.{it_id}: a positive multiplier")
+    return bad
+
+
+def _calibration_target_problems(s, dt, i) -> list[str]:
+    """calibration_target {units: [ids], scale}: the listed units' calibration targets (calibration.target_column)
+    multiplied by scale, their calibrated values redone, the plan re-solved. Fail closed: an emulator-inversion
+    calibration, a non-empty list of known unit ids without repeats, and a positive scale other than 1 that keeps every
+    listed target inside (0, 1)."""
+    bad, ct = [], dt.get("calibration_target")
+    if not isinstance(ct, dict):
+        return [f"decision test {i}: give calibration_target {{units: [ids], scale}}"]
+    cal = s.raw.get("calibration") or {}
+    if cal.get("method") != "emulator_inversion":
+        bad.append(f"decision test {i}: a calibration_target test needs calibration.method emulator_inversion")
+    us, sc = ct.get("units"), ct.get("scale")
+    if set(ct) != {"units", "scale"}:
+        bad.append(f"decision test {i}: calibration_target holds exactly units and scale")
+    if not (isinstance(us, list) and us and len({str(u) for u in us}) == len(us)):
+        return bad + [f"decision test {i}: calibration_target.units: a non-empty list of unit ids, each once"]
+    try:
+        rows = {str(r[s.uid]): r for r in s.units()}
+    except Exception as e:  # noqa: BLE001 — the units table is validated elsewhere; this test cannot be checked
+        return bad + [f"decision test {i}: the units table cannot be read ({e})"]
+    unknown = [str(u) for u in us if str(u) not in rows]
+    if unknown:
+        bad.append(f"decision test {i}: calibration_target.units not in the units table: {unknown[:5]}")
+    if not (_isnum(sc) and sc > 0):
+        return bad + [f"decision test {i}: calibration_target.scale: a positive number"]
+    if abs(float(sc) - 1.0) <= 1e-12:
+        return bad + [f"decision test {i}: a scale of 1 changes no target (an identity)"]
+    tc = cal.get("target_column")
+    for u in us:
+        r = rows.get(str(u))
+        try:
+            v = float(r[tc]) * float(sc) if r is not None else None
+        except (TypeError, ValueError, KeyError):
+            bad.append(f"decision test {i}: unit {u}'s calibration target {tc!r} is not a number")
+            continue
+        if v is not None and not 0.0 < v < 1.0:
+            bad.append(f"decision test {i}: unit {u}'s scaled target {v:g} is not inside (0, 1)")
     return bad
 
 

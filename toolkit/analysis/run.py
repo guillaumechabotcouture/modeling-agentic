@@ -1344,21 +1344,21 @@ def _self_test_joint(ok, q):
         plan = R["point"]["plan"]
         listed = [i for i in A.ids if A.spec.unit_ids() and i in ("0", "3", "6")]
         dt = {"id": "DTt", "type": "calibration_target", "text": "t",
-              "calibration_target": {"units": listed, "scale": 0.5}}
+              "calibration_target": {"units": listed, "scale": 0.8}}     # inside the toy emulator's reach
         rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
         zc = (rec.get("calibration_target") or {}).get("units") or {}
         moved = {i: zc[i]["z"] - z0[i] for i in listed if i in zc}
         ok(rec.get("status") == "run" and len(moved) == len(listed) and all(v < -1e-6 for v in moved.values())
            and set(zc) == set(listed) and rec["results"] and "objective" in rec["results"][0],
-           f"JR9 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
-           f"targets are halved, and re-solves the plan ({rec.get('status')}, {moved})")
+           f"JR10 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
+           f"targets are lowered, and re-solves the plan ({rec.get('status')}, {moved})")
         saved_z = A.joint["z"].pop(listed[0])
         try:
             rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
         finally:
             A.joint["z"][listed[0]] = saved_z
         ok(rec2.get("status") == "not_run" and "joint calibration" in (rec2.get("why") or rec2.get("statement") or ""),
-           f"JR9b a listed unit the joint calibration did not fit fails closed (not run): {rec2.get('status')}")
+           f"JR10b a listed unit the joint calibration did not fit fails closed (not run): {rec2.get('status')}")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d, n=24)
         rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
