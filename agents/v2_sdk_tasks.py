@@ -78,7 +78,9 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
 analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
 the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
-and the draft (manuscript.md) if it exists. The presentation review also reads findings.jsonl:
+and the draft (manuscript.md) if it exists. Read world_model/world_model.md first when it exists: the beliefs written
+before the analysis, which ones its outputs refuted, and where to look. For each refuted decision-relevant belief,
+say whether the engine, an input or the belief is wrong. The presentation review also reads findings.jsonl:
 its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
@@ -123,7 +125,8 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+interpretation. The harness appends the world-model section (world_model/world_model.md) to the report: refer to
+it in words where it helps, never copy its numbers. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
@@ -204,7 +207,9 @@ hypotheses above and write """ + SEED_FILE + """ in the belief table's decision-
 belief_table.py), with as many beliefs as decision_run.beliefs states and at least one per topic in
 decision_run.topics. Each belief is your forecast of what that analysis will show, as competing claims with
 weights: be calibrated, reason from the literature and from how the engine works (its card and code are readable),
-and set the weights from that reasoning, never to hedge every belief toward an even split.
+and set the weights from that reasoning, never to hedge every belief toward an even split. When
+decision_run.claims lists each topic's claims (a v2 run), write exactly one belief per topic whose claims are exactly
+those sentences, and set their weights: never add, drop or reword a claim (the harness scores them by code).
 
 """ + _BT.DECISION_SEED_FORMAT + """""")
 
@@ -249,6 +254,13 @@ def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
     analysis = os.path.join(root, "analysis")
     if _within(base, analysis):
         return "the world-model seed is written before any result: analysis/ is not readable"
+    up = os.path.dirname(root)
+    while up != os.path.dirname(up):        # a v2 run's seed (world_model/seed/): the run itself is withheld, also
+        if os.path.exists(os.path.join(up, "run_state.json")):      # when it lies under the repository's docs or .claude
+            if _within(base, up) and not _within(base, root):
+                return "the seed task may not read the run it belongs to: its inputs and outputs are withheld"
+            break
+        up = os.path.dirname(up)
     repo = os.path.realpath(_REPO)
     if not _within(base, root) and _within(base, repo) and not _within(root, base):
         # the repository's code and documentation only: no run, no template, no input data, no driver files
@@ -562,6 +574,12 @@ class SdkTasks:
               "every one and keep the rest of your world model:\n- " + "\n- ".join(feedback)) if feedback else ""
         return self._session("seed_world_model", PROMPTS["seed_world_model"].format(out_in=inp, out=OUT) + fb,
                              "Write the world-model seed.", OWNS["seed_world_model"])
+
+    def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
+        """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
+        (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
+        import world_model_trials as WMT
+        return WMT.sdk_seed_fn()(run_dir, ctx, feedback, cap_usd)
 
 
 def _self_test() -> int:

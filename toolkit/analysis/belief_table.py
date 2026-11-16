@@ -365,6 +365,15 @@ def decision_seed_problems(seed, run) -> list:
             bad.append(f"belief {i}: decides: true or false")
         if b.get("layer") not in DECISION_LAYERS:
             bad.append(f"belief {i}: layer {b.get('layer')!r}: one of {DECISION_LAYERS}")
+    fixed = run.get("claims")       # v2 runs (v2c-orchestration §14): each topic's claims are fixed, one belief per topic
+    if isinstance(fixed, dict):
+        tops = [b.get("topic") for b in bs if isinstance(b, dict)]
+        for b in bs:
+            if not isinstance(b, dict) or b.get("topic") not in fixed or not isinstance(b.get("claims"), list):
+                continue
+            got = sorted(str(c.get("claim", "")).strip().lower() for c in b["claims"] if isinstance(c, dict))
+            if got != sorted(str(c).strip().lower() for c in fixed[b["topic"]]) or tops.count(b["topic"]) > 1:
+                bad.append(f"belief {b.get('id')}: write exactly the topic's claims {fixed[b['topic']]}, once per topic")
     have = {b.get("topic") for b in bs if isinstance(b, dict)}
     for t in topics:
         if t not in have:
