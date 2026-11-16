@@ -409,8 +409,11 @@ class SdkTasks:
     Every charge is also written to budget_ledger.json."""
 
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
-                 query_fn=None):
+                 query_fn=None, io_root: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
+        # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
+        # safe_io refuses a root inside a run dir (smoke4, 2026-11-16), so its root is the run dir itself.
+        self.io_root = os.path.abspath(io_root or run_dir)
         self.cloud = allow_cloud
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
@@ -443,7 +446,7 @@ class SdkTasks:
         if allowance is None or allowance <= 0:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
-        _sio().remove_path(out, self.run_dir)
+        _sio().remove_path(out, self.io_root)
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
@@ -517,7 +520,7 @@ class SdkTasks:
         except (OSError, ValueError):
             return TaskResult(False, None, usd, f"no valid {OUT}", seen["sid"])
         finally:
-            _sio().remove_path(out, self.run_dir)
+            _sio().remove_path(out, self.io_root)
         return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300], seen["sid"])
 
     def _input(self, obj) -> str:
@@ -590,8 +593,9 @@ class SdkTasks:
     def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
         """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
         (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
-        import world_model_trials as WMT
-        return WMT.sdk_seed_fn()(run_dir, ctx, feedback, cap_usd)
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
+        t.set_allowance(cap_usd)
+        return t.seed_world_model(ctx, feedback)
 
 
 def _self_test() -> int:

@@ -673,6 +673,18 @@ def _self_test() -> int:
            and den("Grep", {"pattern": "x", "path": os.path.dirname(other)}) is not None
            and den("Read", {"file_path": os.path.join(sd, "_task_input.json")}) is None,
            "W13 the seed task reads no run, its own or another, even under the repository's .claude/")
+        open(os.path.join(rd, "metadata.json"), "w").write("{}")       # a run marker, as main.py writes
+        out = os.path.join(sd, "_task_output.json")
+        open(out, "w").write("{}")
+        try:
+            WMT._sio().remove_path(out, sd)
+            refused = False
+        except Exception:  # noqa: BLE001 -- lib.safe_io refuses a root inside a run dir (smoke4, 2026-11-16)
+            refused = True
+        child = SDK.SdkTasks(sd, task_cap_usd=1.0, io_root=rd)
+        ok(refused and child.io_root == os.path.abspath(rd) and WMT._sio().remove_path(out, child.io_root) is not None
+           and not os.path.exists(out),
+           "W14 the seed session in world_model/seed/ removes its output under the run dir as the safe-io root")
     finally:
         shutil.rmtree(rd)
         shutil.rmtree(rd + "_other", ignore_errors=True)
