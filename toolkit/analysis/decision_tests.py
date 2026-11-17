@@ -945,7 +945,13 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                 tot[u][k] = be["cost"][u][k]
                 byc.setdefault(u, {})[k] = dict(be["cost_by"][u][k])
         cost = CostTable(tot, byc)
-        evs["engine_at_boundary"] = list(getattr(A, "point_events", None) or [])    # #252 review P1-3
+        pev = getattr(A, "point_events", None)       # #252 review P1-3; re-review: no record, not run
+        if pev is None:
+            return _not_run(A, dt, "the point evaluation's model corrections are not recorded (Analysis.point_events), "
+                                   "so the re-solved plan could not be guarded")
+        subst = {(u, k) for u, pair in be["pairs"].items() for k in pair}
+        # re-review P1: a correction on a cell the engine now supplies no longer bears on it
+        evs["engine_at_boundary"] = [e for e in pev if (str(e.get("unit")), e.get("package")) not in subst]
         varied = ("at the units of the boundary check, the benefits and costs of the packages run on the engine taken "
                   "from the engine instead of the emulator")
         cases, lowers = [("engine_at_boundary", ben, cost, None, None)], [False]

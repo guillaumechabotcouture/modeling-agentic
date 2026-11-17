@@ -9,4 +9,6 @@ commit: "DT-BE α"
 - Only the two compared cells (the chosen package and its runner-up: benefit, cost and component split) are substituted at each boundary unit, because the check's scale test proves only those are engine-derived. Every other cell keeps the point tables (P1-1, P1-2; BE-R4).
 - The re-solved plan is guarded with the point evaluation's corrections (P1-3; BE-R5).
 - A boundary check clears its stash on entry and publishes it only when it completes (P2-4; BE-R6).
-- An infeasible re-solve is recorded as not run, with why (P2-5; BE-R7).
+- An infeasible re-solve is recorded as not run, with why (P2-5; BE-R7). Codex round 2 raised one P1 and one P2, both fixed with their tests written first (γ).
+- A point correction on a cell the engine now supplies no longer blocks the re-solved plan; every other correction still does (BE-R8).
+- Without the point evaluation's recorded corrections the test is not run (BE-R9).
