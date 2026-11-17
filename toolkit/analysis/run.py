@@ -343,6 +343,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     point["cost_floors"] = floors0
+    if getattr(A, "adjust", None):    # F6 run 4 R3: the base outcome adjustments every evaluation applied
+        from toolkit.analysis import outcome_adjust as OA
+        point["outcome_adjustments"] = OA.record(A.adjust)
     if reserve is not None:
         point["reserve"] = reserve
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's

@@ -1376,6 +1376,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     if sp not in (None, "fitted") and not (isinstance(sp, list) and all(p in pnames for p in sp)):
         bad.append("analysis.sensitivity.parameters: `fitted` or a list of engine parameter names")
     comps = set(s.raw["options"]["components"])
+    from toolkit.analysis import outcome_adjust as _OA     # F6 run 4 R3: base outcome adjustments (trial ratios)
+    try:
+        _pk = s.packages()
+    except Exception:  # noqa: BLE001 -- package problems are reported elsewhere
+        _pk = {}
+    bad += _OA.problems(s.raw, _pk, comps, (s.raw.get("comparator") or {}).get("package"))
     seen = set()
     for k in ("share_threshold", "regret_threshold", "dollars_threshold"):     # F6 S1-5: toolkit/analysis/moves.py
         thr = an.get(k, 0.10)
@@ -1443,10 +1449,16 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             if orc["component"] == orc["reference"]:
                 bad.append(f"decision test {i}: outcome_ratio component and reference must differ")
             vs = orc["values"]
-            if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in vs)):
+            from toolkit.analysis import outcome_adjust as OAm      # F6 run 4 R3: "engine" removes a base adjustment
+            based = {str(a.get("component")) for a in OAm.config(s.raw) or [] if isinstance(a, dict)}
+            if isinstance(vs, list) and "engine" in vs and orc.get("component") not in based:
+                bad.append(f"decision test {i}: outcome_ratio value \"engine\" needs a base outcome adjustment of "
+                           f"{orc.get('component')} (analysis.outcome_adjustments)")
+            nums = [v for v in vs if v != "engine"] if isinstance(vs, list) else None
+            if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in nums)):
                 bad.append(f"decision test {i}: outcome_ratio.values: positive ratios (the package's burden over its "
-                           "counterpart's)")
-            elif all(abs(float(v) - 1.0) <= 1e-12 for v in vs):
+                           "counterpart's), or \"engine\"")
+            elif "engine" not in vs and all(abs(float(v) - 1.0) <= 1e-12 for v in vs):
                 bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
             elif orc["component"] in comps and orc["reference"] in comps:
                 pk = s.packages()

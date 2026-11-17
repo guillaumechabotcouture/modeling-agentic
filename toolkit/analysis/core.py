@@ -106,6 +106,9 @@ class Analysis:
         # F6 S2-5d: the burden anchor (toolkit/analysis/burden.py anchor_step): every evaluation's anchored outcomes at
         # the external level; None (the default) leaves the outcomes as the model predicts them
         self.anchor = None
+        # F6 run 4, owner decision R3 (toolkit/analysis/outcome_adjust.py): trial ratios applied in every evaluation
+        from toolkit.analysis import outcome_adjust as OA
+        self.adjust = OA.build(spec.raw, self.pk)
 
     def set_reserve(self, fraction):
         """F6 S1-1b: plan within `fraction` of every allocatable budget (None: no reserve)."""
@@ -177,6 +180,9 @@ class Analysis:
             from toolkit.analysis import burden as BU
             BU.apply_anchor(self.anchor, out, ids, param=lambda x: BU.param_at(self, theta, x), sampled=sampled,
                             factors=anchor_factors, unit_factors=anchor_unit_factors, skip=anchor_skip)
+        if getattr(self, "adjust", None):     # F6 run 4 R3: base outcome adjustments (trial ratios)
+            from toolkit.analysis import outcome_adjust as OA
+            self.last_events += OA.apply(self.adjust, out, ids, self.outcomes, self.last_events)
         ben = {i: {k: self.dfac * (out[i]["y"][self.comp][self.primary] - out[i]["y"][k][self.primary])
                    for k in self.pk} for i in ids}
         units = [self.by_id[i] for i in ids]
