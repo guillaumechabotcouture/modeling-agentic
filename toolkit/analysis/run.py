@@ -1870,6 +1870,7 @@ def _self_test_burden_e2e(ok, d, q):
            for x in fs) and signoff.status(d) == "signed",
        f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
        f"{sorted({x['kind'] for x in fs})}")
+    _self_test_burden_scale(ok, R, by)
     # F6 S2-5b: a model window on the emulator path; a report-only row with no published interval
     from toolkit.engines.contract import ToyEngine, UnitSpec, Package
     open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
@@ -1921,6 +1922,43 @@ def _self_test_burden_e2e(ok, d, q):
         M.pops = saved
     ok(err is None and all("burden" not in got[i] for i in A.ids),
        f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
+
+
+def _self_test_burden_scale(ok, R, by):
+    """F6 run 3, owner decision D-c: a burden_scale test scales every package's outcomes in each listed reference's
+    group by (reference / model point)^share, from the point outputs alone, and re-solves the plan."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "burden_scale", "text": "t",
+          "burden_scale": {"references": ["A", "B"], "shares": [0.5, 1.0]}}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    bs = rec.get("burden_scale") or {}
+    f = {k: by[k]["value"] / by[k]["model"]["point"] for k in ("A", "B")}
+    got = {k: (bs.get("references") or {}).get(k, {}).get("factor") for k in ("A", "B")}
+    ok(rec.get("status") == "run" and not sent and len(rec.get("results") or []) == 2
+       and all(got[k] is not None and abs(got[k] - f[k]) <= 1e-9 * abs(f[k]) for k in f),
+       f"BS-R1 a burden_scale test runs from the point outputs (no evaluation) with each group's factor reference / "
+       f"model point, as burden_validation reports them ({rec.get('status')}, {got} vs {f}, {len(sent)} evaluations)")
+    reg = {i: A.by_id[i]["region"] for i in A.ids}
+    chk = bs.get("check") or {}
+    want = {i: {k: ben0[i][k] * ({"r0": f["A"], "r1": f["B"]}.get(reg[i], 1.0)) for k in A.pk} for i in A.ids}
+    ok({reg[i] for i in chk} == {"r0", "r1", "r2"}
+       and all(abs(chk[i][k] - want[i][k]) <= 1e-9 * max(1.0, abs(want[i][k])) for i in chk for k in A.pk),
+       "BS-R2 at the largest share (1) every package's benefit in a listed group's units is scaled by the group's "
+       f"factor; a unit of no listed group is held (check units {sorted(chk)})")
+    dt2 = dict(dt, burden_scale={"references": ["zz"], "shares": [1.0]})
+    rec2 = DT_.run_one(A, dt2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    ok(rec2.get("status") == "not_run" and "zz" in rec2.get("reason", ""),
+       f"BS-R3 a reference the file does not hold: not run, with why ({rec2.get('status')}: {rec2.get('reason')})")
 
 
 def _self_test_anchor_e2e(ok, d, q):
