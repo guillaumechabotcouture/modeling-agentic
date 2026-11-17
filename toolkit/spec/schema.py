@@ -1951,6 +1951,15 @@ def _self_test() -> int:
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
+        # F6 run 4 R3 (RIG-002): the boundary check's engine tables in place of the emulator's, re-solved
+        dbe = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTbe", "type": "boundary_engine", "text": "t"}, **kw)))
+        bad(dbe(units=["0"]), "boundary_engine takes no", "SP-BE1 a boundary_engine test takes no parameters")
+        bad(lambda r: (r["analysis"].update(evaluation="direct"), dbe()(r)), "emulator",
+            "SP-BE2 a boundary_engine test needs the emulator path (the boundary check runs only there)")
+        r_be = copy.deepcopy(s.raw)
+        dbe()(r_be)
+        ok(validate(Spec(r_be, d)) == [], f"SP-BE3 a boundary_engine test validates: {validate(Spec(r_be, d))[:3]}")
         _self_test_burden_scale(ok, s, d, bad)
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)

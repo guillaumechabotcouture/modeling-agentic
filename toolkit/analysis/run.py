@@ -585,6 +585,7 @@ def _self_test() -> int:
            and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
                     and f["kind"] != "emulator_boundary_ranking"],
            f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
+        _self_test_boundary_engine(ok, R)
         from toolkit.analysis.model import DirectModel
         Ab, r0 = R["_A"], bd["rows"][0]
         zb = {i: v["z"] for i, v in R["calibration"]["units"].items()}
@@ -1400,6 +1401,41 @@ def _self_test_joint(ok, q):
                and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
                f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
     _ = p
+
+
+def _self_test_boundary_engine(ok, R):
+    """F6 run 4, owner decision R3 (RIG-002): a boundary_engine decision test re-solves the plan with the boundary
+    check's engine benefits and costs in place of the emulator's at its units (stored engine rows, no new job)."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "boundary_engine", "text": "t", "finding": "emulator_boundary_ranking:emulator_boundary"}
+    be = getattr(A, "boundary_engine", None) or {}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    units = (rec.get("boundary_engine") or {}).get("units") or []
+    ok(rec.get("status") == "run" and units and sorted(units) == sorted(be.get("ben") or {}) and not sent
+       and rec.get("finding") == "emulator_boundary_ranking:emulator_boundary",
+       f"BE-R1 a boundary_engine test re-solves with the boundary check's engine tables at its units, with no new "
+       f"evaluation, under the finding it is declared for ({rec.get('status')}, {len(units)} units, {len(sent)} evals)")
+    u = units[0] if units else None
+    ok(u is not None and all(rec["boundary_engine"]["check"][u][k] == be["ben"][u][k] for k in A.pk),
+       "BE-R2 at a boundary unit every package's benefit is the engine side's (packages not run keep the emulator's)")
+    saved = A.boundary_engine
+    try:
+        del A.boundary_engine
+        rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.boundary_engine = saved
+    ok(rec2.get("status") == "not_run" and "boundary" in rec2.get("reason", ""),
+       f"BE-R3 without the boundary check's engine tables: not run, with why ({rec2.get('reason')})")
 
 
 def _self_test_stability_flagged(ok):
