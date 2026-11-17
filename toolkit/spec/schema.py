@@ -1687,6 +1687,37 @@ def direct_toy(r: dict) -> dict:
     return r
 
 
+def _self_test_outcome_adjustments(ok, s, d, bad):
+    """F6 run 4, owner decision R3: base outcome adjustments (analysis.outcome_adjustments): a package's outcomes set to
+    a trial ratio of its counterpart's in every evaluation, checked at sign-off; an outcome_ratio test may take the
+    value "engine" (the base adjustment removed) only for an adjusted component."""
+    good = {"id": "OA1", "component": "a", "reference": "b", "value": 0.5, "source": "toy trial"}
+
+    def oa(*items):
+        return lambda r: r["analysis"].update(outcome_adjustments=[dict(x) for x in items])
+    bad(lambda r: r["analysis"].update(outcome_adjustments={"a": 1}), "outcome_adjustments",
+        "SP-OA1 outcome_adjustments must be a list of adjustments")
+    bad(oa(dict(good, component="zz")), "unknown component", "SP-OA2 an unknown component is refused")
+    bad(oa(dict(good, reference="a")), "differ", "SP-OA3 a component adjusted against itself is refused")
+    bad(oa(dict(good, value=0.0)), "positive", "SP-OA4 a ratio that is not positive is refused")
+    bad(oa(good, dict(good, id="OA2", component="b", reference="a")), "itself adjusted",
+        "SP-OA5 a reference that is itself adjusted is refused (no chains)")
+    bad(oa(good, dict(good, id="OA2")), "more than once", "SP-OA6 a component adjusted twice is refused")
+    bad(oa(dict(good, source="")), "source", "SP-OA7 an adjustment without its source is refused")
+    bad(lambda r: (r["comparator"].update(package="a"), oa(good)(r)), "comparator",
+        "SP-OA8 an adjustment of a component the comparator holds is refused (every benefit is measured from it)")
+    r_g = copy.deepcopy(s.raw)
+    oa(good)(r_g)
+    ok(validate(Spec(r_g, d)) == [], f"SP-OA9 a well-formed outcome adjustment validates: {validate(Spec(r_g, d))[:3]}")
+    dor = {"id": "DTe", "type": "outcome_ratio", "text": "t",
+           "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.4]}}
+    bad(lambda r: r["analysis"]["decision_tests"].append(copy.deepcopy(dor)), "engine",
+        "SP-OA10 an outcome_ratio value \"engine\" without a base adjustment of its component is refused")
+    r_e = copy.deepcopy(r_g)
+    r_e["analysis"]["decision_tests"].append(copy.deepcopy(dor))
+    ok(validate(Spec(r_e, d)) == [], f"SP-OA11 \"engine\" with a base adjustment validates: {validate(Spec(r_e, d))[:3]}")
+
+
 def _self_test_burden_scale(ok, s, d, bad):
     """F6 run 3, owner decision D-c: a burden_scale decision test scales every package's outcomes in the units of the
     listed external references' groups by reference / model (validation.burden), checked at sign-off."""
@@ -1952,6 +1983,7 @@ def _self_test() -> int:
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
         _self_test_burden_scale(ok, s, d, bad)
+        _self_test_outcome_adjustments(ok, s, d, bad)
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
