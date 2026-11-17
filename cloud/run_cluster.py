@@ -4433,6 +4433,13 @@ def _self_test_checkpoint(ok) -> None:
     ok(got.get("sha256") == rec["sha256"] and os.path.exists(os.path.join(dest, "runs", "R_x", "run_state.json"))
        and json.load(open(os.path.join(dest, "checkpoint.json"))).get("sha256") == rec["sha256"],
        f"CK10 `checkpoint` reads the pointer, downloads, verifies and extracts the latest generation: {got}")
+    try:
+        mk10 = json.load(open(os.path.join(dest, "runs", "R_x", "copied_run.json")))
+    except (OSError, ValueError):
+        mk10 = {}
+    ok(list(mk10.get("files") or {}) == ["models/b.jsonl.partial.jsonl"] and "checkpoint R1" in str(mk10.get("source"))
+       and mk10.get("captured_at") == got.get("time_utc"),
+       f"CK10b (F6 run 3) the fetched run dir is marked: its batch journal is a copy, not a live batch ({mk10})")
     store.files[gen(n)[0]] = data + b"tampered"
     out3 = tempfile.mkdtemp()
     cfg3 = RunConfig(name="t", question_file="q", out_dir=out3, labels=("R1",))

@@ -917,6 +917,25 @@ def _self_test() -> int:
                and "key set: True" in open(os.path.join(dest, "job.log")).read(),
                f"RC39 a poll saves the job's outputs and log locally: {s1['fetched']}")
             ok(sync_outputs(run, "j1", dest)["fetched"] == [], "RC40 a second poll with nothing new fetches nothing")
+            # RC40b (F6 run 3): a run dir copied out of a live run is marked: its batch records describe the VM's process
+            code2 = io.BytesIO()
+            with tarfile.open(fileobj=code2, mode="w:gz") as t:
+                src = (b"import os\nr = os.path.join(os.environ['JOB_OUT'], 'runs', 'R')\n"
+                       b"os.makedirs(os.path.join(r, 'analysis', 'batch'))\n"
+                       b"open(os.path.join(r, 'run_state.json'), 'w').write('{}')\n"
+                       b"open(os.path.join(r, 'analysis', 'batch', 'results.jsonl.job.json'), 'w').write('{\"pid\": 7}')\n")
+                ti = tarfile.TarInfo("job.py")
+                ti.size = len(src)
+                t.addfile(ti, io.BytesIO(src))
+            ws.job_task("j2", code2.getvalue(), [sys.executable, "job.py"], {}, 1.0, heartbeat_s=1)
+            dest2 = os.path.join(d, "local2")
+            sync_outputs(run, "j2", dest2)
+            try:
+                mk = json.load(open(os.path.join(dest2, "out", "runs", "R", "copied_run.json")))
+            except (OSError, ValueError):
+                mk = {}
+            ok(list(mk.get("files") or {}) == ["analysis/batch/results.jsonl.job.json"] and "j2" in str(mk.get("source")),
+               f"RC40b a copied run dir is marked with its in-flight records ({mk})")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)

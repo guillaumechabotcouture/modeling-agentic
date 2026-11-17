@@ -3440,6 +3440,7 @@ def _self_test() -> int:
     _self_test_p35(ok)
     _self_test_p37(ok)
     _self_test_p42(ok)
+    _self_test_copied(ok)
     _self_test_p45d(ok)
     _self_test_sched(ok)
     try:
@@ -3952,6 +3953,45 @@ def _self_test_wall(ok) -> None:
         open(os.path.join(d, "models", "helper.py"), "w").write("X = 1\n")
         ok(fp1 == fp0 and code_fingerprint(d, "models/fn.py::f") != fp1,
            "SW5 the pipeline runner's own definition and records are not part of a batch's fingerprint; model code is")
+
+
+def _self_test_copied(ok) -> None:
+    """F6 run 3: a batch's records copied out of a live run (a cp loop, the checkpoint fetch, vm_job's poll sync) are
+    not a batch running here. Its job record names a live pid here (this process), so only the copy can say so."""
+    import tempfile
+    from lib import copied_run as CR
+    me, start = os.getpid(), _pid_start(os.getpid())
+    with tempfile.TemporaryDirectory() as d:
+        bd = os.path.join(d, "analysis", "batch")
+        os.makedirs(os.path.join(bd, PROGRESS_DIR))
+        out = os.path.join(bd, "results.jsonl")
+        open(out + PARTIAL_EXT, "w").write('{"fn": "f"}\n{"ok": true}\n')
+
+        def job(**kw):
+            open(out + JOB_EXT, "w").write(json.dumps(dict({"pid": me, "started": time.time() - 900, "n": 4,
+                                                             "log": out + ".log"}, **kw)))
+        job(pid_start=start, host=os.uname().nodename)
+        ok(job_status(out)["state"] == RUNNING, "CP1 a job of this host with a live pid is running")
+        job(pid_start=start, host="another-host")
+        st = job_status(out)
+        ok(st["state"] == COPIED and "another-host" in st.get("why", ""),
+           f"CP2 a job record from another host is a copy, not a live batch here ({st['state']})")
+        job()                                       # an older record: no host, no start token
+        old = time.time() - 2 * PROGRESS_STALE_S
+        for f in (out + PARTIAL_EXT, out + JOB_EXT):
+            os.utime(f, (old, old))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP3 a record with no host or start token and a journal quiet past the stale limit "
+                                  f"is stale ({st['state']})")
+        open(out + PARTIAL_EXT, "a").write('{"ok": true}\n')
+        ok(job_status(out)["state"] == RUNNING, "CP4 the same record with a fresh journal is still read as running")
+        job(pid_start=start, host=os.uname().nodename)
+        CR.mark(d, "test copy", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED and st.get("copied", {}).get("source") == "test copy" and _STATUS_EXIT[COPIED] == 4,
+           f"CP5 a job record the copy marker lists, unchanged, is reported copied (exit 4) ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, n=5)
+        ok(job_status(out)["state"] == RUNNING, "CP6 a job record rewritten after the copy is read as usual")
 
 
 def _self_test_xhost(ok) -> None:
