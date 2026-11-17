@@ -762,6 +762,9 @@ def burden_scale_refs(spec, bs) -> tuple[list[dict], list[str]]:
     rows = [by[str(x)] for x in ids]
     bad = [f"burden_scale.references: {r['id']} is {r['kind']}, {r['role']}: only an estimated checked or report-only "
            "row sets a scale" for r in rows if r["kind"] != "estimated" or r["role"] not in ("checked", "report_only")]
+    bad += [f"burden_scale.references: {r['id']} has an age band and no model window: its value needs a new "
+            "prediction, and the test reads the point outputs only (declare validation.burden.window)"
+            for r in rows if r["age_band"] and not r["window"]]
     cfg, units, uid = BV.config(spec), spec.units(), spec["decision_units"]["id"]
     seen = {}
     for r in rows:
@@ -783,29 +786,33 @@ def _burden_scale(A, dt, z0, out0, ben0, cost0) -> dict:
     burden_validation reports, here from the point outputs). The relative reductions stay the engine's; benefits,
     which are differences of burdens, scale with them. Costs and every other unit are held, the plan re-solved, and
     nothing is evaluated anew. A reference whose outcome, age band or window differs from the objective's applies its
-    ratio to the objective's outcome: an assumption the record states. Not run when a listed row cannot be read or
-    its model value is not positive."""
+    ratio to the objective's outcome: an assumption the record states. Every re-solved plan is guarded with the point
+    evaluation's model corrections (Analysis.point_events, set by run.py). Not run when a listed row cannot be read,
+    its model value or factor is not finite and positive, or the point corrections are not recorded."""
     from toolkit.analysis import burden as BV
     bs = dt.get("burden_scale") or {}
     rows, bad = burden_scale_refs(A.spec, bs)
     if bad:
         return {"not_run": "; ".join(bad)}
+    ev0 = getattr(A, "point_events", None)    # Codex review of #246 P1-1: the point tables' own corrections
+    if ev0 is None:
+        return {"not_run": "the point evaluation's model corrections are not recorded (Analysis.point_events), so the "
+                           "re-solved plans could not be guarded"}
     cfg = BV.config(A.spec)
     arm = cfg["arm"]
-    bands = sorted({r["age_band"] for r in rows if r["age_band"] and not r["window"]})
-    by_pop = BV.by_population(A, A.theta0, z0, bands, arm) if bands else {}
     refs, unit_f, firsts = {}, {}, set()
     for r in rows:
-        m = BV._value(A, cfg, r, by_pop[r["age_band"]] if r["age_band"] and not r["window"] else out0, arm)
-        if m is None or not m > 0 or not r["value"] > 0:
-            return {"not_run": f"reference {r['id']}: its model value ({m}) or its value ({r['value']}) is not positive"}
+        m = BV._value(A, cfg, r, out0, arm)
+        f = float(r["value"]) / float(m) if m is not None and math.isfinite(float(m)) and float(m) > 0 else None
+        if f is None or not (math.isfinite(f) and f > 0):     # Codex review of #246 P1-2
+            return {"not_run": f"reference {r['id']}: its model value ({m}) or its value ({r['value']}) is not finite "
+                               "and positive"}
         us = BV._members(A, r.get("group_by") or cfg["group"], r["group"])
-        f = float(r["value"]) / float(m)
         unit_f.update({i: f for i in us})
         firsts.update(us[:1])
         refs[r["id"]] = {"group": r["group"], "group_by": r.get("group_by") or cfg["group"], "units": len(us),
                          "outcome": r["outcome"], "age_band": r["age_band"], "value": float(r["value"]),
-                         "model": float(m), "factor": f}
+                         "model": float(m), "factor": f, "window": r["window"]}
     shares = [float(s) for s in bs["shares"]]
     cases, lowers = [], []
     for s in shares:
@@ -816,13 +823,15 @@ def _burden_scale(A, dt, z0, out0, ben0, cost0) -> dict:
     held = next((i for i in A.ids if i not in unit_f), None)
     check = {i: dict(top[i]) for i in sorted(firsts | ({held} if held is not None else set()))}
     o = A.primary
-    mism = sorted({x["id"] for x in rows if x["outcome"] != o or x["age_band"]})
+    mism = sorted({x["id"] for x in rows if x["outcome"] != o or x["age_band"] or x["window"]})
     return {"varied": "every package's outcomes in the units of each listed external reference's group scaled by "
                       "(reference / model)^share, the engine's relative reductions kept", "cases": cases,
             "lowers": lowers,
             "record": {"references": refs, "shares": shares, "objective_outcome": o, "arm": arm, "check": check,
-                       "assumption": (f"the ratio of {', '.join(mism)} (another outcome or an age band) is applied to "
-                                      f"every package's {o}") if mism else None}}
+                       "assumption": (f"the ratio of {', '.join(mism)} (another outcome, an age band or another "
+                                      f"window than the objective's) is applied to every package's {o} over the "
+                                      "objective's horizon") if mism else None},
+            "evs": {s: list(ev0) for s in shares}}
 
 
 def _calibration_target(A, dt, z0) -> dict:
@@ -919,7 +928,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         bsr = _burden_scale(A, dt, z0, out0, ben0, cost0)
         if bsr.get("not_run"):
             return _not_run(A, dt, bsr["not_run"])
-        varied, cases, lowers = bsr["varied"], bsr["cases"], bsr["lowers"]
+        varied, cases, lowers, evs = bsr["varied"], bsr["cases"], bsr["lowers"], bsr["evs"]
         extra["_bs"] = bsr["record"]
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
