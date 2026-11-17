@@ -1725,6 +1725,17 @@ def _self_test_outcome_adjustments(ok, s, d, bad):
            "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.4]}}
     bad(lambda r: r["analysis"]["decision_tests"].append(copy.deepcopy(dor)), "engine",
         "SP-OA10 an outcome_ratio value \"engine\" without a base adjustment of its component is refused")
+    r_x = copy.deepcopy(r_g)      # Codex review of #251 P1-4: a test on a base adjustment's reference is refused
+    r_x["analysis"]["decision_tests"].append({"id": "DTr", "type": "outcome_ratio", "text": "t",
+                                              "outcome_ratio": {"component": "b", "reference": "a", "values": [0.5]}})
+    ok(any("base adjustment" in e for e in validate(Spec(r_x, d))),
+       f"SP-OA12 (P1-4) an outcome_ratio test involving a base adjustment's reference is refused: "
+       f"{[e for e in validate(Spec(r_x, d)) if 'DTr' in e][:2]}")
+    r_1 = copy.deepcopy(r_g)      # P2-9: with a base adjustment, a ratio of 1 is a real case
+    r_1["analysis"]["decision_tests"].append({"id": "DT1r", "type": "outcome_ratio", "text": "t",
+                                              "outcome_ratio": {"component": "a", "reference": "b", "values": [1.0]}})
+    ok(validate(Spec(r_1, d)) == [], f"SP-OA13 (P2-9) a ratio of 1 on an adjusted component validates: "
+                                     f"{validate(Spec(r_1, d))[:2]}")
     r_e = copy.deepcopy(r_g)
     r_e["analysis"]["decision_tests"].append(copy.deepcopy(dor))
     ok(validate(Spec(r_e, d)) == [], f"SP-OA11 \"engine\" with a base adjustment validates: {validate(Spec(r_e, d))[:3]}")

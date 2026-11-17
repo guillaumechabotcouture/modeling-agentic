@@ -140,6 +140,32 @@ def _self_test() -> int:
     ok(ev == [{"unit": "u", "package": "a+s", "kind": "clip", "derived_from": "b+s"}],
        f"OA3 a counterpart's correction is copied onto the derived package ({ev})")
     ok(problems({"analysis": {}}, pk, set("abs"), "none") == [], "OA4 no field, no problem")
+    # Codex review of #251 (P1-2, P1-3, P1-5..7, P2-8)
+    one = lambda **kw: {"analysis": {"outcome_adjustments": [dict({"id": "x", "component": "a", "reference": "b",  # noqa: E731
+                                                                   "value": 0.5, "source": "t"}, **kw)]}}
+    pk2 = {"none": [], "a": ["a"], "b": ["b"], "a+s": ["a", "s"], "s": ["s"]}
+    ok(any("counterpart" in e and "a+s" in e for e in problems(one(), pk2, set("abs"), "none")),
+       "OA5 (P1-2) a package with the component and no counterpart is refused (every affected package is covered)")
+    two = {"analysis": {"outcome_adjustments": [
+        {"id": "x", "component": "a", "reference": "b", "value": 0.5, "source": "t"},
+        {"id": "y", "component": "s", "reference": "t", "value": 0.2, "source": "t"}]}}
+    pk3 = {"none": [], "a": ["a"], "b": ["b"], "s": ["s"], "t": ["t"], "a+s": ["a", "s"], "b+s": ["b", "s"],
+           "a+t": ["a", "t"], "b+t": ["b", "t"]}
+    ok(any("more than one adjusted" in e for e in problems(two, pk3, set("abst"), "none")),
+       "OA6 (P1-3) a package holding two adjusted components is refused (no order-dependent overwrite)")
+    raw = dict(one(), validation={"burden": {"csv": "x.csv", "arm": "a"}})
+    ok(any("validation.burden" in e for e in problems(raw, pk, set("abs"), "none")),
+       "OA7 (P1-5, P1-6) a burden-validation or anchor arm holding an adjusted component is refused")
+    raw = dict(one(), calibration={"method": "likelihood"})
+    ok(any("likelihood" in e for e in problems(raw, pk, set("abs"), "none")),
+       "OA8 (P1-7) adjustments with a likelihood or posterior calibration are refused (it reads raw outcomes)")
+    out = {"u": {"y": {k: {"dalys": 10.0 + n, "__yll": 8.0 + n} for n, k in enumerate(pk)},
+                 "y_group": {k: {"g1": {"dalys": 4.0 + n}, "g2": {"dalys": 6.0}} for n, k in enumerate(pk)}}}
+    apply(adj, out, ["u"], ["dalys"])
+    yg = out["u"]["y_group"]
+    ok(out["u"]["y"]["a"]["__yll"] == 0.5 * out["u"]["y"]["b"]["__yll"]
+       and yg["a"]["g1"]["dalys"] == 0.5 * yg["b"]["g1"]["dalys"] and yg["a"]["g2"]["dalys"] == 3.0,
+       "OA9 (P2-8) every y entry (DALY parts included) and the grouped outputs follow the counterpart")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
