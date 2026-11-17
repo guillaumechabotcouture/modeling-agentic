@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Resume smoke before a paid launch: interrupt toy runs at each resumable state, resume them, check the reuse.
+
+    python3 scripts/resume_smoke.py [<launch tree>] [--json <out>]   # default tree: this checkout; exit 1 on a failure
+    python3 scripts/resume_smoke.py --self-test
+
+A paid run that is interrupted is only cheap to resume if the code that will run reuses every engine row the
+interrupted attempt finished and leaves the signature standing. This checks that on the code a launch ships, before
+it ships, with toy engines and toy functions only, locally, in seconds of CPU. `<launch tree>` is the extracted tree
+a launch ships (`git archive HEAD`, the tree `cloud/run_cluster.py` builds); the smoke runs that tree's own copy of
+this script with the tree as its working directory (`python -I`), so the tree's stage machine, compute.py and
+sign-off code are the ones exercised. A tree without this script is a failure.
+
+Scenarios (each a fresh toy v2 run, signed by the lead through the stage machine's own SIGN):
+  analyze_timeout  the engine batch step exceeds its time limit with 3 of 6 rows done; the run ends run_failed,
+                   resumable "timeout"; --resume (run_v2 again) reopens it at ANALYZE.
+  killed_batch     the batch process is killed (SIGKILL) with 3 of 6 rows done; resumable "killed"; --resume.
+  cap_stop         the per-call compute allowance stops the batch (rows of kind stopped); the batch is rerun with an
+                   allowance (what a relaunch does). The stage machine does not mark a cap stop as resumable
+                   (stage_machine.analysis_failure_cause: infra only), so this scenario is checked at the batch
+                   level, and the report records that --resume alone does not continue it.
+For each: rows reused on resume == ok rows the interrupted attempt kept, zero of those recomputed (the toy function
+logs every call), and, for the stage-machine scenarios, the run's sign-off record is unchanged and still binds the
+spec (spec_sha256 == the spec's sha256), and the run finishes.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CALLS, SLOW, KILL, KILLED, SLEEP = "MA_RS_CALLS", "MA_RS_SLOW_FROM", "MA_RS_KILL_AT", "MA_RS_KILLED", "MA_RS_SLEEP"
+N = 6
+CUT = 3
+
+TOY_FN = f'''import os
+import signal
+import time
+
+
+def f(p):
+    with open(os.environ["{CALLS}"], "a") as fh:
+        fh.write(f"{{p['i']}}\\n")
+    if os.environ.get("{SLEEP}"):
+        time.sleep(float(os.environ["{SLEEP}"]))
+    if p["i"] >= int(os.environ.get("{KILL}") or 99) and not os.path.exists(os.environ["{KILLED}"]):
+        open(os.environ["{KILLED}"], "w").write("x")
+        pid = int(open(os.environ["{KILLED}"] + ".driver").read())
+        os.killpg(os.getpgid(pid), signal.SIGKILL)  # the batch step's process group dies mid-batch, as on a lost VM
+        os._exit(0)                                 # and this worker with it (it holds the step's output pipes)
+    if p["i"] >= int(os.environ.get("{SLOW}") or 99):
+        parent = os.getppid()
+        for _ in range(600):                        # until the step is killed by its time limit
+            time.sleep(0.1)
+            if os.getppid() != parent:
+                break
+    return {{"v": p["i"]}}
+'''
+
+DRIVER = '''import json
+import os
+import sys
+sys.path.insert(0, {scripts!r})
+import compute
+
+
+def main(rd):
+    if os.environ.get("{killed}"):
+        open(os.environ["{killed}"] + ".driver", "w").write(str(os.getpid()))
+    os.makedirs(os.path.join(rd, "analysis", "batch"), exist_ok=True)
+    rows, _ = compute.run_map(rd, os.path.join(rd, "models", "toy_fn.py") + "::f", [{{"i": i}} for i in range({n})],
+                              os.path.join(rd, "analysis", "batch", "rows.jsonl"), backend="local", max_workers=1,
+                              purpose="resume smoke")
+    json.dump([bool(r.get("ok")) for r in rows], open(os.path.join(rd, "analysis", "toy_rows.json"), "w"))
+    return 0 if all(r.get("ok") for r in rows) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))
+'''
+
+
+def judge(name: str, before: list, after: list, summary: dict, sig0=None, sig1=None, spec_sha=None,
+          status=None) -> dict:
+    """The assertions for one scenario. `before`/`after`: the toy function's calls in the interrupted attempt and on
+    resume; `summary`: the resumed batch's compute.py summary; sig0/sig1: the sign-off record before and after;
+    `status`: the resumed run's terminal status (None at batch level)."""
+    return {"scenario": name, "ok": True, "problems": []}     # α: tests first; the assertions land in β
+    kept = sorted(set(before) & set(int(x) for x in summary.get("_kept", [])))
+    problems = []
+    recomputed = sorted(set(after) & set(kept))
+    if summary.get("reused") != len(kept):
+        problems.append(f"rows reused {summary.get('reused')} != ok rows the interrupted attempt kept {len(kept)}")
+    if recomputed:
+        problems.append(f"rows recomputed on resume: {recomputed}")
+    if summary.get("n_ok") != N:
+        problems.append(f"the resumed batch has {summary.get('n_ok')} of {N} ok rows")
+    if sig0 is not None or sig1 is not None:
+        if not sig0 or sig0 != sig1:
+            problems.append("the sign-off record changed or is missing across the resume")
+        elif sig1.get("spec_sha256") != spec_sha:
+            problems.append("the sign-off record no longer binds the spec")
+    if status is not None and status not in ("completed", "completed_scope_declared"):
+        problems.append(f"the resumed run ended {status}")
+    return {"scenario": name, "kept": len(kept), "reused": summary.get("reused"), "computed": summary.get("computed"),
+            "recomputed": len(recomputed), "status": status, "ok": not problems, "problems": problems}
+
+
+def _calls(path) -> list:
+    return [int(x) for x in open(path).read().split()] if os.path.exists(path) else []
+
+
+def _kept(rd) -> list:
+    """The ok rows the interrupted attempt left: the finished batch's rows, else its journal."""
+    out = os.path.join(rd, "analysis", "batch", "rows.jsonl")
+    for p in (out, out + ".partial.jsonl"):
+        if os.path.exists(p):
+            rows = [json.loads(x) for x in open(p) if x.strip()]
+            got = [r.get("i") for r in rows if r.get("ok") and "_partial" not in r]
+            if got:
+                return got
+    return []
+
+
+def scenarios(work: str) -> list:
+    """Run every scenario under `work` with this tree's code; [judge() rows]."""
+    return []                                                 # α: tests first; the scenarios land in β
+    for p in (os.path.join(ROOT, "agents"), os.path.join(ROOT, "scripts"), ROOT):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import analysis_backend as AB
+    import compute
+    import stage_machine as SM
+    from v2_tasks import StubTasks
+    spike = AB.backend("spike")
+    quiet = lambda *a: None  # noqa: E731
+    drv = os.path.join(work, "resume_smoke_driver.py")
+    open(drv, "w").write(DRIVER.format(scripts=os.path.join(ROOT, "scripts"), n=N, killed=KILLED))
+
+    class Batch:
+        """The spike backend with the toy engine batch as a pipeline step before its analysis."""
+        def __init__(self, tmo):
+            self.tmo = tmo
+
+        def __getattr__(self, k):
+            return getattr(spike, k)
+
+        def pipeline_steps(self, spec_path, run_dir):
+            steps = [dict(s) for s in spike.pipeline_steps(spec_path, run_dir)]
+            for s in steps:
+                if s["id"] == "analyze":
+                    s["inputs"] = s["inputs"] + ["analysis/toy_rows.json"]
+            return [{"id": "batch", "run": f"{sys.executable} {drv} {run_dir}", "inputs": [AB.SPEC_FILE],
+                     "outputs": ["analysis/toy_rows.json"], "timeout_s": self.tmo}] + steps
+
+    def toy_run(name):
+        d = os.path.join(work, name)
+        os.makedirs(os.path.join(d, "models"))
+        AB.write_toy_units(os.path.join(d, "units.csv"), n=12)
+        spec = AB.toy_spec("units.csv")
+        spec.pop("engine")
+        spec["deliverable_file"] = {"path": "allocation_optimized.csv",
+                                    "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
+        SM.init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False)
+        open(os.path.join(d, "models", "toy_fn.py"), "w").write(TOY_FN)
+        return d, StubTasks({"spec": spec, "settings": AB.toy_settings(draws=24, points=16)})
+
+    def sig(d):
+        try:
+            return json.load(open(os.path.join(d, SM.SIGNOFF_FILE)))
+        except (OSError, ValueError):
+            return None
+
+    out = []
+    for name, env, want in (("analyze_timeout", {SLOW: str(CUT)}, "timeout"),
+                            ("killed_batch", {KILL: str(CUT)}, "killed")):
+        d, T = toy_run(name)
+        calls = os.path.join(work, f"{name}.calls")
+        os.environ.update({CALLS: calls, KILLED: os.path.join(work, f"{name}.killed"), **env})
+        try:
+            s1 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(8), cross_engine_check=False)
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+        st = SM.load_state(d)
+        why = SM.resumable_failure(d, st)
+        before, kept, sig0 = _calls(calls), _kept(d), sig(d)
+        if s1 != "run_failed" or why != want:
+            out.append({"scenario": name, "ok": False, "problems": [
+                f"the interruption did not end run_failed resumable {want!r} ({s1}, {why})"]})
+            continue
+        s2 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(120), cross_engine_check=False)
+        summ = json.load(open(os.path.join(d, "analysis", "batch", "rows.jsonl.summary.json")))
+        after = _calls(calls)[len(before):]
+        with open(os.path.join(d, AB.SPEC_FILE), "rb") as fh:
+            spec_sha = hashlib.sha256(fh.read()).hexdigest()
+        out.append(judge(name, before, after, dict(summ, _kept=kept), sig0, sig(d), spec_sha, s2))
+    # cap_stop: the per-call allowance stops the batch; rerun with an allowance (a relaunch)
+    d = os.path.join(work, "cap_stop")
+    os.makedirs(os.path.join(d, "models"))
+    open(os.path.join(d, "models", "toy_fn.py"), "w").write(TOY_FN)
+    calls = os.path.join(work, "cap_stop.calls")
+    outp = os.path.join(d, "analysis", "batch", "rows.jsonl")
+    os.makedirs(os.path.dirname(outp))
+    os.environ.update({CALLS: calls, KILLED: os.path.join(work, "cap.killed"), SLEEP: "0.6"})
+    try:
+        _rows, s0 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
+                                    outp, backend="local", max_workers=1, max_core_hours=1.5 / 3600, ledger=False)
+        stopped = (s0.get("failed_by_kind") or {}).get(compute.STOPPED, 0)
+        before, kept = _calls(calls), [r["i"] for r in _rows if r.get("ok")]
+        os.environ.pop(SLEEP, None)
+        _rows, s1 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
+                                    outp, backend="local", max_workers=1, ledger=False)
+    finally:
+        os.environ.pop(SLEEP, None)
+    row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept))
+    if not stopped:
+        row["ok"], row["problems"] = False, row["problems"] + [f"the allowance did not stop the batch ({s0})"]
+    row["note"] = ("a cap stop is not resumable by --resume (stage_machine.analysis_failure_cause: infra only); "
+                   "rerun the batch, as a relaunch does, and its rows are reused")
+    out.append(row)
+    return out
+
+
+def run_tree(tree: str) -> dict:
+    """Run the smoke with `tree`'s own copy of this script (python -I, cwd tree); the report, or a failure."""
+    tree = os.path.realpath(tree)
+    me = os.path.join(tree, "scripts", "resume_smoke.py")
+    if not os.path.isfile(me):
+        return {"tree": tree, "ok": False, "scenarios": [], "problems": ["the tree has no scripts/resume_smoke.py"]}
+    import tempfile
+    with tempfile.TemporaryDirectory() as work:
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR", "OMP_NUM_THREADS",
+                                                            "OPENBLAS_NUM_THREADS")}
+        r = subprocess.run([sys.executable, "-I", me, "--scenarios", os.path.realpath(work)], cwd=tree, env=env,
+                           capture_output=True, text=True, timeout=1800)
+    line = next((x for x in reversed(r.stdout.splitlines()) if x.startswith("RESUME_SMOKE ")), None)
+    if line is None:
+        return {"tree": tree, "ok": False, "scenarios": [],
+                "problems": [f"the smoke did not report: {(r.stderr or r.stdout)[-800:]}"]}
+    rows = json.loads(line[len("RESUME_SMOKE "):])
+    return {"tree": tree, "ok": bool(rows) and all(x.get("ok") for x in rows), "scenarios": rows, "problems": []}
+
+
+def _self_test() -> int:
+    fails = []
+
+    def ok(c, m):
+        print(("PASS " if c else "FAIL ") + m)
+        c or fails.append(m)
+
+    s = {"reused": 3, "computed": 3, "n_ok": N, "_kept": [0, 1, 2]}
+    sg = {"by": "lead", "spec_sha256": "h"}
+    ok(judge("x", [0, 1, 2, 3], [3, 4, 5], s, sg, dict(sg), "h", "completed")["ok"], "RS1 a clean resume passes")
+    ok(not judge("x", [0, 1, 2, 3], [2, 3, 4, 5], s)["ok"], "RS2 a kept row computed again fails")
+    ok(not judge("x", [0, 1, 2, 3], [3, 4, 5], dict(s, reused=2))["ok"], "RS3 fewer rows reused than kept fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, sg, dict(sg, by="owner"), "h")["ok"], "RS4 a changed sign-off fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, sg, dict(sg), "other")["ok"], "RS5 a signature that no longer binds "
+                                                                             "the spec fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, None, None, None, "run_failed")["ok"], "RS6 an unfinished resume fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], dict(s, n_ok=5))["ok"], "RS7 a resumed batch with a failed row fails")
+    rep = run_tree(ROOT)
+    ok(rep["ok"] and {x["scenario"] for x in rep["scenarios"]} == {"analyze_timeout", "killed_batch", "cap_stop"}
+       and all(x["kept"] >= 1 and x["recomputed"] == 0 and x["reused"] == x["kept"] for x in rep["scenarios"]),
+       f"RS8 this tree resumes every scenario reusing every kept row: {json.dumps(rep)[:1500]}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        r = run_tree(t)
+        ok(not r["ok"] and "no scripts/resume_smoke.py" in r["problems"][0], "RS9 a tree without the smoke fails")
+    print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
+                                               "all self-test cases passed."))
+    return 1 if fails else 0
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--self-test"]:
+        return _self_test()
+    if argv[:1] == ["--scenarios"]:
+        print("RESUME_SMOKE " + json.dumps(scenarios(argv[1])))
+        return 0
+    out = None
+    if "--json" in argv:
+        k = argv.index("--json")
+        out = argv[k + 1]
+        del argv[k:k + 2]
+    rep = run_tree(argv[0] if argv else ROOT)
+    for x in rep["scenarios"]:
+        print(f"{x['scenario']:16s} {'ok' if x.get('ok') else 'FAIL'}  kept {x.get('kept')} reused {x.get('reused')} "
+              f"recomputed {x.get('recomputed')} status {x.get('status')}  {'; '.join(x.get('problems') or [])}")
+    for p in rep["problems"]:
+        print(f"FAIL {p}")
+    if out:
+        json.dump(rep, open(out, "w"), indent=1)
+    return 0 if rep["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
