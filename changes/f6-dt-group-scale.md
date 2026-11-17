@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "DT-GS α"
+---
+
+## Changelog
+
+**A `group_outcome_scale` decision test (owner decision D-002), and fixes to `outcome_ratio` from the Codex review of #245.** For D-002 the owner chose to declare F6's departure from principle 3. The engine's under-5 malaria deaths are 1.2-6.8 times the NVASA reference by zone, and the harness refuses age-banded burden anchors. The departure needs a decision test on zone burden. `group_outcome_scale: {by, cases: [{group: factor}]}` (`toolkit/analysis/decision_tests.py` `_group_outcome_scale`) multiplies every package's burden, the comparator's included, in each listed group's units by its factor, for example the external level over the engine's, so every benefit there scales by it. Costs and every other unit are held, and the plan is re-solved for each case. It uses emulator outputs only and evaluates nothing anew. The schema requires a units column, groups that exist, positive factors and at least one case. `outcome_ratio` fixes (Codex review of #245): a ratio of 1 is a real case and is no longer refused as an identity, since it sets the package's burden to its counterpart's (P2-3). A test whose component the comparator holds is refused, because it would move the baseline every benefit is measured from (P2-1). Packages with the component but no counterpart are recorded (`missing_subtraction`, the `varied` text) and never claimed as tested (P2-4). Open P2/P3s for a follow-up: model-correction events of reference-package predictions are not passed to the guard (P2-2); the type cannot carry an engine departure (P2-5); summaries omit the tested ratios (P3); the emulator-only contract is unenforced (P3). Self-tests SP-GS1-6, JR12, SP-OR5 and SP-OR7 failed first.

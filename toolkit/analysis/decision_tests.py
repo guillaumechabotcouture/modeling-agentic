@@ -737,12 +737,14 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
     package has a counterpart."""
     oc = dt["outcome_ratio"]
     c, ref = oc["component"], oc["reference"]
-    pairs = {}
+    pairs, unpaired = {}, []
     for k, cs in A.pk.items():
         if c in cs and ref not in cs:
             kk = next((n for n, c2 in A.pk.items() if set(c2) == (set(cs) - {c}) | {ref}), None)
             if kk is not None:
                 pairs[k] = kk
+            else:
+                unpaired.append(k)       # Codex review of #245 P2-4: disclosed, never claimed as tested
     if not pairs:
         return {"not_run": f"no package with {c} has a counterpart with {ref} in its place"}
     o = A.primary
@@ -758,10 +760,11 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
             check = {i: ben[i][next(iter(pairs))] for i in A.ids}
         cases.append((v, ben, cost0, None, None))
         lowers.append(_lowers_only_unchosen(ben0, ben, plan))
-    return {"varied": f"the {o} of every package with {c} set to each tested ratio times that of the same package with "
-                      f"{ref} in its place", "cases": cases, "lowers": lowers,
+    return {"varied": f"the {o} of every package with {c} that has a counterpart set to each tested ratio times that "
+                      f"of the same package with {ref} in its place" + (f" ({len(unpaired)} without one held: "
+                                                                        f"{unpaired[:5]})" if unpaired else ""), "cases": cases, "lowers": lowers,
             "record": {"component": c, "reference": ref, "values": list(oc["values"]), "outcome": o, "pairs": pairs,
-                       "check": check}}
+                       "unpaired": unpaired, "check": check}, "unpaired": unpaired}
 
 
 def _calibration_target(A, dt, z0) -> dict:
@@ -860,6 +863,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             return _not_run(A, dt, orr["not_run"])
         varied, cases, lowers = orr["varied"], orr["cases"], orr["lowers"]
         extra["_or"] = orr["record"]
+        extra["_missing"] = list(orr["unpaired"])        # the packages with the component that have no counterpart
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
