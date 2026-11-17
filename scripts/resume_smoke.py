@@ -88,7 +88,6 @@ def judge(name: str, before: list, after: list, summary: dict, sig0=None, sig1=N
     """The assertions for one scenario. `before`/`after`: the toy function's calls in the interrupted attempt and on
     resume; `summary`: the resumed batch's compute.py summary; sig0/sig1: the sign-off record before and after;
     `status`: the resumed run's terminal status (None at batch level)."""
-    return {"scenario": name, "ok": True, "problems": []}     # α: tests first; the assertions land in β
     kept = sorted(set(before) & set(int(x) for x in summary.get("_kept", [])))
     problems = []
     recomputed = sorted(set(after) & set(kept))
@@ -127,7 +126,6 @@ def _kept(rd) -> list:
 
 def scenarios(work: str) -> list:
     """Run every scenario under `work` with this tree's code; [judge() rows]."""
-    return []                                                 # α: tests first; the scenarios land in β
     for p in (os.path.join(ROOT, "agents"), os.path.join(ROOT, "scripts"), ROOT):
         if p not in sys.path:
             sys.path.insert(0, p)
