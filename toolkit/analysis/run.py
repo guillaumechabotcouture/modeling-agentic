@@ -1959,6 +1959,37 @@ def _self_test_burden_scale(ok, R, by):
     rec2 = DT_.run_one(A, dt2, z0, ben0, cost0, plan, R["uncertainty"], out0)
     ok(rec2.get("status") == "not_run" and "zz" in rec2.get("reason", ""),
        f"BS-R3 a reference the file does not hold: not run, with why ({rec2.get('status')}: {rec2.get('reason')})")
+    # Codex review of #246 P1-1: the point evaluation's model corrections reach the guard of every re-solved plan
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+        ok(blocked, "BS-R4 a point correction bearing on the re-solved plan stops the test (the point events are "
+                    "guarded, not an empty list)")
+        del A.point_events
+        rec4 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(rec4.get("status") == "not_run" and "corrections" in rec4.get("reason", ""),
+           f"BS-R5 without the point evaluation's recorded corrections: not run ({rec4.get('reason')})")
+    finally:
+        A.point_events = saved_ev
+    # Codex review of #246 P1-2: a model value that is not finite is refused, never a factor of 0
+    from toolkit.analysis import burden as BV_
+    orig_v = BV_._value
+    BV_._value = lambda *a_, **k_: float("inf")
+    try:
+        rec6 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        BV_._value = orig_v
+    ok(rec6.get("status") == "not_run" and "finite" in rec6.get("reason", ""),
+       f"BS-R6 an infinite model value: not run ({rec6.get('status')}: {rec6.get('reason')})")
+    # Codex review of #246 P2-4: each reference's window is recorded, and a transfer across outcome, age band or
+    # window is stated as an assumption
+    ok(all("window" in v for v in (bs.get("references") or {}).values()) and "A" in (bs.get("assumption") or ""),
+       f"BS-R7 the record gives each reference's window and states the transfer assumption ({bs.get('assumption')})")
 
 
 def _self_test_anchor_e2e(ok, d, q):

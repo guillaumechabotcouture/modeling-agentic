@@ -1695,7 +1695,8 @@ def _self_test_burden_scale(ok, s, d, bad):
         "A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
         "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
         "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
-        "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,"]) + "\n")
+        "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,",
+        "F,r2,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic F,overlap,,,REF-F,"]) + "\n")
 
     def bs(burden=True, **kw):
         def mut(r):
@@ -1715,6 +1716,9 @@ def _self_test_burden_scale(ok, s, d, bad):
     bad(bs(burden_scale=dict(good, shares=[0.0])), "shares", "SP-BS5 a share outside (0, 1] is refused")
     bad(bs(burden_scale=dict(good, references=["A", "E"])), "more than one",
         "SP-BS6 references whose groups share a unit are refused (a unit takes one factor)")
+    bad(bs(burden_scale=dict(good, references=["F"])), "model window",
+        "SP-BS8 (Codex review of #246 P2-3) an age-banded row with no model window is refused: its value needs a new "
+        "prediction, and the test reads the point outputs only")
     r_b = copy.deepcopy(s.raw)
     bs(burden_scale=good)(r_b)
     ok(validate(Spec(r_b, d)) == [], f"SP-BS7 a well-formed burden_scale test validates: {validate(Spec(r_b, d))[:3]}")
