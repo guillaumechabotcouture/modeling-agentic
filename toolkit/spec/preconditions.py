@@ -107,7 +107,9 @@ def register(name: str, fn, context: bool = False) -> None:
 
 def _load_builtin() -> None:
     from toolkit.spec import evidence_dossier as ED
+    from toolkit.engines import effect_settings as ES
     ED._register()
+    ES._register()                      # effect by setting against the trials: judged when signing only
 
 
 def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=None, mode: str | None = None,

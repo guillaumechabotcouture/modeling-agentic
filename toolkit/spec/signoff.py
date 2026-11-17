@@ -464,6 +464,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
+    from toolkit.engines import effect_settings as ES
+    out += ES.sheet_lines(raw, run_dir)                 # units outside the trials' settings, and what covers each
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
