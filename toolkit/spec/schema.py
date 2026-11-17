@@ -182,7 +182,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale")
+                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1455,6 +1455,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                                    for c2 in pk.values()) for cs in pk.values()):
                     bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
                                f"{orc['reference']} in its place")
+        elif t == "boundary_engine":         # F6 run 4 R3 (RIG-002): the boundary check's engine tables, re-solved
+            extra_k = sorted(set(dt) - {"id", "type", "text", "finding"})
+            if extra_k:
+                bad.append(f"decision test {i}: boundary_engine takes no parameters (got {extra_k})")
+            if an.get("evaluation") != "emulator":
+                bad.append(f"decision test {i}: boundary_engine needs the emulator path (analysis.evaluation emulator)")
         elif t == "burden_scale":            # F6 run 3, owner decision D-c (toolkit/analysis/decision_tests.py)
             bsc = dt.get("burden_scale")
             if not isinstance(bsc, dict) or set(bsc) != {"references", "shares"}:

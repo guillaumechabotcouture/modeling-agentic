@@ -282,6 +282,12 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
         raise ValueError(f"boundary ranking: engine results missing or without matching provenance "
                          f"({(b['problems'] + miss)[:3]}): fails closed")
     ben_en, cost_en = engine_tables(A, cands, z0, out0, b["results"])
+    # F6 run 4 R3 (RIG-002): the engine side, kept for the boundary_engine decision test (no new job)
+    A.boundary_engine = {"ben": {c["unit"]: dict(ben_en[c["unit"]]) for c in cands},
+                         "cost": {c["unit"]: dict(cost_en[c["unit"]]) for c in cands},
+                         "cost_by": {c["unit"]: dict(getattr(cost_en, "by_component", {}).get(c["unit"]) or {})
+                                     for c in cands},
+                         "run": {c["unit"]: run_packages(A, c) for c in cands}}
     s = summarise(compare(cands, ben0, cost0, ben_en, cost_en, t["tie"]), t, tab, len(js))
     log(f"boundary ranking: emulator order matches the engine for {s['matched']} of {s['units']} boundary units "
         f"(threshold {t['min_share']:.0%})")

@@ -930,6 +930,22 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             return _not_run(A, dt, bsr["not_run"])
         varied, cases, lowers, evs = bsr["varied"], bsr["cases"], bsr["lowers"], bsr["evs"]
         extra["_bs"] = bsr["record"]
+    elif t == "boundary_engine":       # F6 run 4 R3 (RIG-002): the engine side of the boundary check, re-solved
+        be = getattr(A, "boundary_engine", None)
+        if not be or not be.get("ben"):
+            return _not_run(A, dt, "the boundary check produced no engine tables (it runs on the emulator path, for "
+                                   "units with a runner-up)")
+        from toolkit.analysis.core import CostTable, merge_costs
+        ben = {i: dict(ben0[i]) for i in A.ids}
+        for u in be["ben"]:
+            ben[u] = dict(be["ben"][u])
+        part = CostTable({u: dict(be["cost"][u]) for u in be["cost"]}, {u: dict(be["cost_by"][u]) for u in be["cost"]})
+        cost = merge_costs(cost0, part) if hasattr(cost0, "by_component") else {**cost0, **part}
+        varied = ("at the units of the boundary check, the benefits and costs of the packages run on the engine taken "
+                  "from the engine instead of the emulator")
+        cases, lowers = [("engine_at_boundary", ben, cost, None, None)], [False]
+        extra["_be"] = {"units": sorted(be["ben"]), "run_packages": be["run"],
+                        "check": {u: dict(be["ben"][u]) for u in sorted(be["ben"])}}
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
@@ -1102,6 +1118,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         rec["calibration_target"] = extra["_ct"]
     if t == "outcome_ratio":        # the package pairs and one unit's recomputed benefit (a check)
         rec["outcome_ratio"] = extra["_or"]
+    if t == "boundary_engine":      # the boundary units, the packages run on the engine there, their benefits
+        rec["boundary_engine"] = extra["_be"]
     if t == "burden_scale":         # each reference's group, model and external values, factor; one unit per group
         rec["burden_scale"] = extra["_bs"]
     if comps:
