@@ -269,6 +269,7 @@ def summarise(rows, t, tab, n_runs) -> dict:
 
 
 def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=print) -> dict:
+    A.boundary_engine = None         # Codex review of #252 P2-4: published only once this check completes
     t = thresholds()
     tab = table(A, plan, ben0, cost0)
     cands = pick(tab, t["units"])
@@ -283,12 +284,16 @@ def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=p
                          f"({(b['problems'] + miss)[:3]}): fails closed")
     ben_en, cost_en = engine_tables(A, cands, z0, out0, b["results"])
     # F6 run 4 R3 (RIG-002): the engine side, kept for the boundary_engine decision test (no new job)
-    A.boundary_engine = {"ben": {c["unit"]: dict(ben_en[c["unit"]]) for c in cands},
-                         "cost": {c["unit"]: dict(cost_en[c["unit"]]) for c in cands},
-                         "cost_by": {c["unit"]: dict(getattr(cost_en, "by_component", {}).get(c["unit"]) or {})
-                                     for c in cands},
-                         "run": {c["unit"]: run_packages(A, c) for c in cands}}
+    # Codex review of #252 P1-1, P1-2: only the chosen package and its runner-up are engine-derived for certain (the
+    # scale test above checks those two), so only those cells are kept
+    pairs = {c["unit"]: (c["chosen"], c["runner_up"]) for c in cands}
+    be = {"pairs": pairs, "run": {c["unit"]: run_packages(A, c) for c in cands},
+          "ben": {u: {k: ben_en[u][k] for k in p} for u, p in pairs.items()},
+          "cost": {u: {k: cost_en[u][k] for k in p} for u, p in pairs.items()},
+          "cost_by": {u: {k: dict((getattr(cost_en, "by_component", {}).get(u) or {}).get(k) or {}) for k in p}
+                      for u, p in pairs.items()}}
     s = summarise(compare(cands, ben0, cost0, ben_en, cost_en, t["tie"]), t, tab, len(js))
+    A.boundary_engine = be
     log(f"boundary ranking: emulator order matches the engine for {s['matched']} of {s['units']} boundary units "
         f"(threshold {t['min_share']:.0%})")
     return s

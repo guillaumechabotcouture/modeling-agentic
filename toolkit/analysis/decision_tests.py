@@ -935,17 +935,23 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         if not be or not be.get("ben"):
             return _not_run(A, dt, "the boundary check produced no engine tables (it runs on the emulator path, for "
                                    "units with a runner-up)")
-        from toolkit.analysis.core import CostTable, merge_costs
+        from toolkit.analysis.core import CostTable
         ben = {i: dict(ben0[i]) for i in A.ids}
-        for u in be["ben"]:
-            ben[u] = dict(be["ben"][u])
-        part = CostTable({u: dict(be["cost"][u]) for u in be["cost"]}, {u: dict(be["cost_by"][u]) for u in be["cost"]})
-        cost = merge_costs(cost0, part) if hasattr(cost0, "by_component") else {**cost0, **part}
+        tot = {i: dict(cost0[i]) for i in A.ids}
+        byc = {i: {k: dict(v) for k, v in (getattr(cost0, "by_component", {}).get(i) or {}).items()} for i in A.ids}
+        for u, pair in be["pairs"].items():       # only the two compared cells (Codex review of #252 P1-1, P1-2)
+            for k in pair:
+                ben[u][k] = be["ben"][u][k]
+                tot[u][k] = be["cost"][u][k]
+                byc.setdefault(u, {})[k] = dict(be["cost_by"][u][k])
+        cost = CostTable(tot, byc)
+        evs["engine_at_boundary"] = list(getattr(A, "point_events", None) or [])    # #252 review P1-3
         varied = ("at the units of the boundary check, the benefits and costs of the packages run on the engine taken "
                   "from the engine instead of the emulator")
         cases, lowers = [("engine_at_boundary", ben, cost, None, None)], [False]
-        extra["_be"] = {"units": sorted(be["ben"]), "run_packages": be["run"],
-                        "check": {u: dict(be["ben"][u]) for u in sorted(be["ben"])}}
+        extra["_be"] = {"units": sorted(be["ben"]), "pairs": {u: list(p) for u, p in be["pairs"].items()},
+                        "run_packages": be["run"], "check": {u: dict(be["ben"][u]) for u in sorted(be["ben"])},
+                        "benefit": {u: dict(ben[u]) for u in sorted(be["ben"])}}
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
@@ -1048,6 +1054,9 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         try:
             sol = A.solve(ben, cost, budget=budget, feas=feas)
         except RuntimeError as e:
+            if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
+                return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
+                                       "constraints fits the budget the plan is solved within (the solver proves it infeasible)")
             if t != "cost_items" or str(e).strip() != "optimizer status infeasible":
                 raise
             # Codex r1: the price case has no affordable plan; the record keeps the prices and says why

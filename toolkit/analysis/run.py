@@ -1426,8 +1426,8 @@ def _self_test_boundary_engine(ok, R):
        f"BE-R1 a boundary_engine test re-solves with the boundary check's engine tables at its units, with no new "
        f"evaluation, under the finding it is declared for ({rec.get('status')}, {len(units)} units, {len(sent)} evals)")
     u = units[0] if units else None
-    ok(u is not None and all(rec["boundary_engine"]["check"][u][k] == be["ben"][u][k] for k in A.pk),
-       "BE-R2 at a boundary unit every package's benefit is the engine side's (packages not run keep the emulator's)")
+    ok(u is not None and all(rec["boundary_engine"]["benefit"][u][k] == be["ben"][u][k] for k in be["pairs"][u]),
+       "BE-R2 at a boundary unit the two compared packages take the engine side's benefit")
     saved = A.boundary_engine
     try:
         del A.boundary_engine
