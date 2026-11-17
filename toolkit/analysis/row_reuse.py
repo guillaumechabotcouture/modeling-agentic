@@ -29,21 +29,42 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 ARCHIVE = "rows"
+RECORD = "adapter_rows.json"       # {sha256 of a row file: the adapter digest that wrote it} (Codex review of #244 P1-1)
+
+
+def _record(d) -> dict:
+    try:
+        r = json.load(open(os.path.join(d, RECORD)))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in r.items()} if isinstance(r, dict) else {}
+
+
+def _bind(run_dir, d, files, adapter) -> None:
+    """Record `adapter` for each file's current digest; an entry binds bytes, so a file rewritten later is unbound."""
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.analysis.artifacts import _safe_io
+    rec = _record(d)
+    for f in files:
+        h = JC._sha_file(f)
+        if h:
+            rec[h] = adapter
+    _safe_io().publish(os.path.join(d, RECORD), json.dumps(rec, sort_keys=True), run_dir)
+
+
+def _dirs(d) -> list:
+    a = os.path.join(d, ARCHIVE)
+    if os.path.islink(a):
+        raise ValueError(f"{a} is a link: the row archive is refused")
+    return [d] + (sorted(os.path.join(a, x) for x in os.listdir(a) if x.isdigit()) if os.path.isdir(a) else [])
 
 
 def _sources(d) -> list:
-    """Trusted row files of directory d and of its archive d/rows/*: [(file, kind, adapter digest or None)]."""
+    """Trusted row files of directory d and of its archive d/rows/*: [(file, kind, adapter digest or None)], each
+    file's adapter the one its digest is bound to (None: unbound, admitted only under the legacy attestation)."""
     from toolkit.analysis import joint_calibration as JC
-    out = []
-    dirs = [d] + sorted(os.path.join(d, ARCHIVE, x) for x in (os.listdir(os.path.join(d, ARCHIVE))
-                                                              if os.path.isdir(os.path.join(d, ARCHIVE)) else []))
-    for x in dirs:
-        try:
-            ad = json.load(open(os.path.join(x, "adapter.json"))).get("adapter_sha256")
-        except (OSError, ValueError, AttributeError):
-            ad = None
-        out += [(f, kind, ad) for f, kind, _ in JC._trusted_sources(x)]
-    return out
+    rec = _record(d)
+    return [(f, kind, rec.get(JC._sha_file(f) or "")) for x in _dirs(d) for f, kind, _ in JC._trusted_sources(x)]
 
 
 def pool(d) -> dict:
@@ -57,29 +78,32 @@ def pool(d) -> dict:
 
 
 def _archive(run_dir, d) -> None:
-    """Copy d's trusted row files (with its adapter record) into d/rows/<k>/ unless an identical copy is there."""
+    """Copy d's trusted row files and their sidecars into d/rows/<k>/ (no link followed, inside the run dir) unless a
+    copy with the same digest is there; the digest keeps its adapter binding (RECORD is keyed by digest)."""
     from toolkit.analysis import joint_calibration as JC
+    from toolkit.analysis.artifacts import _safe_io
+    sio = _safe_io()
     srcs = JC._trusted_sources(d)
     if not srcs:
         return
-    have = set()
-    a = os.path.join(d, ARCHIVE)
-    if os.path.isdir(a):
-        for x in os.listdir(a):
-            for f, _, _ in JC._trusted_sources(os.path.join(a, x)):
-                have.add(JC._sha_file(f))
-    todo = [(f, k, m) for f, k, m in srcs if JC._sha_file(f) not in have]
+    have = {JC._sha_file(f) for x in _dirs(d)[1:] for f, _, _ in JC._trusted_sources(x)}
+    todo = [f for f, _, _ in srcs if JC._sha_file(f) not in have]
     if not todo:
         return
-    k = 1 + max([int(x) for x in os.listdir(a) if x.isdigit()] if os.path.isdir(a) else [0])
-    dst = os.path.join(a, str(k))
-    os.makedirs(dst)
-    for f, _, _ in todo:
+    a = os.path.join(d, ARCHIVE)
+    k = 1 + max([int(x) for x in os.listdir(a) if x.isdigit()] if os.path.isdir(a) else [], default=0)
+    for f in todo:
         for side in ("", ".summary.json", JC.REUSE_SIDECAR):
             if os.path.isfile(f + side):
-                shutil.copy2(f + side, os.path.join(dst, os.path.basename(f) + side))
-    if os.path.isfile(os.path.join(d, "adapter.json")):
-        shutil.copy2(os.path.join(d, "adapter.json"), os.path.join(dst, "adapter.json"))
+                data, _ = sio.read_nofollow(run_dir, os.path.relpath(f + side, run_dir))
+                sio.publish(os.path.join(a, str(k), os.path.basename(f) + side), data, run_dir)
+
+
+def _untrusted_rows(d) -> bool:
+    from toolkit.analysis import joint_calibration as JC
+    trusted = {f for f, _, _ in JC._trusted_sources(d)}
+    return any(os.path.isfile(os.path.join(d, n)) and os.path.join(d, n) not in trusted
+               for n in ("results.jsonl", "points.jsonl"))
 
 
 def run(run_dir, jobs, engine, out_rel, log=print, Bt=None, **kw) -> dict:
@@ -98,16 +122,21 @@ def run(run_dir, jobs, engine, out_rel, log=print, Bt=None, **kw) -> dict:
     todo = [j for j in jobs if j["id"] not in hit]
     b = {"results": {}, "problems": [], "summary": {"n": 0, "n_failed": 0}, "path": os.path.join(run_dir, out_rel)}
     if todo:
-        _safe_io().publish(os.path.join(d, "adapter.json"), json.dumps({"adapter_sha256": adapter,
-                                                                         "files": list(JC.ADAPTER_FILES)}), run_dir)
+        if _untrusted_rows(d):       # Codex review of #244 P1-2: compute.py's own cache never reads an untrusted file
+            kw = dict(kw, fresh=True)
+        before = {n: JC._sha_file(os.path.join(d, n)) for n in os.listdir(d)}
         b = Bt.run(run_dir, todo, engine, out_rel=out_rel, **kw)
+        _bind(run_dir, d, [f for f, _, _ in JC._trusted_sources(d)        # only what this call just wrote
+                           if before.get(os.path.basename(f)) != JC._sha_file(f)], adapter)
         _archive(run_dir, d)          # the computed rows' own authenticated files, before the merge replaces any
     if hit:
         path = os.path.join(run_dir, out_rel)
         new = {}
+        rec = _record(d)
         for f, kind, _ in JC._trusted_sources(d) if todo else []:
-            for sha, body in JC._source_rows(f, kind):
-                new.setdefault(sha, body)
+            if rec.get(JC._sha_file(f) or "") == adapter:
+                for sha, body in JC._source_rows(f, kind):
+                    new.setdefault(sha, body)
         rows = []
         for n, j in enumerate(jobs):
             body = hit[j["id"]][0] if j["id"] in hit else new.get(B.job_sha(j))
@@ -118,9 +147,8 @@ def run(run_dir, jobs, engine, out_rel, log=print, Bt=None, **kw) -> dict:
         _safe_io().publish(path + JC.REUSE_SIDECAR, json.dumps({
             "out_sha256": hashlib.sha256(text.encode()).hexdigest(), "rows": len(rows), "reused": len(hit),
             "computed": len(todo), "legacy": sum(1 for _, lg in hit.values() if lg)}), run_dir)
-        if not todo:
-            _safe_io().publish(os.path.join(d, "adapter.json"), json.dumps({"adapter_sha256": adapter,
-                                                                             "files": list(JC.ADAPTER_FILES)}), run_dir)
+        if not any(lg for _, lg in hit.values()):   # bound only when every reused row was the current adapter's
+            _bind(run_dir, d, [path], adapter)
         log(f"{out_rel}: {len(hit)} of {len(jobs)} engine rows reused from stored rows (job_sha, engine identity and "
             f"adapter match); {len(todo)} computed")
     res = dict(b["results"], **{k: v[0]["result"] for k, v in hit.items()})
