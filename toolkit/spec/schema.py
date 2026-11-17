@@ -110,7 +110,10 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # type calibration_target: calibration_target {units: [ids], scale}
                                            # (the listed units' calibration targets scaled, F6 run 1);
                                            # type outcome_ratio: outcome_ratio {component, reference, values}
-                                           # (a package's burden at a ratio of its counterpart's, F6 run 2)
+                                           # (a package's burden at a ratio of its counterpart's, F6 run 2);
+                                           # type burden_scale: burden_scale {references: [validation.burden row
+                                           # ids], shares: [s in (0, 1]]} (each row's group's burden scaled by
+                                           # (reference / model)^s, F6 run 3)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     evidence:                              # F6: required when the options use a component whose engine card declares
@@ -179,7 +182,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target", "outcome_ratio")
+                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1452,6 +1455,17 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                                    for c2 in pk.values()) for cs in pk.values()):
                     bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
                                f"{orc['reference']} in its place")
+        elif t == "burden_scale":            # F6 run 3, owner decision D-c (toolkit/analysis/decision_tests.py)
+            bsc = dt.get("burden_scale")
+            if not isinstance(bsc, dict) or set(bsc) != {"references", "shares"}:
+                bad.append(f"decision test {i}: give burden_scale {{references, shares}}")
+                continue
+            sh = bsc["shares"]
+            if not (isinstance(sh, list) and sh and all(_isnum(v) and 0 < v <= 1 for v in sh)):
+                bad.append(f"decision test {i}: burden_scale.shares: numbers in (0, 1] (1 sets each group's burden to "
+                           "its reference)")
+            from toolkit.analysis import decision_tests as DTm
+            bad += [f"decision test {i}: {e}" for e in DTm.burden_scale_refs(s, bsc)[1]]
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
@@ -1671,6 +1685,43 @@ def direct_toy(r: dict) -> dict:
     r["uncertainty"]["excluded"] = [{"kind": k, "reason": "toy"} for k in ("costs", "calibration", "emulator")] + [
         {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
     return r
+
+
+def _self_test_burden_scale(ok, s, d, bad):
+    """F6 run 3, owner decision D-c: a burden_scale decision test scales every package's outcomes in the units of the
+    listed external references' groups by reference / model (validation.burden), checked at sign-off."""
+    from toolkit.analysis import burden as BV
+    open(os.path.join(d, "bs_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS),
+        "A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
+        "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
+        "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
+        "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,",
+        "F,r2,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic F,overlap,,,REF-F,"]) + "\n")
+
+    def bs(burden=True, **kw):
+        def mut(r):
+            if burden:
+                r["validation"] = {"burden": {"csv": "bs_refs.csv"}}
+                r["calibration"]["target_source_id"] = "TOY-TARGETS"
+            r["analysis"]["decision_tests"].append(dict({"id": "DTb", "type": "burden_scale", "text": "t"}, **kw))
+        return mut
+    good = {"references": ["A", "B"], "shares": [0.5, 1.0]}
+    bad(bs(), "give burden_scale", "SP-BS1 a burden_scale test without its mapping is refused")
+    bad(bs(burden=False, burden_scale=good), "validation.burden",
+        "SP-BS2 a burden_scale test without validation.burden references is refused")
+    bad(bs(burden_scale=dict(good, references=["A", "zz"])), "unknown reference",
+        "SP-BS3 a burden_scale test naming a reference the file does not hold is refused")
+    bad(bs(burden_scale=dict(good, references=["C"])), "estimated",
+        "SP-BS4 a reported (not estimated) reference cannot set a scale")
+    bad(bs(burden_scale=dict(good, shares=[0.0])), "shares", "SP-BS5 a share outside (0, 1] is refused")
+    bad(bs(burden_scale=dict(good, references=["A", "E"])), "more than one",
+        "SP-BS6 references whose groups share a unit are refused (a unit takes one factor)")
+    bad(bs(burden_scale=dict(good, references=["F"])), "model window",
+        "SP-BS8 (Codex review of #246 P2-3) an age-banded row with no model window is refused: its value needs a new "
+        "prediction, and the test reads the point outputs only")
+    r_b = copy.deepcopy(s.raw)
+    bs(burden_scale=good)(r_b)
+    ok(validate(Spec(r_b, d)) == [], f"SP-BS7 a well-formed burden_scale test validates: {validate(Spec(r_b, d))[:3]}")
 
 
 def _self_test_unit_attribute(ok, s, d, bad):
@@ -1900,6 +1951,7 @@ def _self_test() -> int:
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
+        _self_test_burden_scale(ok, s, d, bad)
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
