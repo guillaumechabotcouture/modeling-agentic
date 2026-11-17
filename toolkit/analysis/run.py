@@ -239,7 +239,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
             res, probs = Bt.load_results(ad["path"], jobs, eng)
             bsum = {"source": "adopted stored batch", "adoption": ad, "n": len(res), "rejected_rows": len(probs)}
         else:
-            b = Bt.run(run_dir, jobs, eng, **kw)
+            from toolkit.analysis import row_reuse as RR     # F6 run 2: stored rows by job_sha, engine, adapter
+            b = RR.run(run_dir, jobs, eng, "analysis/batch/results.jsonl", log=log, **kw)
             res, probs = b["results"], b["problems"]
             bsum = dict(b["summary"], path=os.path.relpath(b["path"], run_dir), rejected_rows=len(probs))
         batch_rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")

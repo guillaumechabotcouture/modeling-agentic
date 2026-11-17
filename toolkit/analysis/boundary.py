@@ -269,14 +269,14 @@ def summarise(rows, t, tab, n_runs) -> dict:
 
 
 def run(A, plan, z0, out0, ben0, cost0, horizon, run_dir, compute_kw=None, log=print) -> dict:
-    from toolkit.analysis import batch as Bt
     t = thresholds()
     tab = table(A, plan, ben0, cost0)
     cands = pick(tab, t["units"])
     if not cands:
         return summarise([], t, tab, 0)
     js = jobs(A, cands, z0, horizon, seed=int((A.spec["analysis"].get("direct") or {}).get("seed", 1)))
-    b = Bt.run(run_dir, js, A.eng, out_rel=OUT_REL, **(compute_kw or {}))
+    from toolkit.analysis import row_reuse as RR     # F6 run 2: stored rows by job_sha, engine and adapter
+    b = RR.run(run_dir, js, A.eng, OUT_REL, log=log, **(compute_kw or {}))
     miss = [j["id"] for j in js if j["id"] not in b["results"]]
     if b["problems"] or miss:
         raise ValueError(f"boundary ranking: engine results missing or without matching provenance "
