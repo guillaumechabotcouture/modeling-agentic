@@ -257,7 +257,6 @@ def _departures(raw) -> tuple[dict, list]:
 def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None = None) -> list[dict]:
     """Every check's findings on the spec `raw` ({check, principle, severity, text, fix, declared, judgment}); a
     finding whose check the spec declares carries the reason in `declared` and severity DECLARED."""
-    return []           # α: tests first; the checks land in β
     today = today or datetime.date.today()
     if not isinstance(raw, dict):
         return [_f("HIGH", "headline_comparator", "the spec is not a mapping", "Fix the spec")]
