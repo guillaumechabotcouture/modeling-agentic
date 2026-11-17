@@ -2024,6 +2024,106 @@ def _self_test() -> int:
         ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
            "T28 every journal entry records the allowance it was given")
 
+        # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
+        wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
+        d, T, st = new_run("writeup", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=2)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        got = getattr(T, "write_findings", None) or []
+        ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
+           and any(f.get("id") == "R-030" for f in got),
+           f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
+
+        # R3-3 (F6 run 3): a finding whose remedy is an owner amendment goes to OWNER_DECISION, never a SPEC rethink.
+        amend = {"id": "D-031", "severity": "HIGH", "target_stage": "PLAN", "claim": "the comparator omits the funded plan",
+                 "fix_requires": "Owner amendment: add the funded plan as the comparator."}
+        d, T, st = new_run("amend", {"critics": {1: {"critique-domain": [amend]}},
+                                     "plan": lambda pk: {"tasks": [{"id": "T1", "findings": [f["id"] for f in
+                                                                                                pk["findings"]][:1] or ["x"],
+                                                                    "action": "rethink", "owner_state": "SPEC",
+                                                                    "brief": "redraft the comparator"}]
+                                                         if pk["findings"] else {"tasks": []}}}, max_rounds=3)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        try:
+            req = json.load(open(os.path.join(d, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            req = {}
+        ok(s == "paused:awaiting_scope_signoff" and load_state(d).state == "OWNER_DECISION"
+           and p.count("SPEC") == 1 and not any(c.startswith("fix:") for c in T.calls)
+           and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
+           f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
+        if req.get("pending"):
+            import scope_signoff as _SS
+            _SS.sign(d, "owner", all_decision="decline", note="R3-3")
+            s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            p2 = [h["to"] for h in load_state(d).history if "to" in h]
+            ok(not s2.startswith("paused") and p2.count("SPEC") == 1 and FL.load(d)["D-031"].status == "owner_declined",
+               f"R3-3b the owner's answer resumes the run; the declined finding is not redrafted ({s2}, {p2[-5:]})")
+
+        # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
+        # (resumable), and a resume with a higher cap continues.
+        d, T, st = new_run("floor", {}, budget=20.0)
+        st.spent_usd = 20.0 - 10.0 - 0.13            # cap less the write-up reserve ($10) leaves $0.13
+        save_state(d, st)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s == "paused:awaiting_budget" and T.calls == [] and load_state(d).state == "SPEC"
+           and load_state(d).status is None,
+           f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
+        T2 = StubTasks(T.s)
+        s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
+                    backend=spike, cross_engine_check=False)
+        ok(not s2.startswith("paused") and "draft_spec" in T2.calls
+           and load_state(d).budget_usd == 60.0
+           and any(h.get("budget_raised") for h in load_state(d).history),
+           f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
+
+        # R3-2 (F6 run 3): a SPEC rethink on a signed spec drafts its proposal beside it (spec_proposal/); the signed
+        # file is untouched, and only a fresh owner signature on the proposal lets the run go on.
+        rk = {"id": "D-040", "severity": "HIGH", "target_stage": "PLAN", "claim": "the envelope is the wrong year"}
+
+        def spec40(question, run_dir):
+            sp = AB.toy_spec("units.csv")
+            sp.pop("engine")
+            sp["deliverable_file"] = {"path": "allocation_optimized.csv",
+                                      "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
+            if os.path.basename(run_dir) == "spec_proposal":
+                sp["constraints"]["envelope_usd"] = 21000
+            return sp
+        once40 = []
+        d, T, st = new_run("proposal", {"spec": spec40, "critics": {1: {"critique-domain": [rk]}},
+                                        "plan": lambda pk: {"tasks": [{"id": "T1", "findings": ["D-040"], "action": "rethink",
+                                                                       "owner_state": "SPEC", "brief": "redraft"}]}
+                                        if any(f["id"] == "D-040" for f in pk["findings"]) and not once40.append(1)
+                                        and len(once40) == 1 else {"tasks": [], "deferred": [
+                                            {"finding": f["id"], "reason": "t"} for f in pk["findings"]]}},
+                           signoff="owner", max_rounds=3)
+        m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+        m.run()
+        sign(d, "owner", "first")
+        signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+        s = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+        pdir = os.path.join(d, "spec_proposal")
+        ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN"
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
+           and os.path.exists(os.path.join(pdir, AB.SPEC_FILE))
+           and b"21000" in open(os.path.join(pdir, AB.SPEC_FILE), "rb").read(),
+           f"R3-2 the rethink's draft is a proposal beside the untouched signed spec; SIGN waits ({s})")
+        if os.path.exists(os.path.join(pdir, AB.SPEC_FILE)):
+            st2 = load_state(d)
+            st2.signoff = "lead"                                  # a lead sign-off does not sign a proposal
+            save_state(d, st2)
+            s_lead = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            ok(s_lead == "paused:awaiting_signoff" and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
+               f"R3-2b in lead mode the proposal still waits for the owner ({s_lead})")
+            sign(pdir, "owner", "the amendment")
+            s3 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            hist = os.path.join(d, "spec_history", "1", AB.SPEC_FILE)
+            ok(not s3.startswith("paused") and b"21000" in open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+               and os.path.exists(hist) and open(hist, "rb").read() == signed_bytes and not os.path.exists(pdir)
+               and (_signoff(d) or {}).get("note") == "the amendment",
+               f"R3-2c once the owner signs the proposal it replaces the spec, the old one kept in spec_history ({s3})")
+
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
         for name, path in (("escape", "../escape.csv"), ("owned", "run_state.json"), ("report", "report.md"),

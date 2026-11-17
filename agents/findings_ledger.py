@@ -510,6 +510,14 @@ def _self_test() -> int:
         except (ValueError, OSError):
             pass
         ok(open(os.path.join(out, "v")).read() == "untouched", "L14 the ledger is not written through a planted .tmp link")
+    # L17 (F6 run 3): scripts/scope_signoff.py sign keys its answers by fingerprint; the ledger reads that form too
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"answers": {"ab12": {"finding": "D-031", "decision": "decline", "by": "owner"}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        l17 = owner_answers(d)
+        json.dump({"answers": [{"finding": "D-032", "decision": "accept"}]}, open(os.path.join(d, "scope_signoff.json"), "w"))
+        ok(l17 == {"D-031": "decline"} and owner_answers(d) == {"D-032": "accept"},
+           f"L17 owner answers are read from the fingerprint mapping scope_signoff.py writes, and from a list ({l17})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

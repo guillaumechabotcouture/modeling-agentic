@@ -831,6 +831,26 @@ def _self_test() -> int:
                 call()
             except Exception as e:  # noqa: BLE001 -- the failure is the finding
                 errors[k] = f"{type(e).__name__}: {e}"
+        # PS1 (F6 run 3): a draft in the spec proposal dir runs its session there, with the call's allowance, rooted
+        # at the run dir for safe_io; the write-up findings reach the writer's prompt
+        where = {}
+        orig_session = SdkTasks._session
+
+        def at_session(self_, kind, system, prompt, owns, model=None):
+            where[kind] = (self_.run_dir, self_.io_root, self_.allowance, system if kind == "write" else "")
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = at_session
+        try:
+            t2 = SdkTasks(d)
+            t2.set_allowance(1.5)
+            os.makedirs(os.path.join(d, "spec_proposal"), exist_ok=True)
+            t2.draft_spec("Q?", os.path.join(d, "spec_proposal"), None)
+            t2.write(d, "declared", findings=[{"id": "R-030", "claim": "overstates", "fix_requires": "say tested"}])
+        finally:
+            SdkTasks._session = orig_session
+        ok(where.get("draft_spec", ())[:3] == (os.path.join(os.path.abspath(d), "spec_proposal"), os.path.abspath(d), 1.5)
+           and "R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
+           f"PS1 a proposal draft runs in the proposal dir; the writer gets the write-up findings {where.get('draft_spec')}")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
