@@ -239,7 +239,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
             res, probs = Bt.load_results(ad["path"], jobs, eng)
             bsum = {"source": "adopted stored batch", "adoption": ad, "n": len(res), "rejected_rows": len(probs)}
         else:
-            b = Bt.run(run_dir, jobs, eng, **kw)
+            from toolkit.analysis import row_reuse as RR     # F6 run 2: stored rows by job_sha, engine, adapter
+            b = RR.run(run_dir, jobs, eng, "analysis/batch/results.jsonl", log=log, **kw)
             res, probs = b["results"], b["problems"]
             bsum = dict(b["summary"], path=os.path.relpath(b["path"], run_dir), rejected_rows=len(probs))
         batch_rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
@@ -309,6 +310,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         arts["burden_anchor"] = S.write("burden_anchor", anc, BV.PRODUCER, [arts["calibration"], BV.csv_path(spec)])
         log("burden anchor: " + ", ".join(f"{r['id']} x{r['factor']:.3g}" for r in anc["rows"]))
     events0 = list(A.last_events)
+    A.point_events = events0       # the point tables' corrections, which decision tests on them guard (#246)
     from toolkit.alloc import costs as acosts
     floors0 = acosts.floor_report(A.last_cost_floors, A.alloc)     # F6 S1-3: reported, never read as a real cost
     sol = A.solve(ben0, cost0)
@@ -402,6 +404,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
     # ---- decision tests
     dts = DT.run_all(A, z0, out0, ben0, cost0, plan, u["data"], run_dir)
+    if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
+        from toolkit.analysis import joint_calibration as JC
+        dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
+        if dp:
+            raise AnalysisBlocked("calibration", [{"unit": "*", "package": "*", "kind": "declared_miss_untested"}],
+                                  reason="; ".join(dp))
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
@@ -417,7 +425,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "dollars_reallocated", "population_changed", "triggered_by",
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
-                                                    "rejected_values", "reachable_interaction", "unit_attribute")
+                                                    "rejected_values", "reachable_interaction", "unit_attribute",
+                                                    "burden_scale")
                                     if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
         + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
@@ -1332,6 +1341,48 @@ def _self_test_joint(ok, q):
            f"model tier): {sorted(n for n in names_ if n.startswith('calibration_'))}")
         ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
            f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
+        # F6 run 1, owner decision R1: a calibration-target test on the joint path moves the listed units' values
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = R["point"]["plan"]
+        listed = [i for i in A.ids if A.spec.unit_ids() and i in ("0", "3", "6")]
+        dt = {"id": "DTt", "type": "calibration_target", "text": "t",
+              "calibration_target": {"units": listed, "scale": 0.8}}     # inside the toy emulator's reach
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        zc = (rec.get("calibration_target") or {}).get("units") or {}
+        moved = {i: zc[i]["z"] - z0[i] for i in listed if i in zc}
+        ok(rec.get("status") == "run" and len(moved) == len(listed) and all(v < -1e-6 for v in moved.values())
+           and set(zc) == set(listed) and rec["results"] and "objective" in rec["results"][0],
+           f"JR10 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
+           f"targets are lowered, and re-solves the plan ({rec.get('status')}, {moved})")
+        # F6 run 2, owner decision (DT13): a package's burden at a ratio of its swapped counterpart's, emulator only
+        dto = {"id": "DTo", "type": "outcome_ratio", "text": "t",
+               "outcome_ratio": {"component": "a", "reference": "b", "values": [0.5]}}
+        sent_ = []
+        orig_ev = A.evaluate
+        A.evaluate = lambda *a_, **k_: (sent_.append(1), orig_ev(*a_, **k_))[1]
+        try:
+            ro = DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.evaluate = orig_ev
+        o_ = A.primary
+        i0 = A.ids[0]
+        want = A.dfac * (out0[i0]["y"][A.comp][o_] - 0.5 * out0[i0]["y"]["b"][o_])
+        got = (ro.get("outcome_ratio") or {}).get("check", {}).get(i0)
+        ok(ro.get("status") == "run" and got is not None and abs(got - want) <= 1e-9 * max(1.0, abs(want))
+           and ro["results"] and not sent_ and (ro.get("outcome_ratio") or {}).get("pairs") == {"a": "b"},
+           f"JR11 an outcome_ratio test sets package a's burden to half of b's, re-solves the plan, and evaluates "
+           f"nothing anew ({ro.get('status')}, {got} vs {want}, {len(sent_)} evaluations)")
+        dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
+        ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
+        saved_z = A.joint["z"].pop(listed[0])
+        try:
+            rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.joint["z"][listed[0]] = saved_z
+        ok(rec2.get("status") == "not_run" and "joint calibration" in (rec2.get("why") or rec2.get("statement") or ""),
+           f"JR10b a listed unit the joint calibration did not fit fails closed (not run): {rec2.get('status')}")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d, n=24)
         rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
@@ -1821,6 +1872,7 @@ def _self_test_burden_e2e(ok, d, q):
            for x in fs) and signoff.status(d) == "signed",
        f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
        f"{sorted({x['kind'] for x in fs})}")
+    _self_test_burden_scale(ok, R, by)
     # F6 S2-5b: a model window on the emulator path; a report-only row with no published interval
     from toolkit.engines.contract import ToyEngine, UnitSpec, Package
     open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
@@ -1872,6 +1924,74 @@ def _self_test_burden_e2e(ok, d, q):
         M.pops = saved
     ok(err is None and all("burden" not in got[i] for i in A.ids),
        f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
+
+
+def _self_test_burden_scale(ok, R, by):
+    """F6 run 3, owner decision D-c: a burden_scale test scales every package's outcomes in each listed reference's
+    group by (reference / model point)^share, from the point outputs alone, and re-solves the plan."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "burden_scale", "text": "t",
+          "burden_scale": {"references": ["A", "B"], "shares": [0.5, 1.0]}}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    bs = rec.get("burden_scale") or {}
+    f = {k: by[k]["value"] / by[k]["model"]["point"] for k in ("A", "B")}
+    got = {k: (bs.get("references") or {}).get(k, {}).get("factor") for k in ("A", "B")}
+    ok(rec.get("status") == "run" and not sent and len(rec.get("results") or []) == 2
+       and all(got[k] is not None and abs(got[k] - f[k]) <= 1e-9 * abs(f[k]) for k in f),
+       f"BS-R1 a burden_scale test runs from the point outputs (no evaluation) with each group's factor reference / "
+       f"model point, as burden_validation reports them ({rec.get('status')}, {got} vs {f}, {len(sent)} evaluations)")
+    reg = {i: A.by_id[i]["region"] for i in A.ids}
+    chk = bs.get("check") or {}
+    want = {i: {k: ben0[i][k] * ({"r0": f["A"], "r1": f["B"]}.get(reg[i], 1.0)) for k in A.pk} for i in A.ids}
+    ok({reg[i] for i in chk} == {"r0", "r1", "r2"}
+       and all(abs(chk[i][k] - want[i][k]) <= 1e-9 * max(1.0, abs(want[i][k])) for i in chk for k in A.pk),
+       "BS-R2 at the largest share (1) every package's benefit in a listed group's units is scaled by the group's "
+       f"factor; a unit of no listed group is held (check units {sorted(chk)})")
+    dt2 = dict(dt, burden_scale={"references": ["zz"], "shares": [1.0]})
+    rec2 = DT_.run_one(A, dt2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    ok(rec2.get("status") == "not_run" and "zz" in rec2.get("reason", ""),
+       f"BS-R3 a reference the file does not hold: not run, with why ({rec2.get('status')}: {rec2.get('reason')})")
+    # Codex review of #246 P1-1: the point evaluation's model corrections reach the guard of every re-solved plan
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+        ok(blocked, "BS-R4 a point correction bearing on the re-solved plan stops the test (the point events are "
+                    "guarded, not an empty list)")
+        del A.point_events
+        rec4 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(rec4.get("status") == "not_run" and "corrections" in rec4.get("reason", ""),
+           f"BS-R5 without the point evaluation's recorded corrections: not run ({rec4.get('reason')})")
+    finally:
+        A.point_events = saved_ev
+    # Codex review of #246 P1-2: a model value that is not finite is refused, never a factor of 0
+    from toolkit.analysis import burden as BV_
+    orig_v = BV_._value
+    BV_._value = lambda *a_, **k_: float("inf")
+    try:
+        rec6 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        BV_._value = orig_v
+    ok(rec6.get("status") == "not_run" and "finite" in rec6.get("reason", ""),
+       f"BS-R6 an infinite model value: not run ({rec6.get('status')}: {rec6.get('reason')})")
+    # Codex review of #246 P2-4: each reference's window is recorded, and a transfer across outcome, age band or
+    # window is stated as an assumption
+    ok(all("window" in v for v in (bs.get("references") or {}).values()) and "A" in (bs.get("assumption") or ""),
+       f"BS-R7 the record gives each reference's window and states the transfer assumption ({bs.get('assumption')})")
 
 
 def _self_test_anchor_e2e(ok, d, q):
