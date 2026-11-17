@@ -110,7 +110,10 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # type calibration_target: calibration_target {units: [ids], scale}
                                            # (the listed units' calibration targets scaled, F6 run 1);
                                            # type outcome_ratio: outcome_ratio {component, reference, values}
-                                           # (a package's burden at a ratio of its counterpart's, F6 run 2)
+                                           # (a package's burden at a ratio of its counterpart's, F6 run 2);
+                                           # type burden_scale: burden_scale {references: [validation.burden row
+                                           # ids], shares: [s in (0, 1]]} (each row's group's burden scaled by
+                                           # (reference / model)^s, F6 run 3)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     evidence:                              # F6: required when the options use a component whose engine card declares
@@ -179,7 +182,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target", "outcome_ratio")
+                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1452,6 +1455,17 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                                    for c2 in pk.values()) for cs in pk.values()):
                     bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
                                f"{orc['reference']} in its place")
+        elif t == "burden_scale":            # F6 run 3, owner decision D-c (toolkit/analysis/decision_tests.py)
+            bsc = dt.get("burden_scale")
+            if not isinstance(bsc, dict) or set(bsc) != {"references", "shares"}:
+                bad.append(f"decision test {i}: give burden_scale {{references, shares}}")
+                continue
+            sh = bsc["shares"]
+            if not (isinstance(sh, list) and sh and all(_isnum(v) and 0 < v <= 1 for v in sh)):
+                bad.append(f"decision test {i}: burden_scale.shares: numbers in (0, 1] (1 sets each group's burden to "
+                           "its reference)")
+            from toolkit.analysis import decision_tests as DTm
+            bad += [f"decision test {i}: {e}" for e in DTm.burden_scale_refs(s, bsc)[1]]
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
