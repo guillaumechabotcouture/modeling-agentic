@@ -1352,6 +1352,27 @@ def _self_test_joint(ok, q):
            and set(zc) == set(listed) and rec["results"] and "objective" in rec["results"][0],
            f"JR10 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
            f"targets are lowered, and re-solves the plan ({rec.get('status')}, {moved})")
+        # F6 run 2, owner decision (DT13): a package's burden at a ratio of its swapped counterpart's, emulator only
+        dto = {"id": "DTo", "type": "outcome_ratio", "text": "t",
+               "outcome_ratio": {"component": "a", "reference": "b", "values": [0.5]}}
+        sent_ = []
+        orig_ev = A.evaluate
+        A.evaluate = lambda *a_, **k_: (sent_.append(1), orig_ev(*a_, **k_))[1]
+        try:
+            ro = DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.evaluate = orig_ev
+        o_ = A.primary
+        i0 = A.ids[0]
+        want = A.dfac * (out0[i0]["y"][A.comp][o_] - 0.5 * out0[i0]["y"]["b"][o_])
+        got = (ro.get("outcome_ratio") or {}).get("check", {}).get(i0)
+        ok(ro.get("status") == "run" and got is not None and abs(got - want) <= 1e-9 * max(1.0, abs(want))
+           and ro["results"] and not sent_ and (ro.get("outcome_ratio") or {}).get("pairs") == {"a": "b"},
+           f"JR11 an outcome_ratio test sets package a's burden to half of b's, re-solves the plan, and evaluates "
+           f"nothing anew ({ro.get('status')}, {got} vs {want}, {len(sent_)} evaluations)")
+        dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
+        ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
         saved_z = A.joint["z"].pop(listed[0])
         try:
             rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)

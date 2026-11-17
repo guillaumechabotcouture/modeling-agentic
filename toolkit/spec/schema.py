@@ -1860,6 +1860,21 @@ def _self_test() -> int:
         bad(lambda r: (r["calibration"].update(method="none"),
                        dct(calibration_target={"units": ["0"], "scale": 0.8})(r)), "emulator_inversion",
             "SP-CT6 a calibration_target test without an emulator-inversion calibration is refused")
+        # F6 run 2, owner decision (DT13): a package's burden set to a ratio of its counterpart's (one component swapped)
+        dor = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTo", "type": "outcome_ratio", "text": "t"}, **kw)))
+        bad(dor(), "give outcome_ratio", "SP-OR1 an outcome_ratio test without its mapping is refused")
+        bad(dor(outcome_ratio={"component": "zz", "reference": "b", "values": [0.8]}), "unknown component",
+            "SP-OR2 an unknown component is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "a", "values": [0.8]}), "differ",
+            "SP-OR3 a component tested against itself is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.0]}), "positive",
+            "SP-OR4 a ratio that is not positive is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
+            "SP-OR5 a ratio of 1 only (an identity) is refused")
+        r_o = copy.deepcopy(s.raw)
+        dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
+        ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
