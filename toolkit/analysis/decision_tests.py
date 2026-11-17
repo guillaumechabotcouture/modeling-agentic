@@ -706,7 +706,7 @@ def _not_run(A, dt, why, extra=None) -> dict:
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
-def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
+def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
     """F6 run 2, owner decision (DT13): each package holding `component` has its primary-outcome burden set to
     `value` times its counterpart's, the package with `reference` in the component's place (the trial's relative
     effect of one net type against another), for each value; benefits re-derived against the comparator, costs and
@@ -714,6 +714,10 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
     package has a counterpart."""
     oc = dt["outcome_ratio"]
     c, ref = oc["component"], oc["reference"]
+    from toolkit.analysis import outcome_adjust as OA   # Codex review of #251 P1-1, P1-4 (sign-off refuses these too)
+    conflict = OA.dt_problems(oc, getattr(A, "adjust", None))
+    if conflict:
+        return {"not_run": "; ".join(conflict)}
     pairs = {}
     for k, cs in A.pk.items():
         if c in cs and ref not in cs:
@@ -723,22 +727,38 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
     if not pairs:
         return {"not_run": f"no package with {c} has a counterpart with {ref} in its place"}
     o = A.primary
-    cases, lowers, check = [], [], {}
+    cases, lowers, check, by_value, evs = [], [], {}, {}, {}
     for v in oc["values"]:
-        r = float(v)
-        ben = {i: dict(ben0[i]) for i in A.ids}
-        for i in A.ids:
-            y0 = out0[i]["y"][A.comp][o]
-            for k, kk in pairs.items():
-                ben[i][k] = A.dfac * (y0 - r * out0[i]["y"][kk][o])
+        if v == "engine":       # F6 run 4 R3: the component's base adjustment removed (the engine's own effect)
+            saved = A.adjust
+            if not any(a["component"] == c for a in saved or []):
+                return {"not_run": f"the value \"engine\" needs a base outcome adjustment of {c}"}
+            A.adjust = [a for a in saved if a["component"] != c]
+            try:
+                _o, ben_e, _c = A.evaluate(A.theta0, z0)
+                evs[v] = list(A.last_events)
+            finally:
+                A.adjust = saved
+            ben = {i: dict(ben_e[i]) for i in A.ids}     # Codex review of #251 P1-1: the whole re-evaluation
+        else:
+            r = float(v)
+            pev = list(getattr(A, "point_events", None) or [])     # Codex re-review of #251 P1-2: out0's corrections,
+            evs[v] = pev + OA.derive_events(pev, pairs)             # and the counterparts' on the derived (r3 P1)
+            ben = {i: dict(ben0[i]) for i in A.ids}
+            for i in A.ids:
+                y0 = out0[i]["y"][A.comp][o]
+                for k, kk in pairs.items():
+                    ben[i][k] = A.dfac * (y0 - r * out0[i]["y"][kk][o])
         if not check:
             check = {i: ben[i][next(iter(pairs))] for i in A.ids}
+        by_value[str(v)] = {i: ben[i][next(iter(pairs))] for i in A.ids}
         cases.append((v, ben, cost0, None, None))
         lowers.append(_lowers_only_unchosen(ben0, ben, plan))
     return {"varied": f"the {o} of every package with {c} set to each tested ratio times that of the same package with "
                       f"{ref} in its place", "cases": cases, "lowers": lowers,
             "record": {"component": c, "reference": ref, "values": list(oc["values"]), "outcome": o, "pairs": pairs,
-                       "check": check}}
+                       "check": check, "check_by_value": by_value,
+                       "base_adjustments": [a["id"] for a in getattr(A, "adjust", None) or []]}, "evs": evs}
 
 
 def burden_scale_refs(spec, bs) -> tuple[list[dict], list[str]]:
@@ -919,10 +939,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         extra["_ct"] = cr["record"]
         cases, lowers = [("case", ben, cost, None, None)], [False]
     elif t == "outcome_ratio":
-        orr = _outcome_ratio(A, dt, out0, ben0, cost0, plan)
+        orr = _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0)
         if orr.get("not_run"):
             return _not_run(A, dt, orr["not_run"])
         varied, cases, lowers = orr["varied"], orr["cases"], orr["lowers"]
+        evs.update(orr.get("evs") or {})
         extra["_or"] = orr["record"]
     elif t == "burden_scale":
         bsr = _burden_scale(A, dt, z0, out0, ben0, cost0)

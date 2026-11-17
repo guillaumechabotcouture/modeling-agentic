@@ -124,6 +124,8 @@ def needed(pk, comp, ch, ru) -> list[str]:
 def run_packages(A, c) -> list[str]:
     """needed(), plus the anchor arm (#220 r2): the engine side is anchored on that arm's window burden."""
     out = needed(A.pk, A.comp, c["chosen"], c["runner_up"])
+    for a in getattr(A, "adjust", None) or []:      # F6 run 4 R3: an adjusted package reads its counterpart
+        out += [a["pairs"][p] for p in list(out) if p in a["pairs"] and a["pairs"][p] not in out]
     arm = (getattr(A, "anchor", None) or {}).get("arm")
     return out + ([arm] if arm is not None and arm not in out else [])
 
